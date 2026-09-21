@@ -346,10 +346,32 @@ try:
     (_tool / "Cargo.toml").write_text('[package]\nname = "harness"\n', encoding="utf-8")
     (_tool / "src" / "main.rs").write_text("mod mode_a;\n", encoding="utf-8")
     (_tool / "src" / "mode_a.rs").write_text("", encoding="utf-8")
+    # A test target cargo builds only when a feature is on. Selecting it in the
+    # filterset is not enough — cargo skips it silently when the feature is off.
+    _gated = _reach / "crates" / "gated"
+    (_gated / "tests").mkdir(parents=True, exist_ok=True)
+    (_gated / "src").mkdir(parents=True, exist_ok=True)
+    (_gated / "src" / "lib.rs").write_text("", encoding="utf-8")
+    (_gated / "Cargo.toml").write_text(
+        '[package]\nname = "gated"\n\n'
+        '[features]\ndefault = ["baseline"]\nbaseline = []\nextra = []\n\n'
+        '[[test]]\nname = "needs_extra"\npath = "tests/needs_extra.rs"\n'
+        'required-features = ["extra"]\n\n'
+        '[[test]]\nname = "needs_baseline"\npath = "tests/needs_baseline.rs"\n'
+        'required-features = ["baseline"]\n',
+        encoding="utf-8",
+    )
+    (_gated / "tests" / "needs_extra.rs").write_text("", encoding="utf-8")
+    (_gated / "tests" / "needs_baseline.rs").write_text("", encoding="utf-8")
 
-    def reachability(ledger: str, filterset: str, outside: dict | None = None) -> list[str]:
+    def reachability(
+        ledger: str, filterset: str, outside: dict | None = None, features: str = ""
+    ) -> list[str]:
         """`guard_reachability` against the temporary tree rather than the repo."""
-        (_reach / "Makefile").write_text(f"NEXTEST_FILTER := {filterset}\n", encoding="utf-8")
+        (_reach / "Makefile").write_text(
+            f"NEXTEST_SELECTION := --all{features}\nNEXTEST_FILTER := {filterset}\n",
+            encoding="utf-8",
+        )
         saved = (cfp.REPO, cfp.MAKEFILE, cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE)
         cfp.REPO = _reach
         cfp.MAKEFILE = _reach / "Makefile"
@@ -522,6 +544,41 @@ try:
         reachability("`crates/demo/src/bin/aux.rs::a_guard`", "kind(=lib) + binary(=aux)"),
         [],
     )
+    # Selection is necessary but not sufficient: cargo skips a test target whose
+    # `required-features` are unmet and says nothing, so a guard there is
+    # selected and never built. This has happened in this repo — see the
+    # NEXTEST_SELECTION comment in the Makefile.
+    GATED = "kind(=lib) + (package(=gated) & binary(=needs_extra))"
+    check_contains(
+        "a guard in a target whose required feature is off is reported",
+        reachability("`crates/gated/tests/needs_extra.rs::a_guard`", GATED),
+        "requires `extra`",
+    )
+    check(
+        "naming that feature in NEXTEST_SELECTION clears it",
+        reachability(
+            "`crates/gated/tests/needs_extra.rs::a_guard`", GATED, features=" --features gated/extra"
+        ),
+        [],
+    )
+    check(
+        "a required feature the crate enables by default is satisfied",
+        reachability(
+            "`crates/gated/tests/needs_baseline.rs::a_guard`",
+            "kind(=lib) + (package(=gated) & binary(=needs_baseline))",
+        ),
+        [],
+    )
+
+    # Live tree: the feature parser has to keep finding the real variable, or a
+    # Makefile reformat turns the check above into one that reports nothing it
+    # should not — and reads green while doing it.
+    check(
+        "the live Makefile's NEXTEST_SELECTION is still parsed",
+        bool(cfp._gate_features((Path(__file__).resolve().parent.parent / "Makefile").read_text(encoding="utf-8"))),
+        True,
+    )
+
     check_contains(
         "a guard path that does not exist is reported",
         reachability("`crates/demo/tests/gone.rs::a_guard`", NAMES_THE_BINARY),

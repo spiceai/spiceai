@@ -491,6 +491,92 @@ def _cargo_target(path: str) -> tuple[str, str, frozenset[str]] | str | None:
     return package, "test", frozenset({binary})
 
 
+# The gate's package/feature selection, which sits beside the filterset and is
+# read from the Makefile for the same reason: so this check cannot drift from the
+# run it is about. Line continuations are joined before it is parsed.
+NEXTEST_SELECTION_RE = re.compile(
+    r"^NEXTEST_SELECTION\s*:?=\s*(?P<selection>(?:[^\n]*\\\n)*[^\n]*)", re.M
+)
+
+
+def _gate_features(makefile_text: str) -> set[str]:
+    """The `package/feature` pairs the gate's nextest run turns on explicitly."""
+    match = NEXTEST_SELECTION_RE.search(makefile_text)
+    if not match:
+        return set()
+    selection = match.group("selection").replace("\\\n", " ")
+    enabled: set[str] = set()
+    for group in re.findall(r"--features[=\s]+(\S+)", selection):
+        enabled.update(part for part in group.split(",") if part)
+    return enabled
+
+
+def _default_feature_closure(manifest: str) -> set[str]:
+    """Every feature of the crate that building it with defaults turns on.
+
+    Only the crate's own `[features]` table, expanded from `default`. A
+    `dep/feature` entry enables something in another crate and cannot satisfy a
+    `required-features` entry here, so it is not followed.
+    """
+    section = re.search(r"^\[features\](?P<body>.*?)(?=^\[|\Z)", manifest, re.S | re.M)
+    if not section:
+        return set()
+    table = {
+        name: re.findall(r'"([^"]+)"', body)
+        for name, body in re.findall(
+            r"^(?P<name>[A-Za-z0-9_-]+)\s*=\s*\[(?P<body>.*?)\]", section.group("body"), re.S | re.M
+        )
+    }
+    closure: set[str] = set()
+    stack = list(table.get("default", []))
+    while stack:
+        feature = stack.pop()
+        if "/" in feature or feature in closure:
+            continue
+        closure.add(feature)
+        stack.extend(table.get(feature, []))
+    return closure
+
+
+def _unmet_required_features(path: str, target: str, enabled: set[str]) -> list[str]:
+    """Required features of `target` that the gate's run does not turn on.
+
+    Naming a target in the filterset is not enough to make it run: cargo skips a
+    test target whose `required-features` are unmet **without saying so**. That
+    has already happened here — `result_correctness_vs_duckdb_test` was selected
+    and silently never built until `NEXTEST_SELECTION` gained the feature (see
+    the comment above it in the Makefile) — which is exactly the shape this whole
+    check exists to catch.
+
+    A feature counts as enabled when the gate names it as `package/feature` or
+    when the crate's own defaults reach it. Anything else is reported rather than
+    assumed: a feature that only arrives through another crate's dependency
+    edge is unification, which changes when an unrelated crate changes its
+    dependencies, and a guard should not run by that kind of accident.
+    """
+    crate = _crate_of(Path(path))
+    if crate is None:
+        return []
+    package, crate_dir = crate
+    manifest = (REPO / crate_dir / "Cargo.toml").read_text(encoding="utf-8")
+    required: list[str] = []
+    for body in re.findall(r"^\[\[test\]\](?P<body>.*?)(?=^\[|\Z)", manifest, re.S | re.M):
+        name = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', body, re.M)
+        if not name or name.group("name") != target:
+            continue
+        declared = re.search(r"^required-features\s*=\s*\[(?P<list>.*?)\]", body, re.S | re.M)
+        required = re.findall(r'"([^"]+)"', declared.group("list")) if declared else []
+        break
+    if not required:
+        return []
+    defaults = _default_feature_closure(manifest)
+    return sorted(
+        feature
+        for feature in required
+        if feature not in defaults and f"{package}/{feature}" not in enabled
+    )
+
+
 # `package(=…)` / `binary(=…)` inside one clause of the gate's filterset.
 _PACKAGE_CLAUSE_RE = re.compile(r"package\(=(?P<name>[^)]+)\)")
 _BINARY_CLAUSE_RE = re.compile(r"binary\(=(?P<name>[^)]+)\)")
@@ -564,10 +650,12 @@ def guard_reachability(ledger_text: str) -> list[str]:
     """
     if not MAKEFILE.is_file():
         return [f"{MAKEFILE.relative_to(REPO)} not found, so the nextest filterset cannot be read"]
-    filterset = NEXTEST_FILTER_RE.search(MAKEFILE.read_text(encoding="utf-8"))
+    makefile_text = MAKEFILE.read_text(encoding="utf-8")
+    filterset = NEXTEST_FILTER_RE.search(makefile_text)
     if not filterset:
         return ["Makefile no longer defines NEXTEST_FILTER, so nothing pins the gate's selection"]
     selection = filterset.group("filter")
+    enabled_features = _gate_features(makefile_text)
 
     errors = []
     for path in sorted({match.group("path") for match in GUARD_RE.finditer(ledger_text)}):
@@ -583,10 +671,28 @@ def guard_reachability(ledger_text: str) -> list[str]:
             errors.append(f"docs/dev/fork_patches.md names {path} as a guard, but {target}")
             continue
         package, kind, names = target
-        if any(
-            (package, name) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE for name in names
-        ):
+        # An allowlisted target is run by a workflow of its own, with its own
+        # feature set, so neither the gate's filterset nor its features have
+        # anything to say about it. That entry is the claim under review, not
+        # this check.
+        if any((package, name) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE for name in names):
             continue
+        # Being named in the filterset is necessary, not sufficient: an unmet
+        # `required-features` makes cargo skip the target silently, so the guard
+        # does not run however well the filterset selects it.
+        if kind == "test":
+            unmet = _unmet_required_features(path, sorted(names)[0], enabled_features)
+            if unmet:
+                errors.append(
+                    f"docs/dev/fork_patches.md names {path} as a guard, but its target "
+                    f"({package}, {sorted(names)[0]}) requires {', '.join(f'`{f}`' for f in unmet)}, "
+                    f"which the gate's run does not turn on — cargo skips such a target without "
+                    f"saying so, so it is selected and never built. Add "
+                    f"`--features {package}/{unmet[0]}` to NEXTEST_SELECTION, or record "
+                    f"({package}, {sorted(names)[0]}) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with "
+                    f"the runner that does build it"
+                )
+                continue
         if any(
             _clause_selects(clause, package, kind, names) for clause in _union_clauses(selection)
         ):
