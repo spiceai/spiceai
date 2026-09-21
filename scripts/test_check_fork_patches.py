@@ -18,19 +18,26 @@
 
 from __future__ import annotations
 
+import io
 import sys
+import tarfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_fork_patches import (  # noqa: E402
+    DUCKDB_RS_REPO,
+    DUCKDB_THRIFT_EQUALITY_MARKER,
+    DUCKDB_THRIFT_HEADER_SUFFIX,
     LEDGER,
     LOCK,
     drift,
+    duckdb_thrift_iterator_equality,
     gap_accounting,
     ledger_pins,
     pinned_forks,
     temporary_pins,
+    thrift_header_from_tarball,
 )
 
 failures = 0
@@ -234,6 +241,69 @@ check(
     len(temporary_pins(_ORDINARY_ROW + _TEMPORARY_ROW + _ORDINARY_ROW)),
     1,
 )
+
+print("\nduckdb-rs Thrift iterator equality")
+
+# Synthetic tarball helpers — the live checkout is also exercised below, but the
+# parser shapes have to hold when the archive is a fixture, or a cold CI agent
+# that has not yet fetched duckdb-rs would leave the negative cases untested.
+
+
+def _tarball_with_thrift(header_text: str, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(dest, "w:gz") as tf:
+        payload = header_text.encode()
+        info = tarfile.TarInfo(name=f"duckdb/{DUCKDB_THRIFT_HEADER_SUFFIX}")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    return dest
+
+
+_tmp = Path(__file__).resolve().parent / ".test_thrift_tmp"
+try:
+    with_eq = _tarball_with_thrift(
+        "class TEnumIterator {\n  bool operator!=(const TEnumIterator& end);\n  "
+        + DUCKDB_THRIFT_EQUALITY_MARKER
+        + " { return !(*this != end); }\n};\n",
+        _tmp / "with_eq.tar.gz",
+    )
+    without_eq = _tarball_with_thrift(
+        "class TEnumIterator {\n  bool operator!=(const TEnumIterator& end);\n};\n",
+        _tmp / "without_eq.tar.gz",
+    )
+
+    check(
+        "a header carrying the marker is accepted",
+        DUCKDB_THRIFT_EQUALITY_MARKER in (thrift_header_from_tarball(with_eq) or ""),
+        True,
+    )
+    check(
+        "a header missing the marker is rejected by the reader",
+        DUCKDB_THRIFT_EQUALITY_MARKER in (thrift_header_from_tarball(without_eq) or ""),
+        False,
+    )
+finally:
+    import shutil
+
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+# Live-tree: the pinned duckdb-rs revision must still carry the backport. A
+# silent drop on the next re-cut is exactly what this guard exists to catch.
+_live = duckdb_thrift_iterator_equality(pinned_forks(LOCK.read_text(encoding="utf-8")))
+check("the shipped duckdb-rs pin still carries Thrift iterator equality", _live, [])
+check(
+    "the marker string names TEnumIterator",
+    "TEnumIterator" in DUCKDB_THRIFT_EQUALITY_MARKER,
+    True,
+)
+check(
+    "the header suffix reaches Thrift.h",
+    DUCKDB_THRIFT_HEADER_SUFFIX.endswith("Thrift.h"),
+    True,
+)
+check("the duckdb-rs repo constant is set", DUCKDB_RS_REPO, "duckdb-rs")
+
+
 
 if failures:
     print(f"\n{failures} of {checks} checks FAILED")

@@ -243,7 +243,17 @@ jobs:
             echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
             exit 1
           fi
-          brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          # The spiceai-macos flock wrapper is `/opt/spice/bin/brew`, so
+          # dirname/dirname of `command -v brew` is `/opt/spice` and every
+          # keg looks missing. Prefer the well-known prefixes; do not invoke
+          # brew (that takes the lock this probe exists to avoid).
+          if [ -x /opt/homebrew/bin/brew ]; then
+            brew_prefix=/opt/homebrew
+          elif [ -x /usr/local/bin/brew ]; then
+            brew_prefix=/usr/local
+          else
+            brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          fi
           missing=()
           # cmake is invoked by bare name from build scripts, so being in the Cellar is
           # not enough — the name has to resolve to *this* Homebrew. Matching the prefix
