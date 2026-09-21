@@ -1105,18 +1105,20 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn base_table_schema() -> Schema {
+        // The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker lives on the
+        // *schema*, not the `response_status` field: it is a provenance
+        // signal ("this batch really came from the HTTP connector's own
+        // fetch"), not a per-column attribute, so it must survive being
+        // rebuilt into a narrower, decomposed schema (see
+        // `build_json_nest_schema`) the same way whether or not
+        // `response_status` itself is one of the columns kept.
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
             Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
-            Field::new("response_status", DataType::UInt16, false).with_metadata(
-                std::collections::HashMap::from([(
-                    crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
-                    "1".to_string(),
-                )]),
-            ),
+            Field::new("response_status", DataType::UInt16, false),
             Field::new(
                 "response_headers",
                 DataType::Map(
@@ -1138,6 +1140,10 @@ impl HttpTableProvider {
                 true,
             ),
         ])
+        .with_metadata(std::collections::HashMap::from([(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            "1".to_string(),
+        )]))
     }
 
     /// Extract path and query from filters
@@ -2234,6 +2240,25 @@ impl HttpExec {
         )
     }
 
+    /// `self.projected_schema` with [`crate::HTTP_RESPONSE_STATUS_METADATA_KEY`]
+    /// overridden to `status`, so a batch carries the real HTTP status of the
+    /// fetch that produced it even when a JSON-decomposed dataset's declared
+    /// schema has no `response_status` column to hold it. The value also
+    /// doubles as the provenance signal `cache::http_fetch_status` checks
+    /// (only this connector ever sets it) -- a plain presence check, not a
+    /// fixed sentinel, since the value now varies per fetch.
+    fn schema_with_fetch_status(&self, status: u16) -> SchemaRef {
+        let mut metadata = self.projected_schema.metadata().clone();
+        metadata.insert(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            status.to_string(),
+        );
+        Arc::new(Schema::new_with_metadata(
+            self.projected_schema.fields().clone(),
+            metadata,
+        ))
+    }
+
     /// Create a `RecordBatch` from pre-parsed content rows and HTTP response metadata.
     fn create_batch_from_rows(
         &self,
@@ -2333,8 +2358,9 @@ impl HttpExec {
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
-        let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)?;
+        let batch =
+            RecordBatch::try_new(self.schema_with_fetch_status(fetch_result.response_status), columns)
+                .map_err(DataFusionError::from)?;
         Ok(batch)
     }
 
@@ -2557,7 +2583,7 @@ impl HttpExec {
             }
         }
 
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+        RecordBatch::try_new(self.schema_with_fetch_status(fetch_result.response_status), columns)
             .map_err(DataFusionError::from)
     }
 

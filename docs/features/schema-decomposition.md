@@ -259,9 +259,9 @@ WHERE request_path = '/shows/1';
   - JSON null → SQL `NULL`
   - JSON number / boolean / array / object → JSON text
 - The `content`, `request_path`, `response_status`, … metadata columns
-  are **not** available when decomposition is enabled. If you need them,
-  don't enable decomposition — use a view on top of the default schema
-  instead.
+  are **not** available when decomposition is enabled. If you need
+  them, don't enable decomposition — use a view on top of the default
+  schema instead.
 
 ## Building a normalized attributes view
 
