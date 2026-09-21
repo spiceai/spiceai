@@ -2340,11 +2340,6 @@ mod tests {
         );
     }
 
-    /// A `from` that names one object derives the prefix `<key>/`, which nothing
-    /// is under: the snapshot would mark an empty accelerator ready and every
-    /// notification for the object itself would count as outside the dataset.
-    /// Only the object store can tell the two apart, so the refusal needs the
-    /// key this returns.
     /// Only [`object_store::Error::NotFound`] may be treated as "this `from` is a
     /// prefix". Every other HEAD failure must propagate, or an empty accelerator
     /// can be marked ready after an auth/timeout/transient miss.
@@ -2393,6 +2388,12 @@ mod tests {
         );
     }
 
+    /// A `from` that names one object derives the prefix `<key>/`, which nothing
+    /// is under: the snapshot would mark an empty accelerator ready and every
+    /// notification for the object itself would count as outside the dataset.
+    /// Only the object store can tell the two apart, so the refusal needs the
+    /// key this returns.
+    #[test]
     fn a_from_without_a_trailing_slash_may_name_an_object() {
         let object = DatasetSpec::new("s3://my-bucket/events/part-00000.parquet", "events".into());
         assert_eq!(
