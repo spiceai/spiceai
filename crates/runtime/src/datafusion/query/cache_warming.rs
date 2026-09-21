@@ -533,50 +533,70 @@ impl DataFusion {
             return 0;
         };
 
-        let keys = match collect_distinct_keys(self, &distinct_sql, request_context).await {
-            Some(keys) if !keys.is_empty() => keys,
-            _ => return 0,
-        };
-
-        let mut stored = 0_u64;
-        for row in keys {
-            cache_provider.run_pending_tasks().await;
-            if cache_provider.size().await >= cache_provider.max_size() {
-                break;
-            }
-            if execute_warmup_sql(self, &template.sql, Some(row), request_context).await {
-                stored += 1;
-            }
-        }
-        stored
+        warm_distinct_key_rows(
+            self,
+            &template.sql,
+            &distinct_sql,
+            request_context,
+            cache_provider,
+        )
+        .await
     }
 }
 
-async fn collect_distinct_keys(
+/// Replay one parameterized template from streamed DISTINCT rows.
+///
+/// Rows are applied batch-by-batch so a high-cardinality binding cannot
+/// materialize every key before the first replay. Stop when the cache is at
+/// `max_size`, or when a successful store does not increase `size` — Spice
+/// evicts on insert, so `size` may never reach `max_size`.
+async fn warm_distinct_key_rows(
     df: &Arc<DataFusion>,
-    sql: &str,
+    template_sql: &str,
+    distinct_sql: &str,
     request_context: &Arc<RequestContext>,
-) -> Option<Vec<Vec<ScalarValue>>> {
-    let query = QueryBuilder::new(sql, Arc::clone(df))
+    cache_provider: &cache::QueryResultsCacheProvider,
+) -> u64 {
+    let query = QueryBuilder::new(distinct_sql, Arc::clone(df))
         .for_results_cache_warming()
         .results_cache_mode(ResultsCacheMode::Bypass)
         .build();
-    let result = Arc::clone(request_context)
+    let Ok(result) = Arc::clone(request_context)
         .scope(async move { query.run().await })
         .await
-        .ok()?;
-    let batches = result.data.try_collect::<Vec<_>>().await.ok()?;
-    let mut rows = Vec::new();
-    for batch in batches {
+    else {
+        return 0;
+    };
+
+    let mut stream = result.data;
+    let mut stored = 0_u64;
+    let max_size = cache_provider.max_size();
+
+    while let Ok(Some(batch)) = stream.try_next().await {
         for row_idx in 0..batch.num_rows() {
-            let mut values = Vec::with_capacity(batch.num_columns());
-            for col_idx in 0..batch.num_columns() {
-                values.push(ScalarValue::try_from_array(batch.column(col_idx), row_idx).ok()?);
+            cache_provider.run_pending_tasks().await;
+            let size_before = cache_provider.size().await;
+            if size_before >= max_size {
+                return stored;
             }
-            rows.push(values);
+
+            let Ok(values) = (0..batch.num_columns())
+                .map(|col_idx| ScalarValue::try_from_array(batch.column(col_idx), row_idx))
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                continue;
+            };
+
+            if execute_warmup_sql(df, template_sql, Some(values), request_context).await {
+                stored += 1;
+                cache_provider.run_pending_tasks().await;
+                if cache_provider.size().await <= size_before {
+                    return stored;
+                }
+            }
         }
     }
-    Some(rows)
+    stored
 }
 
 async fn execute_warmup_sql(
@@ -1270,6 +1290,42 @@ mod tests {
             cache.size().await,
             0,
             "an empty DISTINCT result must not run the template SQL without parameters"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[tokio::test]
+    async fn high_cardinality_warmup_stops_when_cache_cannot_grow() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-cardinality-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let key_count = 64_i64;
+        let df = prepare_runtime(Some("2KiB"), store.clone()).await;
+        register_table(&df, "orders", (1..=key_count).collect()).await;
+
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: "orders".to_string(),
+                column: "id".to_string(),
+            }],
+        };
+        df.run_warmup_templates(&[template], None).await;
+
+        let cache = df.results_cache_provider().expect("results cache");
+        cache.run_pending_tasks().await;
+        let size = cache.size().await;
+        let max = cache.max_size();
+        let items = cache.item_count().await;
+        assert!(
+            size <= max,
+            "warmup must not leave the cache over its byte budget: size={size} max={max}"
+        );
+        assert!(
+            items < u64::try_from(key_count).expect("key_count fits u64"),
+            "a 2KiB cache must not retain every distinct key; LRU eviction on insert has to stop replay, got {items} items"
         );
         let _ = std::fs::remove_file(&store);
     }

@@ -180,6 +180,11 @@ pub(super) fn template_can_warm(template: &WarmupTemplate) -> bool {
     template.bindings.is_empty() || distinct_keys_sql(template).is_some()
 }
 
+/// Upper bound on `SELECT DISTINCT` rows pulled for one template. Caps both
+/// the key query and the number of replay executions when LRU eviction keeps
+/// `size` below `max_size`.
+pub(super) const MAX_WARMUP_DISTINCT_KEYS: usize = 1024;
+
 /// `SELECT DISTINCT` SQL that yields one row per unique combination of a
 /// template's bound columns. `None` when the template has no variables (run
 /// the template SQL as-is) or the bindings span more than one table (the
@@ -207,7 +212,9 @@ pub(super) fn distinct_keys_sql(template: &WarmupTemplate) -> Option<String> {
         .map(quote_ident)
         .collect::<Vec<_>>()
         .join(".");
-    Some(format!("SELECT DISTINCT {columns} FROM {quoted_table}"))
+    Some(format!(
+        "SELECT DISTINCT {columns} FROM {quoted_table} LIMIT {MAX_WARMUP_DISTINCT_KEYS}"
+    ))
 }
 
 fn quote_ident(name: &str) -> String {
@@ -239,9 +246,14 @@ mod tests {
         assert_eq!(template_id(&a), template_id(&b));
         assert_eq!(a.bindings.len(), 1);
         assert_eq!(a.bindings[0].column, "id");
+        let distinct = distinct_keys_sql(&a).expect("distinct");
         assert!(
-            distinct_keys_sql(&a).expect("distinct").contains("id"),
+            distinct.contains("id"),
             "warmup should DISTINCT the bound column"
+        );
+        assert!(
+            distinct.contains(&format!("LIMIT {MAX_WARMUP_DISTINCT_KEYS}")),
+            "DISTINCT keys must be bounded so a high-cardinality column cannot materialize unbounded rows"
         );
         assert!(template_can_warm(&a));
     }
