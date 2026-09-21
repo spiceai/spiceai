@@ -614,7 +614,11 @@ async fn execute_warmup_sql(
         .scope(async move { query.run().await })
         .await;
     match result {
-        Ok(query_result) => query_result.data.try_collect::<Vec<_>>().await.is_ok(),
+        // Drain without retaining batches. The results-cache wrapper stores as
+        // the stream is consumed; warmup does not need the rows itself, and
+        // holding them here would scale RAM with the full result while
+        // datasets stay not ready.
+        Ok(query_result) => query_result.drain().await.is_ok(),
         Err(e) => {
             tracing::debug!("SQL results cache warmup query failed: {e}");
             false
@@ -709,13 +713,27 @@ mod tests {
     }
 
     async fn register_table(df: &Arc<DataFusion>, name: &str, values: Vec<i64>) {
+        register_table_partitions(df, name, vec![values]).await;
+    }
+
+    async fn register_table_partitions(
+        df: &Arc<DataFusion>,
+        name: &str,
+        partitions: Vec<Vec<i64>>,
+    ) {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(values))],
-        )
-        .expect("batch");
-        let table = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"));
+        let batches: Vec<Vec<RecordBatch>> = partitions
+            .into_iter()
+            .map(|values| {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(values))],
+                )
+                .expect("batch");
+                vec![batch]
+            })
+            .collect();
+        let table = Arc::new(MemTable::try_new(schema, batches).expect("mem table"));
         df.ctx
             .register_table(TableReference::bare(name), table as Arc<dyn TableProvider>)
             .expect("register table");
@@ -1326,6 +1344,37 @@ mod tests {
         assert!(
             items < u64::try_from(key_count).expect("key_count fits u64"),
             "a 2KiB cache must not retain every distinct key; LRU eviction on insert has to stop replay, got {items} items"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// A broad, unparameterized scan yields many batches. Warmup must drain
+    /// them so the cache wrapper can store, without holding the full result
+    /// until the query finishes.
+    #[tokio::test]
+    async fn unparameterized_warmup_drains_multi_batch_result_and_caches() {
+        let store =
+            std::env::temp_dir().join(format!("spice-warmup-drain-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        let partitions: Vec<Vec<i64>> = (0..16)
+            .map(|partition| ((partition * 8 + 1)..=(partition * 8 + 8)).collect())
+            .collect();
+        register_table_partitions(&df, "orders", partitions).await;
+
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders".to_string(),
+            bindings: vec![],
+        };
+        df.run_warmup_templates(&[template], None).await;
+
+        let hit = request_context()
+            .scope(run_sql(&df, "SELECT id FROM orders"))
+            .await;
+        assert_eq!(
+            hit,
+            CacheStatus::CacheHit,
+            "draining a multi-batch warmup stream must still store the result"
         );
         let _ = std::fs::remove_file(&store);
     }
