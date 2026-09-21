@@ -14,7 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, fmt::Display, fmt::Write as _, pin::Pin, sync::Arc};
+use std::{
+    borrow::Cow,
+    fmt::Display,
+    fmt::Write as _,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
@@ -2096,71 +2103,155 @@ fn attach_query_tracker_to_stream(
     span: Span,
     request_context: Arc<RequestContext>,
     tracker: Option<QueryTracker>,
-    mut stream: SendableRecordBatchStream,
+    stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
     let Some(tracker) = tracker else {
         return stream;
     };
 
     let schema = stream.schema();
-    let schema_copy = Arc::clone(&schema);
+    let tracked = query_tracker_stream(
+        span.clone(),
+        request_context,
+        tracker,
+        stream,
+        Arc::clone(&schema),
+    );
+    // `QueryTrackerStream` is `Unpin`, so `RecordBatchStreamAdapter` can
+    // pin-project it directly — no inner `Box::pin`.
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        tracked.instrument(span),
+    ))
+}
 
-    let mut num_records = 0u64;
-    let mut num_output_bytes = 0u64;
+/// Batch view used by [`QueryTrackerStream`] for owned and Arc-shared items.
+trait QueryTrackerBatch {
+    fn as_record_batch(&self) -> &RecordBatch;
+}
 
-    // The output preview is recorded only in the task-history row's `captured_output`, so
-    // it is built only when task history is enabled and that column records it.
+impl QueryTrackerBatch for RecordBatch {
+    fn as_record_batch(&self) -> &RecordBatch {
+        self
+    }
+}
+
+impl QueryTrackerBatch for Arc<RecordBatch> {
+    fn as_record_batch(&self) -> &RecordBatch {
+        self.as_ref()
+    }
+}
+
+/// Manual tracker wrapper so owned and cached-raw hits share one poll loop.
+/// Avoids `stream!` on the cached-raw path (rust-analyzer / debug cost).
+struct QueryTrackerStream<S> {
+    stream: S,
+    tracker: Option<QueryTracker>,
+    request_context: Arc<RequestContext>,
+    schema: arrow::datatypes::SchemaRef,
+    inner_span: Span,
+    num_records: u64,
+    num_output_bytes: u64,
+    capture_task_history: bool,
+    captured_output: Cow<'static, str>,
+    finished: bool,
+}
+
+fn query_tracker_stream<S, I>(
+    span: Span,
+    request_context: Arc<RequestContext>,
+    tracker: QueryTracker,
+    stream: S,
+    schema: arrow::datatypes::SchemaRef,
+) -> QueryTrackerStream<S>
+where
+    S: Stream<Item = Result<I, DataFusionError>> + Unpin,
+    I: QueryTrackerBatch,
+{
     let capture_task_history = tracker.task_history_enabled && tracker.captured_output_enabled;
-    let mut captured_output = Cow::Borrowed("[]"); // default to empty preview
+    QueryTrackerStream {
+        stream,
+        tracker: Some(tracker),
+        request_context,
+        schema,
+        inner_span: span,
+        num_records: 0,
+        num_output_bytes: 0,
+        capture_task_history,
+        captured_output: Cow::Borrowed("[]"),
+        finished: false,
+    }
+}
 
-    let inner_span = span.clone();
-    let updated_stream = stream! {
-        while let Some(batch_result) = stream.next().await {
-            let batch_result = batch_result.map_err(find_datafusion_root);
-            match &batch_result {
-                Ok(batch) => {
-                    // Create a truncated output for the query history table on first batch.
-                    if capture_task_history && num_records == 0 {
-                        captured_output = output_preview(batch);
-                    }
+impl<S, I> Stream for QueryTrackerStream<S>
+where
+    S: Stream<Item = Result<I, DataFusionError>> + Unpin,
+    I: QueryTrackerBatch,
+{
+    type Item = Result<I, DataFusionError>;
 
-                    num_output_bytes += batch.get_array_memory_size() as u64;
-
-                    num_records += batch.num_rows() as u64;
-                    yield batch_result
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.stream).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                this.finished = true;
+                if let Some(tracker) = this.tracker.take() {
+                    finish_returned_output(
+                        &this.request_context,
+                        tracker,
+                        Arc::clone(&this.schema),
+                        this.num_records,
+                        this.num_output_bytes,
+                        &this.captured_output,
+                    );
                 }
-                Err(e) => {
-                    tracker
-                        .schema(schema_copy)
-                        .rows_produced(num_records)
-                        .finish_with_error(
-                            &request_context,
-                            e.to_string(),
-                            stream_error_code(e),
-                        );
-                    if capture_task_history {
-                        tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(item)) => {
+                let item = item.map_err(find_datafusion_root);
+                match &item {
+                    Ok(batch) => {
+                        let record_batch = batch.as_record_batch();
+                        if this.capture_task_history && this.num_records == 0 {
+                            this.captured_output = output_preview(record_batch);
+                        }
+                        this.num_output_bytes += record_batch.get_array_memory_size() as u64;
+                        this.num_records += record_batch.num_rows() as u64;
+                        Poll::Ready(Some(item))
                     }
-                    yield batch_result;
-                    return;
+                    Err(e) => {
+                        this.finished = true;
+                        if let Some(tracker) = this.tracker.take() {
+                            tracker
+                                .schema(Arc::clone(&this.schema))
+                                .rows_produced(this.num_records)
+                                .finish_with_error(
+                                    &this.request_context,
+                                    e.to_string(),
+                                    stream_error_code(e),
+                                );
+                        }
+                        if this.capture_task_history {
+                            tracing::error!(target: "task_history", parent: &this.inner_span, "{e}");
+                        }
+                        Poll::Ready(Some(item))
+                    }
                 }
             }
         }
+    }
 
-        finish_returned_output(
-            &request_context,
-            tracker,
-            schema_copy,
-            num_records,
-            num_output_bytes,
-            &captured_output,
-        );
-    };
-
-    Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        Box::pin(updated_stream.instrument(span)),
-    ))
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.finished {
+            (0, Some(0))
+        } else {
+            self.stream.size_hint()
+        }
+    }
 }
 
 /// The task-history preview of a result batch: its first rows, as JSON.
@@ -2509,62 +2600,21 @@ fn attach_query_tracker_to_cached_raw(
     span: Span,
     request_context: Arc<RequestContext>,
     tracker: Option<QueryTracker>,
-    mut stream: SendableCachedRawStream,
+    stream: SendableCachedRawStream,
     schema: &arrow::datatypes::SchemaRef,
 ) -> SendableCachedRawStream {
     let Some(tracker) = tracker else {
         return stream;
     };
 
-    let schema_copy = Arc::clone(schema);
-    let mut num_records = 0u64;
-    let mut num_output_bytes = 0u64;
-    let capture_task_history = tracker.task_history_enabled && tracker.captured_output_enabled;
-    let mut captured_output = Cow::Borrowed("[]");
-    let inner_span = span.clone();
-
-    let updated_stream = stream! {
-        while let Some(batch_result) = stream.next().await {
-            let batch_result = batch_result.map_err(find_datafusion_root);
-            match &batch_result {
-                Ok(batch) => {
-                    if capture_task_history && num_records == 0 {
-                        captured_output = output_preview(batch.as_ref());
-                    }
-
-                    num_output_bytes += batch.get_array_memory_size() as u64;
-                    num_records += batch.num_rows() as u64;
-                    yield batch_result
-                }
-                Err(e) => {
-                    tracker
-                        .schema(schema_copy)
-                        .rows_produced(num_records)
-                        .finish_with_error(
-                            &request_context,
-                            e.to_string(),
-                            stream_error_code(e),
-                        );
-                    if capture_task_history {
-                        tracing::error!(target: "task_history", parent: &inner_span, "{e}");
-                    }
-                    yield batch_result;
-                    return;
-                }
-            }
-        }
-
-        finish_returned_output(
-            &request_context,
-            tracker,
-            schema_copy,
-            num_records,
-            num_output_bytes,
-            &captured_output,
-        );
-    };
-
-    Box::pin(updated_stream.instrument(span))
+    let tracked = query_tracker_stream(
+        span.clone(),
+        request_context,
+        tracker,
+        stream,
+        Arc::clone(schema),
+    );
+    Box::pin(tracked.instrument(span))
 }
 
 /// Returns true if `err` represents a query cancellation produced by

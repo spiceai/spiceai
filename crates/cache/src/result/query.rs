@@ -555,9 +555,9 @@ impl RecordBatchStream for CachedStream {
 /// batch (one atomic), not `RecordBatch::clone` of every column.
 ///
 /// HTTP and Flight drain this via [`QueryResult::from_cached_raw`] /
-/// [`QueryResultSource::CachedRaw`]. Prefetches the first batch's data
-/// buffers and the next batch's headers at construction. Each later poll
-/// warms headers two batches ahead, so it does not repeat construct.
+/// [`QueryResultSource::CachedRaw`]. Construction issues prefetch hints for
+/// the first batch's data buffers and the next batch's headers. Each later
+/// poll hints headers two batches ahead so it does not repeat construct.
 pub struct CachedRawStream {
     data: CachedBatches,
     schema: SchemaRef,
@@ -567,8 +567,8 @@ pub struct CachedRawStream {
 impl CachedRawStream {
     /// Serve a Raw (or just-decoded) pre-`Arc`'d slice.
     ///
-    /// Prefetches the first batch's data buffers and the next batch's headers
-    /// before returning so HTTP JSON / Flight IPC see warm lines on first poll.
+    /// Issues prefetch hints for the first batch's data buffers and the next
+    /// batch's headers before returning.
     #[must_use]
     pub fn from_raw(data: CachedBatches, schema: SchemaRef) -> Self {
         super::prefetch::prefetch_raw_serve_arced(&data);

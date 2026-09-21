@@ -16,11 +16,10 @@ limitations under the License.
 
 //! Software prefetch for a Raw results-cache serve.
 //!
-//! A hit returns a stream whose first `poll_next` is typically followed
-//! immediately by the consumer reading column buffers (HTTP JSON, Flight IPC).
-//! Touching those lines here, before the caller is handed the stream, hides
-//! the compulsory misses of that first batch — and the next batch's headers
-//! so the following poll's `Arc` clone and encode see warm lines.
+//! [`prefetch_raw_serve_arced`] issues architecture prefetch hints for the
+//! first batch's leading data buffers and the next batch's headers. Hints do
+//! not change results. A >LLC working-set drain of this path was slower than
+//! the legacy clone stream; do not read a miss-hiding benefit from that bench.
 
 use std::sync::Arc;
 
