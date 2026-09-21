@@ -2979,8 +2979,32 @@ impl ExecutionPlan for HttpExec {
                             state.done = true;
                         }
 
-                        // Skip empty pages internally — loop again instead of yielding
+                        // Skip empty pages internally — loop again instead of yielding.
+                        // An empty page is ambiguous the same way a non-paginated empty
+                        // body is (see `create_batch_from_rows`): a retryable status
+                        // (5xx/429) with no rows means this page carries an origin
+                        // failure, not a legitimate end of data, and `state.done` being
+                        // true for it — the common case, since a failed page usually
+                        // carries no valid `next` link either — would otherwise let
+                        // pagination end the stream with `Ok(None)` before this fetch's
+                        // status is ever checked, bypassing `create_batch_from_rows`
+                        // entirely.
                         if content_rows.is_empty() {
+                            if HttpTableProvider::is_retryable_status(fetch_result.response_status)
+                            {
+                                return Err(if fetch_result.response_status == 429 {
+                                    Error::RateLimited {
+                                        message: "the origin answered 429 Too Many Requests \
+                                            with an empty body"
+                                            .to_string(),
+                                    }
+                                } else {
+                                    Error::HttpServerError {
+                                        status: fetch_result.response_status,
+                                    }
+                                }
+                                .into());
+                            }
                             if state.done {
                                 return Ok(None);
                             }
@@ -7690,6 +7714,109 @@ mod tests {
             Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
             request_count,
         )
+    }
+
+    /// Like [`start_query_param_pagination_server`], but the final "page" is a
+    /// retryable origin failure (`503` with an empty body) rather than a
+    /// legitimate empty page.
+    async fn start_query_param_pagination_server_with_failing_final_page(
+        stop_offset: usize,
+    ) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let request_target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let request_url = Url::parse(&format!("http://localhost{request_target}"))
+                        .expect("request target should form a valid URL");
+                    let offset = request_url
+                        .query_pairs()
+                        .find_map(|(key, value)| {
+                            (key == "offset")
+                                .then(|| value.parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+
+                    let response = if offset < stop_offset {
+                        let body = format!(r#"{{"docs":[{{"id":{offset}}}]}}"#);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        let body = r#"{"docs":[]}"#;
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid")
+    }
+
+    /// Regression test: a paginated fetch that ends on a retryable-status,
+    /// empty-body page (e.g. the origin starts answering `503` mid-pagination)
+    /// must surface that as an error rather than the "no more pages" case at
+    /// provider.rs's pagination loop, which returns `Ok(None)` before
+    /// `create_batch_from_rows`'s own retryable-status check ever runs.
+    #[tokio::test]
+    async fn test_pagination_surfaces_a_retryable_empty_final_page_as_an_error() {
+        use datafusion::prelude::SessionContext;
+
+        let base_url = start_query_param_pagination_server_with_failing_final_page(2).await;
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_max_retries(0)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(1),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: None,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config should be valid");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let result = ctx
+            .sql("SELECT content FROM items")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 503 on the final page must surface as an error, not a silently truncated \
+            successful result"
+        );
     }
 
     #[tokio::test]
