@@ -790,6 +790,101 @@ fn references_last_modified(expr: &datafusion_expr::Expr) -> bool {
     found
 }
 
+// Flip a comparison so the `_last_modified` reference is on the left, e.g.
+// `<literal> > _last_modified` becomes `_last_modified < <literal>`.
+fn flip(op: Operator) -> Operator {
+    match op {
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        other => other,
+    }
+}
+
+use datafusion_expr::{Expr, Operator};
+
+fn literal_nanos(expr: &Expr) -> Option<i128> {
+    match expr {
+        Expr::Literal(scalar, _) => scalar_timestamp_nanos(scalar),
+        _ => None,
+    }
+}
+
+/// Returns the bounds contributed by `expr` and whether pruning stays safe.
+fn collect_last_modified_bounds(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq | Operator::Eq => {
+                if is_last_modified_ref(&binary.left) {
+                    return match literal_nanos(&binary.right) {
+                        Some(threshold_nanos) => (
+                            vec![LastModifiedBound {
+                                op: binary.op,
+                                threshold_nanos,
+                            }],
+                            true,
+                        ),
+                        None => (Vec::new(), false),
+                    };
+                }
+                if is_last_modified_ref(&binary.right) {
+                    return match literal_nanos(&binary.left) {
+                        Some(threshold_nanos) => (
+                            vec![LastModifiedBound {
+                                op: flip(binary.op),
+                                threshold_nanos,
+                            }],
+                            true,
+                        ),
+                        None => (Vec::new(), false),
+                    };
+                }
+                (Vec::new(), true)
+            }
+            Operator::And => {
+                let (mut lvals, lsafe) = collect_last_modified_bounds(&binary.left);
+                let (rvals, rsafe) = collect_last_modified_bounds(&binary.right);
+                lvals.extend(rvals);
+                (lvals, lsafe && rsafe)
+            }
+            Operator::Or => {
+                if references_last_modified(&binary.left) || references_last_modified(&binary.right)
+                {
+                    (Vec::new(), false)
+                } else {
+                    (Vec::new(), true)
+                }
+            }
+            _ => (Vec::new(), !references_last_modified(expr)),
+        },
+        Expr::Between(between) if is_last_modified_ref(&between.expr) => {
+            match (
+                between.negated,
+                literal_nanos(&between.low),
+                literal_nanos(&between.high),
+            ) {
+                (false, Some(low), Some(high)) => (
+                    vec![
+                        LastModifiedBound {
+                            op: Operator::GtEq,
+                            threshold_nanos: low,
+                        },
+                        LastModifiedBound {
+                            op: Operator::LtEq,
+                            threshold_nanos: high,
+                        },
+                    ],
+                    true,
+                ),
+                _ => (Vec::new(), false),
+            }
+        }
+        Expr::Not(inner) => (Vec::new(), !references_last_modified(inner)),
+        other => (Vec::new(), !references_last_modified(other)),
+    }
+}
+
 /// Extracts conjunctive `_last_modified` bounds usable to prune the object-store
 /// listing before any file is opened.
 ///
@@ -797,110 +892,14 @@ fn references_last_modified(expr: &datafusion_expr::Expr) -> bool {
 /// `AND`, and pruning on any conjunct is a necessary condition for a row to
 /// pass. If `_last_modified` appears under `OR` or `NOT`, or a comparison
 /// against it uses a non-timestamp literal, this returns `None` so the caller
-/// falls back to a full listing (correct, just unpruned).
+/// falls back to a full listing.
 fn extract_last_modified_predicate(
     filters: &[datafusion_expr::Expr],
 ) -> Option<Vec<LastModifiedBound>> {
-    use datafusion_expr::{Expr, Operator};
-
-    // Flip a comparison so the `_last_modified` reference is on the left, e.g.
-    // `<literal> > _last_modified` becomes `_last_modified < <literal>`.
-    fn flip(op: Operator) -> Operator {
-        match op {
-            Operator::Gt => Operator::Lt,
-            Operator::GtEq => Operator::LtEq,
-            Operator::Lt => Operator::Gt,
-            Operator::LtEq => Operator::GtEq,
-            other => other,
-        }
-    }
-
-    fn literal_nanos(expr: &Expr) -> Option<i128> {
-        match expr {
-            Expr::Literal(scalar, _) => scalar_timestamp_nanos(scalar),
-            _ => None,
-        }
-    }
-
-    // Returns the bounds contributed by `expr` and whether pruning stays safe.
-    fn collect(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
-        match expr {
-            Expr::BinaryExpr(binary) => match binary.op {
-                Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq | Operator::Eq => {
-                    if is_last_modified_ref(&binary.left) {
-                        return match literal_nanos(&binary.right) {
-                            Some(threshold_nanos) => (
-                                vec![LastModifiedBound {
-                                    op: binary.op,
-                                    threshold_nanos,
-                                }],
-                                true,
-                            ),
-                            None => (Vec::new(), false),
-                        };
-                    }
-                    if is_last_modified_ref(&binary.right) {
-                        return match literal_nanos(&binary.left) {
-                            Some(threshold_nanos) => (
-                                vec![LastModifiedBound {
-                                    op: flip(binary.op),
-                                    threshold_nanos,
-                                }],
-                                true,
-                            ),
-                            None => (Vec::new(), false),
-                        };
-                    }
-                    (Vec::new(), true)
-                }
-                Operator::And => {
-                    let (mut lvals, lsafe) = collect(&binary.left);
-                    let (rvals, rsafe) = collect(&binary.right);
-                    lvals.extend(rvals);
-                    (lvals, lsafe && rsafe)
-                }
-                Operator::Or => {
-                    if references_last_modified(&binary.left)
-                        || references_last_modified(&binary.right)
-                    {
-                        (Vec::new(), false)
-                    } else {
-                        (Vec::new(), true)
-                    }
-                }
-                _ => (Vec::new(), !references_last_modified(expr)),
-            },
-            Expr::Between(between) if is_last_modified_ref(&between.expr) => {
-                match (
-                    between.negated,
-                    literal_nanos(&between.low),
-                    literal_nanos(&between.high),
-                ) {
-                    (false, Some(low), Some(high)) => (
-                        vec![
-                            LastModifiedBound {
-                                op: Operator::GtEq,
-                                threshold_nanos: low,
-                            },
-                            LastModifiedBound {
-                                op: Operator::LtEq,
-                                threshold_nanos: high,
-                            },
-                        ],
-                        true,
-                    ),
-                    _ => (Vec::new(), false),
-                }
-            }
-            Expr::Not(inner) => (Vec::new(), !references_last_modified(inner)),
-            other => (Vec::new(), !references_last_modified(other)),
-        }
-    }
-
     let mut bounds = Vec::new();
     let mut safe = true;
     for filter in filters {
-        let (vals, is_safe) = collect(filter);
+        let (vals, is_safe) = collect_last_modified_bounds(filter);
         bounds.extend(vals);
         safe &= is_safe;
     }
