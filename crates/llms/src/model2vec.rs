@@ -190,7 +190,7 @@ fn encode_with_static_model(
     model_name: &str,
     max_token_length: Option<usize>,
     batch_size: usize,
-) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+) -> Result<std::sync::Arc<Vec<Vec<f32>>>, super::embeddings::Error> {
     let embedding_input = match input {
         EmbeddingInput::String(s) => vec![s],
         EmbeddingInput::StringArray(sentences) => sentences,
@@ -204,10 +204,14 @@ fn encode_with_static_model(
 
     if embedding_input.is_empty() {
         tracing::debug!("Embedding input is empty, returning empty vector");
-        return Ok(vec![]);
+        return Ok(std::sync::Arc::new(vec![]));
     }
 
-    Ok(model.encode_with_args(&embedding_input, max_token_length, batch_size))
+    Ok(std::sync::Arc::new(model.encode_with_args(
+        &embedding_input,
+        max_token_length,
+        batch_size,
+    )))
 }
 
 #[async_trait]
@@ -223,7 +227,7 @@ impl Embed for Model2Vec {
     async fn embed(
         &self,
         input: EmbeddingInput,
-    ) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+    ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, super::embeddings::Error> {
         let cache_key = self.embedding_input_cache_key(&input);
 
         let cached_response = if let Some(key) = cache_key {
@@ -232,8 +236,10 @@ impl Embed for Model2Vec {
             None
         };
 
-        if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+        if let Some(cached) = cached_response
+            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(vectors));
         }
 
         // The forward pass is CPU-bound and synchronous; run it on the blocking
@@ -260,14 +266,20 @@ impl Embed for Model2Vec {
         })??;
 
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::clone(&vectors)),
+            )
+            .await;
         }
 
         Ok(vectors)
     }
 
-    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+    fn embed_sync(
+        &self,
+        input: EmbeddingInput,
+    ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, super::embeddings::Error> {
         encode_with_static_model(
             &self.model,
             input,
@@ -402,7 +414,7 @@ mod tests {
 
         let embed_sentences = embed_sentences.expect("Must embed sentences");
         assert_eq!(embed_sentences.len(), 2);
-        for embedded_sentence in &embed_sentences {
+        for embedded_sentence in embed_sentences.iter() {
             assert_eq!(embedded_sentence.len(), 256);
         }
 

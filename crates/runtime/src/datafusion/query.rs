@@ -1905,7 +1905,7 @@ impl Query {
                     None => None,
                 };
                 let planned = match cached_plan {
-                    Some(plan) => Ok(plan),
+                    Some(plan) => Ok(std::sync::Arc::unwrap_or_clone(plan)),
                     None => {
                         self.df
                             .get_or_create_logical_plan(

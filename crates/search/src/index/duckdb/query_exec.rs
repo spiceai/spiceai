@@ -59,12 +59,12 @@ pub(super) struct DuckDBVectorQueryExec {
 
 impl DuckDBVectorQueryExec {
     async fn query_vector(&self) -> DataFusionResult<Vec<f32>> {
-        let mut vectors = self
+        let vectors = self
             .compute_query
             .embed(EmbeddingInput::String(self.query_text.clone()))
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let vector = vectors.pop().ok_or_else(|| {
+        let vector = vectors.first().cloned().ok_or_else(|| {
             DataFusionError::Execution("No embedding vector computed for query".to_string())
         })?;
         validate_vector(&vector, self.dims, "query")?;
@@ -314,8 +314,11 @@ mod tests {
 
     #[async_trait]
     impl Embed for NoopEmbed {
-        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
-            Ok(vec![])
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
+            Ok(std::sync::Arc::new(vec![]))
         }
 
         fn size(&self) -> i32 {
