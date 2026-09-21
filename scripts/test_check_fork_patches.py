@@ -312,57 +312,82 @@ check("the duckdb-rs repo constant is set", DUCKDB_RS_REPO, "duckdb-rs")
 
 print("\nguard reachability")
 
-# `guard_reachability` reads the live Makefile and the live tree, so the only way
-# to pin what it does with a shape this workspace does not currently contain is to
-# point it at one that does. The cases below are the four the ledger's Guard
-# column can produce and the ways a named guard is not run at all.
-
+# `guard_reachability` answers two questions about a guard — does cargo build it,
+# does the gate run it — against the live workspace and the live Makefile. The
+# only way to pin what it does with a shape this workspace does not currently
+# contain is to point it at one that does: a temporary tree of real `.rs` files,
+# plus the target list cargo would report for it.
 _reach = Path(__file__).resolve().parent / ".test_reachability_tmp"
 try:
     _demo = _reach / "crates" / "demo"
-    (_demo / "src").mkdir(parents=True, exist_ok=True)
+    (_demo / "src" / "bin").mkdir(parents=True, exist_ok=True)
     (_demo / "tests" / "covered").mkdir(parents=True, exist_ok=True)
     (_demo / "tests" / "second").mkdir(parents=True, exist_ok=True)
     (_demo / "tests" / "orphan").mkdir(parents=True, exist_ok=True)
     (_demo / "Cargo.toml").write_text('[package]\nname = "demo"\n', encoding="utf-8")
-    (_demo / "src" / "lib.rs").write_text("", encoding="utf-8")
-    # One binary, two modules, and a third directory nothing declares.
+    (_demo / "src" / "lib.rs").write_text("mod shared;\n", encoding="utf-8")
+    (_demo / "src" / "shared.rs").write_text("", encoding="utf-8")
+    # The default binary declares `guard`; the second binary declares nothing.
+    # Each binary has a module tree of its own, which is what stops one being
+    # excused because the other is selected.
+    (_demo / "src" / "main.rs").write_text("mod guard;\n", encoding="utf-8")
+    (_demo / "src" / "guard.rs").write_text("", encoding="utf-8")
+    (_demo / "src" / "bin" / "aux.rs").write_text("", encoding="utf-8")
+    # One integration binary, two modules, a nested module below one of them,
+    # and two directories nothing declares.
     (_demo / "tests" / "integration.rs").write_text("mod covered;\npub mod second;\n", encoding="utf-8")
     (_demo / "tests" / "covered" / "mod.rs").write_text("mod nested;\n", encoding="utf-8")
-    # One level deeper: `nested` is declared by its parent module, `orphan` is not.
     (_demo / "tests" / "covered" / "nested.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "covered" / "orphan.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "second" / "mod.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "orphan" / "mod.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "standalone.rs").write_text("", encoding="utf-8")
-    # A second binary of the demo crate, which is its own target even though the
-    # crate also builds a library.
-    (_demo / "src" / "bin").mkdir(parents=True, exist_ok=True)
-    (_demo / "src" / "bin" / "aux.rs").write_text("", encoding="utf-8")
-    # A crate that builds *no* library: `kind(=lib)` does not reach its `src/`,
-    # so a guard there runs only because a clause names its binary.
+
+    # A crate that builds no library: `kind(=lib)` does not reach its `src/`.
     _tool = _reach / "tools" / "harness"
     (_tool / "src").mkdir(parents=True, exist_ok=True)
     (_tool / "Cargo.toml").write_text('[package]\nname = "harness"\n', encoding="utf-8")
     (_tool / "src" / "main.rs").write_text("mod mode_a;\n", encoding="utf-8")
     (_tool / "src" / "mode_a.rs").write_text("", encoding="utf-8")
-    # A test target cargo builds only when a feature is on. Selecting it in the
-    # filterset is not enough — cargo skips it silently when the feature is off.
+
+    # A test target cargo builds only when a feature is on.
     _gated = _reach / "crates" / "gated"
     (_gated / "tests").mkdir(parents=True, exist_ok=True)
     (_gated / "src").mkdir(parents=True, exist_ok=True)
     (_gated / "src" / "lib.rs").write_text("", encoding="utf-8")
-    (_gated / "Cargo.toml").write_text(
-        '[package]\nname = "gated"\n\n'
-        '[features]\ndefault = ["baseline"]\nbaseline = []\nextra = []\n\n'
-        '[[test]]\nname = "needs_extra"\npath = "tests/needs_extra.rs"\n'
-        'required-features = ["extra"]\n\n'
-        '[[test]]\nname = "needs_baseline"\npath = "tests/needs_baseline.rs"\n'
-        'required-features = ["baseline"]\n',
-        encoding="utf-8",
-    )
+    (_gated / "Cargo.toml").write_text('[package]\nname = "gated"\n', encoding="utf-8")
     (_gated / "tests" / "needs_extra.rs").write_text("", encoding="utf-8")
     (_gated / "tests" / "needs_baseline.rs").write_text("", encoding="utf-8")
+
+    def _target(package, name, kind, src, *, crate, required=(), defaults=()):
+        return {
+            "package": package,
+            "name": name,
+            "kind": kind,
+            "src_path": str(src),
+            "required_features": list(required),
+            "default_features": set(defaults),
+            "crate_dir": str(crate),
+        }
+
+    # What `cargo metadata` reports for the tree above.
+    TARGETS = [
+        _target("demo", "demo", "lib", _demo / "src" / "lib.rs", crate=_demo),
+        _target("demo", "demo", "bin", _demo / "src" / "main.rs", crate=_demo),
+        _target("demo", "aux", "bin", _demo / "src" / "bin" / "aux.rs", crate=_demo),
+        _target("demo", "integration", "test", _demo / "tests" / "integration.rs", crate=_demo),
+        _target("demo", "standalone", "test", _demo / "tests" / "standalone.rs", crate=_demo),
+        _target("harness", "harness", "bin", _tool / "src" / "main.rs", crate=_tool),
+        _target("gated", "gated", "lib", _gated / "src" / "lib.rs", crate=_gated),
+        _target(
+            "gated", "needs_extra", "test", _gated / "tests" / "needs_extra.rs",
+            crate=_gated, required=["extra"], defaults=["baseline"],
+        ),
+        _target(
+            "gated", "needs_baseline", "test", _gated / "tests" / "needs_baseline.rs",
+            crate=_gated, required=["baseline"], defaults=["baseline"],
+        ),
+    ]
 
     def reachability(
         ledger: str, filterset: str, outside: dict | None = None, features: str = ""
@@ -372,14 +397,28 @@ try:
             f"NEXTEST_SELECTION := --all{features}\nNEXTEST_FILTER := {filterset}\n",
             encoding="utf-8",
         )
-        saved = (cfp.REPO, cfp.MAKEFILE, cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE)
+        saved = (
+            cfp.REPO,
+            cfp.MAKEFILE,
+            cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE,
+            cfp._WORKSPACE_TARGETS,
+            cfp._TARGETS_BY_FILE,
+        )
         cfp.REPO = _reach
         cfp.MAKEFILE = _reach / "Makefile"
         cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = {} if outside is None else outside
+        cfp._WORKSPACE_TARGETS = TARGETS
+        cfp._TARGETS_BY_FILE = None
         try:
             return cfp.guard_reachability(ledger)
         finally:
-            cfp.REPO, cfp.MAKEFILE, cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = saved
+            (
+                cfp.REPO,
+                cfp.MAKEFILE,
+                cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE,
+                cfp._WORKSPACE_TARGETS,
+                cfp._TARGETS_BY_FILE,
+            ) = saved
 
     LIB_ONLY = "kind(=lib)"
     NAMES_THE_BINARY = "kind(=lib) + (package(=demo) & binary(=integration))"
@@ -397,8 +436,8 @@ try:
         "binary(=standalone)",
     )
 
-    # A `tests/<dir>/` guard belongs to whichever `tests/*.rs` declares the module,
-    # not to a target named after the directory.
+    # A `tests/<dir>/` guard belongs to whichever `tests/*.rs` declares the
+    # module, not to a target named after the directory.
     check_contains(
         "a module guard resolves to the binary that declares it",
         reachability("`crates/demo/tests/covered/mod.rs::a_guard`", LIB_ONLY),
@@ -418,8 +457,8 @@ try:
         [],
     )
 
-    # The allowlist is keyed by `(package, binary)`, so one entry covers every
-    # module compiled into that binary — adding a module must not need a new entry.
+    # The allowlist is keyed by `(package, target)`, so one entry covers every
+    # module compiled into that target — adding a module needs no new entry.
     check(
         "one allowlist entry covers every module in the binary",
         reachability(
@@ -437,15 +476,6 @@ try:
             outside={("demo", "integration"): "runs in another workflow"},
         ),
         "binary(=standalone)",
-    )
-
-    # Not compiled at all is a different failure from not being selected, and the
-    # two must not share an exit: a resolver that answers `None` for both leaves
-    # the caller reading an orphan as "nothing to say about this path".
-    check_contains(
-        "a `tests/` module no target declares is reported, not skipped",
-        reachability("`crates/demo/tests/orphan/mod.rs::a_guard`", NAMES_THE_BINARY),
-        "declares `mod orphan;`",
     )
 
     # A clause is read whole, so the package it names has to be this one. Tested
@@ -473,43 +503,44 @@ try:
         "binary(=integration)",
     )
 
-    # Reaching the binary through the first component below `tests/` says nothing
-    # about the rest of the chain: a file whose own parent module never declares
-    # it is exactly as uncompiled as an undeclared top-level directory.
+    # Reaching a target through the first component below `tests/` says nothing
+    # about the rest of the chain, and a file its own parent never declares is
+    # compiled by nothing at all — a different failure from not being selected.
     check(
         "a nested module its parent declares resolves to the same binary",
         reachability("`crates/demo/tests/covered/nested.rs::a_guard`", NAMES_THE_BINARY),
         [],
     )
     check_contains(
-        "a nested module its parent does not declare is reported",
+        "a nested module its parent does not declare is compiled by nothing",
         reachability("`crates/demo/tests/covered/orphan.rs::a_guard`", NAMES_THE_BINARY),
-        "does not declare `mod orphan;`",
+        "no target's module tree reaches it",
     )
-    # The directory's own `mod.rs` is the file for that directory, not a submodule
-    # called `mod` — the walk has to stop rather than ask its parent for one.
+    check_contains(
+        "a `tests/` directory no target declares is compiled by nothing",
+        reachability("`crates/demo/tests/orphan/mod.rs::a_guard`", NAMES_THE_BINARY),
+        "no target's module tree reaches it",
+    )
     check(
         "a `<dir>/mod.rs` guard is not read as a submodule named `mod`",
         reachability("`crates/demo/tests/covered/mod.rs::a_guard`", NAMES_THE_BINARY),
         [],
     )
 
+    # Libraries are swept wholesale — but only because the clause is there.
     check(
-        "a `src/` guard is left to the `kind(=lib)` sweep",
-        reachability("`crates/demo/src/lib.rs::a_guard`", LIB_ONLY),
+        "a `src/` guard in a library is left to the `kind(=lib)` sweep",
+        reachability("`crates/demo/src/shared.rs::a_guard`", LIB_ONLY),
         [],
     )
-    # …but only because that clause is there. Skipping every `src/` path meant
-    # the sweep was assumed rather than checked.
     check_contains(
         "a library guard is reported when `kind(=lib)` is gone",
-        reachability("`crates/demo/src/lib.rs::a_guard`", "kind(=proc-macro)"),
+        reachability("`crates/demo/src/shared.rs::a_guard`", "kind(=proc-macro)"),
         "restore `kind(=lib)`",
     )
 
-    # A crate with no library is where the assumption broke: its `src/` guards run
-    # solely because a clause names its binary, and dropping that clause was
-    # invisible.
+    # A crate with no library: its `src/` guards run only because a clause names
+    # its binary, and dropping that clause was invisible.
     check_contains(
         "a guard in a bin-only crate is reported when nothing names its binary",
         reachability("`tools/harness/src/mode_a.rs::a_guard`", LIB_ONLY),
@@ -532,19 +563,22 @@ try:
         "(package(=harness) & kind(=bin))",
     )
 
-    # `src/bin/<name>.rs` is its own target even in a crate that has a library,
-    # so `kind(=lib)` does not cover it either.
+    # Each binary has a module tree of its own. `guard.rs` is declared by the
+    # crate's default binary and by nothing else, so selecting the *other*
+    # binary of the same crate must not excuse it — and the default binary is a
+    # target even though `src/bin/` also exists.
     check_contains(
-        "a `src/bin/<name>.rs` guard is not swept up by `kind(=lib)`",
-        reachability("`crates/demo/src/bin/aux.rs::a_guard`", LIB_ONLY),
+        "another binary of the same crate does not excuse a module it never declares",
+        reachability("`crates/demo/src/guard.rs::a_guard`", "kind(=lib) + binary(=aux)"),
         "(package(=demo) & kind(=bin))",
     )
     check(
-        "naming that binary satisfies it",
-        reachability("`crates/demo/src/bin/aux.rs::a_guard`", "kind(=lib) + binary(=aux)"),
+        "selecting the binary that does declare it satisfies the check",
+        reachability("`crates/demo/src/guard.rs::a_guard`", "kind(=lib) + binary(=demo)"),
         [],
     )
-    # Selection is necessary but not sufficient: cargo skips a test target whose
+
+    # Selection is necessary but not sufficient: cargo skips a target whose
     # `required-features` are unmet and says nothing, so a guard there is
     # selected and never built. This has happened in this repo — see the
     # NEXTEST_SELECTION comment in the Makefile.
@@ -571,8 +605,8 @@ try:
     )
 
     # Live tree: the feature parser has to keep finding the real variable, or a
-    # Makefile reformat turns the check above into one that reports nothing it
-    # should not — and reads green while doing it.
+    # Makefile reformat turns the check above into one that reports nothing —
+    # and reads green while doing it.
     check(
         "the live Makefile's NEXTEST_SELECTION is still parsed",
         bool(cfp._gate_features((Path(__file__).resolve().parent.parent / "Makefile").read_text(encoding="utf-8"))),

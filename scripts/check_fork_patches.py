@@ -24,9 +24,13 @@
 #   scripts/check_fork_patches.py          # validate (exit 1 on drift)
 #   scripts/check_fork_patches.py --list   # print every fork and its status
 #
-# Pure stdlib; no third-party deps. The duckdb-rs Thrift-equality check also
-# shells out to `cargo metadata` only when the git checkout is not already on
-# disk, so a cold cache still resolves the tarball cargo would build.
+# Pure stdlib; no third-party deps. It does shell out to `cargo metadata`: the
+# guard-reachability check needs cargo's own target list, since that is what
+# resolves `[[bin]] path`, the auto-discovered `src/bin/*.rs` binaries, the
+# default binary a bare `src/main.rs` declares, and each target's
+# `required-features` — and the duckdb-rs Thrift-equality check falls back to it
+# when the git checkout is not already on disk. No compile either way; the
+# resolve costs a fraction of a second.
 
 from __future__ import annotations
 
@@ -320,12 +324,6 @@ NEXTEST_FILTER_RE = re.compile(r"^NEXTEST_FILTER\s*:?=\s*(?P<filter>.+)$", re.M)
 # directory.
 GUARD_RE = re.compile(r"(?P<path>(?:crates|bin|tools)/[A-Za-z0-9_./-]+\.rs)")
 
-# A `mod <name>;` declaration, which is what ties a `tests/<name>/mod.rs` guard to
-# the integration-test binary that actually compiles it.
-def _module_declaration(module: str) -> re.Pattern[str]:
-    return re.compile(rf"^\s*(?:pub\s+)?mod\s+{re.escape(module)}\s*;", re.M)
-
-
 # Integration-test binaries that deliberately run outside `make nextest`, mapped
 # to what does run them. Keyed by `(package, binary)` rather than by file: a
 # binary is what the filterset selects and what a workflow names, so one entry
@@ -343,160 +341,34 @@ TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = {
 }
 
 
-def _crate_of(path: Path) -> tuple[str, Path] | None:
-    """The `(package, crate directory)` a repo-relative source path belongs to."""
-    for parent in path.parents:
-        manifest = REPO / parent / "Cargo.toml"
-        if not manifest.is_file():
-            continue
-        name = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
-        return (name.group("name"), parent) if name else None
-    return None
+# Target resolution reuses the workspace's own module walker rather than
+# standing a second parser beside it. `check_module_reachability.py` already
+# handles `#[path]` overrides, inline `mod { … }`, per-platform `cfg`
+# alternatives and mod-rs directory ownership; a hand-rolled walk here would
+# disagree with cargo in a different set of cases than that one does, and the
+# disagreements would be silent.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-def _package_of(path: Path) -> str | None:
-    """The package a repo-relative source path belongs to."""
-    crate = _crate_of(path)
-    return crate[0] if crate else None
-
-
-def _has_lib_target(crate_dir: Path, manifest: str) -> bool:
-    """Whether the crate builds a library, which `kind(=lib)` sweeps wholesale."""
-    return (REPO / crate_dir / "src" / "lib.rs").is_file() or re.search(r"^\[lib\]", manifest, re.M) is not None
-
-
-def _bin_targets(package: str, crate_dir: Path, manifest: str) -> frozenset[str]:
-    """Every binary the crate builds, by target name.
-
-    `[[bin]] name` where the manifest declares one, `src/bin/<name>.rs` for the
-    auto-discovered ones, and the package's own name for a bare `src/main.rs` —
-    which is the case that matters here, since a crate with no library is where
-    a `src/` guard stops being covered by `kind(=lib)`.
-    """
-    names = set()
-    for section in re.findall(r"^\[\[bin\]\](?P<body>.*?)(?=^\[|\Z)", manifest, re.S | re.M):
-        declared = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', section, re.M)
-        if declared:
-            names.add(declared.group("name"))
-    bin_dir = REPO / crate_dir / "src" / "bin"
-    if bin_dir.is_dir():
-        names.update(entry.stem for entry in bin_dir.glob("*.rs"))
-    if not names and (REPO / crate_dir / "src" / "main.rs").is_file():
-        names.add(package)
-    return frozenset(names)
-
-
-def _module_file(module_dir: Path) -> Path | None:
-    """The file whose contents declare what lives inside `module_dir`.
-
-    `mod.rs` first, then the sibling `<name>.rs`, which is the other spelling
-    rustc accepts. Inside a `tests/` tree only the first is used today, but a
-    sibling `tests/<name>.rs` is also a target of its own, so both have to be
-    looked at rather than assumed.
-    """
-    mod_rs = REPO / module_dir / "mod.rs"
-    if mod_rs.is_file():
-        return mod_rs
-    sibling = REPO / module_dir.parent / f"{module_dir.name}.rs"
-    return sibling if sibling.is_file() else None
-
-
-def _cargo_target(path: str) -> tuple[str, str, frozenset[str]] | str | None:
-    """`(package, kind, target names)` for the cargo target that compiles `path`.
-
-    `kind` is `lib`, `bin` or `test`, which is what decides how the gate's
-    filterset has to name it: `kind(=lib)` sweeps every library wholesale, while
-    a bin or an integration-test target is only run if some clause names it.
-
-    `None` when the path belongs to no crate in a way worth reporting. A `str` is
-    a reason the path resolves to no target at all — cargo compiles nothing
-    there, so the ledger names a guard that never runs, a worse state than one
-    the gate merely does not select, and the two must not share an exit.
-    """
-    crate = _crate_of(Path(path))
-    if crate is None:
-        return (
-            "no Cargo.toml above it names a package, so cargo builds it into no target — "
-            "correct the path, or add the manifest"
-        )
-    package, crate_dir = crate
-    parts = Path(path).parts
-    inside_crate = Path(path).relative_to(crate_dir).parts
-
-    if inside_crate and inside_crate[0] == "src":
-        manifest = (REPO / crate_dir / "Cargo.toml").read_text(encoding="utf-8")
-        bins = _bin_targets(package, crate_dir, manifest)
-        # `src/bin/<name>.rs` is its own binary whether or not the crate also
-        # builds a library.
-        if len(inside_crate) >= 3 and inside_crate[1] == "bin":
-            return package, "bin", frozenset({inside_crate[2].removesuffix(".rs")})
-        if _has_lib_target(crate_dir, manifest):
-            return package, "lib", frozenset()
-        if bins:
-            # No library, so every module under `src/` is compiled into the
-            # crate's binaries and runs only if a clause names one of them —
-            # `kind(=lib)` does not reach it.
-            return package, "bin", bins
-        return (
-            f"{crate_dir} builds neither a library nor a binary that could compile it"
-        )
-
-    if "tests" not in parts:
-        return None
-    index = parts.index("tests")
-    inside = parts[index + 1 :]
-    if not inside:
-        return None
-    if len(inside) == 1:
-        # `tests/<name>.rs` is its own target.
-        return package, "test", frozenset({inside[0].removesuffix(".rs")})
-    # `tests/<name>/…` is a module; the target is whichever `tests/*.rs` declares it.
-    tests_dir = Path(*parts[: index + 1])
-    declaration = _module_declaration(inside[0])
-    binary = None
-    for candidate in sorted((REPO / tests_dir).glob("*.rs")):
-        if declaration.search(candidate.read_text(encoding="utf-8")):
-            binary = candidate.stem
-            break
-    if binary is None:
-        return (
-            f"no `tests/*.rs` in {crate_dir} declares `mod {inside[0]};`, so cargo compiles it into "
-            f"no integration-test binary and nothing runs it — declare the module, or correct the path"
-        )
-    # Every level below that has to be declared by its own parent, or the file is
-    # exactly as uncompiled as an undeclared top-level directory: reaching the
-    # binary through the *first* component says nothing about the rest of the
-    # chain.
-    module_dir = tests_dir / inside[0]
-    descend = list(inside[1:])
-    if descend and descend[-1] == "mod.rs":
-        # `…/<name>/mod.rs` is the file *for* `<name>`, which the step that
-        # declared `<name>` has already accounted for — not a submodule `mod`.
-        descend.pop()
-    for component in descend:
-        parent = _module_file(module_dir)
-        module = component.removesuffix(".rs")
-        if parent is None:
-            return (
-                f"{module_dir} has no `mod.rs` and no `{module_dir.name}.rs` beside it, so nothing "
-                f"declares what is inside it and cargo compiles none of it"
-            )
-        if not _module_declaration(module).search(parent.read_text(encoding="utf-8")):
-            return (
-                f"{parent.relative_to(REPO)} does not declare `mod {module};`, so cargo compiles it "
-                f"into no integration-test binary and nothing runs it — declare the module, or "
-                f"correct the path"
-            )
-        module_dir = module_dir / module
-    return package, "test", frozenset({binary})
-
+from check_module_reachability import (  # noqa: E402
+    parse_mods,
+    resolve_child,
+    run_cargo_metadata,
+    walk_from_root,
+)
 
 # The gate's package/feature selection, which sits beside the filterset and is
-# read from the Makefile for the same reason: so this check cannot drift from the
-# run it is about. Line continuations are joined before it is parsed.
+# read from the Makefile for the same reason: so this check cannot drift from
+# the run it is about. Line continuations are joined before it is parsed.
 NEXTEST_SELECTION_RE = re.compile(
     r"^NEXTEST_SELECTION\s*:?=\s*(?P<selection>(?:[^\n]*\\\n)*[^\n]*)", re.M
 )
+
+# `package(=…)` / `binary(=…)` inside one clause of the gate's filterset.
+_PACKAGE_CLAUSE_RE = re.compile(r"package\(=(?P<name>[^)]+)\)")
+_BINARY_CLAUSE_RE = re.compile(r"binary\(=(?P<name>[^)]+)\)")
+
+# Cargo target kinds that mean "library" to a nextest `kind(=lib)` clause.
+_LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib"}
 
 
 def _gate_features(makefile_text: str) -> set[str]:
@@ -511,75 +383,21 @@ def _gate_features(makefile_text: str) -> set[str]:
     return enabled
 
 
-def _default_feature_closure(manifest: str) -> set[str]:
-    """Every feature of the crate that building it with defaults turns on.
+def _default_feature_closure(features: dict[str, list[str]]) -> set[str]:
+    """Every feature of a crate that building it with defaults turns on.
 
-    Only the crate's own `[features]` table, expanded from `default`. A
-    `dep/feature` entry enables something in another crate and cannot satisfy a
-    `required-features` entry here, so it is not followed.
+    A `dep/feature` entry enables something in another crate and cannot satisfy
+    a `required-features` entry here, so it is not followed.
     """
-    section = re.search(r"^\[features\](?P<body>.*?)(?=^\[|\Z)", manifest, re.S | re.M)
-    if not section:
-        return set()
-    table = {
-        name: re.findall(r'"([^"]+)"', body)
-        for name, body in re.findall(
-            r"^(?P<name>[A-Za-z0-9_-]+)\s*=\s*\[(?P<body>.*?)\]", section.group("body"), re.S | re.M
-        )
-    }
     closure: set[str] = set()
-    stack = list(table.get("default", []))
+    stack = list(features.get("default", []))
     while stack:
         feature = stack.pop()
         if "/" in feature or feature in closure:
             continue
         closure.add(feature)
-        stack.extend(table.get(feature, []))
+        stack.extend(features.get(feature, []))
     return closure
-
-
-def _unmet_required_features(path: str, target: str, enabled: set[str]) -> list[str]:
-    """Required features of `target` that the gate's run does not turn on.
-
-    Naming a target in the filterset is not enough to make it run: cargo skips a
-    test target whose `required-features` are unmet **without saying so**. That
-    has already happened here — `result_correctness_vs_duckdb_test` was selected
-    and silently never built until `NEXTEST_SELECTION` gained the feature (see
-    the comment above it in the Makefile) — which is exactly the shape this whole
-    check exists to catch.
-
-    A feature counts as enabled when the gate names it as `package/feature` or
-    when the crate's own defaults reach it. Anything else is reported rather than
-    assumed: a feature that only arrives through another crate's dependency
-    edge is unification, which changes when an unrelated crate changes its
-    dependencies, and a guard should not run by that kind of accident.
-    """
-    crate = _crate_of(Path(path))
-    if crate is None:
-        return []
-    package, crate_dir = crate
-    manifest = (REPO / crate_dir / "Cargo.toml").read_text(encoding="utf-8")
-    required: list[str] = []
-    for body in re.findall(r"^\[\[test\]\](?P<body>.*?)(?=^\[|\Z)", manifest, re.S | re.M):
-        name = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', body, re.M)
-        if not name or name.group("name") != target:
-            continue
-        declared = re.search(r"^required-features\s*=\s*\[(?P<list>.*?)\]", body, re.S | re.M)
-        required = re.findall(r'"([^"]+)"', declared.group("list")) if declared else []
-        break
-    if not required:
-        return []
-    defaults = _default_feature_closure(manifest)
-    return sorted(
-        feature
-        for feature in required
-        if feature not in defaults and f"{package}/{feature}" not in enabled
-    )
-
-
-# `package(=…)` / `binary(=…)` inside one clause of the gate's filterset.
-_PACKAGE_CLAUSE_RE = re.compile(r"package\(=(?P<name>[^)]+)\)")
-_BINARY_CLAUSE_RE = re.compile(r"binary\(=(?P<name>[^)]+)\)")
 
 
 def _union_clauses(selection: str) -> list[str]:
@@ -605,48 +423,189 @@ def _union_clauses(selection: str) -> list[str]:
     return [clause.strip() for clause in clauses if clause.strip()]
 
 
-def _clause_selects(clause: str, package: str, kind: str, names: frozenset[str]) -> bool:
+def _clause_selects(clause: str, package: str, kind: str, name: str) -> bool:
     """Whether one union clause selects this target.
 
     Three forms count, which are the ones the Makefile is written in: a bare
-    `kind(=lib)`, which sweeps every library in the workspace; a `binary(=…)`
-    naming this target — qualified with this package, or unqualified, as
-    `binary(=metrics)` is — and `package(=…) & kind(=bin|test)`, which takes
-    every target of that kind in the package.
+    `kind(=lib)` or `kind(=proc-macro)`, which sweep those targets across the
+    workspace; a `binary(=…)` naming this target — qualified with this package,
+    or unqualified, as `binary(=metrics)` is — and `package(=…) & kind(=…)`,
+    which takes every target of that kind in the package.
     """
     packages = set(_PACKAGE_CLAUSE_RE.findall(clause))
     if packages and packages != {package}:
         return False
-    if f"kind(={kind})" in clause and (kind == "lib" or packages):
+    if f"kind(={kind})" in clause and (kind in {"lib", "proc-macro"} or packages):
         return True
-    return bool(names & set(_BINARY_CLAUSE_RE.findall(clause)))
+    return name in set(_BINARY_CLAUSE_RE.findall(clause))
+
+
+_WORKSPACE_TARGETS: list[dict] | None = None
+_TARGETS_BY_FILE: dict[Path, list[dict]] | None = None
+
+
+def _workspace_targets() -> list[dict]:
+    """Every workspace target, as cargo itself reports it.
+
+    Cargo is the authority here rather than the manifest text: it is what
+    resolves `[[bin]] path`, the auto-discovered `src/bin/*.rs` binaries, the
+    default binary a bare `src/main.rs` declares, and each target's
+    `required-features`. Parsing those by hand got two of them wrong.
+
+    Behind a function so the checker's own tests can hand it a synthetic
+    workspace, and cached because one ledger names dozens of guards.
+    """
+    global _WORKSPACE_TARGETS
+    if _WORKSPACE_TARGETS is not None:
+        return _WORKSPACE_TARGETS
+    metadata = run_cargo_metadata()
+    members = set(metadata.get("workspace_members", []))
+    targets: list[dict] = []
+    for package in metadata.get("packages", []):
+        if package.get("id") not in members:
+            continue
+        defaults = _default_feature_closure(package.get("features", {}))
+        for target in package.get("targets", []):
+            kinds = target.get("kind", [])
+            if "custom-build" in kinds:
+                continue
+            targets.append(
+                {
+                    "package": package["name"],
+                    "name": target.get("name", ""),
+                    "kind": _filterset_kind(kinds),
+                    "src_path": target.get("src_path", ""),
+                    "crate_dir": str(Path(package["manifest_path"]).parent),
+                    "required_features": target.get("required-features") or [],
+                    "default_features": defaults,
+                }
+            )
+    _WORKSPACE_TARGETS = targets
+    return targets
+
+
+def _filterset_kind(kinds: list[str]) -> str:
+    """The kind a nextest `kind(=…)` clause would use for this cargo target."""
+    if any(kind in _LIBRARY_KINDS for kind in kinds):
+        return "lib"
+    return kinds[0] if kinds else "unknown"
+
+
+def _walk_target(root: Path) -> set[Path]:
+    """Every source file the target rooted at `root` compiles.
+
+    A *target root* behaves like `mod.rs` whatever it is called: its submodules
+    live beside it, not in a directory named after it. `walk_from_root` knows
+    that for `lib.rs` and `main.rs`, which is all its own caller ever hands it —
+    it walks only roots under `src/`. Here the roots include integration tests,
+    where it matters: `mod abfs;` in `crates/runtime/tests/integration.rs`
+    is `tests/abfs/mod.rs`, not `tests/integration/abfs/mod.rs`. So the root's
+    own declarations are resolved against its directory and everything below it
+    is handed to the shared walker, which has the ordinary rule right.
+    """
+    reached: set[Path] = {root.resolve()}
+    for name, _, overrides, inline in parse_mods(root):
+        base = root.parent.joinpath(*inline)
+        for override in overrides or (None,):
+            child = resolve_child(base, name, override)
+            if child is not None:
+                walk_from_root(child, reached)
+    return reached
+
+
+def _targets_by_file(wanted: frozenset[Path]) -> dict[Path, list[dict]]:
+    """Which targets compile each of `wanted`, by walking the roots that could.
+
+    Per target rather than per crate, because each binary has a module tree of
+    its own: `src/main.rs` and `src/bin/aux.rs` are separate roots, and a module
+    only one of them declares is compiled only into that one.
+
+    Only the crates holding a wanted path are walked. Walking all 160 costs nine
+    seconds of parsing for an answer about a few dozen files, and this guard
+    sits in `make lint-rust` beside the other no-compile checks.
+    """
+    global _TARGETS_BY_FILE
+    if _TARGETS_BY_FILE is not None:
+        return _TARGETS_BY_FILE
+    mapping: dict[Path, list[dict]] = {}
+    for target in _workspace_targets():
+        crate_dir = Path(target["crate_dir"]).resolve()
+        if not any(_is_under(source, crate_dir) for source in wanted):
+            continue
+        root = Path(target["src_path"])
+        if not root.is_file():
+            continue
+        for source in _walk_target(root):
+            mapping.setdefault(source, []).append(target)
+    _TARGETS_BY_FILE = mapping
+    return mapping
+
+
+def _is_under(source: Path, directory: Path) -> bool:
+    return source == directory or directory in source.parents
+
+
+def _unmet_required_features(target: dict, enabled: set[str]) -> list[str]:
+    """Required features of `target` that the gate's run does not turn on.
+
+    Being named in the filterset is not enough to make a target run: cargo skips
+    one whose `required-features` are unmet **without saying so**. That has
+    already happened here — `result_correctness_vs_duckdb_test` was selected and
+    silently never built until `NEXTEST_SELECTION` gained the feature (see the
+    comment above it in the Makefile) — which is the shape this whole check
+    exists to catch.
+
+    A feature counts as on when the gate names it as `package/feature` or the
+    crate's own defaults reach it. One arriving through another crate's
+    dependency edge does not: that is unification, which moves when an unrelated
+    crate changes its dependencies, and a guard should not run by that accident.
+    """
+    package = target["package"]
+    return sorted(
+        feature
+        for feature in target["required_features"]
+        if feature not in target["default_features"]
+        and f"{package}/{feature}" not in enabled
+    )
+
+
+def _why_unrun(target: dict, unmet: list[str]) -> str:
+    """What to change so this target's tests run in the gate."""
+    package, name, kind = target["package"], target["name"], target["kind"]
+    if unmet:
+        return (
+            f"({package}, {name}) requires {', '.join(f'`{f}`' for f in unmet)}, which the "
+            f"gate's run does not turn on — cargo skips such a target without saying so, so it "
+            f"is selected and never built. Add `--features {package}/{unmet[0]}` to "
+            f"NEXTEST_SELECTION"
+        )
+    if kind in {"lib", "proc-macro"}:
+        return f"({package}, {name}) is a {kind}, so restore `kind(={kind})` to NEXTEST_FILTER"
+    if kind == "bin":
+        return f"add `(package(={package}) & kind(=bin))` to NEXTEST_FILTER"
+    if kind == "test":
+        return f"add `(package(={package}) & binary(={name}))` to NEXTEST_FILTER"
+    return f"({package}, {name}) is a {kind} target, which `make nextest` does not run at all"
 
 
 def guard_reachability(ledger_text: str) -> list[str]:
     """Whether `make nextest` actually runs every guard the ledger names.
 
     A guard is a test that fails when a patch goes missing, so a guard the gate
-    never selects is a comment: the ledger keeps claiming coverage while nothing
-    checks it. `kind(=lib)` sweeps up every unit test, so the exposure is the
-    integration-test targets, which the filterset has to name one at a time.
+    never runs is a comment: the ledger keeps claiming coverage while nothing
+    checks it.
 
-    This matches the filterset's clauses textually rather than evaluating them —
-    it splits the union at `+` and looks in each clause for the `kind(=lib)`,
-    `binary(=…)` or `package(=…) & kind(=bin|test)` forms the Makefile is
-    written in. A clause written some other way reads here as unreachable, which
-    fails loudly and is fixed by naming it the usual way.
+    Two questions have to be asked of each one, and only the pair is sufficient.
+    *Does cargo build it* — which target's module tree reaches the file, and are
+    that target's `required-features` on. *Does the gate run it* — does some
+    clause of the filterset select that target. A guard that fails either is
+    named here.
 
-    Every guard is resolved to its cargo target first, because which clause has
-    to name it depends on the kind. A `src/` guard in a library is swept up by
-    `kind(=lib)`; a `src/` guard in a crate that builds **no** library is not,
-    and runs only because some clause names the binary — the ledger's
-    `tools/substrait-compliance/src/mode_a.rs` guards run solely on
-    `(package(=spice-substrait-compliance) & kind(=bin))`, so treating every
-    `src/` path as covered let that selector be dropped with nothing to notice.
-
-    A path whose owning target cannot be resolved is reported rather than
-    skipped: a `tests/<dir>/` module no `tests/*.rs` declares is not compiled at
-    all, so the ledger claims a guard cargo never builds.
+    The filterset is matched textually rather than evaluated: the union is split
+    at `+` and each clause read whole, looking for the `kind(=lib)`,
+    `binary(=…)` and `package(=…) & kind(=…)` forms the Makefile is written in.
+    A clause written some other way reads here as unreachable, which fails
+    loudly and is fixed by naming it the usual way.
     """
     if not MAKEFILE.is_file():
         return [f"{MAKEFILE.relative_to(REPO)} not found, so the nextest filterset cannot be read"]
@@ -656,71 +615,45 @@ def guard_reachability(ledger_text: str) -> list[str]:
         return ["Makefile no longer defines NEXTEST_FILTER, so nothing pins the gate's selection"]
     selection = filterset.group("filter")
     enabled_features = _gate_features(makefile_text)
+    clauses = _union_clauses(selection)
+
+    named = sorted({match.group("path") for match in GUARD_RE.finditer(ledger_text)})
+    wanted = frozenset((REPO / path).resolve() for path in named if (REPO / path).is_file())
 
     errors = []
-    for path in sorted({match.group("path") for match in GUARD_RE.finditer(ledger_text)}):
-        if not (REPO / path).is_file():
+    for path in named:
+        source = REPO / path
+        if not source.is_file():
+            errors.append(f"docs/dev/fork_patches.md names a guard in {path}, which does not exist")
+            continue
+        targets = _targets_by_file(wanted).get(source.resolve(), [])
+        if not targets:
             errors.append(
-                f"docs/dev/fork_patches.md names a guard in {path}, which does not exist"
+                f"docs/dev/fork_patches.md names {path} as a guard, but no target's module tree "
+                f"reaches it, so cargo compiles it into nothing and it cannot run — declare the "
+                f"module from its parent, or correct the path"
             )
             continue
-        target = _cargo_target(path)
-        if target is None:
-            continue
-        if isinstance(target, str):
-            errors.append(f"docs/dev/fork_patches.md names {path} as a guard, but {target}")
-            continue
-        package, kind, names = target
-        # An allowlisted target is run by a workflow of its own, with its own
-        # feature set, so neither the gate's filterset nor its features have
-        # anything to say about it. That entry is the claim under review, not
-        # this check.
-        if any((package, name) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE for name in names):
-            continue
-        # Being named in the filterset is necessary, not sufficient: an unmet
-        # `required-features` makes cargo skip the target silently, so the guard
-        # does not run however well the filterset selects it.
-        if kind == "test":
-            unmet = _unmet_required_features(path, sorted(names)[0], enabled_features)
-            if unmet:
-                errors.append(
-                    f"docs/dev/fork_patches.md names {path} as a guard, but its target "
-                    f"({package}, {sorted(names)[0]}) requires {', '.join(f'`{f}`' for f in unmet)}, "
-                    f"which the gate's run does not turn on — cargo skips such a target without "
-                    f"saying so, so it is selected and never built. Add "
-                    f"`--features {package}/{unmet[0]}` to NEXTEST_SELECTION, or record "
-                    f"({package}, {sorted(names)[0]}) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with "
-                    f"the runner that does build it"
-                )
-                continue
-        if any(
-            _clause_selects(clause, package, kind, names) for clause in _union_clauses(selection)
-        ):
-            continue
-        # The advice has to name a clause that would really select it, and the
-        # clause differs by kind: a library is only ever reached by `kind(=lib)`;
-        # an integration target is named one at a time, as the Makefile does, so
-        # adding one guard does not drag in the credentialed binaries beside it;
-        # a crate's binaries are taken together, which is how the one bin-only
-        # crate in the ledger is selected today.
-        if kind == "lib":
-            fix = "restore `kind(=lib)` to NEXTEST_FILTER"
-        elif kind == "bin":
-            fix = (
-                f"add `(package(={package}) & kind(=bin))` to NEXTEST_FILTER, or record "
-                f"({package}, {sorted(names)[0]}) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the "
-                f"runner that does run it"
-            )
+        # A guard runs if *any* target that compiles it both builds and is
+        # selected. Several can: a module a library and a binary both declare is
+        # compiled into each.
+        blocked = []
+        for target in targets:
+            if (target["package"], target["name"]) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE:
+                break
+            unmet = _unmet_required_features(target, enabled_features)
+            if not unmet and any(
+                _clause_selects(clause, target["package"], target["kind"], target["name"])
+                for clause in clauses
+            ):
+                break
+            blocked.append(_why_unrun(target, unmet))
         else:
-            fix = (
-                f"add `(package(={package}) & binary({'=' + sorted(names)[0]}))` to "
-                f"NEXTEST_FILTER, or record ({package}, {sorted(names)[0]}) in "
-                f"TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the runner that does run it"
+            errors.append(
+                f"docs/dev/fork_patches.md names {path} as a guard, but `make nextest` does not "
+                f"run it: {'; '.join(blocked)} — or record the target in "
+                f"TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the runner that does"
             )
-        errors.append(
-            f"docs/dev/fork_patches.md names {path} as a guard, but `make nextest` does not "
-            f"select it: {fix}"
-        )
     return errors
 
 
