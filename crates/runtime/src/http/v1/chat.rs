@@ -25,7 +25,7 @@ use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
-    error::{OpenAIError, StreamError},
+    error::{ApiError, OpenAIError, StreamError},
     types::chat::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
@@ -171,14 +171,7 @@ pub(crate) async fn post(
             }
             None => {
                 if evaluate_models.read().await.contains_key(&model_id) {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        llms::chat::Error::EvaluateOnlyModel {
-                            model: model_id.clone(),
-                        }
-                        .to_string(),
-                    )
-                        .into_response()
+                    evaluate_only_chat_response(&model_id)
                 } else {
                     (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response()
                 }
@@ -365,6 +358,21 @@ impl OpenaiErrorEvent {
     }
 }
 
+/// Chat rejection for an evaluate-only model, in the same `OpenAI` JSON envelope
+/// as `/v1/responses`.
+fn evaluate_only_chat_response(model_id: &str) -> Response {
+    let message = llms::chat::Error::EvaluateOnlyModel {
+        model: model_id.to_string(),
+    }
+    .to_string();
+    openai_error_to_response(OpenAIError::ApiError(ApiError {
+        message,
+        r#type: Some("invalid_request_error".to_string()),
+        param: Some("model".to_string()),
+        code: Some("invalid_request_error".to_string()),
+    }))
+}
+
 /// Converts `OpenAI` errors to HTTP responses
 /// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
 #[must_use]
@@ -540,6 +548,69 @@ mod tests {
             vec![
                 "payload".to_string() // From the LLM stream.
             ]
+        );
+    }
+
+    #[derive(Debug)]
+    struct DummyEvaluate;
+
+    #[async_trait::async_trait]
+    impl evaluate_api::Evaluate for DummyEvaluate {
+        async fn evaluate(
+            &self,
+            _request: evaluate_api::EvaluateRequest,
+        ) -> evaluate_api::Result<evaluate_api::EvaluateResponse> {
+            evaluate_api::InvalidRequestSnafu {
+                model: "jev",
+                message: "unused",
+            }
+            .fail()
+        }
+    }
+
+    /// Evaluate-only models return the `OpenAI` JSON error envelope, not plain text.
+    #[tokio::test]
+    async fn evaluate_only_model_returns_openai_json_400() {
+        let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
+        let mut store = EvaluateModelStore::new();
+        store.insert("jev".into(), Arc::new(DummyEvaluate));
+        let evaluate_models = Arc::new(RwLock::new(store));
+
+        let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "jev",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(llms),
+            Extension(evaluate_models),
+            HeaderMap::new(),
+            Json(req_payload),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("OpenAI JSON envelope");
+        assert_eq!(
+            body_json["type"].as_str(),
+            Some("invalid_request_error"),
+            "{body_json}"
+        );
+        assert_eq!(body_json["param"].as_str(), Some("model"), "{body_json}");
+        let message = body_json["message"].as_str().expect("message");
+        assert!(
+            message.contains("/v1/evaluate"),
+            "message should direct callers to /v1/evaluate: {message}"
         );
     }
 }
