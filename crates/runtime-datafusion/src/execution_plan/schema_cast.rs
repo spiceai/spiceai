@@ -19,7 +19,7 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{ColumnStatistics, Constraints, Statistics};
+use datafusion::common::{ColumnStatistics, Constraints, Precision, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -106,6 +106,39 @@ impl SchemaCastScanExec {
         }
     }
 
+    /// For each output column, the input column it is derived from, or `None`
+    /// where no input column carries over unchanged.
+    ///
+    /// A column carries over only when the output schema keeps it unambiguously
+    /// by name and with an unchanged data type. This is deliberately
+    /// conservative: a repeated name is ambiguous (`try_cast_to` may resolve it
+    /// to a different column than the one whose statistics or ordering we would
+    /// attribute), and a retyped column is a cast, which is neither value- nor
+    /// order-preserving. Both statistics projection and equivalence-property
+    /// projection depend on this mapping, so they agree by construction.
+    fn output_to_input_columns(
+        input_schema: &Schema,
+        output_schema: &Schema,
+    ) -> Vec<Option<usize>> {
+        let occurs_once = |schema: &Schema, name: &str| {
+            schema.fields().iter().filter(|f| f.name() == name).count() == 1
+        };
+        output_schema
+            .fields()
+            .iter()
+            .map(|output_field| {
+                let name = output_field.name();
+                if !occurs_once(output_schema, name) || !occurs_once(input_schema, name) {
+                    return None;
+                }
+                input_schema
+                    .column_with_name(name)
+                    .filter(|(_, input_field)| input_field.data_type() == output_field.data_type())
+                    .map(|(input_idx, _)| input_idx)
+            })
+            .collect()
+    }
+
     /// The equivalence properties this exec advertises, derived from its input's.
     ///
     /// This exec casts values in place, so it reports `maintains_input_order` and
@@ -120,50 +153,26 @@ impl SchemaCastScanExec {
     /// secondary ordering all reach that same failure.
     ///
     /// So forward the input's properties wholesale rather than by kind, and put the
-    /// conservatism in the column mapping instead: an input column is mapped only
-    /// when the output schema still has it, by name, with an unchanged data type.
-    /// The output schema may reorder, drop, or retype columns, and a cast is neither
-    /// universally monotonic (`Utf8`→numeric, float NaN handling) nor value
-    /// preserving, so anything referencing a column that fails that test is absent
-    /// from the mapping and [`EquivalenceProperties::project`] drops it.
+    /// conservatism in [`Self::output_to_input_columns`] instead: a property
+    /// referencing a column that does not carry over is absent from the mapping,
+    /// and [`EquivalenceProperties::project`] drops it.
     fn output_equivalence_properties(
         input: &Arc<dyn ExecutionPlan>,
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
     ) -> EquivalenceProperties {
-        // A name that repeats in either schema is ambiguous, and the ambiguity is not
-        // academic: `try_cast_to` re-labels the batch positionally when the schemas
-        // already agree, and matches by first name when it has to build columns. Those
-        // resolve a repeated name to different inputs, so keying the mapping on the
-        // name could advertise one column's properties for another column's values.
-        // Map only unambiguous names.
-        let occurs_once = |schema: &SchemaRef, name: &str| {
-            schema
-                .fields()
-                .iter()
-                .filter(|field| field.name() == name)
-                .count()
-                == 1
-        };
-
         // Grouped by source column: one input column may be produced more than once,
         // and every target of a source has to travel with it.
         let mut sources: Vec<(usize, ProjectionTargets)> = Vec::new();
-        for (output_idx, output_field) in output_schema.fields().iter().enumerate() {
-            if !occurs_once(output_schema, output_field.name())
-                || !occurs_once(input_schema, output_field.name())
-            {
-                continue;
-            }
-            let Some((input_idx, input_field)) = input_schema.column_with_name(output_field.name())
-            else {
-                continue;
-            };
-            if input_field.data_type() != output_field.data_type() {
-                continue;
-            }
-            let target: Arc<dyn PhysicalExpr> =
-                Arc::new(Column::new(output_field.name(), output_idx));
+        for (output_idx, input_idx) in Self::output_to_input_columns(input_schema, output_schema)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(input_idx) = input_idx else { continue };
+            let target: Arc<dyn PhysicalExpr> = Arc::new(Column::new(
+                output_schema.field(output_idx).name(),
+                output_idx,
+            ));
             match sources.iter_mut().find(|(idx, _)| *idx == input_idx) {
                 Some((_, targets)) => targets.push((target, output_idx)),
                 None => sources.push((
@@ -321,59 +330,37 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        // The input's `column_statistics` are indexed by the *input* schema,
-        // but this exec advertises `output_schema`, which may drop, reorder, or
-        // retype columns relative to the input. Caching mode is the case that
-        // drops columns: the accelerator scan carries storage-only columns
-        // (`_fetched_at`, `__spice_cache_namespace`) that this exec strips, so
-        // the input has more columns than this node's schema. Forwarding the
-        // input statistics unchanged would advertise more `column_statistics`
-        // than this node has columns; a `FilterExec` above then indexes those
-        // statistics against this node's schema in
-        // `AnalysisContext::try_from_statistics` and fails with an
-        // out-of-bounds `ExprBoundaries` error (regression test for #14144).
-        //
-        // Project the statistics onto the output schema using the same
-        // conservative mapping as `output_equivalence_properties`: carry an
-        // input column's statistics only when the output schema still has it,
-        // unambiguously by name and with an unchanged data type. A retyped
-        // column is a cast, whose value bounds no longer describe the output
-        // type, so its statistics are dropped to unknown.
+        // The input's statistics are indexed by its own schema, but this exec
+        // advertises `output_schema`, which drops, reorders, or retypes columns
+        // (caching mode strips storage-only columns like `_fetched_at`).
+        // Forwarding them unchanged reports more `column_statistics` than this
+        // node has columns, and a `FilterExec` above then indexes past the end
+        // in `AnalysisContext::try_from_statistics` (#14144). Project onto the
+        // output schema via the same mapping as the equivalence properties;
+        // dropped and retyped columns become unknown.
         let input_stats = self.input.partition_statistics(partition)?;
-        let input_schema = self.input.schema();
+        let column_map = Self::output_to_input_columns(&self.input.schema(), &self.output_schema);
 
-        let occurs_once = |schema: &Schema, name: &str| {
-            schema.fields().iter().filter(|f| f.name() == name).count() == 1
-        };
-
-        let column_statistics = self
-            .output_schema
-            .fields()
-            .iter()
-            .map(|output_field| {
-                if !occurs_once(self.output_schema.as_ref(), output_field.name())
-                    || !occurs_once(input_schema.as_ref(), output_field.name())
-                {
-                    return ColumnStatistics::new_unknown();
-                }
-                match input_schema.column_with_name(output_field.name()) {
-                    Some((input_idx, input_field))
-                        if input_field.data_type() == output_field.data_type() =>
-                    {
-                        input_stats
-                            .column_statistics
-                            .get(input_idx)
-                            .cloned()
-                            .unwrap_or_else(ColumnStatistics::new_unknown)
-                    }
-                    _ => ColumnStatistics::new_unknown(),
-                }
+        let column_statistics: Vec<ColumnStatistics> = column_map
+            .into_iter()
+            .map(|input_idx| {
+                input_idx
+                    .and_then(|idx| input_stats.column_statistics.get(idx).cloned())
+                    .unwrap_or_else(ColumnStatistics::new_unknown)
             })
             .collect();
 
+        // Sum the retained columns' widths rather than keep the input's total,
+        // which still describes the wider child. An unknown column has an absent
+        // `byte_size`, which `Precision::add` propagates, so a dropped or retyped
+        // column leaves the total absent instead of falsely exact.
+        let total_byte_size = column_statistics
+            .iter()
+            .fold(Precision::Exact(0), |acc, col| acc.add(&col.byte_size));
+
         Ok(Arc::new(Statistics {
             num_rows: input_stats.num_rows,
-            total_byte_size: input_stats.total_byte_size,
+            total_byte_size,
             column_statistics,
         }))
     }
@@ -635,10 +622,9 @@ mod tests {
     #[test]
     fn test_partition_statistics_match_output_schema_column_count() {
         // The input carries a storage-only column (`_fetched_at`) that this exec
-        // strips. `partition_statistics` must return exactly one
-        // `ColumnStatistics` per output column, not per input column, so a
-        // consumer that indexes the statistics against this node's schema stays
-        // in bounds. Regression test for #14144.
+        // strips, so the statistics must describe the 2-column output, not the
+        // 3-column input, or a consumer indexing them against this node's schema
+        // goes out of bounds. Regression test for #14144.
         let source = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
         let schema_cast = SchemaCastScanExec::new(source, expected_output_schema());
 
@@ -653,17 +639,59 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_statistics_do_not_keep_input_total_byte_size() {
+        // Dropping a column makes the input's `total_byte_size` describe a wider
+        // row than this node emits. It must not survive as an exact statistic:
+        // derived from the retained columns, it is either their (smaller) sum or
+        // absent, never the input's wider total.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int64Array::from(vec![3])),
+            ],
+        )
+        .expect("record batch");
+        let source =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).expect("source");
+        let input_total = source
+            .partition_statistics(None)
+            .expect("input statistics")
+            .total_byte_size;
+        assert!(
+            matches!(input_total, Precision::Exact(_)),
+            "input reports an exact total to guard against"
+        );
+
+        let schema_cast = SchemaCastScanExec::new(source, output_schema);
+        let total = schema_cast
+            .partition_statistics(None)
+            .expect("partition_statistics should succeed")
+            .total_byte_size;
+        assert_ne!(
+            total, input_total,
+            "total_byte_size must reflect the narrower output, not the input's wider row"
+        );
+    }
+
+    #[test]
     fn test_numeric_filter_above_schema_cast_analyzes_statistics() {
-        // Reproduces #14144: a caching-accelerated dataset fails with an
-        // `ExprBoundaries` out-of-bounds internal error when a query filters on
-        // an integer column. The accelerator scan carries storage-only columns
-        // (`_fetched_at`, `__spice_cache_namespace`) that `SchemaCastScanExec`
-        // strips; a `FilterExec` re-applying a numeric predicate on top runs
-        // `AnalysisContext::try_from_statistics`, which indexes the child's
-        // `column_statistics` against the child's (stripped) schema. If the
-        // statistics still describe the wider input schema, that index runs out
-        // of bounds. Boundary analysis only runs for numeric predicates, which
-        // is why a text-column filter escaped the bug.
+        // Reproduces #14144: a query filtering on an integer column over a
+        // caching-accelerated dataset failed with an `ExprBoundaries` out-of-bounds
+        // internal error. The `FilterExec`'s boundary analysis (numeric predicates
+        // only, which is why a text-column filter escaped the bug) indexes the
+        // child's `column_statistics` against the child's stripped schema, and
+        // stale wider statistics ran that index out of bounds.
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("version", DataType::Int64, true),
