@@ -52,44 +52,16 @@ Verdict and exit code:
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import os
 import sys
-import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
-
-def _http_get_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
-
-
-def _http_post_json(url: str, payload: dict[str, Any], timeout: float = 5.0) -> Any:
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
-
-
-def _http_sql(url: str, sql: str, timeout: float) -> tuple[int, Any]:
-    req = urllib.request.Request(
-        url, data=sql.encode(), headers={"Content-Type": "text/plain"}, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode(errors="replace")
-    except Exception as e:  # noqa: BLE001 - surface any transport error as a sample
-        return 0, f"{type(e).__name__}: {e}"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import multi_key  # noqa: E402
+from harness import arrivals, cli, http, oracle  # noqa: E402
+from harness.timeline import Step, Timeline  # noqa: E402
 
 
 # Per-scenario fault profile POSTed to the origin during the fault window.
@@ -131,55 +103,20 @@ SEND_ERROR_SCENARIOS = {"caching-sie-timeout", "caching-sie-refuse"}
 @dataclass
 class Sample:
     seq: int
+    query_key: str
     t_send_rel_s: float
     phase: str  # warmup | fault | sie_window | recovery
     latency_ms: float
     http_status: int
     rows: int
     version_seen: Optional[int]
+    fetched_at: Optional[str]
     hwm_at_send: Optional[int]
     hwm_after: Optional[int]
     lag_versions: Optional[int]
     freshness: str  # FRESH | STALE | EMPTY | ERROR
     error_kind: str  # none | empty | http_5xx | http_4xx | transport | parse
     fault_id: str
-
-
-class Timeline:
-    """Background thread that steps the origin fault profile on the shared
-    clock and records a driver event per step."""
-
-    def __init__(self, t0: float, control_url: str, steps: list[dict[str, Any]]):
-        self.t0 = t0
-        self.control_url = control_url
-        self.steps = steps
-        self.events: list[dict[str, Any]] = []
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def _run(self) -> None:
-        for step in self.steps:
-            target = self.t0 + step["at_s"]
-            while time.time() < target:
-                time.sleep(min(0.05, max(0.0, target - time.time())))
-            profile = step["profile"]
-            applied_err: Optional[str] = None
-            try:
-                _http_post_json(self.control_url, profile)
-            except Exception as e:  # noqa: BLE001
-                applied_err = f"{type(e).__name__}: {e}"
-            self.events.append(
-                {
-                    "t_rel_s": round(time.time() - self.t0, 4),
-                    "at_s": step["at_s"],
-                    "action": step.get("note", profile.get("id", "")),
-                    "profile_id": profile.get("id", ""),
-                    "mode": profile.get("mode", ""),
-                    "error": applied_err,
-                }
-            )
 
 
 def classify(
@@ -214,10 +151,12 @@ def run(args: argparse.Namespace) -> int:
     fault_profile = SCENARIOS[scenario]
 
     os.makedirs(args.out_dir, exist_ok=True)
-    query = (
+    base_query = (
         f"SELECT version, _fetched_at FROM {args.dataset} "
         f"WHERE origin = '{args.origin_name}'"
     )
+    pick_key = multi_key.make_key_picker(args.seed)
+    query_keys = multi_key.QUERY_KEYS
 
     t0 = args.t0 if args.t0 > 0 else time.time()
 
@@ -230,22 +169,33 @@ def run(args: argparse.Namespace) -> int:
     sie_start = fault_start + args.max_age_s + args.swr_s
 
     steps = [
-        {"at_s": 0.0, "profile": {"id": "healthy", "mode": "healthy", "error_rate": 0.0},
-         "note": "warmup-healthy"},
-        {"at_s": fault_start, "profile": fault_profile, "note": "inject-fault"},
-        {"at_s": fault_end, "profile": {"id": "recovered", "mode": "healthy", "error_rate": 0.0},
-         "note": "recover-healthy"},
+        Step(at_s=0.0, profile={"id": "healthy", "mode": "healthy", "error_rate": 0.0},
+             note="warmup-healthy"),
+        Step(at_s=fault_start, profile=fault_profile, note="inject-fault"),
+        Step(at_s=fault_end, profile={"id": "recovered", "mode": "healthy", "error_rate": 0.0},
+             note="recover-healthy"),
     ]
     timeline = Timeline(t0, args.origin_control_url, steps)
 
     # Make sure the origin starts healthy and the clocks agree.
     try:
-        _http_post_json(args.origin_control_url, steps[0]["profile"])
+        http.post_json(args.origin_control_url, steps[0].profile)
     except Exception as e:  # noqa: BLE001
         print(f"failed to reach origin control API: {e}", file=sys.stderr)
         return 1
 
-    stats0 = _http_get_json(args.origin_stats_url)
+    stats0 = http.get_json(args.origin_stats_url)
+
+    # Prime one cache entry per key while the origin is healthy, so every key
+    # is warm (and its per-key high-water mark exists) before the fault window
+    # freezes each entry independently.
+    for key in query_keys:
+        http.sql(
+            args.spiced_sql_url,
+            multi_key.with_request_query(base_query, key),
+            timeout=args.request_timeout_s,
+        )
+
     timeline.start()
 
     samples: list[Sample] = []
@@ -259,22 +209,27 @@ def run(args: argparse.Namespace) -> int:
         if now - t0 >= run_end:
             break
         seq += 1
+        query_key = pick_key()
 
+        # Per-key high-water mark for the key THIS query uses; a global mark
+        # would mix keys that diverge from initialization jitter.
         try:
-            hwm = _http_get_json(args.origin_stats_url)["hwm_version"]
+            hwm = http.get_json(args.origin_stats_url).get("hwm_by_key", {}).get(query_key)
         except Exception:  # noqa: BLE001
             hwm = None
 
+        query = multi_key.with_request_query(base_query, query_key)
         t_send = time.time()
         t_rel = t_send - t0
-        status, body = _http_sql(args.spiced_sql_url, query, timeout=args.request_timeout_s)
+        status, body = http.sql(args.spiced_sql_url, query, timeout=args.request_timeout_s)
         latency_ms = (time.time() - t_send) * 1000.0
 
         # The origin advances while a blocked fetch is in flight, so the
         # correctness invariant (never serve a version the origin has not
-        # produced) is checked against the high-water mark AFTER the query.
+        # produced) is checked against the per-key high-water mark AFTER the
+        # query.
         try:
-            hwm_after = _http_get_json(args.origin_stats_url)["hwm_version"]
+            hwm_after = http.get_json(args.origin_stats_url).get("hwm_by_key", {}).get(query_key)
         except Exception:  # noqa: BLE001
             hwm_after = None
 
@@ -282,6 +237,9 @@ def run(args: argparse.Namespace) -> int:
             status, body, hwm, args.lag_tol
         )
         lag = (hwm - version_seen) if (hwm is not None and version_seen is not None) else None
+        fetched_at: Optional[str] = None
+        if status == 200 and isinstance(body, list) and body:
+            fetched_at = body[0].get("_fetched_at")
 
         # Track the last fresh version the origin served BEFORE the fault, so
         # the report can show which frozen version SIE then serves.
@@ -304,18 +262,20 @@ def run(args: argparse.Namespace) -> int:
         # The fault id active at send time (from the timeline events).
         fault_id = "healthy"
         for ev in list(timeline.events):
-            if ev["t_rel_s"] <= t_rel:
-                fault_id = ev["profile_id"]
+            if ev.t_rel_s <= t_rel:
+                fault_id = ev.profile_id
 
         samples.append(
             Sample(
                 seq=seq,
+                query_key=query_key,
                 t_send_rel_s=round(t_rel, 3),
                 phase=phase,
                 latency_ms=round(latency_ms, 1),
                 http_status=status,
                 rows=rows,
                 version_seen=version_seen,
+                fetched_at=fetched_at,
                 hwm_at_send=hwm,
                 hwm_after=hwm_after,
                 lag_versions=lag,
@@ -331,46 +291,25 @@ def run(args: argparse.Namespace) -> int:
         if elapsed < args.poll_interval_s:
             time.sleep(args.poll_interval_s - elapsed)
 
-    stats1 = _http_get_json(args.origin_stats_url)
+    stats1 = http.get_json(args.origin_stats_url)
 
     # ---- Persist samples + driver events ----
     samples_path = os.path.join(args.out_dir, "samples.csv")
-    with open(samples_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(asdict(samples[0]).keys()))
-        w.writeheader()
-        for s in samples:
-            w.writerow(asdict(s))
+    oracle.write_samples_csv(samples_path, samples)
 
     events_path = os.path.join(args.out_dir, "driver_events.csv")
-    with open(events_path, "w", newline="") as f:
-        if timeline.events:
-            w = csv.DictWriter(f, fieldnames=list(timeline.events[0].keys()))
-            w.writeheader()
-            for ev in timeline.events:
-                w.writerow(ev)
+    oracle.write_dicts_csv(events_path, [asdict(e) for e in timeline.events])
 
     # ---- Origin request-log evidence over the SIE window ----
+    # Arrivals are keyed on this process's shared clock, so the origin's own
+    # HARNESS_T0 does not have to match.
     fault_status_counts: dict[str, int] = {}
     fetches_in_sie_window = 0
-    if args.origin_request_log and os.path.exists(args.origin_request_log):
-        with open(args.origin_request_log) as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("method") != "GET" or not str(rec.get("path", "")).startswith("/data"):
-                    continue
-                key = str(rec.get("applied_status"))
-                fault_status_counts[key] = fault_status_counts.get(key, 0) + 1
-                # Correlate on the absolute arrival epoch against this
-                # process's shared clock, so the origin's own HARNESS_T0 does
-                # not have to match.
-                recv_ms = rec.get("recv_epoch_ms")
-                if recv_ms is not None:
-                    tr = recv_ms / 1000.0 - t0
-                    if sie_start <= tr <= fault_end:
-                        fetches_in_sie_window += 1
+    for a in arrivals.read_arrivals(args.origin_request_log, t0):
+        key = str(a["applied_status"])
+        fault_status_counts[key] = fault_status_counts.get(key, 0) + 1
+        if sie_start <= a["t_rel_s"] <= fault_end:
+            fetches_in_sie_window += 1
 
     # ---- Oracle ----
     sie_samples = [s for s in samples if s.phase == "sie_window"]
@@ -393,10 +332,8 @@ def run(args: argparse.Namespace) -> int:
         and s.version_seen > s.hwm_after
     ]
 
-    assertions: list[dict[str, Any]] = []
-
-    def add(name: str, passed: bool, detail: str) -> None:
-        assertions.append({"name": name, "pass": bool(passed), "detail": detail})
+    assertions = oracle.AssertionSet()
+    add = assertions.add
 
     add(
         "cache_never_ahead_of_origin",
@@ -477,14 +414,11 @@ def run(args: argparse.Namespace) -> int:
         and n_stale == 0
     )
 
-    if not correctness_ok:
-        verdict, exit_code = "FAIL", 1
-    elif blocked_empty_signature:
-        verdict, exit_code = "BLOCKED", 2
-    elif all(a["pass"] for a in assertions):
-        verdict, exit_code = "PASS", 0
-    else:
-        verdict, exit_code = "FAIL", 1
+    verdict, exit_code = oracle.decide_verdict(
+        correctness_ok=correctness_ok,
+        assertions=assertions,
+        blocked=blocked_empty_signature,
+    )
 
     blocked_reason = None
     if blocked_empty_signature:
@@ -504,7 +438,8 @@ def run(args: argparse.Namespace) -> int:
         "config": {
             "dataset": args.dataset,
             "origin_name": args.origin_name,
-            "query": query,
+            "query_base": base_query,
+            "query_keys": query_keys,
             "max_age_s": args.max_age_s,
             "swr_s": args.swr_s,
             "warmup_s": args.warmup_s,
@@ -525,12 +460,11 @@ def run(args: argparse.Namespace) -> int:
             "origin_fetch_applied_status_counts": fault_status_counts,
             "origin_fetches_in_sie_window": fetches_in_sie_window,
         },
-        "assertions": assertions,
-        "driver_events": timeline.events,
+        "assertions": assertions.as_list(),
+        "driver_events": [asdict(e) for e in timeline.events],
     }
     verdict_path = os.path.join(args.out_dir, "assertions.json")
-    with open(verdict_path, "w") as f:
-        json.dump(verdict_obj, f, indent=2)
+    oracle.write_verdict(verdict_path, verdict_obj)
 
     # ---- Console report ----
     print(f"=== Phase 1 scenario: {scenario} ===")
@@ -544,7 +478,7 @@ def run(args: argparse.Namespace) -> int:
     print()
     print("driver events (shared clock):")
     for ev in timeline.events:
-        print(f"  t+{ev['t_rel_s']:>7.2f}s  {ev['action']:<16} profile={ev['profile_id']} mode={ev['mode']}")
+        print(f"  t+{ev.t_rel_s:>7.2f}s  {ev.action:<16} profile={ev.profile_id} mode={ev.mode}")
     print()
     print("per-response transitions (one line per freshness/version change):")
     print(f"  {'t_rel_s':>8}  {'phase':<10} {'hwm':>5} {'seen':>5} {'lat_ms':>8}  {'http':>4}  band")
@@ -576,31 +510,35 @@ def main() -> int:
     p.add_argument("--scenario", required=True, choices=sorted(SCENARIOS.keys()))
     p.add_argument(
         "--spiced-sql-url",
-        default=os.environ.get("SPICED_SQL_URL", "http://127.0.0.1:8090/v1/sql"),
+        default=cli.env_str("SPICED_SQL_URL", "http://127.0.0.1:8090/v1/sql"),
     )
     p.add_argument(
         "--origin-control-url",
-        default=os.environ.get("ORIGIN_CONTROL_URL", "http://127.0.0.1:9001/control"),
+        default=cli.env_str("ORIGIN_CONTROL_URL", "http://127.0.0.1:9001/control"),
     )
     p.add_argument(
         "--origin-stats-url",
-        default=os.environ.get("ORIGIN_STATS_URL", "http://127.0.0.1:9001/stats"),
+        default=cli.env_str("ORIGIN_STATS_URL", "http://127.0.0.1:9001/stats"),
     )
+    p.add_argument("--origin-request-log", default=cli.env_str("ORIGIN_REQUEST_LOG", ""))
+    p.add_argument("--dataset", default=cli.env_str("DATASET", "d1"))
+    p.add_argument("--origin-name", default=cli.env_str("ORIGIN_NAME", "p1"))
+    p.add_argument("--t0", type=float, default=cli.env_float("HARNESS_T0", 0.0))
+    p.add_argument("--warmup-s", type=float, default=cli.env_float("WARMUP_S", 14.0))
+    p.add_argument("--fault-s", type=float, default=cli.env_float("FAULT_S", 40.0))
+    p.add_argument("--recovery-s", type=float, default=cli.env_float("RECOVERY_S", 16.0))
+    p.add_argument("--max-age-s", type=float, default=cli.env_float("MAX_AGE_S", 3.0))
+    p.add_argument("--swr-s", type=float, default=cli.env_float("SWR_S", 6.0))
+    p.add_argument("--poll-interval-s", type=float, default=cli.env_float("POLL_INTERVAL_S", 2.0))
+    p.add_argument("--request-timeout-s", type=float, default=cli.env_float("REQUEST_TIMEOUT_S", 30.0))
+    p.add_argument("--lag-tol", type=int, default=cli.env_int("LAG_TOL", 9))
+    p.add_argument("--out-dir", default=cli.env_str("OUT_DIR", "/tmp/http_cache_phase1_run"))
     p.add_argument(
-        "--origin-request-log", default=os.environ.get("ORIGIN_REQUEST_LOG", "")
+        "--seed",
+        type=int,
+        default=cli.env_int("SEED", multi_key.DEFAULT_SEED),
+        help="seed for the deterministic request_query key picker",
     )
-    p.add_argument("--dataset", default=os.environ.get("DATASET", "d1"))
-    p.add_argument("--origin-name", default=os.environ.get("ORIGIN_NAME", "p1"))
-    p.add_argument("--t0", type=float, default=float(os.environ.get("HARNESS_T0", "0")))
-    p.add_argument("--warmup-s", type=float, default=float(os.environ.get("WARMUP_S", "14")))
-    p.add_argument("--fault-s", type=float, default=float(os.environ.get("FAULT_S", "40")))
-    p.add_argument("--recovery-s", type=float, default=float(os.environ.get("RECOVERY_S", "16")))
-    p.add_argument("--max-age-s", type=float, default=float(os.environ.get("MAX_AGE_S", "3")))
-    p.add_argument("--swr-s", type=float, default=float(os.environ.get("SWR_S", "6")))
-    p.add_argument("--poll-interval-s", type=float, default=float(os.environ.get("POLL_INTERVAL_S", "2")))
-    p.add_argument("--request-timeout-s", type=float, default=float(os.environ.get("REQUEST_TIMEOUT_S", "30")))
-    p.add_argument("--lag-tol", type=int, default=int(os.environ.get("LAG_TOL", "9")))
-    p.add_argument("--out-dir", default=os.environ.get("OUT_DIR", "/tmp/http_cache_phase1_run"))
     args = p.parse_args()
     return run(args)
 

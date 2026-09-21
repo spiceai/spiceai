@@ -39,7 +39,15 @@ datasets:
       client_timeout: "1"
       connect_timeout: "1"
       allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request /
+      # cache entry, so many keys are exercised per origin.
+      request_query_filters: enabled
     columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
       - name: id
         type: bigint
       - name: version

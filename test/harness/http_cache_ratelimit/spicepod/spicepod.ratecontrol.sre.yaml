@@ -1,0 +1,92 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-ratecontrol-sre
+
+# Phase 2, SRE variant. Identical topology to spicepod.ratecontrol.aimd.yaml
+# (two federated HTTP datasets, one per origin) but the adaptive strategy is
+# Google SRE client-side throttling with hyperparameter K = 2.0 instead of
+# AIMD.
+#
+#   http_adaptive_rate_control: "2.0"  -> SRE throttle, K = 2.0
+#
+# A float value > 1 selects SRE; the admission coefficient is
+#   min(1, (K*accepts + 1) / (requests + 1))
+# over a ~10s exponentially-decaying window of request outcomes. See the
+# adaptive controller for the exact window half-life.
+#
+# The static limit is still required (adaptive control modifies a defined
+# limit); it is the scale the reported effective_limit is expressed on.
+
+runtime:
+  telemetry:
+    enabled: true
+  caching:
+    sql_results:
+      enabled: false
+  params:
+    http_adaptive_rate_control: "2.0"
+    http_requests_per_second_limit: "20"
+    http_max_concurrent_requests: "8"
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request, so
+      # the offered load hits many keys per origin, not a single endpoint.
+      request_query_filters: enabled
+    columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+
+  - from: http://127.0.0.1:9002/data
+    name: d2
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request, so
+      # the offered load hits many keys per origin, not a single endpoint.
+      request_query_filters: enabled
+    columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"

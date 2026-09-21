@@ -1,0 +1,108 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-ratecontrol-aimd
+
+# Phase 2: two origins (p1 :9001, p2 :9002), one federated HTTP dataset each.
+#
+# The datasets are NOT accelerated. Every SQL query issues one HTTP GET to the
+# origin (the connector's response cache stays off because the origin sends no
+# Cache-Control and no `cache_fallback_ttl` is set), so the load generator's
+# offered query rate maps 1:1 to the request rate the per-origin rate
+# controller sees. That is the cleanest signal for the AIMD shape assertions;
+# the caching accelerator's single-flight de-duplication and TTL gate the
+# request rate and would muddy it (that layering is exercised by the caching
+# scenarios and the composition scenario instead).
+#
+# Rate control is a runtime.params concern, applied per origin. A single
+# setting governs the p1 and p2 limiters independently; the harness reads each
+# origin's effect from the `origin`-labelled metrics.
+#
+#   http_adaptive_rate_control: enabled  -> AIMD (additive-increase /
+#                                            multiplicative-decrease)
+#
+# Adaptive control is a MODIFIER on a defined static limit, never a limiter of
+# its own, so a static limit must be set or dataset registration fails with an
+# InvalidConfiguration error. `http_requests_per_second_limit` is both that
+# static limit and the AIMD ceiling the controller recovers back toward.
+
+runtime:
+  telemetry:
+    # Exposes the Prometheus /metrics endpoint the scraper polls.
+    enabled: true
+  caching:
+    # Keep the SQL results cache OFF; the rate controller is the only thing
+    # under test here.
+    sql_results:
+      enabled: false
+  params:
+    http_adaptive_rate_control: enabled
+    # Static limit == AIMD ceiling. Offered QPS is driven above this so the
+    # limiter is always the bottleneck and the ceiling is known for the shape
+    # assertion.
+    http_requests_per_second_limit: "20"
+    http_max_concurrent_requests: "8"
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      # Select the dynamic JSON API provider (a plain GET on the base URL)
+      # rather than the object-store listing connector.
+      allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request, so
+      # the offered load hits many keys per origin, not a single endpoint.
+      request_query_filters: enabled
+    columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+
+  - from: http://127.0.0.1:9002/data
+    name: d2
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request, so
+      # the offered load hits many keys per origin, not a single endpoint.
+      request_query_filters: enabled
+    columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"

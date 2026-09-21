@@ -50,7 +50,7 @@ done
 curl -sf "http://127.0.0.1:$ORIGIN_PORT/healthz" >/dev/null || { echo "origin failed to start"; exit 2; }
 
 echo "[run] starting spiced on :$HTTP_PORT"
-"$SPICED_BIN" ./spicepod/spicepod.caching.yaml \
+"$SPICED_BIN" ./spicepod/spicepod.swr.yaml \
   --http "127.0.0.1:$HTTP_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
   >"$RUN_DIR/spiced.log" 2>&1 &
 pids+=("$!")

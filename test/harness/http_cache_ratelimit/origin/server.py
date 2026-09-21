@@ -24,7 +24,7 @@ Endpoints:
                    the active fault profile.
   POST /control  - set the fault profile (and ``bump_interval``). Applies
                    immediately, no restart.
-  GET  /stats    - aggregate counters plus the current high-water version.
+  GET  /stats    - aggregate counters plus the current high-water version(s).
   GET  /healthz  - liveness probe.
 
 Every request to ``/data`` is appended to a JSONL request log after the
@@ -48,6 +48,11 @@ faulted, except ``refuse``) also carries the ``latency_ms`` slowdown.
 
 The fault draw uses a seeded RNG (``seed`` in the profile) so a run
 replays deterministically.
+
+Multi-key traffic: each distinct raw query string on ``/data`` is an
+independent upstream request / cache key, so each advances its own
+``version`` counter on the same bump cadence (see ``versions`` below). The
+empty-string key is the default (a request that carries no query string).
 
 Payload format is selectable so the harness can confirm empirically which
 shape the Spice HTTP connector schema-infers cleanly:
@@ -82,9 +87,26 @@ REQUEST_LOG_PATH = os.environ.get("ORIGIN_REQUEST_LOG", "origin_requests.jsonl")
 T0 = float(os.environ.get("HARNESS_T0", str(time.time())))
 SEED_VERSION = int(os.environ.get("ORIGIN_SEED_VERSION", "1"))
 
+# Keys a `/control` profile may set. Only these are copied onto the state, so
+# an unexpected field in the request body is ignored rather than stored.
+_CONTROL_KEYS = (
+    "id",
+    "bump_interval",
+    "error_rate",
+    "mode",
+    "error_status",
+    "latency_ms",
+    "timeout_hang_ms",
+    "headers",
+    "seed",
+)
+
 _lock = threading.Lock()
 _state: dict[str, Any] = {
-    "version": SEED_VERSION,
+    # Per query-string key high-water version. Each distinct raw query
+    # string on /data is an independent cache key; the empty key ("") is
+    # the default for a request with no query string.
+    "versions": {"": SEED_VERSION},
     "bump_interval": BUMP_INTERVAL_S,
     # Fault profile (see module docstring).
     "id": "healthy",
@@ -119,18 +141,34 @@ def _t_rel(recv_ms: int) -> float:
     return recv_ms / 1000.0 - T0
 
 
+def _version_for_key_locked(key: str) -> int:
+    """Return the current version for a query-string key, seeding a new key at
+    ``SEED_VERSION`` on first use. Callers must already hold ``_lock``."""
+    versions = _state["versions"]
+    version = versions.get(key)
+    if version is None:
+        version = SEED_VERSION
+        versions[key] = version
+    return version
+
+
 def _bump_loop() -> None:
     """Increase the version on a fixed cadence, independent of requests."""
     while True:
         interval = _state["bump_interval"]
         time.sleep(max(0.05, interval))
         with _lock:
-            _state["version"] += 1
+            # Advance every live query-string key independently on the same
+            # cadence, so each cache key tracks its own version.
+            versions = _state["versions"]
+            for key in versions:
+                versions[key] += 1
 
 
 def _log_request(
     recv_ms: int,
     path: str,
+    query: str,
     method: str,
     version_served: Optional[int],
     applied_status: Any = None,
@@ -144,6 +182,8 @@ def _log_request(
         "origin": ORIGIN_NAME,
         "method": method,
         "path": path,
+        # Raw query string of the request; the per-key cache/version key.
+        "query": query,
         "applied_status": applied_status,
         "applied_delay_ms": applied_delay_ms,
         "fault_profile_id": fault_profile_id,
@@ -177,10 +217,10 @@ def _render_payload(row: dict[str, Any]) -> tuple[str, str]:
     return json.dumps(row) + "\n", "application/x-ndjson"
 
 
-def _profile_headers() -> dict[str, str]:
+def _profile_headers(version: int) -> dict[str, str]:
     """Copy the profile's extra headers as plain strings."""
     hdrs = _state.get("headers") or {}
-    out = {"X-Origin-Version": str(_state["version"])}
+    out = {"X-Origin-Version": str(version)}
     for k, v in hdrs.items():
         out[str(k)] = str(v)
     return out
@@ -238,8 +278,9 @@ async def _serve_data(request: Request, path: str) -> Any:
     response, so the logged ``recv_epoch_ms`` is a true arrival time.
     """
     recv_ms = _now_ms()
+    query = request.url.query
     with _lock:
-        version = _state["version"]
+        version = _version_for_key_locked(query)
         _state["data_requests"] += 1
         _state["total_requests"] += 1
         _state["request_seq"] += 1
@@ -278,6 +319,7 @@ async def _serve_data(request: Request, path: str) -> Any:
     _log_request(
         recv_ms,
         path,
+        query,
         "GET",
         version,
         applied_status=applied_status,
@@ -297,16 +339,18 @@ async def _serve_data(request: Request, path: str) -> Any:
         return PlainTextResponse(
             content="connection refused (fallback 503)",
             status_code=503,
-            headers=_profile_headers(),
+            headers=_profile_headers(version),
         )
 
     if applied_status == "hang":
         await asyncio.sleep(applied_delay_ms / 1000.0)
         # The client (Spice) has almost certainly timed out and dropped the
         # socket by now; respond anyway (harmless if the peer is gone).
-        body, media_type = _render_payload(_current_row(_state["version"], _now_ms()))
+        with _lock:
+            latest_version = _version_for_key_locked(query)
+        body, media_type = _render_payload(_current_row(latest_version, _now_ms()))
         return PlainTextResponse(
-            content=body, media_type=media_type, headers=_profile_headers()
+            content=body, media_type=media_type, headers=_profile_headers(latest_version)
         )
 
     if applied_delay_ms > 0:
@@ -318,12 +362,12 @@ async def _serve_data(request: Request, path: str) -> Any:
         return PlainTextResponse(
             content=f"origin fault: status {applied_status}",
             status_code=int(applied_status),
-            headers=_profile_headers(),
+            headers=_profile_headers(version),
         )
 
     body, media_type = _render_payload(_current_row(version, recv_ms))
     return PlainTextResponse(
-        content=body, media_type=media_type, headers=_profile_headers()
+        content=body, media_type=media_type, headers=_profile_headers(version)
     )
 
 
@@ -342,9 +386,8 @@ async def get_data_json(request: Request) -> Any:
 @app.head("/data.json")
 def head_data_json() -> Any:
     # object_store may HEAD the object before a GET.
-    recv_ms = _now_ms()
     with _lock:
-        version = _state["version"]
+        version = _version_for_key_locked("")
     return PlainTextResponse(
         content="",
         media_type="application/x-ndjson",
@@ -359,33 +402,13 @@ async def post_control(request: Request) -> Any:
     global _rng
     with _lock:
         _state["total_requests"] += 1
-        for key in (
-            "id",
-            "bump_interval",
-            "error_rate",
-            "mode",
-            "error_status",
-            "latency_ms",
-            "timeout_hang_ms",
-            "headers",
-            "seed",
-        ):
+        for key in _CONTROL_KEYS:
             if key in profile:
                 _state[key] = profile[key]
         if "seed" in profile:
             _rng = random.Random(int(profile["seed"]))
-        applied = {
-            "id": _state["id"],
-            "bump_interval": _state["bump_interval"],
-            "error_rate": _state["error_rate"],
-            "mode": _state["mode"],
-            "error_status": _state["error_status"],
-            "latency_ms": _state["latency_ms"],
-            "timeout_hang_ms": _state["timeout_hang_ms"],
-            "headers": _state["headers"],
-            "seed": _state["seed"],
-        }
-    _log_request(recv_ms, "/control", "POST", None, fault_profile_id=applied["id"])
+        applied = {key: _state[key] for key in _CONTROL_KEYS}
+    _log_request(recv_ms, "/control", "", "POST", None, fault_profile_id=applied["id"])
     return JSONResponse({"applied": applied, "server_epoch_ms": recv_ms})
 
 
@@ -395,9 +418,17 @@ def get_stats() -> Any:
     with _lock:
         cutoff = recv_ms - 10_000
         recent = [r for r in _state["recent"] if r >= cutoff]
+        versions = dict(_state["versions"])
         stats = {
             "origin": ORIGIN_NAME,
-            "hwm_version": _state["version"],
+            # Backward-compatible global high-water: the default (empty) key,
+            # for callers that query without a request_query filter.
+            "hwm_version": versions.get("", SEED_VERSION),
+            # Per query-string key high-water map. An oracle compares a
+            # query's observed version against the mark for the key it
+            # actually used, not this global, so keys that diverge do not
+            # raise false alarms.
+            "hwm_by_key": versions,
             "bump_interval": _state["bump_interval"],
             "mode": _state["mode"],
             "fault_profile_id": _state["id"],

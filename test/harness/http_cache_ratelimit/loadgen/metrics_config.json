@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "Harness-relevant Prometheus series, kept in ONE place so a metric rename",
+    "on the rate-control branch is a one-line change here, not a code edit",
+    "(harness plan, open question 7).",
+    "",
+    "The scraper keeps a scraped series when its name STARTS WITH one of the",
+    "base names below. Prefix matching absorbs any suffix the OpenTelemetry ->",
+    "Prometheus exporter appends (e.g. `_total`, a unit suffix such as",
+    "`_milliseconds`), so the base name written here matches whether or not the",
+    "exporter renames it. Verify the exact scraped names and the `origin` label",
+    "value against a live /metrics scrape before trusting a run: run",
+    "`./run_phase2.sh --probe` (or curl the endpoint) and confirm the names and",
+    "the origin label appear as expected. Discovered names are written to",
+    "`discovered_metrics.txt` in every run directory."
+  ],
+  "metrics_endpoint": "http://127.0.0.1:9090/metrics",
+  "origin_label": "origin",
+  "adaptive": {
+    "effective_limit": "dataset_http_adaptive_rate_control_effective_limit",
+    "admission_coefficient_permille": "dataset_http_adaptive_rate_control_admission_coefficient_permille",
+    "throttled_total": "dataset_http_adaptive_rate_control_throttled_total",
+    "throttle_wait_duration_ms": "dataset_http_adaptive_rate_control_throttle_wait_duration_ms"
+  },
+  "cooldown": {
+    "retry_after_updates_total": "dataset_http_rate_limit_retry_after_updates_total",
+    "retry_after_waits_total": "dataset_http_rate_limit_retry_after_waits_total",
+    "retry_after_wait_duration_ms": "dataset_http_rate_limit_retry_after_wait_duration_ms",
+    "retry_after_remaining_ms": "dataset_http_rate_limit_retry_after_remaining_ms"
+  },
+  "static_limiter": {
+    "available_permits": "dataset_http_rate_control_available_permits",
+    "acquisitions_total": "dataset_http_rate_control_acquisitions_total",
+    "acquire_errors_total": "dataset_http_rate_control_acquire_errors_total",
+    "wait_duration_ms": "dataset_http_rate_control_wait_duration_ms",
+    "requests_per_second_limit": "dataset_http_rate_control_requests_per_second_limit",
+    "requests_per_minute_limit": "dataset_http_rate_control_requests_per_minute_limit",
+    "max_concurrent_requests": "dataset_http_rate_control_max_concurrent_requests",
+    "jitter_min_ms": "dataset_http_rate_control_jitter_min_ms",
+    "jitter_max_ms": "dataset_http_rate_control_jitter_max_ms"
+  }
+}
