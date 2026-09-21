@@ -49,6 +49,7 @@ use futures::TryStreamExt;
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
+use std::time::Duration;
 use url::Url;
 #[cfg(not(windows))]
 use {
@@ -731,28 +732,12 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
 }
 
 /// A single comparison against the `_last_modified` metadata column, with the
-/// threshold normalized to nanoseconds since the Unix epoch. An object is kept
-/// when its last-modified time satisfies the comparison.
+/// threshold held as a [`Duration`] since the Unix epoch. An object is kept when
+/// its last-modified time satisfies the comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LastModifiedBound {
     op: datafusion_expr::Operator,
-    threshold_nanos: i128,
-}
-
-/// Reads a timestamp `ScalarValue` as nanoseconds since the Unix epoch.
-///
-/// Every supported precision scales up to nanoseconds by an exact integer
-/// factor, so this matches `DataFusion`'s own integer timestamp comparison
-/// without rounding. `None` for a NULL or non-timestamp literal, which cannot
-/// prune.
-fn scalar_timestamp_nanos(scalar: &ScalarValue) -> Option<i128> {
-    match scalar {
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(i128::from(*v)),
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(i128::from(*v) * 1_000),
-        ScalarValue::TimestampMillisecond(Some(v), _) => Some(i128::from(*v) * 1_000_000),
-        ScalarValue::TimestampSecond(Some(v), _) => Some(i128::from(*v) * 1_000_000_000),
-        _ => None,
-    }
+    threshold: Duration,
 }
 
 /// True when a cast target keeps the `_last_modified` value exactly.
@@ -779,17 +764,11 @@ fn cast_preserves_last_modified_precision(data_type: &DataType) -> bool {
 /// cast literal, so both forms are accepted. A coarsening cast is rejected (see
 /// [`cast_preserves_last_modified_precision`]) so it cannot build a prunable
 /// bound; the residual filter still enforces it.
-fn is_last_modified_ref(expr: &datafusion_expr::Expr) -> bool {
-    use datafusion_expr::Expr;
+fn is_last_modified_ref(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(c) => c.name == "_last_modified",
-        Expr::Cast(cast) => {
-            cast_preserves_last_modified_precision(&cast.data_type)
-                && is_last_modified_ref(&cast.expr)
-        }
-        Expr::TryCast(cast) => {
-            cast_preserves_last_modified_precision(&cast.data_type)
-                && is_last_modified_ref(&cast.expr)
+        Expr::Column(column) => column.name == "_last_modified",
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
+            cast_preserves_last_modified_precision(field.data_type()) && is_last_modified_ref(expr)
         }
         _ => false,
     }
@@ -828,11 +807,28 @@ fn flip(op: Operator) -> Operator {
     }
 }
 
-use datafusion_expr::{Expr, Operator};
+use datafusion_expr::{Between, Cast, Expr, Operator, TryCast};
 
-fn literal_nanos(expr: &Expr) -> Option<i128> {
+/// Reads a timestamp literal as a [`Duration`] since the Unix epoch, using the
+/// constructor for its precision so the value is exact.
+///
+/// Returns `None` for a NULL, a non-timestamp literal, or a pre-epoch (negative)
+/// value that a `Duration` cannot represent — in each case the caller declines
+/// to prune rather than risk dropping matching objects.
+fn literal_duration(expr: &Expr) -> Option<Duration> {
     match expr {
-        Expr::Literal(scalar, _) => scalar_timestamp_nanos(scalar),
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), _), _) => {
+            Some(Duration::from_nanos(u64::try_from(*v).ok()?))
+        }
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), _), _) => {
+            Some(Duration::from_micros(u64::try_from(*v).ok()?))
+        }
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), _), _) => {
+            Some(Duration::from_millis(u64::try_from(*v).ok()?))
+        }
+        Expr::Literal(ScalarValue::TimestampSecond(Some(v), _), _) => {
+            Some(Duration::from_secs(u64::try_from(*v).ok()?))
+        }
         _ => None,
     }
 }
@@ -843,11 +839,11 @@ fn collect_last_modified_bounds(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
         Expr::BinaryExpr(binary) => match binary.op {
             Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq | Operator::Eq => {
                 if is_last_modified_ref(&binary.left) {
-                    return match literal_nanos(&binary.right) {
-                        Some(threshold_nanos) => (
+                    return match literal_duration(&binary.right) {
+                        Some(threshold) => (
                             vec![LastModifiedBound {
                                 op: binary.op,
-                                threshold_nanos,
+                                threshold,
                             }],
                             true,
                         ),
@@ -855,11 +851,11 @@ fn collect_last_modified_bounds(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
                     };
                 }
                 if is_last_modified_ref(&binary.right) {
-                    return match literal_nanos(&binary.left) {
-                        Some(threshold_nanos) => (
+                    return match literal_duration(&binary.left) {
+                        Some(threshold) => (
                             vec![LastModifiedBound {
                                 op: flip(binary.op),
-                                threshold_nanos,
+                                threshold,
                             }],
                             true,
                         ),
@@ -884,21 +880,22 @@ fn collect_last_modified_bounds(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
             }
             _ => (Vec::new(), !references_last_modified(expr)),
         },
-        Expr::Between(between) if is_last_modified_ref(&between.expr) => {
-            match (
-                between.negated,
-                literal_nanos(&between.low),
-                literal_nanos(&between.high),
-            ) {
+        Expr::Between(Between {
+            expr,
+            negated,
+            low,
+            high,
+        }) if is_last_modified_ref(expr) => {
+            match (*negated, literal_duration(low), literal_duration(high)) {
                 (false, Some(low), Some(high)) => (
                     vec![
                         LastModifiedBound {
                             op: Operator::GtEq,
-                            threshold_nanos: low,
+                            threshold: low,
                         },
                         LastModifiedBound {
                             op: Operator::LtEq,
-                            threshold_nanos: high,
+                            threshold: high,
                         },
                     ],
                     true,
@@ -939,17 +936,21 @@ fn extract_last_modified_predicate(
 
 /// True when an object's last-modified time satisfies every bound.
 ///
-/// The materialized `_last_modified` value is `timestamp_micros()`; comparing in
-/// nanoseconds (`micros * 1000`) matches the cast the refresh predicate applies.
+/// The object's mtime is taken as a [`Duration`] since the Unix epoch and
+/// compared against each threshold. Both sides are exact, so the comparison
+/// matches the row predicate. A pre-epoch (negative) mtime cannot be a
+/// `Duration`, so it is never pruned.
 fn last_modified_meta_passes(meta: &ObjectMeta, bounds: &[LastModifiedBound]) -> bool {
-    use datafusion_expr::Operator;
-    let file_nanos = i128::from(meta.last_modified.timestamp_micros()) * 1_000;
+    let Ok(micros) = u64::try_from(meta.last_modified.timestamp_micros()) else {
+        return true;
+    };
+    let file = Duration::from_micros(micros);
     bounds.iter().all(|bound| match bound.op {
-        Operator::Gt => file_nanos > bound.threshold_nanos,
-        Operator::GtEq => file_nanos >= bound.threshold_nanos,
-        Operator::Lt => file_nanos < bound.threshold_nanos,
-        Operator::LtEq => file_nanos <= bound.threshold_nanos,
-        Operator::Eq => file_nanos == bound.threshold_nanos,
+        Operator::Gt => file > bound.threshold,
+        Operator::GtEq => file >= bound.threshold,
+        Operator::Lt => file < bound.threshold,
+        Operator::LtEq => file <= bound.threshold,
+        Operator::Eq => file == bound.threshold,
         // `extract_last_modified_predicate` only produces the operators above.
         _ => true,
     })
@@ -4283,14 +4284,14 @@ mod tests {
         .expect("bare `_last_modified >` is prunable");
         assert_eq!(bare.len(), 1);
         assert_eq!(bare[0].op, Operator::Gt);
-        assert_eq!(bare[0].threshold_nanos, 200_000_000_000);
+        assert_eq!(bare[0].threshold, Duration::from_secs(200));
 
         // Cast form, as the refresh predicate emits it verbatim.
         let cast =
             extract_last_modified_predicate(&[cast_last_modified_to_ns().gt(watermark_ts_ns(200))])
                 .expect("cast-wrapped `_last_modified >` is prunable");
         assert_eq!(cast[0].op, Operator::Gt);
-        assert_eq!(cast[0].threshold_nanos, 200_000_000_000);
+        assert_eq!(cast[0].threshold, Duration::from_secs(200));
 
         // Literal on the left flips the operator.
         let flipped = extract_last_modified_predicate(&[
@@ -4359,14 +4360,14 @@ mod tests {
     }
 
     #[test]
-    fn last_modified_meta_passes_compares_in_nanoseconds() {
+    fn last_modified_meta_passes_compares_as_duration() {
         use datafusion_expr::Operator;
 
         // 200s watermark; an object at 200s does not pass strict `>` but a later
-        // one does. Microsecond mtime is scaled to nanoseconds to match the cast.
+        // one does. The mtime is taken as a Duration since the epoch.
         let bound = LastModifiedBound {
             op: Operator::Gt,
-            threshold_nanos: 200_000_000_000,
+            threshold: Duration::from_secs(200),
         };
         assert!(!last_modified_meta_passes(
             &create_meta("f", 200, 1),
