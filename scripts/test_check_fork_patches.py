@@ -325,8 +325,11 @@ try:
     (_demo / "tests" / "second").mkdir(parents=True, exist_ok=True)
     (_demo / "tests" / "orphan").mkdir(parents=True, exist_ok=True)
     (_demo / "Cargo.toml").write_text('[package]\nname = "demo"\n', encoding="utf-8")
-    (_demo / "src" / "lib.rs").write_text("mod shared;\n", encoding="utf-8")
+    (_demo / "src" / "lib.rs").write_text(
+        'mod shared;\n#[cfg(feature = "extra")]\nmod gated;\n', encoding="utf-8"
+    )
     (_demo / "src" / "shared.rs").write_text("", encoding="utf-8")
+    (_demo / "src" / "gated.rs").write_text("", encoding="utf-8")
     # The default binary declares `guard`; the second binary declares nothing.
     # Each binary has a module tree of its own, which is what stops one being
     # excused because the other is selected.
@@ -359,42 +362,66 @@ try:
     (_gated / "tests" / "needs_extra.rs").write_text("", encoding="utf-8")
     (_gated / "tests" / "needs_baseline.rs").write_text("", encoding="utf-8")
 
-    def _target(package, name, kind, src, *, crate, required=(), defaults=()):
+    def _target(package, name, kind, src, *, crate, required=(), enabled=()):
         return {
             "package": package,
             "name": name,
             "kind": kind,
             "src_path": str(src),
             "required_features": list(required),
-            "default_features": set(defaults),
+            "enabled_features": set(enabled),
             "crate_dir": str(crate),
         }
 
-    # What `cargo metadata` reports for the tree above.
-    TARGETS = [
-        _target("demo", "demo", "lib", _demo / "src" / "lib.rs", crate=_demo),
-        _target("demo", "demo", "bin", _demo / "src" / "main.rs", crate=_demo),
-        _target("demo", "aux", "bin", _demo / "src" / "bin" / "aux.rs", crate=_demo),
-        _target("demo", "integration", "test", _demo / "tests" / "integration.rs", crate=_demo),
-        _target("demo", "standalone", "test", _demo / "tests" / "standalone.rs", crate=_demo),
-        _target("harness", "harness", "bin", _tool / "src" / "main.rs", crate=_tool),
-        _target("gated", "gated", "lib", _gated / "src" / "lib.rs", crate=_gated),
-        _target(
-            "gated", "needs_extra", "test", _gated / "tests" / "needs_extra.rs",
-            crate=_gated, required=["extra"], defaults=["baseline"],
-        ),
-        _target(
-            "gated", "needs_baseline", "test", _gated / "tests" / "needs_baseline.rs",
-            crate=_gated, required=["baseline"], defaults=["baseline"],
-        ),
-    ]
+    # What `cargo metadata` reports for the tree above. `resolved` is the
+    # feature set cargo's resolve turns on per package — the thing the real
+    # script reads out of the metadata rather than guessing at.
+    def targets_for(resolved: dict[str, set[str]]) -> list[dict]:
+        def on(package: str) -> set[str]:
+            return resolved.get(package, set())
+
+        return [
+            _target("demo", "demo", "lib", _demo / "src" / "lib.rs", crate=_demo, enabled=on("demo")),
+            _target("demo", "demo", "bin", _demo / "src" / "main.rs", crate=_demo, enabled=on("demo")),
+            _target(
+                "demo", "aux", "bin", _demo / "src" / "bin" / "aux.rs", crate=_demo, enabled=on("demo")
+            ),
+            _target(
+                "demo", "integration", "test", _demo / "tests" / "integration.rs",
+                crate=_demo, enabled=on("demo"),
+            ),
+            _target(
+                "demo", "standalone", "test", _demo / "tests" / "standalone.rs",
+                crate=_demo, enabled=on("demo"),
+            ),
+            _target("harness", "harness", "bin", _tool / "src" / "main.rs", crate=_tool, enabled=on("harness")),
+            _target("gated", "gated", "lib", _gated / "src" / "lib.rs", crate=_gated, enabled=on("gated")),
+            _target(
+                "gated", "needs_extra", "test", _gated / "tests" / "needs_extra.rs",
+                crate=_gated, required=["extra"], enabled=on("gated"),
+            ),
+            _target(
+                "gated", "needs_baseline", "test", _gated / "tests" / "needs_baseline.rs",
+                crate=_gated, required=["baseline"], enabled=on("gated"),
+            ),
+        ]
 
     def reachability(
-        ledger: str, filterset: str, outside: dict | None = None, features: str = ""
+        ledger: str,
+        filterset: str,
+        outside: dict | None = None,
+        resolved: dict[str, set[str]] | None = None,
     ) -> list[str]:
-        """`guard_reachability` against the temporary tree rather than the repo."""
+        """`guard_reachability` against the temporary tree rather than the repo.
+
+        `resolved` stands in for cargo's own resolve. The gate's `--features`
+        reach the real script only by being handed to `cargo metadata`, so what
+        a case varies here is the resolve, not the Makefile string; the parser
+        that turns one into the other is pinned separately against the live
+        Makefile below.
+        """
         (_reach / "Makefile").write_text(
-            f"NEXTEST_SELECTION := --all{features}\nNEXTEST_FILTER := {filterset}\n",
+            f"NEXTEST_SELECTION := --all\nNEXTEST_FILTER := {filterset}\n",
             encoding="utf-8",
         )
         saved = (
@@ -407,7 +434,7 @@ try:
         cfp.REPO = _reach
         cfp.MAKEFILE = _reach / "Makefile"
         cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = {} if outside is None else outside
-        cfp._WORKSPACE_TARGETS = TARGETS
+        cfp._WORKSPACE_TARGETS = targets_for(resolved or {"gated": {"baseline"}})
         cfp._TARGETS_BY_FILE = None
         try:
             return cfp.guard_reachability(ledger)
@@ -578,6 +605,26 @@ try:
         [],
     )
 
+    # A module behind a `cfg(feature = …)` the build leaves off is not compiled
+    # at all, so naming its target in the filterset buys nothing. That is a
+    # different failure from a file nothing declares, and takes a different fix,
+    # so the two must not share a message.
+    check_contains(
+        "a guard behind a cfg(feature) the build leaves off is reported",
+        reachability("`crates/demo/src/gated.rs::a_guard`", LIB_ONLY),
+        "behind a `cfg(feature = …)` the gate's build leaves off",
+    )
+    check(
+        "…and is clean once the resolve turns that feature on",
+        reachability("`crates/demo/src/gated.rs::a_guard`", LIB_ONLY, resolved={"demo": {"extra"}}),
+        [],
+    )
+    check_contains(
+        "a file nothing declares still says so, not that a feature is off",
+        reachability("`crates/demo/tests/orphan/mod.rs::a_guard`", NAMES_THE_BINARY),
+        "no target's module tree reaches it",
+    )
+
     # Selection is necessary but not sufficient: cargo skips a target whose
     # `required-features` are unmet and says nothing, so a guard there is
     # selected and never built. This has happened in this repo — see the
@@ -589,14 +636,16 @@ try:
         "requires `extra`",
     )
     check(
-        "naming that feature in NEXTEST_SELECTION clears it",
+        "a resolve that turns that feature on clears it",
         reachability(
-            "`crates/gated/tests/needs_extra.rs::a_guard`", GATED, features=" --features gated/extra"
+            "`crates/gated/tests/needs_extra.rs::a_guard`",
+            GATED,
+            resolved={"gated": {"baseline", "extra"}},
         ),
         [],
     )
     check(
-        "a required feature the crate enables by default is satisfied",
+        "a required feature the resolve already turns on is satisfied",
         reachability(
             "`crates/gated/tests/needs_baseline.rs::a_guard`",
             "kind(=lib) + (package(=gated) & binary(=needs_baseline))",

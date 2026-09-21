@@ -352,7 +352,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_module_reachability import (  # noqa: E402
     parse_mods,
     resolve_child,
-    run_cargo_metadata,
     walk_from_root,
 )
 
@@ -383,21 +382,91 @@ def _gate_features(makefile_text: str) -> set[str]:
     return enabled
 
 
-def _default_feature_closure(features: dict[str, list[str]]) -> set[str]:
-    """Every feature of a crate that building it with defaults turns on.
+def _cargo_metadata(features: set[str]) -> dict:
+    """The workspace as cargo resolves it for the gate's own feature selection.
 
-    A `dep/feature` entry enables something in another crate and cannot satisfy
-    a `required-features` entry here, so it is not followed.
+    Resolved rather than `--no-deps`, because the resolve is what answers *is
+    this feature on in this build* — including one an unrelated crate turns on
+    by depending on it. That is the question both the `required-features` check
+    and the `cfg(feature = …)` walk have to ask, and guessing at it from the
+    manifest gets unification wrong in both directions.
     """
-    closure: set[str] = set()
-    stack = list(features.get("default", []))
-    while stack:
-        feature = stack.pop()
-        if "/" in feature or feature in closure:
-            continue
-        closure.add(feature)
-        stack.extend(features.get(feature, []))
-    return closure
+    command = ["cargo", "metadata", "--format-version", "1"]
+    for feature in sorted(features):
+        command += ["--features", feature]
+    try:
+        out = subprocess.run(command, cwd=REPO, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        # Exit 2 (tooling error), never 1 — 1 means an actual ledger problem.
+        print("error: `cargo` not found on PATH, so the workspace cannot be read.", file=sys.stderr)
+        raise SystemExit(2)
+    except subprocess.CalledProcessError as e:
+        print(f"error: `cargo metadata` failed:\n{e.stderr}", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError as e:
+        print(f"error: `cargo metadata` emitted invalid JSON: {e}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+# A `feature = "…"` predicate, which is the only kind this evaluates.
+_FEATURE_PREDICATE_RE = re.compile(r'^feature\s*=\s*"(?P<name>[^"]+)"$')
+
+
+def _split_top_level(text: str) -> list[str]:
+    """`text` split on the commas that sit outside any parentheses."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _is_feature_only(predicate: str) -> bool:
+    """Whether `predicate` is built from nothing but features and `all/any/not`."""
+    residue = re.sub(r'feature\s*=\s*"[^"]*"', "", predicate)
+    residue = re.sub(r"\b(?:all|any|not)\b", "", residue)
+    return not re.sub(r"[(),\s]", "", residue)
+
+
+def _cfg_allows(predicate: str, enabled: set[str]) -> bool:
+    """Whether a `#[cfg(…)]` predicate holds for this build's features.
+
+    Only the feature dimension is decided, and only when the predicate is made
+    of nothing else. A predicate mentioning `target_os`, `unix`, `test` or
+    anything else is treated as satisfiable: the module compiles under some
+    configuration, and a guard that runs on another platform must not be
+    reported as unrun. The bias is deliberate and one-directional — this can
+    fail to report, never invent.
+    """
+    if not predicate.strip() or not _is_feature_only(predicate):
+        return True
+    terms = _split_top_level(predicate)
+    if len(terms) != 1:
+        # Several `cfg` attributes on one declaration all have to hold.
+        return all(_cfg_allows(term, enabled) for term in terms)
+    term = terms[0]
+    named = _FEATURE_PREDICATE_RE.match(term)
+    if named:
+        return named.group("name") in enabled
+    for operator in ("all", "any", "not"):
+        if term.startswith(f"{operator}(") and term.endswith(")"):
+            inner = _split_top_level(term[len(operator) + 1 : -1])
+            if operator == "all":
+                return all(_cfg_allows(item, enabled) for item in inner)
+            if operator == "any":
+                return any(_cfg_allows(item, enabled) for item in inner)
+            return not _cfg_allows(inner[0], enabled) if inner else True
+    return True
 
 
 def _union_clauses(selection: str) -> list[str]:
@@ -444,7 +513,7 @@ _WORKSPACE_TARGETS: list[dict] | None = None
 _TARGETS_BY_FILE: dict[Path, list[dict]] | None = None
 
 
-def _workspace_targets() -> list[dict]:
+def _workspace_targets(gate_features: frozenset[str] = frozenset()) -> list[dict]:
     """Every workspace target, as cargo itself reports it.
 
     Cargo is the authority here rather than the manifest text: it is what
@@ -458,13 +527,16 @@ def _workspace_targets() -> list[dict]:
     global _WORKSPACE_TARGETS
     if _WORKSPACE_TARGETS is not None:
         return _WORKSPACE_TARGETS
-    metadata = run_cargo_metadata()
+    metadata = _cargo_metadata(set(gate_features))
     members = set(metadata.get("workspace_members", []))
+    resolved: dict[str, set[str]] = {}
+    for node in metadata.get("resolve", {}).get("nodes", []):
+        resolved[node.get("id", "")] = set(node.get("features", []))
     targets: list[dict] = []
     for package in metadata.get("packages", []):
         if package.get("id") not in members:
             continue
-        defaults = _default_feature_closure(package.get("features", {}))
+        enabled = resolved.get(package.get("id", ""), set())
         for target in package.get("targets", []):
             kinds = target.get("kind", [])
             if "custom-build" in kinds:
@@ -477,7 +549,7 @@ def _workspace_targets() -> list[dict]:
                     "src_path": target.get("src_path", ""),
                     "crate_dir": str(Path(package["manifest_path"]).parent),
                     "required_features": target.get("required-features") or [],
-                    "default_features": defaults,
+                    "enabled_features": enabled,
                 }
             )
     _WORKSPACE_TARGETS = targets
@@ -491,7 +563,7 @@ def _filterset_kind(kinds: list[str]) -> str:
     return kinds[0] if kinds else "unknown"
 
 
-def _walk_target(root: Path) -> set[Path]:
+def _walk_target(root: Path, enabled: set[str]) -> set[Path]:
     """Every source file the target rooted at `root` compiles.
 
     A *target root* behaves like `mod.rs` whatever it is called: its submodules
@@ -502,18 +574,30 @@ def _walk_target(root: Path) -> set[Path]:
     is `tests/abfs/mod.rs`, not `tests/integration/abfs/mod.rs`. So the root's
     own declarations are resolved against its directory and everything below it
     is handed to the shared walker, which has the ordinary rule right.
+
+    `#[cfg(feature = …)]` is honoured, unlike in the shared walker's own caller:
+    a module the gate's feature resolve switches off is not compiled, so a guard
+    inside one does not run however well the filterset names its target.
     """
+
+    def allows(predicate: str) -> bool:
+        return _cfg_allows(predicate, enabled)
+
     reached: set[Path] = {root.resolve()}
-    for name, _, overrides, inline in parse_mods(root):
+    for name, _, overrides, inline, cfg in parse_mods(root):
+        if cfg and not allows(cfg):
+            continue
         base = root.parent.joinpath(*inline)
         for override in overrides or (None,):
             child = resolve_child(base, name, override)
             if child is not None:
-                walk_from_root(child, reached)
+                walk_from_root(child, reached, cfg_enabled=allows)
     return reached
 
 
-def _targets_by_file(wanted: frozenset[Path]) -> dict[Path, list[dict]]:
+def _targets_by_file(
+    wanted: frozenset[Path], gate_features: frozenset[str]
+) -> dict[Path, list[dict]]:
     """Which targets compile each of `wanted`, by walking the roots that could.
 
     Per target rather than per crate, because each binary has a module tree of
@@ -528,14 +612,14 @@ def _targets_by_file(wanted: frozenset[Path]) -> dict[Path, list[dict]]:
     if _TARGETS_BY_FILE is not None:
         return _TARGETS_BY_FILE
     mapping: dict[Path, list[dict]] = {}
-    for target in _workspace_targets():
+    for target in _workspace_targets(gate_features):
         crate_dir = Path(target["crate_dir"]).resolve()
         if not any(_is_under(source, crate_dir) for source in wanted):
             continue
         root = Path(target["src_path"])
         if not root.is_file():
             continue
-        for source in _walk_target(root):
+        for source in _walk_target(root, target["enabled_features"]):
             mapping.setdefault(source, []).append(target)
     _TARGETS_BY_FILE = mapping
     return mapping
@@ -545,8 +629,34 @@ def _is_under(source: Path, directory: Path) -> bool:
     return source == directory or directory in source.parents
 
 
-def _unmet_required_features(target: dict, enabled: set[str]) -> list[str]:
-    """Required features of `target` that the gate's run does not turn on.
+def _reached_ignoring_features(source: Path, gate_features: frozenset[str]) -> bool:
+    """Whether some target would compile `source` if no `cfg(feature)` applied.
+
+    Only asked about a path already found unreachable, to separate "nothing
+    declares this" from "a feature this build leaves off declares it" — the same
+    file, two different fixes, and one second of walking to tell them apart.
+    """
+    for target in _workspace_targets(gate_features):
+        crate_dir = Path(target["crate_dir"]).resolve()
+        if not _is_under(source.resolve(), crate_dir):
+            continue
+        root = Path(target["src_path"])
+        if not root.is_file():
+            continue
+        reached: set[Path] = {root.resolve()}
+        for name, _, overrides, inline, _cfg in parse_mods(root):
+            base = root.parent.joinpath(*inline)
+            for override in overrides or (None,):
+                child = resolve_child(base, name, override)
+                if child is not None:
+                    walk_from_root(child, reached)
+        if source.resolve() in reached:
+            return True
+    return False
+
+
+def _unmet_required_features(target: dict) -> list[str]:
+    """Required features of `target` that the gate's build does not turn on.
 
     Being named in the filterset is not enough to make a target run: cargo skips
     one whose `required-features` are unmet **without saying so**. That has
@@ -555,17 +665,15 @@ def _unmet_required_features(target: dict, enabled: set[str]) -> list[str]:
     comment above it in the Makefile) — which is the shape this whole check
     exists to catch.
 
-    A feature counts as on when the gate names it as `package/feature` or the
-    crate's own defaults reach it. One arriving through another crate's
-    dependency edge does not: that is unification, which moves when an unrelated
-    crate changes its dependencies, and a guard should not run by that accident.
+    "Turned on" is cargo's resolve for the gate's own selection, so a feature an
+    unrelated crate enables by depending on it counts, because it does in fact
+    build the target. If that dependency edge later goes away the resolve
+    changes and this starts failing, which is the moment it should.
     """
-    package = target["package"]
     return sorted(
         feature
         for feature in target["required_features"]
-        if feature not in target["default_features"]
-        and f"{package}/{feature}" not in enabled
+        if feature not in target["enabled_features"]
     )
 
 
@@ -614,7 +722,7 @@ def guard_reachability(ledger_text: str) -> list[str]:
     if not filterset:
         return ["Makefile no longer defines NEXTEST_FILTER, so nothing pins the gate's selection"]
     selection = filterset.group("filter")
-    enabled_features = _gate_features(makefile_text)
+    enabled_features = frozenset(_gate_features(makefile_text))
     clauses = _union_clauses(selection)
 
     named = sorted({match.group("path") for match in GUARD_RE.finditer(ledger_text)})
@@ -626,13 +734,26 @@ def guard_reachability(ledger_text: str) -> list[str]:
         if not source.is_file():
             errors.append(f"docs/dev/fork_patches.md names a guard in {path}, which does not exist")
             continue
-        targets = _targets_by_file(wanted).get(source.resolve(), [])
+        targets = _targets_by_file(wanted, enabled_features).get(source.resolve(), [])
         if not targets:
-            errors.append(
-                f"docs/dev/fork_patches.md names {path} as a guard, but no target's module tree "
-                f"reaches it, so cargo compiles it into nothing and it cannot run — declare the "
-                f"module from its parent, or correct the path"
-            )
+            # Two different failures look the same from here and take different
+            # fixes: a file nothing declares, and one declared only behind a
+            # feature this build leaves off. Telling them apart costs a second
+            # walk, so it is done only for a path that has already failed.
+            if _reached_ignoring_features(source, enabled_features):
+                errors.append(
+                    f"docs/dev/fork_patches.md names {path} as a guard, but every `mod` "
+                    f"declaration reaching it is behind a `cfg(feature = …)` the gate's build "
+                    f"leaves off, so cargo compiles it into nothing — turn the feature on in "
+                    f"NEXTEST_SELECTION, or record the target in "
+                    f"TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the runner that does build it"
+                )
+            else:
+                errors.append(
+                    f"docs/dev/fork_patches.md names {path} as a guard, but no target's module "
+                    f"tree reaches it, so cargo compiles it into nothing and it cannot run — "
+                    f"declare the module from its parent, or correct the path"
+                )
             continue
         # A guard runs if *any* target that compiles it both builds and is
         # selected. Several can: a module a library and a binary both declare is
@@ -641,7 +762,7 @@ def guard_reachability(ledger_text: str) -> list[str]:
         for target in targets:
             if (target["package"], target["name"]) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE:
                 break
-            unmet = _unmet_required_features(target, enabled_features)
+            unmet = _unmet_required_features(target)
             if not unmet and any(
                 _clause_selects(clause, target["package"], target["kind"], target["name"])
                 for clause in clauses

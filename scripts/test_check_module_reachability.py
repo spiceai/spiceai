@@ -84,44 +84,44 @@ check(
 check(
     "a lifetime does not swallow the rest of the file",
     mods_of("struct S<'a>(&'a str);\nmod real;\n"),
-    [("real", ";", (), ())],
+    [("real", ";", (), (), "")],
 )
 check(
     "a char literal does not swallow the rest of the file",
     mods_of("const C: char = '\\'';\nmod real;\n"),
-    [("real", ";", (), ())],
+    [("real", ";", (), (), "")],
 )
 
 print()
 print("parse_mods")
 
-check("a plain declaration", mods_of("mod alpha;"), [("alpha", ";", (), ())])
-check("a pub declaration", mods_of("pub mod alpha;"), [("alpha", ";", (), ())])
+check("a plain declaration", mods_of("mod alpha;"), [("alpha", ";", (), (), "")])
+check("a pub declaration", mods_of("pub mod alpha;"), [("alpha", ";", (), (), "")])
 check(
     "a pub(crate) declaration",
     mods_of("pub(crate) mod alpha;"),
-    [("alpha", ";", (), ())],
+    [("alpha", ";", (), (), "")],
 )
 check("an inline module declares no file of its own", mods_of("mod alpha { }"), [])
 check(
     "a cfg-gated declaration is still a declaration",
     mods_of('#[cfg(feature = "x")]\nmod alpha;'),
-    [("alpha", ";", (), ())],
+    [("alpha", ";", (), (), 'feature = "x"')],
 )
 check(
     "a path attribute is captured",
     mods_of('#[path = "shared/helper.rs"]\nmod alpha;'),
-    [("alpha", ";", ("shared/helper.rs",), ())],
+    [("alpha", ";", ("shared/helper.rs",), (), "")],
 )
 check(
     "a path attribute does not leak to the next declaration",
     mods_of('#[path = "shared/helper.rs"]\nmod alpha;\nmod beta;'),
-    [("alpha", ";", ("shared/helper.rs",), ()), ("beta", ";", (), ())],
+    [("alpha", ";", ("shared/helper.rs",), (), ""), ("beta", ";", (), (), "")],
 )
 check(
     "a cfg attribute alongside a path attribute",
     mods_of('#[cfg(test)]\n#[path = "t.rs"]\nmod alpha;'),
-    [("alpha", ";", ("t.rs",), ())],
+    [("alpha", ";", ("t.rs",), (), "test")],
 )
 
 # A module routed per platform carries one `cfg_attr` per configuration. `cfg`
@@ -135,7 +135,7 @@ check(
         '#[cfg_attr(windows, path = "windows.rs")]\n'
         "mod platform;"
     ),
-    [("platform", ";", ("unix.rs", "windows.rs"), ())],
+    [("platform", ";", ("unix.rs", "windows.rs"), (), "")],
 )
 check(
     "repeated identical path candidates collapse",
@@ -144,7 +144,7 @@ check(
         '#[cfg_attr(windows, path = "shared.rs")]\n'
         "mod platform;"
     ),
-    [("platform", ";", ("shared.rs",), ())],
+    [("platform", ";", ("shared.rs",), (), "")],
 )
 check(
     "multiple candidates do not leak to the next declaration",
@@ -153,7 +153,7 @@ check(
         '#[cfg_attr(windows, path = "windows.rs")]\n'
         "mod platform;\nmod beta;"
     ),
-    [("platform", ";", ("unix.rs", "windows.rs"), ()), ("beta", ";", (), ())],
+    [("platform", ";", ("unix.rs", "windows.rs"), (), ""), ("beta", ";", (), (), "")],
 )
 
 # Inline nesting decides which directory a declaration resolves against, so the
@@ -162,22 +162,22 @@ check(
 check(
     "a declaration inside an inline module records its parent",
     mods_of("mod alpha { mod beta; }"),
-    [("beta", ";", (), ("alpha",))],
+    [("beta", ";", (), ("alpha",), "")],
 )
 check(
     "the inline stack pops at the closing brace",
     mods_of("mod alpha { mod beta; }\nmod gamma;"),
-    [("beta", ";", (), ("alpha",)), ("gamma", ";", (), ())],
+    [("beta", ";", (), ("alpha",), ""), ("gamma", ";", (), (), "")],
 )
 check(
     "a nested inline module records the whole chain",
     mods_of("mod alpha { mod beta { mod delta; } }"),
-    [("delta", ";", (), ("alpha", "beta"))],
+    [("delta", ";", (), ("alpha", "beta"), "")],
 )
 check(
     "a function body's braces do not disturb the stack",
     mods_of("fn f() { if true { } }\nmod alpha;"),
-    [("alpha", ";", (), ())],
+    [("alpha", ";", (), (), "")],
 )
 
 print()
@@ -283,6 +283,54 @@ with tempfile.TemporaryDirectory() as d:
             "platform/unix/unix_leaf.rs",
             "platform/windows.rs",
         ],
+    )
+
+print("cfg capture and the optional cfg test")
+
+check(
+    "a cfg_attr is not read as a cfg predicate",
+    mods_of('#[cfg_attr(unix, path = "u.rs")]\nmod alpha;'),
+    [("alpha", ";", ("u.rs",), (), "")],
+)
+check(
+    "two cfg attributes on one declaration join as an implicit all()",
+    mods_of('#[cfg(unix)]\n#[cfg(feature = "x")]\nmod alpha;'),
+    [("alpha", ";", (), (), 'unix, feature = "x"')],
+)
+check(
+    "a nested cfg predicate is captured whole",
+    mods_of('#[cfg(all(feature = "a", not(feature = "b")))]\nmod alpha;'),
+    [("alpha", ";", (), (), 'all(feature = "a", not(feature = "b"))')],
+)
+
+with tempfile.TemporaryDirectory() as d:
+    src = Path(d) / "src"
+    src.mkdir()
+    (src / "lib.rs").write_text(
+        'mod plain;\n#[cfg(feature = "off")]\nmod gated;\n', encoding="utf-8"
+    )
+    (src / "plain.rs").write_text("", encoding="utf-8")
+    (src / "gated.rs").write_text("", encoding="utf-8")
+
+    followed: set[Path] = set()
+    walk_from_root(src / "lib.rs", followed)
+    check(
+        "with no cfg test, a gated declaration is still followed",
+        (src / "gated.rs").resolve() in followed,
+        True,
+    )
+
+    filtered: set[Path] = set()
+    walk_from_root(src / "lib.rs", filtered, cfg_enabled=lambda pred: "off" not in pred)
+    check(
+        "a cfg test that rejects the predicate skips that declaration",
+        (src / "gated.rs").resolve() in filtered,
+        False,
+    )
+    check(
+        "…and leaves its ungated sibling alone",
+        (src / "plain.rs").resolve() in filtered,
+        True,
     )
 
 print()
