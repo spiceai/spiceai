@@ -1227,7 +1227,7 @@ struct RawScanInput {
     protected_map: Arc<HashMap<String, i64>>,
     /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
     /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
-    inlined_view: Arc<Vec<InlinedViewEntry>>,
+    inlined_view: Arc<Vec<Arc<InlinedViewEntry>>>,
     /// Current snapshot id captured under the read fence and pinned against GC
     /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
@@ -27013,16 +27013,16 @@ impl CayenneTableProvider {
         (cached.generation == current_gen).then(|| (*cached.batches).clone())
     }
 
-    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         let cached = self.inlined_cache.load();
         (cached.generation == current_gen).then(|| Arc::clone(&cached.view))
     }
 
-    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         // Empty captures share one identity in `ScanViewKey`, just as nonempty
         // captures retain the cached view's identity until its contents change.
-        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<InlinedViewEntry>>> =
+        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<Arc<InlinedViewEntry>>>> =
             std::sync::LazyLock::new(|| Arc::new(Vec::new()));
         if self.cached_inlined_row_count() <= 0 {
             return Some(Arc::clone(&EMPTY_VIEW));
@@ -27067,7 +27067,7 @@ impl CayenneTableProvider {
     /// including the original [`InlinedData`] envelope — enabling the upsert-
     /// rewrite path to reconstruct updated entries without a second metastore
     /// round-trip or IPC re-decode.
-    async fn cached_inlined_view(&self) -> Result<Arc<Vec<InlinedViewEntry>>> {
+    async fn cached_inlined_view(&self) -> Result<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         {
             let cached = self.inlined_cache.load();
@@ -27261,7 +27261,7 @@ impl CayenneTableProvider {
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
 
-        let view: Vec<InlinedViewEntry> = if inlined.is_empty() {
+        let view: Vec<Arc<InlinedViewEntry>> = if inlined.is_empty() {
             Vec::new()
         } else {
             let inlined_deletions = self.load_inlined_deletion_maps().await?;
@@ -27275,7 +27275,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > materialized_through_sequence {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
             view
         };
@@ -27391,13 +27393,18 @@ impl CayenneTableProvider {
         // `base`; re-filtering against just the new removal map removes exactly the
         // rows the newly published tombstones hide (entries with `sequence_number
         // <= delete_sequence` whose PK is in the removal).
-        let mut view: Vec<InlinedViewEntry> = if has_tombstone_delta {
+        let mut view: Vec<Arc<InlinedViewEntry>> = if has_tombstone_delta {
             let mut filtered = Vec::with_capacity(base.view.len());
             for entry in base.view.iter() {
-                filtered.push(self.apply_tombstone_removal_to_entry(entry, &removal_map)?);
+                filtered.push(Arc::new(
+                    self.apply_tombstone_removal_to_entry(entry, &removal_map)?,
+                ));
             }
             filtered
         } else {
+            // Cheap: cloning `Vec<Arc<InlinedViewEntry>>` is one refcount bump
+            // per existing entry, not a deep copy of each entry's decoded
+            // batches — see `InlinedCache::view`'s doc comment.
             (*base.view).clone()
         };
 
@@ -27412,7 +27419,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > new_watermark {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
         }
 
@@ -27448,7 +27457,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry.envelope.clone(),
+            envelope: Arc::clone(&entry.envelope),
             statistics: Arc::clone(&entry.statistics),
         })
     }
@@ -27530,7 +27539,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry,
+            envelope: Arc::new(entry),
             statistics,
         })
     }
@@ -27542,7 +27551,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         materialized_through_sequence: i64,
         tombstone_delta_seq: u64,
-        view: Vec<InlinedViewEntry>,
+        view: Vec<Arc<InlinedViewEntry>>,
     ) -> InlinedCache {
         let batches: Vec<RecordBatch> = view
             .iter()
@@ -28586,7 +28595,7 @@ impl CayenneTableProvider {
 
     fn pruned_inlined_batches(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         mem_tier: &crate::provider::mem_tier::MemTier,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -28608,7 +28617,7 @@ impl CayenneTableProvider {
     /// same removal map the single-tier path built.
     fn pruned_inlined_batches_with_removal(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         removal: Option<&InlinedDeletionMaps>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -28625,7 +28634,9 @@ impl CayenneTableProvider {
             } else if entry.batches.is_empty() {
                 continue;
             } else {
-                entry.clone()
+                // `entry: &Arc<InlinedViewEntry>` here; deref past the Arc so
+                // this stays a plain `InlinedViewEntry` like the other arm.
+                (**entry).clone()
             };
 
             if visible.batches.is_empty() {
@@ -64269,6 +64280,72 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "inline_cache_watermark_delta").await,
             vec![(1, 10), (2, 20), (3, 30)],
             "delta refreshes keep the full visible set gap-free and duplicate-free"
+        );
+    }
+
+    /// The delta extend must SHARE the entries it carries over rather than
+    /// re-materialize them: each already-cached entry owns its decoded
+    /// `RecordBatch`es and its envelope, so a per-entry deep copy turns an
+    /// append into O(corpus) allocations on every scan that observes a write.
+    /// Only pointer identity catches that — a deep-copying rebuild still
+    /// returns exactly the right rows, so no correctness assertion can see it.
+    #[tokio::test]
+    async fn inline_cache_delta_extend_shares_carried_over_entries() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_inline_enabled_upsert_table(
+            "inline_cache_delta_entry_sharing",
+            ctx.runtime_env(),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Warm the cache from the sentinel — this first view is a full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let rebuilt = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        assert_eq!(rebuilt.len(), 1, "precondition: one inline entry is cached");
+
+        // A pure append keeps the structural epoch, so the next read extends the
+        // cached view through the delta path.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        let extended = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache");
+        assert_eq!(extended.len(), 2, "the delta appends exactly the new entry");
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &extended),
+            "precondition: the view was genuinely rebuilt, so entry sharing below \
+             is not trivially true"
+        );
+        assert!(
+            Arc::ptr_eq(&rebuilt[0], &extended[0]),
+            "an entry carried over by the delta extend must be SHARED with the base \
+             view, not deep-copied"
+        );
+
+        // A second delta: an entry first materialized BY a delta must be shared
+        // onward too, not just one that came from the full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[3], &[30])).await;
+        let extended_again = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache again");
+        assert_eq!(extended_again.len(), 3);
+        for (index, carried) in extended.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(carried, &extended_again[index]),
+                "entry {index} must stay shared across successive delta extends"
+            );
+        }
+
+        // Sharing must not cost visibility: every appended row is still returned.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "inline_cache_delta_entry_sharing").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "shared entries must still surface every row exactly once"
         );
     }
 

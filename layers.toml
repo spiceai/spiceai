@@ -285,6 +285,7 @@ runtime-rate-control = "foundation"
 # silently place it in shared-utility.
 runtime-resources = "foundation"
 runtime-status = "foundation"
+sharded-cache = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"
 scheduler = "foundation"
