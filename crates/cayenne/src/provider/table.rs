@@ -3191,10 +3191,11 @@ const FOOTPRINT_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Floor on how often the cheap in-memory gauges are sampled.
 ///
-/// They cost atomic loads and one `try_lock`, so the compaction tick (30 s by
-/// default) never trips this. It bounds the OTHER driver: the post-write
-/// maintenance loop fires on a ~100 ms debounce, and without a floor these would
-/// re-emit ~20 gauges — and re-walk the inline cache — on every write burst, for
+/// All but one cost atomic loads and one `try_lock`, so the compaction tick
+/// (30 s by default) never trips this. It bounds the OTHER driver: the
+/// post-write maintenance loop fires on a ~100 ms debounce, and without a floor
+/// these would re-emit ~20 gauges — and re-walk the inline cache, the one
+/// sample heavy enough to run on the blocking pool — on every write burst, for
 /// values a scrape reads at most once a second.
 const IN_MEMORY_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -9825,7 +9826,7 @@ impl CayenneTableProvider {
             self.sample_pk_index_metrics();
             self.sample_write_shape_metrics();
             self.sample_memory_account_metrics();
-            self.sample_inline_cache_metrics();
+            self.sample_inline_cache_metrics().await;
             self.sample_in_memory_tier_metrics();
             guard.succeeded();
         }
@@ -9920,27 +9921,33 @@ impl CayenneTableProvider {
     ///
     /// An off-pool derived cache: no budget bounds it and nothing registered it
     /// against the query pool, so it was resident memory with no gauge at all.
-    fn sample_inline_cache_metrics(&self) {
-        // One read, so the byte figure and the batch count cannot come from
+    async fn sample_inline_cache_metrics(&self) {
+        // One `Arc`, so the byte figure and the batch count cannot come from
         // either side of a concurrent cache swap and manufacture a per-batch
-        // size that no cache ever held.
-        let (bytes, batches) = Self::inline_cache_footprint(&self.inlined_cache.load());
+        // size that no cache ever held. Cloning it is a refcount bump — which
+        // is what `InlinedCache::batches` is `Arc`'d for — so handing the
+        // corpus to another thread costs nothing.
+        let batches = Arc::clone(&self.inlined_cache.load().batches);
+        let count = u64::try_from(batches.len()).unwrap_or(u64::MAX);
+        // Off the runtime. The walk is O(buffers in the corpus) — 477 µs over a
+        // 57-batch corpus, and the corpus reaches `INLINE_FLUSH_MAX_ROWS` — well
+        // past the ~100 µs an async task may hold a worker before it starves
+        // `/health`, and paid per table on every tick.
+        let Ok(bytes) =
+            tokio::task::spawn_blocking(move || inlined_cache::resident_bytes(&batches)).await
+        else {
+            // The blocking pool is gone (shutdown). Publish nothing rather than
+            // a figure for a cache that was never walked.
+            return;
+        };
         telemetry::cayenne::track_inline_cache(
-            bytes,
-            batches,
+            u64::try_from(bytes).unwrap_or(u64::MAX),
+            count,
             &[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
             )],
         );
-    }
-
-    /// The `(bytes, batches)` pair the inline-cache gauges publish for one view.
-    fn inline_cache_footprint(cache: &InlinedCache) -> (u64, u64) {
-        (
-            u64::try_from(inlined_cache::resident_bytes(&cache.batches)).unwrap_or(u64::MAX),
-            u64::try_from(cache.batches.len()).unwrap_or(u64::MAX),
-        )
     }
 
     /// The figure `cayenne_inline_cache_bytes` publishes for this table: the
@@ -9949,11 +9956,15 @@ impl CayenneTableProvider {
     ///
     /// Public so a test can weigh the published figure against the memory the
     /// process actually gives up to the cache — see
-    /// `crates/cayenne/tests/inline_cache_gauge_test.rs`. Walks buffers rather
-    /// than rows, so it stays cheap on a large inline corpus.
+    /// `crates/cayenne/tests/inline_cache_gauge_test.rs`. Synchronous, and the
+    /// sampler deliberately does not call it: on the runtime this walk belongs
+    /// on the blocking pool (see [`Self::sample_inline_cache_metrics`]).
     #[must_use]
     pub fn inline_cache_resident_bytes(&self) -> u64 {
-        Self::inline_cache_footprint(&self.inlined_cache.load()).0
+        u64::try_from(inlined_cache::resident_bytes(
+            &self.inlined_cache.load().batches,
+        ))
+        .unwrap_or(u64::MAX)
     }
 
     /// Publish the primary-key index gauges, one series per cache.
