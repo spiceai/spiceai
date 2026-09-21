@@ -1912,6 +1912,18 @@ impl CacheRefreshHelper {
             compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
         );
 
+        // Staleness is snapshotted here, before the origin fetch below, not
+        // after: `caching_stale_if_error`'s window is defined (RFC 5861)
+        // relative to when the entry went stale, not to how long this fetch
+        // attempt happens to take. A failing origin can block for its full
+        // retry/timeout budget, and computing `now()` only after that
+        // returns would silently eat that duration out of the configured
+        // window on every attempt.
+        let staleness_before_fetch = expired_batches
+            .as_ref()
+            .filter(|b| !b.is_empty())
+            .and_then(|b| staleness_past_max_age(b, max_age));
+
         match Self::fetch_from_source(&federated, session_state, dataset_name, filters, limit).await
         {
             Ok(batches) if !batches.is_empty() => {
@@ -1941,7 +1953,7 @@ impl CacheRefreshHelper {
                 // to.
                 if !batches_cacheable && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
                 {
-                    let staleness = staleness_past_max_age(&stale, max_age);
+                    let staleness = staleness_before_fetch;
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
                             "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
@@ -2043,7 +2055,7 @@ impl CacheRefreshHelper {
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
                 if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
-                    let staleness = staleness_past_max_age(&batches, max_age);
+                    let staleness = staleness_before_fetch;
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
                             "Origin fetch for dataset '{dataset_name}' failed, so the expired cached response is being served instead because `caching_stale_if_error` allows it. Cause: {e}"
@@ -4406,6 +4418,128 @@ mod tests {
             transient_5xx_outcome(no_column, window, max_age).await,
             "upstream down",
             "a missing fetch-time column cannot prove the entry is inside the window"
+        );
+    }
+
+    /// A source that always fails, after sleeping `delay` first. Stands in for
+    /// a real network timeout/connection failure that takes real time to be
+    /// detected, so a test can prove staleness is measured before that delay,
+    /// not after it.
+    #[derive(Debug)]
+    struct SlowFailingProvider {
+        schema: SchemaRef,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl TableProvider for SlowFailingProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            tokio::time::sleep(self.delay).await;
+            Err(DataFusionError::Execution(
+                "connection refused (test)".to_string(),
+            ))
+        }
+    }
+
+    /// Drive `handle_cache_miss` through the `Err(e)` (transport-failure) arm
+    /// against a source that takes `delay` to fail, and report whether the
+    /// stale entry was served or the error was propagated instead.
+    async fn slow_failure_outcome(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+        delay: Duration,
+    ) -> Result<String, String> {
+        use futures::StreamExt;
+
+        let schema = stale.schema();
+        let failing_source = Arc::new(SlowFailingProvider {
+            schema: Arc::clone(&schema),
+            delay,
+        });
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            failing_source as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,
+            stale_if_error,
+            max_age,
+            Some(vec![stale]),
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        match stream.next().await {
+            Some(Ok(batch)) => Ok(served_content(&batch)),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Err("stream ended with no batches".to_string()),
+        }
+    }
+
+    /// Regression test for staleness being measured before the (possibly
+    /// slow) source-fetch attempt, not after it. An entry whose staleness is
+    /// inside the configured window at the moment the fetch is attempted must
+    /// still be served stale even if the failing fetch itself takes longer
+    /// than the remaining slack in that window -- the fetch's own latency
+    /// must not count against the window.
+    #[tokio::test]
+    async fn a_finite_window_is_measured_before_the_slow_fetch_not_after() {
+        let max_age = Duration::from_millis(100);
+        let window = StaleIfError::For(Duration::from_millis(150));
+        // Staleness at the moment the fetch is attempted: 50ms past the stale
+        // point, comfortably inside the 150ms window.
+        let stale_at_attempt_ms = 50;
+        // The fetch itself takes 200ms to fail. Measured after the fetch,
+        // staleness would appear to be 50ms + 200ms = 250ms, past the 150ms
+        // window -- exactly the bug this test guards against.
+        let fetch_delay = Duration::from_millis(200);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let max_age_nanos = max_age.as_nanos() as i64;
+        let stale_at_attempt_nanos = i64::from(stale_at_attempt_ms) * 1_000_000;
+        let schema = MockHttpTableProvider::with_status(200, "unused").schema();
+        let stale = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - stale_at_attempt_nanos - max_age_nanos),
+        );
+
+        let outcome = slow_failure_outcome(stale, window, max_age, fetch_delay).await;
+        assert_eq!(
+            outcome,
+            Ok("cached response".to_string()),
+            "an entry inside the window when the fetch was attempted must be served \
+             stale, even though the fetch's own {fetch_delay:?} delay would have pushed \
+             a post-fetch staleness measurement past the window"
         );
     }
 
