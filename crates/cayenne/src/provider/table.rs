@@ -38,7 +38,7 @@ use super::delete::{
     DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling,
     Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
-use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
+use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
     OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
     PostWriteMaintenanceState, PublishedLiveRowsDelta, RetentionFailureAction, RetentionPass,
@@ -9920,23 +9920,40 @@ impl CayenneTableProvider {
     ///
     /// An off-pool derived cache: no budget bounds it and nothing registered it
     /// against the query pool, so it was resident memory with no gauge at all.
-    /// `get_array_memory_size` is per batch, not per row, so this is cheap even
-    /// on a large inline corpus.
     fn sample_inline_cache_metrics(&self) {
-        let cache = self.inlined_cache.load();
-        let bytes: usize = cache
-            .batches
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .fold(0, usize::saturating_add);
+        // One read, so the byte figure and the batch count cannot come from
+        // either side of a concurrent cache swap and manufacture a per-batch
+        // size that no cache ever held.
+        let (bytes, batches) = Self::inline_cache_footprint(&self.inlined_cache.load());
         telemetry::cayenne::track_inline_cache(
-            u64::try_from(bytes).unwrap_or(u64::MAX),
-            u64::try_from(cache.batches.len()).unwrap_or(u64::MAX),
+            bytes,
+            batches,
             &[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
             )],
         );
+    }
+
+    /// The `(bytes, batches)` pair the inline-cache gauges publish for one view.
+    fn inline_cache_footprint(cache: &InlinedCache) -> (u64, u64) {
+        (
+            u64::try_from(inlined_cache::resident_bytes(&cache.batches)).unwrap_or(u64::MAX),
+            u64::try_from(cache.batches.len()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// The figure `cayenne_inline_cache_bytes` publishes for this table: the
+    /// decoded inline view cache's resident Arrow bytes, each physical
+    /// allocation counted once.
+    ///
+    /// Public so a test can weigh the published figure against the memory the
+    /// process actually gives up to the cache — see
+    /// `crates/cayenne/tests/inline_cache_gauge_test.rs`. Walks buffers rather
+    /// than rows, so it stays cheap on a large inline corpus.
+    #[must_use]
+    pub fn inline_cache_resident_bytes(&self) -> u64 {
+        Self::inline_cache_footprint(&self.inlined_cache.load()).0
     }
 
     /// Publish the primary-key index gauges, one series per cache.

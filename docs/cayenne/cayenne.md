@@ -1548,7 +1548,7 @@ A resident figure far above `query_memory_pool_used_bytes` has two possible caus
 
 **Off-pool structures.** Nothing registers these against the query pool, so they are invisible in every pool gauge:
 
-- `cayenne_inline_cache_bytes{table}` and `cayenne_inline_cache_batches{table}` — the decoded inline (level-0) view cache. These are *decoded* Arrow bytes, so they legitimately exceed the serialized `cayenne_storage_bytes{tier="inline"}` the same rows occupy in the metastore.
+- `cayenne_inline_cache_bytes{table}` and `cayenne_inline_cache_batches{table}` — the decoded inline (level-0) view cache. These are *decoded* Arrow bytes, so they legitimately exceed the serialized `cayenne_storage_bytes{tier="inline"}` the same rows occupy in the metastore. The byte figure counts each physical Arrow allocation once: the IPC reader decodes a message body into one allocation and points every column and child buffer at a slice of it, so summing each buffer's capacity would bill that allocation once per buffer in the batch.
 - `cayenne_deletion_index_bytes{table}` — the deletion index's own view of its residency, published beside `cayenne_memory_account_bytes{kind="deletion_index"}`, which is the pool-facing figure. A divergence between the two is itself the finding.
 
 **Fleet ceilings.** A table whose index refuses to grow because the *process-global* budget is exhausted looks, in every per-table gauge, exactly like a table that is simply small:
@@ -1557,7 +1557,7 @@ A resident figure far above `query_memory_pool_used_bytes` has two possible caus
 
 Together with `cayenne_pk_index_budget_bytes{table, site}` — the per-table budget the `auto` tier derived, which is what multiplies across tables into a large fleet total — that accounts for the whole PK-keyset hypothesis: how large each table's index is, what it is allowed to reach, whether the fleet is at its ceiling, and which format each table settled on.
 
-All of these are lock-free atomic loads (the inline-cache figure is one `get_array_memory_size` per batch, not per row), so they ride every tick with no throttle.
+All of these are lock-free atomic loads (the inline-cache figure walks buffers, not rows), so they ride every tick with no throttle.
 
 ## The primary-key index
 
