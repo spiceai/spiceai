@@ -450,8 +450,11 @@ impl TableProvider for MetadataPruningListingTable {
         // partition/data-column predicate are always re-enforced) while the
         // prune itself removes the files that cannot match. The `_location`
         // fast-path takes precedence, so this only applies when it is absent.
-        if extract_location_predicates(filters).is_none()
-            && extract_last_modified_predicate(filters).is_some()
+        // `scan` receives `&[Expr]`, so mirror the same predicate detection here
+        // over the borrowed slice this method is given.
+        let owned_filters: Vec<datafusion_expr::Expr> = filters.iter().copied().cloned().collect();
+        if extract_location_predicates(&owned_filters).is_none()
+            && extract_last_modified_predicate(&owned_filters).is_some()
         {
             return Ok(vec![
                 datafusion_expr::TableProviderFilterPushDown::Inexact;
