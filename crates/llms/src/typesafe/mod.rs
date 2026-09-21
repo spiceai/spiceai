@@ -267,15 +267,17 @@ impl TypeSafe {
     }
 }
 
-/// Whether the id names an explicit version (`jev-1.13.0`) rather than an alias.
+/// Whether the id is a `jev-<numeric version>` pin (`jev-1.13.0`) rather than an alias.
 ///
-/// `TypeSafe` accepts versioned pins that `GET /v1/models` need not list, so a pin is
-/// never treated as missing.
+/// `TypeSafe` accepts versioned Jev pins that `GET /v1/models` need not list, so a
+/// pin is never treated as missing. Only the documented `jev-` prefix qualifies —
+/// `foo-1.2.3` is not a Jev pin and must fail health instead of loading Ready.
 fn is_version_pinned(model_id: &str) -> bool {
-    model_id.rsplit_once('-').is_some_and(|(_, tail)| {
-        tail.split('.')
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-            && tail.contains('.')
+    model_id.strip_prefix("jev-").is_some_and(|version| {
+        version.contains('.')
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
     })
 }
 
@@ -533,6 +535,18 @@ mod tests {
         assert_eq!(normalize_model_id(Some("jev-latest")), "jev-latest");
         assert_eq!(normalize_model_id(Some("jev-1.13.0")), "jev-1.13.0");
         assert_eq!(normalize_model_id(Some("jev-preview")), "jev-preview");
+    }
+
+    #[test]
+    fn version_pin_is_only_jev_plus_numeric_version() {
+        assert!(is_version_pinned("jev-1.13.0"));
+        assert!(is_version_pinned("jev-1.2"));
+        assert!(!is_version_pinned("jev-latest"));
+        assert!(!is_version_pinned("jev-preview"));
+        assert!(!is_version_pinned("jev"));
+        assert!(!is_version_pinned("not-jev-1.2"));
+        assert!(!is_version_pinned("jev-does-not-exist-1.13.0"));
+        assert!(!is_version_pinned("garbage-9.9.9.9"));
     }
 
     #[tokio::test]
