@@ -705,7 +705,14 @@ impl TableChangeClock {
             state.changed_at.clear();
         }
 
-        state.changed_at.insert(key, at);
+        // Callers sample `at` before this lock. An earlier invalidation can
+        // therefore land last and must not rewind a newer mark — that would
+        // let a read started between the two stamps pass `changed_since`.
+        state
+            .changed_at
+            .entry(key)
+            .and_modify(|recorded| *recorded = (*recorded).max(at))
+            .or_insert(at);
     }
 
     /// Returns the newest instant at which any of `tables` changed, or
@@ -1474,6 +1481,29 @@ mod tests {
                     .unwrap_or(base)
             )
         );
+    }
+
+    /// Both invalidation callers sample `Instant::now()` before the clock
+    /// lock, so an earlier stamp can be written after a later one. The clock
+    /// must keep the newest mark: a read started between those instants has
+    /// to see the later invalidation.
+    #[test]
+    fn table_invalidation_clock_keeps_the_newest_mark() {
+        let clock = TableChangeClock::default();
+        let base = std::time::Instant::now();
+        let earlier = base + std::time::Duration::from_millis(10);
+        let between = base + std::time::Duration::from_millis(15);
+        let later = base + std::time::Duration::from_millis(20);
+        let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+
+        clock.record_change(&TableReference::bare("customer"), later);
+        clock.record_change(&TableReference::bare("customer"), earlier);
+
+        assert!(
+            clock.changed_since(&tables, between),
+            "a later-arriving earlier stamp must not hide an invalidation a read already missed"
+        );
+        assert_eq!(clock.latest_change(&tables), Some(later));
     }
 
     /// The clock must key tables the same way [`resolved_table_match`] compares
