@@ -28,9 +28,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
+use cache::QueryResultsCacheProvider;
 use cache::encoding::{Encoder, ZstdEncoder};
 use cache::get_hash_builder;
-use cache::QueryResultsCacheProvider;
 use cache::key::{CacheKey, RawCacheKey};
 use cache::result::CacheStatus;
 use cache::result::query::{
