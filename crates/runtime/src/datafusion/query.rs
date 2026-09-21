@@ -2345,7 +2345,7 @@ where
     );
     if let Some(schema) = schema {
         query_result.map_cached_raw(|stream| {
-            attach_query_tracker_to_cached_raw(span, request_context, tracker, stream, schema)
+            attach_query_tracker_to_cached_raw(span, request_context, tracker, stream, &schema)
         })
     } else {
         query_result
@@ -2510,13 +2510,13 @@ fn attach_query_tracker_to_cached_raw(
     request_context: Arc<RequestContext>,
     tracker: Option<QueryTracker>,
     mut stream: SendableCachedRawStream,
-    schema: arrow::datatypes::SchemaRef,
+    schema: &arrow::datatypes::SchemaRef,
 ) -> SendableCachedRawStream {
     let Some(tracker) = tracker else {
         return stream;
     };
 
-    let schema_copy = Arc::clone(&schema);
+    let schema_copy = Arc::clone(schema);
     let mut num_records = 0u64;
     let mut num_output_bytes = 0u64;
     let capture_task_history = tracker.task_history_enabled && tracker.captured_output_enabled;
