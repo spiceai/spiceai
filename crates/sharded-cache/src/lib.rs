@@ -526,6 +526,22 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.protected_weight.load(Ordering::Relaxed)
     }
 
+    /// Test helper: move `key`'s TTL origin `by` further into the past.
+    ///
+    /// A TTL test asserts a two-sided property — this entry has expired *and*
+    /// that one has not — and a sleep only ever buys the margin between the
+    /// two. Aging an entry directly makes that margin exact, so the assertion
+    /// does not depend on how loaded the machine running it is. Returns
+    /// `false` if nothing was aged; callers assert on it.
+    #[cfg(test)]
+    #[must_use]
+    fn rewind_ttl_for_test(&self, key: u64, by: Duration) -> bool {
+        self.shards[shard_index(key)]
+            .0
+            .lock()
+            .rewind_inserted_at(key, by)
+    }
+
     /// Expire stale entries, apply buffered promotes, and evict down to `max_weight`.
     ///
     /// Drains every shard's touch buffer so region relinks deferred from
@@ -1631,10 +1647,13 @@ mod tests {
 
     #[test]
     fn ttl_expires_on_get() {
-        let cache = cache(1024, Duration::from_millis(30));
+        let cache = cache(1024, Duration::from_mins(1));
         cache.insert(1, TestValue::new("ephemeral"), 9);
         assert!(cache.get(&1).is_some());
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cache.rewind_ttl_for_test(1, Duration::from_mins(2)),
+            "the entry must be present to be aged past its deadline"
+        );
         assert!(cache.get(&1).is_none());
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.weighted_size(), 0);
@@ -2078,7 +2097,7 @@ mod tests {
 
     #[test]
     fn failed_size_claim_does_not_renew_ttl_or_recency() {
-        let cache = Arc::new(cache(100, Duration::from_millis(200)));
+        let cache = Arc::new(cache(100, Duration::from_mins(1)));
         cache.insert(0, TestValue::with_size("old", 40), 40);
         cache.insert(16, TestValue::with_size("newer", 20), 20);
         assert_eq!(
@@ -2091,7 +2110,13 @@ mod tests {
         cache.set_before_claim_size(move || {
             cache_for_hook.remove(&1);
         });
-        std::thread::sleep(Duration::from_millis(80));
+        // Put the victim halfway to its deadline, so the claim below happens
+        // while it is comfortably live and the assertions either side of the
+        // deadline are seconds clear of it rather than milliseconds.
+        assert!(
+            cache.rewind_ttl_for_test(0, Duration::from_secs(30)),
+            "the victim must be present and aged before the claim"
+        );
         cache.insert(1, TestValue::with_size("overflow", 60), 60);
 
         assert_eq!(
@@ -2103,7 +2128,13 @@ mod tests {
             cache.get(&0).is_some(),
             "the victim must still be present immediately after the failed claim"
         );
-        std::thread::sleep(Duration::from_millis(150));
+        // Carry the victim past its original deadline. Had the failed claim
+        // reset its origin to the time of the claim, it would still be 31s
+        // short of expiring here and the assertion below would find it.
+        assert!(
+            cache.rewind_ttl_for_test(0, Duration::from_secs(31)),
+            "the victim must still be present to be aged a second time"
+        );
         assert!(
             cache.get(&0).is_none(),
             "a failed size claim must not reset the victim's TTL origin"
@@ -2158,7 +2189,7 @@ mod tests {
     #[test]
     fn tinylfu_reclaims_an_expired_cross_shard_tail_before_a_live_victim() {
         let cache: ShardedCache<TestValue> =
-            ShardedCache::new(100, Duration::from_millis(100), EvictionPolicy::TinyLfu);
+            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::TinyLfu);
         let expired = 0u64;
         let live = 1u64;
         let candidate = 2u64;
@@ -2166,9 +2197,13 @@ mod tests {
         for _ in 0..64 {
             assert!(cache.get(&expired).is_some());
         }
-        std::thread::sleep(Duration::from_millis(70));
         cache.insert(live, TestValue::with_size("live", 50), 50);
-        std::thread::sleep(Duration::from_millis(50));
+        // Age the hot key past the TTL and nothing else: the budget it holds
+        // is reclaimable, and the frequency it just built up must not save it.
+        assert!(
+            cache.rewind_ttl_for_test(expired, Duration::from_mins(2)),
+            "the tail under test must be present and aged before the admission"
+        );
         cache.insert(candidate, TestValue::with_size("new", 10), 10);
 
         assert!(
@@ -2359,14 +2394,17 @@ mod tests {
     #[test]
     fn tinylfu_expires_a_hot_same_shard_resident_before_admission() {
         let cache: ShardedCache<TestValue> =
-            ShardedCache::new(100, Duration::from_millis(30), EvictionPolicy::TinyLfu);
+            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::TinyLfu);
         let old = 16u64;
         let new = 32u64;
         cache.insert(old, TestValue::with_size("old", 100), 100);
         for _ in 0..64 {
             assert!(cache.get(&old).is_some());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cache.rewind_ttl_for_test(old, Duration::from_mins(2)),
+            "the resident must be present and aged before the admission"
+        );
         cache.insert(new, TestValue::with_size("new", 100), 100);
         assert!(
             cache.get(&new).is_some(),
@@ -2377,7 +2415,7 @@ mod tests {
     #[test]
     fn run_pending_tasks_syncs_window_and_protected_weights_on_expire() {
         let cache: ShardedCache<TestValue> =
-            ShardedCache::new(10_000, Duration::from_millis(30), EvictionPolicy::TinyLfu);
+            ShardedCache::new(10_000, Duration::from_mins(1), EvictionPolicy::TinyLfu);
         // One-byte window resident (key 0 → shard 0).
         cache.insert(0, TestValue::with_size("w", 1), 1);
         assert_eq!(cache.weighted_size(), 1);
@@ -2386,7 +2424,10 @@ mod tests {
             1,
             "fresh TinyLFU insert must land in the window segment"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cache.rewind_ttl_for_test(0, Duration::from_mins(2)),
+            "the resident must be present to be aged past its deadline"
+        );
         cache.run_pending_tasks();
         assert_eq!(cache.weighted_size(), 0);
         assert_eq!(

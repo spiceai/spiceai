@@ -329,6 +329,26 @@ impl<V> Shard<V> {
 }
 
 impl<V: Clone> Shard<V> {
+    /// Test helper: move an entry's TTL origin `by` further into the past.
+    ///
+    /// Returns `false` when `key` is absent, or when the monotonic clock's
+    /// origin is itself less than `by` old, so a caller asserts on the rewind
+    /// rather than going on to test an entry that was never aged.
+    #[cfg(test)]
+    pub(crate) fn rewind_inserted_at(&mut self, key: u64, by: Duration) -> bool {
+        let Some(&idx) = self.map.get(&key) else {
+            return false;
+        };
+        let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) else {
+            return false;
+        };
+        let Some(earlier) = node.inserted_at.checked_sub(by) else {
+            return false;
+        };
+        node.inserted_at = earlier;
+        true
+    }
+
     /// Short-lock hit path: look up, bump freq, `Arc::clone` the value handle.
     /// Does **not** relink LRU/LFU/W-TinyLFU lists — callers enqueue a touch and
     /// apply promotions via [`Self::apply_touch`] off the get latency path.
