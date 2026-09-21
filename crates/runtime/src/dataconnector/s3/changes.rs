@@ -139,9 +139,9 @@ pub enum Error {
     UnstructuredTextUnsupported { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `s3_changes_queue_url` value '{url}' is not an SQS queue URL. Use a URL like https://sqs.<region>.amazonaws.com/<account>/<queue>. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_queue_url` is not an SQS queue URL. Use a URL like https://sqs.<region>.amazonaws.com/<account>/<queue>. See: {S3_DOCS}"
     ))]
-    QueueUrlNotHttp { dataset_name: String, url: String },
+    QueueUrlNotHttp { dataset_name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -634,11 +634,7 @@ impl S3ChangesConfig {
                     return QueueUrlIsArnSnafu { dataset_name }.fail();
                 }
                 if !(url.starts_with("https://") || url.starts_with("http://")) {
-                    return QueueUrlNotHttpSnafu {
-                        dataset_name,
-                        url: url.to_string(),
-                    }
-                    .fail();
+                    return QueueUrlNotHttpSnafu { dataset_name }.fail();
                 }
                 if params.get("auth").expose().ok() == Some("public") {
                     return PublicAuthCannotConsumeSqsSnafu { dataset_name }.fail();
@@ -2240,6 +2236,29 @@ mod tests {
         assert!(
             message.contains("not an SQS queue URL"),
             "must reject non-URL queue values, got: {message}"
+        );
+        assert!(
+            !message.contains("not-a-url"),
+            "`s3_changes_queue_url` is secret; the error must not interpolate the value, got: {message}"
+        );
+    }
+
+    #[test]
+    fn queue_url_not_http_error_does_not_include_the_secret_value() {
+        let error = Error::QueueUrlNotHttp {
+            dataset_name: "events".into(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("s3_changes_queue_url") && message.contains("not an SQS queue URL"),
+            "must name the param and the problem, got: {message}"
+        );
+        assert!(
+            !message.contains("TOP-SECRET")
+                && !message.contains("123456789012")
+                && !message.contains("private-events")
+                && !message.contains("sqs://"),
+            "must not interpolate the configured queue value, got: {message}"
         );
     }
 
