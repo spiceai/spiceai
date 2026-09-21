@@ -246,6 +246,19 @@ impl TypeSafe {
                         domain.iter().map(String::as_str),
                     )
                     .map_err(bad)?;
+                    // `TypeSafe` defines `score` as the probability-weighted average of
+                    // the rubric indices. A value that contradicts the distribution is
+                    // a wrong result, not a successful evaluation.
+                    let weighted: f64 = probabilities
+                        .iter()
+                        .map(|(key, p)| key.parse::<f64>().unwrap_or(f64::NAN) * p)
+                        .sum();
+                    if !weighted.is_finite() || (score - weighted).abs() > PROBABILITY_SUM_TOLERANCE
+                    {
+                        return Err(bad(format!(
+                            "question '{id}': score {score} is not the probability-weighted average ({weighted})"
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -274,8 +287,12 @@ fn is_probability(value: f64) -> bool {
 /// Confidence and every probability in the distribution must be a probability.
 /// The distribution must cover exactly the question's domain — no missing keys,
 /// no extras.
-/// Floating-point slack allowed when checking that a distribution sums to 1.
-const PROBABILITY_SUM_TOLERANCE: f64 = 1e-6;
+///
+/// `TypeSafe` documents probabilities as summing to approximately 1. Responses
+/// are commonly rounded to two decimal places (`0.33 + 0.33 + 0.33 = 0.99`).
+/// The slack is slightly above 0.01 so that exact 0.01 shortfall is accepted
+/// despite floating-point representation of `1.0 - 0.99`.
+const PROBABILITY_SUM_TOLERANCE: f64 = 0.011;
 
 fn check_distribution<'a>(
     id: &str,
@@ -930,7 +947,7 @@ mod tests {
         systemone_returning(
             &server,
             json!({"model": "jev-latest", "answers": {"q": {
-                "type": "score", "score": 3,
+                "type": "score", "score": 2.4,
                 "legend": {"0": "routine", "3": "critical"},
                 "probabilities": {"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.7},
                 "confidence": 0.9
@@ -1219,6 +1236,78 @@ mod tests {
             })
             .await
             .expect("a tied maximum is still a valid choice");
+    }
+
+    /// A score that is not the probability-weighted rubric average is a wrong result.
+    #[tokio::test]
+    async fn evaluate_rejects_a_score_that_is_not_the_weighted_average() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 0.0,
+                "legend": {"0": "low", "1": "high"},
+                "probabilities": {"0": 0.0, "1": 1.0},
+                "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: score_question("q", 2),
+            })
+            .await
+            .expect_err("a contradictory score must not be published");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not the probability-weighted average"),
+            "{msg}"
+        );
+    }
+
+    /// Rounded probabilities that sum to approximately 1 remain a valid distribution.
+    #[tokio::test]
+    async fn evaluate_accepts_rounded_probabilities_that_sum_to_approximately_one() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "billing",
+                "probabilities": {"billing": 0.33, "technical": 0.33, "sales": 0.33},
+                "confidence": 0.4
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let questions = BTreeMap::from([(
+            "q".to_string(),
+            Question::Choice {
+                instructions: "which team?".into(),
+                criteria: BTreeMap::from([
+                    ("billing".to_string(), EntryType::String("pay".into())),
+                    ("technical".to_string(), EntryType::String("bugs".into())),
+                    ("sales".to_string(), EntryType::String("sales".into())),
+                ]),
+            },
+        )]);
+
+        client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions,
+            })
+            .await
+            .expect("a two-decimal rounded distribution is still valid");
     }
 
     #[tokio::test]
