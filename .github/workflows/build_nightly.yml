@@ -237,6 +237,11 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
+    # The standard pool, not `spiceai-macos-large`: this build blocks nothing,
+    # so its own latency is free, and it starts at 09:13 UTC when the pool is
+    # near-idle. Its tail is the cost -- the slowest recent run took 235 minutes
+    # and finished at 13:10 UTC -- which is paid by whatever shares its Mac mini
+    # by then, not by the nightly.
     runs-on: spiceai-macos
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
@@ -273,7 +278,17 @@ jobs:
             echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
             exit 1
           fi
-          brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          # The spiceai-macos flock wrapper is `/opt/spice/bin/brew`, so
+          # dirname/dirname of `command -v brew` is `/opt/spice` and every
+          # keg looks missing. Prefer the well-known prefixes; do not invoke
+          # brew (that takes the lock this probe exists to avoid).
+          if [ -x /opt/homebrew/bin/brew ]; then
+            brew_prefix=/opt/homebrew
+          elif [ -x /usr/local/bin/brew ]; then
+            brew_prefix=/usr/local
+          else
+            brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          fi
           missing=()
           # cmake is invoked by bare name from build scripts, so being in the Cellar is
           # not enough — the name has to resolve to *this* Homebrew. Matching the prefix
@@ -416,7 +431,7 @@ jobs:
           sudo chown $USER /var/run/docker.sock
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so the ubuntu base image
@@ -428,7 +443,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build ARM64 Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.local
@@ -467,7 +482,7 @@ jobs:
           ./.spiced-local-tmp --version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so the ubuntu base image
@@ -479,7 +494,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build AMD64 Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.local
@@ -520,7 +535,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated

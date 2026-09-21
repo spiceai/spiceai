@@ -15,21 +15,29 @@ name: Verus Verification
 # hit. Prefix-unambiguity of `[tag][id.len() LE][id]` is a Verus postcondition
 # discharged for every `(tag, id, payload)` triple.
 #
-# That is also why this runs on `merge_group` and not only on the pull request.
-# A proof is a claim about the tree it was checked against; two individually
-# green changes can combine into one the verifier would reject, and no other
-# check in the queue would notice.
+# That is also why the verifier runs in the merge queue rather than on the pull
+# request. A proof is a claim about the tree it was checked against; two
+# individually green changes can combine into one the verifier would reject, and
+# no other check in the queue would notice.
 #
-# One job, one required context (`Verify Verus proofs` in REQUIRED_CHECKS).
-# A second job per crate would be a second required check; do not add one.
-# `Verify hash-index proofs` at the end of this file is not a second check: it
-# repeats this job's verdict under the name the live `trunk` ruleset requires
-# until `scripts/signoff install --yes` applies REQUIRED_CHECKS.
-# The job carries NO `paths` filter, deliberately: a required context has to
-# be emitted by every pull request — a workflow that never triggers reports
-# nothing at all, which blocks the PR rather than passing it. So the job
-# always runs and always reports; the change filter below skips only the
-# verification work when nothing it covers was touched. See docs/dev/ci_signoff.md.
+# One job, one required context: `Verify Verus proofs` is required on `trunk`,
+# and it is the whole gate for every crate that carries proofs. A second job per
+# crate would be a second required check, and a crate-specific name would have to
+# be renamed in the ruleset the day a third crate opts in; do not add either.
+#
+# Where it runs: `merge_group`, `trunk` and the release branches, and dispatch —
+# never on a pull request, which is gated by developer sign-off instead
+# (docs/dev/ci_signoff.md). The `pull_request` trigger below is still required.
+# GitHub reads one required-checks list both before queue entry and on the queue
+# commit, so a context that no pull-request run reports blocks the PR rather
+# than passing it. The job's `if` skips it on a pull request, which reports
+# `Verify Verus proofs` as skipped and satisfies the required check without
+# running the verifier — the same arrangement `Rust Lint`, `Build and Test`, and
+# `Build (release profile)` use in pr.yml.
+#
+# The workflow carries NO `paths` filter for that same reason: a workflow that
+# never triggers reports nothing at all. The change filter inside the job skips
+# only the verification work when nothing it covers was touched.
 on:
   pull_request:
     branches:
@@ -46,6 +54,8 @@ on:
   push:
     branches:
       - trunk
+      - release-*
+      - release/*
   workflow_dispatch:
 
 concurrency:
@@ -53,13 +63,13 @@ concurrency:
   cancel-in-progress: true
 
 # The job reads the repository and fetches a public release. It needs nothing
-# else, and it executes a downloaded binary, so it gets the minimum. Naming any
-# permission drops the rest to none, so `pull-requests: read` has to be explicit:
-# `dorny/paths-filter` reads the changed-file list for a pull request from the
-# REST API, not from the checkout.
+# else, and it executes a downloaded binary, so it gets the minimum. `contents`
+# alone is enough because the job never runs on a pull request: `dorny/paths-filter`
+# reads the REST API only on the `pull_request*` events, and on `merge_group` and
+# `push` diffs the checkout with git (`getChangedFilesFromGit`), which is also why
+# the checkout below takes full history.
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   # The verifier and its specification library ship together and are versioned
@@ -79,6 +89,9 @@ jobs:
     # for every crate that opted into `[package.metadata.verus]`. Adding a
     # crate updates the verify loop and the path filter, not the job name.
     name: Verify Verus proofs
+    # Never on a pull request — the merge queue is the gate, and the skipped run
+    # is what reports this required context there. See the header.
+    if: ${{ github.event_name != 'pull_request' }}
     # GitHub-hosted on purpose: verification must not queue behind the
     # saturated self-hosted pool.
     runs-on: ubuntu-24.04
@@ -92,13 +105,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A pull request only needs base + head for the path diff; other
-          # events need history to diff against.
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          # Every event that reaches this job diffs against history with git, so
+          # the shallow pull-request case does not apply.
+          fetch-depth: 0
           persist-credentials: false
 
-      # Decides whether the verification work below runs. The job itself always
-      # runs, so the required context is always reported.
+      # Decides whether the verification work below runs, on the events that
+      # reach this job at all — a pull request skips the job outright.
       #
       # This has to cover every input that decides what `cargo verus` checks,
       # not only the proof source. A path missing here is not a cheaper run: it
@@ -271,29 +284,3 @@ jobs:
             grep -qE 'verification results:: [1-9][0-9]* verified, 0 errors' \
               "/tmp/verus-${crate_name}.log"
           done
-
-  # The live `trunk` ruleset requires this context rather than
-  # `Verify Verus proofs` until `scripts/signoff install --yes` applies
-  # REQUIRED_CHECKS. A required context that no job reports blocks every pull
-  # request, so this job repeats the `verus-verify` verdict under that name and
-  # the ruleset can switch without stranding pull requests on either side.
-  # Delete it once the ruleset requires `Verify Verus proofs`.
-  verus-verify-ruleset-alias:
-    name: Verify hash-index proofs
-    needs: verus-verify
-    # `always()`, not the default: when `verus-verify` fails or is cancelled a
-    # dependent job is skipped, and a skipped job satisfies a required check.
-    # This one has to run and fail instead.
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Repeat the Verify Verus proofs verdict
-        env:
-          VERIFY_RESULT: ${{ needs.verus-verify.result }}
-        run: |
-          set -euo pipefail
-          if [ "$VERIFY_RESULT" != 'success' ]; then
-            echo "::error::Verify Verus proofs finished '${VERIFY_RESULT}'."
-            exit 1
-          fi
