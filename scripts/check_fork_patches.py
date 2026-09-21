@@ -393,6 +393,50 @@ def _integration_target(path: str) -> tuple[str, str] | str | None:
     )
 
 
+# `package(=…)` / `binary(=…)` inside one clause of the gate's filterset.
+_PACKAGE_CLAUSE_RE = re.compile(r"package\(=(?P<name>[^)]+)\)")
+_BINARY_CLAUSE_RE = re.compile(r"binary\(=(?P<name>[^)]+)\)")
+
+
+def _union_clauses(selection: str) -> list[str]:
+    """The gate's filterset split into the clauses it unions with `+`.
+
+    Splitting at paren depth zero is what lets a clause be read whole. Tested as
+    a bare substring of the whole expression, `binary(=x)` also matches a clause
+    that pairs that binary with a *different* package — which selects nothing of
+    ours, and would excuse a guard the gate never runs.
+    """
+    clauses: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(selection):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "+" and depth == 0:
+            clauses.append(selection[start:index])
+            start = index + 1
+    clauses.append(selection[start:])
+    return [clause.strip() for clause in clauses if clause.strip()]
+
+
+def _clause_selects(clause: str, package: str, binary: str) -> bool:
+    """Whether one union clause selects `(package, binary)`.
+
+    Two forms count, which are the two the Makefile is written in: a
+    `binary(=…)` naming this binary — qualified with this package, or
+    unqualified, as `binary(=metrics)` is — and `package(=…) & kind(=test)`,
+    which takes every integration target in the package.
+    """
+    packages = set(_PACKAGE_CLAUSE_RE.findall(clause))
+    if packages and packages != {package}:
+        return False
+    if binary in set(_BINARY_CLAUSE_RE.findall(clause)):
+        return True
+    return bool(packages) and "kind(=test)" in clause
+
+
 def guard_reachability(ledger_text: str) -> list[str]:
     """Whether `make nextest` actually runs every guard the ledger names.
 
@@ -402,9 +446,10 @@ def guard_reachability(ledger_text: str) -> list[str]:
     integration-test targets, which the filterset has to name one at a time.
 
     This matches the filterset's clauses textually rather than evaluating them —
-    it looks for the `binary(=…)` or `package(=…) & kind(=test)` forms the
-    Makefile is written in. A clause written some other way reads here as
-    unreachable, which fails loudly and is fixed by naming it the usual way.
+    it splits the union at `+` and looks in each clause for the `binary(=…)` or
+    `package(=…) & kind(=test)` forms the Makefile is written in. A clause
+    written some other way reads here as unreachable, which fails loudly and is
+    fixed by naming it the usual way.
 
     A guard in a `src/` tree is skipped, because `kind(=lib)` and the per-crate
     `kind(=bin)` clauses already cover those. A path under a crate's `tests/`
@@ -435,7 +480,7 @@ def guard_reachability(ledger_text: str) -> list[str]:
         if target in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE:
             continue
         package, binary = target
-        if f"binary(={binary})" in selection or f"package(={package}) & kind(=test)" in selection:
+        if any(_clause_selects(clause, package, binary) for clause in _union_clauses(selection)):
             continue
         errors.append(
             f"docs/dev/fork_patches.md names {path} as a guard, but `make nextest` does not "

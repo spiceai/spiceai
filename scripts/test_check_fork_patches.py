@@ -408,6 +408,31 @@ try:
         "declares `mod orphan;`",
     )
 
+    # A clause is read whole, so the package it names has to be this one. Tested
+    # as a bare substring, `binary(=integration)` matches a clause that pairs the
+    # name with someone else's package and excuses a guard nothing runs.
+    check_contains(
+        "a binary selector qualified with another package does not count",
+        reachability(
+            "`crates/demo/tests/covered/mod.rs::a_guard`",
+            "kind(=lib) + (package(=other) & binary(=integration))",
+        ),
+        "binary(=integration)",
+    )
+    check(
+        "an unqualified binary selector counts for any package",
+        reachability("`crates/demo/tests/covered/mod.rs::a_guard`", "kind(=lib) + binary(=integration)"),
+        [],
+    )
+    check_contains(
+        "this package paired with another binary does not count",
+        reachability(
+            "`crates/demo/tests/covered/mod.rs::a_guard`",
+            "kind(=lib) + (package(=demo) & binary(=standalone))",
+        ),
+        "binary(=integration)",
+    )
+
     check(
         "a `src/` guard is left to the `kind(=lib)` sweep",
         reachability("`crates/demo/src/lib.rs::a_guard`", LIB_ONLY),
