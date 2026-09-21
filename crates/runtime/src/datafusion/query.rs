@@ -2110,7 +2110,7 @@ fn attach_query_tracker_to_stream(
     };
 
     let schema = stream.schema();
-    let tracked = query_tracker_stream(
+    let updated_stream = query_tracker_stream(
         span.clone(),
         request_context,
         tracker,
@@ -2121,7 +2121,7 @@ fn attach_query_tracker_to_stream(
     // pin-project it directly — no inner `Box::pin`.
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        tracked.instrument(span),
+        updated_stream.instrument(span),
     ))
 }
 
@@ -2607,14 +2607,14 @@ fn attach_query_tracker_to_cached_raw(
         return stream;
     };
 
-    let tracked = query_tracker_stream(
+    let updated_stream = query_tracker_stream(
         span.clone(),
         request_context,
         tracker,
         stream,
         Arc::clone(schema),
     );
-    Box::pin(tracked.instrument(span))
+    Box::pin(updated_stream.instrument(span))
 }
 
 /// Returns true if `err` represents a query cancellation produced by
