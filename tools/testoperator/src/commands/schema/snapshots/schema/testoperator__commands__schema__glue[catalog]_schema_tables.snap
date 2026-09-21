@@ -1,0 +1,47 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for glue[catalog]"
+---
++---------------+--------------------+------------------+------------+
+| table_catalog | table_schema       | table_name       | table_type |
++---------------+--------------------+------------------+------------+
+| glue          | information_schema | columns          | VIEW       |
+| glue          | information_schema | df_settings      | VIEW       |
+| glue          | information_schema | parameters       | VIEW       |
+| glue          | information_schema | routines         | VIEW       |
+| glue          | information_schema | schemata         | VIEW       |
+| glue          | information_schema | tables           | VIEW       |
+| glue          | information_schema | views            | VIEW       |
+| glue          | tpch               | customer         | BASE TABLE |
+| glue          | tpch               | customer_csv     | BASE TABLE |
+| glue          | tpch               | customer_parquet | BASE TABLE |
+| glue          | tpch               | lineitem         | BASE TABLE |
+| glue          | tpch               | lineitem_csv     | BASE TABLE |
+| glue          | tpch               | lineitem_parquet | BASE TABLE |
+| glue          | tpch               | nation           | BASE TABLE |
+| glue          | tpch               | nation_csv       | BASE TABLE |
+| glue          | tpch               | nation_parquet   | BASE TABLE |
+| glue          | tpch               | orders           | BASE TABLE |
+| glue          | tpch               | orders_csv       | BASE TABLE |
+| glue          | tpch               | orders_parquet   | BASE TABLE |
+| glue          | tpch               | part             | BASE TABLE |
+| glue          | tpch               | part_csv         | BASE TABLE |
+| glue          | tpch               | part_parquet     | BASE TABLE |
+| glue          | tpch               | partsupp         | BASE TABLE |
+| glue          | tpch               | partsupp_csv     | BASE TABLE |
+| glue          | tpch               | partsupp_parquet | BASE TABLE |
+| glue          | tpch               | region           | BASE TABLE |
+| glue          | tpch               | region_csv       | BASE TABLE |
+| glue          | tpch               | region_parquet   | BASE TABLE |
+| glue          | tpch               | supplier         | BASE TABLE |
+| glue          | tpch               | supplier_csv     | BASE TABLE |
+| glue          | tpch               | supplier_parquet | BASE TABLE |
+| spice         | information_schema | columns          | VIEW       |
+| spice         | information_schema | df_settings      | VIEW       |
+| spice         | information_schema | parameters       | VIEW       |
+| spice         | information_schema | routines         | VIEW       |
+| spice         | information_schema | schemata         | VIEW       |
+| spice         | information_schema | tables           | VIEW       |
+| spice         | information_schema | views            | VIEW       |
+| spice         | runtime            | task_history     | BASE TABLE |
++---------------+--------------------+------------------+------------+
