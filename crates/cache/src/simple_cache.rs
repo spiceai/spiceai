@@ -209,6 +209,21 @@ impl<
 
         Ok(())
     }
+
+    /// `SimpleCache` keeps no table-change clock, so it cannot answer this.
+    ///
+    /// It backs the logical-plan cache, which is invalidated by discarding the
+    /// affected plans outright when a hot reload replaces a function or a
+    /// catalog — not by comparing a read instant against a per-table mark. The
+    /// search path must therefore not be given this provider; returning
+    /// `false` there would serve a result whose tables had moved on.
+    fn tables_changed_since(
+        &self,
+        _tables: &std::collections::HashSet<TableReference>,
+        _since: std::time::Instant,
+    ) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

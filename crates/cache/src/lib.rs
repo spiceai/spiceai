@@ -272,16 +272,18 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
 
     /// Returns `true` if any of `tables` was invalidated at or after `since`.
     ///
-    /// Default is `false` (no table-generation clock). [`crate::lru_cache::LruCache`]
-    /// records invalidations and rejects mid-flight search publishes / hits.
+    /// Deliberately has no default. A provider without a table-change clock
+    /// would inherit `false`, and `false` here is the answer that *serves* a
+    /// result — `SearchEngine::search_with_cache` asks this both before
+    /// serving a hit and before publishing a completed search, so a silent
+    /// `false` is a stale result served rather than a missing optimisation.
+    /// Requiring the method makes wiring such a provider into the search path
+    /// a compile error instead.
     fn tables_changed_since(
         &self,
         tables: &HashSet<TableReference>,
         since: std::time::Instant,
-    ) -> bool {
-        let _ = (tables, since);
-        false
-    }
+    ) -> bool;
 }
 
 #[derive(Clone)]
