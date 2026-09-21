@@ -39,10 +39,12 @@ jobs:
     name: Analyze
     # The PR head is untrusted code. Cargo build scripts and local composite
     # actions must not run on the shared self-hosted pool or receive MinIO
-    # credentials. push/schedule/dispatch keep spiceai-dev-runners.
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'spiceai-dev-runners' || 'ubuntu-24.04' }}
+    # credentials. push and schedule already only run on trunk and release
+    # branches. workflow_dispatch gets that pool only on those refs; a
+    # dispatch of any other branch stays on the hosted runner without secrets.
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-') || startsWith(github.ref, 'refs/heads/release/')))) && 'spiceai-dev-runners' || 'ubuntu-24.04' }}
     env:
-      HAS_TEST_MINIO_SECRET: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_TEST_MINIO_SECRET: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-') || startsWith(github.ref, 'refs/heads/release/')))) && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     # An unbounded autobuild waits out GitHub's six-hour default (#12717).
     # Hosted uncached rust analysis has been completing in about 80 minutes;
     # the bound sits above that.
