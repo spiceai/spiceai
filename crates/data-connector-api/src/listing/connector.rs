@@ -501,6 +501,11 @@ impl TableProvider for MetadataPruningListingTable {
             Arc::clone(&self.object_store),
         );
 
+        // A combined `_location = x AND _last_modified > w` heads each named
+        // object anyway, so drop the ones the mtime bound excludes before they
+        // are opened.
+        let last_modified_bounds = extract_last_modified_predicate(filters);
+
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
         for loc in locations {
@@ -539,6 +544,12 @@ impl TableProvider for MetadataPruningListingTable {
 
             if self.uses_format_selected_listing()
                 && !file_matches_extension(&meta.location, &self.listing_extension)
+            {
+                continue;
+            }
+
+            if let Some(bounds) = last_modified_bounds.as_deref()
+                && !last_modified_meta_passes(&meta, bounds)
             {
                 continue;
             }
