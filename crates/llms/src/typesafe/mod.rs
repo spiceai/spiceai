@@ -292,14 +292,25 @@ fn is_probability(value: f64) -> bool {
 /// The distribution must cover exactly the question's domain — no missing keys,
 /// no extras.
 ///
-/// `TypeSafe` documents probabilities as summing to approximately 1. Responses
-/// are commonly rounded to two decimal places (`0.33 + 0.33 + 0.33 = 0.99`).
-/// The slack is slightly above 0.01 so that exact 0.01 shortfall is accepted
-/// despite floating-point representation of `1.0 - 0.99`.
-const PROBABILITY_SUM_TOLERANCE: f64 = 0.011;
-
 /// Half the step of the two-decimal rounding that responses commonly carry.
 const ROUNDING_HALF_STEP: f64 = 0.005;
+
+/// How far a reported probability sum may sit from 1, for a distribution of `n`
+/// masses.
+///
+/// `TypeSafe` documents probabilities as summing to approximately 1. Each mass
+/// may be independently rounded to two decimal places, so the aggregate error
+/// scales with `n` (half a step per value) plus a small floating-point fudge.
+/// A constant sized for two values (`0.011`) rejects a valid seven-way
+/// rounding such as `[0.15 × 6, 0.12]` from `[0.146 × 6, 0.124]`.
+fn probability_sum_tolerance(n: usize) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "distribution size is the question domain, not a byte count"
+    )]
+    let n = n as f64;
+    ROUNDING_HALF_STEP.mul_add(n, 0.001)
+}
 
 /// How far a reported score may sit from the weighted average recomputed from the
 /// reported probabilities, for a rubric whose top index is `top`.
@@ -311,8 +322,7 @@ const ROUNDING_HALF_STEP: f64 = 0.005;
 /// rubric, rounding alone can move the average by more than 0.2.
 fn weighted_score_tolerance(top: f64) -> f64 {
     let index_sum = top * (top + 1.0) / 2.0;
-    // The same floating-point allowance `PROBABILITY_SUM_TOLERANCE` carries.
-    ROUNDING_HALF_STEP * (index_sum + 1.0) + 0.001
+    ROUNDING_HALF_STEP.mul_add(index_sum + 1.0, 0.001)
 }
 
 fn check_distribution<'a>(
@@ -347,7 +357,7 @@ fn check_distribution<'a>(
         }
     }
     let sum: f64 = probabilities.values().sum();
-    if (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
+    if (sum - 1.0).abs() > probability_sum_tolerance(probabilities.len()) {
         return Err(format!(
             "question '{id}': probabilities sum to {sum}, which is not a distribution over [0, 1]"
         ));
@@ -1341,6 +1351,29 @@ mod tests {
             })
             .await
             .expect("a two-decimal rounded distribution is still valid");
+    }
+
+    /// Six masses of 0.146 and one of 0.124 sum to 1 before rounding. Independently
+    /// rounded to two decimals they become `[0.15 × 6, 0.12]` (wire sum 1.02),
+    /// which a two-value tolerance of 0.011 rejects.
+    #[test]
+    fn check_distribution_accepts_independently_rounded_seven_way_masses() {
+        let probabilities = BTreeMap::from([
+            ("a".to_string(), 0.15),
+            ("b".to_string(), 0.15),
+            ("c".to_string(), 0.15),
+            ("d".to_string(), 0.15),
+            ("e".to_string(), 0.15),
+            ("f".to_string(), 0.15),
+            ("g".to_string(), 0.12),
+        ]);
+        check_distribution(
+            "q",
+            &probabilities,
+            0.9,
+            ["a", "b", "c", "d", "e", "f", "g"],
+        )
+        .expect("independent two-decimal rounding of a unit distribution");
     }
 
     /// A ten-level score whose probabilities are the two-decimal rounding of
