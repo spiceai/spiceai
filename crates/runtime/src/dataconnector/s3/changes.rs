@@ -2345,7 +2345,6 @@ mod tests {
     /// notification for the object itself would count as outside the dataset.
     /// Only the object store can tell the two apart, so the refusal needs the
     /// key this returns.
-    #[test]
     /// Only [`object_store::Error::NotFound`] may be treated as "this `from` is a
     /// prefix". Every other HEAD failure must propagate, or an empty accelerator
     /// can be marked ready after an auth/timeout/transient miss.
