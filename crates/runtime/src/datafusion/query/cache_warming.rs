@@ -58,7 +58,9 @@ use crate::datafusion::DataFusion;
 
 use super::QueryBuilder;
 use super::ResultsCacheMode;
-use super::warmup_plan::{WarmupTemplate, distinct_keys_sql, template_from_plan, template_id};
+use super::warmup_plan::{
+    WarmupTemplate, distinct_keys_sql, template_can_warm, template_from_plan, template_id,
+};
 
 /// Distinct plan shapes kept for the next cold start. First N, not hottest N.
 const MAX_WARMUP_PLANS: usize = 10;
@@ -186,6 +188,9 @@ impl ResultsCacheWarmer {
         let Some(template) = template_from_plan(plan) else {
             return;
         };
+        if !template_can_warm(&template) {
+            return;
+        }
         let id = template_id(&template);
         {
             let mut catalog = self.catalog.lock();
@@ -521,17 +526,16 @@ impl DataFusion {
         request_context: &Arc<RequestContext>,
         cache_provider: &cache::QueryResultsCacheProvider,
     ) -> u64 {
-        let Some(distinct_sql) = distinct_keys_sql(template) else {
+        if template.bindings.is_empty() {
             return u64::from(execute_warmup_sql(self, &template.sql, None, request_context).await);
+        }
+        let Some(distinct_sql) = distinct_keys_sql(template) else {
+            return 0;
         };
 
         let keys = match collect_distinct_keys(self, &distinct_sql, request_context).await {
             Some(keys) if !keys.is_empty() => keys,
-            _ => {
-                return u64::from(
-                    execute_warmup_sql(self, &template.sql, None, request_context).await,
-                );
-            }
+            _ => return 0,
         };
 
         let mut stored = 0_u64;
@@ -1156,5 +1160,117 @@ mod tests {
 
         let _ = std::fs::remove_file(&store);
         let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+    }
+
+    #[tokio::test]
+    async fn multi_table_plans_are_not_recorded_for_warmup() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-join-skip-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT, customer_id INT)")
+            .await
+            .expect("create orders")
+            .collect()
+            .await
+            .expect("collect create orders");
+        ctx.sql("CREATE TABLE customers (id INT, name VARCHAR)")
+            .await
+            .expect("create customers")
+            .collect()
+            .await
+            .expect("collect create customers");
+        let plan = ctx
+            .sql(
+                "SELECT orders.id FROM orders JOIN customers ON orders.customer_id = customers.id \
+                 WHERE orders.id = 1 AND customers.name = 'acme'",
+            )
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
+        assert!(
+            df.results_cache_warmer.templates_snapshot().is_empty(),
+            "join plans with bindings on more than one table must not occupy a warmup slot"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[tokio::test]
+    async fn persisted_multi_table_template_is_not_executed_at_replay() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-join-replay-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        register_table(&df, "orders", vec![1, 2, 3]).await;
+        register_table(&df, "customers", vec![10, 20]).await;
+
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![
+                WarmupBinding {
+                    table: "orders".to_string(),
+                    column: "id".to_string(),
+                },
+                WarmupBinding {
+                    table: "customers".to_string(),
+                    column: "id".to_string(),
+                },
+            ],
+        };
+        df.run_warmup_templates(&[template], None).await;
+
+        let cache = df.results_cache_provider().expect("results cache");
+        cache.run_pending_tasks().await;
+        assert_eq!(
+            cache.size().await,
+            0,
+            "a multi-table template must not replay placeholder SQL without parameters"
+        );
+        let miss = request_context()
+            .scope(run_sql(&df, "SELECT id FROM orders WHERE id = 2"))
+            .await;
+        assert_eq!(
+            miss,
+            CacheStatus::CacheMiss,
+            "skipping a multi-table template must leave the cache empty for that shape"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[tokio::test]
+    async fn empty_distinct_keys_do_not_execute_placeholder_sql() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-empty-keys-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        register_table(&df, "orders", vec![]).await;
+
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: "orders".to_string(),
+                column: "id".to_string(),
+            }],
+        };
+        df.run_warmup_templates(&[template], None).await;
+
+        let cache = df.results_cache_provider().expect("results cache");
+        cache.run_pending_tasks().await;
+        assert_eq!(
+            cache.size().await,
+            0,
+            "an empty DISTINCT result must not run the template SQL without parameters"
+        );
+        let _ = std::fs::remove_file(&store);
     }
 }

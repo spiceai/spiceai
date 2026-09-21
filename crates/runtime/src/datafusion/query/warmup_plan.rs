@@ -169,6 +169,17 @@ fn literal_or_placeholder_type(expr: &Expr) -> Option<datafusion::arrow::datatyp
     }
 }
 
+/// Whether this template can be replayed after a refresh.
+///
+/// No bindings: run the template SQL as-is. Bindings on one named table: fill
+/// placeholders from `SELECT DISTINCT`. Bindings that span tables, or that
+/// have an empty table name, cannot produce a valid key combination without a
+/// join, so they are not recorded or replayed.
+#[must_use]
+pub(super) fn template_can_warm(template: &WarmupTemplate) -> bool {
+    template.bindings.is_empty() || distinct_keys_sql(template).is_some()
+}
+
 /// `SELECT DISTINCT` SQL that yields one row per unique combination of a
 /// template's bound columns. `None` when the template has no variables (run
 /// the template SQL as-is) or the bindings span more than one table (the
@@ -232,6 +243,7 @@ mod tests {
             distinct_keys_sql(&a).expect("distinct").contains("id"),
             "warmup should DISTINCT the bound column"
         );
+        assert!(template_can_warm(&a));
     }
 
     #[tokio::test]
@@ -240,6 +252,10 @@ mod tests {
             template_from_plan(&plan_of("SELECT count(*) FROM orders").await).expect("template");
         assert!(t.bindings.is_empty());
         assert!(distinct_keys_sql(&t).is_none());
+        assert!(
+            template_can_warm(&t),
+            "no-variable templates run as-is at warmup"
+        );
     }
 
     #[tokio::test]
@@ -252,5 +268,69 @@ mod tests {
         let cols: Vec<&str> = t.bindings.iter().map(|b| b.column.as_str()).collect();
         assert!(cols.contains(&"id"));
         assert!(cols.contains(&"status"));
+        assert!(
+            template_can_warm(&t),
+            "single-table bindings must be warmable"
+        );
+    }
+
+    async fn plan_of_join(sql: &str) -> LogicalPlan {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT, customer_id INT)")
+            .await
+            .expect("create orders")
+            .collect()
+            .await
+            .expect("collect create orders");
+        ctx.sql("CREATE TABLE customers (id INT, name VARCHAR)")
+            .await
+            .expect("create customers")
+            .collect()
+            .await
+            .expect("collect create customers");
+        ctx.sql(sql).await.expect("sql").logical_plan().clone()
+    }
+
+    #[tokio::test]
+    async fn join_filters_on_two_tables_are_not_warmable() {
+        let t = template_from_plan(
+            &plan_of_join(
+                "SELECT orders.id FROM orders JOIN customers ON orders.customer_id = customers.id \
+                 WHERE orders.id = 1 AND customers.name = 'acme'",
+            )
+            .await,
+        )
+        .expect("template");
+        assert!(
+            t.bindings.len() >= 2,
+            "both equality filters must become bindings, got {t:?}"
+        );
+        let tables: std::collections::HashSet<&str> =
+            t.bindings.iter().map(|b| b.table.as_str()).collect();
+        assert!(
+            tables.len() > 1 || t.bindings.iter().any(|b| b.table.is_empty()),
+            "join bindings must span tables or leave a table name empty, got {t:?}"
+        );
+        assert!(
+            distinct_keys_sql(&t).is_none(),
+            "multi-table bindings must not produce DISTINCT SQL"
+        );
+        assert!(
+            !template_can_warm(&t),
+            "multi-table bindings cannot be warmed without a join DISTINCT"
+        );
+    }
+
+    #[test]
+    fn empty_table_name_on_bindings_is_not_warmable() {
+        let t = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: String::new(),
+                column: "id".to_string(),
+            }],
+        };
+        assert!(distinct_keys_sql(&t).is_none());
+        assert!(!template_can_warm(&t));
     }
 }
