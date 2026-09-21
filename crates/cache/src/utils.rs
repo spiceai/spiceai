@@ -1289,12 +1289,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Regression test for #14157: a decomposed HTTP dataset's schema never
-    /// materializes `response_status` as a column, only the schema-level
-    /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker. `batches_cacheable` and
-    /// `filter_transient_error_responses` must still detect a transient
-    /// origin failure from that marker alone.
-    fn create_decomposed_http_schema_with_status(status: u16) -> Arc<Schema> {
+    /// A batch shaped like what a narrow `SELECT` (one that doesn't
+    /// reference `response_status`) leaves after DataFusion's projection
+    /// pushdown prunes that column away — carrying only the schema-level
+    /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker, no materialized column.
+    /// `batches_cacheable` and `filter_transient_error_responses` must still
+    /// detect a transient origin failure from that marker alone in this
+    /// shape, which is the metadata-only fallback path in
+    /// `has_transient_http_error_responses`.
+    fn create_projected_http_batch_schema_with_status(status: u16) -> Arc<Schema> {
         Arc::new(
             Schema::new(vec![
                 Field::new("id", DataType::Utf8, true),
@@ -1312,17 +1315,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_decomposed_schema_has_no_response_status_column() {
-        let schema = create_decomposed_http_schema_with_status(200);
+    fn test_projected_http_batch_schema_has_no_response_status_column() {
+        let schema = create_projected_http_batch_schema_with_status(200);
         assert!(
             schema.column_with_name(RESPONSE_STATUS_COLUMN).is_none(),
-            "a decomposed HTTP dataset's schema must not have a response_status column"
+            "a projected-away response_status column must not reappear on the schema"
         );
     }
 
     #[test]
-    fn test_batches_cacheable_detects_transient_error_on_decomposed_schema() {
-        let schema = create_decomposed_http_schema_with_status(503);
+    fn test_batches_cacheable_detects_transient_error_on_a_projected_http_batch() {
+        let schema = create_projected_http_batch_schema_with_status(503);
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -1330,7 +1333,7 @@ pub(crate) mod tests {
                 Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
             ],
         )
-        .expect("to create batch with a decomposed HTTP schema");
+        .expect("to create batch with a projected HTTP batch schema");
 
         assert!(
             !batches_cacheable(&[batch]),
@@ -1340,8 +1343,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_batches_cacheable_accepts_ok_status_on_decomposed_schema() {
-        let schema = create_decomposed_http_schema_with_status(200);
+    fn test_batches_cacheable_accepts_ok_status_on_a_projected_http_batch() {
+        let schema = create_projected_http_batch_schema_with_status(200);
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -1349,17 +1352,17 @@ pub(crate) mod tests {
                 Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
             ],
         )
-        .expect("to create batch with a decomposed HTTP schema");
+        .expect("to create batch with a projected HTTP batch schema");
 
         assert!(
             batches_cacheable(&[batch]),
-            "a 200 status on a decomposed schema should be cacheable"
+            "a 200 status on a projected HTTP batch should be cacheable"
         );
     }
 
     #[test]
-    fn test_filter_drops_whole_batch_on_decomposed_schema_transient_error() {
-        let schema = create_decomposed_http_schema_with_status(500);
+    fn test_filter_drops_whole_batch_on_a_projected_http_batch_transient_error() {
+        let schema = create_projected_http_batch_schema_with_status(500);
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -1367,18 +1370,18 @@ pub(crate) mod tests {
                 Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
             ],
         )
-        .expect("to create batch with a decomposed HTTP schema");
+        .expect("to create batch with a projected HTTP batch schema");
 
         let result = filter_transient_error_responses(&[batch]);
         assert!(
             result.is_empty(),
-            "a decomposed batch carrying a transient 500 status must be dropped entirely"
+            "a batch carrying a transient 500 status must be dropped entirely"
         );
     }
 
     #[test]
-    fn test_filter_keeps_whole_batch_on_decomposed_schema_ok_status() {
-        let schema = create_decomposed_http_schema_with_status(200);
+    fn test_filter_keeps_whole_batch_on_a_projected_http_batch_ok_status() {
+        let schema = create_projected_http_batch_schema_with_status(200);
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
