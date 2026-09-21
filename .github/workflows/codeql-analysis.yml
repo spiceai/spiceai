@@ -10,9 +10,15 @@ name: 'CodeQL'
 on:
   workflow_dispatch:
   pull_request:
-    branches: [trunk, release-*]
+    branches:
+      - trunk
+      - release-*
+      - release/*
   merge_group:
-    branches: [trunk, release-*]
+    branches:
+      - trunk
+      - release-*
+      - release/*
   push:
     branches: [trunk, release-*]
     paths-ignore:
@@ -24,7 +30,10 @@ on:
 jobs:
   analyze:
     name: Analyze
-    runs-on: spiceai-dev-runners
+    # pull_request heads are untrusted: Cargo build scripts and local composite
+    # actions must not run on the shared self-hosted pool. Trusted events keep
+    # spiceai-dev-runners.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'spiceai-dev-runners' }}
     env:
       HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     permissions:
