@@ -210,19 +210,22 @@ impl<
         Ok(())
     }
 
-    /// `SimpleCache` keeps no table-change clock, so it cannot answer this.
+    /// `SimpleCache` keeps no table-change clock, so it cannot answer this and
+    /// says so in the only direction that is safe to be wrong in.
     ///
     /// It backs the logical-plan cache, which is invalidated by discarding the
     /// affected plans outright when a hot reload replaces a function or a
-    /// catalog — not by comparing a read instant against a per-table mark. The
-    /// search path must therefore not be given this provider; returning
-    /// `false` there would serve a result whose tables had moved on.
+    /// catalog — not by comparing a read instant against a per-table mark, so
+    /// nothing on that path asks. A caller that did ask would be one this
+    /// provider cannot serve correctly, and `false` is the answer that lets it
+    /// serve: it would return a result whose tables had moved on. `true`
+    /// forfeits the hit instead, which costs a lookup rather than correctness.
     fn tables_changed_since(
         &self,
         _tables: &std::collections::HashSet<TableReference>,
         _since: std::time::Instant,
     ) -> bool {
-        false
+        true
     }
 }
 
@@ -267,6 +270,33 @@ mod tests {
         )
         .await
         .expect("Failed to create cached result")
+    }
+
+    /// The conservative answer is the whole reason this method has no default
+    /// on the trait: a provider that cannot track table changes must not be
+    /// the one that decides a cached result is still fresh. Nothing calls this
+    /// today — the plan cache never asks, and the search and SQL-results paths
+    /// are wired to providers that keep a real clock — so this pins the value
+    /// against a future caller rather than a current one.
+    #[test]
+    fn a_cache_without_a_table_clock_reports_every_table_as_changed() {
+        let cache: SimpleCache<CachedQueryResult, _, _> =
+            SimpleCache::new(10, Duration::from_mins(1), RandomState::default());
+        let mut tables = HashSet::new();
+        tables.insert(TableReference::bare("orders"));
+
+        assert!(
+            TabledCacheProvider::tables_changed_since(&cache, &tables, std::time::Instant::now()),
+            "a cache with no table-change clock must forfeit the hit, not serve it"
+        );
+        assert!(
+            TabledCacheProvider::tables_changed_since(
+                &cache,
+                &HashSet::new(),
+                std::time::Instant::now()
+            ),
+            "the answer must not depend on the table set it was asked about"
+        );
     }
 
     #[rstest]
