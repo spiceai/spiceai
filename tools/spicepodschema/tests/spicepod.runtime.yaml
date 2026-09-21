@@ -19,6 +19,9 @@ runtime:
       s3_region: us-east-1
       s3_auth: iam_role
   caching:
+    # `runtime.caching.*.engine` (`moka` | `pingora`) is accepted for
+    # compatibility and ignored at runtime; LruCache always uses the Spice
+    # sharded-cache backend. `engine: pingora` no longer selects Pingora.
     sql_results:
       enabled: true
       max_size: 1GiB # Default 128 MiB
