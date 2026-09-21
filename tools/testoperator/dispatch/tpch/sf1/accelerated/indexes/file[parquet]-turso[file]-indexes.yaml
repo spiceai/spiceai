@@ -1,19 +1,26 @@
-tests:
-  bench:
-    spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
-    query_set: tpch
-    query_overrides: turso
-    runner_type: spiceai-dev-runners
-    ready_wait: 1500
-    validate_results: true
-  throughput:
-    spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
-    query_set: tpch
-    query_overrides: turso
-    runner_type: spiceai-dev-runners
-  load:
-    spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
-    query_set: tpch
-    query_overrides: turso
-    runner_type: spiceai-dev-runners
-    duration: 28800
+# Disabled: a turso `mode: file` acceleration that declares secondary indexes never
+# reaches ready, so every test on this spicepod dies in the readiness gate instead of
+# running queries. The composite `primary_key` alone is unaffected. Tracked in
+# https://github.com/spiceai/spiceai/issues/11928.
+#
+# `tests` must stay a mapping: testoperator deserializes it without a default, so an
+# empty key (null) fails to parse for every directory-based dispatch.
+tests: {}
+  # bench:
+  #   spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
+  #   query_set: tpch
+  #   query_overrides: turso
+  #   runner_type: spiceai-dev-runners
+  #   ready_wait: 1500
+  #   validate_results: true
+  # throughput:
+  #   spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
+  #   query_set: tpch
+  #   query_overrides: turso
+  #   runner_type: spiceai-dev-runners
+  # load:
+  #   spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
+  #   query_set: tpch
+  #   query_overrides: turso
+  #   runner_type: spiceai-dev-runners
+  #   duration: 28800
