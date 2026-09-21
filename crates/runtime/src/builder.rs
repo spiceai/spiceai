@@ -657,21 +657,17 @@ impl RuntimeBuilder {
         {
             Some(ClusterRole::Scheduler) => {
                 // For a real object store, cluster_state.bootstrap() is called by start_scheduler_registry.
-                if let Some((scheduler_config, state_location)) = shared_app
+                if let Some(scheduler_config) = shared_app
                     .read()
                     .await
                     .as_ref()
                     .and_then(|app| app.runtime.resolved_scheduler())
-                    .and_then(|cfg| {
-                        cfg.state_location
-                            .as_deref()
-                            .map(|location| (cfg, location.to_string()))
-                    })
+                    && let Some(state_location) = scheduler_config.state_location.as_deref()
                 {
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
                         io_runtime.clone(),
-                        &state_location,
+                        state_location,
                         &scheduler_config,
                     )
                     .await
