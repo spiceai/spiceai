@@ -18,7 +18,6 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::DataType;
 use arrow_tools::metadata_keys::HTTP_RESPONSE_STATUS_METADATA_KEY;
 use datafusion::{
     common::tree_node::TreeNodeRecursion, execution::SendableRecordBatchStream,
@@ -37,32 +36,26 @@ pub const RESPONSE_STATUS_COLUMN: &str = "response_status";
 /// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
 /// from record batches before caching.
 ///
-/// If the batches don't contain a `response_status` column (i.e., not from an HTTP connector),
-/// returns the batches unchanged.
+/// If a batch has neither a `response_status` column nor the schema-metadata status marker
+/// (i.e., not from an HTTP connector), it is returned unchanged.
 #[must_use]
 pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBatch> {
     if batches.is_empty() {
         return Vec::new();
     }
 
-    // If schema doesn't have response_status column, this isn't an HTTP result — return as-is
-    if batches[0]
-        .schema()
-        .column_with_name(RESPONSE_STATUS_COLUMN)
-        .is_none()
-    {
-        return batches.to_vec();
-    }
-
     let mut result = Vec::with_capacity(batches.len());
 
     for batch in batches {
-        let Some(col_idx) = batch
-            .schema()
-            .column_with_name(RESPONSE_STATUS_COLUMN)
-            .map(|(idx, _)| idx)
-        else {
-            result.push(batch.clone());
+        let schema = batch.schema();
+        let Some((col_idx, _)) = schema.column_with_name(RESPONSE_STATUS_COLUMN) else {
+            // No materialized column: either a decomposed HTTP dataset (fall back to
+            // the schema-metadata status, which applies to every row in this batch)
+            // or not an HTTP-connector result at all (pass through unchanged).
+            match http_fetch_status(&schema) {
+                Some(status) if is_retryable_status(status) => {}
+                _ => result.push(batch.clone()),
+            }
             continue;
         };
 
@@ -79,7 +72,7 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
         // (exclude 5xx server errors and 429 Too Many Requests)
         let mask: arrow::array::BooleanArray = status_array
             .iter()
-            .map(|status| status.map(|s| !(500..600).contains(&s) && s != 429))
+            .map(|status| status.map(|s| !is_retryable_status(s)))
             .collect();
 
         match filter_record_batch(batch, &mask) {
@@ -97,76 +90,67 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
     result
 }
 
-/// Whether `batch`'s `response_status` column was produced by the HTTP
-/// connector, rather than an unrelated dataset that happens to have a
-/// same-named, same-typed column of its own.
-///
-/// The original check required every column in the batch to be a known HTTP
-/// metadata field, which rejects any batch that mixes metadata with other
-/// columns — exactly what a JSON-decomposed HTTP dataset (`columns:` +
-/// `json_object: "*"`) does by design, so it never matched and
-/// `caching_stale_if_error` silently never detected a transient failure for
-/// one (#14157). But inferring HTTP provenance from column names and types
-/// alone is not sound either way: `refresh_mode: caching` also applies to
-/// non-HTTP connectors (e.g. `localpod`), and a business dataset can
-/// legitimately have its own `response_status: UInt16` and `_fetched_at`
-/// columns, where a value of `503` is real data, not an origin failure.
-/// Checking [`HTTP_RESPONSE_STATUS_METADATA_KEY`] on the *schema* (not the
-/// `response_status` field itself) is an authoritative signal instead of a
-/// heuristic: only the HTTP connector's own `base_table_schema` sets it, and
-/// `build_json_nest_schema` carries it through on the schema it builds
-/// regardless of which columns that decomposed schema keeps (see
-/// `parse_http_json_nesting` in `runtime::dataconnector::https`). Living on
-/// the schema rather than the field also means provenance doesn't depend on
-/// `response_status` being present in a particular projection — the field's
-/// own presence is still what gates whether there is a status to read at all.
-fn is_http_result_batch(batch: &RecordBatch) -> bool {
-    if batch
-        .schema()
-        .metadata()
-        .get(HTTP_RESPONSE_STATUS_METADATA_KEY)
-        != Some(&"1".to_string())
-    {
-        return false;
-    }
-    batch
-        .schema()
-        .field_with_name(RESPONSE_STATUS_COLUMN)
-        .is_ok_and(|field| field.data_type() == &DataType::UInt16)
+/// Whether a status code is a transient failure worth `stale_if_error`
+/// falling back on, rather than real data: a 5xx server error or 429 Too
+/// Many Requests.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
 }
 
+/// The HTTP status this batch's fetch actually returned, read from schema
+/// metadata rather than a `response_status` column: every batch this
+/// connector returns carries [`HTTP_RESPONSE_STATUS_METADATA_KEY`] set to
+/// the real per-fetch status (see `HttpTableProvider::schema_with_fetch_status`),
+/// whether or not `response_status` is one of the declared columns for this
+/// dataset's schema. Only the HTTP connector ever sets this key, so its mere
+/// presence is also the provenance signal that lets callers tell a real
+/// HTTP-connector batch apart from an unrelated dataset that
+/// happens to have its own same-named, same-typed `response_status` column
+/// (where a value of `503` would be real data, not an origin failure).
+fn http_fetch_status(schema: &arrow::datatypes::Schema) -> Option<u16> {
+    schema
+        .metadata()
+        .get(HTTP_RESPONSE_STATUS_METADATA_KEY)
+        .and_then(|v| v.parse().ok())
+}
+
+/// A JSON-decomposed HTTP dataset never materializes `response_status` as a
+/// column (so #14157's schema-contract regression can't recur), but every
+/// row in a batch shares one fetch's status regardless — a single HTTP
+/// response never contains a per-row mix of status codes — so the
+/// schema-metadata value alone, without a column to scan, is enough to
+/// classify the whole batch.
 fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
     let Some(first_batch) = batches.first() else {
         return false;
     };
 
-    if !is_http_result_batch(first_batch) {
+    if http_fetch_status(&first_batch.schema()).is_none() {
         return false;
     }
 
     for batch in batches {
-        let Some(col_idx) = batch
-            .schema()
-            .column_with_name(RESPONSE_STATUS_COLUMN)
-            .map(|(idx, _)| idx)
-        else {
-            return false;
-        };
+        let schema = batch.schema();
+        if let Some((col_idx, _)) = schema.column_with_name(RESPONSE_STATUS_COLUMN) {
+            let Some(status_array) = batch.column(col_idx).as_any().downcast_ref::<UInt16Array>()
+            else {
+                tracing::warn!(
+                    "'{RESPONSE_STATUS_COLUMN}' column is not UInt16Array, skipping transient HTTP cache validation"
+                );
+                return false;
+            };
+            if status_array.iter().flatten().any(is_retryable_status) {
+                return true;
+            }
+            continue;
+        }
 
-        let Some(status_array) = batch.column(col_idx).as_any().downcast_ref::<UInt16Array>()
-        else {
-            tracing::warn!(
-                "'{RESPONSE_STATUS_COLUMN}' column is not UInt16Array, skipping transient HTTP cache validation"
-            );
-            return false;
-        };
-
-        if status_array
-            .iter()
-            .flatten()
-            .any(|status| status == 429 || (500..600).contains(&status))
-        {
-            return true;
+        // No materialized column (a decomposed dataset): fall back to the
+        // schema-metadata status, which applies to every row in this batch.
+        match http_fetch_status(&schema) {
+            Some(status) if is_retryable_status(status) => return true,
+            Some(_) => {}
+            None => return false,
         }
     }
 
@@ -983,7 +967,7 @@ pub(crate) mod tests {
     /// The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker the real HTTP
     /// connector's `base_table_schema` sets, for tagging a test schema the
     /// same way. It lives on the *schema*, not the `response_status` field
-    /// — see [`is_http_result_batch`].
+    /// — see [`http_fetch_status`].
     fn http_provenance_metadata() -> std::collections::HashMap<String, String> {
         std::collections::HashMap::from([(
             HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
@@ -992,7 +976,7 @@ pub(crate) mod tests {
     }
 
     /// Like [`create_http_response_schema`], plus a tagged schema and
-    /// `_fetched_at` — what [`is_http_result_batch`] actually checks.
+    /// `_fetched_at` — what [`http_fetch_status`] actually checks.
     /// Tests exercising `batches_cacheable`/`has_transient_http_error_responses`
     /// need this one; `filter_transient_error_responses` tests don't check
     /// provenance at all, so they stay on the untagged schema above.
@@ -1298,6 +1282,113 @@ pub(crate) mod tests {
             2,
             "Non-HTTP batches pass through unchanged"
         );
+    }
+
+    /// Regression test for #14157: a decomposed HTTP dataset's schema never
+    /// materializes `response_status` as a column, only the schema-level
+    /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker. `batches_cacheable` and
+    /// `filter_transient_error_responses` must still detect a transient
+    /// origin failure from that marker alone.
+    fn create_decomposed_http_schema_with_status(status: u16) -> Arc<Schema> {
+        Arc::new(
+            Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new(
+                    "_fetched_at",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])
+            .with_metadata(std::collections::HashMap::from([(
+                HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                status.to_string(),
+            )])),
+        )
+    }
+
+    #[test]
+    fn test_decomposed_schema_has_no_response_status_column() {
+        let schema = create_decomposed_http_schema_with_status(200);
+        assert!(
+            schema.column_with_name(RESPONSE_STATUS_COLUMN).is_none(),
+            "a decomposed HTTP dataset's schema must not have a response_status column"
+        );
+    }
+
+    #[test]
+    fn test_batches_cacheable_detects_transient_error_on_decomposed_schema() {
+        let schema = create_decomposed_http_schema_with_status(503);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with a decomposed HTTP schema");
+
+        assert!(
+            !batches_cacheable(&[batch]),
+            "a transient 503 must be detected from schema metadata even without a \
+            response_status column"
+        );
+    }
+
+    #[test]
+    fn test_batches_cacheable_accepts_ok_status_on_decomposed_schema() {
+        let schema = create_decomposed_http_schema_with_status(200);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("row-1")])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with a decomposed HTTP schema");
+
+        assert!(
+            batches_cacheable(&[batch]),
+            "a 200 status on a decomposed schema should be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_filter_drops_whole_batch_on_decomposed_schema_transient_error() {
+        let schema = create_decomposed_http_schema_with_status(500);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with a decomposed HTTP schema");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert!(
+            result.is_empty(),
+            "a decomposed batch carrying a transient 500 status must be dropped entirely"
+        );
+    }
+
+    #[test]
+    fn test_filter_keeps_whole_batch_on_decomposed_schema_ok_status() {
+        let schema = create_decomposed_http_schema_with_status(200);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("row-1"), Some("row-2")])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![
+                    Some(0),
+                    Some(0),
+                ])),
+            ],
+        )
+        .expect("to create batch with a decomposed HTTP schema");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2);
     }
 
     #[test]

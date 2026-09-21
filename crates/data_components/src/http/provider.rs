@@ -2240,6 +2240,25 @@ impl HttpExec {
         )
     }
 
+    /// `self.projected_schema` with [`crate::HTTP_RESPONSE_STATUS_METADATA_KEY`]
+    /// overridden to `status`, so a batch carries the real HTTP status of the
+    /// fetch that produced it even when a JSON-decomposed dataset's declared
+    /// schema has no `response_status` column to hold it. The value also
+    /// doubles as the provenance signal `cache::http_fetch_status` checks
+    /// (only this connector ever sets it) -- a plain presence check, not a
+    /// fixed sentinel, since the value now varies per fetch.
+    fn schema_with_fetch_status(&self, status: u16) -> SchemaRef {
+        let mut metadata = self.projected_schema.metadata().clone();
+        metadata.insert(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            status.to_string(),
+        );
+        Arc::new(Schema::new_with_metadata(
+            self.projected_schema.fields().clone(),
+            metadata,
+        ))
+    }
+
     /// Create a `RecordBatch` from pre-parsed content rows and HTTP response metadata.
     fn create_batch_from_rows(
         &self,
@@ -2339,8 +2358,9 @@ impl HttpExec {
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
-        let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)?;
+        let batch =
+            RecordBatch::try_new(self.schema_with_fetch_status(fetch_result.response_status), columns)
+                .map_err(DataFusionError::from)?;
         Ok(batch)
     }
 
@@ -2563,7 +2583,7 @@ impl HttpExec {
             }
         }
 
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+        RecordBatch::try_new(self.schema_with_fetch_status(fetch_result.response_status), columns)
             .map_err(DataFusionError::from)
     }
 

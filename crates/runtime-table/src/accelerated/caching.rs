@@ -3007,7 +3007,7 @@ mod tests {
                     ),
                 ])
                 // Tagged the way the real HTTP connector's `base_table_schema`
-                // tags it, so `cache::is_http_result_batch` recognizes it —
+                // tags it, so `cache::http_fetch_status` recognizes it —
                 // see `HTTP_RESPONSE_STATUS_METADATA_KEY`.
                 .with_metadata(std::collections::HashMap::from([(
                     HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
