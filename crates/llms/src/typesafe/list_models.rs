@@ -19,7 +19,9 @@ limitations under the License.
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::provider::{
     ListModels, ListModelsError, ListModelsResult, create_http_client, get_required_param,
@@ -42,8 +44,76 @@ impl ModelsResponse {
     pub(super) fn into_names(self) -> Vec<String> {
         self.models
             .into_iter()
-            .flat_map(|m| m.name.into_iter().chain(m.id).chain(m.alias))
+            .flat_map(|m| m.name.into_iter().chain(m.id).chain(m.alias.into_vec()))
             .collect()
+    }
+}
+
+/// `GET /v1/models` may send `alias` as one string or `aliases` as an array.
+#[derive(Debug, Default)]
+struct AliasList(Vec<String>);
+
+impl AliasList {
+    fn into_vec(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AliasList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AliasListVisitor;
+
+        impl<'de> Visitor<'de> for AliasListVisitor {
+            type Value = AliasList;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a model alias string or a list of alias strings")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(AliasList(vec![value.to_string()]))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(AliasList(vec![value]))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut names = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(name) = seq.next_element()? {
+                    names.push(name);
+                }
+                Ok(AliasList(names))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(AliasList::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(AliasList::default())
+            }
+        }
+
+        deserializer.deserialize_any(AliasListVisitor)
     }
 }
 
@@ -55,33 +125,10 @@ struct ModelCard {
     name: Option<String>,
     #[serde(default)]
     id: Option<String>,
-    /// Additional names callers may configure (e.g. `jev-latest`). The documented
-    /// listing uses `aliases`; a singular `alias` string is also accepted.
-    #[serde(
-        default,
-        alias = "aliases",
-        deserialize_with = "deserialize_alias_list"
-    )]
-    alias: Vec<String>,
-}
-
-/// `GET /v1/models` may send `alias` as one string or `aliases` as an array.
-fn deserialize_alias_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-
-    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
-        None => Vec::new(),
-        Some(OneOrMany::One(name)) => vec![name],
-        Some(OneOrMany::Many(names)) => names,
-    })
+    /// Additional names callers may configure (e.g. `jev-latest`). Accepts a
+    /// singular `alias` string or the documented `aliases` array.
+    #[serde(default, alias = "aliases")]
+    alias: AliasList,
 }
 
 /// `TypeSafe` model lister (`GET /v1/models`).
@@ -225,14 +272,14 @@ mod tests {
     /// `GET /v1/models` may return a singular `alias` string rather than an array.
     #[test]
     fn singular_alias_string_is_listed() {
-        let body = serde_json::json!({
-            "models": [{"id": "jev-1.13.0", "alias": "jev-latest"}]
-        });
         let parsed: ModelsResponse =
-            serde_json::from_value(body).expect("a singular alias string parses");
+            serde_json::from_str(r#"{"models":[{"id":"jev-1.13.0","alias":"jev-latest"}]}"#)
+                .expect("a singular alias string parses");
         let names = parsed.into_names();
-        assert!(names.contains(&"jev-1.13.0".to_string()), "{names:?}");
-        assert!(names.contains(&"jev-latest".to_string()), "{names:?}");
+        assert_eq!(
+            names,
+            vec!["jev-1.13.0".to_string(), "jev-latest".to_string()]
+        );
     }
 
     /// The documented card carries `name` and `id` together; `alias = "id"` makes
