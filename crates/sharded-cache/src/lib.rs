@@ -341,13 +341,12 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         let shard_idx = shard_index(*key);
         let handle = {
             let mut shard = self.shards[shard_idx].0.lock();
-            let now = Instant::now();
             if matches!(self.policy, EvictionPolicy::TinyLfu) {
                 shard.increment_sketch(*key);
             }
             let before_window = shard.window_weight();
             let before_protected = shard.protected_weight();
-            match shard.get(*key, now, self.ttl) {
+            match shard.get(*key, Instant::now(), self.ttl) {
                 GetOutcome::Hit(handle) => handle,
                 GetOutcome::Miss => return None,
                 GetOutcome::Expired { value, weight } => {
