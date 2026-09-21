@@ -87,6 +87,16 @@ JJ_REMOTE_URL=""
 # Packages excluded from workspace lint (must match Makefile lint-rust excludes).
 readonly LINT_EXCLUDED_PACKAGES="libnfs lopdf ttf-parser pdf-extract"
 
+# Build under the same cargo profile the merge queue uses: `pr.yml` sets
+# RUST_PROFILE to `lint`, while the Makefile's fallback is `dev`. Two costs come
+# with that fallback. `dev` carries full debug info, which the clippy passes
+# generate and then throw away because they only ever emit metadata. And the two
+# profiles write to different target directories, so a runner that has just
+# built a pull request shares nothing with the sign-off that follows it.
+# Matching the merge queue also makes the attestation describe the build that
+# actually gates the merge. An explicit RUST_PROFILE still wins.
+export RUST_PROFILE="${RUST_PROFILE:-lint}"
+
 # True when running under the Remote Sign-off workflow. Drives pending/failure
 # statuses, "via remote" descriptions, and the GitHub Actions step summary.
 # GITHUB_ACTIONS alone is not enough — other workflows must not inherit this.
@@ -117,7 +127,11 @@ readonly REQUIRED_CHECKS=(
   "Integration Tests (part 2)"
   "Integration Tests (part 3)"
   "ADBC Integration Tests"   # integration_adbc.yml
-  "Features Check"           # features.yml
+  # `Features Check` (features.yml) is deliberately absent. That workflow is
+  # disabled, so no run reports the context, and a required check nothing
+  # reports blocks every pull request rather than passing it — which is what
+  # happened the one time it was required (added to the ruleset 2026-07-10
+  # 05:00, reverted 05:06). Re-enable the workflow before listing it again.
   "Check Rust Licenses"      # license_check.yml
   "E2E Test CI"              # e2e_test_ci.yml (gate job)
   # verus_verify.yml. The only check that reads the Verus proofs (hash-index

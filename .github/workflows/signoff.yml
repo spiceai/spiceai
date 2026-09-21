@@ -258,7 +258,7 @@ jobs:
     concurrency:
       group: signoff-commit-${{ needs.resolve.outputs.head_sha || format('input-{0}-{1}', inputs.pr_number, inputs.branch) }}
       cancel-in-progress: true
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     # The spiceai-macos pool terminates a job at ~360 minutes, and that arrives
     # as `cancelled` with no failed step — the same shape as the
     # cancel-in-progress eviction above, and with no chance for the steps below

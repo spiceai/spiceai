@@ -50,11 +50,11 @@ use super::maintenance_metrics::{
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
-    BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
-    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext, OnConflictDeletionUpdate,
-    OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream, PendingTombstoneDeltas,
-    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
-    PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
+    BatchValidationResult, CheckpointCorpusKeys, DeletionSinkSource, ExtractedPrimaryKeys,
+    InlineAwareDeletionSink, InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
+    OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
+    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
+    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
     pk_deletion_snapshot_for_strategy,
@@ -1227,7 +1227,7 @@ struct RawScanInput {
     protected_map: Arc<HashMap<String, i64>>,
     /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
     /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
-    inlined_view: Arc<Vec<InlinedViewEntry>>,
+    inlined_view: Arc<Vec<Arc<InlinedViewEntry>>>,
     /// Current snapshot id captured under the read fence and pinned against GC
     /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
@@ -27013,16 +27013,16 @@ impl CayenneTableProvider {
         (cached.generation == current_gen).then(|| (*cached.batches).clone())
     }
 
-    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         let cached = self.inlined_cache.load();
         (cached.generation == current_gen).then(|| Arc::clone(&cached.view))
     }
 
-    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         // Empty captures share one identity in `ScanViewKey`, just as nonempty
         // captures retain the cached view's identity until its contents change.
-        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<InlinedViewEntry>>> =
+        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<Arc<InlinedViewEntry>>>> =
             std::sync::LazyLock::new(|| Arc::new(Vec::new()));
         if self.cached_inlined_row_count() <= 0 {
             return Some(Arc::clone(&EMPTY_VIEW));
@@ -27067,7 +27067,7 @@ impl CayenneTableProvider {
     /// including the original [`InlinedData`] envelope — enabling the upsert-
     /// rewrite path to reconstruct updated entries without a second metastore
     /// round-trip or IPC re-decode.
-    async fn cached_inlined_view(&self) -> Result<Arc<Vec<InlinedViewEntry>>> {
+    async fn cached_inlined_view(&self) -> Result<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         {
             let cached = self.inlined_cache.load();
@@ -27261,7 +27261,7 @@ impl CayenneTableProvider {
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
 
-        let view: Vec<InlinedViewEntry> = if inlined.is_empty() {
+        let view: Vec<Arc<InlinedViewEntry>> = if inlined.is_empty() {
             Vec::new()
         } else {
             let inlined_deletions = self.load_inlined_deletion_maps().await?;
@@ -27275,7 +27275,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > materialized_through_sequence {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
             view
         };
@@ -27391,13 +27393,18 @@ impl CayenneTableProvider {
         // `base`; re-filtering against just the new removal map removes exactly the
         // rows the newly published tombstones hide (entries with `sequence_number
         // <= delete_sequence` whose PK is in the removal).
-        let mut view: Vec<InlinedViewEntry> = if has_tombstone_delta {
+        let mut view: Vec<Arc<InlinedViewEntry>> = if has_tombstone_delta {
             let mut filtered = Vec::with_capacity(base.view.len());
             for entry in base.view.iter() {
-                filtered.push(self.apply_tombstone_removal_to_entry(entry, &removal_map)?);
+                filtered.push(Arc::new(
+                    self.apply_tombstone_removal_to_entry(entry, &removal_map)?,
+                ));
             }
             filtered
         } else {
+            // Cheap: cloning `Vec<Arc<InlinedViewEntry>>` is one refcount bump
+            // per existing entry, not a deep copy of each entry's decoded
+            // batches — see `InlinedCache::view`'s doc comment.
             (*base.view).clone()
         };
 
@@ -27412,7 +27419,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > new_watermark {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
         }
 
@@ -27448,7 +27457,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry.envelope.clone(),
+            envelope: Arc::clone(&entry.envelope),
             statistics: Arc::clone(&entry.statistics),
         })
     }
@@ -27530,7 +27539,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry,
+            envelope: Arc::new(entry),
             statistics,
         })
     }
@@ -27542,7 +27551,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         materialized_through_sequence: i64,
         tombstone_delta_seq: u64,
-        view: Vec<InlinedViewEntry>,
+        view: Vec<Arc<InlinedViewEntry>>,
     ) -> InlinedCache {
         let batches: Vec<RecordBatch> = view
             .iter()
@@ -28586,7 +28595,7 @@ impl CayenneTableProvider {
 
     fn pruned_inlined_batches(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         mem_tier: &crate::provider::mem_tier::MemTier,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -28608,7 +28617,7 @@ impl CayenneTableProvider {
     /// same removal map the single-tier path built.
     fn pruned_inlined_batches_with_removal(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         removal: Option<&InlinedDeletionMaps>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -28625,7 +28634,9 @@ impl CayenneTableProvider {
             } else if entry.batches.is_empty() {
                 continue;
             } else {
-                entry.clone()
+                // `entry: &Arc<InlinedViewEntry>` here; deref past the Arc so
+                // this stays a plain `InlinedViewEntry` like the other arm.
+                (**entry).clone()
             };
 
             if visible.batches.is_empty() {
@@ -32011,7 +32022,7 @@ impl CayenneTableProvider {
     /// `lock_current_snapshot_for_apply`. Waiting for that registration to clear
     /// under the held lock therefore blocks the publish being waited for, and a
     /// DELETE that raced one could only end in the drain's timeout.
-    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+    pub(crate) async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
         self.checkpoint_mem_tier_holding_write_lock()
             .await
             .map(|_rows| ())
@@ -35785,32 +35796,15 @@ impl TableProvider for CayenneTableProvider {
         // branches above materialize inline rows; once durable, the rows are
         // subject to the sink's own tier-aware liveness rule.
         //
-        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
-        // so no CDC apply can land between them. They are not separable: a
-        // checkpoint publishes its rows as a PROTECTED snapshot, and
-        // `build_deletion_vector_sink` freezes the protected set the sink will scan
-        // (the sink re-reads only the main listing at execution), so a checkpoint
-        // that lands after the capture is invisible to this delete. Nothing under
-        // the sink builder takes `write_lock`, so holding it across the build
-        // cannot deadlock.
-        //
-        // This lock is released before `DeletionExec` runs the sink, which takes
-        // `write_lock` again; a CDC apply between the two is still invisible to the
-        // scan sources frozen here (#13828). Closing that window means building the
-        // sink inside the execution-time critical section, not here.
-        let file_sink = {
-            let _guard = self.write_lock.lock().await;
-            // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
-            // into — there the sink reconciles the tier itself at execution time
-            // (`delete_mem_tier_rows_matching`).
-            self.checkpoint_mem_tier_for_delete().await?;
-            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-                .await?
-        };
+        // The checkpoint and the scan-source capture belong in the hold the DELETE
+        // itself runs under, so both are deferred to
+        // `InlineAwareDeletionSink::delete_from` rather than done here — a plan is
+        // built and executed as two steps, and an apply landing between them was
+        // invisible to sources frozen at build (#13828). See [`DeletionSinkSource`].
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
-                file_sink,
+                file_sink: DeletionSinkSource::BuildAtExecution(DeletionRequestSource::User),
                 filters,
             }),
         ))))
@@ -35942,7 +35936,7 @@ fn active_transaction(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeletionRequestSource {
+pub(crate) enum DeletionRequestSource {
     User,
     Cdc,
 }
@@ -36102,7 +36096,7 @@ impl CayenneTableProvider {
     /// User-visible deletes require a verified deleted-row count because the SQL
     /// client receives "rows affected". CDC deletes discard that count, so they
     /// can use count-skipping key-delete paths when the filter shape supports it.
-    async fn build_deletion_vector_sink(
+    pub(crate) async fn build_deletion_vector_sink(
         &self,
         filters: &[Expr],
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
@@ -36220,7 +36214,7 @@ impl CayenneTableProvider {
             .await?;
         let sink = InlineAwareDeletionSink {
             table: self.clone_for_write(),
-            file_sink,
+            file_sink: DeletionSinkSource::Prebuilt(Box::new(file_sink)),
             filters: filters.to_vec(),
         };
         let deleted = sink
@@ -54987,6 +54981,17 @@ mod tests {
         rows
     }
 
+    /// Apply one batch through the real CDC append path, so a `cdc_durability: memory`
+    /// table with an armed slot advancer lands it in the RAM mem-tier rather than
+    /// durably (`insert_into` does not reach that path).
+    async fn cdc_apply(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let _cdc_write = provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("cdc append");
+    }
+
     /// Retention must delete every row its predicate matches and NOTHING else, and a
     /// second pass over the result must be a no-op. Deleting too much is silent data
     /// loss; deleting too little leaves rows the operator asked to have removed.
@@ -55398,6 +55403,92 @@ mod tests {
             !persisted.num_rows_exact,
             "a retention delete must taint the persisted count, or a distributed COUNT(*) folds {} as the answer",
             persisted.num_rows
+        );
+    }
+
+    /// A CDC apply landing between a `DELETE`'s plan build and its execution must not
+    /// destroy the row it wrote, and must not escape the predicate.
+    ///
+    /// The deletion sink captures the tiers it will scan when it is BUILT, and
+    /// re-reads only the main listing at execution. Building it at plan time therefore
+    /// judged the delete against a snapshot of the table taken before the apply:
+    ///
+    /// - `(8, 20)` arrives after the capture, matches `value < 50`, and is in no scan
+    ///   source — so the predicate never sees it and it survives a delete that names it.
+    /// - `(7, 60)` supersedes the durable `(7, 10)`, which the capture still holds and
+    ///   which DOES match. A key tombstone written from that retired version hides the
+    ///   KEY, taking the live replacement with it — silent loss of a row the predicate
+    ///   never matched, the shape #13574 closed one tier over (#13828).
+    ///
+    /// Verified to fail with the sink built at plan time: the delete leaves
+    /// `[(8, 20), (9, 90)]` — it destroyed the live `(7, 60)` and kept the `(8, 20)`
+    /// its predicate names.
+    #[tokio::test]
+    async fn a_cdc_apply_between_plan_build_and_execution_is_judged_by_the_delete() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_cdc_apply_gap",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        // The RAM path is armed by the runtime installing a slot advancer; without one
+        // the write silently takes the durable path and this test covers nothing.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(
+            provider.is_cdc_memory_mode() && provider.has_slot_advancer(),
+            "precondition: the applies must take the in-memory CDC path this test is about"
+        );
+
+        // `(7, 10)` matches `value < 50`; `(9, 90)` is the untouched control.
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 9], &[10, 90]),
+        )
+        .await;
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+            )
+            .await
+            .expect("delete plan");
+
+        // THE GAP: an apply between plan build and execution upserts key 7 out of the
+        // predicate and inserts key 8 into it.
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 8], &[60, 20]),
+        )
+        .await;
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (8, 20), (9, 90)],
+            "precondition: the apply is visible to readers before the delete executes"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "precondition: the apply must still be RAM-resident, which is the tier a \
+             plan-time capture cannot see"
+        );
+
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (9, 90)],
+            "the delete must be judged against the table as it is when it RUNS: `(8, 20)` \
+             matches `value < 50` and goes, `(7, 60)` does not match and must survive — a \
+             key tombstone drawn from the superseded `(7, 10)` would take it with it"
         );
     }
 
@@ -64210,6 +64301,72 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "inline_cache_watermark_delta").await,
             vec![(1, 10), (2, 20), (3, 30)],
             "delta refreshes keep the full visible set gap-free and duplicate-free"
+        );
+    }
+
+    /// The delta extend must SHARE the entries it carries over rather than
+    /// re-materialize them: each already-cached entry owns its decoded
+    /// `RecordBatch`es and its envelope, so a per-entry deep copy turns an
+    /// append into O(corpus) allocations on every scan that observes a write.
+    /// Only pointer identity catches that — a deep-copying rebuild still
+    /// returns exactly the right rows, so no correctness assertion can see it.
+    #[tokio::test]
+    async fn inline_cache_delta_extend_shares_carried_over_entries() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_inline_enabled_upsert_table(
+            "inline_cache_delta_entry_sharing",
+            ctx.runtime_env(),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Warm the cache from the sentinel — this first view is a full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let rebuilt = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        assert_eq!(rebuilt.len(), 1, "precondition: one inline entry is cached");
+
+        // A pure append keeps the structural epoch, so the next read extends the
+        // cached view through the delta path.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        let extended = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache");
+        assert_eq!(extended.len(), 2, "the delta appends exactly the new entry");
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &extended),
+            "precondition: the view was genuinely rebuilt, so entry sharing below \
+             is not trivially true"
+        );
+        assert!(
+            Arc::ptr_eq(&rebuilt[0], &extended[0]),
+            "an entry carried over by the delta extend must be SHARED with the base \
+             view, not deep-copied"
+        );
+
+        // A second delta: an entry first materialized BY a delta must be shared
+        // onward too, not just one that came from the full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[3], &[30])).await;
+        let extended_again = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache again");
+        assert_eq!(extended_again.len(), 3);
+        for (index, carried) in extended.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(carried, &extended_again[index]),
+                "entry {index} must stay shared across successive delta extends"
+            );
+        }
+
+        // Sharing must not cost visibility: every appended row is still returned.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "inline_cache_delta_entry_sharing").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "shared entries must still surface every row exactly once"
         );
     }
 
