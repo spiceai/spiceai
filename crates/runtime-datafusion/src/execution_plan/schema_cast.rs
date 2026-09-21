@@ -19,7 +19,7 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Statistics};
+use datafusion::common::{ColumnStatistics, Constraints, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -321,7 +321,61 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        // The input's `column_statistics` are indexed by the *input* schema,
+        // but this exec advertises `output_schema`, which may drop, reorder, or
+        // retype columns relative to the input. Caching mode is the case that
+        // drops columns: the accelerator scan carries storage-only columns
+        // (`_fetched_at`, `__spice_cache_namespace`) that this exec strips, so
+        // the input has more columns than this node's schema. Forwarding the
+        // input statistics unchanged would advertise more `column_statistics`
+        // than this node has columns; a `FilterExec` above then indexes those
+        // statistics against this node's schema in
+        // `AnalysisContext::try_from_statistics` and fails with an
+        // out-of-bounds `ExprBoundaries` error (regression test for #14144).
+        //
+        // Project the statistics onto the output schema using the same
+        // conservative mapping as `output_equivalence_properties`: carry an
+        // input column's statistics only when the output schema still has it,
+        // unambiguously by name and with an unchanged data type. A retyped
+        // column is a cast, whose value bounds no longer describe the output
+        // type, so its statistics are dropped to unknown.
+        let input_stats = self.input.partition_statistics(partition)?;
+        let input_schema = self.input.schema();
+
+        let occurs_once = |schema: &Schema, name: &str| {
+            schema.fields().iter().filter(|f| f.name() == name).count() == 1
+        };
+
+        let column_statistics = self
+            .output_schema
+            .fields()
+            .iter()
+            .map(|output_field| {
+                if !occurs_once(self.output_schema.as_ref(), output_field.name())
+                    || !occurs_once(input_schema.as_ref(), output_field.name())
+                {
+                    return ColumnStatistics::new_unknown();
+                }
+                match input_schema.column_with_name(output_field.name()) {
+                    Some((input_idx, input_field))
+                        if input_field.data_type() == output_field.data_type() =>
+                    {
+                        input_stats
+                            .column_statistics
+                            .get(input_idx)
+                            .cloned()
+                            .unwrap_or_else(ColumnStatistics::new_unknown)
+                    }
+                    _ => ColumnStatistics::new_unknown(),
+                }
+            })
+            .collect();
+
+        Ok(Arc::new(Statistics {
+            num_rows: input_stats.num_rows,
+            total_byte_size: input_stats.total_byte_size,
+            column_statistics,
+        }))
     }
 
     // Allow optimizer to push limits through to inputs
@@ -576,6 +630,68 @@ mod tests {
             0,
             "Schema should have 0 fields for empty projection"
         );
+    }
+
+    #[test]
+    fn test_partition_statistics_match_output_schema_column_count() {
+        // The input carries a storage-only column (`_fetched_at`) that this exec
+        // strips. `partition_statistics` must return exactly one
+        // `ColumnStatistics` per output column, not per input column, so a
+        // consumer that indexes the statistics against this node's schema stays
+        // in bounds. Regression test for #14144.
+        let source = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
+        let schema_cast = SchemaCastScanExec::new(source, expected_output_schema());
+
+        let stats = schema_cast
+            .partition_statistics(None)
+            .expect("partition_statistics should succeed");
+        assert_eq!(
+            stats.column_statistics.len(),
+            2,
+            "column statistics count must match the 2-column output schema, not the 3-column input"
+        );
+    }
+
+    #[test]
+    fn test_numeric_filter_above_schema_cast_analyzes_statistics() {
+        // Reproduces #14144: a caching-accelerated dataset fails with an
+        // `ExprBoundaries` out-of-bounds internal error when a query filters on
+        // an integer column. The accelerator scan carries storage-only columns
+        // (`_fetched_at`, `__spice_cache_namespace`) that `SchemaCastScanExec`
+        // strips; a `FilterExec` re-applying a numeric predicate on top runs
+        // `AnalysisContext::try_from_statistics`, which indexes the child's
+        // `column_statistics` against the child's (stripped) schema. If the
+        // statistics still describe the wider input schema, that index runs out
+        // of bounds. Boundary analysis only runs for numeric predicates, which
+        // is why a text-column filter escaped the bug.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("version", DataType::Int64, true),
+            Field::new("_fetched_at", DataType::Int64, true),
+            Field::new("__spice_cache_namespace", DataType::Utf8, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("version", DataType::Int64, true),
+        ]));
+
+        let source = Arc::new(EmptyExec::new(input_schema));
+        let schema_cast: Arc<dyn ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(source, Arc::clone(&output_schema)));
+
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            physical_col("id", &output_schema).expect("id column exists"),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+        ));
+        let filter = FilterExec::try_new(predicate, schema_cast)
+            .expect("FilterExec should be constructible");
+
+        // Before the fix this returned the `ExprBoundaries` col_index
+        // out-of-bounds internal error instead of `Ok`.
+        filter
+            .partition_statistics(None)
+            .expect("filter statistics analysis must not go out of bounds");
     }
 
     #[test]
