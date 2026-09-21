@@ -40,10 +40,12 @@ jobs:
     runs-on: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'spiceai-dev-runners' || 'ubuntu-24.04' }}
     env:
       HAS_TEST_MINIO_SECRET: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+    # PR-controlled autobuild must not hold a write-capable GITHUB_TOKEN.
+    # security-events: write lives on the upload job, which never checks out
+    # the PR.
     permissions:
       actions: read
       contents: read
-      security-events: write
 
     strategy:
       fail-fast: false
@@ -112,3 +114,39 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-sarif
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: ${{ runner.temp }}/codeql-sarif
+          if-no-files-found: error
+
+  # Downloads SARIF produced by Analyze and publishes it to code scanning.
+  # This job does not check out the repository, so PR-controlled build scripts
+  # never see security-events: write.
+  upload:
+    name: Upload SARIF
+    needs: analyze
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: codeql-sarif-*
+          path: sarif-results
+          merge-multiple: true
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: sarif-results
+          category: /language:rust
