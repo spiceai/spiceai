@@ -1,10 +1,18 @@
 name: 'CodeQL'
 
-# Security scanner: runs on push to trunk/release + a weekly schedule (and manual
-# dispatch), deliberately NOT in the merge queue — it isn't a required merge gate
-# and would add scan latency to every queue entry.
+# Rust CodeQL security scan. GitHub's automatic Code Quality job covers
+# interpreted languages on pull requests (e.g. Analyze (python)); compiled
+# Rust needs this autobuild. The trunk ruleset requires CodeQL results on the
+# PR head, so this also runs on pull_request and merge_group. Trunk/release
+# pushes, a weekly schedule, and workflow_dispatch still run it. Do not add
+# paths-ignore on pull_request: a skipped rust scan leaves the enterprise
+# code-scanning rule waiting on a check that never starts.
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [trunk, release-*]
+  merge_group:
+    branches: [trunk, release-*]
   push:
     branches: [trunk, release-*]
     paths-ignore:
