@@ -111,19 +111,28 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
 /// non-HTTP connectors (e.g. `localpod`), and a business dataset can
 /// legitimately have its own `response_status: UInt16` and `_fetched_at`
 /// columns, where a value of `503` is real data, not an origin failure.
-/// Checking [`HTTP_RESPONSE_STATUS_METADATA_KEY`] on the field itself is an
-/// authoritative signal instead of a heuristic: only the HTTP connector's own
-/// `base_table_schema` sets it, and `build_json_nest_schema` carries it
-/// through by cloning that same `Field` when the column is force-included
-/// (see `parse_http_json_nesting` in `runtime::dataconnector::https`).
+/// Checking [`HTTP_RESPONSE_STATUS_METADATA_KEY`] on the *schema* (not the
+/// `response_status` field itself) is an authoritative signal instead of a
+/// heuristic: only the HTTP connector's own `base_table_schema` sets it, and
+/// `build_json_nest_schema` carries it through on the schema it builds
+/// regardless of which columns that decomposed schema keeps (see
+/// `parse_http_json_nesting` in `runtime::dataconnector::https`). Living on
+/// the schema rather than the field also means provenance doesn't depend on
+/// `response_status` being present in a particular projection — the field's
+/// own presence is still what gates whether there is a status to read at all.
 fn is_http_result_batch(batch: &RecordBatch) -> bool {
+    if batch
+        .schema()
+        .metadata()
+        .get(HTTP_RESPONSE_STATUS_METADATA_KEY)
+        != Some(&"1".to_string())
+    {
+        return false;
+    }
     batch
         .schema()
         .field_with_name(RESPONSE_STATUS_COLUMN)
-        .is_ok_and(|field| {
-            field.data_type() == &DataType::UInt16
-                && field.metadata().get(HTTP_RESPONSE_STATUS_METADATA_KEY) == Some(&"1".to_string())
-        })
+        .is_ok_and(|field| field.data_type() == &DataType::UInt16)
 }
 
 fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
@@ -971,33 +980,35 @@ pub(crate) mod tests {
         ]))
     }
 
-    /// Tags a `response_status` field the way the real HTTP connector's
-    /// `base_table_schema` does, so it is recognized by
-    /// [`is_http_result_batch`]. See [`HTTP_RESPONSE_STATUS_METADATA_KEY`].
-    fn http_response_status_field() -> Field {
-        Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false).with_metadata(
-            std::collections::HashMap::from([(
-                HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
-                "1".to_string(),
-            )]),
-        )
+    /// The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker the real HTTP
+    /// connector's `base_table_schema` sets, for tagging a test schema the
+    /// same way. It lives on the *schema*, not the `response_status` field
+    /// — see [`is_http_result_batch`].
+    fn http_provenance_metadata() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([(
+            HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            "1".to_string(),
+        )])
     }
 
-    /// Like [`create_http_response_schema`], plus a tagged `response_status`
-    /// and `_fetched_at` — what [`is_http_result_batch`] actually checks.
+    /// Like [`create_http_response_schema`], plus a tagged schema and
+    /// `_fetched_at` — what [`is_http_result_batch`] actually checks.
     /// Tests exercising `batches_cacheable`/`has_transient_http_error_responses`
     /// need this one; `filter_transient_error_responses` tests don't check
     /// provenance at all, so they stay on the untagged schema above.
     fn create_http_response_schema_with_fetched_at() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
-            http_response_status_field(),
-            Field::new(
-                "_fetched_at",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                true,
-            ),
-        ]))
+        Arc::new(
+            Schema::new(vec![
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new(
+                    "_fetched_at",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])
+            .with_metadata(http_provenance_metadata()),
+        )
     }
 
     #[tokio::test]
@@ -1221,20 +1232,23 @@ pub(crate) mod tests {
     /// detected and `caching_stale_if_error` could never fall back to the
     /// cache.
     fn create_real_http_connector_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("request_path", DataType::Utf8, false),
-            Field::new("request_query", DataType::Utf8, true),
-            Field::new("request_body", DataType::Utf8, true),
-            Field::new("request_headers", DataType::Utf8, true),
-            Field::new("content", DataType::Utf8, false),
-            http_response_status_field(),
-            Field::new("response_headers", DataType::Utf8, true),
-            Field::new(
-                "_fetched_at",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                true,
-            ),
-        ]))
+        Arc::new(
+            Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, false),
+                Field::new("request_query", DataType::Utf8, true),
+                Field::new("request_body", DataType::Utf8, true),
+                Field::new("request_headers", DataType::Utf8, true),
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new("response_headers", DataType::Utf8, true),
+                Field::new(
+                    "_fetched_at",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])
+            .with_metadata(http_provenance_metadata()),
+        )
     }
 
     #[test]

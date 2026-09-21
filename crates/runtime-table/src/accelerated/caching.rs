@@ -2994,25 +2994,26 @@ mod tests {
     impl MockHttpTableProvider {
         /// Create a mock HTTP provider that returns data with the specified response status code.
         fn with_status(status_code: u16, content: &str) -> Self {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("request_path", DataType::Utf8, true),
-                Field::new("request_query", DataType::Utf8, true),
-                Field::new("content", DataType::Utf8, true),
+            let schema = Arc::new(
+                Schema::new(vec![
+                    Field::new("request_path", DataType::Utf8, true),
+                    Field::new("request_query", DataType::Utf8, true),
+                    Field::new("content", DataType::Utf8, true),
+                    Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                    Field::new(
+                        CACHE_REFRESHED_AT_COLUMN,
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        true,
+                    ),
+                ])
                 // Tagged the way the real HTTP connector's `base_table_schema`
                 // tags it, so `cache::is_http_result_batch` recognizes it —
                 // see `HTTP_RESPONSE_STATUS_METADATA_KEY`.
-                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false).with_metadata(
-                    std::collections::HashMap::from([(
-                        HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
-                        "1".to_string(),
-                    )]),
-                ),
-                Field::new(
-                    CACHE_REFRESHED_AT_COLUMN,
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    true,
-                ),
-            ]));
+                .with_metadata(std::collections::HashMap::from([(
+                    HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+            );
 
             #[expect(clippy::cast_possible_truncation)]
             let now = SystemTime::now()

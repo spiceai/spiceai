@@ -1105,18 +1105,20 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn base_table_schema() -> Schema {
+        // The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker lives on the
+        // *schema*, not the `response_status` field: it is a provenance
+        // signal ("this batch really came from the HTTP connector's own
+        // fetch"), not a per-column attribute, so it must survive being
+        // rebuilt into a narrower, decomposed schema (see
+        // `build_json_nest_schema`) the same way whether or not
+        // `response_status` itself is one of the columns kept.
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
             Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
-            Field::new("response_status", DataType::UInt16, false).with_metadata(
-                std::collections::HashMap::from([(
-                    crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
-                    "1".to_string(),
-                )]),
-            ),
+            Field::new("response_status", DataType::UInt16, false),
             Field::new(
                 "response_headers",
                 DataType::Map(
@@ -1138,6 +1140,10 @@ impl HttpTableProvider {
                 true,
             ),
         ])
+        .with_metadata(std::collections::HashMap::from([(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            "1".to_string(),
+        )]))
     }
 
     /// Extract path and query from filters

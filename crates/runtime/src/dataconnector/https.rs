@@ -1514,7 +1514,15 @@ fn build_json_nest_schema(
         let nullable = column.nullable.unwrap_or(true);
         fields.push(arrow_schema::Field::new(name, dt, nullable));
     }
-    Ok(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
+    // Carry the base schema's HTTP-provenance marker forward even though the
+    // decomposed schema is otherwise a different set of fields: it is what
+    // `cache::is_http_result_batch` checks to tell a real HTTP-connector
+    // batch from an unrelated dataset that happens to have a same-shaped
+    // `response_status` column of its own (see `HTTP_RESPONSE_STATUS_METADATA_KEY`).
+    Ok(std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        base.metadata().clone(),
+    )))
 }
 
 /// Compute the static schema (no source I/O) for an HTTPS dataset in
