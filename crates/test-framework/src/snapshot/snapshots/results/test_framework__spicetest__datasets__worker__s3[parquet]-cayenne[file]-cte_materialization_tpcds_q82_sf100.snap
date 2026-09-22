@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q82"
+---
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| i_item_id        | i_item_desc                                                                                                                                                       | i_current_price |
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| AAAAAAAAABHOBAAA | Average, pretty times might not help certain payments. Important, informal years will act required layers; forests could stay in a rocks. Gre                     | 85.67           |
+| AAAAAAAAAIIBDAAA | F                                                                                                                                                                 | 81.33           |
+| AAAAAAAABMGDAAAA | Persiste                                                                                                                                                          | 72.60           |
+| AAAAAAAABOJOCAAA | Royal, grey cases taste sometime                                                                                                                                  | 74.07           |
+| AAAAAAAABOODCAAA | Actual police pursue stairs. Others may believe now economic profits. Senior, continuous maps cannot drop later good, futur                                       | 97.57           |
+| AAAAAAAADCHFCAAA | Young, important teachers should not please purely average, leading questions. Darling husbands may not relate on a authorities. Hence excell                     | 69.26           |
+| AAAAAAAADNADAAAA | Very capable services compromise in a firms. Never prime firms scrape hardly. Troops may double however. Good, red houses s                                       | 91.62           |
+| AAAAAAAADONOCAAA | Today weekly years hold; cells honour most enough open requirements. Molecular friends cover presidential, immediate clothes. Si                                  | 94.71           |
+| AAAAAAAAEEMCAAAA | Thick, positive readers return in the explanations; police sell about perfect groups. Difficult, integrated motives would not allow here at a pubs. Ready marks b | 87.93           |
+| AAAAAAAAELEIBAAA | Marginal, radical years understand very running windows; considerable eyes get by the procedures. Interested, competitive rights cost everywhere. A               | 76.94           |
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+

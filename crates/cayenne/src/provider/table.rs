@@ -50,11 +50,11 @@ use super::maintenance_metrics::{
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
-    BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
-    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext, OnConflictDeletionUpdate,
-    OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream, PendingTombstoneDeltas,
-    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
-    PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
+    BatchValidationResult, CheckpointCorpusKeys, DeletionSinkSource, ExtractedPrimaryKeys,
+    InlineAwareDeletionSink, InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
+    OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
+    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
+    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
     pk_deletion_snapshot_for_strategy,
@@ -160,7 +160,9 @@ use super::memory_account::CayenneMemoryAccount;
 use super::staging_wal::PreparedStagedAppend;
 use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use vortex_datafusion::VortexAccessPlanProvider;
+use vortex_datafusion::VortexWriteObserver;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
@@ -747,6 +749,16 @@ struct SnapshotScanListingRequest<'a> {
     snapshot_id: &'a str,
     limit: Option<usize>,
     scan_schema: SchemaRef,
+    captured_files: Option<&'a CapturedSnapshotFiles>,
+}
+
+/// The unpruned warm file set captured with a scan's inline and deletion views.
+/// Listing generations belong to this capture, never to a later live directory.
+#[derive(Clone)]
+struct CapturedSnapshotFiles {
+    dir_generation: u64,
+    listing_epoch: u64,
+    files: Arc<Vec<PartitionedFile>>,
 }
 
 /// The live state one sweep reads, owned so it can cross into `spawn_blocking`.
@@ -1215,10 +1227,14 @@ struct RawScanInput {
     protected_map: Arc<HashMap<String, i64>>,
     /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
     /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
-    inlined_view: Arc<Vec<InlinedViewEntry>>,
-    /// Current snapshot id captured under the read fence — the file set the scan
-    /// reads. Pinned against GC by [`Self::scan_guard`].
+    inlined_view: Arc<Vec<Arc<InlinedViewEntry>>>,
+    /// Current snapshot id captured under the read fence and pinned against GC
+    /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
+    /// Warm files captured under the same fence as the inline and deletion views.
+    /// A checkpoint may add files to the same directory after capture; those files
+    /// must not be unioned with this view's pre-checkpoint inline rows.
+    warm_files: CapturedSnapshotFiles,
     /// Cold-tier manifest belonging to [`Self::current_snapshot_id`], resolved under
     /// the SAME held read fence (see
     /// [`CayenneTableProvider::cold_manifest_under_held_fence`]). `None` when the
@@ -1268,6 +1284,8 @@ impl RawScanInput {
     fn key(&self, structural_version: u64) -> ScanViewKey {
         ScanViewKey {
             snapshot_id: self.current_snapshot_id.clone(),
+            dir_generation: self.warm_files.dir_generation,
+            listing_epoch: self.warm_files.listing_epoch,
             structural_version,
             structural_epoch: self.structural_epoch,
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
@@ -1329,6 +1347,8 @@ struct ColdTierScan<'a> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ScanViewKey {
     snapshot_id: String,
+    dir_generation: u64,
+    listing_epoch: u64,
     structural_version: u64,
     structural_epoch: u64,
     maintained_aggregate_epoch: Option<u64>,
@@ -1365,41 +1385,65 @@ struct ScanView {
     /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
     /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
     union_tombstones: crate::provider::mem_tier::InMemTombstones,
-    /// The forced-structural generation ([`super::structural_version::StructuralVersion`])
-    /// this bundle was validated at (EVEN — a non-torn capture; see
-    /// [`CayenneTableProvider::scan_view_at_current_input`]). It is folded into the
-    /// [`ScanViewKey`] so a **live schema-evolution** — the sole event wired to
-    /// `StructuralVersion::begin_mutation()`, whose off-fence all-shards mem-tier flush
-    /// could otherwise tear a straddling capture — mints a fresh key, and it gates the
-    /// read-current (lag > 0) fast path so a stale-tolerant scan is never served a
-    /// pre-evolution bundle. The other forced snapshot events (truncate / full-delete /
-    /// `INSERT OVERWRITE` / reopen) are fence-serialized and advance only the additive
-    /// `scan_input_version`, so a read-your-writes (lag == 0) capture sees them via the
-    /// snapshot id and they need no structural bump.
+    /// Seqlock generation this bundle was validated at (even — a non-torn capture).
+    /// Folded into the [`ScanViewKey`] so a live schema-evolution mints a fresh key,
+    /// and compared on both reuse fast paths so a serve is never a pre-evolution
+    /// bundle. Fence-serialized snapshot events (truncate / full-delete /
+    /// `INSERT OVERWRITE` / reopen) bump only `scan_input_version`.
     structural_version: u64,
 }
 
 /// A completed, cached scan view plus its identity and ordering metadata. Held by
 /// [`ScanViewCache::latest_complete`].
 struct CompletedScanView {
-    /// The identity this view was built for. A read-your-writes (lag == 0) scan whose
-    /// capture keys to this serves it directly (no rebuild).
+    /// The identity this view was built for. A [`ScanViewReuse::UntilInvalidated`]
+    /// scan whose capture keys to this serves it directly (no rebuild).
     key: ScanViewKey,
     /// Ordering axis — the `scan_input_version` observed at capture. Higher = newer.
     /// A SAFE heuristic: any completed view at a given identity is valid, so a wrong
     /// "which is newest" pick is still correct; it only decides which completed build
     /// wins the single `latest_complete` slot.
     order: u64,
-    /// When the underlying state was captured — the staleness reference for the
-    /// read-current (lag > 0) path (`now - captured_at <= lag` ⇒ servable).
+    /// When the underlying state was captured or revalidated at this key.
+    /// [`ScanViewReuse::WithinLag`] serves this view while `now - captured_at <= lag`.
     captured_at: Instant,
-    /// When this slot was last SERVED (a read-current within-lag serve or a
-    /// read-your-writes exact-key hit); seeded at promotion time. Drives idle eviction: the background sweep
-    /// drops the view only after it has gone unserved for the idle window, so a view
-    /// still being reused — including a read-your-writes exact-key hit that stays
-    /// valid regardless of age — is retained, not dropped mid-reuse.
-    last_access: Instant,
+    /// When this slot was last served, as nanoseconds since
+    /// [`scan_view_clock_epoch`]. Atomic so a wait-free hit can refresh it
+    /// without taking the in-flight mutex. Drives idle eviction: the sweep drops
+    /// the view only after it has gone unserved for the idle window.
+    last_access_ns: AtomicU64,
     view: Arc<ScanView>,
+}
+
+impl CompletedScanView {
+    fn touch(&self, now: Instant) {
+        self.last_access_ns
+            .store(scan_view_instant_as_ns(now), Ordering::Relaxed);
+    }
+
+    fn last_access(&self) -> Instant {
+        scan_view_instant_from_ns(self.last_access_ns.load(Ordering::Relaxed))
+    }
+}
+
+/// Process-local origin for [`CompletedScanView::last_access_ns`]. `Instant`
+/// is not itself atomic; encoding as ns-since-epoch lets a hit refresh
+/// last-access with a single store.
+fn scan_view_clock_epoch() -> Instant {
+    static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    *EPOCH
+}
+
+fn scan_view_instant_as_ns(now: Instant) -> u64 {
+    u64::try_from(
+        now.saturating_duration_since(scan_view_clock_epoch())
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn scan_view_instant_from_ns(ns: u64) -> Instant {
+    scan_view_clock_epoch() + Duration::from_nanos(ns)
 }
 
 /// A `Shared` build future: N concurrent scans that key to the same identity await
@@ -1421,23 +1465,40 @@ struct InFlightScanView {
     build: ScanViewBuild,
 }
 
-/// The decision a scan reaches under the cache lock, executed (awaited) after the
-/// lock is released. Keeps `.await` outside the `parking_lot` guard.
+/// The decision a scan reaches under the in-flight lock, executed (awaited)
+/// after the lock is released. Keeps `.await` outside the `parking_lot` guard.
 enum ScanViewAction {
     /// A completed view to return immediately.
     Serve(Arc<ScanView>),
-    /// A build (own or deduplicated) to await.
-    Await(ScanViewBuild),
+    /// A build (own or deduplicated) to await. Identity is carried so the
+    /// awaiter can publish `latest_complete` without a second in-flight lock.
+    Await {
+        build: ScanViewBuild,
+        key: ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+    },
 }
 
-/// Result of probing the cache for a specific [`ScanViewKey`].
-enum ScanViewProbe {
-    /// A completed view with this exact identity — serve it, no rebuild.
-    Hit(Arc<ScanView>),
-    /// A build for this identity is in flight — await it (dedup).
-    Pending(ScanViewBuild),
-    /// Nothing for this identity — the caller must start a build.
-    Miss,
+/// How a cached [`ScanView`] is reused across scans.
+///
+/// Derived from the dataset's `refresh_mode` **and writability**
+/// (`scan_view_reuse_for`):
+///
+/// - [`Self::UntilInvalidated`] — `full` / `append` / `snapshot` / `caching`,
+///   and **writable** `changes` (write-back). Serve the cached view until a
+///   write bumps `scan_input_version`.
+/// - [`Self::WithinLag`] — **read-only** `changes` only. Serve a view
+///   captured within `lag` so concurrent scans can share one build across a
+///   burst of applies. Direct builder users must not pick this for a
+///   write-back table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanViewReuse {
+    /// Serve `latest_complete` until a write advances `scan_input_version`.
+    #[default]
+    UntilInvalidated,
+    /// Serve a view captured within `lag`. A zero lag recaptures every scan.
+    WithinLag(Duration),
 }
 
 /// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
@@ -1445,93 +1506,168 @@ enum ScanViewProbe {
 /// version a scan actually queries (build-only-what's-queried), which relieves the
 /// per-version rebuild CPU that competed with the CDC apply under churn.
 ///
-/// Two slots, not a map: a single self-replacing `latest_complete` (a newer completed
-/// build overwrites it, oldest-out — implicit eviction) plus a short `in_flight` list
-/// for dedup. Guarded by a `parking_lot::Mutex`; the rule is **decide under the lock,
-/// await OUTSIDE it** — the mutex is never held across `.await`.
-#[derive(Default)]
+/// Two slots, not a map:
+/// - `latest_complete` is an [`ArcSwapOption`] so a hit is wait-free (no mutex,
+///   no drain). Concurrent scans pipeline: they load the published view while a
+///   miss is still capturing.
+/// - `in_flight` is a short list behind a `parking_lot::Mutex` used only on a
+///   miss, for build dedup. The rule remains **decide under that lock, await
+///   OUTSIDE it**.
 struct ScanViewCache {
     /// The newest completed bundle. `None` until the first build resolves.
-    latest_complete: Option<CompletedScanView>,
+    latest_complete: ArcSwapOption<CompletedScanView>,
     /// Builds still resolving. Self-trims on [`Self::drain_completed`].
-    in_flight: Vec<InFlightScanView>,
+    in_flight: ParkingMutex<Vec<InFlightScanView>>,
+}
+
+impl Default for ScanViewCache {
+    fn default() -> Self {
+        Self {
+            latest_complete: ArcSwapOption::empty(),
+            in_flight: ParkingMutex::new(Vec::new()),
+        }
+    }
+}
+
+/// Unpruned snapshot-directory listing with per-file footer statistics.
+///
+/// A PK point lookup still has to LIST the snapshot and fetch stats for every
+/// Vortex file before it can prune to the one file whose min/max contains K.
+/// On a frozen snapshot that work is identical across queries, so the first
+/// complete listing is stored here and later scans prune in memory.
+struct CachedSnapshotListing {
+    snapshot_id: String,
+    dir_generation: u64,
+    listing_epoch: u64,
+    files: Arc<Vec<PartitionedFile>>,
+    /// Captured file set these statistics enrich, when built for a scan view.
+    /// A query may reuse the enrichment only for that same immutable file set.
+    source_files: Option<Arc<Vec<PartitionedFile>>>,
 }
 
 impl ScanViewCache {
+    /// Publish `view` as `latest_complete` if it is at least as new as the
+    /// currently published slot (`order` is the scan-input version at capture).
+    /// At the same version, retain the most recent validated capture time.
+    fn publish_completed(
+        &self,
+        key: ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+        view: Arc<ScanView>,
+    ) {
+        let completed = Arc::new(CompletedScanView {
+            key,
+            order,
+            captured_at,
+            // Seed last-access at PROMOTION time (not `captured_at`): a build
+            // slower than the idle window would otherwise be published already
+            // "stale" and evicted on the next tick before any scan could reuse
+            // it. Serves refresh it from here.
+            last_access_ns: AtomicU64::new(scan_view_instant_as_ns(Instant::now())),
+            view,
+        });
+        self.latest_complete.rcu(|current| match current {
+            Some(existing) if (existing.order, existing.captured_at) >= (order, captured_at) => {
+                Some(Arc::clone(existing))
+            }
+            _ => Some(Arc::clone(&completed)),
+        });
+    }
+
+    /// Wait-free serve of a `latest_complete` snapshot already loaded by the
+    /// caller. The caller must load `candidate` **between** `version_before`
+    /// and `version_after`; this does not load `latest_complete` again, so a
+    /// write that publishes after `version_after` cannot swap in a different
+    /// view that this check would still accept.
+    fn try_serve_latest(
+        reuse: ScanViewReuse,
+        version_before: u64,
+        version_after: u64,
+        structural: u64,
+        now: Instant,
+        candidate: Option<Arc<CompletedScanView>>,
+    ) -> Option<Arc<ScanView>> {
+        // A live schema-evolution leaves the generation odd; never serve across it.
+        if structural & 1 == 1 {
+            return None;
+        }
+        let current = candidate?;
+        let servable = match reuse {
+            ScanViewReuse::UntilInvalidated => {
+                version_before == version_after
+                    && current.order == version_after
+                    && current.view.structural_version == structural
+            }
+            ScanViewReuse::WithinLag(lag) if !lag.is_zero() => {
+                now.saturating_duration_since(current.captured_at) <= lag
+                    && current.view.structural_version == structural
+            }
+            ScanViewReuse::WithinLag(_) => false,
+        };
+        if !servable {
+            return None;
+        }
+        current.touch(now);
+        Some(Arc::clone(&current.view))
+    }
+
+    /// Reuse a completed view after a validated capture confirms its identity.
+    /// Renew the version and capture time so subsequent scans can reuse it
+    /// without another capture, including after an unchanged-key invalidation.
+    fn serve_if_key(
+        &self,
+        key: &ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+    ) -> Option<Arc<ScanView>> {
+        let current = self.latest_complete.load_full()?;
+        if current.key != *key {
+            return None;
+        }
+        current.touch(Instant::now());
+        let view = Arc::clone(&current.view);
+        self.publish_completed(key.clone(), order, captured_at, Arc::clone(&view));
+        Some(view)
+    }
+
     /// Peek every in-flight build (a `Shared` peek — NO poll), promote the
     /// highest-`order` SUCCESS to `latest_complete`, and drop completed entries
-    /// (errored or superseded), leaving only still-pending builds. A build is
-    /// observed complete only once some awaiter or the independent driver task has
-    /// driven it to completion; a build no one has driven simply stays pending here.
-    fn drain_completed(&mut self) {
+    /// (errored or superseded), leaving only still-pending builds. Called only
+    /// on the miss / evictor path — a hit never walks `in_flight`.
+    fn drain_completed(&self, in_flight: &mut Vec<InFlightScanView>) {
         let mut idx = 0;
-        while idx < self.in_flight.len() {
-            if self.in_flight[idx].build.peek().is_none() {
+        while idx < in_flight.len() {
+            if in_flight[idx].build.peek().is_none() {
                 idx += 1;
                 continue;
             }
             // Ready: remove it (swap_remove moves the last entry into `idx`, so do
             // NOT advance — re-examine `idx` next iteration) and promote-or-drop.
-            let done = self.in_flight.swap_remove(idx);
+            let done = in_flight.swap_remove(idx);
             let Some(Ok(view)) = done.build.peek() else {
                 continue; // errored build — drop it (not poisoned)
             };
-            let newer = self
-                .latest_complete
-                .as_ref()
-                .is_none_or(|current| done.order >= current.order);
-            if newer {
-                self.latest_complete = Some(CompletedScanView {
-                    key: done.key,
-                    order: done.order,
-                    captured_at: done.captured_at,
-                    // Seed last-access at PROMOTION time (not `captured_at`): a build
-                    // slower than the idle window would otherwise be promoted already
-                    // "stale" and evicted on the next tick before any scan could reuse
-                    // it. Serves refresh it from here.
-                    last_access: Instant::now(),
-                    view: Arc::clone(view),
-                });
-            }
+            self.publish_completed(done.key, done.order, done.captured_at, Arc::clone(view));
         }
     }
 
-    /// The `latest_complete` view iff it is servable for a read-current scan: captured
-    /// within `lag` of `now` AND at the current structural generation (so a
-    /// stale-tolerant scan is never served a pre-schema-evolution view). Records the
-    /// access (`last_access`) ONLY on a true serve — a within-lag-but-obsolete view is
-    /// NOT refreshed, so the evictor can still drop it and release its pinned dirs.
-    fn servable_within_lag(
-        &mut self,
-        now: Instant,
-        lag: Duration,
-        structural: u64,
-    ) -> Option<Arc<ScanView>> {
-        let current = self.latest_complete.as_mut()?;
-        let servable = now.duration_since(current.captured_at) <= lag
-            && current.view.structural_version == structural;
-        servable.then(|| {
-            current.last_access = now;
-            Arc::clone(&current.view)
-        })
+    /// Drop `latest_complete` iff it has gone unserved past `idle_window`.
+    /// Compare-and-swap so a concurrent publish is not clobbered.
+    fn evict_if_idle(&self, now: Instant, idle_window: Duration) {
+        let current = self.latest_complete.load();
+        let Some(current_view) = current.as_ref() else {
+            return;
+        };
+        if now.saturating_duration_since(current_view.last_access()) <= idle_window {
+            return;
+        }
+        let _ = self.latest_complete.compare_and_swap(&current, None);
     }
 
-    /// Probe for an exact identity: serve a completed view, await an in-flight build,
-    /// or report a miss. Used by the read-your-writes (lag == 0) path and the
-    /// read-current MISS path. Records the access (`last_access`) on a hit so a view
-    /// still being reused (an exact-key hit is valid regardless of age) is not
-    /// idle-evicted.
-    fn find_by_key(&mut self, key: &ScanViewKey) -> ScanViewProbe {
-        if let Some(current) = self.latest_complete.as_mut()
-            && current.key == *key
-        {
-            current.last_access = Instant::now();
-            return ScanViewProbe::Hit(Arc::clone(&current.view));
-        }
-        if let Some(entry) = self.in_flight.iter().find(|entry| entry.key == *key) {
-            return ScanViewProbe::Pending(entry.build.clone());
-        }
-        ScanViewProbe::Miss
+    #[cfg(test)]
+    fn has_latest_complete(&self) -> bool {
+        self.latest_complete.load().is_some()
     }
 }
 
@@ -1625,6 +1761,18 @@ pub struct CayenneTableProvider {
     /// replaces the per-scan `ListingTable` cache while preserving repeated
     /// scan behavior when `collect_statistics` asks us to read Vortex footers.
     scan_file_statistics: Arc<dyn FileStatisticsCache>,
+    /// Unpruned snapshot directory listing (paths + footer stats) for the
+    /// current file set. Keyed by snapshot id, [`Self::current_dir_generation`],
+    /// and [`Self::listing_cache_epoch`] so a publish that adds files cannot
+    /// serve a short list. A hit skips object-store LIST and per-file
+    /// footer/catalog fetches; the query still prunes with its own predicate.
+    cached_snapshot_listing: Arc<ArcSwapOption<CachedSnapshotListing>>,
+    /// Bumped whenever [`Self::cached_snapshot_listing`] is dropped. Distinct
+    /// from [`Self::current_dir_generation`]: bumping that generation aborts
+    /// compaction. An in-flight LIST samples this at start and skips storing
+    /// if it moved, so a listing that overlapped
+    /// [`Self::refresh_listing_table`] cannot restore the pre-refresh file set.
+    listing_cache_epoch: Arc<AtomicU64>,
     /// Table-level Vortex statistics cache loaded from the metastore and maintained
     /// after writes. The optimizer-facing `Statistics` and raw `TableStatistics`
     /// blob live under the same lock so clears and updates publish both views
@@ -1675,28 +1823,9 @@ pub struct CayenneTableProvider {
     /// derived from the acceleration settings and set via the builder, and shared
     /// across writer clones (a plain in-memory `bool`, `Copy`).
     durable_write_back: bool,
-    /// Per-scan freshness tolerance (the read-current lag) applied by [`Self::scan`].
-    /// `0` = read-your-writes: every scan captures and serves the CURRENT state.
-    /// Non-zero lets concurrent analytical scans share a recently-built [`ScanView`]
-    /// within the lag (the demand cache's cross-query reuse lever). Derived at
-    /// construction from the dataset's `access` mode AND refresh mode: only a read-only
-    /// CDC replica (`access: read` + `refresh_mode: changes`) — eventually-consistent by
-    /// design — gets a bounded non-zero lag; every other table (a read-only
-    /// full-refresh/snapshot/append table, which must reflect its last refresh
-    /// immediately, or any writable dataset) gets `0` for read-your-writes. Set via the
-    /// builder. A plain in-memory `Duration` (`Copy`), shared across writer clones. See
-    /// [`Self::scan_view_at_current_input`].
-    ///
-    /// NOTE: `0` for read-write datasets rebuilds per scan under a mixed read/write
-    /// workload (any mutation re-keys the capture), even across RESULT-PRESERVING churn
-    /// (compaction / checkpoint) that leaves query results identical. If that proves too
-    /// eager, the intended refinement is to export a monotonic WRITE-WATERMARK bumped
-    /// only by result-changing writes and serve any view whose watermark ≥ the reader's
-    /// start — coarse read-your-writes that reuses across result-preserving churn, with
-    /// this `Duration` staying as the bounded-staleness fallback. Deferred: it moves a
-    /// value that is currently a heuristic onto the correctness path and needs a
-    /// write-vs-preserving bump audit + loom test, so it is out of scope for this change.
-    default_scan_freshness: Duration,
+    /// How a scan reuses a cached [`ScanView`]. Set from `refresh_mode` at
+    /// construction; see [`ScanViewReuse`] and [`Self::scan_view_at_current_input`].
+    scan_view_reuse: ScanViewReuse,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -1760,6 +1889,22 @@ pub struct CayenneTableProvider {
     /// sweep holds a now-stale floor. Consumed on first fire.
     #[cfg(test)]
     test_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a demand-cache `capture_raw_scan_input` returns
+    /// and before `scan_input_version` is sampled to stamp the capture. A write
+    /// in this window used to tag stale rows with the post-write version; the
+    /// capture now retries when the counter moved. Consumed on first fire.
+    #[cfg(test)]
+    test_post_scan_input_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam after selecting a scan view, before building its file plan.
+    /// Consumed on first fire, outside the listing fence.
+    #[cfg(test)]
+    test_post_scan_view_selection_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a snapshot-directory LIST is collected and
+    /// before it is stored in [`Self::cached_snapshot_listing`], so a test can
+    /// add files and refresh listing in the window an in-flight LIST would
+    /// otherwise re-store a stale file set. Consumed on first fire.
+    #[cfg(test)]
+    test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -1840,6 +1985,13 @@ pub struct CayenneTableProvider {
     /// Accounts the keyset + deletion indexes against the query memory
     /// pool. `Arc`-shared with provider clones so they update one reservation.
     table_memory: Arc<CayenneMemoryAccount>,
+    /// Secondary indexes over the table's Vortex files, from the acceleration's
+    /// `indexes`. `None` when it declares none. Owned by the provider and its
+    /// clones, so dropping the table drops the index and its reservation.
+    lookup_index: Option<Arc<super::lookup_index::LookupIndexState>>,
+    /// Secondary indexes over a memory-mode table's rows, kept with each
+    /// memory-tier segment. `None` in file mode and without `indexes`.
+    mem_tier_index: Option<Arc<super::mem_tier_index::MemTierIndexer>>,
     /// Coalesces inline-memtable checkpoint checks spawned after inline writes.
     /// The check takes `write_lock` in the background after the scheduling
     /// writer returns, so inline commits do not hold the writer lock while
@@ -1898,9 +2050,9 @@ pub struct CayenneTableProvider {
     /// computation is offloaded to `spawn_blocking` (D3) and deduplicated across
     /// concurrent scans on the same state. Retires the two per-scan `ArcSwapOption`
     /// memos (`merged_scan_deletions`, `mem_tier_visible_memo`). Shared across
-    /// `clone_for_write` clones. `parking_lot::Mutex` — decide under
-    /// the lock, await OUTSIDE it (never held across `.await`).
-    scan_view_cache: Arc<ParkingMutex<ScanViewCache>>,
+    /// `clone_for_write` clones. Hit path is wait-free (`ArcSwapOption`); the
+    /// in-flight mutex is taken only on a miss, and never held across `.await`.
+    scan_view_cache: Arc<ScanViewCache>,
     /// A weak self-reference the cache uses to obtain an owned `Arc<Self>` for its
     /// `spawn_blocking` builds (a build closure must be `'static`, so it cannot borrow
     /// `&self`). Set once via [`Self::init_weak_self`] right after the provider is
@@ -1910,8 +2062,10 @@ pub struct CayenneTableProvider {
     weak_self: Arc<std::sync::OnceLock<std::sync::Weak<CayenneTableProvider>>>,
     /// Monotonic scan-input version, bumped by [`Self::notify_scan_input_change`] on
     /// EVERY mutation (ordinary or forced). It is the cache's ORDERING axis (which
-    /// completed build wins the `latest_complete` slot) and a cheap freshness signal;
-    /// it is NOT a correctness gate. Shared across `clone_for_write` clones.
+    /// completed build wins the `latest_complete` slot) and the invalidation signal
+    /// for [`ScanViewReuse::UntilInvalidated`]: a scan serves `latest_complete` iff
+    /// this counter still equals the view's capture generation. Shared across
+    /// `clone_for_write` clones.
     scan_input_version: Arc<AtomicU64>,
     /// Seqlock bracketing a demand capture (`read_validated_async`) so a scan never
     /// builds a bundle whose capture straddled a mutation that changes the per-shard
@@ -1922,7 +2076,7 @@ pub struct CayenneTableProvider {
     /// snapshot publishing does NOT bump it — those run under `listing_fence.write()`,
     /// so a capture (holding `listing_fence.read()`) sees them all-or-nothing. Its
     /// even value is folded into the [`ScanViewKey`] (so a schema-evolve mints a fresh
-    /// key) and gates the read-current fast path. INERT at `cdc_mem_tier_shards == 1`
+    /// key) and gates both reuse fast paths. INERT at `cdc_mem_tier_shards == 1`
     /// (single-shard capture is atomic), which memory mode enforces. Shared across
     /// clones.
     structural_version: Arc<crate::provider::structural_version::StructuralVersion>,
@@ -2526,7 +2680,30 @@ pub struct CayenneTableProviderBuilder {
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
-    default_scan_freshness: Duration,
+    scan_view_reuse: ScanViewReuse,
+    secondary_indexes: Vec<Vec<String>>,
+}
+
+/// Resolves every configured lookup-index column before table creation/open.
+/// Returning the resolved specs lets `create` fail before it mutates the
+/// catalog, while `open` repeats the check against the persisted schema.
+fn validated_lookup_index_keys(
+    table_name: &str,
+    schema: &arrow_schema::Schema,
+    indexes: &[Vec<String>],
+) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
+    let keys = super::lookup_index::KeySpec::from_indexes(indexes);
+    for key in &keys {
+        for column in key.columns() {
+            super::lookup_index::KeyColumn::resolve(schema, column).map_err(|message| {
+                Error::InvalidConfiguration {
+                    table: table_name.to_string(),
+                    message,
+                }
+            })?;
+        }
+    }
+    Ok(keys)
 }
 
 struct PendingMaintainedAggregateInsert {
@@ -2624,7 +2801,8 @@ struct CayenneTableProviderOpenOptions {
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
-    default_scan_freshness: Duration,
+    scan_view_reuse: ScanViewReuse,
+    secondary_indexes: Vec<Vec<String>>,
 }
 
 impl CayenneTableProviderBuilder {
@@ -2641,8 +2819,8 @@ impl CayenneTableProviderBuilder {
             context: None,
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
-            // Read-your-writes by default; the runtime raises it for read-only datasets.
-            default_scan_freshness: Duration::ZERO,
+            scan_view_reuse: ScanViewReuse::UntilInvalidated,
+            secondary_indexes: Vec::new(),
         }
     }
 
@@ -2714,15 +2892,26 @@ impl CayenneTableProviderBuilder {
         self
     }
 
-    /// Set the per-scan freshness tolerance (read-current lag). `0` =
-    /// read-your-writes (the default). The runtime derives this from the dataset's
-    /// `access` mode AND refresh mode: a bounded non-zero lag only for a read-only CDC
-    /// replica (`access: read` + `refresh_mode: changes`), and `0` for every other
-    /// table (read-write, or read-only non-CDC). See
-    /// [`CayenneTableProvider::default_scan_freshness`].
+    /// Set how a scan reuses a cached [`ScanView`]. Default is
+    /// [`ScanViewReuse::UntilInvalidated`] (`full` / `append` / `snapshot` /
+    /// `caching`, and writable `changes`). The runtime sets
+    /// [`ScanViewReuse::WithinLag`] only for read-only `refresh_mode: changes`.
     #[must_use]
-    pub fn with_default_scan_freshness(mut self, freshness: Duration) -> Self {
-        self.default_scan_freshness = freshness;
+    pub fn with_scan_view_reuse(mut self, reuse: ScanViewReuse) -> Self {
+        self.scan_view_reuse = reuse;
+        self
+    }
+
+    /// Maintain a secondary index on each column set, one per `indexes` entry of
+    /// the acceleration. A query whose filters pin every column of one of them
+    /// to an equality literal reads only the rows holding that key.
+    ///
+    /// Taken from the acceleration on every open rather than stored with the
+    /// table, so adding, changing or removing an entry takes effect the next time
+    /// the table is registered.
+    #[must_use]
+    pub fn with_secondary_indexes(mut self, indexes: Vec<Vec<String>>) -> Self {
+        self.secondary_indexes = indexes;
         self
     }
 
@@ -2730,8 +2919,8 @@ impl CayenneTableProviderBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table cannot be found in the catalog or if the listing
-    /// table cannot be created.
+    /// Returns an error if the table cannot be found in the catalog, its lookup
+    /// indexes are invalid, or the listing table cannot be created.
     pub async fn open(self, table_name: &str) -> Result<CayenneTableProvider> {
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -2741,7 +2930,8 @@ impl CayenneTableProviderBuilder {
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
-            default_scan_freshness: self.default_scan_freshness,
+            scan_view_reuse: self.scan_view_reuse,
+            secondary_indexes: self.secondary_indexes,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -2753,9 +2943,11 @@ impl CayenneTableProviderBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table cannot be created in the catalog.
+    /// Returns an error if its lookup indexes are invalid or the table cannot be
+    /// created in the catalog.
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
+        validated_lookup_index_keys(&table_name, &options.schema, &self.secondary_indexes)?;
         let _table_id = self.catalog.create_table(options).await?;
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -2765,7 +2957,8 @@ impl CayenneTableProviderBuilder {
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
-            default_scan_freshness: self.default_scan_freshness,
+            scan_view_reuse: self.scan_view_reuse,
+            secondary_indexes: self.secondary_indexes,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -2805,6 +2998,10 @@ fn retention_deferred_transient_message(table_name: &str) -> String {
         "Failed to apply the retention policy to accelerated dataset '{table_name}': a write to this dataset is still being published, so rows matching `retention_sql` stay queryable for the moment. The next pass applies it; retry a manual drain in a few seconds. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
+
+/// Writes up to this many rows index their memory-tier segment on the writing
+/// task; larger ones hash and sort their keys on the blocking pool.
+const MEM_TIER_INDEX_INLINE_ROWS: usize = 1_024;
 
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
     let elapsed = start.elapsed();
@@ -3188,7 +3385,7 @@ enum WriteShapeDecision {
     /// columns — the structural case.
     SerialSortColumns = 0,
     /// The write must produce one sequence of files for another reason (position
-    /// deletes, a Z-order-clustered promotion).
+    /// deletes, a curve-clustered promotion).
     SerialRequired = 1,
     /// The byte estimate produced fewer shards than the concurrency cap.
     SizeBounded = 2,
@@ -3604,7 +3801,7 @@ pub(crate) enum EncodeFanOut {
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
-    /// assumes one output sequence), a Z-order-clustered cold promotion
+    /// assumes one output sequence), a curve-clustered cold promotion
     /// (sharding scatters the clustering the promotion exists to create), and a
     /// globally sorted rewrite (splitting the sorted stream across shard files
     /// would give each file the whole key range, forfeiting the pruning the
@@ -3708,6 +3905,63 @@ fn range_bounds_from_statistics(
         }
         previous = Some(cut);
         bounds.push(rebuild_scalar_like(min, cut)?);
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+/// A sample taken from a string or binary view column, holding only the bytes
+/// of the values it picked.
+///
+/// `take` on a view array shares the source batch's data buffers, so every
+/// sampled batch would otherwise keep all of its key bytes alive until the
+/// sample is complete — the whole key column, for a sample of a few thousand
+/// values.
+fn compact_sampled_views(picked: ArrayRef) -> ArrayRef {
+    use arrow::array::AsArray;
+
+    match picked.data_type() {
+        DataType::Utf8View => Arc::new(picked.as_string_view().gc()),
+        DataType::BinaryView => Arc::new(picked.as_binary_view().gc()),
+        _ => picked,
+    }
+}
+
+/// Up to `shards - 1` strictly ascending split points cutting the non-NULL
+/// values of `sample` into equal-count slices, for any type the range router can
+/// compare (see [`is_range_routable_type`]). NULLs are skipped; the router keeps
+/// NULL keys on the first shard.
+///
+/// Unlike [`range_bounds_from_histogram`] this needs no numeric interpolation,
+/// so it cuts string and binary keys too — the keys lookups on a full-refresh
+/// table most often use. A row whose key equals a split point lands on the lower
+/// shard, so repeated values never straddle two files. `None` when the sample is
+/// too small to cut or every cut collapses onto one value.
+fn equal_count_bounds(sample: &ArrayRef, shards: usize) -> Option<Vec<ScalarValue>> {
+    const MIN_ROWS_PER_SHARD: usize = 64;
+
+    let nulls = sample.null_count();
+    let values = sample.len().saturating_sub(nulls);
+    if shards < 2 || values < shards.saturating_mul(MIN_ROWS_PER_SHARD) {
+        return None;
+    }
+    let order = arrow::compute::sort_to_indices(
+        sample.as_ref(),
+        Some(arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: true,
+        }),
+        None,
+    )
+    .ok()?;
+    let mut bounds: Vec<ScalarValue> = Vec::with_capacity(shards - 1);
+    for cut in 1..shards {
+        let position = nulls + values * cut / shards;
+        let row = usize::try_from(order.value(position)).ok()?;
+        let bound = ScalarValue::try_from_array(sample.as_ref(), row).ok()?;
+        if bound.is_null() || bounds.last().is_some_and(|last| last >= &bound) {
+            continue;
+        }
+        bounds.push(bound);
     }
     (!bounds.is_empty()).then_some(bounds)
 }
@@ -4214,6 +4468,153 @@ fn scalars_share_a_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
 /// An unsorted consolidation carries nothing a reader depends on and is free to
 /// fan its encode out across cores.
 #[must_use]
+/// Which rung of the precedence chain produced a rewrite's clustering key.
+///
+/// Kept alongside the columns because the rungs are not distinguishable from the
+/// column list alone: schema inference fills `cayenne_sort_columns` on every
+/// catalog-visible CDC table, so an inference-derived key can equal an
+/// operator-configured one while carrying none of its authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteKeySource {
+    /// Operator-configured `cayenne_sort_columns` — a stated intent, and the
+    /// order a sorted-snapshot scan may advertise as `output_ordering`.
+    Configured,
+    /// The hottest columns observed in scan pushdown filters (default-on
+    /// adaptive layout). A guess the engine made, never advertised.
+    ObservedFilters,
+    /// Inference-derived `cayenne_sort_columns`, or the primary key.
+    Inferred,
+}
+
+/// A rewrite's clustering key plus [`RewriteKeySource`].
+pub(crate) struct RewriteLayout {
+    pub(crate) columns: Vec<String>,
+    pub(crate) source: RewriteKeySource,
+}
+
+impl RewriteLayout {
+    fn configured(columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            source: RewriteKeySource::Configured,
+        }
+    }
+
+    fn observed(columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            source: RewriteKeySource::ObservedFilters,
+        }
+    }
+
+    fn inferred(columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            source: RewriteKeySource::Inferred,
+        }
+    }
+}
+
+/// How a clustering sort consumes its input.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ClusterSortSpan {
+    /// Sort the whole stream as one run, so the output is globally ordered by
+    /// the curve key. Required wherever the resulting files are read back
+    /// through the ordinary scan path.
+    Global,
+    /// Split into byte-capped runs, each sorted independently. Caps per-run
+    /// memory and first-batch latency, but curve key ranges overlap ACROSS runs,
+    /// so the result is not globally ordered — only safe where the files
+    /// advertise no ordering, as cold-tier files do.
+    BoundedRuns,
+}
+
+/// In-memory bytes of rows each range shard of a whole-table replace sorts by the
+/// routing key at a time (see `WriteShardConfig::range_run_sort_bytes`).
+///
+/// A range file then holds a few key-sorted runs instead of arrival order, so an
+/// equality lookup reads about one zone per run rather than every zone of the
+/// key. One run per shard is resident at a time, charged to the query memory
+/// pool; a refused charge seals the run early rather than failing the write.
+const OVERWRITE_RUN_SORT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Most-filtered columns considered when choosing a routing key, so a hot
+/// column of a type the router cannot split does not rule the others out.
+const DEFAULT_ROUTING_CANDIDATES: usize = 4;
+
+/// A range-partitioned write: split points on one key column.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RangePartitioning<'a> {
+    /// The column `bounds` describe. `None` means the leading column of the
+    /// table's shard key, which is what a rewrite merge splits on.
+    pub(crate) column: Option<&'a str>,
+    /// Ascending split points; see `WriteShardConfig::range_bounds`.
+    pub(crate) bounds: &'a [ScalarValue],
+    /// Sort each range's rows by the key in runs of this many bytes.
+    pub(crate) run_sort_bytes: Option<u64>,
+}
+
+/// How a whole-table replace routes rows into key-range files; see
+/// [`CayenneTableProvider::overwrite_range_plan`].
+#[derive(Debug)]
+pub(crate) struct OverwriteRangePlan {
+    column: String,
+    bounds: Vec<ScalarValue>,
+}
+
+impl OverwriteRangePlan {
+    pub(crate) fn partitioning(&self) -> RangePartitioning<'_> {
+        RangePartitioning {
+            column: Some(&self.column),
+            bounds: &self.bounds,
+            run_sort_bytes: Some(OVERWRITE_RUN_SORT_BYTES),
+        }
+    }
+}
+
+/// Where a range-routed replace takes its key from, for the debug log.
+#[derive(Debug, Clone, Copy)]
+enum RangeKeySource {
+    PrimaryKey,
+    ShardKey,
+    ObservedFilters,
+}
+
+/// Whether the range router can split a column of this type: `sort_to_indices`
+/// orders it and the `gt` comparison kernel compares it against a scalar bound
+/// of the same type. Booleans have nothing worth splitting; dictionary-encoded
+/// columns are left to hashing because a bound is a plain scalar.
+const fn is_range_routable_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(..)
+            | DataType::Duration(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
 const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePolicy {
     if is_sorted {
         super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
@@ -4365,12 +4766,15 @@ impl CayenneTableProvider {
     ///    adapts them to the evolved schema (missing-column null-fill +
     ///    widened-type cast in the Vortex opener).
     /// 4. Under one held `listing_fence.write()`: persist the evolved schema
-    ///    to the metastore (`update_table_schema`), swap the in-memory
-    ///    [`Self::table_schema`], re-derive the cached optimizer statistics at
-    ///    the new width, clear stale per-file statistics, and rebuild the
-    ///    listing table — so a scan observes either the old schema entirely
-    ///    or the new one entirely. In-flight scans keep the `SchemaRef` they
-    ///    already loaded (old files under the old schema stay valid).
+    ///    to the metastore (`update_table_schema`, or
+    ///    `update_table_schema_dropping_statistics` when a decimal scale
+    ///    change would mis-decode leftover unscaled min/max), swap the
+    ///    in-memory [`Self::table_schema`], re-derive the cached optimizer
+    ///    statistics at the new width (or drop them on a scale change),
+    ///    clear stale per-file statistics, and rebuild the listing table —
+    ///    so a scan observes either the old schema entirely or the new one
+    ///    entirely. In-flight scans keep the `SchemaRef` they already loaded
+    ///    (old files under the old schema stay valid).
     ///
     /// Idempotent: re-applying a plan whose evolved schema is already live is
     /// a no-op; a crash between the metastore UPDATE and the swap is healed by
@@ -4452,10 +4856,21 @@ impl CayenneTableProvider {
         // Step 4: publish.
         {
             let _fence = self.listing_fence.write().await;
-            self.catalog
-                .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
-                .await
-                .map_err(|source| Error::Catalog { source })?;
+            let drop_decimal_stats = plan.changes_decimal_scale();
+            if drop_decimal_stats {
+                self.catalog
+                    .update_table_schema_dropping_statistics(
+                        &self.table_metadata.table_id,
+                        &plan.evolved_schema,
+                    )
+                    .await
+                    .map_err(|source| Error::Catalog { source })?;
+            } else {
+                self.catalog
+                    .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
+                    .await
+                    .map_err(|source| Error::Catalog { source })?;
+            }
             self.table_schema.store(Arc::clone(&plan.evolved_schema));
             {
                 // Cached optimizer statistics are column-indexed against the
@@ -4463,28 +4878,38 @@ impl CayenneTableProvider {
                 // == schema width); re-derive from the raw blob at the evolved
                 // width. A blob that no longer deserializes (widened column
                 // stat dtypes) degrades to None — unknown stats, never wrong.
+                // A decimal *scale* change cannot re-derive: the blob's
+                // unscaled integers would decode at the new scale (123.45 at
+                // scale 2 becomes 1.2345 at scale 4) and prune matching rows.
                 let mut stats_cache = self.table_statistics.write();
-                let df_stats = stats_cache
-                    .raw
-                    .as_ref()
-                    .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
-                stats_cache.optimizer_inexact = df_stats
-                    .as_ref()
-                    .map(|s| Self::statistics_to_inexact(s.clone()));
-                stats_cache.optimizer = df_stats;
-                // Preserve the exactness of the (unchanged) count across the
-                // schema-width re-derivation. Conservative when `raw` is cold
-                // (pre-first-persist): treat the count as NOT exact rather than
-                // trusting it — `optimizer` is `None` in that case too, so nothing
-                // is served, but this never leaves a stale-Exact flag behind.
-                stats_cache.count_exact = stats_cache
-                    .raw
-                    .as_ref()
-                    .is_some_and(|raw| raw.num_rows_exact);
+                if drop_decimal_stats {
+                    stats_cache.raw = None;
+                    stats_cache.optimizer = None;
+                    stats_cache.optimizer_inexact = None;
+                    stats_cache.count_exact = false;
+                } else {
+                    let df_stats = stats_cache
+                        .raw
+                        .as_ref()
+                        .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
+                    stats_cache.optimizer_inexact = df_stats
+                        .as_ref()
+                        .map(|s| Self::statistics_to_inexact(s.clone()));
+                    stats_cache.optimizer = df_stats;
+                    // Preserve the exactness of the (unchanged) count across the
+                    // schema-width re-derivation. Conservative when `raw` is cold
+                    // (pre-first-persist): treat the count as NOT exact rather than
+                    // trusting it — `optimizer` is `None` in that case too, so nothing
+                    // is served, but this never leaves a stale-Exact flag behind.
+                    stats_cache.count_exact = stats_cache
+                        .raw
+                        .as_ref()
+                        .is_some_and(|raw| raw.num_rows_exact);
+                }
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
-            self.scan_file_statistics.clear();
+            self.clear_scan_file_statistics_cache();
             self.refresh_listing_table_under_held_fence().await?;
         }
 
@@ -5028,6 +5453,11 @@ impl CayenneTableProvider {
         // (via `update_current_snapshot_id` + `invalidate_inlined_cache`) advance the
         // freshness gate; no torn-capture discard is possible.
         self.update_current_snapshot_id(new_snapshot_id);
+        // The refresh's write-time index becomes visible with its snapshot, never
+        // before: a probe can then treat any index for another snapshot as stale.
+        if let Some(lookup_index) = &self.lookup_index {
+            lookup_index.promote_staged(new_snapshot_id);
+        }
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
@@ -5093,7 +5523,7 @@ impl CayenneTableProvider {
         // stale. Invalidate the in-memory optimizer view synchronously with the
         // snapshot pointer; background maintenance can rebuild it later.
         self.clear_cached_table_statistics_unlocked();
-        self.scan_file_statistics.clear();
+        self.clear_scan_file_statistics_cache();
         self.mark_maintained_aggregates_stale();
     }
 
@@ -6698,12 +7128,20 @@ impl CayenneTableProvider {
         strategy: &PkDeletionStrategyWithCache,
         session_config: &SessionConfig,
     ) -> ListingOptions {
-        let provider = Arc::new(PositionDeletionAccessPlanProvider::new(Arc::clone(
-            strategy.position_cache(),
-        )));
-        let file_format: Arc<dyn FileFormat> =
-            Arc::new(vortex_format.with_access_plan_provider(provider));
+        let file_format: Arc<dyn FileFormat> = Arc::new(
+            vortex_format.with_access_plan_provider(Self::position_deletion_plans(strategy)),
+        );
         ListingOptions::new(file_format).with_session_config_options(session_config)
+    }
+
+    /// The per-file access plans every scan of this table attaches: the
+    /// position-delete vectors described on [`Self::create_listing_options`].
+    fn position_deletion_plans(
+        strategy: &PkDeletionStrategyWithCache,
+    ) -> Arc<dyn VortexAccessPlanProvider> {
+        Arc::new(PositionDeletionAccessPlanProvider::new(Arc::clone(
+            strategy.position_cache(),
+        )))
     }
 
     /// Construct the snapshot directory URL string.
@@ -7876,7 +8314,8 @@ impl CayenneTableProvider {
             context,
             maintained_aggregate_specs,
             durable_write_back,
-            default_scan_freshness,
+            scan_view_reuse,
+            secondary_indexes,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -8058,6 +8497,31 @@ impl CayenneTableProvider {
             &table_metadata.table_id,
             &context.runtime_env().memory_pool,
         ));
+        // Secondary indexes over the table's Vortex files, or — for a memory-mode
+        // table, which writes no files — over its rows where they live.
+        let index_keys =
+            validated_lookup_index_keys(table_name, &table_metadata.schema, &secondary_indexes)?;
+        let (lookup_index, mem_tier_index) = if table_metadata.vortex_config.memory_mode {
+            (
+                None,
+                super::mem_tier_index::MemTierIndexer::new(
+                    table_name,
+                    &index_keys,
+                    &table_metadata.schema,
+                    Arc::clone(&table_memory),
+                ),
+            )
+        } else {
+            (
+                super::lookup_index::LookupIndexState::new(
+                    table_name,
+                    index_keys,
+                    Arc::clone(&context.runtime_env().memory_pool),
+                    Arc::clone(&table_memory),
+                ),
+                None,
+            )
+        };
 
         // Per-table in-memory CDC tier caps (`cdc_durability: memory`). The byte
         // cap is read live from the context's actuators (seeded from
@@ -8091,6 +8555,12 @@ impl CayenneTableProvider {
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_scan_view_selection_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -8099,6 +8569,8 @@ impl CayenneTableProvider {
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_file_statistics: Arc::new(DefaultFileStatisticsCache::default()),
+            cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
+            listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer_inexact: table_statistics
                     .as_ref()
@@ -8116,7 +8588,7 @@ impl CayenneTableProvider {
             pk_row_converter,
             pk_column_indices,
             durable_write_back,
-            default_scan_freshness,
+            scan_view_reuse,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -8140,6 +8612,8 @@ impl CayenneTableProvider {
             pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
+            lookup_index,
+            mem_tier_index,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             // At open the mem tier is empty, so the metastore count fetched
@@ -8148,7 +8622,7 @@ impl CayenneTableProvider {
             mem_tier_pending_superseded: Arc::new(AtomicI64::new(0)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
-            scan_view_cache: Arc::new(ParkingMutex::new(ScanViewCache::default())),
+            scan_view_cache: Arc::new(ScanViewCache::default()),
             weak_self: Arc::new(std::sync::OnceLock::new()),
             scan_input_version: Arc::new(AtomicU64::new(0)),
             structural_version: Arc::new(
@@ -8698,17 +9172,24 @@ impl CayenneTableProvider {
             estimated_bytes,
             policy,
             None,
+            None,
         )
         .await
     }
 
-    /// [`Self::write_to_snapshot`], with ascending split points that
-    /// range-partition the shard key instead of hashing it.
+    /// [`Self::write_to_snapshot`], range-partitioning the rows on a key instead
+    /// of hashing it.
     ///
     /// Only a caller that knows the key range of the rows it is about to write
-    /// can supply these — a rewrite reads them off the statistics of the plan it
-    /// is merging. A streaming write has no such view, passes `None`, and hashes
-    /// as before.
+    /// can supply the split points — a rewrite reads them off the statistics of
+    /// the plan it is merging, a whole-table replace off the table it replaces
+    /// (see [`Self::overwrite_range_plan`]). A streaming write has no such view,
+    /// passes `None`, and hashes as before.
+    ///
+    /// `write_observer`, when set, is told each batch's file and file-local row
+    /// position as it is written: the full-refresh overwrite builds the
+    /// point-lookup index from it, so the index publishes with the snapshot
+    /// instead of being rebuilt from the finished files afterwards.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn write_to_snapshot_range_partitioned(
         &self,
@@ -8718,7 +9199,8 @@ impl CayenneTableProvider {
         target_partitions: usize,
         estimated_bytes: Option<u64>,
         policy: super::delta_encoding::WritePolicy,
-        range_bounds: Option<&[ScalarValue]>,
+        range: Option<RangePartitioning<'_>>,
+        write_observer: Option<Arc<dyn VortexWriteObserver>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
@@ -8819,24 +9301,40 @@ impl CayenneTableProvider {
         // full default strategy. See `provider::delta_encoding`.
         let encoding_level =
             super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
-        let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
-            Some(strategy) => self.context.write_format_with_strategy(
-                strategy,
-                self.write_shard_config(
-                    target_partitions,
-                    target_size_bytes,
-                    estimated_bytes,
-                    fan_out,
-                    range_bounds,
-                ),
-            ),
-            None => self.write_shard_format(
+        let shard_config = self
+            .write_shard_config(
                 target_partitions,
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
-                range_bounds,
-            ),
+                range.as_ref().map(|range| range.bounds),
+            )
+            .map(|mut config| {
+                if let Some(range) = range.as_ref()
+                    && config.range_bounds.is_some()
+                {
+                    // The bounds describe `range.column` when the caller named
+                    // one (a table without a primary key routes on a column that
+                    // is not its shard key), so the router must split that column.
+                    if let Some(column) = range.column {
+                        config.shard_key_columns = vec![column.to_string()];
+                    }
+                    config.range_run_sort_bytes = range.run_sort_bytes;
+                }
+                config
+            });
+        let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
+            Some(strategy) => self
+                .context
+                .write_format_with_strategy(strategy, shard_config),
+            None => match shard_config {
+                Some(config) => Arc::new(self.context.file_format().with_write_shard(config)),
+                None => Arc::clone(self.context.file_format()),
+            },
+        };
+        let write_format = match write_observer {
+            Some(observer) => Arc::new(write_format.with_write_observer(observer)),
+            None => write_format,
         };
 
         // Create a new ListingTable pointing to the snapshot directory
@@ -9243,7 +9741,7 @@ impl CayenneTableProvider {
         // is scattered across shard files and each file's zone maps span the
         // whole range — forfeiting exactly the pruning the sort was for. Every
         // stream that goes through `sort_stream_by_columns` or
-        // `zorder_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // `cluster_sort_stream` states that with [`EncodeFanOut::Serial`], which
         // is handled above. A low `session_target_partitions` is NOT a
         // substitute: it bounds only the unset default, while a configured
         // `cayenne_write_concurrency` is honored above it (see
@@ -9375,10 +9873,13 @@ impl CayenneTableProvider {
         // either side of a concurrent mutation and manufacture a gap.
         let accounted = self.table_memory.snapshot();
         let to_gauge = |bytes: usize| u64::try_from(bytes).unwrap_or(u64::MAX);
+        let lookup_index = (self.lookup_index.is_some() || self.mem_tier_index.is_some())
+            .then(|| to_gauge(accounted.lookup_index));
         telemetry::cayenne::track_memory_account(
             to_gauge(accounted.keyset),
             to_gauge(accounted.deletion_index),
             to_gauge(accounted.cold_existence),
+            lookup_index,
             to_gauge(accounted.reserved),
             &[telemetry::KeyValue::new(
                 "table",
@@ -9846,6 +10347,7 @@ impl CayenneTableProvider {
     /// `target_size_bytes` / `estimated_bytes` decide how many writers a write
     /// of this size earns, so the same values must be passed here and to the
     /// `writer_ops` heuristic in [`Self::write_to_snapshot`].
+    #[cfg(test)]
     fn write_shard_format(
         &self,
         session_target_partitions: usize,
@@ -9960,6 +10462,9 @@ impl CayenneTableProvider {
             // hashes the key instead, which is what every write did before range
             // partitioning existed.
             range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
+            // Run sorting is the caller's opt-in (see
+            // `write_to_snapshot_range_partitioned`).
+            range_run_sort_bytes: None,
         })
     }
 
@@ -10054,6 +10559,8 @@ impl CayenneTableProvider {
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
+            cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
+            listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
             row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
@@ -10064,7 +10571,7 @@ impl CayenneTableProvider {
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
-            default_scan_freshness: self.default_scan_freshness,
+            scan_view_reuse: self.scan_view_reuse,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -10078,6 +10585,14 @@ impl CayenneTableProvider {
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
             #[cfg(test)]
             test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
+            #[cfg(test)]
+            test_post_scan_input_capture_hook: Arc::clone(&self.test_post_scan_input_capture_hook),
+            #[cfg(test)]
+            test_post_scan_view_selection_hook: Arc::clone(
+                &self.test_post_scan_view_selection_hook,
+            ),
+            #[cfg(test)]
+            test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -10093,6 +10608,8 @@ impl CayenneTableProvider {
             pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
+            lookup_index: self.lookup_index.as_ref().map(Arc::clone),
+            mem_tier_index: self.mem_tier_index.as_ref().map(Arc::clone),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             durable_inlined_row_count: Arc::clone(&self.durable_inlined_row_count),
@@ -10302,7 +10819,7 @@ impl CayenneTableProvider {
             })
             .ok()?;
 
-        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, stats.num_rows);
+        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, schema, stats.num_rows);
 
         // Overlay per-column NDV estimates from the HyperLogLog sketches as
         // `distinct_count`. The cluster reporter uses this to encode an
@@ -10525,8 +11042,28 @@ impl CayenneTableProvider {
         cache.count_exact = false;
     }
 
+    /// Drop the unpruned snapshot listing cache and bump
+    /// [`Self::listing_cache_epoch`] so an in-flight LIST cannot re-store the
+    /// file set this drop is invalidating. Does **not** bump
+    /// [`Self::current_dir_generation`] (that aborts compaction).
+    fn drop_cached_snapshot_listing(&self) {
+        self.listing_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.cached_snapshot_listing.store(None);
+    }
+
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
         self.scan_file_statistics.clear();
+        self.drop_cached_snapshot_listing();
+    }
+
+    /// Discard cached views before physically removing their captured files.
+    /// The caller holds both `write_lock` and `listing_fence.write()`, serializing
+    /// this generation advance with schema evolution. Cache misses wait for the
+    /// listing fence, so their captures see the files remaining after retention.
+    pub(crate) fn invalidate_scan_views_before_file_removal(&self) {
+        self.clear_scan_file_statistics_cache();
+        self.notify_scan_input_change();
+        drop(self.structural_version.begin_mutation());
     }
 
     /// Check the table-wide PK index out for validation. The cell is left empty for
@@ -11560,6 +12097,7 @@ impl CayenneTableProvider {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema,
+                captured_files: None,
             })
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -14771,11 +15309,19 @@ impl CayenneTableProvider {
     ///
     /// This is the **append-only** invalidation: the structural epoch is left
     /// unchanged, so the next miss may extend the cached view with the delta
-    /// instead of rebuilding it. Use [`Self::bump_inlined_structural_epoch`] for
-    /// any mutation that can change an already-materialized entry (rewrite,
-    /// removal, tombstone, checkpoint, overwrite, recovery).
+    /// instead of rebuilding it. Also advances `scan_input_version` so
+    /// [`ScanViewReuse::UntilInvalidated`] recaptures rather than serving a
+    /// [`ScanView`] whose inlined batches predate the append. Use
+    /// [`Self::bump_inlined_structural_epoch`] for any mutation that can change
+    /// an already-materialized entry (rewrite, removal, tombstone, checkpoint,
+    /// overwrite, recovery).
     fn bump_inlined_generation(&self) {
         self.inlined_generation.fetch_add(1, Ordering::Release);
+        // A pure inline append is baked into the captured ScanView's inlined
+        // batches. Without this bump, `UntilInvalidated` keeps serving the
+        // pre-append view (the structural epoch is unchanged) and a subsequent
+        // PK lookup misses the new row.
+        self.notify_scan_input_change();
     }
 
     /// Invalidate the inline cache AND mark the change structural so the next
@@ -14801,7 +15347,7 @@ impl CayenneTableProvider {
             .fetch_add(1, Ordering::Release);
         self.inlined_generation.fetch_add(1, Ordering::Release);
         // A structural bump changes what a scan sees, so advance the scan-input version
-        // (the demand cache's ordering axis; the next read-your-writes capture re-keys
+        // (the demand cache's ordering axis; the next UntilInvalidated capture re-keys
         // over the new state). Single funnel for inline mutations, checkpoint clears,
         // overwrite, recovery, on-conflict, and deferred-snapshot publishes.
         self.notify_scan_input_change();
@@ -14810,12 +15356,11 @@ impl CayenneTableProvider {
     /// Advance the monotonic scan-input version: a cheap signal (NO lock, NO capture,
     /// NO clone) that scan-visible state may have changed. It is the demand cache's
     /// ORDERING axis (which completed build wins the `latest_complete` slot — see
-    /// [`ScanViewCache`]) and a cheap freshness signal, NOT a correctness gate: a
-    /// read-your-writes scan captures the CURRENT state directly, so it sees the
-    /// mutation regardless of this counter. Spurious calls are harmless (they only
-    /// nudge the ordering heuristic), so callers may bump LIBERALLY. Wired at every
-    /// mutation that changes a scan input (the sites that invalidated the retired
-    /// memos, direct or indirect).
+    /// [`ScanViewCache`]) and the invalidation signal for
+    /// [`ScanViewReuse::UntilInvalidated`]: a later scan will recapture rather than
+    /// serve the cached view. Spurious calls are harmless (they only force a rebuild),
+    /// so callers may bump LIBERALLY. Wired at every mutation that changes a scan
+    /// input (writes, deletes, refresh, compaction, snapshot flips).
     fn notify_scan_input_change(&self) {
         self.scan_input_version.fetch_add(1, Ordering::Release);
     }
@@ -15683,6 +16228,16 @@ impl CayenneTableProvider {
             snapshot_sequence,
             "Published staged on-conflict snapshot"
         );
+
+        // The cached ScanView bakes `protected_map`, merged deletions, and the
+        // inlined view. A wait-free UntilInvalidated hit would keep serving that
+        // pre-publish bundle (missing the new snapshot / hiding superseded rows)
+        // unless `scan_input_version` advances. `bump_inlined_generation` already
+        // notifies when an inline tombstone was activated; this covers the
+        // file-only / protected-snapshot-only publish. Callers hold
+        // `listing_fence.write()`, so a concurrent capture cannot observe the
+        // bump without also observing this publish.
+        self.notify_scan_input_change();
     }
 
     fn publish_staged_position_deletion_cache(
@@ -15919,7 +16474,8 @@ impl CayenneTableProvider {
                 Arc::clone(self.context.runtime_env()),
                 None,
                 Arc::clone(&self.seq_allocator),
-            );
+            )
+            .with_scan_input_version(Arc::clone(&self.scan_input_version));
             sink.persist_position_based_deletions(position_specs)
                 .await
                 .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -16400,6 +16956,11 @@ impl CayenneTableProvider {
             let _view_guard = self.scan_state_lock.write().await;
             self.mark_maintained_aggregates_stale_on_checkpoint();
             self.publish_on_conflict_update(update);
+            // Bump under the write guard so a concurrent scan cannot hit the
+            // pre-publish ScanView after this unlock. An inline-tombstone
+            // publish already notified via `bump_inlined_structural_epoch`; a
+            // second bump only forces a rebuild.
+            self.notify_scan_input_change();
             return;
         };
 
@@ -16413,6 +16974,10 @@ impl CayenneTableProvider {
                 let update = update.take().unwrap_or_else(OnConflictUpdate::none);
                 self.mark_maintained_aggregates_stale_on_checkpoint();
                 self.publish_on_conflict_update(update);
+                // Same bake as the staged publish: `protected_map` lives on the
+                // cached ScanView. Without this, a post-retention append that
+                // isolates into a new snapshot stays invisible until eviction.
+                self.notify_scan_input_change();
                 return;
             }
         }
@@ -16486,7 +17051,7 @@ impl CayenneTableProvider {
     /// from the stream schema (or otherwise unparseable) are skipped with a
     /// warning and the stream is returned unsorted (see
     /// `util::stream_utils::sort_stream`) — never surfaced as an error.
-    fn sort_stream_by_columns(
+    pub(crate) fn sort_stream_by_columns(
         &self,
         stream: SendableRecordBatchStream,
         sort_columns: &[String],
@@ -16512,6 +17077,269 @@ impl CayenneTableProvider {
         Ok(sorted_stream)
     }
 
+    /// Orders a whole-table replace by the table's configured `sort_columns`,
+    /// returning the stream to write and the write fan-out that order allows.
+    ///
+    /// A full-refresh table replaces its entire contents on every refresh, so
+    /// compaction — the only other path that orders data — never runs for it
+    /// (`refresh_mode: full` leaves nothing to consolidate). Ordering here is
+    /// what makes `sort_columns` mean anything for such a table: otherwise the
+    /// snapshot keeps arrival order however the column is configured, every
+    /// file's zone maps span the whole key range, and a selective scan prunes
+    /// nothing.
+    ///
+    /// Only an operator-configured order is honoured. An inferred one is a
+    /// guess at the workload, and a full refresh is too expensive to reorder on
+    /// a guess.
+    ///
+    /// Sharding the write would scatter the order across files, which is what
+    /// the order was for, so an ordered replace returns
+    /// [`WritePolicy::MAINTENANCE_SERIAL`] — the same trade the compaction
+    /// rewrite makes. A shard count alone does not achieve this: the fan-out is
+    /// decided by the policy's [`EncodeFanOut`], not by the caller's partition
+    /// count, so a `Sized` policy re-shards the sorted stream round-robin and
+    /// leaves every output file spanning the whole key range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the sort execution itself fails; see
+    /// [`Self::sort_stream_by_columns`] for how unusable columns are handled.
+    pub(crate) fn sort_overwrite_input(
+        &self,
+        data: SendableRecordBatchStream,
+        target_partitions: usize,
+    ) -> Result<(
+        SendableRecordBatchStream,
+        usize,
+        super::delta_encoding::WritePolicy,
+    )> {
+        if self.context.has_cluster_by() {
+            let ctx = self.create_session_context();
+            let clustered = self.cluster_sort_stream(
+                data,
+                self.configured_clustering_indices(),
+                &ctx.task_ctx(),
+                ClusterSortSpan::Global,
+            )?;
+            return Ok((clustered, 1, rewrite_write_policy(true)));
+        }
+        if !self.context.sort_columns_are_authoritative() {
+            return Ok((data, target_partitions, rewrite_write_policy(false)));
+        }
+
+        let sort_columns = self.context.sort_columns().to_vec();
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            sort_columns = ?sort_columns,
+            "Sorting whole-table replace before writing the new snapshot"
+        );
+        let ctx = self.create_session_context();
+        let sorted = self.sort_stream_by_columns(data, &sort_columns, &ctx.task_ctx())?;
+        Ok((sorted, 1, rewrite_write_policy(true)))
+    }
+
+    /// How a whole-table replace routes its rows into key-range files instead of
+    /// hashing them, or `None` to hash as before.
+    ///
+    /// A hash (or round-robin) split gives every output file the whole key
+    /// domain, so an equality lookup on the key opens every file and, unless the
+    /// source happens to return rows in key order, every zone of the key column
+    /// in each of them. Routing on the key instead gives each file one contiguous
+    /// slice of the domain, so file statistics prune a lookup to one file, and the
+    /// bounded run sort the sink applies inside each range lets zone maps prune
+    /// within it. The shard count — and so the number of concurrent encoders — is
+    /// unchanged; nothing is globally sorted, and an overwrite never attests an
+    /// order (`current_sorted_snapshot`).
+    ///
+    /// The split points are equal-count quantiles of the key in the table being
+    /// REPLACED, which a full refresh is about to rewrite with rows drawn from
+    /// the same distribution. Skewed or drifted bounds only unbalance file sizes;
+    /// they cannot place a row wrongly, because every row still reaches exactly
+    /// one file and the files' statistics are computed from what they contain.
+    ///
+    /// The key comes from [`Self::range_routing_candidates`], taking the first
+    /// whose values spread across every shard. Tables with an explicit order
+    /// (`cayenne_sort_columns`, `cayenne_cluster_by`) keep their single sorted
+    /// writer. The first load has nothing to sample and hashes, as does a table
+    /// too small to cut.
+    pub(crate) async fn overwrite_range_plan(
+        &self,
+        target_partitions: usize,
+    ) -> Option<OverwriteRangePlan> {
+        // Places equal-count cuts within a fraction of a percent of their target
+        // for any shard count a write uses.
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return None;
+        }
+        let shards = self.snapshot_write_concurrency(target_partitions);
+        if shards < 2 {
+            return None;
+        }
+        let schema = self.table_schema();
+        for (column, source) in self.range_routing_candidates(&schema) {
+            let Ok(index) = schema.index_of(&column) else {
+                continue;
+            };
+            let key_type = schema.field(index).data_type().clone();
+            let started = Instant::now();
+            let sample = match self.sample_column(index, &key_type, MAX_SAMPLE_ROWS).await {
+                Ok(Some(sample)) => sample,
+                // Nothing to sample, or no trustworthy row count: the same for
+                // every column.
+                Ok(None) => return None,
+                Err(error) => {
+                    // Placement only: hashing keeps the replace correct, just unclustered.
+                    tracing::debug!(
+                        table = self.table_name(),
+                        column = column.as_str(),
+                        %error,
+                        "Could not sample the routing key of a whole-table replace; hashing it instead"
+                    );
+                    return None;
+                }
+            };
+            // NULL keys all route to the first shard; past one shard's share of
+            // the rows they would pile the write onto one encoder.
+            if sample.null_count().saturating_mul(shards) > sample.len() {
+                continue;
+            }
+            let Some(bounds) = equal_count_bounds(&sample, shards) else {
+                continue;
+            };
+            if bounds.len() + 1 < shards {
+                // Too few distinct values to fill every shard: routing would pile
+                // the rows onto fewer encoders than hashing uses.
+                continue;
+            }
+            tracing::debug!(
+                table = self.table_name(),
+                column = column.as_str(),
+                key_source = ?source,
+                shards,
+                bounds = bounds.len(),
+                sample_rows = sample.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Routing whole-table replace into key-range files"
+            );
+            return Some(OverwriteRangePlan { column, bounds });
+        }
+        None
+    }
+
+    /// Columns a whole-table replace may be range-routed on, most preferred
+    /// first, limited to types the router can split.
+    ///
+    /// A configured `cayenne_shard_key_columns` is the only candidate: the
+    /// operator named the key. Otherwise the leading primary-key column comes
+    /// first, unless scans filter on another column more than twice as often —
+    /// schema inference can supply a primary key the workload never looks rows up
+    /// by (an auto-increment surrogate), and a layout routed on it prunes
+    /// nothing. Join keys arrive as runtime filters, which are not observed, so
+    /// the primary key yields only to a column filtered on distinctly more often.
+    /// Whichever of the two is not preferred follows as the fallback.
+    fn range_routing_candidates(&self, schema: &SchemaRef) -> Vec<(String, RangeKeySource)> {
+        let routable = |column: &str| {
+            schema
+                .field_with_name(column)
+                .is_ok_and(|field| is_range_routable_type(field.data_type()))
+        };
+        let leading_key = self
+            .resolved_shard_key_columns()
+            .into_iter()
+            .next()
+            .filter(|column| routable(column));
+        if !self.context.shard_key_columns().is_empty() {
+            return leading_key
+                .map(|column| (column, RangeKeySource::ShardKey))
+                .into_iter()
+                .collect();
+        }
+        let observations = &self.filter_column_observations;
+        let hottest = observations
+            .top_columns(DEFAULT_ROUTING_CANDIDATES, schema.as_ref())
+            .into_iter()
+            .find(|column| routable(column));
+        match (leading_key, hottest) {
+            (Some(key), Some(hottest)) if hottest != key => {
+                let hottest_leads =
+                    observations.hits(&hottest) > observations.hits(&key).saturating_mul(2);
+                let key = (key, RangeKeySource::PrimaryKey);
+                let hottest = (hottest, RangeKeySource::ObservedFilters);
+                if hottest_leads {
+                    vec![hottest, key]
+                } else {
+                    vec![key, hottest]
+                }
+            }
+            (Some(key), _) => vec![(key, RangeKeySource::PrimaryKey)],
+            (None, Some(hottest)) => vec![(hottest, RangeKeySource::ObservedFilters)],
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// Every `stride`-th value of one column of the current table, cast to
+    /// `data_type`, where the stride keeps the sample near `max_rows`. `None`
+    /// for an empty table, or when the table reports no row count and the
+    /// sample would grow past a bounded size.
+    ///
+    /// Reads the whole key column of the table being replaced. A full refresh
+    /// re-reads every row of its source anyway, so one projected column of the
+    /// old snapshot is small beside the refresh itself.
+    async fn sample_column(
+        &self,
+        index: usize,
+        data_type: &DataType,
+        max_rows: usize,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        use arrow::array::UInt32Array;
+
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let plan = TableProvider::scan(self, &state, Some(&vec![index]), &[], None).await?;
+        let total_rows = plan
+            .partition_statistics(None)
+            .ok()
+            .and_then(|stats| stats.num_rows.get_value().copied());
+        // Without a row count, sample sparsely rather than hold the column.
+        let stride = total_rows.map_or(16, |rows| rows.div_ceil(max_rows).max(1));
+        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+        let mut sampled: Vec<ArrayRef> = Vec::new();
+        let mut sampled_rows = 0_usize;
+        let mut position = 0_usize;
+        while let Some(batch) = stream.next().await.transpose()? {
+            let rows = batch.num_rows();
+            let column = batch.column(0);
+            let first = (stride - position % stride) % stride;
+            let picks: UInt32Array = (first..rows)
+                .step_by(stride)
+                .filter_map(|row| u32::try_from(row).ok())
+                .collect();
+            if !picks.is_empty() {
+                sampled_rows = sampled_rows.saturating_add(picks.len());
+                if sampled_rows > max_rows.saturating_mul(4) {
+                    // A misreported row count: stop rather than hold the column.
+                    return Ok(None);
+                }
+                let picked = arrow::compute::take(column.as_ref(), &picks, None)?;
+                sampled.push(compact_sampled_views(picked));
+            }
+            position = position.saturating_add(rows);
+        }
+        if sampled.is_empty() {
+            return Ok(None);
+        }
+        let parts: Vec<&dyn Array> = sampled.iter().map(AsRef::as_ref).collect();
+        let sample = arrow::compute::concat(&parts)?;
+        let sample = if sample.data_type() == data_type {
+            sample
+        } else {
+            arrow::compute::cast(&sample, data_type)?
+        };
+        Ok(Some(sample))
+    }
+
     /// Effective sort columns for a snapshot rewrite under default settings.
     ///
     /// Precedence: operator-configured `sort_columns` > hottest observed filter
@@ -16530,6 +17358,26 @@ impl CayenneTableProvider {
     /// reaching private compaction internals.
     #[must_use]
     pub fn effective_sort_columns_for_rewrite(&self) -> Vec<String> {
+        // An explicit multi-dimensional cluster key is the complete layout
+        // instruction. Do not layer inferred, observed, or configured
+        // lexicographic sorting on top of it; hierarchical clustering is a
+        // separate future contract.
+        if self.context.has_cluster_by() {
+            return Vec::new();
+        }
+
+        self.effective_rewrite_layout().columns
+    }
+
+    /// The rewrite's clustering key *and which rung produced it*.
+    ///
+    /// The rung is what decides whether the rewrite may lay its rows out along a
+    /// multi-dimensional curve instead of sorting them lexicographically, so it
+    /// cannot be re-derived by comparing the column list afterwards: schema
+    /// inference fills `cayenne_sort_columns` on every catalog-visible CDC
+    /// table, so an inference-derived key can be *equal* to
+    /// `context.sort_columns()` while meaning something entirely different.
+    fn effective_rewrite_layout(&self) -> RewriteLayout {
         // Auto-observed columns feed a `SortExec` row-format merge whose
         // `RowConverter` rejects `Map`/`Union`/nested types (e.g. a `Map` recorded
         // from an `attrs['k'] = ...` filter). Restrict inferred layouts to scalar
@@ -16571,7 +17419,7 @@ impl CayenneTableProvider {
 
         // Rung 1: an explicit operator sort order wins outright.
         if self.context.sort_columns_are_authoritative() {
-            return self.context.sort_columns().to_vec();
+            return RewriteLayout::configured(self.context.sort_columns().to_vec());
         }
         let schema = self.table_schema();
         let observed = self.filter_column_observations.top_columns(
@@ -16584,7 +17432,7 @@ impl CayenneTableProvider {
             // but a deterministic one, and it keeps pre-observation behavior
             // identical to what inference produced before the adaptive layout
             // existed. Falls through to no clustering when inference gave none.
-            return self.context.inferred_sort_columns().to_vec();
+            return RewriteLayout::inferred(self.context.inferred_sort_columns().to_vec());
         }
         let sortable: Vec<String> = observed
             .into_iter()
@@ -16602,11 +17450,11 @@ impl CayenneTableProvider {
             // cold-tier fallback in `resolve_cold_clustering_indices`).
             let inferred = self.context.inferred_sort_columns();
             if !inferred.is_empty() {
-                return inferred.to_vec();
+                return RewriteLayout::inferred(inferred.to_vec());
             }
-            return self.table_metadata.primary_key.clone();
+            return RewriteLayout::inferred(self.table_metadata.primary_key.clone());
         }
-        sortable
+        RewriteLayout::observed(sortable)
     }
 
     /// Sort and rewrite data by reading from the current listing table, writing
@@ -16651,6 +17499,7 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
+        let clustering = self.configured_clustering_indices();
         let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
         tracing::debug!(
             "Sorting and rewriting data for table {} by columns {:?} (auto_from_filters={})",
@@ -16669,9 +17518,12 @@ impl CayenneTableProvider {
         // An empty list resolves to no key at all, and `sort_stream_by_columns`
         // then hands the stream back untouched — so whether this rewrite is
         // sorted is a property of the resolved list, not of the entry point.
-        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
-        let sorted_stream =
-            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
+        let rewrite_is_sorted = !clustering.is_empty() || !rewrite_sort_columns.is_empty();
+        let sorted_stream = if clustering.is_empty() {
+            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?
+        } else {
+            self.cluster_sort_stream(stream, clustering, &ctx.task_ctx(), ClusterSortSpan::Global)?
+        };
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -17186,7 +18038,7 @@ impl CayenneTableProvider {
     ) -> bool {
         subset_rewrite_eligibility(
             self.should_capture_positions() || self.pk_deletion_strategy.is_position_based(),
-            self.context.has_sort_columns(),
+            self.context.has_sort_columns() || self.context.has_cluster_by(),
             self.protected_snapshots.load().len(),
             candidate.paths.len(),
             files.len(),
@@ -20273,9 +21125,82 @@ impl CayenneTableProvider {
         // Configured sort_columns win; otherwise (default empty) sort by the
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
-        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
-        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
-        if rewrite_is_sorted {
+        let rewrite_layout = self.effective_rewrite_layout();
+        let rewrite_source = rewrite_layout.source;
+        let explicit_curve_indices = self.configured_clustering_indices();
+        let rewrite_sort_columns = if explicit_curve_indices.is_empty() {
+            rewrite_layout.columns
+        } else {
+            // Explicit clustering is the complete layout instruction. Inferred
+            // and observed sort keys are ignored, and an explicit sort key is
+            // rejected during registration.
+            Vec::new()
+        };
+
+        // A multi-dimensional curve replaces the lexicographic sort ONLY for an
+        // explicit cluster key, or for an observed-filter key of two or more
+        // clusterable columns. Every part of the adaptive case is load-bearing:
+        //
+        //   * Observed-filter only. The adaptive layout picks the hottest
+        //     columns and then throws the second one's pruning away by sorting
+        //     lexicographically; a curve is what collects it. The other rungs
+        //     stay lexicographic — an operator's explicit order is a stated
+        //     intent whose ordering the scan may advertise, and an
+        //     inference-derived key still attests today.
+        //   * Two or more columns. A one-column curve is just an ascending
+        //     sort, but it places NULLs first where a bare sort column is
+        //     NULLS LAST, and it discards ASC/DESC — so it would change the
+        //     physical order for no gain.
+        //   * All clusterable. `is_row_sortable_type` admits `Decimal256`,
+        //     `Dictionary` and `FixedSizeBinary`, which the curve kernel maps
+        //     to the reserved zero key; such a dimension would cost a transpose
+        //     and an interleave per row to encode a constant.
+        let rewrite_schema = self.table_schema();
+        let adaptive_curve_indices: Vec<usize> = if explicit_curve_indices.is_empty()
+            && rewrite_sort_columns.len() > 1
+            && rewrite_source == RewriteKeySource::ObservedFilters
+        {
+            rewrite_sort_columns
+                .iter()
+                .filter_map(|n| {
+                    let idx = rewrite_schema.index_of(n.trim()).ok()?;
+                    let field = rewrite_schema.fields().get(idx)?;
+                    super::clustering::is_clusterable(field.data_type()).then_some(idx)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let curve_indices = if explicit_curve_indices.is_empty() {
+            adaptive_curve_indices
+        } else {
+            explicit_curve_indices
+        };
+        let rewrite_is_curve_ordered = !curve_indices.is_empty();
+        let rewrite_is_sorted = rewrite_is_curve_ordered || !rewrite_sort_columns.is_empty();
+
+        if rewrite_is_curve_ordered {
+            let clustering_columns = if self.context.has_cluster_by() {
+                self.context.cluster_by()
+            } else {
+                &rewrite_sort_columns
+            };
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                clustering_columns = ?clustering_columns,
+                "Clustering compaction rewrite along a curve before writing consolidated output files"
+            );
+            // Global span, NOT byte-bounded runs: this snapshot's files are read
+            // back through the ordinary scan path, and `bounded_sort_stream`
+            // only orders within a run.
+            stream = self.cluster_sort_stream(
+                stream,
+                curve_indices,
+                &ctx.task_ctx(),
+                ClusterSortSpan::Global,
+            )?;
+        } else if rewrite_is_sorted {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -20583,7 +21508,17 @@ impl CayenneTableProvider {
             // optimization on such snapshots; claiming a wrong order is a
             // correctness bug. Recovering the optimization means storing the
             // attested key alongside the id and advertising from it (follow-up).
+            //
+            // A curve-ordered rewrite must NEVER attest, and the suppression is
+            // an explicit flag rather than a column comparison on purpose: the
+            // curve is applied to an observed-filter key, and schema inference
+            // fills `cayenne_sort_columns` on every catalog-visible CDC table,
+            // so that key can be EQUAL to `context.sort_columns()` while the
+            // physical order is a Hilbert curve rather than the lexicographic
+            // order the scan would advertise. Comparing the lists would pass and
+            // claim an ordering the files do not have.
             if !rewrite_sort_columns.is_empty()
+                && !rewrite_is_curve_ordered
                 && rewrite_sort_columns == self.context.sort_columns()
             {
                 self.current_sorted_snapshot
@@ -20692,16 +21627,28 @@ impl CayenneTableProvider {
         Ok((stream, generation_before))
     }
 
+    /// Resolve the explicitly configured clustering columns to schema indices.
+    /// Registration validates every name, so an empty result means no explicit
+    /// cluster key rather than a partially accepted configuration.
+    fn configured_clustering_indices(&self) -> Vec<usize> {
+        let schema = self.table_schema();
+        self.context
+            .cluster_by()
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .collect()
+    }
+
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` →
+    /// `cayenne_cluster_by` → else `cayenne_sort_columns` →
     /// else hottest observed filter columns (F4 default-on) → else the primary
     /// key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
         let schema = self.table_schema();
         let vc = &self.table_metadata.vortex_config;
-        let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
-            vc.cold_clustering_columns.clone()
+        let names: Vec<String> = if !vc.cluster_by.is_empty() {
+            vc.cluster_by.clone()
         } else if self.context.sort_columns_are_authoritative() {
             // Only an EXPLICIT sort order outranks observed filters here. An
             // inference-derived one (the primary key, for most CDC tables) drops
@@ -20710,11 +21657,11 @@ impl CayenneTableProvider {
             // workload instead of for a guess.
             self.context.sort_columns().to_vec()
         } else {
-            // Auto-observed columns only cluster if the Z-order encoder can key on
-            // them; `Decimal`, `Map`, and other types unsupported by
-            // `column_order_keys` collapse to the all-zero key (no clustering), so
-            // drop them and keep the primary-key fallback rather than writing an
-            // effectively unclustered cold run.
+            // Auto-observed columns only cluster if the curve encoder can key on
+            // them; `Decimal256`, `Map`, and other types unsupported by
+            // `column_order_keys` collapse to the reserved zero key (no
+            // clustering), so drop them and keep the primary-key fallback rather
+            // than writing an effectively unclustered cold run.
             let observed: Vec<String> = self
                 .filter_column_observations
                 .top_columns(
@@ -20725,7 +21672,7 @@ impl CayenneTableProvider {
                 .filter(|n| {
                     schema
                         .field_with_name(n)
-                        .is_ok_and(|f| super::zorder::is_zorder_clusterable(f.data_type()))
+                        .is_ok_and(|f| super::clustering::is_clusterable(f.data_type()))
                 })
                 .collect();
             if observed.is_empty() {
@@ -20748,7 +21695,7 @@ impl CayenneTableProvider {
             .filter_map(|n| {
                 // Resolve an exact field name first; else parse the extended
                 // `col [ASC|DESC] [NULLS ...]` syntax that `sort_columns` accepts
-                // (direction is irrelevant to the Z-order curve) so a configured
+                // (direction is irrelevant to the clustering curve) so a configured
                 // `sort_columns: ["amount DESC"]` still clusters cold files rather
                 // than being silently dropped by a literal-name lookup.
                 schema.index_of(n.trim()).ok().or_else(|| {
@@ -20756,52 +21703,132 @@ impl CayenneTableProvider {
                         .and_then(|(col, _)| schema.index_of(col).ok())
                 })
             })
+            // A type the curve cannot key on maps every value to the reserved
+            // zero key: it contributes no clustering while still costing a
+            // transpose and an interleave dimension on every row. The observed
+            // branch above filters earlier because it must decide whether to
+            // fall through to the primary key; this catches the explicit
+            // `cluster_by` and `sort_columns` branches, which
+            // would otherwise carry an unclusterable column all the way in.
+            .filter(|&i| {
+                schema
+                    .fields()
+                    .get(i)
+                    .is_some_and(|f| super::clustering::is_clusterable(f.data_type()))
+            })
             .collect()
     }
 
-    /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
-    /// key column, sorting on it in byte-bounded runs via
-    /// [`super::streaming::bounded_sort_stream`] (per-run `SortExec`:
-    /// pool-accounted, disk-spilling), then stripping the key. Bounding the
-    /// sort caps per-run memory and first-batch latency; Z-order ranges may
-    /// overlap across runs, which only weakens per-file min/max pruning
-    /// slightly — cold files advertise no ordering, so this is a
-    /// clustering-quality trade-off, not a correctness change. The run cap is
-    /// [`crate::metadata::VortexConfig::cold_clustering_run_size_bytes`],
-    /// measured on the augmented batches (key included — what `SortExec`
-    /// actually buffers). Empty `clustering_indices` returns the stream
-    /// unchanged.
-    fn zorder_sort_stream(
+    /// The `[min, max]` each clustering column's curve coordinate is normalized
+    /// against, positionally matching `clustering_indices`.
+    ///
+    /// Read from the maintained metastore aggregate — already warm, O(1), and
+    /// covering the *whole* table rather than the rows this promotion happens to
+    /// carry, so every file this promotion writes shares one coordinate space.
+    /// The aggregate widens as later writes merge new extrema, and clean cold
+    /// files are carried forward without rewrite, so a later promotion may
+    /// normalize onto a different scale. A column the aggregate cannot describe
+    /// yields `None`, which the kernel reads as "use this type's full key domain".
+    ///
+    /// Reads the maintained cache directly rather than through
+    /// [`Self::optimizer_table_statistics`]: that planner-facing view empties
+    /// `column_statistics` once the table is wider than
+    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`] — a costing shortcut that
+    /// would otherwise leave every clustering dimension unnormalized on exactly
+    /// the widest tables. Clustering reads only the few configured dimensions,
+    /// so it never pays the cost that limit exists to avoid.
+    ///
+    /// The lock is taken ONCE for all dimensions. A per-column acquisition could
+    /// straddle a cache clear and return a bound for one dimension and `None`
+    /// for the next, and a missing bound is a floor rather than a soft
+    /// degradation (see the `super::clustering` module docs), so a torn read
+    /// would cost the whole multi-dimensional layout for that promotion.
+    fn cluster_column_bounds(
+        &self,
+        clustering_indices: &[usize],
+    ) -> Vec<super::clustering::ColumnBounds> {
+        let schema = self.table_schema();
+        let cache = self.table_statistics.read();
+        let Some(stats) = cache
+            .optimizer
+            .as_ref()
+            .or(cache.optimizer_inexact.as_ref())
+        else {
+            return vec![None; clustering_indices.len()];
+        };
+        clustering_indices
+            .iter()
+            .map(|&i| {
+                let data_type = schema.fields().get(i)?.data_type();
+                let column = stats.column_statistics.get(i)?;
+                let lo = super::clustering::bound_key(column.min_value.get_value()?, data_type)?;
+                let hi = super::clustering::bound_key(column.max_value.get_value()?, data_type)?;
+                (lo <= hi).then_some((lo, hi))
+            })
+            .collect()
+    }
+
+    /// Cluster a stream along a Hilbert curve over `clustering_indices` by
+    /// appending a transient key column, sorting on it with a pool-accounted,
+    /// disk-spilling `SortExec`, then stripping the key. `span` picks how the
+    /// sort consumes the stream; see [`ClusterSortSpan`].
+    /// Empty `clustering_indices` returns the stream unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a [`ClusterSortSpan::Global`] sort fails to execute.
+    fn cluster_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-    ) -> SendableRecordBatchStream {
+        span: ClusterSortSpan,
+    ) -> Result<SendableRecordBatchStream> {
         if clustering_indices.is_empty() {
-            return stream;
+            return Ok(stream);
         }
         let original_schema = stream.schema();
-        let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
+        let key_name = super::clustering::cluster_key_column_name(&original_schema);
+        let augmented_schema =
+            super::clustering::cluster_augmented_schema(&original_schema, &key_name);
+        // Resolved once for the whole rewrite: per-batch bounds would put each
+        // batch on its own coordinate scale, and keys from different scales do
+        // not order against each other.
+        let bounds = self.cluster_column_bounds(&clustering_indices);
         let idx = clustering_indices;
-        let augmented = stream
-            .map(move |res| res.and_then(|b| super::zorder::append_zorder_key_column(&b, &idx)));
+        let appended_key_name = key_name.clone();
+        let augmented = stream.map(move |res| {
+            res.and_then(|b| {
+                super::clustering::append_cluster_key_column(&b, &idx, &bounds, &appended_key_name)
+            })
+        });
         let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&augmented_schema),
             augmented,
         ));
-        let sorted = super::streaming::bounded_sort_stream(
-            &self.table_metadata.table_name,
-            augmented_stream,
-            vec![super::zorder::ZORDER_COLUMN_NAME.to_string()],
-            task_ctx,
-            self.table_metadata
-                .vortex_config
-                .cold_clustering_run_size_bytes(),
-        );
+        let key_column = vec![key_name];
+        let sorted = match span {
+            ClusterSortSpan::Global => {
+                util::stream_utils::sort_stream(augmented_stream, &key_column, task_ctx)?
+            }
+            ClusterSortSpan::BoundedRuns => super::streaming::bounded_sort_stream(
+                &self.table_metadata.table_name,
+                augmented_stream,
+                key_column,
+                task_ctx,
+                self.table_metadata
+                    .vortex_config
+                    .cold_clustering_run_size_bytes(),
+            ),
+        };
         let orig = Arc::clone(&original_schema);
-        let stripped = sorted
-            .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
-        Box::pin(RecordBatchStreamAdapter::new(original_schema, stripped))
+        let stripped = sorted.map(move |res| {
+            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &orig))
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            original_schema,
+            stripped,
+        )))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -20838,7 +21865,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Write a (Z-ordered, deletes-applied) stream to the cold object store as
+    /// Write a (clustered, deletes-applied) stream to the cold object store as
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
     /// file with accurate per-file footer statistics (for listing-time pruning).
     ///
@@ -20846,7 +21873,7 @@ impl CayenneTableProvider {
     /// it would lose rows — carrying the placeholder `row_count` of 0 that
     /// [`Self::promote_warm_to_cold_inner`] treats as an unknown count.
     ///
-    /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
+    /// Single ordered run (`target_partitions = 1`) so the clustering survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
     /// tight, non-overlapping zone maps. Bloom-eligible tables split the stream
     /// into row-bounded chunks (sequential writes to the same dir) so every file
@@ -21014,7 +22041,7 @@ impl CayenneTableProvider {
             let row_count = inferred_row_count.unwrap_or(0);
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
-                crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
+                crate::stats::statistics_to_persisted_blob(&stats, &self.table_schema())
                     .unwrap_or_else(|| {
                         tracing::warn!(
                             target: "cayenne::compaction",
@@ -21155,7 +22182,7 @@ impl CayenneTableProvider {
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
     /// [`super::cold_partition::ColdScanFiles`] session extension),
-    /// Z-order cluster it, write read-optimized Vortex to the cold store, then
+    /// cluster it along the curve, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
     /// warm snapshot. Subsequent CDC writes accumulate in warm again until the
@@ -21428,10 +22455,10 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             source_tier = "warm",
             target_tier = "datalake",
-            clustering = "z_order",
+            clustering = "hilbert",
             warm_bytes,
             warm_files,
-            "Moving warm-tier data to the datalake (Z-order clustered)"
+            "Moving warm-tier data to the datalake (Hilbert clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -21530,11 +22557,14 @@ impl CayenneTableProvider {
             "Planned the cross-tier read stream for the data move"
         );
 
-        // Z-order cluster for a read-optimized cold layout.
+        // Cluster along the curve for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
         let clustering_is_empty = clustering.is_empty();
         let task_ctx = ctx.task_ctx();
-        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
+        // Bounded runs: cold files advertise no ordering, so trading a global
+        // order for capped per-run memory is a clustering-quality choice only.
+        let stream =
+            self.cluster_sort_stream(stream, clustering, &task_ctx, ClusterSortSpan::BoundedRuns)?;
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -21543,7 +22573,7 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
-                // `zorder_sort_stream` returned the stream untouched when no
+                // `cluster_sort_stream` returned the stream untouched when no
                 // clustering key resolved; otherwise sharding would scatter the
                 // clustering this promotion exists to create.
                 if clustering_is_empty {
@@ -22326,7 +23356,12 @@ impl CayenneTableProvider {
                 // bounds cannot be cut for a different number of encoders than
                 // this write creates.
                 write_policy,
-                range_bounds.as_deref(),
+                range_bounds.as_deref().map(|bounds| RangePartitioning {
+                    column: None,
+                    bounds,
+                    run_sort_bytes: None,
+                }),
+                None,
             )
             .await;
 
@@ -23930,6 +24965,7 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         scan_guard: Arc<SnapshotScanRef>,
         maintained_aggregate_epoch: Option<u64>,
+        lookup_index: Option<super::lookup_index::LookupIndexExplain>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
         let table_name = self.table_metadata.table_name.as_str();
@@ -23942,13 +24978,15 @@ impl CayenneTableProvider {
                     epoch,
                 )
                 .with_optimizer_column_overlay(overlay)
-                .with_table_name(table_name),
+                .with_table_name(table_name)
+                .with_lookup_index(lookup_index),
             )
         } else {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
                     .with_optimizer_column_overlay(overlay)
-                    .with_table_name(table_name),
+                    .with_table_name(table_name)
+                    .with_lookup_index(lookup_index),
             )
         }
     }
@@ -24226,6 +25264,12 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
+        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
+        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
+        // caller that passes the `write_lock` INTO the sink rather than holding it,
+        // and the wrapper takes that same non-reentrant lock itself. The consequence
+        // is that `retention_sql` does not reach a `mode: memory` tier, which the
+        // accelerator warns about at registration.
         let sink = self
             .build_deletion_vector_sink(
                 &filters,
@@ -24804,6 +25848,26 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-scan-input-capture hook, if one
+    /// is installed. See [`Self::test_post_scan_input_capture_hook`].
+    #[cfg(test)]
+    async fn run_test_post_scan_input_capture_hook(&self) {
+        let hook = self.test_post_scan_input_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-snapshot-LIST hook, if one is
+    /// installed. See [`Self::test_post_snapshot_list_hook`].
+    #[cfg(test)]
+    async fn run_test_post_snapshot_list_hook(&self) {
+        let hook = self.test_post_snapshot_list_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
@@ -24998,7 +26062,7 @@ impl CayenneTableProvider {
     /// `COUNT(*)`) reinvokes `infer_stats`, which in turn reapplies the
     /// `VortexAccessPlanProvider` and observes the fresh deletion bitmap.
     pub(crate) fn invalidate_scan_file_statistics(&self) {
-        self.scan_file_statistics.clear();
+        self.clear_scan_file_statistics_cache();
     }
 
     /// Refresh the listing table, ASSUMING the caller already holds
@@ -25029,8 +26093,12 @@ impl CayenneTableProvider {
         );
 
         // Invalidate the list-files cache for the snapshot directory so the next
-        // scan discovers newly written files
+        // scan discovers newly written files. Drop the in-process snapshot listing
+        // cache too: this path can add files without bumping
+        // `current_dir_generation` (position-based checkpoint, schema evolution),
+        // so a generation-keyed hit would serve the pre-refresh file set.
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
+        self.drop_cached_snapshot_listing();
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -25945,15 +27013,19 @@ impl CayenneTableProvider {
         (cached.generation == current_gen).then(|| (*cached.batches).clone())
     }
 
-    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         let cached = self.inlined_cache.load();
         (cached.generation == current_gen).then(|| Arc::clone(&cached.view))
     }
 
-    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
+        // Empty captures share one identity in `ScanViewKey`, just as nonempty
+        // captures retain the cached view's identity until its contents change.
+        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<Arc<InlinedViewEntry>>>> =
+            std::sync::LazyLock::new(|| Arc::new(Vec::new()));
         if self.cached_inlined_row_count() <= 0 {
-            return Some(Arc::new(Vec::new()));
+            return Some(Arc::clone(&EMPTY_VIEW));
         }
         self.try_read_inlined_view_cached()
     }
@@ -25995,7 +27067,7 @@ impl CayenneTableProvider {
     /// including the original [`InlinedData`] envelope — enabling the upsert-
     /// rewrite path to reconstruct updated entries without a second metastore
     /// round-trip or IPC re-decode.
-    async fn cached_inlined_view(&self) -> Result<Arc<Vec<InlinedViewEntry>>> {
+    async fn cached_inlined_view(&self) -> Result<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         {
             let cached = self.inlined_cache.load();
@@ -26189,7 +27261,7 @@ impl CayenneTableProvider {
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
 
-        let view: Vec<InlinedViewEntry> = if inlined.is_empty() {
+        let view: Vec<Arc<InlinedViewEntry>> = if inlined.is_empty() {
             Vec::new()
         } else {
             let inlined_deletions = self.load_inlined_deletion_maps().await?;
@@ -26203,7 +27275,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > materialized_through_sequence {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
             view
         };
@@ -26319,13 +27393,18 @@ impl CayenneTableProvider {
         // `base`; re-filtering against just the new removal map removes exactly the
         // rows the newly published tombstones hide (entries with `sequence_number
         // <= delete_sequence` whose PK is in the removal).
-        let mut view: Vec<InlinedViewEntry> = if has_tombstone_delta {
+        let mut view: Vec<Arc<InlinedViewEntry>> = if has_tombstone_delta {
             let mut filtered = Vec::with_capacity(base.view.len());
             for entry in base.view.iter() {
-                filtered.push(self.apply_tombstone_removal_to_entry(entry, &removal_map)?);
+                filtered.push(Arc::new(
+                    self.apply_tombstone_removal_to_entry(entry, &removal_map)?,
+                ));
             }
             filtered
         } else {
+            // Cheap: cloning `Vec<Arc<InlinedViewEntry>>` is one refcount bump
+            // per existing entry, not a deep copy of each entry's decoded
+            // batches — see `InlinedCache::view`'s doc comment.
             (*base.view).clone()
         };
 
@@ -26340,7 +27419,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > new_watermark {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
         }
 
@@ -26376,7 +27457,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry.envelope.clone(),
+            envelope: Arc::clone(&entry.envelope),
             statistics: Arc::clone(&entry.statistics),
         })
     }
@@ -26458,7 +27539,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry,
+            envelope: Arc::new(entry),
             statistics,
         })
     }
@@ -26470,7 +27551,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         materialized_through_sequence: i64,
         tombstone_delta_seq: u64,
-        view: Vec<InlinedViewEntry>,
+        view: Vec<Arc<InlinedViewEntry>>,
     ) -> InlinedCache {
         let batches: Vec<RecordBatch> = view
             .iter()
@@ -26922,9 +28003,10 @@ impl CayenneTableProvider {
             })?;
         };
 
-        // Read under the held fence: the current snapshot id (the file set) and the
-        // structural epoch (the version key `changed()` compares).
+        // Capture the complete warm file set under the fence. Pinning a snapshot
+        // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
+        let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         // The cold half of the file set, resolved under the SAME held fence as the
@@ -26969,10 +28051,66 @@ impl CayenneTableProvider {
             protected_map,
             inlined_view,
             current_snapshot_id,
+            warm_files,
             cold_files,
             structural_epoch,
             scan_guard,
             read_schema,
+        })
+    }
+
+    /// Capture the unpruned warm listing while holding `listing_fence.read()`.
+    /// Reuse an existing complete listing when its generations match; on a miss,
+    /// enumerate file metadata only. Footer reads and query pruning stay outside
+    /// the fence in `snapshot_files_with_stats`.
+    async fn capture_warm_files(
+        &self,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<CapturedSnapshotFiles> {
+        let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
+        let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let files = if let Some(cached) = self.cached_snapshot_listing.load_full()
+            && cached.snapshot_id == snapshot_id
+            && cached.dir_generation == dir_generation
+            && cached.listing_epoch == listing_epoch
+        {
+            Arc::clone(&cached.files)
+        } else {
+            let ctx = self.create_session_context();
+            let state = ctx.state();
+            let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                snapshot_id,
+            ))?;
+            let options = Self::create_listing_options(
+                self.context.file_format(),
+                &self.pk_deletion_strategy,
+                state.config(),
+            );
+            let request = SnapshotScanListingRequest {
+                state: &state,
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: &[],
+                snapshot_id,
+                limit: None,
+                scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
+                captured_files: None,
+            };
+            let store = state.runtime_env().object_store(&table_url)?;
+            Arc::new(
+                self.snapshot_file_list(&request, &store)
+                    .await?
+                    .try_collect()
+                    .await?,
+            )
+        };
+        Ok(CapturedSnapshotFiles {
+            dir_generation,
+            listing_epoch,
+            files,
         })
     }
 
@@ -27112,14 +28250,13 @@ impl CayenneTableProvider {
     /// (awaited locally) but is not cached for dedup — bounded memory, correct result.
     const MAX_IN_FLIGHT_SCAN_VIEWS: usize = 8;
 
-    /// Bound on the seqlock capture retry across a live schema-evolution (odd/torn
-    /// generation). Each retry yields; the window is one schema-evolve, so a handful of
-    /// yields settles it. Exceeding this fails the scan loud rather than spinning.
+    /// Bound on capture retries across a live schema-evolution (odd/torn generation)
+    /// or a write that advanced `scan_input_version` while the capture ran. Each
+    /// retry yields; exceeding this fails the scan loud rather than spinning.
     const MAX_STRUCTURAL_CAPTURE_RETRIES: u32 = 32;
 
-    /// Tick period of the background [`Self::run_scan_view_evictor`] sweep. Bounds how
-    /// long a no-longer-servable cached view lingers (and pins its snapshot dirs)
-    /// after a table goes idle, on top of its own freshness bound.
+    /// Tick period of the background [`Self::run_scan_view_evictor`] sweep.
+    /// Also the idle window for [`ScanViewReuse::UntilInvalidated`].
     const SCAN_VIEW_EVICTION_INTERVAL: Duration = Duration::from_secs(5);
 
     /// Initialize the demand scan-view cache once the provider is wrapped in an `Arc`:
@@ -27137,23 +28274,11 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Background sweep that DROPS a cached `latest_complete` view once it has gone
-    /// UNSERVED for the idle window — even when NO query is running. A completed view
-    /// holds its capture's [`SnapshotScanRef`], pinning the snapshot dirs it reads; on a
-    /// table that was queried once and then went idle, that reference would otherwise
-    /// keep those dirs alive forever, blocking compaction GC. The demand cache only
-    /// refreshes `latest_complete` on a scan miss, so with no scans nothing would ever
-    /// release it — hence a timer rather than piggybacking on the query path.
-    ///
-    /// It evicts on IDLE TIME (`now - last_access`), not age-since-capture, so a view
-    /// still being reused is retained rather than dropped mid-reuse — including a
-    /// read-your-writes (`freshness == 0`) exact-key hit, which stays valid regardless
-    /// of the view's age as long as the scan-visible state has not moved. Only a view
-    /// that has not been served for `max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`
-    /// is dropped. An in-flight build (and a query currently executing, which cloned its
-    /// own `Arc`) is untouched — dropping the cache's reference just lets the dirs free
-    /// once the last user finishes. Holds only a `Weak<Self>`, so it never pins the
-    /// provider and exits on the first tick after the table is torn down.
+    /// Background sweep that drops a cached `latest_complete` once it has gone
+    /// unserved for the idle window. Keyed on last-access, not age, so a
+    /// [`ScanViewReuse::UntilInvalidated`] view stays cached while scans keep
+    /// hitting it (valid at any age until a write). Holds only a `Weak<Self>`
+    /// and exits after the table is torn down.
     async fn run_scan_view_evictor(weak: std::sync::Weak<Self>) {
         loop {
             tokio::time::sleep(Self::SCAN_VIEW_EVICTION_INTERVAL).await;
@@ -27165,26 +28290,18 @@ impl CayenneTableProvider {
         }
     }
 
-    /// One eviction step (the body of [`Self::run_scan_view_evictor`], factored out so
-    /// it is testable without the timer): drain completed builds, then drop
-    /// `latest_complete` iff it has not been SERVED within the idle window
-    /// (`max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`). Keying on
-    /// last-access (not age) keeps a still-reused view — e.g. a read-your-writes
-    /// exact-key hit, valid at any age while the state is unchanged — instead of
-    /// dropping it mid-reuse; an idle view's pinned snapshot dirs are released for GC.
+    /// One eviction step: drain completed builds, then drop `latest_complete`
+    /// iff it has not been served within the idle window (last-access, not age).
     fn evict_stale_scan_view(&self, now: Instant) {
-        let idle_window = self
-            .default_scan_freshness
-            .max(Self::SCAN_VIEW_EVICTION_INTERVAL);
-        let mut cache = self.scan_view_cache.lock();
-        cache.drain_completed();
-        if cache
-            .latest_complete
-            .as_ref()
-            .is_some_and(|current| now.duration_since(current.last_access) > idle_window)
+        let idle_window = match self.scan_view_reuse {
+            ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
+            ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
+        };
         {
-            cache.latest_complete = None;
+            let mut in_flight = self.scan_view_cache.in_flight.lock();
+            self.scan_view_cache.drain_completed(&mut in_flight);
         }
+        self.scan_view_cache.evict_if_idle(now, idle_window);
     }
 
     /// Start a `ScanView` build for `raw` (validated at seqlock generation
@@ -27192,17 +28309,25 @@ impl CayenneTableProvider {
     /// identity await ONE build (dedup). The CPU-bound merge + visible-segment build
     /// runs in `spawn_blocking` (D3) off the tokio worker. An INDEPENDENTLY-SPAWNED
     /// driver task polls a clone of the `Shared` to completion, so a completed build is
-    /// observable via `peek()` (and reusable by read-current scans) even if the
+    /// observable via `peek()` (and reusable by a `WithinLag` serve) even if the
     /// originating scan is cancelled before it resolves.
     ///
     /// Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the unit-test
     /// path): build inline and wrap the ready result. Correct; just not offloaded or
     /// independently driven.
-    fn spawn_scan_view_build(&self, raw: RawScanInput, structural_version: u64) -> ScanViewBuild {
+    fn spawn_scan_view_build(
+        &self,
+        raw: RawScanInput,
+        structural_version: u64,
+        key: ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+    ) -> ScanViewBuild {
         use futures::FutureExt;
         let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
             // Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the
-            // unit-test path): build inline and wrap the ready result.
+            // unit-test path): build inline and wrap the ready result. The
+            // awaiter publishes `latest_complete`.
             let result = self
                 .build_scan_view(raw, structural_version)
                 .map(Arc::new)
@@ -27222,63 +28347,66 @@ impl CayenneTableProvider {
         }
         .boxed()
         .shared();
-        // Independent driver: drives the shared build to completion regardless of
-        // whether the originating scan stays parked on it.
-        task::spawn(build.clone());
+        // Independent driver: drives the shared build to completion and publishes
+        // `latest_complete` even if the originating scan is cancelled, so the next
+        // hit is wait-free (no drain of `in_flight` required).
+        let driver_build = build.clone();
+        let cache = Arc::clone(&self.scan_view_cache);
+        task::spawn(async move {
+            if let Ok(view) = driver_build.await {
+                cache.publish_completed(key, order, captured_at, view);
+            }
+        });
         build
     }
 
-    /// Obtain the [`ScanView`] bundle for a scan from the demand-driven cache, at the
-    /// requested `freshness` tolerance. Decide under the cache mutex, await OUTSIDE it
-    /// (the mutex is never held across `.await`).
+    /// Obtain the [`ScanView`] for this scan from the demand cache.
+    /// A hit is wait-free (`ArcSwap` load + atomic version validation). A miss
+    /// captures, then takes the in-flight mutex only long enough to dedup or
+    /// spawn; the build is awaited outside it.
     ///
-    /// **Read-current (`freshness > 0`, stale-tolerant analytical path).** Fast path:
-    /// under the cache mutex, drain completed builds and serve `latest_complete` iff it
-    /// was captured within `freshness` AND its structural generation still matches
-    /// `structural_version.current()` — the latter guard means a stale-tolerant scan is
-    /// NEVER served a pre-schema-evolution bundle (a schema-evolve advances the
-    /// generation). No capture, no fence on this path. On a miss it falls through to a
-    /// fresh build (below).
+    /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
+    /// `order == scan_input_version` and the structural generation matches.
+    /// [`ScanViewReuse::WithinLag`]: serve it when `now - captured_at <= lag`
+    /// and the structural generation matches. A zero lag recaptures every scan.
     ///
-    /// **Read-your-writes (`freshness == 0`, the default and correctness path).**
-    /// Capture the CURRENT state atomically under the structural seqlock
-    /// (`read_validated_async`, so the key's structural version is self-consistent with
-    /// the captured snapshot — a capture that straddled a live schema-evolution is
-    /// discarded and retried), key it, then under the cache mutex: serve an exact-key
-    /// completed view, await an in-flight build for the same key (dedup), or start a
-    /// build. Because the capture reflects the writer's own mutations (a direct DML bump
-    /// changes the snapshot id / tier version → a fresh key → a miss → a rebuild from
-    /// current state), the scan sees its own writes — fixing the overwrite regression.
+    /// On a miss, capture under the structural seqlock, then hit / await / build.
     async fn scan_view_at_current_input(
         &self,
-        freshness: Duration,
+        reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
-        // Read-current fast path: serve a recent, structurally-current completed view.
-        if !freshness.is_zero() {
-            let now = Instant::now();
-            let mut cache = self.scan_view_cache.lock();
-            cache.drain_completed();
-            // Read the seqlock generation UNDER the cache mutex, immediately before the
-            // servability check, so no live schema-evolution can slip in between the
-            // read and the compare (a pre-lock read left a TOCTOU window across the
-            // `.lock()` + `drain_completed()`). An in-flight evolution reads ODD and can
-            // never equal a completed view's always-EVEN `structural_version`, so a
-            // straddling evolution falls through to the read-your-writes rebuild below.
-            let structural = self.structural_version.current();
-            if let Some(view) = cache.servable_within_lag(now, freshness, structural) {
-                return Ok(view);
-            }
-            // Miss (nothing fresh enough, or superseded by a schema-evolve): fall
-            // through to a fresh read-your-writes build. Drop the guard first — the
-            // capture below awaits and the mutex must never be held across `.await`.
-            drop(cache);
+        // Bracket the candidate with both versions. Ordinary writes invalidate
+        // UntilInvalidated; a structural event rejects either reuse mode when it
+        // straddles selection. No drain, no mutex.
+        let now = Instant::now();
+        if let Some((structural, (version_before, candidate, version_after))) =
+            self.structural_version.read_validated(|| {
+                let version_before = self.scan_input_version.load(Ordering::Acquire);
+                let candidate = self.scan_view_cache.latest_complete.load_full();
+                let version_after = self.scan_input_version.load(Ordering::Acquire);
+                (version_before, candidate, version_after)
+            })
+            && let Some(view) = ScanViewCache::try_serve_latest(
+                reuse,
+                version_before,
+                version_after,
+                structural,
+                now,
+                candidate,
+            )
+        {
+            return Ok(view);
         }
 
         // Capture the CURRENT state under the structural seqlock, retrying across a
-        // (rare) live schema-evolution that leaves the generation odd/torn.
+        // (rare) live schema-evolution that leaves the generation odd/torn, and
+        // across a write that advanced `scan_input_version` while we captured.
+        // Stamping the capture with a post-write version would make
+        // `UntilInvalidated` serve the pre-write rows until the next write.
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
+            let order_before = self.scan_input_version.load(Ordering::Acquire);
             let (structural_version, raw) = match self
                 .structural_version
                 .read_validated_async(|| self.capture_raw_scan_input())
@@ -27293,7 +28421,7 @@ impl CayenneTableProvider {
                     if attempts >= Self::MAX_STRUCTURAL_CAPTURE_RETRIES {
                         return Err(datafusion_common::DataFusionError::Execution(format!(
                             "Scan of table {} could not capture a stable scan view across \
-                             {attempts} structural retries (persistent schema-evolution churn?)",
+                             {attempts} retries (persistent schema-evolution or write churn?)",
                             self.table_metadata.table_name
                         )));
                     }
@@ -27302,44 +28430,101 @@ impl CayenneTableProvider {
                 }
             };
 
+            #[cfg(test)]
+            self.run_test_post_scan_input_capture_hook().await;
+
+            let order_after = self.scan_input_version.load(Ordering::Acquire);
+            if order_before != order_after {
+                if attempts >= Self::MAX_STRUCTURAL_CAPTURE_RETRIES {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "Scan of table {} could not capture a stable scan view across \
+                         {attempts} retries (persistent schema-evolution or write churn?)",
+                        self.table_metadata.table_name
+                    )));
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+
             let key = raw.key(structural_version);
-            let order = self.scan_input_version.load(Ordering::Acquire);
+            let order = order_after;
             let captured_at = Instant::now();
 
-            // Decide under the lock; the build future is awaited AFTER releasing it.
+            // Another scan may have published while we captured — serve it
+            // without taking the in-flight mutex.
+            if let Some(view) = self.scan_view_cache.serve_if_key(&key, order, captured_at) {
+                return Ok(view);
+            }
+
+            // Dedup or spawn under the in-flight lock; await AFTER releasing it.
             let action = {
-                let mut cache = self.scan_view_cache.lock();
-                cache.drain_completed();
-                match cache.find_by_key(&key) {
-                    ScanViewProbe::Hit(view) => ScanViewAction::Serve(view),
-                    ScanViewProbe::Pending(build) => ScanViewAction::Await(build),
-                    ScanViewProbe::Miss => {
-                        let build = self.spawn_scan_view_build(raw, structural_version);
-                        // Cache the in-flight build for dedup, unless we are over the
-                        // churn cap (then build standalone — bounded memory, no dedup).
-                        if cache.in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
-                            cache.in_flight.push(InFlightScanView {
-                                key,
-                                order,
-                                captured_at,
-                                build: build.clone(),
-                            });
-                        }
-                        ScanViewAction::Await(build)
+                let mut in_flight = self.scan_view_cache.in_flight.lock();
+                self.scan_view_cache.drain_completed(&mut in_flight);
+                if let Some(view) = self.scan_view_cache.serve_if_key(&key, order, captured_at) {
+                    ScanViewAction::Serve(view)
+                } else if let Some(pending) = in_flight.iter().find(|entry| entry.key == key) {
+                    ScanViewAction::Await {
+                        build: pending.build.clone(),
+                        key: pending.key.clone(),
+                        // This scan validated the same identity at its own
+                        // version and time, even when the shared build is older.
+                        order,
+                        captured_at,
+                    }
+                } else {
+                    let build = self.spawn_scan_view_build(
+                        raw,
+                        structural_version,
+                        key.clone(),
+                        order,
+                        captured_at,
+                    );
+                    // Cache the in-flight build for dedup, unless we are over the
+                    // churn cap (then build standalone — bounded memory, no dedup).
+                    if in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
+                        in_flight.push(InFlightScanView {
+                            key: key.clone(),
+                            order,
+                            captured_at,
+                            build: build.clone(),
+                        });
+                    }
+                    ScanViewAction::Await {
+                        build,
+                        key,
+                        order,
+                        captured_at,
                     }
                 }
             };
 
             return match action {
                 ScanViewAction::Serve(view) => Ok(view),
-                ScanViewAction::Await(build) => build.await.map_err(|error| {
-                    // The shared build errored; it was dropped (not promoted) on drain,
-                    // so a subsequent scan re-enters and starts a fresh build.
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to build scan view for table {}: {error}",
-                        self.table_metadata.table_name
-                    ))
-                }),
+                ScanViewAction::Await {
+                    build,
+                    key,
+                    order,
+                    captured_at,
+                } => {
+                    let view = build.await.map_err(|error| {
+                        // The shared build errored; it was dropped (not promoted) on drain,
+                        // so a subsequent scan re-enters and starts a fresh build.
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to build scan view for table {}: {error}",
+                            self.table_metadata.table_name
+                        ))
+                    })?;
+                    // Publish before returning so the next sequential scan is a
+                    // wait-free hit (the driver also publishes; last-writer with
+                    // a lower `order` is ignored).
+                    self.scan_view_cache.publish_completed(
+                        key,
+                        order,
+                        captured_at,
+                        Arc::clone(&view),
+                    );
+                    Ok(view)
+                }
             };
         }
     }
@@ -27410,7 +28595,7 @@ impl CayenneTableProvider {
 
     fn pruned_inlined_batches(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         mem_tier: &crate::provider::mem_tier::MemTier,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -27432,7 +28617,7 @@ impl CayenneTableProvider {
     /// same removal map the single-tier path built.
     fn pruned_inlined_batches_with_removal(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         removal: Option<&InlinedDeletionMaps>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -27449,7 +28634,9 @@ impl CayenneTableProvider {
             } else if entry.batches.is_empty() {
                 continue;
             } else {
-                entry.clone()
+                // `entry: &Arc<InlinedViewEntry>` here; deref past the Arc so
+                // this stays a plain `InlinedViewEntry` like the other arm.
+                (**entry).clone()
             };
 
             if visible.batches.is_empty() {
@@ -27638,19 +28825,23 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
         incoming_bytes: u64,
         overwrite: bool,
+        deletions: &crate::provider::on_conflict::OnConflictDeletions,
     ) -> Result<u64> {
         self.enforce_memory_limit(incoming_bytes)?;
         if overwrite {
-            self.overwrite_mem_tier(batches, incoming_bytes).await
-        } else {
-            self.append_to_mem_tier(
-                batches,
-                &crate::provider::on_conflict::OnConflictDeletions::default(),
-                incoming_bytes,
-                0,
-            )
-            .await
+            return self.overwrite_mem_tier(batches, incoming_bytes).await;
         }
+
+        let incoming_rows: u64 = batches
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .fold(0, u64::saturating_add);
+        let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
+        // `append_to_mem_tier` answers with the mem-tier epoch, which is not a row
+        // count — returning it would report the epoch as `rows affected`.
+        self.append_to_mem_tier(batches, deletions, incoming_bytes, superseded)
+            .await?;
+        Ok(incoming_rows)
     }
 
     /// Atomically REPLACE the entire RAM mem-tier with `batches` (memory-mode full
@@ -27668,6 +28859,7 @@ impl CayenneTableProvider {
             .map(|b| b.num_rows() as u64)
             .fold(0, u64::saturating_add);
         let arc_batches = Arc::new(batches);
+        let segment_index = self.index_mem_tier_segment(&arc_batches).await;
         // Full refresh replaces everything: no tombstones (empty deletions).
         let mut tombstones = self.prepare_segment_tombstones(
             &crate::provider::on_conflict::OnConflictDeletions::default(),
@@ -27694,12 +28886,27 @@ impl CayenneTableProvider {
                     incoming_rows,
                     0,
                     None,
+                    segment_index,
                 );
             self.mem_tier.shard(0).store(Arc::new(next));
             // Memory-mode overwrite swaps the entire tier without a structural-epoch
             // bump, so advance the scan-input version (the next capture re-keys over the new tier).
             self.notify_scan_input_change();
         }
+
+        // The replaced tier's keys are gone and the replacement's are not recorded,
+        // so any cached primary-key index now describes rows that no longer exist and
+        // omits every row that does. Drop it; the next append rebuilds it from the
+        // live tier.
+        //
+        // A stale entry is not symmetric. A key the overwrite REMOVED that the cache
+        // still lists only costs a redundant tombstone on re-insert, which masks
+        // nothing — the documented `PkBloom` false-positive invariant. A key the
+        // overwrite INTRODUCED that the cache does not list is the damaging
+        // direction: an upsert reads it as new, supersedes nothing, and leaves two
+        // live rows under one primary key. This path could not produce that before
+        // the memory append started recording keys at all.
+        self.clear_cached_pk_keyset();
         Ok(incoming_rows)
     }
 
@@ -28418,6 +29625,9 @@ impl CayenneTableProvider {
         // where the bulk of `inmemory_fence_work` (the per-batch HAMT build) used
         // to sit while the lock was held.
         let mut tombstones = self.prepare_segment_tombstones(deletions);
+        // Index the segment off the publish lock too; it depends only on the
+        // incoming batches.
+        let segment_index = self.index_mem_tier_segment(&arc_batches).await;
 
         let (epoch, maintained_aggregate_insert, maintained_aggregate_delete) = {
             // Publish the RAM swap under the dedicated `mem_tier_publish_lock`,
@@ -28497,6 +29707,7 @@ impl CayenneTableProvider {
                 incoming_rows,
                 superseded,
                 source_position,
+                segment_index.clone(),
             );
             let epoch = next.epoch;
             // N=1 publishes the tier swap and IVM epoch under this shard lock. Use
@@ -28556,8 +29767,7 @@ impl CayenneTableProvider {
             // Advance the scan-input version: a mem-tier append changes the visible
             // set + tier version but deliberately does NOT bump the structural epoch
             // (see the invariant above), so it is NOT covered by the
-            // `bump_inlined_structural_epoch` funnel and must signal here. The tier
-            // version change re-keys the next read-your-writes capture.
+            // `bump_inlined_structural_epoch` funnel and must signal here.
             self.notify_scan_input_change();
             record_cayenne_write_phase(
                 &self.table_metadata.table_name,
@@ -29854,6 +31064,198 @@ impl CayenneTableProvider {
         Ok(removed_rows)
     }
 
+    /// Remove every mem-tier row matching `filters` on a `mode: memory` table, and
+    /// return how many rows that removed (#12008).
+    ///
+    /// The caller must hold `write_lock`, and must be executing the delete rather
+    /// than planning it: the capture, the predicate pass and the swap all happen
+    /// inside this one hold, so no write can land between deciding what to delete
+    /// and deleting it. That is what keeps this path clear of the plan/execute
+    /// window #13828 describes for the durable arm.
+    ///
+    /// RESTRICTED TO MEMORY-RESIDENT MODE, for two reasons. A
+    /// `cdc_durability: memory` table already has this covered: its scanning
+    /// DELETE checkpoints the tier into Vortex first, so the rows are durable and
+    /// the deletion sink sees them. And its tier bytes are RESERVED against the
+    /// process-global mem-tier budget, released only by the checkpoint that flushes
+    /// them — shrinking the tier here would leak that reservation. Memory mode
+    /// skips the global reservation entirely (`write_cdc_in_memory` does not
+    /// reserve, so it must not release), which is what makes rebuilding the tier
+    /// safe.
+    ///
+    /// A predicate that matches nothing rebuilds nothing: every segment keeps its
+    /// `Arc`s, so a no-match delete costs one predicate pass over the tier and no
+    /// batch copy. A predicate that does match pays a visibility probe over the
+    /// matched rows only.
+    pub(crate) async fn delete_mem_tier_rows_matching(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<u64> {
+        if !self.is_memory_resident_mode() || self.mem_tier.is_empty() {
+            return Ok(0);
+        }
+
+        let coerced = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        if physical_filters.is_empty() {
+            // No predicate means every row (the `TableProvider::delete_from`
+            // contract), which is delete-all — handled by `purge_mem_tier_all`,
+            // not here.
+            return Ok(0);
+        }
+
+        let mut visible_deleted: u64 = 0;
+        let mut raw_removed: u64 = 0;
+        // Each shard is rebuilt under ITS OWN publish lock, in index order — the
+        // deadlock-free order every other multi-shard site uses. Memory mode is
+        // single-shard (enforced by the accelerator's memory-mode overrides), so
+        // this is one iteration, and it relies on that: shards are swapped one at a
+        // time, so at N>1 a lock-free scan could capture one shard before the delete
+        // and the next after it. Making this atomic across shards needs more than
+        // per-shard locking, and nothing here provides it.
+        for (shard_id, shard) in self.mem_tier.shards().iter().enumerate() {
+            let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
+            let current = shard.load_full();
+            if current.segments.is_empty() {
+                continue;
+            }
+
+            // The predicate is evaluated EXACTLY ONCE per batch, and both answers
+            // this loop needs come from that one mask. Evaluating it again to count
+            // would not merely cost a second pass: a volatile predicate
+            // (`WHERE random() < 0.5`) answers differently each time, so the count a
+            // client is told would describe a different row set than the one removed.
+            let deletion_maps = Self::mem_tier_deletion_maps(&current);
+            let tier_has_tombstones = Self::mem_tier_has_tombstones(&current);
+            let mut shard_visible: u64 = 0;
+            let (next, removed) = current.retain_rows(|batch, data_sequence| {
+                let Some(matched) = self.delete_match_mask(batch, &physical_filters)? else {
+                    return Ok(batch.clone());
+                };
+                let match_count = matched.true_count();
+                // Nothing to remove: hand the batch back untouched rather than
+                // building an all-true mask and filtering by it, which would
+                // allocate one `ArrayData` per column to reproduce the input.
+                if match_count == 0 {
+                    return Ok(batch.clone());
+                }
+
+                // A tier holding an upsert history carries superseded versions that
+                // no scan serves. Removing one is harmless — it is invisible either
+                // way, and its segment's tombstone stays to hide anything older —
+                // but COUNTING one is not: a user `DELETE` reports an exact
+                // `rows affected`, and a client that upserted a key twice would be
+                // told two rows went. Visibility is therefore resolved over the
+                // MATCHED rows alone — a probe of what is being deleted, not a walk
+                // of the tier. With no tombstone anywhere every row is visible and
+                // even that probe is skipped.
+                shard_visible = shard_visible.saturating_add(if tier_has_tombstones {
+                    let matched_rows = arrow::compute::filter_record_batch(batch, &matched)?;
+                    self.filter_inlined_batch_for_deletions(
+                        matched_rows,
+                        data_sequence,
+                        &deletion_maps,
+                    )
+                    .map_err(|error| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to resolve mem-tier row visibility while deleting from dataset '{}': {error}",
+                            self.table_metadata.table_name
+                        ))
+                    })?
+                    .map_or(0, |visible| visible.num_rows() as u64)
+                } else {
+                    match_count as u64
+                });
+
+                let keep = arrow::compute::not(&matched)?;
+                Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+            }, |batch| {
+                self.mem_tier_index
+                    .as_ref()
+                    .and_then(|indexer| indexer.index_batch(batch))
+            })?;
+            if removed == 0 {
+                continue;
+            }
+            visible_deleted = visible_deleted.saturating_add(shard_visible);
+            shard.store(Arc::new(next));
+            raw_removed = raw_removed.saturating_add(removed);
+        }
+
+        // Keyed on the PHYSICAL fact, not on the number reported to the client: a
+        // rebuild that dropped only superseded rows still swapped the tier, and
+        // every scan-view cache keyed on its version has to re-key.
+        if raw_removed > 0 {
+            // Re-sync the resident-row counter from the tier rather than
+            // subtracting from it, exactly as `purge_mem_tier_all` does. Subtracting
+            // is not safe here: the position-based arm of `delete_from` runs
+            // `checkpoint_inlined_data_if_present_for_delete` first, which re-syncs
+            // this counter from the DURABLE inline corpus alone and so zeroes the
+            // mem-tier's contribution — a subtraction on top of that drives it
+            // NEGATIVE, and it gates the `> 0` branch that decides whether a scan
+            // consults the inline corpus at all.
+            //
+            // In memory-resident mode the tier IS the table (the inline corpus is
+            // disabled), so its row count is the whole truth. It counts superseded
+            // versions a scan does not serve, which over-reports rather than under-
+            // reports — the safe direction for a value served as an INEXACT estimate
+            // and as a "might have rows" gate.
+            self.inlined_row_count.store(
+                i64::try_from(self.mem_tier.total_rows()).unwrap_or(i64::MAX),
+                Ordering::Relaxed,
+            );
+            self.notify_scan_input_change();
+            self.clear_scan_file_statistics_cache();
+        }
+        Ok(visible_deleted)
+    }
+
+    /// The rows of `batch` a `DELETE ... WHERE` matches: the conjunction of
+    /// `physical_filters`, with NULL folded to "did not match". `None` when there
+    /// is nothing to decide — an empty batch, or no predicate at all (which means
+    /// every row, and is the delete-all purge's job, not this one's).
+    ///
+    /// SQL deletes a row only where the predicate evaluates TRUE, so NULL and
+    /// FALSE both mean keep. Folding the null mask into the values here is what
+    /// makes the caller's inversion total: `not(NULL)` is NULL, and
+    /// `filter_record_batch` drops a NULL-masked row, so inverting the raw mask
+    /// would silently delete the rows the predicate could not evaluate.
+    fn delete_match_mask(
+        &self,
+        batch: &RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<Option<arrow::array::BooleanArray>> {
+        if batch.num_rows() == 0 || physical_filters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut matched: Option<arrow::array::BooleanArray> = None;
+        for filter in physical_filters {
+            let value = filter.evaluate(batch)?;
+            let array = value.into_array(batch.num_rows())?;
+            let mask = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
+                        self.table_metadata.table_name,
+                        array.data_type()
+                    ))
+                })?;
+            let mask = if mask.null_count() == 0 {
+                mask.clone()
+            } else {
+                arrow::compute::prep_null_mask_filter(mask)
+            };
+            matched = Some(match matched {
+                None => mask,
+                Some(prev) => arrow::compute::and(&prev, &mask)?,
+            });
+        }
+        Ok(matched)
+    }
+
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
@@ -30620,7 +32022,7 @@ impl CayenneTableProvider {
     /// `lock_current_snapshot_for_apply`. Waiting for that registration to clear
     /// under the held lock therefore blocks the publish being waited for, and a
     /// DELETE that raced one could only end in the drain's timeout.
-    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+    pub(crate) async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
         self.checkpoint_mem_tier_holding_write_lock()
             .await
             .map(|_rows| ())
@@ -30822,31 +32224,13 @@ impl CayenneTableProvider {
 
     fn apply_inlined_delete_filters(
         &self,
-        mut batch: RecordBatch,
+        batch: RecordBatch,
         physical_filters: &[Arc<dyn PhysicalExpr>],
     ) -> datafusion_common::Result<RecordBatch> {
-        for filter in physical_filters {
-            if batch.num_rows() == 0 {
-                break;
-            }
-
-            let filter_value = filter.evaluate(&batch)?;
-            let filter_array = filter_value.into_array(batch.num_rows())?;
-            let filter_array = filter_array
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
-                        self.table_metadata.table_name,
-                        filter_array.data_type()
-                    ))
-                })?;
-
-            batch = arrow::compute::filter_record_batch(&batch, filter_array)?;
+        match self.delete_match_mask(&batch, physical_filters)? {
+            Some(matched) => Ok(arrow::compute::filter_record_batch(&batch, &matched)?),
+            None => Ok(batch),
         }
-
-        Ok(batch)
     }
 
     fn extract_primary_keys_from_batch(
@@ -31382,6 +32766,9 @@ impl CayenneTableProvider {
                     // `target_partitions` ways: with tens of protected snapshots
                     // that multiplies file opens ~50× for no parallelism gain
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+                    None,
+                    None,
+                    None,
                 )
                 .await?;
 
@@ -31550,6 +32937,9 @@ impl CayenneTableProvider {
             // Internal reads (compaction, keyset) also benefit from keeping small
             // groups whole: merging N small runs otherwise pays N × tp footer opens.
             Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -31586,6 +32976,14 @@ impl CayenneTableProvider {
         // byte-range splitting the same way (`0` disables the auto opt-out — the
         // main query branch keeps default splitting behavior).
         small_group_repartition_opt_out_bytes: u64,
+        captured_files: Option<&CapturedSnapshotFiles>,
+        // Candidate row addresses for this scan's equality key, still to be
+        // validated against the file list resolved below. Only the main `scan()`
+        // path ever supplies one.
+        lookup_selection: Option<super::lookup_index::LookupSelection>,
+        // Scan-local lookup-index evidence. The file listing below finalizes a
+        // provisional selection as selected, empty, or snapshot_mismatch.
+        lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // The reference schema the Vortex decode targets. Internal reads
         // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
@@ -31654,7 +33052,7 @@ impl CayenneTableProvider {
 
         let SnapshotFilesForScan {
             file_groups: mut partitioned_file_lists,
-            statistics,
+            mut statistics,
             grouped_by_partition,
         } = self
             .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
@@ -31666,8 +33064,35 @@ impl CayenneTableProvider {
                 snapshot_id,
                 limit: statistic_file_limit,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files,
             })
             .await?;
+
+        // Point-lookup index: restrict the scan to the files that hold a
+        // candidate row, and carry their positions into the Vortex scan. A file
+        // carries exactly ONE access plan, and position-delete vectors travel in
+        // it, so the selection is composed with the provider this scan would
+        // otherwise attach: deleted candidates are removed from the selection,
+        // never resurrected.
+        let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
+        if let Some(selection) = lookup_selection {
+            let (restricted_files, provider, explain) = selection.restrict(
+                snapshot_id,
+                partitioned_file_lists,
+                Self::position_deletion_plans(&self.pk_deletion_strategy),
+                self.file_set_version(),
+            );
+            partitioned_file_lists = restricted_files;
+            lookup_plan_provider = provider;
+            if let Some(slot) = lookup_index_explain {
+                *slot = explain;
+            }
+            if lookup_plan_provider.is_some() {
+                // A row selection makes the footer row count an upper bound,
+                // so exact-aggregate optimizations must not read it as live.
+                statistics = statistics.to_inexact();
+            }
+        }
 
         if partitioned_file_lists.is_empty() {
             let projected_schema = project_schema(&scan_schema, projection)?;
@@ -31749,6 +33174,7 @@ impl CayenneTableProvider {
             .map(|file| file.object_meta.size)
             .sum();
         let disable_repartition = disable_repartition
+            || lookup_plan_provider.is_some()
             || (small_group_repartition_opt_out_bytes > 0
                 && group_bytes < small_group_repartition_opt_out_bytes);
 
@@ -31767,8 +33193,20 @@ impl CayenneTableProvider {
             }
         }
 
-        options
-            .format
+        // The per-file access plan is the only way a row selection reaches the
+        // Vortex scan, and a format carries exactly one provider. Swapping it
+        // here (after listing and footer-statistics collection) keeps the
+        // selection out of the shared file-statistics cache.
+        let plan_format: Arc<dyn FileFormat> = match lookup_plan_provider {
+            Some(provider) => Arc::new(
+                self.context
+                    .file_format()
+                    .with_access_plan_provider(provider),
+            ),
+            None => Arc::clone(&options.format),
+        };
+
+        plan_format
             .create_physical_plan(
                 state,
                 FileScanConfigBuilder::new(table_url.object_store(), file_source)
@@ -31880,7 +33318,7 @@ impl CayenneTableProvider {
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
-                &self.table_metadata.schema,
+                &self.table_schema(),
                 file.row_count,
             ) {
                 part_file = part_file.with_statistics(stats);
@@ -32048,41 +33486,10 @@ impl CayenneTableProvider {
         let collect_stats = request.options.collect_stat;
         let has_pending_deletions = self.has_pending_deletions();
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
-        let store = request
-            .state
-            .runtime_env()
-            .object_store(request.table_url)?;
-        let meta_fetch_concurrency = request
-            .state
-            .config_options()
-            .execution
-            .meta_fetch_concurrency;
-
-        // Manifest-driven file resolution (default OFF). When enabled and the
-        // manifest has rows for this snapshot, the scan's file set comes from
-        // `cayenne_snapshot_file`; otherwise it falls back to directory listing
-        // (dual-source). The two sources are equal by construction — see
-        // `manifest_partitioned_files` and `upsert_snapshot_manifest_from_listing`.
-        let manifest_files = if self.context.scan_from_manifest() {
-            self.manifest_partitioned_files(request).await
-        } else {
-            None
-        };
-        let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
-            match manifest_files {
-                Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
-                None => {
-                    pruned_partition_list(
-                        request.state,
-                        store.as_ref(),
-                        request.table_url,
-                        request.partition_filters,
-                        &request.options.file_extension,
-                        &request.options.table_partition_cols,
-                    )
-                    .await?
-                }
-            };
+        let dir_generation = request.captured_files.map_or_else(
+            || self.current_dir_generation.load(Ordering::Acquire),
+            |files| files.dir_generation,
+        );
 
         let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
             super::file_pruning::build_listing_pruning_predicate(
@@ -32093,60 +33500,47 @@ impl CayenneTableProvider {
             None
         };
 
-        let table_name = self.table_metadata.table_name.clone();
-        let files = file_list
-            .map(|part_file| async {
-                let part_file = part_file?;
-                let statistics = if collect_stats {
-                    self.collect_scan_file_statistics(
-                        request.state,
-                        request.snapshot_id,
-                        &store,
-                        request.options.format.as_ref(),
-                        &part_file,
-                    )
-                    .await?
-                } else {
-                    Arc::new(Statistics::new_unknown(&self.table_schema()))
-                };
-                let part_file = part_file.with_statistics(statistics);
-                if let Some(ref predicate) = listing_pruning_predicate
-                    && super::file_pruning::should_prune_partitioned_file(
-                        &part_file,
-                        &request.scan_schema,
-                        predicate,
-                    )?
-                {
-                    tracing::debug!(
-                        table = %table_name,
-                        file = %part_file.object_meta.location,
-                        "Pruned Vortex file at listing time via footer statistics"
-                    );
-                    telemetry::cayenne::track_scan_files(
-                        1,
-                        1,
-                        &[telemetry::KeyValue::new("table", table_name.clone())],
-                    );
-                    return Ok(None);
-                }
+        let unpruned = self
+            .snapshot_files_with_stats(request, collect_stats, dir_generation)
+            .await?;
+        let table_name = self.table_metadata.table_name.as_str();
+        let pk_eq = i64_eq_literal_on_schema(&request.scan_schema, request.data_filters);
+        let mut kept = Vec::new();
+        for part_file in unpruned.iter() {
+            let prune = if let Some((col_idx, value)) = pk_eq {
+                super::file_pruning::should_prune_i64_eq(part_file, col_idx, value)
+            } else if let Some(ref predicate) = listing_pruning_predicate {
+                super::file_pruning::should_prune_partitioned_file(
+                    part_file,
+                    &request.scan_schema,
+                    predicate,
+                )?
+            } else {
+                false
+            };
+            if prune {
+                tracing::debug!(
+                    table = %table_name,
+                    file = %part_file.object_meta.location,
+                    "Pruned Vortex file at listing time via footer statistics"
+                );
                 telemetry::cayenne::track_scan_files(
                     1,
-                    0,
-                    &[telemetry::KeyValue::new("table", table_name.clone())],
+                    1,
+                    &[telemetry::KeyValue::new("table", table_name.to_string())],
                 );
-                Ok(Some(part_file))
-            })
-            .buffer_unordered(meta_fetch_concurrency)
-            .filter_map(|result| async move {
-                match result {
-                    Ok(Some(file)) => Some(Ok(file)),
-                    Ok(None) => None,
-                    Err(err) => Some(Err(err)),
-                }
-            });
+                continue;
+            }
+            telemetry::cayenne::track_scan_files(
+                1,
+                0,
+                &[telemetry::KeyValue::new("table", table_name.to_string())],
+            );
+            kept.push(part_file.clone());
+        }
 
         let (file_group, truncated_file_set) =
-            Self::collect_scan_files_with_limit(files, request.limit, use_stats_for_limit).await?;
+            Self::file_group_with_limit(kept, request.limit, use_stats_for_limit);
 
         let threshold = request
             .state
@@ -32190,6 +33584,151 @@ impl CayenneTableProvider {
         })
     }
 
+    async fn snapshot_file_list<'a>(
+        &'a self,
+        request: &SnapshotScanListingRequest<'a>,
+        store: &'a Arc<dyn ObjectStore>,
+    ) -> datafusion_common::Result<futures::stream::BoxStream<'a, DataFusionResult<PartitionedFile>>>
+    {
+        if self.context.scan_from_manifest()
+            && let Some(files) = self.manifest_partitioned_files(request).await
+        {
+            return Ok(stream::iter(files.into_iter().map(Ok)).boxed());
+        }
+        pruned_partition_list(
+            request.state,
+            store.as_ref(),
+            request.table_url,
+            request.partition_filters,
+            &request.options.file_extension,
+            &request.options.table_partition_cols,
+        )
+        .await
+    }
+
+    /// Return the snapshot's files with statistics, using
+    /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
+    /// generation, and listing-cache epoch still match. A complete listing
+    /// (not truncated by LIMIT) is stored so later point lookups prune in
+    /// memory instead of re-LISTing.
+    async fn snapshot_files_with_stats(
+        &self,
+        request: &SnapshotScanListingRequest<'_>,
+        collect_stats: bool,
+        dir_generation: u64,
+    ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        let listing_epoch = request.captured_files.map_or_else(
+            || self.listing_cache_epoch.load(Ordering::Acquire),
+            |files| files.listing_epoch,
+        );
+        if collect_stats
+            && let Some(cached) = self.cached_snapshot_listing.load_full()
+            && cached.snapshot_id == request.snapshot_id
+            && cached.dir_generation == dir_generation
+            && cached.listing_epoch == listing_epoch
+            && request.captured_files.is_none_or(|captured| {
+                Arc::ptr_eq(&captured.files, &cached.files)
+                    || cached
+                        .source_files
+                        .as_ref()
+                        .is_some_and(|source| Arc::ptr_eq(&captured.files, source))
+            })
+        {
+            return Ok(Arc::clone(&cached.files));
+        }
+
+        let store = request
+            .state
+            .runtime_env()
+            .object_store(request.table_url)?;
+        let meta_fetch_concurrency = request
+            .state
+            .config_options()
+            .execution
+            .meta_fetch_concurrency;
+
+        let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
+            if let Some(captured) = request.captured_files {
+                stream::iter(captured.files.iter().cloned().map(Ok)).boxed()
+            } else {
+                self.snapshot_file_list(request, &store).await?
+            };
+
+        let files = file_list
+            .map(|part_file| async {
+                let part_file = part_file?;
+                let statistics = if collect_stats {
+                    self.collect_scan_file_statistics(
+                        request.state,
+                        request.snapshot_id,
+                        &store,
+                        request.options.format.as_ref(),
+                        &part_file,
+                    )
+                    .await?
+                } else {
+                    Arc::new(Statistics::new_unknown(&self.table_schema()))
+                };
+                Ok(part_file.with_statistics(statistics))
+            })
+            .buffer_unordered(meta_fetch_concurrency);
+
+        let (file_group, truncated) =
+            Self::collect_scan_files_with_limit(files, None, collect_stats).await?;
+        let files = Arc::new(file_group.into_inner());
+        #[cfg(test)]
+        self.run_test_post_snapshot_list_hook().await;
+        if collect_stats && !truncated {
+            let gen_after = self.current_dir_generation.load(Ordering::Acquire);
+            let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
+            if gen_after == dir_generation && epoch_after == listing_epoch {
+                self.cached_snapshot_listing
+                    .store(Some(Arc::new(CachedSnapshotListing {
+                        snapshot_id: request.snapshot_id.to_string(),
+                        dir_generation,
+                        listing_epoch,
+                        files: Arc::clone(&files),
+                        source_files: request
+                            .captured_files
+                            .map(|captured| Arc::clone(&captured.files)),
+                    })));
+            }
+        }
+        Ok(files)
+    }
+
+    fn file_group_with_limit(
+        files: Vec<PartitionedFile>,
+        limit: Option<usize>,
+        use_stats_for_limit: bool,
+    ) -> (FileGroup, bool) {
+        let Some(limit) = limit.filter(|_| use_stats_for_limit) else {
+            return (FileGroup::new(files), false);
+        };
+        let mut file_group = FileGroup::default();
+        let mut num_rows = DFPrecision::Absent;
+        let mut truncated = false;
+        for file in files {
+            if truncated {
+                break;
+            }
+            if let Some(file_stats) = &file.statistics {
+                num_rows = if file_group.is_empty() {
+                    file_stats.num_rows
+                } else {
+                    num_rows.add(&file_stats.num_rows)
+                };
+            }
+            file_group.push(file);
+            if let DFPrecision::Exact(row_count) = num_rows
+                && row_count > limit
+            {
+                truncated = true;
+            }
+        }
+        (file_group, truncated)
+    }
+
     async fn collect_scan_file_statistics(
         &self,
         state: &dyn Session,
@@ -32216,7 +33755,7 @@ impl CayenneTableProvider {
             && persisted.file_size_bytes == file_size_bytes
             && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
                 &persisted.statistics_blob,
-                &self.table_metadata.schema,
+                &self.table_schema(),
                 persisted.num_rows,
             )
             // A blob written before per-column byte sizes were persisted carries no
@@ -32248,10 +33787,9 @@ impl CayenneTableProvider {
                 .await?,
         );
 
-        if let Some(blob) = crate::stats::statistics_to_persisted_blob(
-            statistics.as_ref(),
-            &self.table_metadata.schema,
-        ) {
+        if let Some(blob) =
+            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), &self.table_schema())
+        {
             let num_rows = match statistics.num_rows {
                 DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
                     i64::try_from(rows).unwrap_or(0)
@@ -32665,6 +34203,376 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Diffs the published secondary index against a fresh build made by reading
+    /// the snapshot's finished files.
+    ///
+    /// The write-time index takes its positions from the writer, which is only
+    /// correct while the writer appends batches in arrival order. This is how
+    /// that invariant gets checked rather than assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table is not indexed, no index is published, or
+    /// the snapshot's files cannot be listed.
+    pub async fn verify_lookup_index_against_read_back(
+        &self,
+    ) -> std::result::Result<super::lookup_index::LookupIndexVerification, String> {
+        let state = self
+            .lookup_index
+            .as_ref()
+            .ok_or_else(|| "table is not indexed".to_string())?;
+        let published = state
+            .published()
+            .ok_or_else(|| "no published index to verify".to_string())?;
+        let read_schema = self.read_schema();
+        let ctx = self.create_session_context();
+        let session = ctx.state();
+        let (store, files) = self
+            .lookup_index_snapshot_files(&session, published.snapshot_id(), &read_schema)
+            .await
+            .ok_or_else(|| "could not list the indexed snapshot's files".to_string())?;
+        super::lookup_index::verify_against_read_back(
+            state,
+            published,
+            &store,
+            files,
+            &self.table_schema(),
+        )
+        .await
+    }
+
+    /// Probe and build accounting for this table's secondary indexes, or `None`
+    /// when the acceleration declares no `indexes`.
+    #[must_use]
+    pub fn lookup_index_counters(&self) -> Option<super::lookup_index::LookupIndexCounters> {
+        self.lookup_index
+            .as_ref()
+            .map(|state| state.counters())
+            .or_else(|| {
+                self.mem_tier_index
+                    .as_ref()
+                    .map(|indexer| indexer.counters())
+            })
+    }
+
+    /// Builds a new memory-tier segment's secondary index, before the segment is
+    /// published. `None` when the table keeps no in-memory index.
+    async fn index_mem_tier_segment(
+        &self,
+        batches: &Arc<Vec<RecordBatch>>,
+    ) -> Option<Arc<super::mem_tier_index::SegmentIndex>> {
+        let indexer = self.mem_tier_index.as_ref()?;
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        if rows <= MEM_TIER_INDEX_INLINE_ROWS {
+            return Some(Arc::new(indexer.index_segment(batches)));
+        }
+        // Hashing and sorting a large write's keys is CPU work, so it leaves the
+        // runtime.
+        let (indexer, batches) = (Arc::clone(indexer), Arc::clone(batches));
+        match tokio::task::spawn_blocking(move || indexer.index_segment(&batches)).await {
+            Ok(index) => Some(Arc::new(index)),
+            Err(error) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    "Dataset '{}' (cayenne): failed to index written rows, so lookups read those rows in full. Cause: {error}",
+                    self.table_metadata.table_name
+                );
+                None
+            }
+        }
+    }
+
+    /// The memory-tier rows a lookup on an indexed key must read, taken from the
+    /// scan's captured tier: each segment's candidate rows, with the tier's
+    /// tombstones applied exactly as the view applies them. The outer `None`
+    /// means the table keeps no in-memory index; an indexed table whose filters
+    /// pin no key returns an explained fallback with no candidate override.
+    fn mem_tier_index_candidates(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+        filters: &[Expr],
+    ) -> datafusion_common::Result<
+        Option<(
+            Option<Vec<VisibleMemTierSegment>>,
+            super::lookup_index::LookupIndexExplain,
+        )>,
+    > {
+        let Some(indexer) = &self.mem_tier_index else {
+            return Ok(None);
+        };
+        let scalar_for = |column: &str| {
+            filters
+                .iter()
+                .find_map(|filter| bare_column_scalar_for(filter, column))
+        };
+        let Some(probe) = indexer.probe_key(&scalar_for) else {
+            return Ok(Some((
+                None,
+                super::lookup_index::LookupIndexExplain::not_applicable(None),
+            )));
+        };
+        let mut segments = Vec::new();
+        let mut read_whole = false;
+        let mut candidate_rows = 0u64;
+        for shard in shards {
+            let deletion_maps = Self::mem_tier_deletion_maps(shard);
+            for segment in shard.segments.iter() {
+                let batches = if let Some(index) = &segment.index {
+                    let candidates = index.candidates(&segment.batches, &probe)?;
+                    read_whole |= candidates.read_whole;
+                    candidates.batches
+                } else {
+                    read_whole |= !segment.batches.is_empty();
+                    segment.batches.to_vec()
+                };
+                let mut visible = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    candidate_rows = candidate_rows.saturating_add(batch.num_rows() as u64);
+                    let batch = self
+                        .filter_inlined_batch_for_deletions(
+                            batch,
+                            segment.data_sequence,
+                            &deletion_maps,
+                        )
+                        .map_err(|error| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to apply in-memory row visibility to a lookup on dataset '{}': {error}",
+                                self.table_metadata.table_name
+                            ))
+                        })?;
+                    if let Some(batch) = batch {
+                        visible.push(batch);
+                    }
+                }
+                if !visible.is_empty() {
+                    segments.push(VisibleMemTierSegment {
+                        statistics: Arc::clone(&segment.statistics),
+                        batches: visible,
+                    });
+                }
+            }
+        }
+        let outcome = if read_whole {
+            super::lookup_index::ProbeOutcome::Unbuilt
+        } else if segments.is_empty() {
+            super::lookup_index::ProbeOutcome::Empty
+        } else {
+            super::lookup_index::ProbeOutcome::Selected
+        };
+        indexer.record(probe.label, outcome, candidate_rows);
+        let explain_outcome = match outcome {
+            super::lookup_index::ProbeOutcome::Selected => {
+                super::lookup_index::LookupIndexExplainOutcome::Selected
+            }
+            super::lookup_index::ProbeOutcome::Empty => {
+                super::lookup_index::LookupIndexExplainOutcome::Empty
+            }
+            super::lookup_index::ProbeOutcome::Unbuilt => {
+                super::lookup_index::LookupIndexExplainOutcome::Unbuilt
+            }
+            super::lookup_index::ProbeOutcome::SnapshotMismatch => {
+                super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
+            }
+        };
+        Ok(Some((
+            Some(segments),
+            super::lookup_index::LookupIndexExplain::selection(
+                probe.label.to_string(),
+                explain_outcome,
+                None,
+                candidate_rows,
+            ),
+        )))
+    }
+
+    /// The table's file-set version, sampled before a listing it describes.
+    fn file_set_version(&self) -> super::lookup_index::FileSetVersion {
+        super::lookup_index::FileSetVersion {
+            dir_generation: self.current_dir_generation.load(Ordering::Relaxed),
+            listing_epoch: self.listing_cache_epoch.load(Ordering::Acquire),
+        }
+    }
+
+    /// Starts a write-time secondary index build for `snapshot_id`, or `None`
+    /// when the table is not indexed.
+    pub(crate) fn begin_lookup_index_build(
+        &self,
+        snapshot_id: &str,
+    ) -> Option<Arc<dyn VortexWriteObserver>> {
+        let state = self.lookup_index.as_ref()?;
+        // Keys are encoded against the STORED schema, so the same value encodes
+        // identically whether it arrives from a write stream or from a scan that
+        // decoded it as a view type.
+        let builder = state.begin_incremental_build(snapshot_id, &self.table_schema())?;
+        Some(builder as Arc<dyn VortexWriteObserver>)
+    }
+
+    /// Drops a write-time index build whose snapshot is being abandoned.
+    pub(crate) fn discard_lookup_index_build(&self) {
+        if let Some(state) = &self.lookup_index {
+            state.discard_pending();
+        }
+    }
+
+    /// Finishes the write-time index for `snapshot_id` BEFORE its snapshot becomes
+    /// visible, so the flip that makes it visible can publish the index with it
+    /// and no query is served by a full scan while an index is rebuilt.
+    ///
+    /// Best-effort by construction: a refused or failed build leaves the refreshed
+    /// table to a background build, and the snapshot publishes regardless. Data
+    /// availability must never depend on this index.
+    pub(crate) async fn stage_lookup_index_for_snapshot(&self, snapshot_id: &str) {
+        let Some(state) = &self.lookup_index else {
+            return;
+        };
+        let file_set = self.file_set_version();
+        let read_schema = self.read_schema();
+        let ctx = self.create_session_context();
+        let session = ctx.state();
+        match self
+            .lookup_index_snapshot_files(&session, snapshot_id, &read_schema)
+            .await
+        {
+            Some((_store, files)) => {
+                state.stage_pending(snapshot_id, files, file_set).await;
+            }
+            None => {
+                state.discard_pending();
+            }
+        }
+    }
+
+    /// Resolves the secondary index for this scan.
+    ///
+    /// Only a query whose filters pin every column of an indexed key to an
+    /// equality literal touches the index at all: it probes the published index
+    /// and, when there is none for the visible snapshot, may start the one
+    /// background build that replaces it — as the build schedule allows, so a
+    /// build that cannot fit or keeps failing is not retried on every lookup.
+    /// Returned candidate row addresses are still unvalidated against the file
+    /// list the plan resolves. The outer `None` means the table declares no
+    /// file-mode index; an indexed table always returns an explain decision.
+    async fn resolve_lookup_index_selection(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        read_schema: &SchemaRef,
+    ) -> Option<(
+        Option<super::lookup_index::LookupSelection>,
+        super::lookup_index::LookupIndexExplain,
+    )> {
+        let index_state = self.lookup_index.as_ref()?;
+        let scalar_for = |column: &str| {
+            filters
+                .iter()
+                .find_map(|filter| bare_column_scalar_for(filter, column))
+        };
+        let Some(shape) = index_state.matched_shape(&scalar_for) else {
+            return Some((
+                None,
+                super::lookup_index::LookupIndexExplain::not_applicable(None),
+            ));
+        };
+
+        let visible_snapshot = self.get_current_snapshot_id();
+        // Probe first: a stale index is dropped here, so a build claimed below
+        // replaces nothing rather than an index that is already gone.
+        let (selection, explain, should_build) = match index_state
+            .probe(&visible_snapshot, &scalar_for)
+        {
+            super::lookup_index::LookupProbe::Selection(selection) => (
+                Some(selection),
+                super::lookup_index::LookupIndexExplain::not_applicable(Some(shape.to_string())),
+                false,
+            ),
+            super::lookup_index::LookupProbe::Fallback(explain) => {
+                let should_build = matches!(
+                    explain.outcome,
+                    super::lookup_index::LookupIndexExplainOutcome::Unbuilt
+                        | super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
+                );
+                (None, explain, should_build)
+            }
+        };
+        if should_build && let Some(claim) = index_state.claim_build(&visible_snapshot) {
+            // The claim frees its slot if this scan is dropped while listing.
+            let file_set = self.file_set_version();
+            match self
+                .lookup_index_snapshot_files(state, &visible_snapshot, read_schema)
+                .await
+            {
+                Some((store, files)) => super::lookup_index::spawn_build(
+                    claim,
+                    visible_snapshot.clone(),
+                    store,
+                    files,
+                    self.table_schema(),
+                    file_set,
+                ),
+                None => claim.unpublished(),
+            }
+        }
+        Some((selection, explain))
+    }
+
+    /// The WHOLE snapshot's data files, as the scan itself lists them. Filters
+    /// are deliberately not applied: a file pruned away for one query still
+    /// holds rows another query's key maps to, and an index built from a pruned
+    /// subset would answer a later lookup with a false empty.
+    async fn lookup_index_snapshot_files(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        read_schema: &SchemaRef,
+    ) -> Option<(Arc<dyn ObjectStore>, Vec<super::lookup_index::IndexedFile>)> {
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url).ok()?;
+        // The index needs only each file's path, size and modification time.
+        // Collecting per-file statistics here doubled the CPU of every later scan
+        // of a freshly refreshed table, so this listing skips them.
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        )
+        .with_collect_stat(false);
+        let scan_schema = Self::snapshot_scan_schema(read_schema, &options);
+        let listed = self
+            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                state,
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: &[],
+                snapshot_id,
+                limit: None,
+                scan_schema,
+                captured_files: None,
+            })
+            .await
+            .ok()?;
+        let store = state.runtime_env().object_store(&table_url).ok()?;
+        let files: Vec<super::lookup_index::IndexedFile> = listed
+            .file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| super::lookup_index::IndexedFile {
+                path: file.object_meta.location.to_string(),
+                size: file.object_meta.size,
+                last_modified_ms: file.object_meta.last_modified.timestamp_millis(),
+            })
+            .collect();
+        // A snapshot with no files — a refresh small enough to be inlined into the
+        // metastore — still gets an index: an empty one, which answers every
+        // lookup's file branch with nothing to read instead of leaving the table
+        // to a build that could never publish.
+        Some((store, files))
+    }
+
     /// Digest of the single primary-key point this scan's filters constrain, for
     /// transaction read-footprint capture. Returns `None` unless the filters pin
     /// every PK column to an equality literal (a partial-key or unbounded read),
@@ -32827,18 +34735,30 @@ fn pk_column_equals_literal(expr: &Expr, pk_name: &str) -> bool {
 /// pinned to a single literal — the caller then marks the read footprint
 /// incomplete. Mirrors [`pk_column_equals_literal`], returning the value.
 fn pk_scalar_for(expr: &Expr, pk_name: &str) -> Option<ScalarValue> {
+    equality_value_for(expr, &|e| matches_column(e, pk_name), &literal_scalar)
+}
+
+/// The value a conjunctive filter pins a column to: `column = value` in either
+/// operand order, recursing through `AND`. `is_column` recognizes the column
+/// side and `value_of` evaluates the other side.
+fn equality_value_for(
+    expr: &Expr,
+    is_column: &dyn Fn(&Expr) -> bool,
+    value_of: &dyn Fn(&Expr) -> Option<ScalarValue>,
+) -> Option<ScalarValue> {
     match expr {
         Expr::BinaryExpr(bin) if bin.op == Operator::Eq => {
-            if matches_column(&bin.left, pk_name) {
-                literal_scalar(&bin.right)
-            } else if matches_column(&bin.right, pk_name) {
-                literal_scalar(&bin.left)
+            if is_column(&bin.left) {
+                value_of(&bin.right)
+            } else if is_column(&bin.right) {
+                value_of(&bin.left)
             } else {
                 None
             }
         }
         Expr::BinaryExpr(bin) if bin.op == Operator::And => {
-            pk_scalar_for(&bin.left, pk_name).or_else(|| pk_scalar_for(&bin.right, pk_name))
+            equality_value_for(&bin.left, is_column, value_of)
+                .or_else(|| equality_value_for(&bin.right, is_column, value_of))
         }
         _ => None,
     }
@@ -32850,6 +34770,38 @@ fn literal_scalar(expr: &Expr) -> Option<ScalarValue> {
         Expr::Literal(scalar, _) => Some(scalar.clone()),
         Expr::Cast(c) => literal_scalar(&c.expr),
         Expr::TryCast(c) => literal_scalar(&c.expr),
+        _ => None,
+    }
+}
+
+/// The value a filter pins the BARE column `name` to, for the point-lookup
+/// index.
+///
+/// Unlike [`pk_scalar_for`] this refuses a cast on the column side: a cast can
+/// map several stored values onto the literal (`CAST(score AS BIGINT) = 5` holds
+/// for 5.2), while the index finds rows by their stored value, so answering such
+/// a predicate from it would drop rows. A cast on the value side is evaluated
+/// rather than stripped, so the index is probed with the value the predicate
+/// actually compares against.
+fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
+    equality_value_for(
+        expr,
+        &|e| matches!(e, Expr::Column(col) if col.name == name),
+        &evaluated_literal,
+    )
+}
+
+/// The constant `expr` evaluates to: a literal, or casts applied to one. `None`
+/// when a cast cannot be applied, which leaves the predicate to the scan.
+fn evaluated_literal(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(scalar, _) => Some(scalar.clone()),
+        Expr::Cast(c) => evaluated_literal(&c.expr)?
+            .cast_to(c.field.data_type())
+            .ok(),
+        Expr::TryCast(c) => evaluated_literal(&c.expr)?
+            .cast_to(c.field.data_type())
+            .ok(),
         _ => None,
     }
 }
@@ -33040,6 +34992,20 @@ fn extract_integer_literal(expr: &Expr) -> Option<i64> {
     }
 }
 
+fn i64_eq_literal_on_schema(schema: &SchemaRef, filters: &[Expr]) -> Option<(usize, i64)> {
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.data_type() != &arrow_schema::DataType::Int64 {
+            continue;
+        }
+        for filter in filters {
+            if let Some(ScalarValue::Int64(Some(v))) = pk_scalar_for(filter, field.name()) {
+                return Some((idx, v));
+            }
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl TableProvider for CayenneTableProvider {
     fn schema(&self) -> SchemaRef {
@@ -33077,7 +35043,7 @@ impl TableProvider for CayenneTableProvider {
         // collected. Gating this on `has_sort_columns()` instead is what made the
         // adaptive layout inert on every catalog-visible CDC deployment, since
         // inference fills `cayenne_sort_columns` on all of them.
-        if !self.context.sort_columns_are_authoritative() {
+        if !self.context.has_cluster_by() && !self.context.sort_columns_are_authoritative() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -33114,12 +35080,11 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Obtain the scan-view bundle from the demand cache at this dataset's freshness
-        // (`default_scan_freshness`: 0 = read-your-writes for read-write datasets; a
-        // bounded lag for read-only ones — see [`Self::scan_view_at_current_input`]). The
-        // KDI merge + visible mem-tier segments are computed OFF the query path (in
-        // `spawn_blocking`) and deduplicated across concurrent scans on the same state,
-        // so the scan no longer recomputes them per-scan (the retired memos' job).
+        // Obtain the scan-view bundle from the demand cache. See
+        // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
+        // segments are computed OFF the query path (in `spawn_blocking`) and
+        // deduplicated across concurrent scans on the same state, so the scan no
+        // longer recomputes them per-scan (the retired memos' job).
         // Everything below descends from that ONE capture, so it is internally
         // consistent (the merged deletions hide the old copies of the exact rows this
         // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
@@ -33128,8 +35093,16 @@ impl TableProvider for CayenneTableProvider {
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
         let scan_view = self
-            .scan_view_at_current_input(self.default_scan_freshness)
+            .scan_view_at_current_input(self.scan_view_reuse)
             .await?;
+        #[cfg(test)]
+        {
+            let hook = self.test_post_scan_view_selection_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
@@ -33141,6 +35114,12 @@ impl TableProvider for CayenneTableProvider {
         let scan_guard = Arc::clone(&scan_view.raw.scan_guard);
         let deletion_snapshot = scan_view.merged_deletions.clone();
         let visible_segments = Arc::clone(&scan_view.visible_segments);
+        // An in-memory index answers from the captured tier itself, whose segments
+        // carry it, rather than from the view's visible segments.
+        let mem_tier_shards = self
+            .mem_tier_index
+            .as_ref()
+            .map(|_| scan_view.raw.mem_tier_shards.clone());
         let mem_tier_union_tombstones = scan_view.union_tombstones.clone();
         // The read schema captured atomically with this snapshot; every plan branch
         // below builds from it (not a live re-read) so they stay mutually consistent
@@ -33277,13 +35256,27 @@ impl TableProvider for CayenneTableProvider {
                 ))
             })?;
 
+        // Secondary index: candidate row addresses for an exact equality key
+        // over indexed columns. `None` keeps the ordinary scan, which is what a
+        // table without `indexes` and every other predicate shape resolve to.
+        let lookup_resolution = self
+            .resolve_lookup_index_selection(state, scan_filters, &read_schema)
+            .await;
+
         // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
         // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT
         // byte-range-split the matching file across N file_groups. The fan-out
         // pays per-group Vortex footer-open cost (~50 µs each) without speeding
         // up the lookup because only one chunk in one file_group actually
         // contains K. See `pk_lookup_file_group_fanout` bench.
-        let is_pk_selective_scan = self.is_pk_selective_scan(scan_filters);
+        let index_selected = lookup_resolution
+            .as_ref()
+            .is_some_and(|(selection, _)| selection.is_some());
+        let is_pk_selective_scan = self.is_pk_selective_scan(scan_filters) || index_selected;
+        let (lookup_selection, mut lookup_index_explain) = lookup_resolution
+            .map_or((None, None), |(selection, explain)| {
+                (selection, Some(explain))
+            });
         let scan_listing_config_override;
         let scan_listing_config = if is_pk_selective_scan {
             scan_listing_config_override = state.config().clone().with_target_partitions(1);
@@ -33338,16 +35331,17 @@ impl TableProvider for CayenneTableProvider {
                 // branch is often the scan's ONLY source, so byte-range
                 // splitting can be its only decode parallelism.
                 0,
+                Some(&warm_files),
+                lookup_selection,
+                lookup_index_explain.as_mut(),
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
         let main_plan = main_plan_result?;
         // The listing fence is NOT held here: `capture_raw_scan_input` released it
         // when the capture returned, and `scan_guard` pins the captured snapshot
-        // dirs against GC for the full scan lifetime (plan-build + execution). Direct
-        // scan planning resolves the file listing eagerly against that pinned
-        // snapshot id, so a concurrent listing flip cannot delete a file this scan
-        // reads (the ref-count keeps it, cleanup skips count > 0).
+        // dirs against GC for the full scan lifetime (plan-build + execution). The
+        // captured warm file set excludes later additions to that same directory.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
@@ -33468,9 +35462,16 @@ impl TableProvider for CayenneTableProvider {
         // visible segments, applying the tier's tombstones merge-on-read (already
         // baked into the segments) plus the per-query pruning predicate. `None` (and
         // skipped) in file mode, where the tier is empty.
+        let mem_index_resolution = match &mem_tier_shards {
+            Some(shards) => self.mem_tier_index_candidates(shards, scan_filters)?,
+            None => None,
+        };
+        let indexed_segments = mem_index_resolution
+            .as_ref()
+            .and_then(|(segments, _)| segments.as_deref());
         let mem_plan: Option<Arc<dyn ExecutionPlan>> = self
             .build_mem_tier_scan_plan_from_segments(
-                &visible_segments,
+                indexed_segments.unwrap_or(&visible_segments[..]),
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
                 // Scan-resolved (1 for PK point lookups) — see the inline branch.
@@ -33478,6 +35479,9 @@ impl TableProvider for CayenneTableProvider {
                 &read_schema,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
+        if lookup_index_explain.is_none() {
+            lookup_index_explain = mem_index_resolution.map(|(_, explain)| explain);
+        }
 
         // Build the final plan:
         // - If protected snapshots exist: deletion filter on main, UNION with snapshots
@@ -33560,10 +35564,16 @@ impl TableProvider for CayenneTableProvider {
                 plan,
                 scan_guard,
                 maintained_aggregate_epoch,
+                lookup_index_explain,
             ));
         }
 
-        Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard, maintained_aggregate_epoch))
+        Ok(self.wrap_scan_plan_with_cayenne_metadata(
+            plan,
+            scan_guard,
+            maintained_aggregate_epoch,
+            lookup_index_explain,
+        ))
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
@@ -33765,29 +35775,15 @@ impl TableProvider for CayenneTableProvider {
         // branches above materialize inline rows; once durable, the rows are
         // subject to the sink's own tier-aware liveness rule.
         //
-        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
-        // so no CDC apply can land between them. They are not separable: a
-        // checkpoint publishes its rows as a PROTECTED snapshot, and
-        // `build_deletion_vector_sink` freezes the protected set the sink will scan
-        // (the sink re-reads only the main listing at execution), so a checkpoint
-        // that lands after the capture is invisible to this delete. Nothing under
-        // the sink builder takes `write_lock`, so holding it across the build
-        // cannot deadlock.
-        //
-        // This lock is released before `DeletionExec` runs the sink, which takes
-        // `write_lock` again; a CDC apply between the two is still invisible to the
-        // scan sources frozen here (#13828). Closing that window means building the
-        // sink inside the execution-time critical section, not here.
-        let file_sink = {
-            let _guard = self.write_lock.lock().await;
-            self.checkpoint_mem_tier_for_delete().await?;
-            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-                .await?
-        };
+        // The checkpoint and the scan-source capture belong in the hold the DELETE
+        // itself runs under, so both are deferred to
+        // `InlineAwareDeletionSink::delete_from` rather than done here — a plan is
+        // built and executed as two steps, and an apply landing between them was
+        // invisible to sources frozen at build (#13828). See [`DeletionSinkSource`].
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
-                file_sink,
+                file_sink: DeletionSinkSource::BuildAtExecution(DeletionRequestSource::User),
                 filters,
             }),
         ))))
@@ -33919,7 +35915,7 @@ fn active_transaction(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeletionRequestSource {
+pub(crate) enum DeletionRequestSource {
     User,
     Cdc,
 }
@@ -34079,7 +36075,7 @@ impl CayenneTableProvider {
     /// User-visible deletes require a verified deleted-row count because the SQL
     /// client receives "rows affected". CDC deletes discard that count, so they
     /// can use count-skipping key-delete paths when the filter shape supports it.
-    async fn build_deletion_vector_sink(
+    pub(crate) async fn build_deletion_vector_sink(
         &self,
         filters: &[Expr],
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
@@ -34153,6 +36149,7 @@ impl CayenneTableProvider {
             write_lock,
             Arc::clone(&self.seq_allocator),
         )
+        .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_exact_count(source.requires_exact_count());
 
         Ok(sink)
@@ -34196,7 +36193,7 @@ impl CayenneTableProvider {
             .await?;
         let sink = InlineAwareDeletionSink {
             table: self.clone_for_write(),
-            file_sink,
+            file_sink: DeletionSinkSource::Prebuilt(Box::new(file_sink)),
             filters: filters.to_vec(),
         };
         let deleted = sink
@@ -34258,7 +36255,8 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             None, // write lock already held above
             Arc::clone(&self.seq_allocator),
-        );
+        )
+        .with_scan_input_version(Arc::clone(&self.scan_input_version));
 
         let deleted = sink
             .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
@@ -35450,6 +37448,16 @@ mod tests {
 
     #[tokio::test]
     async fn file_retention_invalidates_segments_for_deleted_files() {
+        for reuse in [
+            ScanViewReuse::UntilInvalidated,
+            ScanViewReuse::WithinLag(Duration::from_hours(1)),
+            ScanViewReuse::WithinLag(Duration::ZERO),
+        ] {
+            check_file_retention_invalidates_segments_for_deleted_files(reuse).await;
+        }
+    }
+
+    async fn check_file_retention_invalidates_segments_for_deleted_files(reuse: ScanViewReuse) {
         use arrow::array::TimestampNanosecondArray;
         use arrow_schema::TimeUnit;
 
@@ -35478,6 +37486,7 @@ mod tests {
             crate::TimeRetentionFilterBuilder::try_new("event_time", u64::MAX, &schema)
                 .expect("retention builder");
         let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_scan_view_reuse(reuse)
             .with_time_retention_filter_builder(retention_builder)
             .create(CreateTableOptions {
                 table_name: "file_retention_segment_cache".to_string(),
@@ -38295,6 +40304,77 @@ mod tests {
         );
     }
 
+    /// Wide-table planner stats empty `column_statistics` past
+    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`]. Clustering still has to
+    /// read the maintained `[min, max]` for the few dimensions it normalizes
+    /// (regression test for the accessor that does not go through that summary).
+    #[tokio::test]
+    async fn cluster_column_bounds_keep_wide_table_normalization() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("data dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()))
+                .expect("catalog"),
+        );
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("ts", DataType::Int64, false),
+            arrow_schema::Field::new("tenant", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "wide_cluster_bounds".to_string(),
+            schema,
+            primary_key: vec!["ts".to_string()],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let table = CayenneTableProvider::create_table(
+            catalog as Arc<dyn MetadataCatalog>,
+            options,
+            SessionContext::new().runtime_env(),
+        )
+        .await
+        .expect("create table");
+
+        let mut column_statistics =
+            vec![ColumnStatistics::new_unknown(); TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT + 1];
+        column_statistics[0].min_value =
+            DFPrecision::Exact(ScalarValue::Int64(Some(1_700_000_000_000_000)));
+        column_statistics[0].max_value =
+            DFPrecision::Exact(ScalarValue::Int64(Some(1_700_000_016_383_000)));
+        column_statistics[1].min_value = DFPrecision::Exact(ScalarValue::Int64(Some(0)));
+        column_statistics[1].max_value = DFPrecision::Exact(ScalarValue::Int64(Some(15)));
+
+        {
+            let mut cache = table.table_statistics.write();
+            cache.optimizer = Some(Statistics {
+                num_rows: DFPrecision::Exact(16_384),
+                total_byte_size: DFPrecision::Absent,
+                column_statistics,
+            });
+            cache.count_exact = true;
+        }
+
+        let planner = table
+            .optimizer_table_statistics()
+            .expect("planner-facing stats");
+        assert!(
+            planner.column_statistics.is_empty(),
+            "the wide-table planner summary must stay empty so this test is actually on that path"
+        );
+
+        let bounds = table.cluster_column_bounds(&[0, 1]);
+        assert!(
+            bounds.iter().all(Option::is_some),
+            "clustering must still see per-dimension bounds on a wide table: {bounds:?}"
+        );
+    }
+
     #[test]
     fn compute_column_stats_uses_typed_min_max_for_int64() {
         let array = Int64Array::from(vec![Some(10), None, Some(-4), Some(7)]);
@@ -39601,13 +41681,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 2");
         assert_eq!(
@@ -39645,10 +41735,79 @@ mod tests {
         );
     }
 
-    /// The purge is gated on the delete being a tautology: a filtered delete
-    /// through the same position-based sink must NOT discard the whole tier.
-    /// (Filtered deletes not reaching mem-tier rows is #12008; what matters here
-    /// is that the delete-all fix cannot over-delete.)
+    /// A filtered delete must take the rows it removed off the live-row counter.
+    ///
+    /// `inlined_row_count` gates whether a scan consults the inline corpus at all
+    /// and, with no persisted statistics, is served as the table's inexact row
+    /// estimate. Left unreconciled it only ever grows: a memory-mode table that
+    /// deletes as much as it inserts would report a count that climbs forever.
+    #[tokio::test]
+    async fn filtered_delete_takes_its_rows_off_the_live_row_count() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "filtered_delete_live_row_count",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = int64_id_batch(&[1, 2, 3, 4, 5]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
+            .await
+            .expect("memory-mode append");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            5,
+            "precondition: the append counted its five rows as live"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").gt(datafusion_expr::lit(3_i64))],
+            )
+            .await
+            .expect("filtered delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("filtered delete executed");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "precondition: the delete removed the two matching rows"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            3,
+            "the live-row count must drop by what the delete removed"
+        );
+    }
+
+    /// A filtered delete through the position-based sink must remove exactly the
+    /// matching mem-tier rows — not nothing (#12008), and not the whole tier (the
+    /// delete-all purge must not fire on a predicate).
+    ///
+    /// A table with no primary key has no key to tombstone, so this is the arm
+    /// that can only be served by rebuilding the tier
+    /// (`delete_mem_tier_rows_matching`).
     #[tokio::test]
     async fn filtered_delete_does_not_purge_the_mem_tier_without_a_primary_key() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -39672,7 +41831,12 @@ mod tests {
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![batch], bytes, false)
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append");
 
@@ -39683,13 +41847,24 @@ mod tests {
             )
             .await
             .expect("filtered delete plan");
-        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
             .await
             .expect("filtered delete executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(deleted, 1, "exactly one mem-tier row matches `id = 2`");
 
         assert_eq!(
             scan_sorted_ids(&provider).await,
-            vec![1, 2, 3],
+            vec![1, 3],
+            "a filtered delete must remove the matching mem-tier row, and only it"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
             "a filtered delete must not purge the whole mem-tier"
         );
     }
@@ -40198,13 +42373,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 2");
         assert_eq!(
@@ -40217,7 +42402,12 @@ mod tests {
         let b3 = int64_id_batch(&[10, 20, 30, 40]);
         let bytes3 = b3.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b3], bytes3, true)
+            .write_batches_memory_mode(
+                vec![b3],
+                bytes3,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("overwrite");
         assert_eq!(
@@ -40284,7 +42474,12 @@ mod tests {
             "batch ({bytes} bytes) must exceed the cap for the test to be meaningful"
         );
         let err = provider
-            .write_batches_memory_mode(vec![big], bytes, false)
+            .write_batches_memory_mode(
+                vec![big],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("a write exceeding the memory limit must error");
         assert!(
@@ -40342,7 +42537,12 @@ mod tests {
             "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
         );
         provider
-            .write_batches_memory_mode(vec![seed], seed_bytes, false)
+            .write_batches_memory_mode(
+                vec![seed],
+                seed_bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("seed write under cap");
 
@@ -40355,7 +42555,12 @@ mod tests {
         // Overwrite that would fit *after* replace must still fail while the old
         // tier is resident (peak = resident + incoming).
         let err = provider
-            .write_batches_memory_mode(vec![replacement], replacement_bytes, true)
+            .write_batches_memory_mode(
+                vec![replacement],
+                replacement_bytes,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("overwrite must count resident bytes toward the hard cap");
         assert!(
@@ -43833,6 +46038,322 @@ mod tests {
         assert_eq!(sorted, narrow, "bounds must be strictly ascending");
     }
 
+    /// A view sample must not pin the data buffers of the batch it was taken
+    /// from.
+    #[test]
+    fn compact_sampled_views_drops_unpicked_bytes() {
+        use arrow::array::{AsArray, StringViewArray, UInt32Array};
+
+        let long = |i: usize| format!("{i:064}");
+        let source: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..4096).map(long)));
+        let picks = UInt32Array::from_iter_values((0..4096).step_by(64));
+        let picked = arrow::compute::take(source.as_ref(), &picks, None).expect("take views");
+        assert!(
+            picked.get_array_memory_size() > source.get_array_memory_size() / 2,
+            "take shares the source's data buffers, which is what compaction exists for"
+        );
+
+        let compacted = compact_sampled_views(picked);
+        assert!(
+            compacted.get_array_memory_size() < source.get_array_memory_size() / 16,
+            "a 1-in-64 sample keeps {} of the source's {} bytes",
+            compacted.get_array_memory_size(),
+            source.get_array_memory_size()
+        );
+        let values: Vec<&str> = compacted.as_string_view().iter().flatten().collect();
+        let expected: Vec<String> = (0..4096).step_by(64).map(long).collect();
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn equal_count_bounds_cut_strings_at_quantiles() {
+        use arrow::array::StringArray;
+
+        // 1000 distinct keys in a scrambled order, plus NULLs the cut must skip.
+        let mut keys: Vec<Option<String>> = (0..1000)
+            .map(|i| Some(format!("k{:04}", (i * 7919) % 1000)))
+            .collect();
+        keys.extend([None, None, None]);
+        let sample: ArrayRef = Arc::new(StringArray::from(keys));
+
+        let bounds = equal_count_bounds(&sample, 4).expect("1000 keys split into 4");
+        assert_eq!(
+            bounds,
+            vec![
+                ScalarValue::Utf8(Some("k0250".to_string())),
+                ScalarValue::Utf8(Some("k0500".to_string())),
+                ScalarValue::Utf8(Some("k0750".to_string())),
+            ]
+        );
+
+        // Heavy repeats collapse to strictly ascending cuts.
+        let repeated: ArrayRef = Arc::new(StringArray::from(
+            (0..1000)
+                .map(|i| if i < 900 { "a" } else { "b" })
+                .collect::<Vec<_>>(),
+        ));
+        let bounds = equal_count_bounds(&repeated, 4).expect("two values still cut once");
+        assert_eq!(bounds, vec![ScalarValue::Utf8(Some("a".to_string()))]);
+
+        // Too few rows to be worth cutting.
+        let tiny: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        assert!(equal_count_bounds(&tiny, 4).is_none());
+        assert!(equal_count_bounds(&sample, 1).is_none());
+    }
+
+    /// The routing key of a whole-table replace: a configured shard key alone;
+    /// otherwise the primary key, yielding the lead only to a column filtered on
+    /// more than twice as often, with the other kept as the fallback; never a
+    /// column the router cannot split.
+    #[tokio::test]
+    async fn test_range_routing_candidates_order() {
+        use datafusion_expr::{col, lit};
+
+        fn names(provider: &CayenneTableProvider) -> Vec<String> {
+            provider
+                .range_routing_candidates(&provider.table_schema())
+                .into_iter()
+                .map(|(column, _)| column)
+                .collect()
+        }
+        fn filter_on(provider: &CayenneTableProvider, column: &str, times: usize) {
+            for _ in 0..times {
+                provider
+                    .filter_column_observations
+                    .record_filters(&[col(column).eq(lit(1_i64))]);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sid", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let ctx = SessionContext::new();
+
+        let (keyed, _keyed_dir) = create_cayenne_table_with_config(
+            "routing_candidates_keyed",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert_eq!(
+            names(&keyed),
+            vec!["id"],
+            "nothing observed: the primary key"
+        );
+        filter_on(&keyed, "id", 2);
+        filter_on(&keyed, "sid", 4);
+        assert_eq!(
+            names(&keyed),
+            vec!["id", "sid"],
+            "twice the key's filters is not enough to take the lead"
+        );
+        filter_on(&keyed, "sid", 1);
+        assert_eq!(
+            names(&keyed),
+            vec!["sid", "id"],
+            "more than twice the key's filters takes the lead"
+        );
+        filter_on(&keyed, "flag", 100);
+        assert_eq!(
+            names(&keyed),
+            vec!["sid", "id"],
+            "a boolean cannot be split into ranges, however hot"
+        );
+
+        let (unkeyed, _unkeyed_dir) = create_cayenne_table_with_config(
+            "routing_candidates_unkeyed",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(names(&unkeyed).is_empty(), "no key and nothing observed");
+        filter_on(&unkeyed, "sid", 1);
+        assert_eq!(names(&unkeyed), vec!["sid"]);
+
+        let (configured, _configured_dir) = create_cayenne_table_with_config(
+            "routing_candidates_configured",
+            Arc::clone(&schema),
+            VortexConfig {
+                shard_key_columns: vec!["sid".to_string()],
+                ..VortexConfig::default()
+            },
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        filter_on(&configured, "id", 100);
+        assert_eq!(
+            names(&configured),
+            vec!["sid"],
+            "a configured shard key is the only candidate"
+        );
+    }
+
+    /// A whole-table replace of a keyed table routes its rows into key-range
+    /// files once a previous snapshot exists to sample: each file holds its own
+    /// slice of the key domain in key order, the slices do not overlap, and no
+    /// row is lost or duplicated. The first load has nothing to sample and
+    /// hashes.
+    #[tokio::test]
+    async fn test_overwrite_routes_rows_into_disjoint_sorted_key_range_files() {
+        use arrow::array::StringArray;
+
+        const ROWS: usize = 20_000;
+        const SHARDS: usize = 4;
+
+        async fn replace(provider: &CayenneTableProvider, data: SendableRecordBatchStream) {
+            let prepared = provider
+                .begin_overwrite(data, SHARDS)
+                .await
+                .expect("begin_overwrite");
+            prepared.apply_owned_txn().await.expect("apply_owned_txn");
+            prepared.finish().await.expect("finish");
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sid", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "range_routed_overwrite",
+            Arc::clone(&schema),
+            VortexConfig {
+                // Keep the refresh out of the metastore so it writes files.
+                inline_max_rows: 0,
+                write_concurrency: Some(SHARDS),
+                ..VortexConfig::default()
+            },
+            vec!["sid".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Keys in a scrambled order, which neither the source nor a hash split
+        // clusters; `offset` changes the order between refreshes.
+        let refresh = |offset: usize| -> SendableRecordBatchStream {
+            let order: Vec<usize> = (0..ROWS).map(|i| (i * 7919 + offset) % ROWS).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        order.iter().map(|i| format!("sid-{i:08}")),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        order
+                            .iter()
+                            .map(|&i| i64::try_from(i).expect("row fits i64")),
+                    )),
+                ],
+            )
+            .expect("refresh batch");
+            let batches: Vec<DataFusionResult<RecordBatch>> = (0..ROWS)
+                .step_by(1024)
+                .map(|start| Ok(batch.slice(start, 1024.min(ROWS - start))))
+                .collect();
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(batches),
+            ))
+        };
+
+        assert!(
+            provider.overwrite_range_plan(SHARDS).await.is_none(),
+            "an empty table has nothing to sample"
+        );
+        replace(&provider, refresh(0)).await;
+
+        let plan = provider
+            .overwrite_range_plan(SHARDS)
+            .await
+            .expect("a loaded keyed table is split into ranges");
+        assert_eq!(plan.column, "sid");
+        assert_eq!(plan.bounds.len(), SHARDS - 1);
+
+        replace(&provider, refresh(13)).await;
+
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register table");
+        let totals = ctx
+            .sql("SELECT count(*) AS n, count(DISTINCT sid) AS d FROM t")
+            .await
+            .expect("count query")
+            .collect()
+            .await
+            .expect("count rows");
+        let column = |index: usize| {
+            totals[0]
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0)
+        };
+        let expected = i64::try_from(ROWS).expect("rows fit i64");
+        assert_eq!(column(0), expected, "every row survives the refresh");
+        assert_eq!(column(1), expected, "no row is duplicated");
+
+        // Read each file on its own, in file order.
+        let snapshot_id = provider.current_snapshot_id();
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("list snapshot files");
+        assert_eq!(files.len(), SHARDS, "one file per key range: {files:?}");
+        let file_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut ranges = Vec::with_capacity(files.len());
+        for (name, _) in &files {
+            let path = provider.snapshot_dir_path_for(&snapshot_id).join(name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(&schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing table");
+            let keys: Vec<String> = file_ctx
+                .read_table(table)
+                .expect("read file")
+                .collect()
+                .await
+                .expect("scan file")
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("sid is Utf8")
+                        .iter()
+                        .map(|key| key.expect("sid is not null").to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert!(
+                keys.is_sorted(),
+                "{name}: a range file's rows are written in key order"
+            );
+            let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
+                panic!("{name}: every range of a scrambled full key domain receives rows");
+            };
+            ranges.push((first.clone(), last.clone()));
+        }
+        ranges.sort();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "files must cover disjoint key ranges: {ranges:?}"
+            );
+        }
+    }
+
     /// Build one merge input's statistics: the key range it covers and its rows.
     #[cfg(test)]
     fn band_stats(min: i64, max: i64, rows: usize) -> Arc<Statistics> {
@@ -44928,6 +47449,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: file_limit,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("direct scan file listing should succeed");
@@ -44940,7 +47462,13 @@ mod tests {
             direct_files.grouped_by_partition,
             listing_files.grouped_by_partition
         );
-        assert_eq!(direct_files.statistics, listing_files.statistics);
+        // Cayenne marks listing stats Inexact when LIMIT truncated the file set
+        // (`file_group_with_limit` saw Exact footer counts). ListingTable may
+        // still report Exact for the same numbers. Values must match.
+        assert_eq!(
+            CayenneTableProvider::statistics_to_inexact(direct_files.statistics.clone()),
+            CayenneTableProvider::statistics_to_inexact(listing_files.statistics.clone())
+        );
         assert_eq!(
             file_group_paths(&direct_files.file_groups),
             file_group_paths(&listing_files.file_groups),
@@ -45262,6 +47790,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("listing scan with point-lookup filter");
@@ -45269,6 +47798,32 @@ mod tests {
             .into_iter()
             .map(|g| g.len())
             .sum();
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "a complete listing must populate the snapshot listing cache"
+        );
+        let pruned_cached = provider
+            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                state: &ctx.state(),
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: std::slice::from_ref(&sel_filter),
+                snapshot_id: &snapshot_id,
+                limit: None,
+                scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
+            })
+            .await
+            .expect("cached listing scan with point-lookup filter");
+        let pruned_cached_files: usize = file_group_paths(&pruned_cached.file_groups)
+            .into_iter()
+            .map(|g| g.len())
+            .sum();
+        assert_eq!(
+            pruned_cached_files, pruned_files,
+            "a cache hit must still prune disjoint files at listing time"
+        );
 
         // Control: a no-filter listing sees all three files.
         let all = provider
@@ -45281,6 +47836,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("listing scan without filter");
@@ -45298,6 +47854,602 @@ mod tests {
             pruned_files, 1,
             "point-lookup id={target_id} must prune the 2 disjoint files at listing \
              via footer min/max, got {pruned_files}"
+        );
+    }
+
+    /// `refresh_listing_table` can add files to the current snapshot without
+    /// bumping `current_dir_generation` (position-based checkpoint, schema
+    /// evolution). The snapshot listing cache must drop so the next PK lookup
+    /// sees the new row, not a stale file list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_sees_row_added_via_listing_refresh_without_generation_bump() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_listing_refresh_no_gen_bump",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::from_iter_values((0..100).map(|id| id * 10))),
+            ],
+        )
+        .expect("seed batch");
+        insert_batch_with_context(&ctx, &provider, seed).await;
+
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                50,
+                "value",
+            )
+            .await,
+            vec![500],
+            "warmup PK lookup must see the seeded row"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "warmup scan must populate the snapshot listing cache"
+        );
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+
+        let extra = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![200_i64])),
+                Arc::new(Int64Array::from(vec![2000_i64])),
+            ],
+        )
+        .expect("extra batch");
+        provider
+            .write_to_snapshot(
+                single_batch_stream(extra),
+                provider.target_file_size_bytes(),
+                &provider.get_current_snapshot_id(),
+                1,
+                None,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+            )
+            .await
+            .expect("write extra file into the current snapshot");
+        provider
+            .refresh_listing_table()
+            .await
+            .expect("refresh listing after extra file");
+        assert_eq!(
+            provider.current_dir_generation.load(Ordering::Relaxed),
+            generation_before,
+            "refresh_listing_table must not bump current_dir_generation"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_none(),
+            "listing refresh must drop the snapshot listing cache"
+        );
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                200,
+                "value",
+            )
+            .await,
+            vec![2000],
+            "PK lookup after listing refresh must see the new row, not a stale cached file list"
+        );
+    }
+
+    /// A LIST that started before `refresh_listing_table` must not re-store the
+    /// pre-refresh file set: the next PK lookup of a row added in that window
+    /// has to see it. The overlapping scan itself still reads the files it
+    /// collected (the seeded row).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_overlapping_listing_refresh_sees_new_row_on_next_scan() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_overlapping_listing_refresh",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::from_iter_values((0..100).map(|id| id * 10))),
+            ],
+        )
+        .expect("seed batch");
+        insert_batch_with_context(&ctx, &provider, seed).await;
+
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                50,
+                "value",
+            )
+            .await,
+            vec![500],
+            "warmup PK lookup must see the seeded row"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "warmup scan must populate the snapshot listing cache"
+        );
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        // Force a LIST without bumping `listing_cache_epoch`, matching an
+        // in-flight listing that sampled the epoch before refresh.
+        provider.cached_snapshot_listing.store(None);
+
+        let extra = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![200_i64])),
+                Arc::new(Int64Array::from(vec![2000_i64])),
+            ],
+        )
+        .expect("extra batch");
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let fired = Arc::clone(&hook_fired);
+            *provider.test_post_snapshot_list_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .write_to_snapshot(
+                            single_batch_stream(extra),
+                            provider_in_hook.target_file_size_bytes(),
+                            &provider_in_hook.get_current_snapshot_id(),
+                            1,
+                            None,
+                            crate::provider::delta_encoding::WritePolicy::DELTA,
+                        )
+                        .await
+                        .expect("write extra file during overlapping listing");
+                    provider_in_hook
+                        .refresh_listing_table()
+                        .await
+                        .expect("refresh listing during overlapping listing");
+                    fired.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                50,
+                "value",
+            )
+            .await,
+            vec![500],
+            "overlapping PK lookup must still see the seeded row from the files it listed"
+        );
+        assert!(
+            hook_fired.load(Ordering::SeqCst),
+            "the overlapping scan must reach the post-LIST hook"
+        );
+        assert_eq!(
+            provider.current_dir_generation.load(Ordering::Relaxed),
+            generation_before,
+            "refresh_listing_table must not bump current_dir_generation"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_none(),
+            "an overlapping LIST must not re-store the pre-refresh file set"
+        );
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                200,
+                "value",
+            )
+            .await,
+            vec![2000],
+            "next PK lookup after an overlapping listing refresh must see the new row"
+        );
+    }
+
+    /// A warm PK lookup over many on-disk files must not re-pay listing. After
+    /// the snapshot listing cache is populated, `scan` + collect of `id = K`
+    /// should stay in the single-digit-millisecond range even with dozens of
+    /// files (the SF-10 path: prune in memory, open one Vortex file).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_warm_scan_is_single_digit_ms_with_many_files() {
+        const FILES: i64 = 64;
+        const ROWS_PER_FILE: i64 = 256;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_warm_many_files",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        for f in 0..FILES {
+            let start = f * ROWS_PER_FILE;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start..start + ROWS_PER_FILE)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + ROWS_PER_FILE).map(|x| x * 10),
+                    )),
+                ],
+            )
+            .expect("batch");
+            insert_batch_with_context(&ctx, &provider, batch).await;
+        }
+        let target_id = (FILES * ROWS_PER_FILE) / 2;
+        let expected = target_id * 10;
+        for _ in 0..4 {
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    target_id,
+                    "value",
+                )
+                .await,
+                vec![expected]
+            );
+        }
+        let mut elapsed = Vec::new();
+        for _ in 0..16 {
+            let t0 = Instant::now();
+            let values = query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                target_id,
+                "value",
+            )
+            .await;
+            elapsed.push(t0.elapsed());
+            assert_eq!(values, vec![expected]);
+        }
+        elapsed.sort();
+        let p50 = elapsed[elapsed.len() / 2];
+        // Single-digit ms is the SF-10 bench gate on a quiet box. Under nextest
+        // this machine is noisy; 50 ms still fails a full re-LIST of 64 files.
+        assert!(
+            p50 < Duration::from_millis(50),
+            "warm PK lookup p50 over {FILES} files was {p50:?}, want < 50ms; samples={elapsed:?}"
+        );
+    }
+
+    /// Same executed PK lookup as the SF-10 bench, against one ~64 MiB Vortex
+    /// file (the per-file size that bench produces). Isolates Vortex
+    /// plan+execute from listing hundreds of files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_warm_scan_is_single_digit_ms_on_large_file() {
+        const ROWS: i64 = 262_144;
+        const PAYLOAD_LEN: usize = 256;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("payload", DataType::Binary, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_warm_large_file",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        let ids: Vec<i64> = (0..ROWS).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+        let mut payload_flat =
+            Vec::with_capacity(usize::try_from(ROWS).expect("rows") * PAYLOAD_LEN);
+        for id in 0..ROWS {
+            let mut buf = [0_u8; PAYLOAD_LEN];
+            let mut x = id.cast_unsigned().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for b in &mut buf {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *b = u8::try_from((x >> 33) & 0xFF).expect("masked to a byte");
+            }
+            payload_flat.extend_from_slice(&buf);
+        }
+        let payload =
+            arrow::array::BinaryArray::from_iter_values(payload_flat.chunks_exact(PAYLOAD_LEN));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(values)),
+                Arc::new(payload),
+            ],
+        )
+        .expect("batch");
+        insert_batch_with_context(&ctx, &provider, batch).await;
+        let target_id = ROWS / 2;
+        let expected = target_id * 100;
+        for _ in 0..4 {
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    target_id,
+                    "value",
+                )
+                .await,
+                vec![expected]
+            );
+        }
+        let mut elapsed = Vec::new();
+        for _ in 0..16 {
+            let t0 = Instant::now();
+            let values = query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                target_id,
+                "value",
+            )
+            .await;
+            elapsed.push(t0.elapsed());
+            assert_eq!(values, vec![expected]);
+        }
+        elapsed.sort();
+        let p50 = elapsed[elapsed.len() / 2];
+        assert!(
+            p50 < Duration::from_millis(50),
+            "warm PK lookup p50 on a ~64MiB file was {p50:?}, want < 50ms; samples={elapsed:?}"
+        );
+    }
+
+    /// Concurrent PK lookup throughput on the production planner path
+    /// (`read_table` + `id = ?` + collect), covering both reuse modes.
+    ///
+    /// Sequential p50 tests do not catch a lock that serializes the warm hit.
+    /// This drives 8 workers against many on-disk files after the listing cache
+    /// and `ScanView` are warm, and requires: every row is the seeded
+    /// `value = id * 10`, zero metastore queries, and concurrent elapsed at
+    /// least 2× faster than a one-worker baseline on the same fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn pk_point_lookup_warm_concurrent_throughput_reuses_listing_and_scan_view() {
+        const FILES: i64 = 32;
+        const ROWS_PER_FILE: i64 = 256;
+        const WORKERS: usize = 8;
+        const LOOKUPS_PER_WORKER: usize = 64;
+        let cases: [(&str, ScanViewReuse); 2] = [
+            ("full_append", ScanViewReuse::UntilInvalidated),
+            ("changes", ScanViewReuse::WithinLag(Duration::from_secs(1))),
+        ];
+        for (mode, reuse) in cases {
+            pk_lookup_concurrent_throughput_case(
+                mode,
+                reuse,
+                FILES,
+                ROWS_PER_FILE,
+                WORKERS,
+                LOOKUPS_PER_WORKER,
+            )
+            .await;
+        }
+    }
+
+    async fn pk_lookup_concurrent_throughput_case(
+        mode: &str,
+        reuse: ScanViewReuse,
+        files: i64,
+        rows_per_file: i64,
+        workers: usize,
+        lookups_per_worker: usize,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+        let catalog_dyn: Arc<dyn MetadataCatalog> = Arc::clone(&catalog) as _;
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let provider = Arc::new(
+            CayenneTableProviderBuilder::new(catalog_dyn, runtime_env)
+                .with_scan_view_reuse(reuse)
+                .create(CreateTableOptions {
+                    table_name: format!("pk_lookup_throughput_{mode}"),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: data_dir,
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("create table"),
+        );
+        provider.init_scan_view_cache();
+        for f in 0..files {
+            let start = f * rows_per_file;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start..start + rows_per_file)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + rows_per_file).map(|x| x * 10),
+                    )),
+                ],
+            )
+            .expect("batch");
+            insert_batch_with_context(&ctx, &provider, batch).await;
+        }
+        let ctx = Arc::new(ctx);
+        let total_rows = files * rows_per_file;
+        // One PK from each quartile so workers prune different files.
+        let target_ids: [i64; 4] = [
+            rows_per_file / 2,
+            total_rows / 4 + rows_per_file / 2,
+            total_rows / 2 + rows_per_file / 2,
+            total_rows - rows_per_file / 2,
+        ];
+        for id in target_ids {
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    id,
+                    "value",
+                )
+                .await,
+                vec![id * 10],
+                "{mode}: warmup PK lookup id={id}"
+            );
+        }
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "{mode}: warmup must populate the snapshot listing cache"
+        );
+
+        // One-worker baseline on the same fixture: 8 mutex-serialized workers
+        // at ~307 µs/lookup would still beat a 10 ms serial budget. Require
+        // the concurrent run to beat fully-serialized one-worker time.
+        let baseline_t0 = Instant::now();
+        for n in 0..lookups_per_worker {
+            let id = target_ids[n % target_ids.len()];
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    id,
+                    "value",
+                )
+                .await,
+                vec![id * 10],
+                "{mode}: one-worker baseline PK lookup id={id}"
+            );
+        }
+        let baseline = baseline_t0.elapsed();
+        let queries_before = catalog.metastore_query_count();
+
+        let errors = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut joins = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let provider = Arc::clone(&provider);
+            let ctx = Arc::clone(&ctx);
+            let errors = Arc::clone(&errors);
+            joins.push(tokio::spawn(async move {
+                for n in 0..lookups_per_worker {
+                    let id = target_ids[(worker + n) % target_ids.len()];
+                    let values = query_pk_i64(
+                        Arc::clone(&provider) as Arc<dyn TableProvider>,
+                        &ctx,
+                        id,
+                        "value",
+                    )
+                    .await;
+                    if values != vec![id * 10] {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for join in joins {
+            join.await.expect("throughput worker");
+        }
+        let elapsed = t0.elapsed();
+        let completed = u64::try_from(workers.saturating_mul(lookups_per_worker))
+            .expect("lookup count fits u64");
+        let error_count = errors.load(Ordering::Relaxed);
+        let queries_after = catalog.metastore_query_count();
+        let elapsed_ms = u64::try_from(elapsed.as_millis())
+            .expect("elapsed ms fits u64")
+            .max(1);
+        let qps = completed.saturating_mul(1000) / elapsed_ms;
+        // Fully serialized: `workers` copies of the one-worker baseline.
+        // Wait-free hits must beat that by at least 2×.
+        let serialized =
+            baseline.saturating_mul(u32::try_from(workers).expect("worker count fits u32"));
+        assert_eq!(
+            error_count, 0,
+            "{mode}: {error_count} PK lookups returned the wrong row"
+        );
+        assert_eq!(
+            queries_before, queries_after,
+            "{mode}: warm concurrent PK lookups queried the metastore ({queries_before} -> {queries_after})"
+        );
+        assert!(
+            elapsed.saturating_mul(2) < serialized,
+            "{mode}: {workers} workers took {elapsed:?} for {lookups_per_worker} lookups each; one worker took {baseline:?} for {lookups_per_worker}, so fully serialized is {serialized:?}. Want concurrent at least 2× faster (elapsed*2 < serialized); qps={qps}"
         );
     }
 
@@ -45421,6 +48573,7 @@ mod tests {
             snapshot_id: &snapshot_id,
             limit: file_limit,
             scan_schema: Arc::clone(&scan_schema),
+            captured_files: None,
         };
 
         // The manifest resolver must now return a non-empty set (flag is ON and
@@ -45471,7 +48624,10 @@ mod tests {
             manifest_files.grouped_by_partition,
             listing_files.grouped_by_partition
         );
-        assert_eq!(manifest_files.statistics, listing_files.statistics);
+        assert_eq!(
+            CayenneTableProvider::statistics_to_inexact(manifest_files.statistics.clone()),
+            CayenneTableProvider::statistics_to_inexact(listing_files.statistics.clone())
+        );
 
         // Dual-source fallback: clear the manifest and the resolver must return
         // `None`, so the scan falls back to directory listing rather than reading
@@ -49086,6 +52242,181 @@ mod tests {
         assert!(CayenneTableProvider::sort_columns_to_file_sort_order(&[], &schema2).is_none());
     }
 
+    /// [sound `output_ordering`] A rewrite that laid its rows out along a curve
+    /// must NOT attest the snapshot as sorted.
+    ///
+    /// The scan advertises `output_ordering` from `context.sort_columns()`. A
+    /// curve is not a lexicographic order — it interleaves the columns, puts
+    /// NULLs first, and discards ASC/DESC — so attesting would tell `DataFusion`
+    /// the files carry an order they do not, and it would elide a sort the data
+    /// needs or open a merge join on unordered input: wrong rows, not a slow
+    /// plan.
+    ///
+    /// The trap this pins is that the attestation cannot be guarded by comparing
+    /// column lists. Schema inference fills `cayenne_sort_columns` on every
+    /// catalog-visible CDC table, so the observed-filter key the curve is
+    /// applied to can be *equal* to the configured list while meaning something
+    /// different. Here the inferred sort columns equal the observed key exactly,
+    /// so only the curve flag stands between the rewrite and a false attestation.
+    /// A table column that happens to share the transient clustering key's name
+    /// must not be sorted in its place: the rows must come out in the same curve
+    /// order as for a table without that column.
+    #[tokio::test]
+    async fn test_cluster_sort_stream_ignores_a_column_named_like_the_key() {
+        use arrow::array::{AsArray, Int64Array};
+        use arrow::datatypes::Int64Type;
+
+        async fn cluster_order(rows: &[(i64, i64)], decoy: bool) -> Vec<(i64, i64)> {
+            let mut fields = vec![
+                Field::new("x", DataType::Int64, false),
+                Field::new("y", DataType::Int64, false),
+            ];
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ];
+            if decoy {
+                fields.push(Field::new(
+                    super::super::clustering::CLUSTER_KEY_COLUMN_NAME,
+                    DataType::Int64,
+                    false,
+                ));
+                columns.push(Arc::new(Int64Array::from(vec![0_i64; rows.len()])));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let ctx = SessionContext::new();
+            let (provider, _dir) = create_cayenne_table_with_config(
+                if decoy {
+                    "cluster_key_decoy"
+                } else {
+                    "cluster_key_plain"
+                },
+                Arc::clone(&schema),
+                VortexConfig::default(),
+                vec![],
+                ctx.runtime_env(),
+            )
+            .await;
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+            let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(vec![Ok(batch)]),
+            ));
+            let sorted = provider
+                .cluster_sort_stream(input, vec![0, 1], &ctx.task_ctx(), ClusterSortSpan::Global)
+                .expect("cluster sort");
+            let batches: Vec<RecordBatch> = sorted.try_collect().await.expect("sorted rows");
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    let x = batch.column(0).as_primitive::<Int64Type>();
+                    let y = batch.column(1).as_primitive::<Int64Type>();
+                    (0..batch.num_rows())
+                        .map(|row| (x.value(row), y.value(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        // 256 points of a 16x16 grid in a scrambled order.
+        let rows: Vec<(i64, i64)> = (0..256_i64)
+            .map(|i| ((i * 37) % 16, (i * 11) % 16))
+            .collect();
+        let plain = cluster_order(&rows, false).await;
+        assert_ne!(
+            plain, rows,
+            "the fixture must actually be reordered by clustering"
+        );
+        assert_eq!(cluster_order(&rows, true).await, plain);
+    }
+
+    #[tokio::test]
+    async fn test_curve_ordered_rewrite_does_not_advertise_output_ordering() {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("tenant", DataType::Int64, false),
+        ]));
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
+        // Inferred (not authoritative) sort columns, so the observed filter
+        // columns win, and equal to the key observation will produce, so a column
+        // comparison alone would attest; `inline_max_rows: 0` forces writes to
+        // files so the rewrite actually sorts them.
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "curve_ordering_lifecycle",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["tenant".to_string(), "ts".to_string()],
+                sort_columns_origin: crate::metadata::SortColumnsOrigin::Inferred,
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let rows: Vec<i64> = (0..64).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(rows.clone())) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter()
+                        .map(|i| 1_700_000_000_000_000 + i * 1_000)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|i| (i * 7) % 16).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+
+        // Seed the observation histogram through the real pushdown path, on TWO
+        // differently-scaled columns — the shape a curve exists for.
+        let state = ctx.state();
+        for _ in 0..4 {
+            let filters = vec![
+                datafusion_expr::col("ts").gt(datafusion_expr::lit(1_700_000_000_000_000_i64)),
+                datafusion_expr::col("tenant").eq(datafusion_expr::lit(3_i64)),
+            ];
+            let _plan = provider
+                .scan(&state, None, &filters, None)
+                .await
+                .expect("scan with ts/tenant filters");
+        }
+        let observed = provider.effective_sort_columns_for_rewrite();
+        assert_eq!(
+            observed.as_slice(),
+            provider.context.sort_columns(),
+            "fixture must observe exactly the inferred sort columns, two of them for the curve \
+             to engage, got {observed:?}"
+        );
+
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("curve-ordered rewrite");
+
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        assert!(
+            plan.properties().output_ordering().is_none(),
+            "a curve-ordered rewrite must NOT advertise output_ordering: the files are \
+             interleaved across the key columns, not lexicographically sorted by them"
+        );
+    }
+
     /// [sound `output_ordering`] A snapshot freshly produced by the sorted compaction
     /// rewrite, with no unsorted union branches, advertises `output_ordering` by the
     /// sort columns; a subsequent append delta-adds an UNSORTED file in place and
@@ -51629,6 +54960,17 @@ mod tests {
         rows
     }
 
+    /// Apply one batch through the real CDC append path, so a `cdc_durability: memory`
+    /// table with an armed slot advancer lands it in the RAM mem-tier rather than
+    /// durably (`insert_into` does not reach that path).
+    async fn cdc_apply(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let _cdc_write = provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("cdc append");
+    }
+
     /// Retention must delete every row its predicate matches and NOTHING else, and a
     /// second pass over the result must be a no-op. Deleting too much is silent data
     /// loss; deleting too little leaves rows the operator asked to have removed.
@@ -52040,6 +55382,92 @@ mod tests {
             !persisted.num_rows_exact,
             "a retention delete must taint the persisted count, or a distributed COUNT(*) folds {} as the answer",
             persisted.num_rows
+        );
+    }
+
+    /// A CDC apply landing between a `DELETE`'s plan build and its execution must not
+    /// destroy the row it wrote, and must not escape the predicate.
+    ///
+    /// The deletion sink captures the tiers it will scan when it is BUILT, and
+    /// re-reads only the main listing at execution. Building it at plan time therefore
+    /// judged the delete against a snapshot of the table taken before the apply:
+    ///
+    /// - `(8, 20)` arrives after the capture, matches `value < 50`, and is in no scan
+    ///   source — so the predicate never sees it and it survives a delete that names it.
+    /// - `(7, 60)` supersedes the durable `(7, 10)`, which the capture still holds and
+    ///   which DOES match. A key tombstone written from that retired version hides the
+    ///   KEY, taking the live replacement with it — silent loss of a row the predicate
+    ///   never matched, the shape #13574 closed one tier over (#13828).
+    ///
+    /// Verified to fail with the sink built at plan time: the delete leaves
+    /// `[(8, 20), (9, 90)]` — it destroyed the live `(7, 60)` and kept the `(8, 20)`
+    /// its predicate names.
+    #[tokio::test]
+    async fn a_cdc_apply_between_plan_build_and_execution_is_judged_by_the_delete() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_cdc_apply_gap",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        // The RAM path is armed by the runtime installing a slot advancer; without one
+        // the write silently takes the durable path and this test covers nothing.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(
+            provider.is_cdc_memory_mode() && provider.has_slot_advancer(),
+            "precondition: the applies must take the in-memory CDC path this test is about"
+        );
+
+        // `(7, 10)` matches `value < 50`; `(9, 90)` is the untouched control.
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 9], &[10, 90]),
+        )
+        .await;
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+            )
+            .await
+            .expect("delete plan");
+
+        // THE GAP: an apply between plan build and execution upserts key 7 out of the
+        // predicate and inserts key 8 into it.
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 8], &[60, 20]),
+        )
+        .await;
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (8, 20), (9, 90)],
+            "precondition: the apply is visible to readers before the delete executes"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "precondition: the apply must still be RAM-resident, which is the tier a \
+             plan-time capture cannot see"
+        );
+
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (9, 90)],
+            "the delete must be judged against the table as it is when it RUNS: `(8, 20)` \
+             matches `value < 50` and goes, `(7, 60)` does not match and must survive — a \
+             key tombstone drawn from the superseded `(7, 10)` would take it with it"
         );
     }
 
@@ -54625,8 +58053,9 @@ mod tests {
     /// directions:
     /// - two quiescent captures (no write between) produce EQUAL keys — every cheap
     ///   anchor (current snapshot id, structural epoch, per-shard version, file-index
-    ///   ptr, protected-map / inline-view `Arc`) is stable, so a read-your-writes scan
-    ///   HITS the cached bundle instead of rebuilding;
+    ///   ptr, protected-map / inline-view `Arc`) is stable, so a
+    ///   [`ScanViewReuse::UntilInvalidated`] scan hits the cached bundle instead of
+    ///   rebuilding;
     /// - a capture taken after a RAM append produces a DIFFERENT key (the tier version
     ///   moved), so the scan rebuilds — never serving a stale view across a mutation.
     ///
@@ -54677,7 +58106,7 @@ mod tests {
         assert_eq!(
             first.key(structural),
             second.key(structural),
-            "two quiescent captures must key identically (a read-your-writes scan hits the cache)"
+            "two quiescent captures must key identically (UntilInvalidated hits the cache)"
         );
         // The cheap anchors must be genuinely stable, not trivially always-equal.
         assert_eq!(first.current_snapshot_id, second.current_snapshot_id);
@@ -54739,15 +58168,13 @@ mod tests {
         pairs
     }
 
-    /// Read-your-writes (`freshness == 0`) — the correctness default. A scan through
-    /// the demand cache must see its own writes on the VERY NEXT scan: after an append,
-    /// `scan_view_at_current_input(0)` captures the current state, keys to it (a fresh
-    /// key ⇒ cache miss ⇒ rebuild), and serves a bundle reflecting the append — never a
-    /// stale prior bundle (the class of the overwrite regression this replaces).
-    /// A second scan of the SAME state HITS the cached bundle (same `Arc`) — the dedup /
-    /// reuse the cache preserves. (`weak_self` is unset here, so the cache builds inline;
-    /// the identity + freshness logic is identical to the production `spawn_blocking`
-    /// path.)
+    /// [`ScanViewReuse::UntilInvalidated`] — the full/append path. A scan through
+    /// the demand cache must see its own writes on the VERY NEXT scan: after an append
+    /// bumps `scan_input_version`, the cached view is invalid, so the scan recaptures
+    /// and rebuilds. A second scan of the SAME state HITS the cached bundle (same
+    /// `Arc`) without recapturing. (`weak_self` is unset here, so the cache builds
+    /// inline; the identity + reuse logic is identical to the production
+    /// `spawn_blocking` path.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_serves_own_writes_and_reuses() {
         let ctx = SessionContext::new();
@@ -54774,26 +58201,26 @@ mod tests {
             .await
             .expect("first RAM append");
         let first = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes build 1");
+            .expect("UntilInvalidated build 1");
         assert_eq!(
             collect_segment_pairs(&first.visible_segments),
             vec![(1, 10), (2, 20)],
-            "first read-your-writes scan reflects the first append"
+            "first UntilInvalidated scan reflects the first append"
         );
 
         // Same state, no mutation between: the next scan HITS the cached bundle.
         let reused = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes build 2 (reuse)");
+            .expect("UntilInvalidated build 2 (reuse)");
         assert!(
             Arc::ptr_eq(&first, &reused),
             "an unchanged state must serve the SAME cached bundle (dedup / reuse)"
         );
 
-        // A second append: read-your-writes must see it on the very next scan.
+        // A second append: UntilInvalidated must see it on the very next scan.
         let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
@@ -54802,9 +58229,9 @@ mod tests {
             .await
             .expect("second RAM append");
         let after = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes build 3");
+            .expect("UntilInvalidated build 3");
         assert!(
             !Arc::ptr_eq(&first, &after),
             "a mutated state must rebuild (a fresh key), not serve the stale bundle"
@@ -54812,15 +58239,477 @@ mod tests {
         assert_eq!(
             collect_segment_pairs(&after.visible_segments),
             vec![(1, 10), (2, 20), (3, 30)],
-            "read-your-writes scan sees the second append immediately"
+            "UntilInvalidated scan sees the second append immediately"
         );
     }
 
-    /// Read-current (`freshness > 0`, stale-tolerant) — the analytical alignment path.
-    /// Once a bundle is cached, a read-current scan within the lag serves that
-    /// (now-stale) bundle rather than rebuilding, while a read-your-writes
-    /// (`freshness == 0`) scan of the same moment sees the newer state. This is the
-    /// bounded-staleness knob the SF1000 latency A/B exercises.
+    /// A validated capture with an unchanged key must renew both invalidation
+    /// metadata and the lag window without rebuilding the view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_equal_key_renews_capture_metadata() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_equal_key",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1], &[10])).await;
+        let first = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("warm inline view");
+        assert!(!first.raw.inlined_view.is_empty());
+        provider.notify_scan_input_change();
+        let captured_after = Instant::now();
+        let reused = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("validate unchanged view");
+        assert!(Arc::ptr_eq(&first, &reused));
+        let completed = provider
+            .scan_view_cache
+            .latest_complete
+            .load_full()
+            .expect("completed view");
+        assert_eq!(
+            completed.order,
+            provider.scan_input_version.load(Ordering::Acquire)
+        );
+        assert!(completed.captured_at >= captured_after);
+
+        // A quiet table still renews its lag window when a new capture confirms
+        // the same state, without requiring another write to advance the version.
+        let recaptured_after = Instant::now();
+        let recaptured = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await
+            .expect("recapture unchanged view");
+        assert!(Arc::ptr_eq(&first, &recaptured));
+        let renewed = provider
+            .scan_view_cache
+            .latest_complete
+            .load_full()
+            .expect("renewed capture");
+        assert_eq!(renewed.order, completed.order);
+        assert!(renewed.captured_at >= recaptured_after);
+
+        // An older build's driver or an in-flight drain may publish after this
+        // renewal. It must not rewind the freshness window at the same version.
+        provider.scan_view_cache.publish_completed(
+            completed.key.clone(),
+            completed.order,
+            completed.captured_at,
+            Arc::clone(&completed.view),
+        );
+        assert!(Arc::ptr_eq(
+            &renewed,
+            &provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("retained renewal")
+        ));
+    }
+
+    /// Both a completed build found by draining and a pending same-key build
+    /// inherit the version and time validated by the joining scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_equal_key_in_flight_renews_capture_metadata() {
+        use futures::FutureExt;
+
+        for build_complete in [false, true] {
+            let ctx = SessionContext::new();
+            let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+                "scan_view_equal_key_in_flight",
+                ctx.runtime_env(),
+                VortexConfig {
+                    inline_max_rows: 1024,
+                    ..VortexConfig::default()
+                },
+            )
+            .await;
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            insert_batch(&provider, id_value_batch(schema, &[1], &[10])).await;
+            let first = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("warm inline view");
+            assert!(!first.raw.inlined_view.is_empty());
+            let completed = provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("completed capture");
+            let build: ScanViewBuild = futures::future::ready(Ok(Arc::clone(&first)))
+                .boxed()
+                .shared();
+            if build_complete {
+                assert!(build.clone().now_or_never().is_some());
+            }
+            {
+                let mut in_flight = provider.scan_view_cache.in_flight.lock();
+                in_flight.clear();
+                in_flight.push(InFlightScanView {
+                    key: completed.key.clone(),
+                    order: completed.order,
+                    captured_at: completed.captured_at,
+                    build,
+                });
+            }
+            provider.scan_view_cache.latest_complete.store(None);
+            provider.notify_scan_input_change();
+            let captured_after = Instant::now();
+            let reused = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("reuse in-flight view");
+            assert!(Arc::ptr_eq(&first, &reused));
+            let renewed = provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("renewed capture");
+            assert_eq!(
+                renewed.order,
+                provider.scan_input_version.load(Ordering::Acquire)
+            );
+            assert!(renewed.captured_at >= captured_after);
+        }
+    }
+
+    /// A file append changes the captured file set. Its replacement view must
+    /// include the new file, then remain reusable without another capture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_reuses_after_file_append() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_position_based_table_with_vortex_config(
+            "scan_view_file_append",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        let first = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("warm scan view");
+        assert!(
+            first.raw.inlined_view.is_empty(),
+            "fixture must write files"
+        );
+        let first_key = first.raw.key(first.structural_version);
+        let first_order = provider.scan_input_version.load(Ordering::Acquire);
+        insert_batch(&provider, id_value_batch(schema, &[2], &[20])).await;
+        assert!(provider.scan_input_version.load(Ordering::Acquire) > first_order);
+        assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (2, 20)]);
+        let completed = provider
+            .scan_view_cache
+            .latest_complete
+            .load_full()
+            .expect("completed post-append view");
+        assert_ne!(
+            completed.key, first_key,
+            "file append changes the captured file set"
+        );
+        assert!(!Arc::ptr_eq(&first, &completed.view));
+        assert_eq!(
+            completed.order,
+            provider.scan_input_version.load(Ordering::Acquire),
+            "the replacement view must carry the post-append order"
+        );
+
+        *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(|| {
+            Box::pin(async { panic!("an unchanged table must reuse without recapturing") })
+        }));
+        assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (2, 20)]);
+    }
+
+    /// Checkpointing inline rows into the current snapshot must not add a second
+    /// copy to a scan that selected its view before the checkpoint. Exercise both
+    /// a reused lagged view and the selection-to-plan window for every reuse mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_checkpoint_keeps_captured_file_set() {
+        for scan_from_manifest in [false, true] {
+            for checkpoint_after_selection in [false, true] {
+                for reuse in [
+                    ScanViewReuse::UntilInvalidated,
+                    ScanViewReuse::WithinLag(Duration::from_hours(1)),
+                    ScanViewReuse::WithinLag(Duration::ZERO),
+                ] {
+                    let ctx = SessionContext::new();
+                    let (mut provider, _catalog, _tmp) =
+                        create_position_based_table_with_vortex_config(
+                            "scan_view_checkpoint",
+                            ctx.runtime_env(),
+                            VortexConfig {
+                                inline_max_rows: 1024,
+                                compaction_background_interval_ms: 0,
+                                scan_from_manifest,
+                                ..VortexConfig::default()
+                            },
+                        )
+                        .await;
+                    provider.scan_view_reuse = reuse;
+                    let provider = Arc::new(provider);
+                    provider.init_scan_view_cache();
+                    let schema = Arc::clone(&provider.table_metadata.schema);
+                    insert_batch(&provider, id_value_batch(schema, &[1, 1, 2], &[10, 10, 20]))
+                        .await;
+                    let expected = vec![(1, 10), (1, 10), (2, 20)];
+                    assert_eq!(scan_id_values(&provider).await, expected);
+                    let before = provider
+                        .scan_view_cache
+                        .latest_complete
+                        .load_full()
+                        .expect("warm pre-checkpoint view");
+                    assert!(!before.view.raw.inlined_view.is_empty());
+                    assert!(before.view.raw.warm_files.files.is_empty());
+                    let snapshot_id = provider.get_current_snapshot_id();
+                    if checkpoint_after_selection {
+                        let writer = Arc::clone(&provider);
+                        *provider.test_post_scan_view_selection_hook.lock() =
+                            Some(Box::new(move || {
+                                Box::pin(async move {
+                                    assert_eq!(
+                                        writer.checkpoint_inlined_data().await.expect("checkpoint"),
+                                        3,
+                                    );
+                                })
+                            }));
+                    } else {
+                        assert_eq!(
+                            provider
+                                .checkpoint_inlined_data()
+                                .await
+                                .expect("checkpoint"),
+                            3,
+                        );
+                    }
+                    assert_eq!(
+                        scan_id_values(&provider).await,
+                        expected,
+                        "{reuse:?}, manifest={scan_from_manifest}, after_selection={checkpoint_after_selection}",
+                    );
+                    assert_eq!(provider.get_current_snapshot_id(), snapshot_id);
+                    assert_eq!(provider.cached_inlined_row_count(), 0);
+                    let after = provider
+                        .scan_view_cache
+                        .latest_complete
+                        .load_full()
+                        .expect("post-checkpoint view");
+                    if reuse == ScanViewReuse::WithinLag(Duration::from_hours(1)) {
+                        assert!(
+                            Arc::ptr_eq(&before.view, &after.view),
+                            "lagged reads must preserve the captured view across a checkpoint",
+                        );
+                    }
+                    // Once refreshed, the checkpointed files supply the same row
+                    // multiset, including the legitimate duplicate from INSERT.
+                    provider
+                        .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                        .await
+                        .expect("refresh view after checkpoint");
+                    assert_eq!(scan_id_values(&provider).await, expected);
+                }
+            }
+        }
+    }
+
+    /// Position-based deletes must invalidate a warmed view on a table with no
+    /// primary key, whose deletion snapshot has no index pointer in the cache key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_position_delete_sees_committed_rows() {
+        for inline_max_rows in [0, 1024] {
+            let ctx = SessionContext::new();
+            let (provider, _catalog, _tmp) = create_position_based_table_with_vortex_config(
+                "scan_view_position_delete",
+                ctx.runtime_env(),
+                VortexConfig {
+                    inline_max_rows,
+                    compaction_background_interval_ms: 0,
+                    ..VortexConfig::default()
+                },
+            )
+            .await;
+            let provider = Arc::new(provider);
+            provider.init_scan_view_cache();
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+            assert!(provider.pk_deletion_strategy().is_position_based());
+            let first = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("warm pre-delete view");
+            assert_eq!(first.raw.inlined_view.is_empty(), inline_max_rows == 0);
+            let reused = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("reuse pre-delete view");
+            assert!(
+                Arc::ptr_eq(&first, &reused),
+                "pre-delete cache must be warm"
+            );
+            let delete = provider
+                .delete_from(&ctx.state(), vec![col("id").eq(lit_i64(2))])
+                .await
+                .expect("position delete plan");
+            collect(delete, ctx.task_ctx())
+                .await
+                .expect("execute delete");
+            assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (3, 30)]);
+        }
+    }
+
+    fn value_for_id(pairs: &[(i64, i64)], id: i64) -> Option<i64> {
+        pairs
+            .iter()
+            .filter(|(row_id, _)| *row_id == id)
+            .map(|(_, value)| *value)
+            .max()
+    }
+
+    /// Sequential read-modify-write under [`ScanViewReuse::UntilInvalidated`]:
+    /// each scan must see the previous committed upsert so two increments of
+    /// the same PK produce `x=2`, not a lost update. This is the write-back
+    /// UPDATE shape (read current, write current+1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_until_invalidated_sees_sequential_rmw() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_rmw",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[0])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed x=0");
+
+        for expected in [1_i64, 2] {
+            let view = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("RMW read");
+            let current = value_for_id(&collect_segment_pairs(&view.visible_segments), 1)
+                .expect("id 1 is visible");
+            let next = current + 1;
+            let _ = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[next])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("RMW write");
+            let after = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("RMW verify");
+            assert_eq!(
+                value_for_id(&collect_segment_pairs(&after.visible_segments), 1),
+                Some(expected),
+                "UntilInvalidated sequential increment must produce x={expected}"
+            );
+        }
+    }
+
+    /// A write that lands after `capture_raw_scan_input` returns and before the
+    /// capture is stamped with `scan_input_version` must not tag the pre-write
+    /// rows with the post-write version. The capture retries and the scan sees
+    /// the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_retries_when_a_write_races_capture() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_capture_race",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+
+        {
+            let writer = provider.clone_for_write();
+            let schema = Arc::clone(&schema);
+            let task_ctx = ctx.task_ctx();
+            *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let _ = writer
+                        .write_cdc_append_stream(
+                            single_batch_stream(id_value_batch(schema, &[3], &[30])),
+                            &task_ctx,
+                        )
+                        .await
+                        .expect("write that races the capture stamp");
+                })
+            }));
+        }
+
+        let raced = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("scan that raced a write");
+        assert_eq!(
+            collect_segment_pairs(&raced.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "a write between capture and version stamp must not be cached as current"
+        );
+
+        let after = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("scan after raced write");
+        assert_eq!(
+            collect_segment_pairs(&after.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "UntilInvalidated must keep serving the post-write view"
+        );
+    }
+
+    /// [`ScanViewReuse::WithinLag`] — the `refresh_mode: changes` path. Once a
+    /// bundle is cached, a timed-reuse scan within the lag serves that (now-stale)
+    /// bundle rather than rebuilding, while [`ScanViewReuse::UntilInvalidated`] at
+    /// the same moment sees the newer state (the write bumped `scan_input_version`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_read_current_serves_within_lag() {
         let ctx = SessionContext::new();
@@ -54846,14 +58735,14 @@ mod tests {
             )
             .await
             .expect("first RAM append");
-        // Build the bundle, then a second read-your-writes scan promotes it to
+        // Build the bundle, then a second UntilInvalidated scan promotes it to
         // `latest_complete` (drain observes the first build complete).
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("build");
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("promote to latest_complete");
 
@@ -54866,35 +58755,230 @@ mod tests {
             .await
             .expect("second RAM append");
 
-        // Read-current with a generous lag serves the STALE cached bundle (no rebuild).
+        // WithinLag with a generous lag serves the STALE cached bundle (no rebuild).
         let stale = provider
-            .scan_view_at_current_input(Duration::from_hours(1))
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::from_hours(1)))
             .await
-            .expect("read-current within lag");
+            .expect("WithinLag within lag");
         assert_eq!(
             collect_segment_pairs(&stale.visible_segments),
             vec![(1, 10), (2, 20)],
-            "read-current within the lag serves the cached (stale) bundle"
+            "WithinLag within the lag serves the cached (stale) bundle"
         );
 
-        // Read-your-writes at the same moment sees the newer state.
+        // UntilInvalidated at the same moment sees the newer state.
         let fresh = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes after mutation");
+            .expect("UntilInvalidated after mutation");
         assert_eq!(
             collect_segment_pairs(&fresh.visible_segments),
             vec![(1, 10), (2, 20), (3, 30)],
-            "read-your-writes bypasses the lag and sees the mutation"
+            "UntilInvalidated bypasses the lag and sees the mutation"
         );
     }
 
-    /// The background evictor drops a cached `latest_complete` once it has aged past the
-    /// dataset's freshness bound, releasing the snapshot dirs its capture pinned — so an
-    /// idle table (queried once, then quiet) does not pin an old snapshot forever and
-    /// block compaction GC. Eviction only removes an already-non-servable view, and a
-    /// subsequent scan rebuilds correctly. (This provider's `default_scan_freshness` is
-    /// the builder default `0`, so any cached view is immediately stale-for-reuse.)
+    /// [`ScanViewReuse::WithinLag(ZERO)`] recaptures every scan, so a write is
+    /// visible on the next scan — the old full/append freshness-0 path, and
+    /// `CAYENNE_SCAN_VIEW_FRESHNESS_MS=0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_zero_lag_sees_write() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_zero_lag",
+            Arc::clone(&ctx.runtime_env()),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("promote");
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("write");
+
+        let zero = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await
+            .expect("zero lag");
+        assert_eq!(
+            collect_segment_pairs(&zero.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "WithinLag(0) recaptures every scan and must see the write"
+        );
+    }
+
+    /// After the lag elapses, [`ScanViewReuse::WithinLag`] recaptures and sees
+    /// the write it batched. Time itself is under test — keep the sleep short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_within_lag_expires_and_recaptures() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_lag_expire",
+            Arc::clone(&ctx.runtime_env()),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("promote");
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("write");
+
+        let lag = Duration::from_millis(30);
+        let still_stale = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(lag))
+            .await
+            .expect("within lag");
+        assert_eq!(
+            collect_segment_pairs(&still_stale.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "WithinLag still batches the write before the lag elapses"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let expired = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(lag))
+            .await
+            .expect("lag elapsed");
+        assert_eq!(
+            collect_segment_pairs(&expired.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "once the lag elapses, WithinLag recaptures and sees the write"
+        );
+    }
+
+    /// A CDC in-memory delete must bump `scan_input_version` so
+    /// [`ScanViewReuse::UntilInvalidated`] (and the production `TableProvider::scan`
+    /// path) hide the deleted key on the next scan. [`ScanViewReuse::WithinLag`]
+    /// may still serve the pre-delete view inside the lag — that is the batching
+    /// trade for read-only `changes`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_delete_invalidates_until_invalidated_not_within_lag() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_delete",
+            Arc::clone(&ctx.runtime_env()),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("promote");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2],
+            "production scan sees both seed rows before the delete"
+        );
+
+        provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[1]))
+            .await
+            .expect("delete")
+            .expect("in-memory CDC delete absorbed");
+
+        let stale = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::from_hours(1)))
+            .await
+            .expect("within lag after delete");
+        assert_eq!(
+            collect_segment_pairs(&stale.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "WithinLag batches the delete and still serves id 1"
+        );
+
+        let fresh = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("until-invalidated after delete");
+        assert_eq!(
+            collect_segment_pairs(&fresh.visible_segments),
+            vec![(2, 20)],
+            "UntilInvalidated recaptures after the delete and hides id 1"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![2],
+            "production TableProvider::scan uses UntilInvalidated by default and hides id 1"
+        );
+    }
+
+    /// The background evictor drops a cached `latest_complete` once it has gone
+    /// unserved past the idle window, releasing the snapshot dirs its capture pinned
+    /// — so an idle table (queried once, then quiet) does not pin an old snapshot
+    /// forever and block compaction GC. A subsequent scan rebuilds correctly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_evictor_releases_idle_cached_view() {
         let ctx = SessionContext::new();
@@ -54922,15 +59006,15 @@ mod tests {
             .expect("RAM append");
         // Two scans populate + promote a completed view into `latest_complete`.
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("build");
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("promote to latest_complete");
         assert!(
-            provider.scan_view_cache.lock().latest_complete.is_some(),
+            provider.scan_view_cache.has_latest_complete(),
             "a completed view must be cached before eviction"
         );
 
@@ -54938,7 +59022,7 @@ mod tests {
         // it is within the idle window — a still-reused view is retained, not dropped.
         provider.evict_stale_scan_view(Instant::now());
         assert!(
-            provider.scan_view_cache.lock().latest_complete.is_some(),
+            provider.scan_view_cache.has_latest_complete(),
             "a just-served view is within the idle window and must be retained"
         );
 
@@ -54946,13 +59030,13 @@ mod tests {
         // evicts it, releasing its pinned snapshot dirs.
         provider.evict_stale_scan_view(Instant::now() + Duration::from_hours(1));
         assert!(
-            provider.scan_view_cache.lock().latest_complete.is_none(),
+            !provider.scan_view_cache.has_latest_complete(),
             "an idle (long-unserved) cached view must be evicted, releasing its pinned snapshot dirs"
         );
 
         // Eviction must not break correctness: the next scan rebuilds the current state.
         let rebuilt = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("rebuild after eviction");
         assert_eq!(
@@ -54960,6 +59044,411 @@ mod tests {
             vec![(1, 10), (2, 20)],
             "a scan after eviction rebuilds and still returns the correct rows"
         );
+    }
+
+    fn catalog_query_count(catalog: &Arc<dyn MetadataCatalog>) -> u64 {
+        catalog
+            .as_any()
+            .downcast_ref::<CayenneCatalog>()
+            .expect("CayenneCatalog")
+            .metastore_query_count()
+    }
+
+    fn collect_i64_column(batches: &[RecordBatch], column: usize) -> Vec<i64> {
+        let mut values = Vec::new();
+        for batch in batches {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 column");
+            for i in 0..array.len() {
+                assert!(
+                    !array.is_null(i),
+                    "PK lookup / scan result must not contain NULL"
+                );
+                values.push(array.value(i));
+            }
+        }
+        values
+    }
+
+    /// Execute `WHERE id = ?` through the `DataFusion` planner (`read_table` +
+    /// filter + project). Direct [`TableProvider::scan`] + collect does not
+    /// apply data-column filters: pushdown is
+    /// [`TableProviderFilterPushDown::Inexact`], so a post-scan `FilterExec`
+    /// (added by the planner, then pushed into Vortex) is required for
+    /// correct rows.
+    async fn query_pk_i64(
+        table: Arc<dyn TableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+        column: &str,
+    ) -> Vec<i64> {
+        let batches = ctx
+            .read_table(table)
+            .expect("read_table")
+            .filter(col("id").eq(lit_i64(id)))
+            .expect("pk filter")
+            .select_columns(&[column])
+            .expect("project")
+            .collect()
+            .await
+            .expect("pk collect");
+        collect_i64_column(&batches, 0)
+    }
+
+    /// `WHERE id = ?` projecting `value` — the QPS-bench lookup, via the
+    /// planner so the predicate actually filters rows.
+    async fn pk_lookup_projected_value(
+        table: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+    ) -> Vec<i64> {
+        query_pk_i64(
+            Arc::clone(table) as Arc<dyn TableProvider>,
+            ctx,
+            id,
+            "value",
+        )
+        .await
+    }
+
+    /// A cache hit of `scan_view_at_current_input` must not round-trip the
+    /// metastore. Covers both production reuse modes (`UntilInvalidated` for
+    /// `full`/`append`, `WithinLag` for read-only `changes`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_reuse_does_not_query_metastore() {
+        let cases: [(&str, ScanViewReuse); 3] = [
+            ("full", ScanViewReuse::UntilInvalidated),
+            ("append", ScanViewReuse::UntilInvalidated),
+            ("changes", ScanViewReuse::WithinLag(Duration::from_secs(1))),
+        ];
+        for (mode, reuse) in cases {
+            let ctx = SessionContext::new();
+            let runtime_env = ctx.runtime_env();
+            let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+                &format!("scan_view_no_meta_{mode}"),
+                Arc::clone(&runtime_env),
+                VortexConfig {
+                    cdc_durability: crate::metadata::CdcDurability::Memory,
+                    deletion_mode: crate::metadata::DeletionMode::Key,
+                    inline_max_rows: 1024,
+                    ..VortexConfig::default()
+                },
+            )
+            .await;
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+            let _ = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("seed");
+            let first = provider
+                .scan_view_at_current_input(reuse)
+                .await
+                .expect("warmup capture");
+            assert_eq!(
+                collect_segment_pairs(&first.visible_segments),
+                vec![(1, 10), (2, 20)],
+                "{mode}: first capture must return the seeded rows"
+            );
+            let before = catalog_query_count(&catalog);
+            for _ in 0..32 {
+                let reused = provider
+                    .scan_view_at_current_input(reuse)
+                    .await
+                    .expect("reuse");
+                assert!(
+                    Arc::ptr_eq(&first, &reused),
+                    "{mode}: reuse must serve the same cached ScanView"
+                );
+                assert_eq!(
+                    collect_segment_pairs(&reused.visible_segments),
+                    vec![(1, 10), (2, 20)],
+                    "{mode}: reused view must still return the seeded rows"
+                );
+            }
+            let after = catalog_query_count(&catalog);
+            assert_eq!(
+                before, after,
+                "{mode}: scan-view reuse queried the metastore ({before} -> {after})"
+            );
+        }
+    }
+
+    async fn file_backed_reuse_table(
+        table_name: &str,
+        reuse: ScanViewReuse,
+    ) -> (
+        tempfile::TempDir,
+        Arc<CayenneCatalog>,
+        Arc<CayenneTableProvider>,
+        Arc<SessionContext>,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let data_path = temp_dir.path().join("data");
+        tokio::fs::create_dir_all(&data_path)
+            .await
+            .expect("data dir");
+        let db_path = temp_dir.path().join("catalog.db");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+        let ctx = Arc::new(SessionContext::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let table = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                Arc::clone(&ctx.runtime_env()),
+            )
+            .with_scan_view_reuse(reuse)
+            .create(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("create table"),
+        );
+        table.init_scan_view_cache();
+        let ids: Vec<i64> = (0..64).collect();
+        let names: Vec<String> = ids.iter().map(|id| format!("n{id}")).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids)),
+                Arc::new(arrow::array::StringArray::from(names)),
+            ],
+        )
+        .expect("batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+            .expect("memory exec");
+        let insert_plan = table
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("insert plan");
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert collect");
+        // The seed's deferred catalog updates must finish before the cache-hit
+        // measurement can attribute metastore operations to scans alone.
+        table
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain seed maintenance before warming the scan cache");
+        for _ in 0..8 {
+            let plan = table
+                .scan(&ctx.state(), Some(&vec![0]), &[], None)
+                .await
+                .expect("warmup scan");
+            let _ = collect(plan, ctx.task_ctx()).await.expect("warmup collect");
+        }
+        (temp_dir, catalog, table, ctx)
+    }
+
+    /// `TableProvider::scan` under each production reuse mode must not query
+    /// the metastore after the cache is warm. `full` and `append` are
+    /// `UntilInvalidated`; read-only `changes` is `WithinLag`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_production_scan_reuse_does_not_query_metastore() {
+        let cases: [(&str, ScanViewReuse); 3] = [
+            ("full", ScanViewReuse::UntilInvalidated),
+            ("append", ScanViewReuse::UntilInvalidated),
+            ("changes", ScanViewReuse::WithinLag(Duration::from_secs(1))),
+        ];
+        for (mode, reuse) in cases {
+            let (_tmp, catalog, table, ctx) =
+                file_backed_reuse_table(&format!("scan_no_meta_{mode}"), reuse).await;
+            let before = catalog.metastore_query_count();
+            for _ in 0..32 {
+                let plan = table
+                    .scan(&ctx.state(), Some(&vec![0]), &[], None)
+                    .await
+                    .expect("reuse scan");
+                let rows = collect(plan, ctx.task_ctx()).await.expect("reuse collect");
+                let mut ids = collect_i64_column(&rows, 0);
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    (0..64).collect::<Vec<i64>>(),
+                    "{mode}: reuse scan must return the seeded id set, not a stale or partial snapshot"
+                );
+            }
+            let after = catalog.metastore_query_count();
+            assert_eq!(
+                before, after,
+                "{mode}: production scan reuse queried the metastore ({before} -> {after})"
+            );
+        }
+    }
+
+    /// File-backed PK lookup through the `DataFusion` planner — the same executed
+    /// query the 10K QPS bench times. `full` / `append` (`UntilInvalidated`)
+    /// must return the seeded `value = id * 100` on a cache hit, and must see
+    /// a row appended after the cache was warm. Read-only `changes`
+    /// (`WithinLag`) is checked for the seeded lookup only: a write may lag
+    /// until the freshness window expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_reuse_pk_lookup_returns_correct_value_for_full_and_append() {
+        const ROWS: i64 = 256;
+        // 256 rows is below `DEFAULT_INLINE_MAX_ROWS` (1024), so the seed and
+        // the post-warmup append stay in the inline corpus — this is the path
+        // that must bump `scan_input_version` on a pure inline append, otherwise
+        // `UntilInvalidated` serves the pre-append view and the new PK is missing.
+        // `full_file` forces the file-backed path the QPS bench uses (~10 GiB).
+        let file_only = VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let cases: [(&str, ScanViewReuse, bool, VortexConfig); 4] = [
+            (
+                "full",
+                ScanViewReuse::UntilInvalidated,
+                true,
+                VortexConfig::default(),
+            ),
+            (
+                "append",
+                ScanViewReuse::UntilInvalidated,
+                true,
+                VortexConfig::default(),
+            ),
+            (
+                "full_file",
+                ScanViewReuse::UntilInvalidated,
+                true,
+                file_only,
+            ),
+            (
+                "changes",
+                ScanViewReuse::WithinLag(Duration::from_secs(1)),
+                false,
+                VortexConfig::default(),
+            ),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let target_id = ROWS / 2;
+        let expected_value = target_id * 100;
+
+        for (mode, reuse, sees_write_immediately, vortex_config) in cases {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let data_path = temp_dir.path().join("data");
+            tokio::fs::create_dir_all(&data_path)
+                .await
+                .expect("data dir");
+            let catalog = Arc::new(
+                CayenneCatalog::new(format!("sqlite://{}/catalog.db", temp_dir.path().display()))
+                    .expect("catalog"),
+            );
+            catalog.init().await.expect("catalog init");
+            let ctx = SessionContext::new();
+            let table = Arc::new(
+                CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                    Arc::clone(&ctx.runtime_env()),
+                )
+                .with_scan_view_reuse(reuse)
+                .create(CreateTableOptions {
+                    table_name: format!("pk_lookup_{mode}"),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: data_path.to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("create table"),
+            );
+            table.init_scan_view_cache();
+
+            let ids: Vec<i64> = (0..ROWS).collect();
+            let names: Vec<String> = ids.iter().map(|id| format!("name_{id}")).collect();
+            let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+            let seed = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .expect("seed batch");
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![seed.clone()]], seed.schema(), None)
+                    .expect("memory exec");
+            let insert_plan = table
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("insert plan");
+            let _ = collect(insert_plan, ctx.task_ctx())
+                .await
+                .expect("insert collect");
+
+            for _ in 0..16 {
+                assert_eq!(
+                    pk_lookup_projected_value(&table, &ctx, target_id).await,
+                    vec![expected_value],
+                    "{mode}: reused PK lookup for id={target_id} must return value={expected_value}"
+                );
+            }
+
+            if !sees_write_immediately {
+                continue;
+            }
+
+            // Append a new PK. UntilInvalidated must recapture and return it.
+            let new_id = ROWS;
+            let new_value = new_id * 100;
+            let extra = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![new_id])),
+                    Arc::new(arrow::array::StringArray::from(vec![format!(
+                        "name_{new_id}"
+                    )])),
+                    Arc::new(Int64Array::from(vec![new_value])),
+                ],
+            )
+            .expect("extra batch");
+            let extra_input =
+                MemorySourceConfig::try_new_exec(&[vec![extra.clone()]], extra.schema(), None)
+                    .expect("extra exec");
+            let extra_plan = table
+                .insert_into(&ctx.state(), extra_input, InsertOp::Append)
+                .await
+                .expect("extra insert plan");
+            let _ = collect(extra_plan, ctx.task_ctx())
+                .await
+                .expect("extra insert");
+
+            assert_eq!(
+                pk_lookup_projected_value(&table, &ctx, new_id).await,
+                vec![new_value],
+                "{mode}: after an append, PK lookup must see the new row (not a stale cached view)"
+            );
+            assert_eq!(
+                pk_lookup_projected_value(&table, &ctx, target_id).await,
+                vec![expected_value],
+                "{mode}: the previously looked-up row must still be correct after the append"
+            );
+        }
     }
 
     /// A `ScanView` a scan is holding must stay valid across a concurrent mem-tier
@@ -58987,6 +63476,19 @@ mod tests {
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_position_based_table_with_vortex_config(
+            table_name,
+            runtime_env,
+            VortexConfig::default(),
+        )
+        .await
+    }
+
+    async fn create_position_based_table_with_vortex_config(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        vortex_config: VortexConfig,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -59011,7 +63513,7 @@ mod tests {
             on_conflict: None,
             base_path: data_dir,
             partition_column: None,
-            vortex_config: VortexConfig::default(),
+            vortex_config,
         };
 
         let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
@@ -59778,6 +64280,72 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "inline_cache_watermark_delta").await,
             vec![(1, 10), (2, 20), (3, 30)],
             "delta refreshes keep the full visible set gap-free and duplicate-free"
+        );
+    }
+
+    /// The delta extend must SHARE the entries it carries over rather than
+    /// re-materialize them: each already-cached entry owns its decoded
+    /// `RecordBatch`es and its envelope, so a per-entry deep copy turns an
+    /// append into O(corpus) allocations on every scan that observes a write.
+    /// Only pointer identity catches that — a deep-copying rebuild still
+    /// returns exactly the right rows, so no correctness assertion can see it.
+    #[tokio::test]
+    async fn inline_cache_delta_extend_shares_carried_over_entries() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_inline_enabled_upsert_table(
+            "inline_cache_delta_entry_sharing",
+            ctx.runtime_env(),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Warm the cache from the sentinel — this first view is a full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let rebuilt = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        assert_eq!(rebuilt.len(), 1, "precondition: one inline entry is cached");
+
+        // A pure append keeps the structural epoch, so the next read extends the
+        // cached view through the delta path.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        let extended = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache");
+        assert_eq!(extended.len(), 2, "the delta appends exactly the new entry");
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &extended),
+            "precondition: the view was genuinely rebuilt, so entry sharing below \
+             is not trivially true"
+        );
+        assert!(
+            Arc::ptr_eq(&rebuilt[0], &extended[0]),
+            "an entry carried over by the delta extend must be SHARED with the base \
+             view, not deep-copied"
+        );
+
+        // A second delta: an entry first materialized BY a delta must be shared
+        // onward too, not just one that came from the full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[3], &[30])).await;
+        let extended_again = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache again");
+        assert_eq!(extended_again.len(), 3);
+        for (index, carried) in extended.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(carried, &extended_again[index]),
+                "entry {index} must stay shared across successive delta extends"
+            );
+        }
+
+        // Sharing must not cost visibility: every appended row is still returned.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "inline_cache_delta_entry_sharing").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "shared entries must still surface every row exactly once"
         );
     }
 

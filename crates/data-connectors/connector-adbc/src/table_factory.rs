@@ -96,9 +96,10 @@ fn pre_federation_optimizer_rules_for_driver(
 /// now applied in one function that cannot be bypassed, so dropping it is an
 /// edit to that function rather than an omission a move can make invisible.
 ///
-/// The scope is this connector. The ADBC **catalog** connector builds an
-/// `AdbcTableFactory` directly and carries no policy at all —
-/// [#13664](https://github.com/spiceai/spiceai/issues/13664).
+/// The scope is the ADBC **dataset** connector. The catalog connector has a
+/// separate factory path in `runtime`; it now installs the generic Spice
+/// policy plus driver-specific expression restrictions, but deliberately keeps
+/// its existing function surface and optimizer rules distinct from this one.
 pub(crate) struct AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,

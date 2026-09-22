@@ -140,12 +140,28 @@ checkHttpRequestCLI() {
 getLatestRelease() {
     local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
     local latest_release=""
+    local response=""
+    local headers=()
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -s "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            headers=(-H "Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        response=$(curl -fsS "${headers[@]}" "$spiceReleaseUrl") || {
+            echo "Failed to get latest release information"
+            exit 1
+        }
     else
-        latest_release=$(wget -q --header="Accept: application/json" -O - "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            headers=(--header="Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        response=$(wget -nv "${headers[@]}" --header="Accept: application/json" -O - "$spiceReleaseUrl") || {
+            echo "Failed to get latest release information"
+            exit 1
+        }
     fi
+
+    latest_release=$(printf '%s\n' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
     if [ -z "$latest_release" ]; then
         echo "Failed to get latest release information"
@@ -153,6 +169,22 @@ getLatestRelease() {
     fi
 
     ret_val=$latest_release
+}
+
+validateRuntimeArchive() {
+    local archive_contents archive_member archive_entry
+
+    archive_contents=$(tar -tzf "$1" 2>/dev/null) || return 1
+    archive_member=$(printf '%s\n' "$archive_contents" | grep -Fx -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME") || return 1
+    # Require exactly one executable entry at the archive root.
+    case "$archive_member" in
+        "$SPICED_FILENAME"|"./$SPICED_FILENAME") ;;
+        *) return 1 ;;
+    esac
+
+    archive_entry=$(tar -tvzf "$1" "$archive_member" 2>/dev/null) || return 1
+    # GNU tar and BSD tar prefix regular files with '-', links with 'l' or 'h'.
+    [[ "$archive_entry" == -* && "$archive_entry" != *$'\n'* ]]
 }
 
 downloadWithRetry() {
@@ -164,19 +196,21 @@ downloadWithRetry() {
         echo "Download attempt $attempt of $MAX_RETRIES..."
         
         if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-            if curl -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
-                if [ -f "$output" ]; then
+            if curl --fail -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
+                if [ -f "$output" ] && validateRuntimeArchive "$output"; then
                     return 0
                 fi
             fi
         else
             if wget -q --auth-no-challenge --header='Accept:application/octet-stream' "$url" -O "$output" 2>/dev/null; then
-                if [ -f "$output" ]; then
+                if [ -f "$output" ] && validateRuntimeArchive "$output"; then
                     return 0
                 fi
             fi
         fi
         
+        rm -f "$output"
+
         if [ $attempt -lt $MAX_RETRIES ]; then
             echo "Download failed, retrying in ${RETRY_DELAY} seconds..."
             sleep $RETRY_DELAY

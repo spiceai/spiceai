@@ -1,0 +1,27 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "dataformat-orc"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+datafusion.workspace = true
+datafusion-datasource.workspace = true
+datafusion-physical-expr.workspace = true
+futures.workspace = true
+object_store.workspace = true
+orc-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -23,6 +23,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::{common::DFSchema, logical_expr::Expr};
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
@@ -59,7 +60,7 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 }
 
 /// The `DataFusion` built-ins `DuckDB` must not be handed, because `DuckDB`
-/// cannot evaluate them faithfully: two have a function that looks like the one
+/// cannot evaluate them faithfully: one has a function that looks like the one
 /// asked for but answers a different question, and one has no such function at
 /// all.
 ///
@@ -85,25 +86,22 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// exist!` — the unknown-function failure the deny-list exists to prevent
 /// (issue #10703).
 ///
-/// `regexp_count` is here because its translation is not value-preserving
-/// either, on a narrower input: the dialect renders it
-/// `len(regexp_extract_all(x, p))`, and `regexp_extract_all(NULL, p)` is NULL in
-/// `DuckDB`, so `len(NULL)` is NULL where `DataFusion` counts zero matches and
-/// answers `0`. A count that is NULL rather than `0` propagates differently
-/// through `SUM`, through `= 0`, and through a `WHERE` built on it, so an
-/// accelerated dataset gained or lost rows against an unaccelerated one
-/// (issue #13870). The dialect keeps its handler — the rewrite is right for
-/// non-NULL input and #13870 is about making it NULL-preserving so the pushdown
-/// can come back — but a denied name is never advertised as native, which
-/// [`crate::dialect::duckdb_native_function_names`] enforces.
-///
-/// `regexp_like` and `regexp_replace` are the two `DataFusion` regexp built-ins
-/// left, and both agreed with local evaluation on every input measured,
-/// including a NULL one.
+/// `regexp_like`, `regexp_replace` and `regexp_count` are the three
+/// `DataFusion` regexp built-ins the dialect renders. `regexp_like` and
+/// `regexp_replace` agreed with local evaluation on every input the #13809
+/// sweep measured, a NULL one included, for literal patterns; they still share
+/// the family's Perl-class divergence (`regexp_like('xy١', '\d')` is `false`
+/// federated and `true` locally, tracked as #14148), which the per-call screen
+/// below applies to `regexp_count` alone.
+/// `regexp_count` was here until its rendering was made NULL-preserving
+/// (issue #13870); the call shapes it still cannot render faithfully are
+/// refused by the handler and evaluated locally through the per-call check
+/// below, not by name. A denied name is never advertised as native, which
+/// [`crate::dialect::duckdb_native_function_names`] enforces should a handled
+/// name ever join this list.
 pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::REGEXP_MATCH_NAME,
     crate::dialect::REGEXP_INSTR_NAME,
-    crate::dialect::REGEXP_COUNT_NAME,
 ];
 
 /// The deny-list for a consumer that installs the `DuckDB` dialect but wants
@@ -148,8 +146,9 @@ fn duckdb_function_support() -> FunctionSupport {
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
 /// `AdbcTableFactory::with_function_support`.
 ///
-/// Three layers, all derived from [`crate::dialect`] so they cannot drift from
-/// what the dialect can actually render:
+/// Four layers. Function decisions are derived from [`crate::dialect`] so they
+/// cannot drift from what the dialect can actually render; the expression
+/// restriction records a `GoogleSQL` capability boundary:
 ///
 /// 1. the name carve-out, so the JSON extraction functions the `BigQuery`
 ///    dialect rewrites into `JSON_VALUE` federate instead of being denied;
@@ -161,7 +160,10 @@ fn duckdb_function_support() -> FunctionSupport {
 ///    The check also gates the `DataFusion` built-ins the dialect rewrites
 ///    (e.g. `regexp_like` → `REGEXP_CONTAINS`), whose untranslatable shapes
 ///    must stay local the same way;
-/// 3. `regexp_match` is denied outright. `BigQuery` has no function of that
+/// 3. case-insensitive [`Expr::Like`] is denied because `GoogleSQL` has no
+///    `ILIKE` operator. Both positive and negated forms evaluate locally while
+///    ordinary case-sensitive `LIKE` remains pushable;
+/// 4. `regexp_match` is denied outright. `BigQuery` has no function of that
 ///    name — a federated call fails remotely with `Function not found:
 ///    regexp_match` — and no faithful rendering exists to rewrite it into: its
 ///    list-of-matches result has no `BigQuery` counterpart that survives the
@@ -181,10 +183,23 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
         .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
         .build()
+        .with_expression_support(Arc::new(bigquery_can_evaluate_expression))
         // The builder carries the scalar hook; the aggregate and window hooks
         // have no builder method yet, so they are installed on the built value.
         .with_aggregate_call_support(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
         .with_window_call_support(Arc::new(crate::dialect::bigquery_can_translate_window))
+}
+
+/// Whether `BigQuery` can evaluate this non-function expression shape without
+/// changing `DataFusion` semantics.
+///
+/// `GoogleSQL` has case-sensitive `LIKE` but no `ILIKE`. Rewriting through
+/// `LOWER` is not known to preserve Unicode, collation, pattern, and escape
+/// semantics, so either positive or negated case-insensitive `LIKE` stays
+/// local. Binary operator variants are intentionally outside this policy.
+#[must_use]
+pub fn bigquery_can_evaluate_expression(expr: &Expr, _schema: Option<&DFSchema>) -> bool {
+    !matches!(expr, Expr::Like(like) if like.case_insensitive)
 }
 
 /// `SQLite`-flavored deny-list as a value, for
@@ -261,6 +276,7 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
 #[cfg(test)]
 mod tests {
     use super::{
+        deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
     };
@@ -322,19 +338,44 @@ mod tests {
         assert!(federates(col("s")));
     }
 
-    /// The two layers rank: a name in [`DUCKDB_DENIED_BUILTINS`] does not
-    /// federate even where the per-call check can render it. `regexp_count`
-    /// with an integer start is renderable — `duckdb_can_translate` says so,
-    /// and `dialect::tests::duckdb_declines_a_regexp_count_start_it_cannot_turn_into_an_offset`
-    /// asserts it — but the rendering answers NULL where `DataFusion` answers
-    /// `0` for a NULL input, so the name is denied and the call evaluates
-    /// locally (issue #13870). Renderability is not faithfulness, and only the
-    /// deny-list encodes the difference.
     #[test]
-    fn a_denied_builtin_does_not_federate_even_when_the_dialect_renders_it() {
+    fn bigquery_refuses_only_case_insensitive_like_expressions() {
+        let support = deny_spice_functions_for_bigquery_table_providers();
+        for denied in [col("s").ilike(lit("u%")), col("s").not_ilike(lit("u%"))] {
+            assert!(
+                contains_unsupported_functions(&plan_projecting(denied), &support)
+                    .expect("the support check must not error"),
+                "BigQuery has no ILIKE operator, including its negated form"
+            );
+        }
+
         assert!(
-            !federates(regexp_count(col("s"), lit("a"), Some(lit(1)), None)),
-            "regexp_count is denied by name, so no call of it may federate"
+            !contains_unsupported_functions(&plan_projecting(col("s").like(lit("u%"))), &support,)
+                .expect("the support check must not error"),
+            "ordinary LIKE is valid GoogleSQL and must keep federating"
+        );
+    }
+
+    /// The two layers rank: a name in [`DUCKDB_DENIED_BUILTINS`] does not
+    /// federate whatever the per-call check says, and a name that is not
+    /// denied federates exactly when the dialect renders the call.
+    /// `regexp_count` with an integer start is the second case: the rendering
+    /// is value-preserving (#13870), so it is not denied by name and the call
+    /// federates; `regexp_match` is the first, denied by name because `DuckDB`
+    /// has no faithful rendering of it at all (#13809).
+    #[test]
+    fn a_denied_name_stays_local_and_a_rendered_name_federates() {
+        assert!(
+            federates(regexp_count(col("s"), lit("a"), Some(lit(1)), None)),
+            "regexp_count is rendered faithfully and not denied by name, so it federates"
+        );
+        assert!(
+            !federates(datafusion::functions::regex::expr_fn::regexp_match(
+                col("s"),
+                lit("a"),
+                None,
+            )),
+            "regexp_match is denied by name, so no call of it may federate"
         );
     }
 

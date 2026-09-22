@@ -18,18 +18,26 @@
 
 from __future__ import annotations
 
+import io
 import sys
+import tarfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_fork_patches import (  # noqa: E402
+    DUCKDB_RS_REPO,
+    DUCKDB_THRIFT_EQUALITY_MARKER,
+    DUCKDB_THRIFT_HEADER_SUFFIX,
     LEDGER,
     LOCK,
     drift,
+    duckdb_thrift_iterator_equality,
     gap_accounting,
     ledger_pins,
     pinned_forks,
+    temporary_pins,
+    thrift_header_from_tarball,
 )
 
 failures = 0
@@ -204,7 +212,101 @@ ledger_text = LEDGER.read_text(encoding="utf-8")
 check("the shipped tree marks at least one gap", "**GAP**" in ledger_text, True)
 check("the shipped Open gaps list accounts for every gap", gap_accounting(ledger_text), [])
 
+# A pin on a pull request's branch is reviewable and must not land. The marker is
+# what makes it un-landable, so the guard has to see it — and has to stay quiet
+# for the ordinary rows it sits beside.
+_ORDINARY_ROW = (
+    "| [vortex](#vortex) | `" + "a" * 40 + "` | `spiceai-54` |\n"
+)
+_TEMPORARY_ROW = (
+    "| [vortex](#vortex) | `" + "b" * 40 + "` | `in-list-hashed-probe` "
+    "(TEMPORARY: spiceai/vortex#95) |\n"
+)
+
+check(
+    "a pin recorded against a long-lived branch does not block",
+    temporary_pins(_ORDINARY_ROW),
+    [],
+)
+
+_blocked = temporary_pins(_TEMPORARY_ROW)
+check("a pin marked temporary blocks", len(_blocked), 1)
+check(
+    "the message names what has to merge first",
+    "spiceai/vortex#95" in _blocked[0] and "vortex" in _blocked[0],
+    True,
+)
+check(
+    "a temporary row beside ordinary rows is still caught",
+    len(temporary_pins(_ORDINARY_ROW + _TEMPORARY_ROW + _ORDINARY_ROW)),
+    1,
+)
+
+print("\nduckdb-rs Thrift iterator equality")
+
+# Synthetic tarball helpers — the live checkout is also exercised below, but the
+# parser shapes have to hold when the archive is a fixture, or a cold CI agent
+# that has not yet fetched duckdb-rs would leave the negative cases untested.
+
+
+def _tarball_with_thrift(header_text: str, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(dest, "w:gz") as tf:
+        payload = header_text.encode()
+        info = tarfile.TarInfo(name=f"duckdb/{DUCKDB_THRIFT_HEADER_SUFFIX}")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    return dest
+
+
+_tmp = Path(__file__).resolve().parent / ".test_thrift_tmp"
+try:
+    with_eq = _tarball_with_thrift(
+        "class TEnumIterator {\n  bool operator!=(const TEnumIterator& end);\n  "
+        + DUCKDB_THRIFT_EQUALITY_MARKER
+        + " { return !(*this != end); }\n};\n",
+        _tmp / "with_eq.tar.gz",
+    )
+    without_eq = _tarball_with_thrift(
+        "class TEnumIterator {\n  bool operator!=(const TEnumIterator& end);\n};\n",
+        _tmp / "without_eq.tar.gz",
+    )
+
+    check(
+        "a header carrying the marker is accepted",
+        DUCKDB_THRIFT_EQUALITY_MARKER in (thrift_header_from_tarball(with_eq) or ""),
+        True,
+    )
+    check(
+        "a header missing the marker is rejected by the reader",
+        DUCKDB_THRIFT_EQUALITY_MARKER in (thrift_header_from_tarball(without_eq) or ""),
+        False,
+    )
+finally:
+    import shutil
+
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+# Live-tree: the pinned duckdb-rs revision must still carry the backport. A
+# silent drop on the next re-cut is exactly what this guard exists to catch.
+_live = duckdb_thrift_iterator_equality(pinned_forks(LOCK.read_text(encoding="utf-8")))
+check("the shipped duckdb-rs pin still carries Thrift iterator equality", _live, [])
+check(
+    "the marker string names TEnumIterator",
+    "TEnumIterator" in DUCKDB_THRIFT_EQUALITY_MARKER,
+    True,
+)
+check(
+    "the header suffix reaches Thrift.h",
+    DUCKDB_THRIFT_HEADER_SUFFIX.endswith("Thrift.h"),
+    True,
+)
+check("the duckdb-rs repo constant is set", DUCKDB_RS_REPO, "duckdb-rs")
+
+
+
 if failures:
     print(f"\n{failures} of {checks} checks FAILED")
     raise SystemExit(1)
 print(f"\nall {checks} checks passed")
+
