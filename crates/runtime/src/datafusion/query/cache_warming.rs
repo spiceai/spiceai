@@ -464,14 +464,14 @@ impl DataFusion {
             if status.is_shutdown() {
                 return false;
             }
-            if self.accelerated_initial_loads_done().await {
+            if self.accelerated_initial_loads_done(status).await {
                 return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
-    async fn accelerated_initial_loads_done(&self) -> bool {
+    async fn accelerated_initial_loads_done(&self, runtime_status: &status::RuntimeStatus) -> bool {
         let names = self.accelerated_table_names().await;
         for name in names {
             let Ok(provider) = self.get_accelerated_table_provider(&name.to_string()).await else {
@@ -483,7 +483,7 @@ impl DataFusion {
             ) else {
                 continue;
             };
-            if !first_full_or_append_refresh_settled(table, status, &name).await {
+            if !first_full_or_append_refresh_settled(table, runtime_status, &name).await {
                 return false;
             }
         }
