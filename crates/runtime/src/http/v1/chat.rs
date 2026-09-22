@@ -25,7 +25,7 @@ use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
-    error::{ApiError, OpenAIError, StreamError},
+    error::{OpenAIError, StreamError},
     types::chat::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
@@ -365,7 +365,7 @@ fn evaluate_only_chat_response(model_id: &str) -> Response {
         model: model_id.to_string(),
     }
     .to_string();
-    openai_error_to_response(OpenAIError::ApiError(ApiError {
+    openai_error_to_response(OpenAIError::ApiError(async_openai::error::ApiError {
         message,
         r#type: Some("invalid_request_error".to_string()),
         param: Some("model".to_string()),
