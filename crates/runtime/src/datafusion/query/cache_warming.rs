@@ -1051,6 +1051,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warmup_rejects_persisted_dml_even_without_bindings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let df = prepare_runtime(None, dir.path().join("warmup.json")).await;
+        register_table(&df, "orders", vec![1, 2, 3]);
+
+        // Binding-free templates replay the stored SQL as-is. Without read-only
+        // enforcement, a corrupted catalog could INSERT/DDL at startup.
+        let ok = execute_warmup_sql(
+            &df,
+            "INSERT INTO orders VALUES (1)",
+            None,
+            &request_context(),
+        )
+        .await;
+        assert!(
+            !ok,
+            "warmup must reject DML from a persisted template via read-only validation"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_remote_persists_keep_all_observed_templates() {
         let dir =
             std::env::temp_dir().join(format!("spice-warmup-remote-race-{}", std::process::id()));

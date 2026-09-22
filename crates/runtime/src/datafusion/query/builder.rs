@@ -174,11 +174,13 @@ impl QueryBuilder {
     /// admission permit or emitting query metrics / task-history rows.
     ///
     /// Used by SQL results-cache warming so replay stays on the refresh
-    /// runtime and cannot stall user queries.
+    /// runtime and cannot stall user queries. Also enforces read-only SQL so
+    /// a corrupted or tampered warmup catalog cannot run DDL/DML at startup.
     #[must_use]
     pub(crate) fn for_results_cache_warming(mut self) -> Self {
         self.runtime_binding = QueryRuntimeBinding::CurrentRuntimeUngated;
         self.emit_tracker = false;
+        self.read_only = true;
         self
     }
 
