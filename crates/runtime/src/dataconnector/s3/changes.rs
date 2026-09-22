@@ -813,14 +813,18 @@ fn key_from_may_name(dataset: &DatasetSpec) -> Option<String> {
     (!rest.is_empty()).then(|| decode_from_path_key(rest))
 }
 
+/// Keep decoded key characters, including leading or trailing spaces from
+/// `%20`. Only `/` is a path separator: S3 object keys may start with
+/// whitespace, so `str::trim()` would make `from: s3://bucket/%20events/`
+/// miss notifications for ` events/…`.
 fn normalize_prefix(prefix: &str) -> String {
-    let trimmed = prefix.trim().trim_start_matches('/');
-    if trimmed.is_empty() {
+    let stripped = prefix.trim_start_matches('/');
+    if stripped.is_empty() {
         String::new()
-    } else if trimmed.ends_with('/') {
-        trimmed.to_string()
+    } else if stripped.ends_with('/') {
+        stripped.to_string()
     } else {
-        format!("{trimmed}/")
+        format!("{stripped}/")
     }
 }
 
@@ -2819,6 +2823,38 @@ mod tests {
         assert_eq!(prefix, "events/foo+bar/");
     }
 
+    /// `str::trim()` would drop a leading space from `from: s3://bucket/%20events/`,
+    /// so snapshot listing and `starts_with` would use `events/` while
+    /// notification keys stay ` events/…`. Regression for #14121.
+    #[test]
+    fn a_leading_space_from_prefix_matches_a_decoded_notification_key() {
+        assert_eq!(normalize_prefix(" events/"), " events/");
+        assert_eq!(normalize_prefix(" events"), " events/");
+        assert_eq!(normalize_prefix("/ events/"), " events/");
+        assert_eq!(normalize_prefix("events/"), "events/");
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("///"), "");
+
+        let dataset = DatasetSpec::new("s3://my-bucket/%20events/", "events".into());
+        let (bucket, dataset_prefix) =
+            bucket_and_key_prefix(&dataset).expect("leading-space from is a valid prefix");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(dataset_prefix, " events/");
+
+        let events = parse_notification_body(&created_put_body("%20events/part.parquet"))
+            .expect("valid notification");
+        assert_eq!(events[0].key, " events/part.parquet");
+        assert!(
+            matches_dataset(&events[0], &bucket, &dataset_prefix),
+            "leading-space notification key must match the decoded from prefix, prefix={dataset_prefix:?} key={:?}",
+            events[0].key
+        );
+        assert!(
+            !matches_dataset(&events[0], &bucket, "events/"),
+            "stripping the leading space would leave this notification unmatched"
+        );
+    }
+
     #[tokio::test]
     async fn validate_rejects_prefix_outside_dataset() {
         let params = test_params(vec![
@@ -2879,6 +2915,36 @@ mod tests {
             .expect("decoded nested prefix is under the decoded from")
             .expect("changes enabled");
         assert_eq!(nested_config.key_prefix, "events/data files/2026/");
+    }
+
+    #[tokio::test]
+    async fn validate_preserves_a_leading_space_from_prefix() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let mut dataset = DatasetSpec::new("s3://my-bucket/%20events/", "events".into());
+        dataset.acceleration = Some(Acceleration {
+            refresh_mode: Some(RefreshMode::Changes),
+            ..Acceleration::default()
+        });
+        let config = S3ChangesConfig::try_from_params(&params, &dataset)
+            .expect("leading-space from is valid")
+            .expect("changes enabled");
+        assert_eq!(config.dataset_prefix, " events/");
+        assert_eq!(config.key_prefix, " events/");
+
+        let nested = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_changes_key_prefix", "%20events/2026"),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let nested_config = S3ChangesConfig::try_from_params(&nested, &dataset)
+            .expect("decoded nested prefix is under the leading-space from")
+            .expect("changes enabled");
+        assert_eq!(nested_config.key_prefix, " events/2026/");
     }
 
     #[tokio::test]
