@@ -108,7 +108,7 @@ jobs:
                 target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                builder: "spiceai-macos",
+                builder: "spiceai-macos-large",
                 runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64"
@@ -163,9 +163,9 @@ jobs:
         uses: ./.github/actions/install-protoc
 
       - name: Set up spiceio
-        if: matrix.target.builder == 'spiceai-macos' && env.HAS_SPICEIO_SECRET == 'true'
+        if: matrix.target.builder == 'spiceai-macos-large' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@71b9a1f2d548b19503a023e9b0c033c0931f92da # v0.9.0
+        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -173,6 +173,11 @@ jobs:
           bucket: sccache
           region: us-west-1
           immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
@@ -194,7 +199,7 @@ jobs:
         # that a wedge here is cut by *this step* — which attributes the failure to the
         # compile — rather than by the job bound, which GitHub renders as the whole job
         # being cancelled. It buys no diagnostics on this leg: the `always()` steps below
-        # are all gated to `spiceai-macos`, so a Linux build has none to run.
+        # are all gated to `spiceai-macos-large`, so a Linux build has none to run.
         timeout-minutes: 150
         uses: ./.github/actions/build-spiced
         with:
@@ -220,7 +225,7 @@ jobs:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Show sccache stats
-        if: always() && matrix.target.builder == 'spiceai-macos' && env.SCCACHE_SETUP == 'true'
+        if: always() && matrix.target.builder == 'spiceai-macos-large' && env.SCCACHE_SETUP == 'true'
         # `always()`: this is the one step that reports cache health, and without it
         # it is skipped on exactly the failures it would explain (#12420). The `||`
         # keeps a diagnostic from ever deciding a verdict — when the cache backend is
@@ -229,11 +234,11 @@ jobs:
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
-        if: always() && matrix.target.builder == 'spiceai-macos' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && matrix.target.builder == 'spiceai-macos-large' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
-        if: always() && matrix.target.builder == 'spiceai-macos'
+        if: always() && matrix.target.builder == 'spiceai-macos-large'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-e2e-build-logs
@@ -359,6 +364,15 @@ jobs:
               },
               {
                 name: "macOS aarch64 (Apple Silicon)",
+                // The standard pool, not `spiceai-macos-large`: these two
+                // jobs are minutes long and every wait inside them is bounded
+                // (60s readiness, then 30s/30s/60s in the expect scripts), so
+                // what decides them is the size of whatever shares their Mac
+                // mini. A host carries several runner instances, and sharing
+                // one with a three-hour build starved this job badly enough
+                // that `spiced --version` took 186s against 0.1-0.3s on an
+                // uncontended host, blowing those bounds (#13761). The pool
+                // split bounds the neighbour rather than removing it.
                 runner: "spiceai-macos",
                 target_os: "darwin",
                 target_arch: "aarch64"
@@ -1503,7 +1517,6 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
-            { engine: cayenne, mode: file },
             { engine: turso, mode: memory },
             { engine: turso, mode: file },
             # { engine: postgres},

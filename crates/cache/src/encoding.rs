@@ -47,6 +47,17 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// `RecordBatch`es encoded by an [`Encoder`].
+#[derive(Debug, Clone, Default)]
+pub struct Encoded {
+    /// The encoded payload.
+    pub bytes: Vec<u8>,
+    /// The size of the Arrow IPC stream the payload holds. Decoding reads all of it, so this,
+    /// not the size of the payload, is what a decode costs: a result that compresses well is
+    /// small to store and as expensive to decode as its uncompressed size.
+    pub decoded_len: usize,
+}
+
 /// Trait for encoding and decoding `RecordBatch` data.
 #[async_trait]
 pub trait Encoder: Send + Sync {
@@ -55,7 +66,7 @@ pub trait Encoder: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if serialization or compression fails.
-    async fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>>;
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Encoded>;
 
     /// Decode compressed bytes back into a vector of `RecordBatch`es.
     ///
@@ -91,9 +102,9 @@ impl Default for ZstdEncoder {
 
 #[async_trait]
 impl Encoder for ZstdEncoder {
-    async fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Encoded> {
         if batches.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Encoded::default());
         }
 
         // First, serialize to Arrow IPC format
@@ -120,7 +131,10 @@ impl Encoder for ZstdEncoder {
             .await
             .context(FailedToCompressSnafu)?;
         encoder.shutdown().await.context(FailedToCompressSnafu)?;
-        Ok(compressed_data)
+        Ok(Encoded {
+            bytes: compressed_data,
+            decoded_len: ipc_buffer.len(),
+        })
     }
 
     async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
@@ -158,6 +172,48 @@ pub fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
     }
 }
 
+/// A zstd encoder that counts `decode` calls. Test-only: used to prove hit1
+/// and hit2 each decode, a third fetch does not, and concurrent `records()`
+/// on one clone share a decode.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct CountingEncoder {
+    inner: ZstdEncoder,
+    decodes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl CountingEncoder {
+    pub(crate) fn zstd() -> (Arc<dyn Encoder>, Arc<std::sync::atomic::AtomicUsize>) {
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                inner: ZstdEncoder::default(),
+                decodes: Arc::clone(&decodes),
+            }),
+            decodes,
+        )
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Encoder for CountingEncoder {
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Encoded> {
+        self.inner.encode(batches).await
+    }
+
+    async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
+        self.decodes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.decode(data).await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,16 +241,16 @@ mod tests {
         let encoder = ZstdEncoder::default();
         let original = vec![create_test_batch()];
 
-        let encoded_data = encoder
+        let payload = encoder
             .encode(&original)
             .await
             .expect("encode should succeed");
-        (!encoded_data.is_empty())
+        (!payload.bytes.is_empty())
             .then_some(())
             .expect("encoded data should not be empty");
 
         let decoded = encoder
-            .decode(&encoded_data)
+            .decode(&payload.bytes)
             .await
             .expect("decode should succeed");
         (decoded.len() == original.len())
@@ -213,14 +269,13 @@ mod tests {
         let encoder = ZstdEncoder::default();
         let empty: Vec<RecordBatch> = vec![];
 
-        let encoded_data = encoder.encode(&empty).await.expect("encode should succeed");
-        encoded_data
-            .is_empty()
+        let payload = encoder.encode(&empty).await.expect("encode should succeed");
+        (payload.bytes.is_empty() && payload.decoded_len == 0)
             .then_some(())
             .expect("encoded empty data should be empty");
 
         let decoded = encoder
-            .decode(&encoded_data)
+            .decode(&payload.bytes)
             .await
             .expect("decode should succeed");
         decoded
@@ -245,16 +300,23 @@ mod tests {
         let zstd_encoder = ZstdEncoder::default();
 
         let uncompressed_size = batch.get_array_memory_size();
-        let zstd_size = zstd_encoder
+        let encoded = zstd_encoder
             .encode(std::slice::from_ref(&batch))
             .await
-            .expect("encode should succeed")
-            .len();
+            .expect("encode should succeed");
+        let zstd_size = encoded.bytes.len();
 
         // Zstd should compress this significantly
         assert!(
             zstd_size < uncompressed_size,
             "Zstd size ({zstd_size}) should be less than uncompressed size ({uncompressed_size})"
+        );
+        // A decode reads the whole IPC stream, which holds every one of the values.
+        let value_bytes = 1000 * std::mem::size_of::<i32>();
+        assert!(
+            encoded.decoded_len >= value_bytes,
+            "the decoded length ({}) must cover the {value_bytes} bytes of values the payload holds, not its compressed size ({zstd_size})",
+            encoded.decoded_len
         );
     }
 }
