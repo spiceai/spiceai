@@ -321,7 +321,8 @@ impl HttpRateLimiter {
                 break;
             }
 
-            let step = ADAPTIVE_THROTTLE_STEP.min(ADAPTIVE_MAX_THROTTLE_WAIT.saturating_sub(waited));
+            let step =
+                ADAPTIVE_THROTTLE_STEP.min(ADAPTIVE_MAX_THROTTLE_WAIT.saturating_sub(waited));
             tracing::debug!(
                 admission_coefficient = adaptive.admission_coefficient(),
                 "Adaptive rate control throttling HTTP request to a failing origin."
