@@ -943,7 +943,7 @@ fn prefix_display(bucket: &str, key_prefix: &str) -> String {
 /// Snapshot and non-empty restart list `dataset_prefix` (`from:`), not a
 /// nested `s3_changes_key_prefix`. The startup line must name that listing.
 fn empty_snapshot_starting_log(
-    dataset_name: &impl std::fmt::Display,
+    dataset_name: impl std::fmt::Display,
     bucket: &str,
     dataset_prefix: &str,
 ) -> String {
@@ -954,7 +954,7 @@ fn empty_snapshot_starting_log(
 }
 
 fn nonempty_restart_starting_log(
-    dataset_name: &impl std::fmt::Display,
+    dataset_name: impl std::fmt::Display,
     bucket: &str,
     dataset_prefix: &str,
 ) -> String {
