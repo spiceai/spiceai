@@ -625,7 +625,10 @@ They are not equal in consequence; this is the order to close them in.
 **Hangs, crashes and failures.** These take a query or the process down:
 
 4. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
-   resilience (fork PRs #61–#63).
+   resilience (fork PRs #36, #61–#63) — #36 is the quiet half, a `FetchFailed`
+   that reaches the scheduler buried in `Shared(Arc(ArrowError(ExternalError(…))))`
+   and is read as a non-retryable execution error, so the recovery that reruns
+   the offending map stage never runs.
 5. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
    and #59: a missing partition file read as an empty partition; shuffle-fetch
    clients pooled per peer; the reconciliation sweep that revives a lost stage or
