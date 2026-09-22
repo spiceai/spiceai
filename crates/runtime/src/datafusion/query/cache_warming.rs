@@ -87,6 +87,10 @@ pub(crate) struct ResultsCacheWarmer {
     enabled: bool,
     catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
     persist_lock: Arc<parking_lot::Mutex<()>>,
+    /// Serializes remote `ObjectState` persists. Concurrent `update` calls share
+    /// one cached version, so a stale task can overwrite a newer catalog without
+    /// a conflict; one writer at a time keeps recorded shapes.
+    remote_persist_lock: Arc<tokio::sync::Mutex<()>>,
     count: Arc<AtomicUsize>,
     started: AtomicBool,
     persist: WarmupPersist,
@@ -139,6 +143,7 @@ impl ResultsCacheWarmer {
                 ids,
             })),
             persist_lock: Arc::new(parking_lot::Mutex::new(())),
+            remote_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             count: Arc::new(AtomicUsize::new(count)),
             started: AtomicBool::new(false),
             persist,
@@ -237,7 +242,11 @@ impl ResultsCacheWarmer {
                 let catalog = Arc::clone(&self.catalog);
                 let count = Arc::clone(&self.count);
                 let state = Arc::clone(state);
+                let remote_persist_lock = Arc::clone(&self.remote_persist_lock);
                 tokio::spawn(async move {
+                    let _persist = remote_persist_lock.lock().await;
+                    // Re-snapshot under the lock so this write includes any
+                    // templates observed while we waited for earlier persists.
                     persist_remote(state, catalog, count).await;
                 });
             }
@@ -1037,6 +1046,71 @@ mod tests {
             reloaded.templates_snapshot().len(),
             1,
             "a new process must load the persisted plan shape from object storage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_remote_persists_keep_all_observed_templates() {
+        let dir =
+            std::env::temp_dir().join(format!("spice-warmup-remote-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(&dir).expect("local store"));
+
+        let warmer = ResultsCacheWarmer::from_object_store(Arc::clone(&store), "", true).await;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT, status VARCHAR)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+
+        // Two distinct shapes observed back-to-back each spawn a remote persist.
+        // Without serializing those writers, ObjectState::update can let the
+        // older snapshot overwrite the newer catalog (losing template B).
+        let plan_a = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql a")
+            .logical_plan()
+            .clone();
+        let plan_b = ctx
+            .sql("SELECT id FROM orders WHERE status = 'open'")
+            .await
+            .expect("sql b")
+            .logical_plan()
+            .clone();
+        warmer.observe_plan(&plan_a, &CacheNamespace::Public);
+        warmer.observe_plan(&plan_b, &CacheNamespace::Public);
+
+        let state = ObjectState::<Vec<WarmupTemplate>>::new(Arc::clone(&store));
+        let start = std::time::Instant::now();
+        loop {
+            let templates = state
+                .get(WARMUP_STATE_KEY)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if templates.len() >= 2 {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "expected both observed templates in object storage, got {templates:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let reloaded = ResultsCacheWarmer::from_object_store(store, "", true).await;
+        assert_eq!(
+            reloaded.templates_snapshot().len(),
+            2,
+            "serialized remote persists must keep both plan shapes, got {:?}",
+            reloaded.templates_snapshot()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
