@@ -262,6 +262,11 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             prefix: ModelSource::SpiceAI.short_name(),
             parameters: get_params_spec(&ModelSource::SpiceAI),
         },
+        ModelSourceSchema {
+            name: "typesafe",
+            prefix: ModelSource::TypeSafe.short_name(),
+            parameters: get_params_spec(&ModelSource::TypeSafe),
+        },
     ]
 }
 

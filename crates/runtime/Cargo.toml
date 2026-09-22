@@ -96,6 +96,7 @@ opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
+evaluate-api = { path = "../evaluate-api" }
 mediatype = "0.21.0"
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
@@ -371,6 +372,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "evaluate-api/openapi",
     "runtime-acceleration/openapi",
     "runtime-table/openapi",
     "runtime-api-types/openapi",
