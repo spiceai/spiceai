@@ -316,8 +316,9 @@ async fn persist_remote(
 ) {
     let mut local = catalog.lock().templates.clone();
     for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
-        let remote = match state.get(WARMUP_STATE_KEY).await {
-            Ok(templates) => templates.unwrap_or_default(),
+        let (remote, version) = match state.get_with_version(WARMUP_STATE_KEY).await {
+            Ok(Some((templates, version))) => (templates, Some(version)),
+            Ok(None) => (Vec::new(), None),
             Err(e) => {
                 tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
                 return;
@@ -328,7 +329,27 @@ async fn persist_remote(
             apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
             return;
         }
-        if remote.is_empty() {
+        if let Some(version) = version {
+            match state
+                .update_with_version(WARMUP_STATE_KEY, &merged, version)
+                .await
+            {
+                Ok(UpdateResult::Ok) => {
+                    apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
+                    return;
+                }
+                Ok(UpdateResult::NotFound) => {
+                    local = merged;
+                }
+                Ok(UpdateResult::Conflict { current }) => {
+                    local = merge_templates(&current, &merged);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
+                    return;
+                }
+            }
+        } else {
             match state.insert(WARMUP_STATE_KEY, &merged).await {
                 Ok(InsertResult::Ok) => {
                     apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
@@ -336,28 +357,11 @@ async fn persist_remote(
                 }
                 Ok(InsertResult::AlreadyExists) => {
                     local = merged;
-                    continue;
                 }
                 Err(e) => {
                     tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
                     return;
                 }
-            }
-        }
-        match state.update(WARMUP_STATE_KEY, &merged).await {
-            Ok(UpdateResult::Ok) => {
-                apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-                return;
-            }
-            Ok(UpdateResult::NotFound) => {
-                local = merged;
-            }
-            Ok(UpdateResult::Conflict { current }) => {
-                local = merge_templates(&current, &merged);
-            }
-            Err(e) => {
-                tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                return;
             }
         }
     }
@@ -995,6 +999,127 @@ mod tests {
         assert_eq!(
             capped[MAX_WARMUP_PLANS - 1].sql,
             format!("SELECT {}", MAX_WARMUP_PLANS - 1)
+        );
+    }
+
+    fn warmup_tpl(sql: &str) -> WarmupTemplate {
+        WarmupTemplate {
+            sql: sql.to_string(),
+            bindings: vec![],
+        }
+    }
+
+    fn catalog_mutex(templates: Vec<WarmupTemplate>) -> Arc<parking_lot::Mutex<WarmupCatalog>> {
+        let ids = templates.iter().map(template_id).collect();
+        Arc::new(parking_lot::Mutex::new(WarmupCatalog { templates, ids }))
+    }
+
+    fn template_sqls(templates: &[WarmupTemplate]) -> Vec<&str> {
+        templates
+            .iter()
+            .map(|template| template.sql.as_str())
+            .collect()
+    }
+
+    /// Regression for Copilot on #14178: `ObjectState::update` reads the shared
+    /// cached etag, so a stale persist that `get`s `[seed]` and later
+    /// `update`s `[seed, A]` can overwrite a newer `[seed, A, B]` without a
+    /// conflict. Persist now binds If-Match to the `get` version.
+    #[tokio::test]
+    async fn persist_remote_keeps_newer_templates_when_object_state_cache_advances() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let state = Arc::new(ObjectState::new(store));
+        let seed = warmup_tpl("SELECT seed");
+        let template_a = warmup_tpl("SELECT A");
+        let template_b = warmup_tpl("SELECT B");
+        state
+            .insert(WARMUP_STATE_KEY, &vec![seed.clone()])
+            .await
+            .expect("seed catalog");
+
+        let (stale_remote, stale_version) = state
+            .get_with_version(WARMUP_STATE_KEY)
+            .await
+            .expect("stale get")
+            .expect("seed exists");
+        let stale_merged = merge_templates(&stale_remote, &[template_a.clone()]);
+        assert_eq!(template_sqls(&stale_merged), ["SELECT seed", "SELECT A"]);
+
+        persist_remote(
+            Arc::clone(&state),
+            catalog_mutex(vec![template_a.clone(), template_b.clone()]),
+            Arc::new(AtomicUsize::new(2)),
+        )
+        .await;
+        match state
+            .update_with_version(WARMUP_STATE_KEY, &stale_merged, stale_version)
+            .await
+            .expect("stale versioned write")
+        {
+            UpdateResult::Conflict { current } => {
+                assert_eq!(
+                    template_sqls(&current),
+                    ["SELECT seed", "SELECT A", "SELECT B"]
+                );
+            }
+            other => panic!("expected Conflict so B is not dropped, got {other:?}"),
+        }
+
+        persist_remote(
+            Arc::clone(&state),
+            catalog_mutex(vec![template_a]),
+            Arc::new(AtomicUsize::new(1)),
+        )
+        .await;
+        let persisted = state
+            .get(WARMUP_STATE_KEY)
+            .await
+            .expect("final get")
+            .expect("catalog exists");
+        assert_eq!(
+            template_sqls(&persisted),
+            ["SELECT seed", "SELECT A", "SELECT B"]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_persist_remote_keeps_both_observed_templates() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let state = Arc::new(ObjectState::new(store));
+        let seed = warmup_tpl("SELECT seed");
+        let template_a = warmup_tpl("SELECT A");
+        let template_b = warmup_tpl("SELECT B");
+        state
+            .insert(WARMUP_STATE_KEY, &vec![seed])
+            .await
+            .expect("seed catalog");
+
+        let stale = persist_remote(
+            Arc::clone(&state),
+            catalog_mutex(vec![template_a.clone()]),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        let newer = persist_remote(
+            Arc::clone(&state),
+            catalog_mutex(vec![template_a, template_b]),
+            Arc::new(AtomicUsize::new(2)),
+        );
+        tokio::join!(stale, newer);
+
+        let persisted = state
+            .get(WARMUP_STATE_KEY)
+            .await
+            .expect("final get")
+            .expect("catalog exists");
+        assert!(
+            persisted.iter().any(|template| template.sql == "SELECT A"),
+            "A missing from {persisted:?}"
+        );
+        assert!(
+            persisted.iter().any(|template| template.sql == "SELECT B"),
+            "B missing from {persisted:?}"
         );
     }
 
