@@ -1616,7 +1616,7 @@ pub(crate) mod tests {
             .expect("compressed multi-batch result should be cached");
 
         let cached_batches = cached.records().await.expect("cached result should decode");
-        let cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
+        let cached_rows: usize = cached_batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
             cached_rows,
             2 * n,
