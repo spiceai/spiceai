@@ -127,6 +127,16 @@ pub async fn download_snapshot(
     engine_override: Option<Arc<dyn SnapshotEngine>>,
 ) -> BootstrapStatus {
     let dataset_name = source.name().to_string();
+    // A view withholds bootstrap while any dependency has an unpersisted refresh
+    // override: `with_source` would otherwise stamp the static Spicepod fingerprint
+    // and accept an archive for definition A while live dependencies produce B.
+    if let Some(reason) = source.snapshot_bootstrap_refusal() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "{reason}; skipping snapshot download"
+        );
+        return BootstrapStatus::none();
+    }
     // The source opens its own checkpoint: each engine's checkpointer carries that
     // engine's sidecar SQL and lives in its own `runtime-checkpoint-*` crate, so it
     // reaches here as a factory behind the `AccelerationSource` contract rather than
@@ -149,6 +159,9 @@ pub async fn download_snapshot(
         // wrong rather than merely old, and no schema check would catch it. A view
         // also stamps producing-read consistency so a `consistent_read` bootstrap
         // refuses an archive published under `accept_skew`.
+        //
+        // Views share the same live-refresh identity publish uses (see
+        // `View::definition_fingerprint`); datasets keep the Spicepod identity.
         manager = manager.with_source(source);
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {

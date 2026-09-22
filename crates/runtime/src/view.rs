@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    accelerated::AcceleratedTable, component::view::View,
+    Runtime, accelerated::AcceleratedTable, component::view::View,
     embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table,
 };
@@ -1212,6 +1212,93 @@ fn apply_live_refresh_sql_to_identity_fields(
             fields.remove(KEY);
         }
     }
+}
+
+/// Peel federation / SpiceTable layers to the accelerated table underneath.
+fn find_accelerated_table(provider: &dyn TableProvider) -> Option<&AcceleratedTable> {
+    if let Some(accelerated) =
+        spice_table::find_layer::<AcceleratedTable>(provider, spice_table::LayerWalk::Read)
+    {
+        return Some(accelerated);
+    }
+    if let Some(layered) = provider.downcast_ref::<spice_table::SpiceTable>() {
+        return find_accelerated_table(layered.below().as_ref());
+    }
+    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner) = adaptor.table_provider.as_ref()
+    {
+        return find_accelerated_table(inner.as_ref());
+    }
+    None
+}
+
+/// Effective runtime `Refresh.sql` for accelerated dataset deps, observed synchronously.
+///
+/// Used by [`crate::component::view::View::definition_fingerprint`] so bootstrap stamps
+/// the same live identity publish uses. Missing or locked deps are omitted — combine with
+/// [`view_snapshot_bootstrap_refusal`] so an active override cannot fall through to the
+/// static Spicepod fingerprint.
+#[must_use]
+pub(crate) fn live_dataset_refresh_sql_sync(
+    runtime: &Runtime,
+    name: &TableReference,
+    sql: &str,
+    app: &app::App,
+) -> HashMap<String, Option<String>> {
+    let df = runtime.datafusion();
+    let names = dataset_names_in_view_closure(name, sql, app);
+    let mut live = HashMap::new();
+    for dep_name in names {
+        let Some(provider) = df.get_table_sync(&TableReference::parse_str(&dep_name)) else {
+            continue;
+        };
+        let Some(accelerated) = find_accelerated_table(provider.as_ref()) else {
+            continue;
+        };
+        let Ok(refresh) = accelerated.refresh_params().try_read() else {
+            continue;
+        };
+        let sql = refresh
+            .sql
+            .as_ref()
+            .map(crate::accelerated::refresh::RefreshSQL::to_sql);
+        live.insert(dep_name, sql);
+    }
+    live
+}
+
+/// Refuse view snapshot bootstrap while any accelerated dependency has an unpersisted
+/// refresh override (or its refresh lock cannot be inspected).
+#[must_use]
+pub(crate) fn view_snapshot_bootstrap_refusal(
+    runtime: &Runtime,
+    view_name: &TableReference,
+    sql: &str,
+    app: &app::App,
+) -> Option<String> {
+    let df = runtime.datafusion();
+    let names = dataset_names_in_view_closure(view_name, sql, app);
+    for dep_name in names {
+        let Some(provider) = df.get_table_sync(&TableReference::parse_str(&dep_name)) else {
+            continue;
+        };
+        let Some(accelerated) = find_accelerated_table(provider.as_ref()) else {
+            continue;
+        };
+        let Ok(refresh) = accelerated.refresh_params().try_read() else {
+            return Some(format!(
+                "view '{view_name}' depends on '{dep_name}' whose refresh state could not be inspected, so snapshot bootstrap is withheld"
+            ));
+        };
+        if !refresh.live_refresh_sql_matches_configured()
+            || !refresh.materialization_is_configured()
+        {
+            return Some(format!(
+                "view '{view_name}' depends on '{dep_name}' whose live refresh SQL does not match the Spicepod definition this view's fingerprint describes (or whose materialization is not proven configured), so snapshot bootstrap is withheld"
+            ));
+        }
+    }
+    None
 }
 
 /// Acceleration settings that decide which rows are stored and which survive a write.

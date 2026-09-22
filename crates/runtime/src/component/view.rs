@@ -347,21 +347,42 @@ impl AccelerationSource for View {
         // the same vector size without the SQL or the schema changing. Strict about
         // unstamped archives: view snapshots have carried a stamp since the day they
         // existed, so one without is not from this view's series.
+        //
+        // Bootstrap must share publish's live identity: when accelerated dependencies are
+        // observable, each dataset's effective runtime `Refresh.sql` is hashed too. An
+        // empty live map (cold start) falls through to the Spicepod declaration, which
+        // equals live SQL until a PATCH lands. See also [`Self::snapshot_bootstrap_refusal`].
+        let live = crate::view::live_dataset_refresh_sql_sync(
+            &self.runtime,
+            &self.name,
+            &self.sql,
+            &self.app,
+        );
         Some(
             runtime_acceleration::acceleration_source::SourceDefinition {
                 fingerprint: crate::view::definition_fingerprint(
-                    &crate::view::view_definition_closure(
+                    &crate::view::view_definition_closure_with_live_refresh_sql(
                         &self.name,
                         &self.sql,
                         &self.columns,
                         &self.params,
                         &self.app,
+                        &live,
                     ),
                 ),
                 accept_unstamped: false,
                 materialization:
                     runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,
             },
+        )
+    }
+
+    fn snapshot_bootstrap_refusal(&self) -> Option<String> {
+        crate::view::view_snapshot_bootstrap_refusal(
+            &self.runtime,
+            &self.name,
+            &self.sql,
+            &self.app,
         )
     }
 }

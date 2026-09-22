@@ -190,6 +190,16 @@ pub trait AccelerationSource: Send + Sync {
     /// [`Self::connector_name`]: a default `None` would silently opt a new
     /// definition-bearing source out of that check.
     fn definition_fingerprint(&self) -> Option<SourceDefinition>;
+
+    /// Why snapshot bootstrap must be skipped for this source right now, if at all.
+    ///
+    /// Default `None` means bootstrap may proceed under [`Self::definition_fingerprint`].
+    /// A view returns a reason while any accelerated dependency has an unpersisted
+    /// refresh override: bootstrapping the Spicepod (static) fingerprint would accept
+    /// an archive for definition A while live dependencies are producing definition B.
+    fn snapshot_bootstrap_refusal(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The refresh mode `source` actually runs with, applying the connector's fill-in for an

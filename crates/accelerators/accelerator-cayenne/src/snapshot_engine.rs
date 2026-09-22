@@ -314,12 +314,86 @@ async fn absent_on_disk(files: &[PathBuf]) -> (Vec<String>, usize) {
     (named, total)
 }
 
+/// Whether `anchor` holds any directory entry.
+///
+/// Matches [`runtime_acceleration::AccelerationLayout::has_existing_acceleration`] for a
+/// directory layout: an empty restored tree is the only safe companion to a slice that
+/// points at a current snapshot with no manifest rows.
+async fn data_dir_has_entries(anchor: &std::path::Path) -> bool {
+    let anchor = anchor.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        match std::fs::read_dir(&anchor) {
+            Ok(mut entries) => entries.next().is_some(),
+            // Unreadable → treat as non-empty so verification refuses rather than
+            // importing a slice that would fall back to directory listing.
+            Err(_) => true,
+        }
+    })
+    .await
+    .unwrap_or(true)
+}
+
+/// `current_snapshot_id` from the slice's `cayenne_table` row, when set.
+fn current_snapshot_id_of(slice: &DatasetMetastoreSlice) -> Result<Option<&str>, String> {
+    let table_row = slice
+        .tables
+        .get("cayenne_table")
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| "the slice carries no `cayenne_table` row".to_string())?;
+    let idx = column_index("cayenne_table", "current_snapshot_id")
+        .ok_or_else(|| "`cayenne_table` has no `current_snapshot_id` column in this build".to_string())?;
+    Ok(slice_text(table_row, idx))
+}
+
+/// How many `cayenne_snapshot_file` rows name the current snapshot.
+fn manifest_rows_for_current_snapshot(slice: &DatasetMetastoreSlice) -> Result<usize, String> {
+    let Some(current_snapshot_id) = current_snapshot_id_of(slice)? else {
+        return Ok(0);
+    };
+    let snapshot_id_idx = column_index("cayenne_snapshot_file", "snapshot_id")
+        .ok_or_else(|| "`cayenne_snapshot_file` has no `snapshot_id` column in this build".to_string())?;
+    Ok(slice
+        .tables
+        .get("cayenne_snapshot_file")
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| slice_text(row, snapshot_id_idx) == Some(current_snapshot_id))
+        .count())
+}
+
+/// Refuse a slice whose `current_snapshot_id` is set but that snapshot has no manifest
+/// rows, unless `anchor` is also empty.
+///
+/// An empty `referenced_data_files` list makes both archive-member and restore-side
+/// checks succeed vacuously; Cayenne then falls back to directory listing and can serve
+/// unrelated or orphaned files. A genuinely empty published snapshot is fine only when
+/// the restored tree is empty too.
+async fn reject_empty_manifest_with_orphans(
+    slice: &DatasetMetastoreSlice,
+    anchor: &std::path::Path,
+) -> Result<(), String> {
+    let Some(current_snapshot_id) = current_snapshot_id_of(slice)? else {
+        return Ok(());
+    };
+    if manifest_rows_for_current_snapshot(slice)? > 0 {
+        return Ok(());
+    }
+    if !data_dir_has_entries(anchor).await {
+        return Ok(());
+    }
+    Err(format!(
+        "current_snapshot_id is '{current_snapshot_id}' but the slice has no manifest rows for that snapshot, and the data directory is not empty — refusing so Cayenne cannot fall back to directory listing of orphaned files"
+    ))
+}
+
 /// Check that every data file `slice`'s current snapshot references was extracted under
 /// `anchor`.
 async fn verify_slice_against_disk(
     slice: &DatasetMetastoreSlice,
     anchor: &std::path::Path,
 ) -> Result<(), String> {
+    reject_empty_manifest_with_orphans(slice, anchor).await?;
     let files = referenced_data_files(slice, anchor)?;
     let (named, total) = absent_on_disk(&files).await;
     if total == 0 {
@@ -483,6 +557,12 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         // `verify_directory_snapshot` can check the finished archive against exactly the
         // metadata it was built to match.
         {
+            // Same empty-manifest gate as restore: a slice that names a current
+            // snapshot with no files would make `verify_directory_snapshot` pass
+            // vacuously while the directory walker still packs orphan files.
+            reject_empty_manifest_with_orphans(&slice, &self.data_dir_anchor)
+                .await
+                .map_err(SnapshotEngineError::from_display)?;
             let expected = referenced_data_files(&slice, &self.data_dir_anchor)
                 .map_err(SnapshotEngineError::from_display)?;
             let mut stash = self
@@ -917,6 +997,33 @@ mod tests {
         verify_slice_against_disk(&slice, tmp.path())
             .await
             .expect("no current snapshot means nothing to verify");
+    }
+
+    /// `current_snapshot_id` with no manifest rows previously verified vacuously and
+    /// let Cayenne fall back to directory listing of whatever sat under the data dir.
+    #[tokio::test]
+    async fn verification_rejects_current_snapshot_with_empty_manifest_and_orphans() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        // Orphan file that is not described by any manifest row.
+        std::fs::write(anchor.join("orphan.vortex"), b"orphan").expect("write orphan");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("empty manifest + non-empty data dir must be refused");
+        assert!(reason.contains("no manifest rows"), "{reason}");
+        assert!(reason.contains("snap-1"), "{reason}");
+    }
+
+    /// A genuinely empty published snapshot (current id, no files, empty tree) is fine.
+    #[tokio::test]
+    async fn verification_allows_current_snapshot_with_empty_manifest_when_data_dir_empty() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        verify_slice_against_disk(&slice, tmp.path())
+            .await
+            .expect("empty manifest is ok when the restored tree is empty");
     }
 
     #[tokio::test]
