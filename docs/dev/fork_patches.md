@@ -77,9 +77,11 @@ that does not exist, which is worse than a **GAP** — a gap is at least on the
 list below. `kind(=lib)` sweeps up every unit test, so the exposure is the
 integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 `--all --tests` compiles them either way, so an unnamed binary is built and then
-skipped. Three rows' guards were found running nowhere for that reason and are
-named there now: the `datafusion-functions-json` trio, `arrow-adbc` fork PR #4,
-and vortex's `set_available_parallelism`. Nothing yet checks this automatically
+skipped. Six rows' guards were found running nowhere for that reason, in three
+integration-test targets now named there: `json_semantics` for the
+`datafusion-functions-json` trio, `adbc_cancellation` for the two `arrow-adbc`
+cancellation rows (fork PRs #4 and #65, which share one test), and `cpu_budget`
+for vortex's `set_available_parallelism`. Nothing yet checks this automatically
 — adding a guard here means checking by hand that `NEXTEST_FILTER` selects the
 target it lives in, or that a workflow of its own runs it.
 

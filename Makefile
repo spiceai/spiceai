@@ -200,8 +200,9 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # The last three are fork-ledger guards as well, in integration-test targets
 # `kind(=lib)` cannot reach, and they ran nowhere before being named here:
 # `json_semantics` holds the three `datafusion-functions-json` guards,
-# `adbc_cancellation` the `arrow-adbc` fork PR #4 guard, and `cpu_budget` the
-# guard for vortex's `set_available_parallelism`. Each is self-contained — a fake
+# `adbc_cancellation` the one guard shared by the `arrow-adbc` fork PR #4 and #65
+# rows, and `cpu_budget` the guard for vortex's `set_available_parallelism` —
+# six ledger rows across the three. Each is self-contained — a fake
 # in-process ADBC driver, a spicepod written to a temp dir, arrow built in
 # memory — needing no credentials and no service, and `--all --tests` compiles
 # all three whether or not they are selected, so leaving them out saved only the
