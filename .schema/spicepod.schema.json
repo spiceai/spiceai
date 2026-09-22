@@ -487,6 +487,12 @@
         "prefix": "spiceai",
         "paramsRef": "#/$defs/SpiceaiModelParams",
         "schemaRef": "#/$defs/SpiceaiModel"
+      },
+      {
+        "name": "typesafe",
+        "prefix": "typesafe",
+        "paramsRef": "#/$defs/TypesafeModelParams",
+        "schemaRef": "#/$defs/TypesafeModel"
       }
     ]
   },
@@ -4305,6 +4311,18 @@
           },
           "then": {
             "$ref": "#/$defs/SpiceaiModel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^typesafe($|:.+|/.+)"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/TypesafeModel"
           }
         }
       ]
@@ -12451,6 +12469,31 @@
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "TypesafeModelParams": {
+      "title": "TypesafeParams",
+      "type": "object",
+      "properties": {
+        "typesafe_api_key": {
+          "description": "`TypeSafe` API key. Autoloads from secret stores as `typesafe_api_key` (env `TYPESAFE_API_KEY`). Alias `ai_api_key` accepts spicepod param `typesafe_ai_api_key`; env `TYPESAFE_AI_API_KEY` is also tried at load time.",
+          "type": "string",
+          "x-secret": true
+        },
+        "typesafe_endpoint": {
+          "description": "`TypeSafe` API base URL. Defaults to the direct API (`https://api.typesafe.ai`), not the Vercel AI gateway. Spicepod key: `typesafe_endpoint`.",
+          "type": "string",
+          "default": "https://api.typesafe.ai"
+        },
+        "max_concurrency": {
+          "description": "Maximum number of concurrent requests for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
         }
       },
       "additionalProperties": true
@@ -22566,6 +22609,73 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SpiceaiModelParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelFile"
+          }
+        },
+        "datasets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "TypesafeModel": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
+          "type": "string",
+          "pattern": "^typesafe($|:.+|/.+)"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Configuration parameters for the typesafe model provider.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypesafeModelParams"
             },
             {
               "type": "null"
