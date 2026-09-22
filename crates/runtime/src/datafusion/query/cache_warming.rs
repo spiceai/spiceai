@@ -1106,7 +1106,7 @@ mod tests {
             .await
             .expect("stale get")
             .expect("seed exists");
-        let stale_merged = merge_templates(&stale_remote, &[template_a.clone()]);
+        let stale_merged = merge_templates(&stale_remote, std::slice::from_ref(&template_a));
         assert_eq!(template_sqls(&stale_merged), ["SELECT seed", "SELECT A"]);
 
         persist_remote(
@@ -1159,7 +1159,7 @@ mod tests {
             .await
             .expect("seed catalog");
 
-        let stale = persist_remote(
+        let stale_persist = persist_remote(
             Arc::clone(&state),
             catalog_mutex(vec![template_a.clone()]),
             Arc::new(AtomicUsize::new(1)),
@@ -1169,7 +1169,7 @@ mod tests {
             catalog_mutex(vec![template_a, template_b]),
             Arc::new(AtomicUsize::new(2)),
         );
-        tokio::join!(stale, newer);
+        tokio::join!(stale_persist, newer);
 
         let persisted = state
             .get(WARMUP_STATE_KEY)

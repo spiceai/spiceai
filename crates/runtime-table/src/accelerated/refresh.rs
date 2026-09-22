@@ -1755,7 +1755,7 @@ mod tests {
 
     #[test]
     fn retry_is_scheduled_only_when_this_refresher_stays_alive() {
-        let interval = Some(Duration::from_secs(60));
+        let interval = Some(Duration::from_mins(1));
         let completion_recorded = !retry_is_scheduled(interval, false);
         let loop_returned = true;
         let periodic_timer_reset = false;
