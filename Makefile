@@ -206,8 +206,6 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # memory — needing no credentials and no service, and `--all --tests` compiles
 # all three whether or not they are selected, so leaving them out saved only the
 # seconds of running them and cost the coverage the ledger claimed.
-# `scripts/check_fork_patches.py` now fails when the ledger names a guard this
-# filterset does not select.
 NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin)) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit

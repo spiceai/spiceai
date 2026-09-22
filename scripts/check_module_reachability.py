@@ -29,7 +29,6 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -45,43 +44,6 @@ MOD_RE = re.compile(
 # `#[path = "…"]`, including the `#[cfg_attr(…, path = "…")]` spelling. The
 # value is read from the blanked text's companion literal table, not from here.
 PATH_ATTR_RE = re.compile(r"\bpath\s*=\s*(?P<lit>\x00L(?P<idx>\d+)\x00)")
-
-# The opener of a `#[cfg(…)]` attribute. `cfg_attr(` does not match: the paren
-# has to follow `cfg` directly, modulo whitespace.
-CFG_ATTR_OPEN_RE = re.compile(r"\bcfg\s*\(")
-
-# A blanked string literal's marker, for putting the literal back.
-LITERAL_MARKER_RE = re.compile(r"\x00L(\d+)\x00")
-
-
-def cfg_predicate(region: str, literals: list[str]) -> str:
-    """The `cfg(…)` predicate text on one declaration's attributes.
-
-    Returned as source text with string literals restored, and `""` when the
-    declaration carries no `cfg`. Several `cfg` attributes on one declaration
-    all have to hold, so they are joined as the arguments of an implicit
-    `all(…)`.
-
-    Nothing here evaluates the predicate — `walk_from_root` only does that when
-    a caller hands it a `cfg_enabled` test, and its own caller does not (see
-    `parse_mods`).
-    """
-    predicates = []
-    for opener in CFG_ATTR_OPEN_RE.finditer(region):
-        depth = 0
-        for index in range(opener.end() - 1, len(region)):
-            if region[index] == "(":
-                depth += 1
-            elif region[index] == ")":
-                depth -= 1
-                if depth == 0:
-                    predicates.append(region[opener.end() : index])
-                    break
-    joined = ", ".join(predicate.strip() for predicate in predicates if predicate.strip())
-    return LITERAL_MARKER_RE.sub(
-        lambda m: '"' + (literals[int(m.group(1))] if int(m.group(1)) < len(literals) else "") + '"',
-        joined,
-    )
 
 
 
@@ -223,23 +185,18 @@ def _marker(index: int, width: int) -> str:
     return marker
 
 
-def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...], str]]:
+def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
     """Every `mod` declaration in `path`, in source order.
 
-    Each entry is `(name, kind, path_overrides, inline_parents, cfg)`, where
-    `kind` is `;` for a file module or `{` for an inline one, `path_overrides`
-    holds every `#[path = "…"]` candidate on the declaration (empty when it has
-    none), `inline_parents` names the inline `mod` blocks the declaration sits
-    inside — which is what decides the directory it resolves against — and `cfg`
-    is the declaration's `#[cfg(…)]` predicate as source text, `""` when it has
-    none.
+    Each entry is `(name, kind, path_overrides, inline_parents)`, where `kind` is
+    `;` for a file module or `{` for an inline one, `path_overrides` holds every
+    `#[path = "…"]` candidate on the declaration (empty when it has none), and
+    `inline_parents` names the inline `mod` blocks the declaration sits inside —
+    which is what decides the directory it resolves against.
 
-    `cfg` is reported, never evaluated here. For this guard's own question a
-    module declared only under a non-default feature is still declared, so
-    gating it must not make its file look dead; the same reasoning is why
-    *every* `path` candidate is kept rather than one. A caller asking a
-    different question — which files a *particular* build compiles — passes
-    `walk_from_root` a `cfg_enabled` test.
+    `#[cfg(...)]` is never evaluated: a module declared only under a non-default
+    feature is still declared, so gating it must not make its file look dead.
+    The same reasoning is why *every* `path` candidate is kept rather than one.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -259,17 +216,17 @@ def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, .
         events.append((b.start(), 1, b.group()))
     events.sort(key=lambda e: (e[0], e[1]))
 
-    mods: list[tuple[str, str, tuple[str, ...], tuple[str, ...], str]] = []
-    stack: list[tuple[int, str, str]] = []
+    mods: list[tuple[str, str, str | None, tuple[str, ...]]] = []
+    stack: list[tuple[int, str]] = []
     depth = 0
-    pending: tuple[str, str] | None = None
+    pending: str | None = None
 
     for _, _, item in events:
         if isinstance(item, str):
             if item == "{":
                 depth += 1
                 if pending is not None:
-                    stack.append((depth, *pending))
+                    stack.append((depth, pending))
                     pending = None
             else:
                 if stack and stack[-1][0] == depth:
@@ -277,44 +234,30 @@ def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, .
                 depth -= 1
             continue
 
-        # The attributes immediately preceding this declaration, bounded by the
-        # previous `;`/`{`/`}` so an attribute belonging to an earlier item
-        # cannot be picked up by this one.
+        if item.group("kind") == "{":
+            pending = item.group("name")
+            continue
+
+        # Every `path = "…"` in the attributes immediately preceding this
+        # declaration. Bounded by the previous `;`/`{`/`}` so an attribute
+        # belonging to an earlier item cannot be picked up by this one.
+        #
+        # All of them are kept, not just the last. A module routed per platform
+        # carries one `#[cfg_attr(…, path = "…")]` per configuration, and since
+        # `cfg` is never evaluated every candidate is reachable under some build
+        # — keeping only the last would report the others' files as dead.
         start = max(
             blanked.rfind(";", 0, item.start()),
             blanked.rfind("}", 0, item.start()),
             blanked.rfind("{", 0, item.start()),
         )
-        attributes = blanked[start + 1 : item.start()]
-        cfg = cfg_predicate(attributes, literals)
-
-        if item.group("kind") == "{":
-            # An inline module's own `cfg` governs everything declared inside
-            # it, so it rides the nesting stack rather than being dropped here.
-            pending = (item.group("name"), cfg)
-            continue
-
-        # Every `path = "…"` on the declaration, not just the last. A module
-        # routed per platform carries one `#[cfg_attr(…, path = "…")]` per
-        # configuration, and each candidate is reachable under some build —
-        # keeping only the last would report the others' files as dead.
         overrides = []
-        for pm in PATH_ATTR_RE.finditer(attributes):
+        for pm in PATH_ATTR_RE.finditer(blanked[start + 1 : item.start()]):
             idx = int(pm.group("idx"))
             if idx < len(literals) and literals[idx] not in overrides:
                 overrides.append(literals[idx])
-        # A declaration is compiled only when its own predicate *and* every
-        # enclosing inline module's predicate hold, which is an implicit
-        # `all(…)` over them.
-        governing = [c for _, _, c in stack if c] + ([cfg] if cfg else [])
         mods.append(
-            (
-                item.group("name"),
-                ";",
-                tuple(overrides),
-                tuple(n for _, n, _ in stack),
-                ", ".join(governing),
-            )
+            (item.group("name"), ";", tuple(overrides), tuple(n for _, n in stack))
         )
 
     return mods
@@ -338,17 +281,8 @@ def resolve_child(mod_dir: Path, name: str, override: str | None) -> Path | None
 MOD_RS_NAMES = {"mod.rs", "lib.rs", "main.rs"}
 
 
-def walk_from_root(
-    root: Path,
-    reached: set[Path],
-    cfg_enabled: "Callable[[str], bool] | None" = None,
-) -> None:
+def walk_from_root(root: Path, reached: set[Path]) -> None:
     """Mark `root` and everything its module tree reaches.
-
-    `cfg_enabled`, when given, is asked about each declaration's `#[cfg(…)]`
-    predicate and the declaration is skipped when it answers `False`. Left out —
-    as this script's own caller leaves it out — every declaration is followed,
-    because a module gated behind a feature is still a module somebody compiles.
 
     Two different directories are in play, and conflating them is what makes a
     naive version report live files:
@@ -374,9 +308,7 @@ def walk_from_root(
         file_dir = current.parent
         module_dir = file_dir if current.name in MOD_RS_NAMES else file_dir / current.stem
 
-        for name, _, overrides, inline, cfg in parse_mods(current):
-            if cfg and cfg_enabled is not None and not cfg_enabled(cfg):
-                continue
+        for name, _, overrides, inline in parse_mods(current):
             if overrides:
                 base = module_dir.joinpath(*inline) if inline else file_dir
             else:
