@@ -45,6 +45,8 @@ test_with_backends!(test_roundtrip_preserves_values);
 test_with_backends!(test_roundtrip_preserves_nulls);
 test_with_backends!(test_roundtrip_mixed_types);
 test_with_backends!(test_roundtrip_many_small_batches);
+test_with_backends!(test_inline_write_coalesces_into_one_batch);
+test_with_backends!(test_inline_scan_batches_scale_with_writes_not_rows);
 test_with_backends!(test_roundtrip_mixed_inline_and_vortex);
 test_with_backends!(test_roundtrip_across_reopen);
 test_with_backends!(test_roundtrip_exceeds_byte_threshold);
@@ -1475,5 +1477,135 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
         "post-checkpoint scans must not bump the inline generation"
     );
 
+    Ok(())
+}
+
+/// One write of N single-row batches must store ONE batch, not N.
+///
+/// `serialize_batches_to_ipc` writes one IPC message per input batch and
+/// `deserialize_ipc_to_batch` returns one `RecordBatch` per message, so without
+/// coalescing a CDC write that arrives as single rows is stored -- and later
+/// decoded and cached -- as N single-row batches. The fixed per-batch cost (one
+/// `ArrayData` plus 64-byte-padded buffers for every leaf, and a schema header
+/// per IPC message) is then paid once per ROW instead of once per write.
+async fn test_inline_write_coalesces_into_one_batch(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ROWS: i64 = 512;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let (table, _ctx) = create_table(&fixture, "coalesce_one", Arc::clone(&schema)).await?;
+    let table_id = fixture.catalog.get_table("coalesce_one").await?.table_id;
+
+    // One write, ROWS single-row batches -- the shape the CDC path produces.
+    let batches: Vec<RecordBatch> = (0..ROWS)
+        .map(|i| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![i])),
+                    Arc::new(StringArray::from(vec![format!("row-{i}")])),
+                ],
+            )
+            .expect("batch")
+        })
+        .collect();
+    common::insert_batches(&table, batches).await?;
+
+    let entries = fixture.catalog.get_inlined_data(&table_id).await?;
+    assert_eq!(entries.len(), 1, "one write should produce one inline entry");
+
+    let decoded: Vec<RecordBatch> = arrow::ipc::reader::StreamReader::try_new(
+        std::io::Cursor::new(entries[0].data_ipc.as_slice()),
+        None,
+    )?
+    .collect::<Result<_, _>>()?;
+
+    assert_eq!(
+        decoded.len(),
+        1,
+        "the entry holds {} batches for {ROWS} rows; each one costs a schema \
+         header and a padded buffer per leaf, so they must be coalesced",
+        decoded.len(),
+    );
+    assert_eq!(
+        decoded[0].num_rows(),
+        usize::try_from(ROWS)?,
+        "coalescing must preserve every row"
+    );
+    Ok(())
+}
+
+/// Accumulated inline rows must cost batches proportional to WRITES, not rows.
+///
+/// Mirrors a cache-write workload: a batching writer flushes every tick, so the
+/// corpus grows to thousands of rows across a few dozen writes. Every scan walks
+/// the decoded batches of every entry, so if that count tracks rows the scan
+/// cost grows with the corpus rather than with the number of flushes.
+async fn test_inline_scan_batches_scale_with_writes_not_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const WRITES: i64 = 60;
+    const ROWS_PER_WRITE: i64 = 100;
+    const TOTAL: i64 = WRITES * ROWS_PER_WRITE; // 6,000 rows
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let (table, ctx) = create_table(&fixture, "accumulated", Arc::clone(&schema)).await?;
+    let table_id = fixture.catalog.get_table("accumulated").await?.table_id;
+
+    for w in 0..WRITES {
+        let batches: Vec<RecordBatch> = (0..ROWS_PER_WRITE)
+            .map(|r| {
+                let id = w * ROWS_PER_WRITE + r;
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(vec![id])),
+                        Arc::new(StringArray::from(vec![format!("row-{id}")])),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        common::insert_batches(&table, batches).await?;
+    }
+
+    let entries = fixture.catalog.get_inlined_data(&table_id).await?;
+    let total_batches: usize = entries
+        .iter()
+        .map(|e| {
+            arrow::ipc::reader::StreamReader::try_new(
+                std::io::Cursor::new(e.data_ipc.as_slice()),
+                None,
+            )
+            .expect("ipc reader")
+            .count()
+        })
+        .sum();
+
+    assert!(
+        total_batches <= entries.len(),
+        "{total_batches} batches across {} entries for {TOTAL} rows: batch count \
+         tracks rows, so every scan walks the whole corpus one row at a time",
+        entries.len(),
+    );
+
+    ctx.register_table("accumulated", Arc::new(table))?;
+    let got = collect_sorted(&ctx, "SELECT id, payload FROM accumulated ORDER BY id").await?;
+    assert_eq!(got.num_rows(), usize::try_from(TOTAL)?, "every row must be visible");
+
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column");
+    assert_eq!(ids.value(0), 0);
+    assert_eq!(ids.value(usize::try_from(TOTAL)? - 1), TOTAL - 1);
     Ok(())
 }

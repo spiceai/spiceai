@@ -26840,6 +26840,18 @@ impl CayenneTableProvider {
         if inline_max_rows == 0 || inline_max_bytes == 0 || total_rows > inline_max_rows {
             return Ok(false);
         }
+        // Coalesce before serializing for better memory usage and query/read performance.
+        let coalesced: Vec<RecordBatch>;
+        let batches = if batches.len() > 1 {
+            coalesced = vec![
+                arrow::compute::concat_batches(&batches[0].schema(), batches)
+                    .map_err(|e| Error::Arrow { source: e })?,
+            ];
+            &coalesced[..]
+        } else {
+            batches
+        };
+
         let ipc_bytes =
             serialize_batches_to_ipc(batches).map_err(|e| Error::Arrow { source: e })?;
         if ipc_bytes.len() > inline_max_bytes {
