@@ -1257,6 +1257,16 @@ async fn process_message(
         );
     }
 
+    // An in-flight create still owns this receipt. Applying a sibling key
+    // would attach `SqsDeleteCommitter` and delete the whole message when
+    // that sibling commits, so a failed apply of the in-flight key has
+    // nothing to retry. Leave until every matching create is committed.
+    if matching.iter().any(|event| {
+        event.kind == ObjectEventKind::Created && applied_keys.lock().is_in_flight(&event.key)
+    }) {
+        return ProcessOutcome::Leave;
+    }
+
     // A key can appear in more than one record of a notification, and the
     // applied-key set learns of it only once its envelope is yielded, so each
     // key is read at most once here.
@@ -1265,18 +1275,11 @@ async fn process_message(
         .iter()
         .copied()
         .filter(|event| {
-            event.kind == ObjectEventKind::Created && !applied_keys.lock().is_known(&event.key)
+            event.kind == ObjectEventKind::Created && !applied_keys.lock().is_committed(&event.key)
         })
         .filter(|&event| seen_keys.insert(event.key.as_str()))
         .collect();
     if created.is_empty() {
-        let in_flight = matching.iter().any(|event| {
-            event.kind == ObjectEventKind::Created && applied_keys.lock().is_in_flight(&event.key)
-        });
-        if in_flight {
-            // Apply is still pending. Do not delete — a failed apply must retry.
-            return ProcessOutcome::Leave;
-        }
         return ProcessOutcome::Ack { receipt_handle };
     }
 
@@ -2952,6 +2955,48 @@ mod tests {
         assert!(
             matches!(outcome, ProcessOutcome::Ack { .. }),
             "a queued ObjectCreated for a committed key must not append again, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_created_leaves_message_when_any_create_is_in_flight() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/a.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["a"])],
+                ),
+                (
+                    "my-bucket/events/b.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["b"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        };
+        let applied = parking_lot::Mutex::new(AppliedKeySet::default());
+        applied
+            .lock()
+            .mark_in_flight(["events/a.parquet".to_string()]);
+        let outcome = process_message(
+            &events_dataset(),
+            &default_config(),
+            &parquet_files(),
+            &id_name_schema(),
+            &reader,
+            &applied,
+            &QueueMessage {
+                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/b.parquet"}}}]}"#.into(),
+                receipt_handle: "rh-mixed-inflight".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, ProcessOutcome::Leave),
+            "a sibling ObjectCreated must not delete a receipt that still covers an in-flight key, got {outcome:?}"
+        );
+        assert!(
+            !applied.lock().is_known("events/b.parquet"),
+            "the new key must not be marked known when the message is left"
         );
     }
 
