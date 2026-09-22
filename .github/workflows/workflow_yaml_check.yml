@@ -17,6 +17,7 @@ on:
       - '.github/actionlint.yaml'
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
+      - '.github/scripts/test_relocate_codeql_query_paths.py'
   push:
     branches:
       - trunk
@@ -26,6 +27,7 @@ on:
       - '.github/actionlint.yaml'
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
+      - '.github/scripts/test_relocate_codeql_query_paths.py'
   workflow_dispatch:
 
 concurrency:
@@ -60,7 +62,9 @@ jobs:
         run: pip install pyyaml
 
       - name: Run tests
-        run: python .github/scripts/test_check_workflow_yaml.py -v
+        run: |
+          python .github/scripts/test_check_workflow_yaml.py -v
+          python .github/scripts/test_relocate_codeql_query_paths.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
