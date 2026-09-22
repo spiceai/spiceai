@@ -1784,6 +1784,7 @@ impl Query {
                         cache_manager.raw_cache_key,
                         datasets,
                         started_at,
+                        Arc::clone(&physical_plan),
                     )
                 } else {
                     res_stream

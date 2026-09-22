@@ -684,22 +684,12 @@ async fn a_5xx_response_is_recognized_on_a_json_decomposed_dataset() -> Result<(
 /// (`HTTP_RESPONSE_STATUS_METADATA_KEY`) is actually present on a schema
 /// that never declared `response_status`, *and* `response_status` survives
 /// to the batch `batches_cacheable` inspects. `SELECT *` guarantees the
-/// latter; it does not for a narrower query.
-///
-/// KNOWN GAP, not fixed by this test or by this PR: a query that does not
-/// reference `response_status` at all — e.g. `SELECT rank FROM http_data
-/// WHERE request_path = '/items'` — lets `DataFusion`'s column-pruning
-/// projection pushdown drop it before `cache::to_cached_record_batch_stream`
-/// ever sees the batch, so the same 503 *is* wrongly cached in that case
-/// (reproduced locally: swapping the query below for that one flips this
-/// test from passing to failing with `cache_status: CacheHit` on the second
-/// attempt). Fixing that needs `response_status` (or an equivalent signal)
-/// to survive an arbitrary user projection before reaching the cache
-/// decision — a separate, larger design than a schema-level fix, tracked as
-/// a follow-up rather than attempted here. Checks `QueryResult::cache_status`
-/// directly, which is the runtime's own record of whether a query was served
-/// from — or written to — the results cache, rather than inferring it
-/// indirectly from row content.
+/// latter; a narrower projection does not — see
+/// `a_5xx_response_is_not_cached_by_the_sql_results_cache_under_a_narrow_projection`
+/// below for that case. Checks `QueryResult::cache_status` directly, which is
+/// the runtime's own record of whether a query was served from — or written
+/// to — the results cache, rather than inferring it indirectly from row
+/// content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerated_dataset()
 -> Result<(), anyhow::Error> {
@@ -753,6 +743,77 @@ async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerat
             cache::result::CacheStatus::CacheHit,
             "attempt {attempt}: a transient 503 must never be served from the SQL results cache \
             (got {cache_status:?})"
+        );
+    }
+    Ok(())
+}
+
+/// The narrow-projection counterpart to
+/// `a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerated_dataset`:
+/// the query below never references `response_status` at all, so
+/// `DataFusion`'s column-pruning projection pushdown drops it from the batch
+/// before `cache::to_cached_record_batch_stream` ever sees a column or a
+/// schema-metadata value to check. `HttpExec` records the retryable status on
+/// its own `ExecutionPlan::metrics()` instead (`HTTP_TRANSIENT_FAILURE_METRIC_NAME`),
+/// which lives on the plan tree rather than the batch schema, so no
+/// projection can prune it — `cache::plan_saw_transient_http_failure` walks
+/// the plan for it as the fallback this test exercises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_under_a_narrow_projection()
+-> Result<(), anyhow::Error> {
+    use futures::TryStreamExt;
+
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    origin.set_status_with_empty_body(503);
+
+    let mut dataset = Dataset::new(format!("http://{}", origin.addr), "http_data");
+    dataset.params = Some(Params::from_string_map(
+        [
+            ("file_format", "json"),
+            ("allowed_request_paths", "/items"),
+            ("max_retries", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    ));
+    let dataset = decompose_into_named_columns(dataset);
+
+    let rt = build_runtime_with_sql_results_cache(
+        dataset,
+        "sql_results_cache_5xx_narrow_projection_not_cached",
+    )
+    .await;
+
+    let sql = "SELECT rank FROM http_data WHERE request_path = '/items'";
+
+    // Run the same failing query twice. Neither run may report a cache hit:
+    // if the first, failing fetch had been wrongly written to the results
+    // cache, the second, identical query would find it there.
+    for attempt in 1..=2 {
+        let result = rt
+            .datafusion()
+            .query_builder(sql)
+            .build()
+            .run()
+            .await
+            .expect("query planning should succeed");
+        let cache_status = result.cache_status;
+        // Drain the stream so any post-execution cache write (which happens
+        // once the stream completes) has actually run before the next query.
+        let _rows: Vec<_> = result.data.try_collect().await.expect(
+            "the query itself must not error: the failing body decomposes to one row \
+            of NULLs, not a stream error",
+        );
+
+        assert_ne!(
+            cache_status,
+            cache::result::CacheStatus::CacheHit,
+            "attempt {attempt}: a transient 503 must never be served from the SQL results cache \
+            under a projection that excludes response_status (got {cache_status:?})"
         );
     }
     Ok(())

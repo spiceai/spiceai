@@ -35,6 +35,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
@@ -2063,6 +2064,13 @@ pub struct HttpExec {
     /// When `true`, the partitions are a template that will be expanded
     /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
     deferred_partitions: bool,
+    /// Counts fetches that turned into a successful batch despite carrying a
+    /// retryable `response_status` (5xx/429) — see
+    /// [`crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME`]. Lives on the plan tree
+    /// rather than the batch schema, so it survives a user projection that
+    /// prunes `response_status` out of the batch before `cache::batches_cacheable`
+    /// ever sees it.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl HttpExec {
@@ -2116,6 +2124,7 @@ impl HttpExec {
             limit,
             properties,
             deferred_partitions: false,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -2230,14 +2239,22 @@ impl HttpExec {
         let content_rows =
             parse_content_with_map_to_array(&result.content, self.limit, map_to_array);
 
-        self.create_batch_from_rows(
+        let batch = self.create_batch_from_rows(
             path.as_deref(),
             query.as_deref(),
             body.as_deref(),
             request_headers.as_deref(),
             &content_rows,
             &result,
-        )
+        )?;
+
+        if HttpTableProvider::is_retryable_status(result.response_status) {
+            MetricBuilder::new(&self.metrics)
+                .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
+                .add(1);
+        }
+
+        Ok(batch)
     }
 
     /// `self.projected_schema` with [`crate::HTTP_RESPONSE_STATUS_METADATA_KEY`]
@@ -2710,6 +2727,10 @@ impl ExecutionPlan for HttpExec {
         Ok(self)
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -3020,6 +3041,12 @@ impl ExecutionPlan for HttpExec {
                             &content_rows,
                             &fetch_result,
                         )?;
+
+                        if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                            MetricBuilder::new(&exec.metrics)
+                                .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
+                                .add(1);
+                        }
 
                         state.rows_fetched += num_rows;
 

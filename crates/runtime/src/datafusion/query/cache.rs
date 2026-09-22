@@ -29,6 +29,7 @@ use datafusion::{
     common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
+    physical_plan::ExecutionPlan,
     sql::TableReference,
 };
 use runtime_request_context::{
@@ -1473,6 +1474,7 @@ impl Query {
         plan_cache_key: RawCacheKey,
         datasets: Arc<HashSet<TableReference>>,
         read_started_at: std::time::Instant,
+        physical_plan: Arc<dyn ExecutionPlan>,
     ) -> SendableRecordBatchStream {
         if let Some(cache_provider) = df.results_cache_provider() {
             to_cached_record_batch_stream(
@@ -1481,6 +1483,7 @@ impl Query {
                 plan_cache_key,
                 datasets,
                 read_started_at,
+                Some(physical_plan),
             )
         } else {
             stream

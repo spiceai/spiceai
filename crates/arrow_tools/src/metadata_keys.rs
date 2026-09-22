@@ -119,3 +119,16 @@ pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stat
 /// narrower, JSON-decomposed shape regardless of which columns that schema
 /// keeps.
 pub const HTTP_RESPONSE_STATUS_METADATA_KEY: &str = "spice.http_response_status";
+
+/// `ExecutionPlan::metrics()` counter name the HTTP connector's `HttpExec`
+/// increments whenever a fetch it turned into a successful batch actually
+/// carried a retryable status (5xx/429) — the same "retryable but not
+/// zero rows" case `HTTP_RESPONSE_STATUS_METADATA_KEY` and the
+/// `response_status` column exist to report, but readable even when a user
+/// projection (e.g. `SELECT rank FROM http_data`) prunes `response_status`
+/// out of the batch before it ever reaches `cache::batches_cacheable`.
+/// Metrics live on the plan tree, not the batch schema, so column pruning
+/// cannot remove them; a plan-metrics walk from the root, summed by this
+/// name, is how a caller checks for this failure past an arbitrary
+/// projection.
+pub const HTTP_TRANSIENT_FAILURE_METRIC_NAME: &str = "http_transient_failure_rows";

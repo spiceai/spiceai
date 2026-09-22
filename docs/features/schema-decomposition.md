@@ -241,8 +241,11 @@ WHERE request_path = '/shows/1';
 
 - When at least one `columns:` entry has `metadata.json_object: "*"`, the
   HTTP provider swaps its default fixed schema for one built from
-  `columns:` in declaration order. All decomposed columns are `Utf8`
-  (nullable).
+  `columns:` in declaration order. A body-derived column defaults to
+  `Utf8` (nullable) unless you declare its `type`/`nullable`; a metadata
+  column (`response_status`, `_fetched_at`, …) instead keeps its fixed
+  type from the default HTTP schema (e.g. `response_status` is
+  non-nullable `UInt16`) regardless of what you declare for it.
 - Each row from the response is decomposed:
   - JSON arrays are flattened to one row per element (same as default
     HTTP connector behavior).

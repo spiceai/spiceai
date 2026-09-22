@@ -18,10 +18,14 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::compute::filter_record_batch;
-use arrow_tools::metadata_keys::HTTP_RESPONSE_STATUS_METADATA_KEY;
+use arrow_tools::metadata_keys::{
+    HTTP_RESPONSE_STATUS_METADATA_KEY, HTTP_TRANSIENT_FAILURE_METRIC_NAME,
+};
 use datafusion::{
-    common::tree_node::TreeNodeRecursion, execution::SendableRecordBatchStream,
-    logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter,
+    common::tree_node::TreeNodeRecursion,
+    execution::SendableRecordBatchStream,
+    logical_expr::LogicalPlan,
+    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     sql::TableReference,
 };
 
@@ -162,6 +166,28 @@ fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
     false
 }
 
+/// Walks `plan` and its children for `HttpExec`'s
+/// [`HTTP_TRANSIENT_FAILURE_METRIC_NAME`] counter, summed across every node.
+///
+/// `has_transient_http_error_responses` catches a retryable status through
+/// the `response_status` column or the schema-metadata fallback, but a user
+/// projection (e.g. `SELECT rank FROM http_data`) can prune `response_status`
+/// out of the batch entirely before it ever reaches that check.
+/// `ExecutionPlan::metrics()` lives on the plan tree, not the batch schema,
+/// so no column pruning can remove it — this is the fallback for that case.
+fn plan_saw_transient_http_failure(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(metrics) = plan.metrics()
+        && let Some(value) = metrics.sum_by_name(HTTP_TRANSIENT_FAILURE_METRIC_NAME)
+        && value.as_usize() > 0
+    {
+        return true;
+    }
+
+    plan.children()
+        .into_iter()
+        .any(plan_saw_transient_http_failure)
+}
+
 /// Returns whether the batches should be written to cache.
 ///
 /// For HTTP-shaped results, any presence of a transient error response (5xx/429)
@@ -226,6 +252,7 @@ pub fn to_cached_record_batch_stream(
     raw_cache_key: RawCacheKey,
     input_tables: Arc<HashSet<TableReference>>,
     read_started_at: std::time::Instant,
+    physical_plan: Option<Arc<dyn ExecutionPlan>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let cache_schema = Arc::clone(&schema);
@@ -294,6 +321,13 @@ pub fn to_cached_record_batch_stream(
             } else if !batches_cacheable(&records) {
                 tracing::debug!(
                     "The result carried transient HTTP error responses (5xx/429), skipping cache storage"
+                );
+            } else if physical_plan
+                .as_ref()
+                .is_some_and(plan_saw_transient_http_failure)
+            {
+                tracing::debug!(
+                    "The result's execution plan recorded a transient HTTP error response (5xx/429) that a projection excluded from the output columns, skipping cache storage"
                 );
             } else if !has_encoder && !batches_boundable(&records) {
                 // Only a raw entry can be pinned by what its batches rested on.
@@ -808,6 +842,7 @@ pub(crate) mod tests {
             key,
             Arc::new(input_tables),
             read_started_at,
+            None,
         );
         while wrapped.next().await.is_some() {}
 
@@ -1045,6 +1080,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1119,6 +1155,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["http_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1193,6 +1230,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["http_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1633,6 +1671,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         // Consume the stream to trigger caching.
@@ -1725,6 +1764,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -1806,6 +1846,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -1876,6 +1917,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output = cached_stream
@@ -1932,6 +1974,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1996,6 +2039,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -2058,6 +2102,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -2135,6 +2180,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["docs".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output = cached_stream
