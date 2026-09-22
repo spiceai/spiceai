@@ -54,20 +54,16 @@ permissions:
 jobs:
   analyze:
     name: Analyze
-    # The checked-out tree is untrusted on pull_request_target, merge_group,
-    # and a workflow_dispatch of a feature branch. Cargo build scripts and
-    # local composite actions must not run on the shared self-hosted pool or
-    # receive MinIO credentials. push and schedule already only run on
-    # trunk and release branches. workflow_dispatch gets that pool only on
-    # those refs; a dispatch of any other branch stays on the hosted runner
-    # without secrets. merge_group is hosted and secret-less for the same
-    # reason.
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-') || startsWith(github.ref, 'refs/heads/release/')))) && 'spiceai-dev-runners' || 'ubuntu-24.04' }}
+    # Rust autobuild runs on the EPYC pool for every event, including
+    # pull_request_target and merge_group. The checked-out tree is untrusted
+    # on pull_request_target, merge_group, and a workflow_dispatch of a
+    # feature branch, so those runs do not receive MinIO credentials. Produce
+    # SARIF stays on a fresh hosted VM and does not check out that tree.
+    runs-on: spiceai-dev-runners
     env:
       HAS_TEST_MINIO_SECRET: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-') || startsWith(github.ref, 'refs/heads/release/')))) && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     # An unbounded autobuild waits out GitHub's six-hour default (#12717).
-    # Hosted uncached rust analysis has been completing in about 80 minutes;
-    # the bound sits above that.
+    # 150 minutes sits above a cold uncached rust analysis.
     timeout-minutes: 150
     permissions:
       actions: read
