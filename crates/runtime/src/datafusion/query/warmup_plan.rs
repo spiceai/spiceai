@@ -99,10 +99,17 @@ fn finalize_binding_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
 fn resolve_alias_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
     let aliases = alias_to_input_table(plan);
     for binding in bindings.iter_mut() {
-        if let Some(table) = aliases.get(binding.table.as_str()) {
+        if let Some(table) = alias_target(&aliases, &binding.table) {
             binding.table.clone_from(table);
         }
     }
+}
+
+fn alias_target<'a>(aliases: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
+    aliases.get(name).or_else(|| {
+        let parsed = TableReference::parse_str(name);
+        aliases.get(parsed.table())
+    })
 }
 
 fn alias_to_input_table(plan: &LogicalPlan) -> HashMap<String, String> {
@@ -112,7 +119,8 @@ fn alias_to_input_table(plan: &LogicalPlan) -> HashMap<String, String> {
             && let Some(table) = underlying_table_scan(alias.input.as_ref())
         {
             map.insert(alias.alias.to_string(), table.clone());
-            map.insert(alias.alias.table().to_string(), table);
+            map.insert(alias.alias.table().to_string(), table.clone());
+            map.insert(quote_table_reference(&alias.alias), table);
         }
         Ok(TreeNodeRecursion::Continue)
     });
@@ -123,7 +131,7 @@ fn alias_to_input_table(plan: &LogicalPlan) -> HashMap<String, String> {
 /// between is not a table we can `SELECT DISTINCT` from.
 fn underlying_table_scan(plan: &LogicalPlan) -> Option<String> {
     match plan {
-        LogicalPlan::TableScan(scan) => Some(scan.table_name.to_string()),
+        LogicalPlan::TableScan(scan) => Some(quote_table_reference(&scan.table_name)),
         LogicalPlan::SubqueryAlias(alias) => underlying_table_scan(alias.input.as_ref()),
         _ => None,
     }
@@ -139,9 +147,21 @@ fn drop_unresolved_alias_tables(plan: &LogicalPlan, bindings: &mut [WarmupBindin
 }
 
 fn is_input_table(name: &str, inputs: &HashSet<TableReference>) -> bool {
-    inputs
-        .iter()
-        .any(|table| table.to_string() == name || table.table() == name)
+    let parsed = TableReference::parse_str(name);
+    inputs.iter().any(|table| {
+        quote_table_reference(table) == name
+            || table.to_string() == name
+            || table.table() == name
+            || table_refs_match(table, &parsed)
+    })
+}
+
+fn table_refs_match(left: &TableReference, right: &TableReference) -> bool {
+    left.table() == right.table()
+        && (left.schema().is_none() || right.schema().is_none() || left.schema() == right.schema())
+        && (left.catalog().is_none()
+            || right.catalog().is_none()
+            || left.catalog() == right.catalog())
 }
 
 fn fill_missing_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
@@ -155,7 +175,7 @@ fn fill_missing_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
     let Some(table) = tables.iter().next() else {
         return;
     };
-    let name = table.to_string();
+    let name = quote_table_reference(table);
     for binding in bindings.iter_mut() {
         if binding.table.is_empty() {
             binding.table.clone_from(&name);
@@ -173,7 +193,7 @@ fn parameterize_predicate(expr: Expr, bindings: &mut Vec<WarmupBinding>) -> Expr
         let table = column
             .relation
             .as_ref()
-            .map_or_else(String::new, ToString::to_string);
+            .map_or_else(String::new, quote_table_reference);
         let data_type = match &e {
             Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
                 if value_on_right {
@@ -248,6 +268,10 @@ pub(super) const MAX_WARMUP_DISTINCT_KEYS: usize = 1024;
 /// template's bound columns. `None` when the template has no variables (run
 /// the template SQL as-is) or the bindings span more than one table (the
 /// distinct keys would not be a real join combination).
+///
+/// The `FROM` clause quotes each `TableReference` part so `spice.public.orders`
+/// stays catalog-qualified and a single identifier such as `users.v1` is not
+/// split into schema and table.
 #[must_use]
 pub(super) fn distinct_keys_sql(template: &WarmupTemplate) -> Option<String> {
     if template.bindings.is_empty() {
@@ -266,14 +290,27 @@ pub(super) fn distinct_keys_sql(template: &WarmupTemplate) -> Option<String> {
         .map(|b| quote_ident(&b.column))
         .collect::<Vec<_>>()
         .join(", ");
-    let quoted_table = table
-        .split('.')
-        .map(quote_ident)
-        .collect::<Vec<_>>()
-        .join(".");
+    let quoted_table = quote_table_reference(&TableReference::parse_str(table));
     Some(format!(
         "SELECT DISTINCT {columns} FROM {quoted_table} LIMIT {MAX_WARMUP_DISTINCT_KEYS}"
     ))
+}
+
+/// Quote each `TableReference` part. Display-flattening then splitting on `.`
+/// would turn a single identifier `users.v1` into schema `users` / table `v1`.
+fn quote_table_reference(table: &TableReference) -> String {
+    match (table.catalog(), table.schema()) {
+        (Some(catalog), Some(schema)) => format!(
+            "{}.{}.{}",
+            quote_ident(catalog),
+            quote_ident(schema),
+            quote_ident(table.table())
+        ),
+        (None, Some(schema)) => {
+            format!("{}.{}", quote_ident(schema), quote_ident(table.table()))
+        }
+        _ => quote_ident(table.table()),
+    }
 }
 
 fn quote_ident(name: &str) -> String {
@@ -335,7 +372,7 @@ mod tests {
             .expect("template");
         assert_eq!(t.bindings.len(), 1, "got {t:?}");
         assert_eq!(
-            t.bindings[0].table, "orders",
+            t.bindings[0].table, r#""orders""#,
             "binding must name the input table, not the alias, got {t:?}"
         );
         assert_eq!(t.bindings[0].column, "id");
@@ -458,5 +495,99 @@ mod tests {
         };
         assert!(distinct_keys_sql(&t).is_none());
         assert!(!template_can_warm(&t));
+    }
+
+    #[test]
+    fn catalog_qualified_binding_quotes_each_table_part() {
+        let t = WarmupTemplate {
+            sql: "SELECT id FROM spice.public.orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: "spice.public.orders".to_string(),
+                column: "id".to_string(),
+            }],
+        };
+        assert_eq!(
+            distinct_keys_sql(&t).as_deref(),
+            Some(r#"SELECT DISTINCT "id" FROM "spice"."public"."orders" LIMIT 1024"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn dotted_table_identifier_is_not_split_into_schema_and_table() {
+        let ctx = SessionContext::new();
+        ctx.sql(r#"CREATE TABLE "users.v1" (id INT, status VARCHAR)"#)
+            .await
+            .expect("create dotted table")
+            .collect()
+            .await
+            .expect("collect create");
+        let plan = ctx
+            .sql(r#"SELECT id FROM "users.v1" WHERE id = 1"#)
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        let t = template_from_plan(&plan).expect("template");
+        assert_eq!(
+            t.bindings.len(),
+            1,
+            "expected one binding for the dotted table, got {t:?}"
+        );
+        assert_eq!(
+            t.bindings[0].table, r#""users.v1""#,
+            "binding must keep the dotted identifier as one table, got {t:?}"
+        );
+        let distinct = distinct_keys_sql(&t).expect("distinct");
+        assert!(
+            distinct.contains(r#""users.v1""#),
+            "DISTINCT must quote the dotted identifier as one table, got {distinct}"
+        );
+        assert!(
+            !distinct.contains(r#""users"."v1""#),
+            "DISTINCT must not split a dotted identifier into schema.table, got {distinct}"
+        );
+        ctx.sql(&distinct)
+            .await
+            .expect("DISTINCT must execute against the dotted table identifier")
+            .collect()
+            .await
+            .expect("collect distinct");
+    }
+
+    #[tokio::test]
+    async fn aliased_dotted_table_resolves_to_quoted_identifier() {
+        let ctx = SessionContext::new();
+        ctx.sql(r#"CREATE TABLE "users.v1" (id INT, status VARCHAR)"#)
+            .await
+            .expect("create dotted table")
+            .collect()
+            .await
+            .expect("collect create");
+        let plan = ctx
+            .sql(r#"SELECT id FROM "users.v1" AS u WHERE u.id = 1"#)
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        let t = template_from_plan(&plan).expect("template");
+        assert_eq!(
+            t.bindings[0].table, r#""users.v1""#,
+            "alias must resolve to the dotted input table, got {t:?}"
+        );
+        let distinct = distinct_keys_sql(&t).expect("distinct");
+        assert!(
+            distinct.contains(r#""users.v1""#),
+            "DISTINCT must read the dotted input table, got {distinct}"
+        );
+        assert!(
+            !distinct.contains(r#""u""#),
+            "DISTINCT must not use the SQL alias as a table name, got {distinct}"
+        );
+        ctx.sql(&distinct)
+            .await
+            .expect("DISTINCT must execute against the dotted table, not the alias")
+            .collect()
+            .await
+            .expect("collect distinct");
     }
 }
