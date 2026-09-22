@@ -398,16 +398,14 @@ impl Index for FullTextDatabaseIndex {
             // (now-installed) directory and take a fresh writer so the next commit builds on the
             // restored state rather than the pre-restore one.
             let reopened = tantivy::Index::open_in_dir(&directory)
-                .map_err(|source| {
+                .inspect_err(|_source| {
                     rollback_to_old_directory();
-                    source
                 })
                 .context(TextSearchIndexingSnafu)?;
             let new_writer = reopened
                 .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
-                .map_err(|source| {
+                .inspect_err(|_source| {
                     rollback_to_old_directory();
-                    source
                 })
                 .context(IndexCreationSnafu)?;
             new_writer.set_merge_policy(Box::new(index_merge_policy()));
