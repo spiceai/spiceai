@@ -32,11 +32,34 @@ runs:
           echo "::error::'brew' is not on PATH, so the cc toolchain cannot be installed or verified on this runner."
           exit 1
         fi
-        brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+        # `command -v brew` is not `$prefix/bin/brew` on the spiceai-macos pool:
+        # a flock wrapper lives at `/opt/spice/bin/brew` (and a copy under gnu-tar
+        # gnubin). `dirname` twice of that path is `/opt/spice`, which has no
+        # Cellar, so every formula looks missing and we `brew install` kegs that
+        # are already present. Homebrew then annotates each as a warning
+        # ("already installed, run brew upgrade"). Probe the well-known prefixes
+        # first and do not invoke `brew` (that takes the global lock this probe
+        # exists to avoid). Fall back to the dirname heuristic for unusual layouts.
+        if [ -x /opt/homebrew/bin/brew ]; then
+          brew_prefix=/opt/homebrew
+        elif [ -x /usr/local/bin/brew ]; then
+          brew_prefix=/usr/local
+        else
+          brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+        fi
+        formula_present() {
+          # Aliases: pkg-config → pkgconf, openssl → openssl@3.
+          [ -d "$brew_prefix/opt/$1" ] && return 0
+          case "$1" in
+            pkg-config) [ -d "$brew_prefix/opt/pkgconf" ] && return 0 ;;
+            openssl)    [ -d "$brew_prefix/opt/openssl@3" ] && return 0 ;;
+          esac
+          return 1
+        }
         formulas=(cmake pkg-config openssl unixodbc llvm libnfs)
         missing=()
         for formula in "${formulas[@]}"; do
-          [ -d "$brew_prefix/opt/$formula" ] || missing+=("$formula")
+          formula_present "$formula" || missing+=("$formula")
         done
         # cmake and pkg-config are invoked by bare name from build scripts, so being in
         # the Cellar is not sufficient — the name also has to resolve to *this* Homebrew.
