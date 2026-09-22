@@ -36,7 +36,7 @@ impl Embed for EmbedGoogle {
         self.embeddings_cache.clone()
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>> {
         let texts: Vec<String> = match input {
             EmbeddingInput::String(s) => vec![s],
             EmbeddingInput::StringArray(arr) => arr,
@@ -52,7 +52,7 @@ impl Embed for EmbedGoogle {
 
         if texts.is_empty() {
             tracing::debug!("Embedding input is empty, returning empty vector");
-            return Ok(vec![]);
+            return Ok(std::sync::Arc::new(vec![]));
         }
 
         let requests: Vec<EmbedContentRequest> = texts
@@ -75,7 +75,9 @@ impl Embed for EmbedGoogle {
                 ))),
             })?;
 
-        Ok(embeddings.into_iter().map(|emb| emb.values).collect())
+        Ok(std::sync::Arc::new(
+            embeddings.into_iter().map(|emb| emb.values).collect(),
+        ))
     }
 
     fn model_name(&self) -> Option<&str> {
