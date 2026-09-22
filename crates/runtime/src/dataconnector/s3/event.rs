@@ -284,11 +284,10 @@ impl std::error::Error for ObjectUrlError {}
 /// host, and [`ObjectUrlError::UnrepresentableKey`] when the key does not
 /// survive a WHATWG path round-trip.
 pub fn s3_object_from(bucket: &str, key: &str) -> Result<String, ObjectUrlError> {
-    let mut url = Url::parse(&format!("s3://{bucket}")).map_err(|error| {
-        ObjectUrlError::InvalidBucket {
+    let mut url =
+        Url::parse(&format!("s3://{bucket}")).map_err(|error| ObjectUrlError::InvalidBucket {
             detail: error.to_string(),
-        }
-    })?;
+        })?;
     url.set_path(key);
     let as_url = url.to_string();
     let reconstructed = decode_from_path_key(url.path().trim_start_matches('/'));
