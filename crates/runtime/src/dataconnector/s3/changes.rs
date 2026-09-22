@@ -2156,13 +2156,13 @@ mod tests {
 
     fn created_put_body(key: &str) -> String {
         format!(
-            r#"{{"Records":[{{"eventName":"ObjectCreated:Put","s3":{{"bucket":{{"name":"my-bucket"}},"object":{{"key":"{key}"}}}}}}]}}"#
+            r#"{{"Records":[{{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{{"bucket":{{"name":"my-bucket"}},"object":{{"key":"{key}"}}}}}}]}}"#
         )
     }
 
     fn removed_body(key: &str) -> String {
         format!(
-            r#"{{"Records":[{{"eventName":"ObjectRemoved:Delete","s3":{{"bucket":{{"name":"my-bucket"}},"object":{{"key":"{key}"}}}}}}]}}"#
+            r#"{{"Records":[{{"eventSource":"aws:s3","eventName":"ObjectRemoved:Delete","s3":{{"bucket":{{"name":"my-bucket"}},"object":{{"key":"{key}"}}}}}}]}}"#
         )
     }
 
@@ -3103,7 +3103,7 @@ mod tests {
             &reader,
             &applied,
             &QueueMessage {
-                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/b.parquet"}}}]}"#.into(),
+                body: r#"{"Records":[{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/b.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-mixed-inflight".into(),
             },
         )
@@ -3170,7 +3170,7 @@ mod tests {
             &reader,
             &applied_mutex([]),
             &QueueMessage {
-                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
+                body: r#"{"Records":[{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-twice".into(),
             },
         )
@@ -3259,7 +3259,7 @@ mod tests {
             &reader,
             &applied_mutex([]),
             &QueueMessage {
-                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"other-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
+                body: r#"{"Records":[{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"other-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-bucket".into(),
             },
         )
@@ -4236,7 +4236,7 @@ mod tests {
             &reader,
             &applied_mutex([]),
             &QueueMessage {
-                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"other/b.parquet"}}}]}"#.into(),
+                body: r#"{"Records":[{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventSource":"aws:s3","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"other/b.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-mixed".into(),
             },
         )

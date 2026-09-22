@@ -112,6 +112,21 @@ fn is_s3_test_event(value: &Value) -> bool {
 }
 
 fn parse_s3_record(record: &Value) -> Result<S3ObjectEvent, ParseError> {
+    // Direct S3→SQS and SNS-unwrapped S3 records set `eventSource` to
+    // `aws:s3`. A Records body from another service that happens to carry
+    // `s3.bucket` / `s3.object` is not an S3 object event.
+    match record
+        .get("eventSource")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some("aws:s3") => {}
+        other => {
+            return Err(ParseError::Unrecognized {
+                detail: s3_record_source_error_detail(other),
+            });
+        }
+    }
     let event_name = record
         .get("eventName")
         .and_then(Value::as_str)
@@ -192,6 +207,13 @@ fn eventbridge_source_error_detail(source: Option<&str>) -> String {
     }
 }
 
+fn s3_record_source_error_detail(source: Option<&str>) -> String {
+    match source.filter(|got| !got.is_empty()) {
+        Some(got) => format!("S3 record `eventSource` must be `aws:s3`, not '{got}'"),
+        None => "S3 record `eventSource` must be `aws:s3`".to_string(),
+    }
+}
+
 #[must_use]
 pub fn event_kind(event_name: &str) -> ObjectEventKind {
     let name = event_name.to_ascii_lowercase();
@@ -254,6 +276,7 @@ mod tests {
 
     const S3_PUT_BODY: &str = r#"{
         "Records": [{
+            "eventSource": "aws:s3",
             "eventName": "ObjectCreated:Put",
             "s3": {
                 "bucket": {"name": "my-bucket"},
@@ -264,7 +287,7 @@ mod tests {
 
     const SNS_WRAPPED: &str = r#"{
         "Type": "Notification",
-        "Message": "{\"Records\":[{\"eventName\":\"ObjectCreated:CompleteMultipartUpload\",\"s3\":{\"bucket\":{\"name\":\"my-bucket\"},\"object\":{\"key\":\"events/part.parquet\"}}}]}"
+        "Message": "{\"Records\":[{\"eventSource\":\"aws:s3\",\"eventName\":\"ObjectCreated:CompleteMultipartUpload\",\"s3\":{\"bucket\":{\"name\":\"my-bucket\"},\"object\":{\"key\":\"events/part.parquet\"}}}]}"
     }"#;
 
     const EVENTBRIDGE_CREATED: &str = r#"{
@@ -364,6 +387,61 @@ mod tests {
                 "events/"
             ),
             "object key `events` is not under prefix `events/`"
+        );
+    }
+
+    #[test]
+    fn parse_records_rejects_non_s3_event_source() {
+        let err = parse_notification_body(
+            r#"{
+                "Records": [{
+                    "eventSource": "aws:sns",
+                    "eventName": "ObjectCreated:Put",
+                    "s3": {
+                        "bucket": {"name": "my-bucket"},
+                        "object": {"key": "events/a.parquet"}
+                    }
+                }]
+            }"#,
+        )
+        .expect_err("non-S3 Records eventSource must fail closed");
+        assert!(matches!(err, ParseError::Unrecognized { .. }));
+        assert_eq!(
+            s3_record_source_error_detail(Some("aws:sns")),
+            "S3 record `eventSource` must be `aws:s3`, not 'aws:sns'"
+        );
+        assert!(
+            err.to_string().contains("`eventSource`") && err.to_string().contains("`aws:s3`"),
+            "error must name the required Records eventSource, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("events/a.parquet"),
+            "error must not treat a non-S3 Records body as an object event, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_records_rejects_missing_event_source() {
+        let err = parse_notification_body(
+            r#"{
+                "Records": [{
+                    "eventName": "ObjectCreated:Put",
+                    "s3": {
+                        "bucket": {"name": "my-bucket"},
+                        "object": {"key": "events/a.parquet"}
+                    }
+                }]
+            }"#,
+        )
+        .expect_err("missing Records eventSource must fail closed");
+        assert!(matches!(err, ParseError::Unrecognized { .. }));
+        assert_eq!(
+            s3_record_source_error_detail(None),
+            "S3 record `eventSource` must be `aws:s3`"
+        );
+        assert!(
+            err.to_string().contains("`eventSource`") && err.to_string().contains("`aws:s3`"),
+            "error must name the required Records eventSource, got: {err}"
         );
     }
 
