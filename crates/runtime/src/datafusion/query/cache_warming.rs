@@ -53,6 +53,7 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
 use crate::accelerated::AcceleratedTable;
+use crate::accelerated::RefreshCompletion;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::datafusion::DataFusion;
 
@@ -468,10 +469,7 @@ impl DataFusion {
             ) else {
                 continue;
             };
-            let mode = table.refresher().refresh_mode().await;
-            if matches!(mode, RefreshMode::Full | RefreshMode::Append)
-                && !table.refresher().initial_load_completed()
-            {
+            if !first_full_or_append_refresh_settled(table).await {
                 return false;
             }
         }
@@ -542,6 +540,29 @@ impl DataFusion {
         )
         .await
     }
+}
+
+/// Whether warmup may start for this accelerated table.
+///
+/// Full/Append wait for a per-process refresh completion recorded after
+/// cache invalidation. The reusable `initial_load_completed` flag is not
+/// enough: checkpoint-backed tables publish it at construction, before this
+/// process's startup refresh (if any) has run.
+async fn first_full_or_append_refresh_settled(table: &AcceleratedTable) -> bool {
+    first_full_or_append_refresh_settled_for(
+        table.refresher().refresh_mode().await,
+        table.refresher().refresh_completion().as_ref(),
+    )
+}
+
+fn first_full_or_append_refresh_settled_for(
+    mode: RefreshMode,
+    completion: Option<&RefreshCompletion>,
+) -> bool {
+    if !matches!(mode, RefreshMode::Full | RefreshMode::Append) {
+        return true;
+    }
+    completion.is_none_or(RefreshCompletion::has_recorded)
 }
 
 /// Replay one parameterized template from streamed DISTINCT rows.
@@ -649,7 +670,9 @@ mod tests {
     use super::super::warmup_plan::{WarmupBinding, WarmupTemplate};
     use super::MAX_WARMUP_PLANS;
     use crate::{
+        accelerated::RefreshCompletion,
         builder::RuntimeBuilder,
+        component::dataset::acceleration::RefreshMode,
         datafusion::query::{QueryBuilder as QBuilder, ResultsCacheMode},
         status,
     };
@@ -1373,5 +1396,45 @@ mod tests {
             "draining a multi-batch warmup stream must still store the result"
         );
         let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn warmup_waits_on_per_process_completion_not_reusable_flag() {
+        let completion = RefreshCompletion::new();
+        assert!(
+            !first_full_or_append_refresh_settled_for(RefreshMode::Full, Some(&completion)),
+            "Full must wait for this process's refresh completion, even when the reusable flag is already true"
+        );
+        assert!(
+            !first_full_or_append_refresh_settled_for(RefreshMode::Append, Some(&completion)),
+            "Append must wait for this process's refresh completion"
+        );
+        assert!(
+            first_full_or_append_refresh_settled_for(RefreshMode::Changes, Some(&completion)),
+            "Changes is not a warmup gate"
+        );
+        assert!(
+            first_full_or_append_refresh_settled_for(RefreshMode::Caching, Some(&completion)),
+            "Caching is not a warmup gate"
+        );
+
+        completion.record_untriggered();
+        assert!(
+            first_full_or_append_refresh_settled_for(RefreshMode::Full, Some(&completion)),
+            "Disabled startup (no scheduled refresh) must release warmup"
+        );
+
+        let recorded = RefreshCompletion::new();
+        let id = recorded.issue();
+        recorded.record(id);
+        assert!(
+            first_full_or_append_refresh_settled_for(RefreshMode::Full, Some(&recorded)),
+            "a recorded refresh after invalidation must release warmup"
+        );
+
+        assert!(
+            first_full_or_append_refresh_settled_for(RefreshMode::Full, None),
+            "a table with no completion signal cannot be waited on"
+        );
     }
 }

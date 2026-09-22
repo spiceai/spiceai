@@ -833,6 +833,14 @@ impl Refresher {
                         "Skipped refresh for {}: existing acceleration is available",
                         self.dataset_name
                     );
+                    // No scheduled refresh this process. Answer the initial-load
+                    // question so callers (results-cache warmup) do not wait for
+                    // a completion that will never be recorded. Do not close():
+                    // a later manual trigger still has to answer its own `next`
+                    // waiter.
+                    if let Some(completion) = &self.refresh_completion {
+                        completion.record_untriggered();
+                    }
                     None
                 }
                 NextRefresh::WaitFor(duration) => {
@@ -1310,11 +1318,11 @@ fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
 /// After a refresh task finishes: invalidate cached results, then publish
 /// `initial_load_completed`, then record the completion.
 ///
-/// Results-cache warmup polls that flag after the first full/append refresh.
-/// Publishing the flag before invalidation lets warmup store entries this
-/// callback then evicts, so readiness is released on an empty cache. The flag
-/// still precedes `record_done`, so a waiter woken by the completion observes
-/// the initial load as done — the same pairing as `RefreshTask::signal_dataset_ready`.
+/// Results-cache warmup waits on the completion recorded here after the first
+/// full/append refresh. Publishing the flag before invalidation would let a
+/// poller of that flag store entries this callback then evicts. The flag still
+/// precedes `record_done`, so a waiter woken by the completion observes the
+/// initial load as done — the same pairing as `RefreshTask::signal_dataset_ready`.
 async fn after_refresh_task_completed(
     refresh_succeeded: bool,
     initial_load_completed: &AtomicBool,
@@ -1379,7 +1387,9 @@ mod tests {
 
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
+    use cache::QueryResultsCacheProvider;
     use runtime_status as status;
+    use spicepod::component::caching::SQLResultsCacheConfig;
 
     use super::*;
 
@@ -1871,6 +1881,273 @@ mod tests {
             entered,
             refresh_handle,
         )
+    }
+
+    fn results_cache() -> Arc<QueryResultsCacheProvider> {
+        Arc::new(
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid results cache"),
+        )
+    }
+
+    async fn store_warmup_entry(cache: &QueryResultsCacheProvider, table: &str, key: u64) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        cache
+            .put_raw_key(
+                &cache::key::RawCacheKey::new(key),
+                cache::result::query::CachedQueryResult::new_raw(
+                    vec![RecordBatch::new_empty(Arc::clone(&schema))],
+                    schema,
+                    Arc::new(std::collections::HashSet::from([TableReference::bare(
+                        table,
+                    )])),
+                    std::time::Instant::now(),
+                    std::time::Instant::now(),
+                ),
+            )
+            .await
+            .expect("store warmup entry");
+    }
+
+    async fn warmup_entry_present(cache: &QueryResultsCacheProvider, key: u64) -> bool {
+        cache.run_pending_tasks().await;
+        cache
+            .get_raw_key(&cache::key::RawCacheKey::new(key))
+            .await
+            .expect("read warmup entry")
+            .is_some()
+    }
+
+    /// Checkpoint-backed Full table whose startup refresh is held in the
+    /// source scan, with a results cache attached so invalidation is observable.
+    ///
+    /// The `Caching` `Arc` must stay alive: the refresher holds only a `Weak`
+    /// and skips invalidation when it cannot upgrade.
+    async fn started_gated_checkpoint_always_refresher() -> (
+        Arc<Refresher>,
+        RefreshCompletion,
+        watch::Sender<bool>,
+        Arc<QueryResultsCacheProvider>,
+        Arc<Caching>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("source batch builds");
+        let open = watch::Sender::new(false);
+        let entered = watch::Sender::new(0);
+        let source = Arc::new(GatedSource {
+            inner: Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("source table builds"),
+            ),
+            open: open.clone(),
+            entered: entered.clone(),
+        });
+        let federated = Arc::new(FederatedTable::new_unchecked(source));
+        let accelerator =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("accelerator table builds"))
+                as Arc<dyn TableProvider>;
+
+        let cache = results_cache();
+        let caching = Arc::new(Caching::new().with_results_cache(Arc::clone(&cache)));
+        let refresh_completion = RefreshCompletion::new();
+        let mut refresher = Refresher::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("orders"),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.with_refresh_completion(refresh_completion.clone());
+        refresher.caching(&Some(Arc::clone(&caching)));
+        refresher.checkpointer(Some(MockCheckpointer::new_arc(
+            true,
+            Some(SystemTime::now()),
+        )));
+        refresher.refresh_on_startup(RefreshOnStartup::Always);
+        refresher.set_initial_load_completed(true);
+
+        let mut entered_rx = entered.subscribe();
+        let (_trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+        let refresh_handle = refresher
+            .start(AccelerationRefreshMode::Full(receiver))
+            .await
+            .expect("refresh task starts");
+        timeout(Duration::from_secs(5), entered_rx.changed())
+            .await
+            .expect("Always + checkpoint must start a refresh that reaches the source")
+            .expect("the source outlives the scan");
+
+        (
+            Arc::new(refresher),
+            refresh_completion,
+            open,
+            cache,
+            caching,
+            refresh_handle,
+        )
+    }
+
+    /// Reproduction for warmup vs checkpoint-backed startup refresh: the
+    /// reusable `initial_load_completed` flag is already true, so a poller
+    /// that waits on it stores while this process's first refresh is still
+    /// in flight; that refresh then invalidates the warmed entry.
+    #[tokio::test]
+    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_invalidation() {
+        const WARMUP_KEY: u64 = 7;
+        let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
+            started_gated_checkpoint_always_refresher().await;
+
+        assert!(
+            refresher.initial_load_completed(),
+            "checkpoint-backed tables publish the reusable flag at construction"
+        );
+        assert_eq!(
+            refresh_completion.completed_requests(),
+            0,
+            "this process has not completed a refresh yet"
+        );
+
+        store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
+        assert!(
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "warmup that trusted the reusable flag stored before this refresh finished"
+        );
+
+        open.send_replace(true);
+        timeout(Duration::from_secs(5), refresh_completion.any().wait())
+            .await
+            .expect("the gated startup refresh completes after the source opens");
+
+        assert!(
+            !warmup_entry_present(&cache, WARMUP_KEY).await,
+            "the startup refresh must invalidate entries stored while it was in flight"
+        );
+
+        drop(refresh_handle);
+    }
+
+    /// The wait warmup must use: a store after the per-process completion
+    /// cannot be evicted by that same refresh, because invalidation already
+    /// ran.
+    #[tokio::test]
+    async fn warmup_store_after_refresh_completion_survives_startup_invalidation() {
+        const WARMUP_KEY: u64 = 11;
+        let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
+            started_gated_checkpoint_always_refresher().await;
+
+        assert!(
+            refresher.initial_load_completed(),
+            "the reusable flag is already true for a checkpoint-backed table"
+        );
+        assert!(
+            !refresh_completion.has_recorded(),
+            "this process's startup refresh has not finished"
+        );
+
+        open.send_replace(true);
+        timeout(Duration::from_secs(5), refresh_completion.any().wait())
+            .await
+            .expect("the gated startup refresh completes after the source opens");
+        assert!(
+            refresh_completion.has_recorded(),
+            "any() and has_recorded must agree after the refresh"
+        );
+
+        store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
+        assert!(
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "a store after the completion is recorded must survive that refresh's invalidation"
+        );
+
+        drop(refresh_handle);
+    }
+
+    /// Full + checkpoint + Auto + no interval schedules no refresh. Warmup
+    /// waiting on `any()` must not hang, and a later `next` waiter must still
+    /// wait for a manual trigger.
+    #[tokio::test]
+    async fn disabled_startup_answers_any_without_closing_next() {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("source batch builds");
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("source table builds"),
+        )));
+        let accelerator =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("accelerator table builds"))
+                as Arc<dyn TableProvider>;
+
+        let refresh_completion = RefreshCompletion::new();
+        let mut refresher = Refresher::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("orders"),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.with_refresh_completion(refresh_completion.clone());
+        refresher.checkpointer(Some(MockCheckpointer::new_arc(
+            true,
+            Some(SystemTime::now()),
+        )));
+        refresher.refresh_on_startup(RefreshOnStartup::Auto);
+        refresher.set_initial_load_completed(true);
+
+        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+        let refresh_handle = refresher
+            .start(AccelerationRefreshMode::Full(receiver))
+            .await
+            .expect("refresh task starts");
+
+        timeout(Duration::from_secs(2), refresh_completion.any().wait())
+            .await
+            .expect("Disabled startup must answer any() so warmup cannot hang");
+        assert!(
+            refresh_completion.has_recorded(),
+            "record_untriggered must satisfy the initial-load poll"
+        );
+
+        let next = refresh_completion.next();
+        let _ = timeout(Duration::from_millis(200), next.wait())
+            .await
+            .expect_err("a later next() waiter must still wait for a manual trigger");
+
+        let next = refresh_completion.next();
+        trigger
+            .send(None)
+            .await
+            .expect("manual trigger is accepted");
+        timeout(Duration::from_secs(5), next.wait())
+            .await
+            .expect("a manual trigger after Disabled startup must still answer next()");
+
+        drop(refresh_handle);
     }
 
     /// Poll `initial_load_completed` rather than sleeping, so the refresh is

@@ -181,6 +181,20 @@ impl RefreshCompletion {
         self.waiter(true)
     }
 
+    /// Whether [`RefreshCompletion::any`] is already answered: a refresh has
+    /// been recorded since the table was built, or the signal was closed
+    /// because no refresh will run here.
+    ///
+    /// Results-cache warmup uses this instead of the reusable
+    /// `initial_load_completed` flag, which checkpoint-backed tables publish
+    /// at construction — before this process's first Full/Append refresh (if
+    /// any) has invalidated cached results.
+    #[must_use]
+    pub fn has_recorded(&self) -> bool {
+        let state = self.state.borrow();
+        state.closed || state.completed > 0
+    }
+
     /// The highest request id recorded complete so far.
     ///
     /// Test-only: it lets a test assert that the refresh it is holding open has
@@ -487,6 +501,35 @@ mod tests {
         let _ = timeout(SHORT, completion.any().wait())
             .await
             .expect_err("no completion has been recorded, so there is nothing to observe");
+    }
+
+    #[test]
+    fn has_recorded_is_false_until_a_completion_or_close() {
+        let completion = RefreshCompletion::new();
+        assert!(
+            !completion.has_recorded(),
+            "a new table has not completed a refresh"
+        );
+
+        record_one(&completion);
+        assert!(
+            completion.has_recorded(),
+            "a recorded refresh must answer the initial-load poll"
+        );
+
+        let closed = RefreshCompletion::new();
+        closed.close();
+        assert!(
+            closed.has_recorded(),
+            "closing is an answer that no refresh will run here"
+        );
+
+        let untriggered = RefreshCompletion::new();
+        untriggered.record_untriggered();
+        assert!(
+            untriggered.has_recorded(),
+            "an untriggered completion answers the initial-load poll without closing"
+        );
     }
 
     /// A request that has been issued but not completed is not a completion, so
