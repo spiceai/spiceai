@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
 
@@ -48,6 +49,7 @@ pub mod result;
 pub use backend::CacheBackend;
 pub use backend::CacheBackendBuilder;
 pub use backend::MokaBackend;
+pub use backend::SpiceBackend;
 
 #[cfg(feature = "pingora")]
 pub use backend::PingoraBackend;
@@ -129,6 +131,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// <https://github.com/spiceai/spiceai/issues/12931> reported.
 pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
+
+    /// Whether replacing this value in the store should keep the entry's
+    /// remaining TTL rather than starting a new one.
+    ///
+    /// Used when rewriting a resident results-cache entry in place (recording
+    /// a decode hit, or promoting Encoded → Raw): the payload is the same
+    /// result, so extending its life would make a hit reset `item_ttl`. New
+    /// results (a miss store, a revalidation) leave this `false`.
+    fn keep_remaining_ttl(&self) -> bool {
+        false
+    }
 }
 
 impl Sizeable for Vec<Vec<f32>> {
@@ -211,7 +224,7 @@ pub(crate) fn invalidated_table_name(table_ref: &TableReference) -> Arc<str> {
 pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
     HashProvider + std::fmt::Debug + std::fmt::Display
 {
-    async fn get_raw_key(&self, key: &u64) -> Option<V>;
+    async fn get_raw_key(&self, key: &u64) -> Option<std::sync::Arc<V>>;
     /// Looks up `key`, treating a value that `is_valid` rejects as a miss —
     /// including for hit/miss metrics, so the hit ratio reflects results
     /// actually served rather than entries merely found.
@@ -224,8 +237,16 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         &self,
         key: &u64,
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
-    ) -> Option<V>;
+    ) -> Option<std::sync::Arc<V>>;
     async fn put_raw_key(&self, key: &u64, value: V);
+    /// Replace the value at `key` only when `should_replace` accepts the
+    /// currently stored value. See [`crate::backend::CacheBackend::replace_if`].
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool;
     async fn invalidate_all(&self);
     async fn size_bytes(&self) -> u64;
     async fn item_count(&self) -> u64;
@@ -248,6 +269,21 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
     ///
     /// If the cache invalidation fails.
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
+
+    /// Returns `true` if any of `tables` was invalidated at or after `since`.
+    ///
+    /// Deliberately has no default. A provider without a table-change clock
+    /// would inherit `false`, and `false` here is the answer that *serves* a
+    /// result — `SearchEngine::search_with_cache` asks this both before
+    /// serving a hit and before publishing a completed search, so a silent
+    /// `false` is a stale result served rather than a missing optimisation.
+    /// Requiring the method makes wiring such a provider into the search path
+    /// a compile error instead.
+    fn tables_changed_since(
+        &self,
+        tables: &HashSet<TableReference>,
+        since: std::time::Instant,
+    ) -> bool;
 }
 
 #[derive(Clone)]
@@ -262,18 +298,109 @@ pub enum HashBuilder {
 }
 
 impl std::hash::BuildHasher for HashBuilder {
-    type Hasher = Box<dyn Hasher + Send + Sync + 'static>;
+    type Hasher = KeyHasher;
 
     fn build_hasher(&self) -> Self::Hasher {
         match self {
-            HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::Blake3 => Box::new(blake3_compat::Blake3Wrapper::new()),
-            HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
+            HashBuilder::Ahash(builder) => KeyHasher::Ahash(builder.build_hasher()),
+            HashBuilder::Siphash(builder) => KeyHasher::Siphash(builder.build_hasher()),
+            HashBuilder::Blake3 => KeyHasher::Blake3(Box::new(blake3_compat::Blake3Wrapper::new())),
+            HashBuilder::XxHash3(builder) => KeyHasher::XxHash3(builder.build_hasher()),
+            HashBuilder::XxHash32(builder) => KeyHasher::XxHash32(builder.build_hasher()),
+            HashBuilder::XxHash64(builder) => KeyHasher::XxHash64(builder.build_hasher()),
+            HashBuilder::XxHash128 => {
+                KeyHasher::XxHash128(xxhash_compat::XxHash3_128Wrapper::new())
+            }
         }
+    }
+}
+
+/// Concrete hasher for [`HashBuilder`].
+///
+/// `HashBuilder` is already an enum; boxing the hasher it builds was what
+/// turned every plan-node write into a virtual call plus a heap allocation.
+/// Match dispatch keeps each algorithm's write path — including `ahash`'s
+/// integer folding — so a plan key is the same value as hashing the plan
+/// write by write.
+pub enum KeyHasher {
+    Ahash(ahash::AHasher),
+    Siphash(std::collections::hash_map::DefaultHasher),
+    Blake3(Box<blake3_compat::Blake3Wrapper>),
+    XxHash3(twox_hash::XxHash3_64),
+    XxHash32(twox_hash::XxHash32),
+    XxHash64(twox_hash::XxHash64),
+    XxHash128(xxhash_compat::XxHash3_128Wrapper),
+}
+
+macro_rules! dispatch_key_hasher {
+    ($self:expr, $method:ident $(, $arg:expr)* $(,)?) => {
+        match $self {
+            Self::Ahash(hasher) => hasher.$method($($arg),*),
+            Self::Siphash(hasher) => hasher.$method($($arg),*),
+            Self::Blake3(hasher) => hasher.$method($($arg),*),
+            Self::XxHash3(hasher) => hasher.$method($($arg),*),
+            Self::XxHash32(hasher) => hasher.$method($($arg),*),
+            Self::XxHash64(hasher) => hasher.$method($($arg),*),
+            Self::XxHash128(hasher) => hasher.$method($($arg),*),
+        }
+    };
+}
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        dispatch_key_hasher!(self, finish)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        dispatch_key_hasher!(self, write, bytes);
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        dispatch_key_hasher!(self, write_u8, i);
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        dispatch_key_hasher!(self, write_u16, i);
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        dispatch_key_hasher!(self, write_u32, i);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        dispatch_key_hasher!(self, write_u64, i);
+    }
+
+    fn write_u128(&mut self, i: u128) {
+        dispatch_key_hasher!(self, write_u128, i);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        dispatch_key_hasher!(self, write_usize, i);
+    }
+
+    fn write_i8(&mut self, i: i8) {
+        dispatch_key_hasher!(self, write_i8, i);
+    }
+
+    fn write_i16(&mut self, i: i16) {
+        dispatch_key_hasher!(self, write_i16, i);
+    }
+
+    fn write_i32(&mut self, i: i32) {
+        dispatch_key_hasher!(self, write_i32, i);
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        dispatch_key_hasher!(self, write_i64, i);
+    }
+
+    fn write_i128(&mut self, i: i128) {
+        dispatch_key_hasher!(self, write_i128, i);
+    }
+
+    fn write_isize(&mut self, i: isize) {
+        dispatch_key_hasher!(self, write_isize, i);
     }
 }
 
@@ -447,10 +574,11 @@ impl Caching {
         Ok(())
     }
 
-    /// Drives moka housekeeping on every configured cache. `moka::future::Cache`
-    /// has no background maintenance thread, so invalidation predicates and
-    /// expired entries on a cache with no `get`/`insert` traffic are only
-    /// reclaimed when this runs.
+    /// Drives housekeeping on every configured cache. SQL results expire stale
+    /// entries via `run_pending_tasks` (Spice shard walk on the blocking pool)
+    /// and then refresh size gauges. Plans, search, and embeddings run
+    /// `checkpoint`. Expired entries on a cache with no `get`/`insert` traffic
+    /// are only reclaimed when this runs.
     pub async fn run_pending_maintenance(&self) {
         // The interner pools are reclaimed here rather than by the runtime,
         // because this crate is the only thing that populates them: every value
@@ -519,7 +647,7 @@ impl Caching {
 /// self-healing (later changes repopulate per-table entries), at the cost
 /// of some lost cache entries in the moments after a collapse.
 #[derive(Default)]
-struct TableChangeClock {
+pub(crate) struct TableChangeClock {
     state: parking_lot::RwLock<TableChangeState>,
 }
 
@@ -530,7 +658,7 @@ struct TableChangeClock {
 const MAX_TRACKED_TABLES: usize = 4096;
 
 #[derive(Default)]
-struct TableChangeState {
+pub(crate) struct TableChangeState {
     changed_at: std::collections::HashMap<u64, std::time::Instant>,
     /// Stands in for every table dropped from `changed_at`. Holds the
     /// newest instant among the dropped entries, which is `>=` the true
@@ -550,10 +678,12 @@ impl TableChangeClock {
     /// with `a`/`b.c`. A hash collision between two genuinely different tables
     /// would only ever *reject* a cacheable result, never serve a stale one.
     fn resolved_key(table_ref: &TableReference) -> u64 {
-        use std::hash::{BuildHasher, Hasher};
+        use std::hash::Hasher;
 
-        let mut hasher =
-            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default().build_hasher();
+        // `XxHash64` keeps its state inline, where the streaming `XxHash3_64`
+        // allocates it, and this runs for every table on every cache hit. The key
+        // only has to agree with itself within this process.
+        let mut hasher = twox_hash::XxHash64::with_seed(0);
         for component in [
             table_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG),
             table_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA),
@@ -565,7 +695,7 @@ impl TableChangeClock {
         hasher.finish()
     }
 
-    fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
+    pub(crate) fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
         let key = Self::resolved_key(table_ref);
         let mut state = self.state.write();
 
@@ -575,7 +705,14 @@ impl TableChangeClock {
             state.changed_at.clear();
         }
 
-        state.changed_at.insert(key, at);
+        // Callers sample `at` before this lock. An earlier invalidation can
+        // therefore land last and must not rewind a newer mark — that would
+        // let a read started between the two stamps pass `changed_since`.
+        state
+            .changed_at
+            .entry(key)
+            .and_modify(|recorded| *recorded = (*recorded).max(at))
+            .or_insert(at);
     }
 
     /// Returns the newest instant at which any of `tables` changed, or
@@ -612,7 +749,7 @@ impl TableChangeClock {
     /// Ties count as changed: a change recorded in the same instant
     /// as the read began must be assumed to have happened first, since serving
     /// stale data is worse than losing a cache entry.
-    fn changed_since<S: std::hash::BuildHasher>(
+    pub(crate) fn changed_since<S: std::hash::BuildHasher>(
         &self,
         tables: &HashSet<TableReference, S>,
         since: std::time::Instant,
@@ -674,6 +811,11 @@ pub struct QueryResultsCacheProvider {
     encoder: Option<Arc<dyn encoding::Encoder>>,
     encoding: spicepod::component::caching::Encoding,
     hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
+    /// The builder the results-cache keys are hashed with. Kept beside the
+    /// store so [`Self::hasher`] can return a [`KeyHasher`] without boxing
+    /// through [`HashProvider`] — `ahash` / siphash keys are keyed from this
+    /// instance, not a fresh [`get_hash_builder`] call.
+    hash_builder: HashBuilder,
     table_changes: TableChangeClock,
 }
 
@@ -731,7 +873,7 @@ impl QueryResultsCacheProvider {
         let cache = Arc::new(LruCache::new(
             cache_max_size,
             cache_ttl,
-            hash_builder,
+            hash_builder.clone(),
             config.caching_policy,
             config.engine,
         ));
@@ -747,6 +889,7 @@ impl QueryResultsCacheProvider {
             encoder,
             encoding: config.encoding,
             hashing_algorithm: config.hashing_algorithm,
+            hash_builder,
             table_changes: TableChangeClock::default(),
         };
 
@@ -757,7 +900,7 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
-        let raw_key = key.as_raw_key(self.cache.hasher());
+        let raw_key = key.as_raw_key(self.hasher());
         self.get_raw_key(&raw_key).await
     }
 
@@ -839,7 +982,7 @@ impl QueryResultsCacheProvider {
         let validity = EntryValidity::from_u8(observed.load(std::sync::atomic::Ordering::Relaxed));
 
         if let Some(result) = result {
-            Some((result, validity))
+            Some((std::sync::Arc::unwrap_or_clone(result), validity))
         } else {
             let reason = match validity {
                 // Nothing the clock ruled on; the key simply was not there.
@@ -866,7 +1009,7 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn put(&self, key: CacheKey<'_>, result: CachedQueryResult) -> Result<()> {
-        let raw_key = key.as_raw_key(self.cache.hasher());
+        let raw_key = key.as_raw_key(self.hasher());
         self.put_raw_key(&raw_key, result).await
     }
 
@@ -880,6 +1023,97 @@ impl QueryResultsCacheProvider {
     ) -> Result<()> {
         let res = self.cache.put_raw_key(&raw_key.as_u64(), result).await;
         Ok(res)
+    }
+
+    /// Decode `result` for serving. The first successful decode of an encoded
+    /// entry leaves it encoded, so a one-shot key does not inflate to Raw. The
+    /// second successful decode replaces the stored value with
+    /// [`result::query::CachedData::Raw`] so a later fetch of `raw_key` is an
+    /// `Arc::clone` and the weigher bills the decoded size.
+    ///
+    /// Concurrent `records()` on one fetch share a decode (`OnceCell`). The
+    /// stored cell is cleared after the first hit so the second fetch decodes
+    /// again. The replace is skipped when a newer result already occupies the
+    /// key, or when the decoded size would not fit `max_size`. That last case
+    /// keeps the encoded bytes so the entry is not evicted by the promotion
+    /// itself, and rewrites the stored value with a fresh empty decode cell so
+    /// the decoded batches (still held by the returned `Arc`) are not retained
+    /// off-budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding fails.
+    pub async fn records(
+        &self,
+        raw_key: &RawCacheKey,
+        result: &CachedQueryResult,
+    ) -> std::result::Result<crate::result::query::CachedBatches, encoding::Error> {
+        let records = result.records().await?;
+        self.after_encoded_decode(raw_key, result, &records).await;
+        Ok(records)
+    }
+
+    async fn after_encoded_decode(
+        &self,
+        raw_key: &RawCacheKey,
+        result: &CachedQueryResult,
+        records: &crate::result::query::CachedBatches,
+    ) {
+        match result.encoded_decode_hits() {
+            Some(0) => {
+                let recorded = result.with_recorded_decode_hit();
+                self.cache
+                    .replace_if(
+                        &raw_key.as_u64(),
+                        recorded,
+                        &|current: &CachedQueryResult| {
+                            current.is_same_generation(result)
+                                && current.encoded_decode_hits() == Some(0)
+                        },
+                    )
+                    .await;
+            }
+            Some(1) => self.promote_encoded_to_raw(raw_key, result, records).await,
+            _ => {}
+        }
+    }
+
+    async fn promote_encoded_to_raw(
+        &self,
+        raw_key: &RawCacheKey,
+        result: &CachedQueryResult,
+        records: &crate::result::query::CachedBatches,
+    ) {
+        let promoted = result.to_promoted_raw(Arc::clone(records));
+        let promoted_size = u64::try_from(promoted.get_memory_size()).unwrap_or(u64::MAX);
+        if promoted_size > self.cache_max_size {
+            tracing::debug!(
+                promoted_size,
+                cache_max_size = self.cache_max_size,
+                "Skipping encoded-to-raw promotion because the decoded entry exceeds cache max size"
+            );
+            // Keep the encoded payload (promotion must not evict the only
+            // copy) and the caller's served `Arc`, but drop the stored
+            // decode cell so `memory_size()` is not under-billing resident
+            // decoded batches.
+            let reset = result.with_cleared_decode_cell();
+            self.cache
+                .replace_if(&raw_key.as_u64(), reset, &|current: &CachedQueryResult| {
+                    current.is_same_generation(result) && current.encoded_decode_hits() == Some(1)
+                })
+                .await;
+            return;
+        }
+
+        self.cache
+            .replace_if(
+                &raw_key.as_u64(),
+                promoted,
+                &|current: &CachedQueryResult| {
+                    current.is_same_generation(result) && current.encoded_decode_hits() == Some(1)
+                },
+            )
+            .await;
     }
 
     /// # Errors
@@ -1039,8 +1273,8 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn hasher(&self) -> Box<dyn Hasher> {
-        self.cache.hasher()
+    pub fn hasher(&self) -> KeyHasher {
+        self.hash_builder.build_hasher()
     }
 
     #[must_use]
@@ -1079,8 +1313,9 @@ impl QueryResultsCacheProvider {
     }
 
     /// Re-reports the size and item-count gauges from the cache's current
-    /// state. Both accessors drive `moka` housekeeping first, so this reflects
-    /// entries already dropped by invalidation or expiry.
+    /// state. Size and item count read the Spice backend's live counters (no
+    /// expiry scan); call `run_pending_tasks` / `checkpoint` first when the
+    /// gauges should exclude unobserved TTL entries.
     pub async fn report_size_metrics(&self) {
         CachedQueryResult::record_item_count(self.item_count().await);
         CachedQueryResult::record_size(self.size().await);
@@ -1248,6 +1483,29 @@ mod tests {
         );
     }
 
+    /// Both invalidation callers sample `Instant::now()` before the clock
+    /// lock, so an earlier stamp can be written after a later one. The clock
+    /// must keep the newest mark: a read started between those instants has
+    /// to see the later invalidation.
+    #[test]
+    fn table_invalidation_clock_keeps_the_newest_mark() {
+        let clock = TableChangeClock::default();
+        let base = std::time::Instant::now();
+        let earlier = base + std::time::Duration::from_millis(10);
+        let between = base + std::time::Duration::from_millis(15);
+        let later = base + std::time::Duration::from_millis(20);
+        let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+
+        clock.record_change(&TableReference::bare("customer"), later);
+        clock.record_change(&TableReference::bare("customer"), earlier);
+
+        assert!(
+            clock.changed_since(&tables, between),
+            "a later-arriving earlier stamp must not hide an invalidation a read already missed"
+        );
+        assert_eq!(clock.latest_change(&tables), Some(later));
+    }
+
     /// The clock must key tables the same way [`resolved_table_match`] compares
     /// them, so an invalidation written as `foo` still rejects a result that
     /// recorded `spice.public.foo`, and vice versa.
@@ -1383,6 +1641,58 @@ mod tests {
         )
         .await
         .expect("valid cached result")
+    }
+
+    /// Two stores of the same key race, and the *older* result lands last.
+    ///
+    /// No cache engine orders concurrent writes to one key — the store that
+    /// reaches the shard last wins, whichever query started first — so the
+    /// resident entry can be the older of two results. Read-time validation is
+    /// what makes that harmless: the entry carries its own `read_started_at`,
+    /// and an entry whose table changed at or after that instant is never
+    /// served, no matter which store deposited it.
+    #[tokio::test]
+    async fn get_raw_key_rejects_an_older_generation_that_overwrote_a_newer_one() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        let key = RawCacheKey::new(42);
+
+        // Query A starts, reading `customer`.
+        let old_read_started_at = Instant::now();
+        // `customer` changes while A is still running.
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        // Query B starts after the change and stores first.
+        let new_read_started_at = Instant::now();
+
+        provider
+            .put_raw_key(
+                &key,
+                cached_result_for("customer", new_read_started_at).await,
+            )
+            .await
+            .expect("cache access should succeed");
+        // A's older result lands last and overwrites B's.
+        provider
+            .put_raw_key(
+                &key,
+                cached_result_for("customer", old_read_started_at).await,
+            )
+            .await
+            .expect("cache access should succeed");
+
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "an older generation that overwrote a newer one must not be servable once its table has changed"
+        );
     }
 
     /// A result stored *after* its table was invalidated must never be served.
@@ -1926,5 +2236,470 @@ mod tests {
         (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
             .then_some(())
             .expect("cache should be disabled for COPY");
+    }
+
+    async fn encoded_counting_result(
+        rows: usize,
+    ) -> (
+        CachedQueryResult,
+        Arc<std::sync::atomic::AtomicUsize>,
+        arrow::datatypes::SchemaRef,
+    ) {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let values = vec![0i32; rows];
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .expect("batch");
+        let (encoder, decodes) = encoding::CountingEncoder::zstd();
+        let now = Instant::now();
+        let result = CachedQueryResult::from_batches(
+            vec![batch],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+            Some(encoder),
+        )
+        .await
+        .expect("encoded result");
+        (result, decodes, schema)
+    }
+
+    /// Store encoded → first fetch decodes and stays Encoded → second fetch
+    /// decodes again and promotes → third fetch is Raw and does not decode.
+    #[tokio::test]
+    async fn third_fetch_of_an_encoded_key_is_raw_and_does_not_decode() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(42);
+        let (result, decodes, _) = encoded_counting_result(5_000).await;
+        assert!(result.is_encoded(), "store path must start encoded");
+        let encoded_weight = result.memory_size();
+
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        assert!(first.is_encoded(), "first fetch is still the encoded store");
+        let first_records = provider.records(&key, &first).await.expect("first decode");
+        assert_eq!(first_records[0].num_rows(), 5_000);
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first fetch must decode once"
+        );
+
+        provider.run_pending_tasks().await;
+        let second = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("hit after first decode");
+        assert!(
+            second.is_encoded(),
+            "a one-shot must not inflate to Raw after the first decode"
+        );
+        assert_eq!(second.encoded_decode_hits(), Some(1));
+        let second_records = provider
+            .records(&key, &second)
+            .await
+            .expect("second decode+promote");
+        assert_eq!(second_records[0].num_rows(), 5_000);
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second fetch must decode again before promoting"
+        );
+
+        provider.run_pending_tasks().await;
+        let third = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("hit after promote");
+        assert!(
+            !third.is_encoded(),
+            "the stored entry must be Raw after the second successful decode"
+        );
+        let third_records = provider.records(&key, &third).await.expect("raw path");
+        assert!(
+            Arc::ptr_eq(&second_records, &third_records),
+            "the third fetch must Arc-share the promoted batches"
+        );
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the third fetch must not decode"
+        );
+        assert!(
+            third.memory_size() > encoded_weight,
+            "the weigher must bill the raw size after promotion, got {} then {}",
+            encoded_weight,
+            third.memory_size()
+        );
+        assert!(
+            provider.size().await >= third.memory_size(),
+            "the store's weighted size must reflect the promoted raw entry, got {} vs {}",
+            provider.size().await,
+            third.memory_size()
+        );
+    }
+
+    /// A one-shot key stays encoded after its only decode.
+    #[tokio::test]
+    async fn one_shot_fetch_leaves_the_entry_encoded() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(46);
+        let (result, decodes, _) = encoded_counting_result(1_000).await;
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        let _ = provider.records(&key, &first).await.expect("decode");
+        provider.run_pending_tasks().await;
+
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached");
+        assert!(
+            stored.is_encoded(),
+            "one successful decode must not promote to Raw"
+        );
+        assert_eq!(stored.encoded_decode_hits(), Some(1));
+        assert!(
+            !stored.encoded_has_resident_decode(),
+            "the first hit must replace the stored decode cell so decoded batches are not retained"
+        );
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Concurrent first-wave `records()` on one fetch share a decode and must
+    /// not promote: they are still one hit of a one-shot key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_fetches_leave_the_entry_encoded() {
+        let provider = Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("8MiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..SQLResultsCacheConfig::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let key = RawCacheKey::new(47);
+        let (result, decodes, _) = encoded_counting_result(2_000).await;
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let first = first.clone();
+                tokio::spawn(async move { provider.records(&key, &first).await.expect("decode") })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.expect("task joins"));
+        }
+
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "concurrent first-wave records() must share one decode"
+        );
+        let head = &results[0];
+        for (i, batches) in results.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(head, batches),
+                "concurrent first fetch {i} must Arc-share the winning decode"
+            );
+        }
+
+        provider.run_pending_tasks().await;
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached");
+        assert!(
+            stored.is_encoded(),
+            "a concurrent first wave must not promote to Raw"
+        );
+        assert_eq!(stored.encoded_decode_hits(), Some(1));
+    }
+
+    /// A promotion must not replace a newer result stored under the same key.
+    #[tokio::test]
+    async fn promote_does_not_overwrite_a_newer_generation() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(43);
+        let (first, decodes, _) = encoded_counting_result(1_000).await;
+        provider
+            .put_raw_key(&key, first.clone())
+            .await
+            .expect("put first generation");
+
+        let (newer, _, _) = encoded_counting_result(1_000).await;
+        assert!(
+            !first.is_same_generation(&newer),
+            "the second store is a distinct generation"
+        );
+        provider
+            .put_raw_key(&key, newer.clone())
+            .await
+            .expect("put newer generation");
+
+        // First decode of the stale clone only records a hit, which must not
+        // overwrite the newer generation. A second decode would try to promote.
+        let _ = provider
+            .records(&key, &first)
+            .await
+            .expect("stale clone still decodes");
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let stale_second = first.with_recorded_decode_hit();
+        let _ = provider
+            .records(&key, &stale_second)
+            .await
+            .expect("stale clone's second decode still serves");
+
+        let stored = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        assert!(
+            stored.is_encoded(),
+            "the newer encoded generation must still be stored"
+        );
+        assert!(
+            stored.is_same_generation(&newer),
+            "promotion of the stale clone must not replace the newer result"
+        );
+    }
+
+    /// When decoded size would not fit `max_size`, keep the encoded entry so
+    /// promotion cannot evict the only copy of the result. The served `Arc` is
+    /// kept; the stored decode cell is reset so decoded batches are not
+    /// retained off-budget.
+    #[tokio::test]
+    async fn promote_is_skipped_when_raw_exceeds_max_size() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("4KiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(44);
+        let (result, decodes, schema) = encoded_counting_result(8_000).await;
+        // A separate raw entry of the same shape, so the size check does not
+        // fill this encoded value's decode cell.
+        let now = Instant::now();
+        let raw_probe = CachedQueryResult::new_raw(
+            vec![
+                arrow::array::RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(arrow::array::Int32Array::from(vec![0i32; 8_000]))],
+                )
+                .expect("batch"),
+            ],
+            schema,
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        assert!(
+            raw_probe.memory_size() > 4 * 1024,
+            "fixture must exceed a 4 KiB cache once raw, got {}",
+            raw_probe.memory_size()
+        );
+        assert!(
+            result.memory_size() <= 4 * 1024,
+            "fixture must fit encoded, got {}",
+            result.memory_size()
+        );
+
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded that fits");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        let _ = provider
+            .records(&key, &first)
+            .await
+            .expect("first decode; still encoded");
+
+        provider.run_pending_tasks().await;
+        let second = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached after first hit");
+        assert!(second.is_encoded(), "first hit must not promote");
+        let _ = provider
+            .records(&key, &second)
+            .await
+            .expect("second decode; promote must be skipped");
+
+        provider.run_pending_tasks().await;
+        let third = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached");
+        assert!(
+            third.is_encoded(),
+            "an entry that cannot fit raw must stay encoded rather than be evicted"
+        );
+        assert!(
+            !third.encoded_has_resident_decode(),
+            "skipping promotion must drop the stored decode cell so decoded batches are not retained off-budget"
+        );
+        let third_records = provider.records(&key, &third).await.expect("third hit");
+        assert_eq!(third_records[0].num_rows(), 8_000);
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "hit1 and hit2 each decode; skipping promotion must reset the stored decode cell, so a later fetch decodes again"
+        );
+
+        provider.run_pending_tasks().await;
+        let fourth = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached after a post-skip decode");
+        assert!(fourth.is_encoded(), "still encoded after another skip");
+        assert!(
+            !fourth.encoded_has_resident_decode(),
+            "each skipped promotion must leave the stored decode cell empty"
+        );
+        assert!(
+            fourth.memory_size() <= 4 * 1024,
+            "the weigher must still bill compressed size after a skipped promotion, got {}",
+            fourth.memory_size()
+        );
+    }
+
+    /// A promotion is a reweigh of the same result, so it must not restart
+    /// `item_ttl`. Time itself is under test here.
+    #[tokio::test]
+    async fn promote_does_not_restart_item_ttl() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("250ms".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(45);
+        let (result, _, _) = encoded_counting_result(32).await;
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let first = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still live before promote");
+        let _ = provider.records(&key, &first).await.expect("first decode");
+        provider.run_pending_tasks().await;
+
+        let second = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still live for second decode");
+        assert!(
+            second.is_encoded(),
+            "the first decode must leave the entry encoded"
+        );
+        let _ = provider
+            .records(&key, &second)
+            .await
+            .expect("second decode+promote");
+        provider.run_pending_tasks().await;
+
+        let promoted = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("promoted entry must still be live");
+        assert!(
+            !promoted.is_encoded(),
+            "the entry must be Raw after the second decode"
+        );
+
+        // Original remaining TTL is ~150ms. If promotion restarted a 250ms
+        // TTL, this wait would still leave the entry live.
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+        provider.run_pending_tasks().await;
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("get after original ttl")
+                .is_none(),
+            "promotion must not restart item_ttl"
+        );
     }
 }

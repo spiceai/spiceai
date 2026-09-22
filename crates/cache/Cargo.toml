@@ -29,16 +29,18 @@ moka = { workspace = true, features = ["future"] }
 opentelemetry.workspace = true
 parking_lot.workspace = true
 pingora-lru = { workspace = true, optional = true }
+sharded-cache = { path = "../sharded-cache" }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 twox-hash = { workspace = true }
 # Specification and proof vocabulary for `src/namespace_key.rs`. A normal
 # `cargo build` erases the specifications, so this carries no runtime cost;
 # `cargo verus focus` re-checks the proofs. Pinned to the Verus release whose
 # verifier is run in CI — the two are versioned together. Must match the
-# `vstd` pin in `crates/hash-index/Cargo.toml` and `VERUS_VSTD_VERSION` in
+# `vstd` pin in `crates/hash-index/Cargo.toml` and
+# `crates/sharded-cache/Cargo.toml`, and `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
 vstd = "=0.0.0-2026-08-30-0159"
 
@@ -61,6 +63,14 @@ name = "cache_throughput"
 [[bench]]
 harness = false
 name = "hash_algorithms"
+
+[[bench]]
+harness = false
+name = "cache_hit_costs"
+
+[[bench]]
+harness = false
+name = "engine_bakeoff"
 
 [lints]
 workspace = true

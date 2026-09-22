@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-cast.workspace = true
+arrow-ipc.workspace = true
 # `serde` for the schema JSON encoding in `schema::schema_to_json`, which is a
 # durable on-disk format: declared here rather than inherited from another crate's
 # feature selection, so the encoding cannot lose its impls to a feature change

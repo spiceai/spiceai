@@ -8,16 +8,13 @@ inputs:
   spiced_commit: # optionally override the commit to download
     description: 'spiced build commit'
     required: false
-    type: string
   ref: # optionally override the branch to fetch latest 10 commits from
     description: 'target ref'
     required: false
     default: 'refs/heads/trunk'
-    type: string
   with_odbc: # whether to download the ODBC-enabled binary
     description: 'download the ODBC-enabled spiced binary'
     required: false
-    type: boolean
 outputs:
   spiced_commit:
     value: ${{ steps.output_spiced_commit.outputs.SPICED_COMMIT || steps.output_spiced_commit_windows.outputs.SPICED_COMMIT }}

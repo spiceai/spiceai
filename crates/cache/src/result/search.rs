@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -107,20 +108,34 @@ pub struct CachedSearchResult {
     /// nothing would fail — the entry would simply stop being billed for memory
     /// it privately holds.
     input_tables: Interned<HashSet<TableReference>>,
+    /// When the search that produced this entry began reading its tables.
+    /// Used with [`crate::TableChangeClock`] so a result whose tables were
+    /// invalidated mid-flight cannot publish or serve as a hit afterward.
+    read_started_at: Instant,
 }
 
 impl CachedSearchResult {
     /// Builds an entry, interning the input-table set so entries over the same
     /// tables share one allocation. See [`crate::intern::table_set`].
+    ///
+    /// `read_started_at` must be the instant the search began (before table
+    /// reads), so mid-flight invalidation can reject this entry on put/get.
     #[must_use]
     pub fn new(
         results: Arc<HashMap<TableReference, CachedAggregationResult>>,
         input_tables: Arc<HashSet<TableReference>>,
+        read_started_at: Instant,
     ) -> Self {
         Self {
             results,
             input_tables: crate::intern::table_set::intern(input_tables),
+            read_started_at,
         }
+    }
+
+    #[must_use]
+    pub fn read_started_at(&self) -> Instant {
+        self.read_started_at
     }
 }
 
@@ -198,6 +213,7 @@ mod tests {
                 result.clone(),
             )])),
             Arc::new(HashSet::new()),
+            Instant::now(),
         );
         assert!(
             cached.get_memory_size() * 100 < scan_batch.get_array_memory_size(),
@@ -232,6 +248,7 @@ mod tests {
                 ),
             )])),
             Arc::new(HashSet::from([TableReference::bare("docs")])),
+            Instant::now(),
         )
     }
 
