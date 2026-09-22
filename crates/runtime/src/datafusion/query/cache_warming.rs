@@ -716,11 +716,7 @@ mod tests {
         register_table_partitions(df, name, vec![values]);
     }
 
-    fn register_table_partitions(
-        df: &Arc<DataFusion>,
-        name: &str,
-        partitions: Vec<Vec<i64>>,
-    ) {
+    fn register_table_partitions(df: &Arc<DataFusion>, name: &str, partitions: Vec<Vec<i64>>) {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batches: Vec<Vec<RecordBatch>> = partitions
             .into_iter()
