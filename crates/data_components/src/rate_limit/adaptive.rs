@@ -20,18 +20,24 @@ limitations under the License.
 //! When an origin starts failing or timing out, admitting requests at the
 //! statically-configured rate only makes matters worse. An adaptive controller
 //! watches the outcome of every request and *dynamically* lowers the effective
-//! request rate, then raises it again as the origin recovers. Two interchangeable
-//! strategies are implemented:
+//! request rate, then raises it again as the origin recovers.
 //!
-//! * [`AdaptiveRateControl::Aimd`] — additive-increase / multiplicative-decrease.
-//!   Keep an effective limit; halve it on a failure, add one on a success, and
-//!   clamp it to `[floor, ceiling]`.
-//! * [`AdaptiveRateControl::SreThrottle`] — the Google SRE client-side throttling
-//!   formula over a time-decaying window of attempts and successes.
+//! The control law is Google SRE client-side throttling over a time-decaying
+//! window of attempts and successes. It has exactly two hyperparameters, the two
+//! degrees of freedom of the control system:
 //!
-//! Both expose a single `admission_coefficient()` in `[0, 1]` — the fraction of
-//! requests the limiter should admit — and a deterministic [`AdaptiveController::try_admit`]
-//! gate that turns that fraction into an admit/throttle decision.
+//! * **magnitude** (`k`, `> 1`) — *where* the effective rate settles for a given
+//!   failure rate. Throttling begins only when the success rate falls below
+//!   `1 / k`, so a larger magnitude tolerates a higher failure rate before it
+//!   throttles.
+//! * **elasticity** (the window half-life, `> 0`) — *how fast* the controller
+//!   reacts to and recovers from a change in the failure rate. A shorter
+//!   half-life reacts and recovers faster; a longer one is smoother and slower.
+//!
+//! The controller exposes a single `admission_coefficient()` in `[0, 1]` — the
+//! fraction of requests to admit — and a deterministic
+//! [`AdaptiveController::try_admit`] gate that turns that fraction into an
+//! admit/throttle decision.
 //!
 //! Adaptive control is a *modifier* on the origin's statically-configured rate
 //! limits, never a limiter of its own. The single admission coefficient reduces
@@ -42,84 +48,109 @@ limitations under the License.
 //! error caught before a controller is ever built.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-/// The smallest effective limit AIMD will decay to. Never below one, so a
+/// The smallest ceiling a controller will scale within. Never below one, so a
 /// recovering origin always gets at least one probe request through.
-const AIMD_FLOOR: f64 = 1.0;
+const MIN_CEILING: f64 = 1.0;
 
-/// Half-life of the SRE decaying window: an attempt recorded this long ago
-/// counts half as much toward `requests`/`accepts` as one recorded now. This is
-/// what lets the admission coefficient recover to 1 after a burst of failures
-/// ages out.
-const SRE_WINDOW_HALF_LIFE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Default magnitude (`k`): throttle when the success rate drops below 1/2.
+pub const DEFAULT_ADAPTIVE_MAGNITUDE: f64 = 2.0;
+
+/// Default elasticity: an attempt recorded one half-life ago counts half as much
+/// toward the window as one recorded now, so a failure burst ages out over
+/// roughly this long.
+pub const DEFAULT_ADAPTIVE_ELASTICITY: Duration = Duration::from_secs(10);
 
 /// How much admission credit the deterministic [`AdaptiveController::try_admit`]
 /// gate must accumulate before it admits one request. Kept at 1.0 so the
 /// long-run admitted fraction equals the admission coefficient.
 const ADMISSION_CREDIT_PER_REQUEST: f64 = 1.0;
 
-/// The adaptive rate-control strategy selected for an origin.
+/// The adaptive rate-control strategy resolved for an origin.
 ///
-/// Parsed from the `adaptive_rate_control` dataset parameter via
-/// [`parse_adaptive_rate_control`].
+/// The wiring layer (`data-http-rate-control`) resolves the three
+/// `adaptive_rate_control*` parameters into this: [`parse_adaptive_mode`] for the
+/// on/off switch, then [`AdaptiveRateControl::enabled`] for the two
+/// hyperparameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AdaptiveRateControl {
     /// Adaptive control is off. The effective rate is exactly the static config.
     Disabled,
-    /// Additive-increase / multiplicative-decrease control.
-    Aimd,
-    /// Google SRE client-side throttling with hyperparameter `k` (`k > 1`).
-    SreThrottle { k: f64 },
+    /// SRE client-side throttling with `magnitude` (`k > 1`) and `elasticity`
+    /// (the decaying-window half-life).
+    Enabled {
+        magnitude: f64,
+        elasticity: Duration,
+    },
 }
 
-/// Why an `adaptive_rate_control` parameter value could not be parsed.
+impl AdaptiveRateControl {
+    /// Build an enabled control from its two hyperparameters, validating both.
+    ///
+    /// # Errors
+    /// Returns [`AdaptiveRateControlParseError::MagnitudeInvalid`] when `magnitude`
+    /// is not a finite number greater than 1, and
+    /// [`AdaptiveRateControlParseError::ElasticityInvalid`] when `elasticity` is
+    /// zero or non-finite (an infinite half-life would never let the origin
+    /// recover).
+    pub fn enabled(
+        magnitude: f64,
+        elasticity: Duration,
+    ) -> Result<Self, AdaptiveRateControlParseError> {
+        if !magnitude.is_finite() || magnitude <= 1.0 {
+            return Err(AdaptiveRateControlParseError::MagnitudeInvalid { magnitude });
+        }
+        if elasticity.is_zero() || elasticity == Duration::MAX {
+            return Err(AdaptiveRateControlParseError::ElasticityInvalid { elasticity });
+        }
+        Ok(Self::Enabled {
+            magnitude,
+            elasticity,
+        })
+    }
+}
+
+/// The parsed value of the `adaptive_rate_control` on/off switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptiveMode {
+    Disabled,
+    Enabled,
+}
+
+/// Why an `adaptive_rate_control*` parameter value could not be parsed.
 ///
 /// The wiring layer (`data-http-rate-control`) turns this into a user-facing
-/// `InvalidConfiguration` error that names the dataset and a fix.
+/// `InvalidConfiguration` error that names the dataset, the offending parameter,
+/// and a fix.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AdaptiveRateControlParseError {
-    /// The value was neither `disabled`/`enabled` nor a valid positive float.
-    Unrecognized { value: String },
-    /// The value parsed as a float `k`, but SRE throttling needs `k > 1`.
-    KNotGreaterThanOne { k: f64 },
+    /// The `adaptive_rate_control` value was neither `disabled` nor `enabled`.
+    UnrecognizedMode { value: String },
+    /// The magnitude (SRE coefficient `k`) was not a finite number `> 1`.
+    MagnitudeInvalid { magnitude: f64 },
+    /// The elasticity (decay-window half-life) was not a positive, finite duration.
+    ElasticityInvalid { elasticity: Duration },
 }
 
-/// Parse the `adaptive_rate_control` parameter string into a strategy.
+/// Parse the `adaptive_rate_control` on/off switch.
 ///
-/// * absent / empty / `disabled` -> [`AdaptiveRateControl::Disabled`]
-/// * `enabled` -> [`AdaptiveRateControl::Aimd`] (the default enabled strategy)
-/// * a finite positive float `k > 1` -> [`AdaptiveRateControl::SreThrottle`]
+/// * absent / empty / `disabled` -> [`AdaptiveMode::Disabled`]
+/// * `enabled` -> [`AdaptiveMode::Enabled`]
 ///
 /// # Errors
-/// Returns [`AdaptiveRateControlParseError::Unrecognized`] for a value that is
-/// neither `disabled`/`enabled` nor a valid finite positive float, and
-/// [`AdaptiveRateControlParseError::KNotGreaterThanOne`] for a float `k <= 1`.
-pub fn parse_adaptive_rate_control(
-    value: &str,
-) -> Result<AdaptiveRateControl, AdaptiveRateControlParseError> {
-    let trimmed = value.trim();
-    match trimmed.to_ascii_lowercase().as_str() {
-        "" | "disabled" => return Ok(AdaptiveRateControl::Disabled),
-        "enabled" => return Ok(AdaptiveRateControl::Aimd),
-        _ => {}
+/// Returns [`AdaptiveRateControlParseError::UnrecognizedMode`] for any other value.
+pub fn parse_adaptive_mode(value: &str) -> Result<AdaptiveMode, AdaptiveRateControlParseError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "disabled" => Ok(AdaptiveMode::Disabled),
+        "enabled" => Ok(AdaptiveMode::Enabled),
+        _ => Err(AdaptiveRateControlParseError::UnrecognizedMode {
+            value: value.trim().to_string(),
+        }),
     }
-
-    let k = trimmed
-        .parse::<f64>()
-        .ok()
-        .filter(|k| k.is_finite() && *k > 0.0)
-        .ok_or_else(|| AdaptiveRateControlParseError::Unrecognized {
-            value: trimmed.to_string(),
-        })?;
-
-    if k <= 1.0 {
-        return Err(AdaptiveRateControlParseError::KNotGreaterThanOne { k });
-    }
-
-    Ok(AdaptiveRateControl::SreThrottle { k })
 }
 
 /// The result of an HTTP request as the adaptive controller sees it: a 2xx is a
@@ -133,58 +164,51 @@ pub enum RequestOutcome {
 
 /// A live adaptive controller for one origin.
 ///
-/// Cheap to share behind an `Arc`; all interior state is lock-free (AIMD) or
-/// behind a short non-async critical section (SRE).
+/// Cheap to share behind an `Arc`; window updates are behind a short non-async
+/// critical section and the admission gate is lock-free.
 #[derive(Debug)]
 pub struct AdaptiveController {
     ceiling: f64,
-    strategy: Strategy,
+    sre: SreState,
     /// Fractional admission credit for the deterministic [`Self::try_admit`] gate.
     admission_credit: AtomicU64,
-}
-
-#[derive(Debug)]
-enum Strategy {
-    Aimd(AimdState),
-    Sre(SreState),
 }
 
 impl AdaptiveController {
     /// Build a controller for `control`, or `None` when control is disabled.
     ///
-    /// `ceiling` is the origin's configured static rate limit — the reference
-    /// the controller grows back toward (the largest configured per-second /
+    /// `ceiling` is the origin's configured static rate limit — the reference the
+    /// admission coefficient scales (the largest configured per-second /
     /// per-minute / concurrency limit). Adaptive control has no ceiling of its
     /// own: callers must derive this from the configured limits and reject an
     /// enabled controller with no static limit before reaching here. It is
-    /// clamped to be at least [`AIMD_FLOOR`].
+    /// clamped to be at least [`MIN_CEILING`].
     #[must_use]
     pub fn new(control: AdaptiveRateControl, ceiling: f64) -> Option<Self> {
-        let ceiling = if ceiling.is_finite() && ceiling >= AIMD_FLOOR {
+        let ceiling = if ceiling.is_finite() && ceiling >= MIN_CEILING {
             ceiling
         } else {
-            AIMD_FLOOR
+            MIN_CEILING
         };
 
-        let strategy = match control {
+        let (magnitude, elasticity) = match control {
             AdaptiveRateControl::Disabled => return None,
-            AdaptiveRateControl::Aimd => Strategy::Aimd(AimdState::new(ceiling)),
-            AdaptiveRateControl::SreThrottle { k } => Strategy::Sre(SreState::new(k)),
+            AdaptiveRateControl::Enabled {
+                magnitude,
+                elasticity,
+            } => (magnitude, elasticity),
         };
 
         Some(Self {
             ceiling,
-            strategy,
+            sre: SreState::new(magnitude, elasticity),
             admission_credit: AtomicU64::new(0.0_f64.to_bits()),
         })
     }
 
     /// Record the outcome of one request.
     pub fn record(&self, outcome: RequestOutcome) {
-        match &self.strategy {
-            Strategy::Aimd(state) => state.record(outcome),
-            Strategy::Sre(state) => state.record(outcome, Instant::now()),
-        }
+        self.sre.record(outcome, Instant::now());
     }
 
     /// The fraction of requests the controller currently wants to admit, in
@@ -195,27 +219,17 @@ impl AdaptiveController {
     }
 
     fn admission_coefficient_at(&self, now: Instant) -> f64 {
-        let coefficient = match &self.strategy {
-            Strategy::Aimd(state) => state.effective_limit() / self.ceiling,
-            Strategy::Sre(state) => state.admission_coefficient(now),
-        };
-        coefficient.clamp(0.0, 1.0)
+        self.sre.admission_coefficient(now).clamp(0.0, 1.0)
     }
 
-    /// The effective request-rate limit the controller currently allows.
-    ///
-    /// For AIMD this is the tracked limit; for SRE it is the admission
-    /// coefficient scaled by the ceiling, so both strategies report on the same
-    /// scale.
+    /// The effective request-rate limit the controller currently allows: the
+    /// admission coefficient scaled by the ceiling.
     #[must_use]
     pub fn effective_limit(&self) -> f64 {
-        match &self.strategy {
-            Strategy::Aimd(state) => state.effective_limit(),
-            Strategy::Sre(state) => state.admission_coefficient(Instant::now()) * self.ceiling,
-        }
+        self.admission_coefficient_at(Instant::now()) * self.ceiling
     }
 
-    /// The static ceiling this controller grows back toward.
+    /// The static ceiling this controller scales within.
     #[must_use]
     pub fn ceiling(&self) -> f64 {
         self.ceiling
@@ -264,57 +278,15 @@ impl AdaptiveController {
     }
 }
 
-/// AIMD: an effective limit, halved on failure and grown by one on success,
-/// clamped to `[AIMD_FLOOR, ceiling]`. Stored as the bits of an `f64` in an
-/// `AtomicU64` so updates are lock-free.
-#[derive(Debug)]
-struct AimdState {
-    effective_limit: AtomicU64,
-    ceiling: f64,
-}
-
-impl AimdState {
-    fn new(ceiling: f64) -> Self {
-        Self {
-            effective_limit: AtomicU64::new(ceiling.to_bits()),
-            ceiling,
-        }
-    }
-
-    fn effective_limit(&self) -> f64 {
-        f64::from_bits(self.effective_limit.load(Ordering::Relaxed))
-    }
-
-    fn record(&self, outcome: RequestOutcome) {
-        let mut current = self.effective_limit.load(Ordering::Relaxed);
-        loop {
-            let value = f64::from_bits(current);
-            let next = match outcome {
-                RequestOutcome::Success => (value + 1.0).min(self.ceiling),
-                RequestOutcome::Failure => (value * 0.5).max(AIMD_FLOOR),
-            };
-
-            match self.effective_limit.compare_exchange_weak(
-                current,
-                next.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
 /// Google SRE client-side throttling over a time-decaying window.
 ///
 /// `requests` counts attempts and `accepts` counts successes; both decay
-/// exponentially with [`SRE_WINDOW_HALF_LIFE`]. The admission coefficient is
-/// `min(1, (k*accepts + 1) / (requests + 1))`.
+/// exponentially with the `half_life` (the elasticity). The admission
+/// coefficient is `min(1, (k*accepts + 1) / (requests + 1))`.
 #[derive(Debug)]
 struct SreState {
     k: f64,
+    half_life: Duration,
     window: Mutex<SreWindow>,
 }
 
@@ -326,9 +298,10 @@ struct SreWindow {
 }
 
 impl SreState {
-    fn new(k: f64) -> Self {
+    fn new(k: f64, half_life: Duration) -> Self {
         Self {
             k,
+            half_life,
             window: Mutex::new(SreWindow {
                 requests: 0.0,
                 accepts: 0.0,
@@ -339,7 +312,7 @@ impl SreState {
 
     fn record(&self, outcome: RequestOutcome, now: Instant) {
         let mut window = self.window.lock();
-        window.decay_to(now);
+        window.decay_to(now, self.half_life);
         window.requests += 1.0;
         if outcome == RequestOutcome::Success {
             window.accepts += 1.0;
@@ -349,7 +322,7 @@ impl SreState {
     fn admission_coefficient(&self, now: Instant) -> f64 {
         let (requests, accepts) = {
             let mut window = self.window.lock();
-            window.decay_to(now);
+            window.decay_to(now, self.half_life);
             (window.requests, window.accepts)
         };
 
@@ -364,7 +337,7 @@ impl SreState {
 }
 
 impl SreWindow {
-    fn decay_to(&mut self, now: Instant) {
+    fn decay_to(&mut self, now: Instant, half_life: Duration) {
         let Some(last) = self.last_update else {
             self.last_update = Some(now);
             return;
@@ -377,7 +350,7 @@ impl SreWindow {
         }
 
         // 0.5 ^ (elapsed / half_life)
-        let half_lives = elapsed.as_secs_f64() / SRE_WINDOW_HALF_LIFE.as_secs_f64();
+        let half_lives = elapsed.as_secs_f64() / half_life.as_secs_f64();
         let factor = 0.5_f64.powf(half_lives);
         self.requests *= factor;
         self.accepts *= factor;
@@ -388,62 +361,78 @@ impl SreWindow {
 mod tests {
     use super::*;
 
+    fn enabled(magnitude: f64) -> AdaptiveRateControl {
+        AdaptiveRateControl::enabled(magnitude, DEFAULT_ADAPTIVE_ELASTICITY)
+            .expect("test control should be valid")
+    }
+
     #[test]
-    fn parse_disabled_enabled_and_sre() {
+    fn parse_mode_disabled_and_enabled() {
+        assert_eq!(parse_adaptive_mode(""), Ok(AdaptiveMode::Disabled));
+        assert_eq!(parse_adaptive_mode("disabled"), Ok(AdaptiveMode::Disabled));
+        assert_eq!(parse_adaptive_mode("DISABLED"), Ok(AdaptiveMode::Disabled));
+        assert_eq!(parse_adaptive_mode("enabled"), Ok(AdaptiveMode::Enabled));
+        assert_eq!(parse_adaptive_mode(" Enabled "), Ok(AdaptiveMode::Enabled));
+    }
+
+    #[test]
+    fn parse_mode_rejects_unrecognized() {
         assert_eq!(
-            parse_adaptive_rate_control(""),
-            Ok(AdaptiveRateControl::Disabled)
+            parse_adaptive_mode("sometimes"),
+            Err(AdaptiveRateControlParseError::UnrecognizedMode {
+                value: "sometimes".to_string()
+            })
         );
+        // A bare number is no longer a valid mode: magnitude is its own parameter.
         assert_eq!(
-            parse_adaptive_rate_control("disabled"),
-            Ok(AdaptiveRateControl::Disabled)
-        );
-        assert_eq!(
-            parse_adaptive_rate_control("DISABLED"),
-            Ok(AdaptiveRateControl::Disabled)
-        );
-        assert_eq!(
-            parse_adaptive_rate_control("enabled"),
-            Ok(AdaptiveRateControl::Aimd)
-        );
-        assert_eq!(
-            parse_adaptive_rate_control(" Enabled "),
-            Ok(AdaptiveRateControl::Aimd)
-        );
-        assert_eq!(
-            parse_adaptive_rate_control("2.0"),
-            Ok(AdaptiveRateControl::SreThrottle { k: 2.0 })
+            parse_adaptive_mode("2.0"),
+            Err(AdaptiveRateControlParseError::UnrecognizedMode {
+                value: "2.0".to_string()
+            })
         );
     }
 
     #[test]
-    fn parse_rejects_invalid_and_out_of_range_k() {
+    fn enabled_validates_magnitude() {
         assert_eq!(
-            parse_adaptive_rate_control("sometimes"),
-            Err(AdaptiveRateControlParseError::Unrecognized {
-                value: "sometimes".to_string()
+            AdaptiveRateControl::enabled(2.0, DEFAULT_ADAPTIVE_ELASTICITY),
+            Ok(AdaptiveRateControl::Enabled {
+                magnitude: 2.0,
+                elasticity: DEFAULT_ADAPTIVE_ELASTICITY
             })
         );
-        // K must be strictly greater than 1.
+        // Magnitude must be strictly greater than 1.
         assert_eq!(
-            parse_adaptive_rate_control("1.0"),
-            Err(AdaptiveRateControlParseError::KNotGreaterThanOne { k: 1.0 })
+            AdaptiveRateControl::enabled(1.0, DEFAULT_ADAPTIVE_ELASTICITY),
+            Err(AdaptiveRateControlParseError::MagnitudeInvalid { magnitude: 1.0 })
         );
         assert_eq!(
-            parse_adaptive_rate_control("0.5"),
-            Err(AdaptiveRateControlParseError::KNotGreaterThanOne { k: 0.5 })
-        );
-        // A negative or zero float is not a valid throttling factor at all.
-        assert_eq!(
-            parse_adaptive_rate_control("-3"),
-            Err(AdaptiveRateControlParseError::Unrecognized {
-                value: "-3".to_string()
-            })
+            AdaptiveRateControl::enabled(0.5, DEFAULT_ADAPTIVE_ELASTICITY),
+            Err(AdaptiveRateControlParseError::MagnitudeInvalid { magnitude: 0.5 })
         );
         assert!(matches!(
-            parse_adaptive_rate_control("inf"),
-            Err(AdaptiveRateControlParseError::Unrecognized { .. })
+            AdaptiveRateControl::enabled(f64::INFINITY, DEFAULT_ADAPTIVE_ELASTICITY),
+            Err(AdaptiveRateControlParseError::MagnitudeInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn enabled_validates_elasticity() {
+        // Zero half-life would make the window collapse.
+        assert_eq!(
+            AdaptiveRateControl::enabled(2.0, Duration::ZERO),
+            Err(AdaptiveRateControlParseError::ElasticityInvalid {
+                elasticity: Duration::ZERO
+            })
+        );
+        // An infinite half-life (the saturated value a duration parser yields for
+        // "inf") would never let the origin recover.
+        assert_eq!(
+            AdaptiveRateControl::enabled(2.0, Duration::MAX),
+            Err(AdaptiveRateControlParseError::ElasticityInvalid {
+                elasticity: Duration::MAX
+            })
+        );
     }
 
     #[test]
@@ -451,54 +440,13 @@ mod tests {
         assert!(AdaptiveController::new(AdaptiveRateControl::Disabled, 32.0).is_none());
     }
 
-    // --- AIMD ---
-
-    #[test]
-    fn aimd_halves_on_failure_and_adds_one_on_success() {
-        let controller = AdaptiveController::new(AdaptiveRateControl::Aimd, 32.0)
-            .expect("aimd controller should build");
-        assert!((controller.effective_limit() - 32.0).abs() < f64::EPSILON);
-
-        controller.record(RequestOutcome::Failure);
-        assert!((controller.effective_limit() - 16.0).abs() < f64::EPSILON);
-        controller.record(RequestOutcome::Failure);
-        assert!((controller.effective_limit() - 8.0).abs() < f64::EPSILON);
-
-        controller.record(RequestOutcome::Success);
-        assert!((controller.effective_limit() - 9.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn aimd_clamps_to_floor_and_ceiling() {
-        let controller = AdaptiveController::new(AdaptiveRateControl::Aimd, 4.0)
-            .expect("aimd controller should build");
-
-        // Ceiling: successes cannot push the limit past the configured max.
-        for _ in 0..10 {
-            controller.record(RequestOutcome::Success);
-        }
-        assert!((controller.effective_limit() - 4.0).abs() < f64::EPSILON);
-
-        // Floor: repeated failures never drive the limit below 1.
-        for _ in 0..20 {
-            controller.record(RequestOutcome::Failure);
-        }
-        assert!((controller.effective_limit() - 1.0).abs() < f64::EPSILON);
-        assert!((controller.admission_coefficient() - 0.25).abs() < 1e-9);
-    }
-
-    // --- SRE ---
-
     #[test]
     fn sre_never_throttles_a_fully_healthy_origin() {
         let controller =
-            AdaptiveController::new(AdaptiveRateControl::SreThrottle { k: 2.0 }, 100.0)
-                .expect("sre controller should build");
+            AdaptiveController::new(enabled(2.0), 100.0).expect("sre controller should build");
 
         // accepts == requests at every finite count => coefficient exactly 1.
-        for _ in 0..1 {
-            controller.record(RequestOutcome::Success);
-        }
+        controller.record(RequestOutcome::Success);
         assert!((controller.admission_coefficient() - 1.0).abs() < f64::EPSILON);
         for _ in 0..999 {
             controller.record(RequestOutcome::Success);
@@ -507,13 +455,13 @@ mod tests {
     }
 
     #[test]
-    fn sre_throttles_exactly_below_one_over_k() {
-        let k = 4.0;
-        let controller = AdaptiveController::new(AdaptiveRateControl::SreThrottle { k }, 100.0)
+    fn sre_throttles_exactly_below_one_over_magnitude() {
+        let magnitude = 4.0;
+        let controller = AdaptiveController::new(enabled(magnitude), 100.0)
             .expect("sre controller should build");
 
         // Build a large window so the "+1" terms are negligible and the
-        // threshold sits at accepts/requests == 1/k.
+        // threshold sits at accepts/requests == 1/magnitude.
         // Just above 1/k (ratio 0.30 > 0.25): not throttled (coefficient == 1).
         let total = 1000;
         let accepts_above = 300;
@@ -531,7 +479,7 @@ mod tests {
         );
 
         // Just below 1/k (ratio 0.20 < 0.25): throttled (coefficient < 1).
-        let controller = AdaptiveController::new(AdaptiveRateControl::SreThrottle { k }, 100.0)
+        let controller = AdaptiveController::new(enabled(magnitude), 100.0)
             .expect("sre controller should build");
         let accepts_below = 200;
         for i in 0..total {
@@ -551,10 +499,9 @@ mod tests {
     #[test]
     fn sre_coefficient_is_clamped_to_unit_interval() {
         let controller =
-            AdaptiveController::new(AdaptiveRateControl::SreThrottle { k: 10.0 }, 100.0)
-                .expect("sre controller should build");
-        // A single success with a large k would push the raw ratio above 1;
-        // the coefficient must still clamp to 1.
+            AdaptiveController::new(enabled(10.0), 100.0).expect("sre controller should build");
+        // A single success with a large magnitude would push the raw ratio above
+        // 1; the coefficient must still clamp to 1.
         controller.record(RequestOutcome::Success);
         let coefficient = controller.admission_coefficient();
         assert!(

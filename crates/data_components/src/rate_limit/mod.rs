@@ -26,8 +26,8 @@ use tokio::time::Instant;
 pub mod adaptive;
 
 pub use adaptive::{
-    AdaptiveController, AdaptiveRateControl, AdaptiveRateControlParseError, RequestOutcome,
-    parse_adaptive_rate_control,
+    AdaptiveController, AdaptiveMode, AdaptiveRateControl, AdaptiveRateControlParseError,
+    DEFAULT_ADAPTIVE_ELASTICITY, DEFAULT_ADAPTIVE_MAGNITUDE, RequestOutcome, parse_adaptive_mode,
 };
 
 /// One throttle step the adaptive controller waits when it declines to admit a
@@ -618,7 +618,9 @@ mod tests {
         );
     }
 
-    use crate::rate_limit::adaptive::{AdaptiveRateControl, RequestOutcome};
+    use crate::rate_limit::adaptive::{
+        AdaptiveRateControl, DEFAULT_ADAPTIVE_ELASTICITY, RequestOutcome,
+    };
     use reqwest::StatusCode;
 
     /// Classify a stub HTTP status the way the request path does, reusing the
@@ -642,73 +644,6 @@ mod tests {
         f64::from(u32::try_from(admitted).unwrap_or(samples)) / f64::from(samples)
     }
 
-    /// Behavioral demonstration (AIMD): an origin with a *configured* static
-    /// limit that starts healthy, turns to 503s, then recovers. Adaptive control
-    /// only modifies that defined limit, so the admitted rate must collapse under
-    /// the failures and climb back on recovery — driven entirely through the
-    /// public `record_request_outcome` path on a real `HttpRateLimiter`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn adaptive_aimd_reduces_admitted_rate_under_failures_then_recovers() {
-        // The origin's configured static rate limit — the reference AIMD scales.
-        const STATIC_LIMIT: f64 = 32.0;
-        const STATIC_LIMIT_U64: u64 = 32;
-        let limiter = HttpRateLimiter::with_adaptive(AdaptiveRateControl::Aimd, STATIC_LIMIT);
-
-        // Healthy origin: 200 OK. The effective limit sits at the configured
-        // static limit and (nearly) every request is admitted.
-        for _ in 0..64 {
-            limiter.record_request_outcome(outcome_for_status(StatusCode::OK));
-        }
-        let healthy = admitted_fraction(&limiter, 1000);
-
-        // Origin starts failing: 503 Service Unavailable and request timeouts.
-        // Each failure halves the effective limit; it collapses to the floor.
-        for i in 0..32 {
-            let status = if i % 2 == 0 {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::REQUEST_TIMEOUT
-            };
-            limiter.record_request_outcome(outcome_for_status(status));
-        }
-        let failing = admitted_fraction(&limiter, 1000);
-
-        // Origin recovers: 200 OK again. The effective limit climbs back by one
-        // per success until it is near the configured static limit.
-        for _ in 0..64 {
-            limiter.record_request_outcome(outcome_for_status(StatusCode::OK));
-        }
-        let recovered = admitted_fraction(&limiter, 1000);
-
-        eprintln!(
-            "AIMD admitted fraction: healthy={healthy:.3} failing={failing:.3} recovered={recovered:.3}"
-        );
-
-        assert!(
-            healthy > 0.9,
-            "healthy origin should admit almost everything, got {healthy:.3}"
-        );
-        assert!(
-            failing < 0.2,
-            "failing origin admitted rate should collapse, got {failing:.3}"
-        );
-        assert!(
-            failing < healthy,
-            "failures must reduce the admitted rate ({failing:.3} !< {healthy:.3})"
-        );
-        assert!(
-            recovered > 0.9,
-            "recovered origin should admit almost everything again, got {recovered:.3}"
-        );
-
-        let metrics = limiter.metrics();
-        assert!(
-            metrics.adaptive_effective_limit() >= STATIC_LIMIT_U64 - 1,
-            "effective-limit metric should recover toward the configured static limit, got {}",
-            metrics.adaptive_effective_limit()
-        );
-    }
-
     /// Behavioral demonstration (Google SRE throttling): the admission
     /// coefficient must fall below 1 once the success ratio drops under `1/k`,
     /// and return to 1 after the failure burst decays out of the window. Uses
@@ -718,10 +653,9 @@ mod tests {
         // The origin's configured static rate limit that SRE scales by the
         // admission coefficient. Its magnitude does not affect the coefficient.
         const STATIC_LIMIT: f64 = 32.0;
-        let limiter = HttpRateLimiter::with_adaptive(
-            AdaptiveRateControl::SreThrottle { k: 4.0 },
-            STATIC_LIMIT,
-        );
+        let control = AdaptiveRateControl::enabled(4.0, DEFAULT_ADAPTIVE_ELASTICITY)
+            .expect("sre control should be valid");
+        let limiter = HttpRateLimiter::with_adaptive(control, STATIC_LIMIT);
 
         // Healthy origin: accepts == requests, coefficient is exactly 1.
         for _ in 0..50 {

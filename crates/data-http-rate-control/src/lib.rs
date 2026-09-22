@@ -32,9 +32,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::Duration;
 
-pub use data_components::rate_limit::{AdaptiveRateControl, AdaptiveRateControlParseError};
+pub use data_components::rate_limit::{
+    AdaptiveMode, AdaptiveRateControl, AdaptiveRateControlParseError,
+};
 use data_components::rate_limit::{
-    HttpRateLimiter, HttpRateLimiterMetrics, parse_adaptive_rate_control,
+    DEFAULT_ADAPTIVE_ELASTICITY, DEFAULT_ADAPTIVE_MAGNITUDE, HttpRateLimiter,
+    HttpRateLimiterMetrics, parse_adaptive_mode,
 };
 use data_connector_types::{ConnectorComponent, DataConnectorError, DataConnectorResult};
 use governor::Quota;
@@ -55,6 +58,8 @@ const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit"
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
 const RUNTIME_ADAPTIVE_RATE_CONTROL: &str = "http_adaptive_rate_control";
+const RUNTIME_ADAPTIVE_RATE_CONTROL_MAGNITUDE: &str = "http_adaptive_rate_control_magnitude";
+const RUNTIME_ADAPTIVE_RATE_CONTROL_ELASTICITY: &str = "http_adaptive_rate_control_elasticity";
 
 /// Every `http_*` rate-control key this module reads from `runtime.params`.
 /// Exposed as the authoritative list for this family; the startup unknown-param
@@ -68,6 +73,8 @@ pub const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
     RUNTIME_RATE_CONTROL_JITTER_MIN,
     RUNTIME_RATE_CONTROL_JITTER_MAX,
     RUNTIME_ADAPTIVE_RATE_CONTROL,
+    RUNTIME_ADAPTIVE_RATE_CONTROL_MAGNITUDE,
+    RUNTIME_ADAPTIVE_RATE_CONTROL_ELASTICITY,
 ];
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
@@ -179,8 +186,9 @@ impl HttpRateControlConfig {
     /// Adaptive control is a modifier on a defined limit, so this being `None`
     /// while [`Self::adaptive_rate_control`] is enabled is a configuration error
     /// (see [`ensure_adaptive_has_static_limit`]). The reference is the ceiling
-    /// AIMD recovers back toward; the single admission coefficient scales every
-    /// configured limit uniformly, so any one of them serves as the reference.
+    /// the admission coefficient scales within; that single coefficient scales
+    /// every configured limit uniformly, so any one of them serves as the
+    /// reference.
     #[must_use]
     pub fn static_limit_reference(&self) -> Option<f64> {
         [
@@ -195,7 +203,7 @@ impl HttpRateControlConfig {
         })
     }
 
-    /// Whether adaptive control is enabled (either strategy) for this origin.
+    /// Whether adaptive control is enabled for this origin.
     #[must_use]
     pub fn adaptive_enabled(&self) -> bool {
         self.adaptive_rate_control != AdaptiveRateControl::Disabled
@@ -635,7 +643,7 @@ fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -
 }
 
 #[must_use]
-pub fn parameter_specs() -> [ParameterSpec; 6] {
+pub fn parameter_specs() -> [ParameterSpec; 8] {
     [
         ParameterSpec::runtime("max_concurrent_requests")
             .description("Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled."),
@@ -648,7 +656,11 @@ pub fn parameter_specs() -> [ParameterSpec; 6] {
         ParameterSpec::runtime("rate_control_jitter_max")
             .description("Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
         ParameterSpec::runtime("adaptive_rate_control")
-            .description("Client-side adaptive throttling that lowers the effective HTTP request rate when the upstream origin fails or times out, then raises it again as the origin recovers. Overrides runtime.params.http_adaptive_rate_control when set. Values: 'disabled' (default), 'enabled' (AIMD additive-increase/multiplicative-decrease), or a number greater than 1 for Google SRE client-side throttling with that factor K, such as '2.0'."),
+            .description("Client-side adaptive throttling that lowers the effective HTTP request rate when the upstream origin fails or times out, then raises it again as the origin recovers, scaling within the configured static rate limits. Overrides runtime.params.http_adaptive_rate_control when set. Values: 'disabled' (default) or 'enabled'."),
+        ParameterSpec::runtime("adaptive_rate_control_magnitude")
+            .description("Throttling magnitude for adaptive rate control: the Google SRE client-side throttling coefficient K (a number greater than 1). Sets where the effective rate settles for a given failure rate; throttling begins only when the success rate falls below 1/K, so a larger value tolerates a higher failure rate before throttling. Overrides runtime.params.http_adaptive_rate_control_magnitude when set. Applies only when adaptive_rate_control is enabled. Defaults to 2.0."),
+        ParameterSpec::runtime("adaptive_rate_control_elasticity")
+            .description("Throttling elasticity for adaptive rate control: the half-life of the outcome-decay window as a duration such as '10s'. Sets how fast the controller reacts to and recovers from a change in the failure rate; a shorter value reacts and recovers faster, a longer value is smoother and slower. Overrides runtime.params.http_adaptive_rate_control_elasticity when set. Applies only when adaptive_rate_control is enabled. Defaults to 10s."),
     ]
 }
 
@@ -745,18 +757,98 @@ fn ensure_adaptive_has_static_limit(
     Ok(())
 }
 
-/// Resolve and parse the `adaptive_rate_control` parameter (falling back to
-/// `runtime.params.http_adaptive_rate_control`) into an [`AdaptiveRateControl`].
+/// Resolve the three `adaptive_rate_control*` parameters (each falling back to
+/// its matching `runtime.params.http_*` default) into an [`AdaptiveRateControl`].
+///
+/// The on/off switch is `adaptive_rate_control`; the two hyperparameters are
+/// `adaptive_rate_control_magnitude` (SRE coefficient `k > 1`, default 2.0) and
+/// `adaptive_rate_control_elasticity` (decay-window half-life, default 10s). The
+/// two hyperparameters are inert when adaptive control is disabled, so a
+/// runtime-wide magnitude/elasticity default applies only to the datasets that
+/// enable adaptive control.
 ///
 /// # Errors
-/// Returns an invalid-configuration error for a value that is neither
-/// `disabled`/`enabled` nor a valid float `k > 1`.
+/// Returns an invalid-configuration error for an `adaptive_rate_control` value
+/// other than `disabled`/`enabled`, a magnitude that is not a number greater than
+/// 1, or an elasticity that is not a positive, finite duration.
 fn parse_adaptive_rate_control_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
     connector_component: &ConnectorComponent,
     dataconnector: &'static str,
 ) -> DataConnectorResult<AdaptiveRateControl> {
+    let mode = resolve_adaptive_mode(params, runtime_params, connector_component, dataconnector)?;
+    if mode == AdaptiveMode::Disabled {
+        // The magnitude/elasticity knobs are meaningless without the feature on,
+        // so they stay inert here rather than erroring — a runtime-wide default
+        // must not fail every dataset that leaves adaptive control off.
+        return Ok(AdaptiveRateControl::Disabled);
+    }
+
+    let magnitude = parse_optional_f64_param(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+        "adaptive_rate_control_magnitude",
+        RUNTIME_ADAPTIVE_RATE_CONTROL_MAGNITUDE,
+    )?
+    .unwrap_or(DEFAULT_ADAPTIVE_MAGNITUDE);
+    let elasticity = parse_optional_duration_param(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+        "adaptive_rate_control_elasticity",
+        RUNTIME_ADAPTIVE_RATE_CONTROL_ELASTICITY,
+    )?
+    .unwrap_or(DEFAULT_ADAPTIVE_ELASTICITY);
+
+    AdaptiveRateControl::enabled(magnitude, elasticity).map_err(|error| {
+        let (param_name, runtime_param_name, detail) = match error {
+            AdaptiveRateControlParseError::MagnitudeInvalid { magnitude } => (
+                "adaptive_rate_control_magnitude",
+                RUNTIME_ADAPTIVE_RATE_CONTROL_MAGNITUDE,
+                format!(
+                    "the throttling magnitude must be a number greater than 1, but got {magnitude}. A larger value tolerates a higher failure rate before throttling. Use a value such as '2.0'."
+                ),
+            ),
+            AdaptiveRateControlParseError::ElasticityInvalid { .. } => (
+                "adaptive_rate_control_elasticity",
+                RUNTIME_ADAPTIVE_RATE_CONTROL_ELASTICITY,
+                "the throttling elasticity must be a positive, finite duration such as '10s'. A shorter value reacts and recovers faster.".to_string(),
+            ),
+            // The on/off switch was already resolved by `resolve_adaptive_mode`.
+            AdaptiveRateControlParseError::UnrecognizedMode { value } => (
+                "adaptive_rate_control",
+                RUNTIME_ADAPTIVE_RATE_CONTROL,
+                format!("'{value}' is not a valid value. Use 'disabled' or 'enabled'."),
+            ),
+        };
+        let display_name = runtime_or_dataset_param_name(
+            params,
+            runtime_params,
+            param_name,
+            runtime_param_name,
+        );
+        DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            connector_component: connector_component.clone(),
+            message: format!(
+                "The '{display_name}' parameter is invalid: {detail} See: https://spiceai.org/docs/components/data-connectors/http"
+            ),
+        }
+    })
+}
+
+/// Resolve the `adaptive_rate_control` on/off switch, falling back to
+/// `runtime.params.http_adaptive_rate_control`, defaulting to disabled.
+fn resolve_adaptive_mode<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<AdaptiveMode> {
     let (raw_value, display_name) =
         if let Some(raw_value) = params.get("adaptive_rate_control").expose().ok() {
             (
@@ -772,25 +864,16 @@ fn parse_adaptive_rate_control_param<S: BuildHasher>(
                 format!("runtime.params.{RUNTIME_ADAPTIVE_RATE_CONTROL}"),
             )
         } else {
-            return Ok(AdaptiveRateControl::Disabled);
+            return Ok(AdaptiveMode::Disabled);
         };
 
-    parse_adaptive_rate_control(raw_value).map_err(|error| {
-        let detail = match error {
-            AdaptiveRateControlParseError::Unrecognized { value } => format!(
-                "'{value}' is not a valid value. Use 'disabled', 'enabled' (AIMD control), or a number greater than 1 (Google SRE throttling factor K), such as '2.0'."
-            ),
-            AdaptiveRateControlParseError::KNotGreaterThanOne { k } => format!(
-                "the Google SRE throttling factor K must be greater than 1, but got {k}. Use a value such as '2.0'."
-            ),
-        };
-        DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: dataconnector.to_string(),
-            connector_component: connector_component.clone(),
-            message: format!(
-                "The '{display_name}' parameter is invalid: {detail} See: https://spiceai.org/docs/components/data-connectors/http"
-            ),
-        }
+    parse_adaptive_mode(raw_value).map_err(|_| DataConnectorError::InvalidConfigurationNoSource {
+        dataconnector: dataconnector.to_string(),
+        connector_component: connector_component.clone(),
+        message: format!(
+            "The '{display_name}' parameter is invalid: '{}' is not a valid value. Use 'disabled' or 'enabled'. See: https://spiceai.org/docs/components/data-connectors/http",
+            raw_value.trim()
+        ),
     })
 }
 
@@ -902,7 +985,7 @@ impl HttpRateControlRegistry {
         let adaptive_control = config.adaptive_rate_control;
         // The reference ceiling is only consulted when a controller is built,
         // which config validation guarantees requires a static limit; the
-        // fallback is the AIMD floor and never reached for an enabled control.
+        // fallback is the minimum ceiling and never reached for an enabled control.
         let ceiling = config.static_limit_reference().unwrap_or(1.0);
         let mut rate_limiters = self.rate_limiters.write().await;
         Arc::clone(
@@ -1272,6 +1355,48 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
     Ok(Some(value))
 }
 
+/// Parse an optional floating-point parameter, falling back to its
+/// `runtime.params.http_*` default. Domain bounds (e.g. magnitude `> 1`) are
+/// enforced by the caller; this only rejects an unparseable value.
+fn parse_optional_f64_param<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+    parameter_name: &str,
+    runtime_parameter_name: &'static str,
+) -> DataConnectorResult<Option<f64>> {
+    let (raw_value, display_name) =
+        if let Some(raw_value) = params.get(parameter_name).expose().ok() {
+            (raw_value, params.user_param(parameter_name).to_string())
+        } else if let Some(raw_value) = runtime_params
+            .and_then(|runtime_params| runtime_params.get(runtime_parameter_name))
+            .map(String::as_str)
+        {
+            (
+                raw_value,
+                format!("runtime.params.{runtime_parameter_name}"),
+            )
+        } else {
+            return Ok(None);
+        };
+
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    trimmed
+        .parse::<f64>()
+        .map(Some)
+        .map_err(|source| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataconnector.to_string(),
+            message: format!("The '{display_name}' parameter must be a number, such as '2.0'."),
+            connector_component: connector_component.clone(),
+            source: source.into(),
+        })
+}
+
 fn parse_optional_duration_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
@@ -1515,53 +1640,39 @@ mod tests {
     #[test]
     fn adaptive_enabled_without_a_static_limit_is_a_config_error() {
         let component = test_component();
-        for adaptive in [
-            AdaptiveRateControl::Aimd,
-            AdaptiveRateControl::SreThrottle { k: 2.0 },
-        ] {
-            let error = ensure_adaptive_has_static_limit(
-                &adaptive_config(adaptive, None),
-                &component,
-                "https",
-            )
-            .expect_err("adaptive control with no static rate limit must be rejected");
+        let adaptive = AdaptiveRateControl::enabled(2.0, Duration::from_secs(10))
+            .expect("test control should be valid");
+        let error =
+            ensure_adaptive_has_static_limit(&adaptive_config(adaptive, None), &component, "https")
+                .expect_err("adaptive control with no static rate limit must be rejected");
 
-            match error {
-                DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                    assert!(
-                        message.contains("adaptive_rate_control"),
-                        "message must name the parameter: {message}"
-                    );
-                    assert!(
-                        message.contains("requests_per_second_limit")
-                            && message.contains("max_concurrent_requests"),
-                        "message must name the fix: {message}"
-                    );
-                    assert!(
-                        message.contains("spiceai.org/docs"),
-                        "message must include a docs link: {message}"
-                    );
-                }
-                other => panic!("expected an invalid-configuration error, got {other:?}"),
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("adaptive_rate_control"),
+                    "message must name the parameter: {message}"
+                );
+                assert!(
+                    message.contains("requests_per_second_limit")
+                        && message.contains("max_concurrent_requests"),
+                    "message must name the fix: {message}"
+                );
+                assert!(
+                    message.contains("spiceai.org/docs"),
+                    "message must include a docs link: {message}"
+                );
             }
+            other => panic!("expected an invalid-configuration error, got {other:?}"),
         }
     }
 
     #[test]
     fn adaptive_enabled_with_a_static_limit_is_accepted() {
         let component = test_component();
-        ensure_adaptive_has_static_limit(
-            &adaptive_config(AdaptiveRateControl::Aimd, Some(10)),
-            &component,
-            "https",
-        )
-        .expect("AIMD with a static limit is a valid configuration");
-        ensure_adaptive_has_static_limit(
-            &adaptive_config(AdaptiveRateControl::SreThrottle { k: 3.0 }, Some(10)),
-            &component,
-            "https",
-        )
-        .expect("SRE throttling with a static limit is a valid configuration");
+        let adaptive = AdaptiveRateControl::enabled(3.0, Duration::from_secs(10))
+            .expect("test control should be valid");
+        ensure_adaptive_has_static_limit(&adaptive_config(adaptive, Some(10)), &component, "https")
+            .expect("adaptive control with a static limit is a valid configuration");
     }
 
     #[test]
