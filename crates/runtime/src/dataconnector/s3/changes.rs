@@ -138,7 +138,7 @@ pub enum Error {
     FromNamesAnObject { dataset_name: String, from: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` does not support unstructured text objects. Set `file_format` to `parquet`, `csv`, or `json`, set `file_extension` to one of those, or point `from` at objects with one of those extensions. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` does not support unstructured text objects. Set `file_format` to a listing format such as `parquet`, `csv`, `json`, or `orc`, set `file_extension` to one of those, or point `from` at objects with one of those extensions. See: {S3_DOCS}"
     ))]
     UnstructuredTextUnsupported { dataset_name: String },
 
@@ -423,7 +423,7 @@ impl ObjectReader for ListingObjectReader {
             })?;
         let file_format = format_opt.ok_or_else(|| {
             StreamError::External(format!(
-                "S3 changes cannot read unstructured text object s3://{bucket}/{key} for dataset '{}'. Set `file_format` to parquet, csv, or json. See: {S3_DOCS}",
+                "S3 changes cannot read unstructured text object s3://{bucket}/{key} for dataset '{}'. Set `file_format` to a listing format such as parquet, csv, json, or orc. See: {S3_DOCS}",
                 self.dataset.name
             ))
         })?;
@@ -699,10 +699,9 @@ impl S3ChangesConfig {
 /// `file_format`, then `file_extension` (`parse_file_extension_param`), then
 /// the `from` path (`detect_file_extension_from_url_or_path`). A prefix
 /// dataset with `file_extension: .parquet` and no `file_format` is therefore
-/// accepted here, matching `get_file_format_and_extension`.
+/// accepted here, matching `get_file_format_and_extension`. ORC (and Vortex
+/// on non-Windows) are listing formats, so they are accepted here too.
 fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> Result<()> {
-    const STRUCTURED: &[&str] = &["parquet", "csv", "json", "tsv", "jsonl", "ndjson", "ldjson"];
-
     let file_format = params
         .get("file_format")
         .expose()
@@ -720,13 +719,13 @@ fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> 
 
     let explicit_ok = file_format
         .as_deref()
-        .is_some_and(|fmt| STRUCTURED.contains(&fmt));
+        .is_some_and(is_structured_listing_format);
     let extension_ok = file_extension
         .as_deref()
-        .is_some_and(|ext| STRUCTURED.contains(&ext));
+        .is_some_and(is_structured_listing_format);
     let inferred_ok = path_extension
         .as_deref()
-        .is_some_and(|ext| STRUCTURED.contains(&ext));
+        .is_some_and(is_structured_listing_format);
 
     // `file_format: auto` is not itself structured; a bare prefix still needs
     // `file_extension` or a structured `from` path.
@@ -738,6 +737,24 @@ fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> 
         dataset_name: dataset.name.to_string(),
     }
     .fail()
+}
+
+/// Formats `get_file_format_and_extension` turns into a listing `FileFormat`.
+/// Vortex is not linked on Windows; keep the allowlist in lockstep.
+fn is_structured_listing_format(name: &str) -> bool {
+    matches!(
+        name,
+        "parquet" | "csv" | "json" | "tsv" | "jsonl" | "ndjson" | "ldjson" | "orc"
+    ) || {
+        #[cfg(not(windows))]
+        {
+            name == "vortex"
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
+    }
 }
 
 fn parse_backfill_interval(params: &Parameters, dataset_name: &str) -> Result<Duration> {
@@ -2516,6 +2533,99 @@ mod tests {
         S3ChangesConfig::try_from_params(&params, &dataset)
             .expect("a .parquet.gz from path is structured, matching listing inference")
             .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_orc_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_format", "orc"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("orc is a listing FileFormat")
+            .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_orc_file_extension_without_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_extension", ".orc"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("file_extension .orc is structured, matching listing inference")
+            .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_orc_from_path_without_file_format() {
+        let mut dataset = events_dataset();
+        dataset.from = "s3://my-bucket/events/part.orc".to_string();
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &dataset)
+            .expect("a .orc from path is structured, matching listing inference")
+            .expect("changes enabled");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn validate_accepts_vortex_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_format", "vortex"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("vortex is a listing FileFormat on non-Windows")
+            .expect("changes enabled");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn validate_accepts_vortex_file_extension_without_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_extension", ".vortex"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("file_extension .vortex is structured, matching listing inference")
+            .expect("changes enabled");
+    }
+
+    #[test]
+    fn listing_structured_formats_are_accepted_for_changes() {
+        for name in [
+            "parquet", "csv", "json", "tsv", "jsonl", "ndjson", "ldjson", "orc",
+        ] {
+            assert!(
+                is_structured_listing_format(name),
+                "{name} is a listing FileFormat and must pass changes validation"
+            );
+        }
+        #[cfg(not(windows))]
+        assert!(
+            is_structured_listing_format("vortex"),
+            "vortex is a listing FileFormat on non-Windows"
+        );
+        assert!(
+            !is_structured_listing_format("txt"),
+            "txt remains unstructured text"
+        );
+        assert!(
+            !is_structured_listing_format("auto"),
+            "file_format: auto is not itself structured"
+        );
     }
 
     #[tokio::test]
