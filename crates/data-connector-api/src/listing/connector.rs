@@ -482,7 +482,13 @@ impl TableProvider for MetadataPruningListingTable {
             // new objects never re-reads (and, for `jsonl.gz`, re-decompresses)
             // the whole source. Correctness is preserved by the residual
             // `FilterExec` this table reports via `supports_filters_pushdown`.
-            if let Some(bounds) = extract_last_modified_predicate(filters) {
+            if self.inner.options().metadata_cols.iter().any(|column| {
+                matches!(
+                    column,
+                    datafusion_datasource::metadata::MetadataColumn::LastModified
+                )
+            }) && let Some(bounds) = extract_last_modified_predicate(filters)
+            {
                 return self
                     .scan_last_modified_pruned(state, &bounds, projection, limit)
                     .await;
