@@ -1290,7 +1290,7 @@ pub(crate) mod tests {
     }
 
     /// A batch shaped like what a narrow `SELECT` (one that doesn't
-    /// reference `response_status`) leaves after DataFusion's projection
+    /// reference `response_status`) leaves after `DataFusion`'s projection
     /// pushdown prunes that column away — carrying only the schema-level
     /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker, no materialized column.
     /// `batches_cacheable` and `filter_transient_error_responses` must still
