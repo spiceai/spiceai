@@ -937,6 +937,7 @@ struct RuntimeLookupFilterIdentity {
 
 struct RuntimeLookupFilter {
     identity: RuntimeLookupFilterIdentity,
+    /// Distinct, non-null keys, bounded by `RUNTIME_INDEX_MAX_KEYS` during extraction.
     keys: Vec<Vec<ScalarValue>>,
 }
 
@@ -1061,7 +1062,7 @@ fn selection_keeps(selection: &Selection, position: u64) -> bool {
     }
 }
 
-/// Returns the exact non-null keys carried for `columns` by a dynamic filter.
+/// Finds a dynamic filter with a matching `IN` shape without materializing keys.
 /// Bounds and hash-membership expressions deliberately decline: only an
 /// `InListExpr` is an enumerable key set for the lookup index. Traversal is
 /// limited to conjunctions, where selecting candidates for one conjunct is
@@ -1076,7 +1077,7 @@ fn dynamic_in_list_expr<'a>(
     columns: &[String],
 ) -> Option<&'a DynamicFilterPhysicalExpr> {
     if let Some(dynamic) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
-        in_list_keys(&dynamic.current().ok()?, columns)?;
+        matching_in_list(&dynamic.current().ok()?, columns)?;
         return Some(dynamic);
     }
     let binary = expr.downcast_ref::<BinaryExpr>()?;
@@ -1107,25 +1108,47 @@ fn snapshot_dynamic_in_list_filter(
     })
 }
 
-fn in_list_keys(expr: &Arc<dyn PhysicalExpr>, columns: &[String]) -> Option<Vec<Vec<ScalarValue>>> {
+fn matching_in_list<'a>(
+    expr: &'a Arc<dyn PhysicalExpr>,
+    columns: &[String],
+) -> Option<&'a InListExpr> {
     if let Some(in_list) = expr.downcast_ref::<InListExpr>()
         && !in_list.negated()
         && in_list_matches_columns(in_list, columns)
     {
-        let mut keys = Vec::with_capacity(in_list.len());
-        for value in in_list.list() {
-            let scalar = value.downcast_ref::<Literal>()?.value();
-            if columns.len() == 1 {
-                if !scalar.is_null() {
-                    keys.push(vec![scalar.clone()]);
-                }
+        return Some(in_list);
+    }
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    if binary.op() != &Operator::And {
+        return None;
+    }
+    matching_in_list(binary.left(), columns).or_else(|| matching_in_list(binary.right(), columns))
+}
+
+fn in_list_keys(expr: &Arc<dyn PhysicalExpr>, columns: &[String]) -> Option<Vec<Vec<ScalarValue>>> {
+    let in_list = matching_in_list(expr, columns)?;
+    collect_runtime_keys(in_list.list(), columns.len())
+}
+
+/// Retains only bounded distinct keys. An oversized list declines the entire
+/// lookup without reading the remaining literals or exposing a partial selection.
+fn collect_runtime_keys<'a>(
+    values: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>>,
+    num_columns: usize,
+) -> Option<Vec<Vec<ScalarValue>>> {
+    let mut keys = HashSet::new();
+    for value in values {
+        let scalar = value.downcast_ref::<Literal>()?.value();
+        let key = if num_columns == 1 {
+            if scalar.is_null() {
                 continue;
             }
-
+            vec![scalar.clone()]
+        } else {
             let ScalarValue::Struct(struct_array) = scalar else {
                 return None;
             };
-            if struct_array.len() != 1 {
+            if struct_array.len() != 1 || struct_array.num_columns() != num_columns {
                 return None;
             }
             if struct_array.is_null(0) {
@@ -1136,17 +1159,16 @@ fn in_list_keys(expr: &Arc<dyn PhysicalExpr>, columns: &[String]) -> Option<Vec<
                 .iter()
                 .map(|array| ScalarValue::try_from_array(array, 0).ok())
                 .collect::<Option<Vec<_>>>()?;
-            if key.iter().all(|value| !value.is_null()) {
-                keys.push(key);
+            if key.iter().any(ScalarValue::is_null) {
+                continue;
             }
+            key
+        };
+        if keys.insert(key) && keys.len() > RUNTIME_INDEX_MAX_KEYS {
+            return None;
         }
-        return Some(keys);
     }
-    let binary = expr.downcast_ref::<BinaryExpr>()?;
-    if binary.op() != &Operator::And {
-        return None;
-    }
-    in_list_keys(binary.left(), columns).or_else(|| in_list_keys(binary.right(), columns))
+    Some(keys.into_iter().collect())
 }
 
 fn in_list_matches_columns(in_list: &InListExpr, columns: &[String]) -> bool {
@@ -1796,16 +1818,14 @@ impl LookupIndexState {
             return None;
         }
 
-        let keys: HashSet<Vec<ScalarValue>> = filter.keys.iter().cloned().collect();
-        if keys.len() > RUNTIME_INDEX_MAX_KEYS {
+        if filter.keys.len() > RUNTIME_INDEX_MAX_KEYS {
             self.record_runtime_fallback(&shape);
             return None;
         }
-        let keys = keys.into_iter().collect::<Vec<_>>();
         let max_rows = RUNTIME_INDEX_MIN_ROWS
             .max(usize_of(index.stats.rows) / 1_000)
             .min(RUNTIME_INDEX_MAX_ROWS);
-        let Some(hit) = index.probe_keys(&filter.identity.columns, &keys, max_rows) else {
+        let Some(hit) = index.probe_keys(&filter.identity.columns, &filter.keys, max_rows) else {
             self.record_runtime_fallback(&shape);
             return None;
         };
@@ -3094,6 +3114,107 @@ mod tests {
 
         assert!(in_list_matches_columns(in_list, &["tenant".to_string()]));
         assert!(!in_list_matches_columns(in_list, &["Tenant".to_string()]));
+    }
+
+    #[test]
+    fn runtime_key_extraction_refuses_too_many_distinct_keys() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let values = (0..=RUNTIME_INDEX_MAX_KEYS)
+            .map(|value| i64::try_from(value).expect("small key"))
+            .collect::<Vec<_>>();
+        let in_list = tenant_in_list(&column, &values);
+        let keys = in_list_keys(&in_list, &["tenant".to_string()]);
+        assert!(
+            keys.is_none(),
+            "extraction materialized {} keys instead of declining at the distinct-key bound",
+            keys.as_ref().map_or(0, Vec::len)
+        );
+    }
+
+    #[test]
+    fn runtime_key_extraction_deduplicates_before_applying_the_bound() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let values = (0..RUNTIME_INDEX_MAX_KEYS)
+            .cycle()
+            .take(RUNTIME_INDEX_MAX_KEYS * 3)
+            .map(|value| i64::try_from(value).expect("small key"))
+            .collect::<Vec<_>>();
+        let in_list = tenant_in_list(&column, &values);
+        let keys = in_list_keys(&in_list, &["tenant".to_string()]).expect("bounded distinct keys");
+        assert_eq!(keys.len(), RUNTIME_INDEX_MAX_KEYS);
+        let expected: HashSet<_> = (0..RUNTIME_INDEX_MAX_KEYS)
+            .map(|value| {
+                vec![ScalarValue::Int64(Some(
+                    i64::try_from(value).expect("small key"),
+                ))]
+            })
+            .collect();
+        assert_eq!(keys.into_iter().collect::<HashSet<_>>(), expected);
+    }
+
+    #[test]
+    fn runtime_key_extraction_stops_at_the_first_excess_distinct_key() {
+        let visited = std::cell::Cell::new(0);
+        let values = (0..RUNTIME_INDEX_MAX_KEYS * 2)
+            .map(|value| {
+                Arc::new(Literal::new(ScalarValue::Int64(Some(
+                    i64::try_from(value).expect("small key"),
+                )))) as Arc<dyn PhysicalExpr>
+            })
+            .collect::<Vec<_>>();
+        let keys =
+            collect_runtime_keys(values.iter().inspect(|_| visited.set(visited.get() + 1)), 1);
+        assert!(
+            keys.is_none(),
+            "an oversized list must not return partial keys"
+        );
+        assert_eq!(visited.get(), RUNTIME_INDEX_MAX_KEYS + 1);
+    }
+
+    #[test]
+    fn runtime_key_extraction_preserves_correlated_non_null_tuples() {
+        let fields = vec![
+            Arc::new(Field::new("tenant", DataType::Int64, true)),
+            Arc::new(Field::new("service", DataType::Utf8, true)),
+        ];
+        let literal = |tenant: Option<i64>, service: Option<&str>| {
+            Arc::new(Literal::new(ScalarValue::Struct(Arc::new(
+                arrow::array::StructArray::new(
+                    fields.clone().into(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![tenant])),
+                        Arc::new(StringArray::from(vec![service])),
+                    ],
+                    None,
+                ),
+            )))) as Arc<dyn PhysicalExpr>
+        };
+        let mut values = vec![literal(Some(1), Some("a")); RUNTIME_INDEX_MAX_KEYS * 2];
+        values.extend([
+            literal(Some(2), Some("b")),
+            literal(None, Some("a")),
+            literal(Some(1), None),
+        ]);
+        let keys = collect_runtime_keys(&values, 2).expect("two distinct non-null tuples");
+        assert_eq!(
+            keys.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::from("a")],
+                vec![ScalarValue::Int64(Some(2)), ScalarValue::from("b")],
+            ])
+        );
+        let oversized = (0..RUNTIME_INDEX_MAX_KEYS * 2)
+            .map(|value| literal(Some(i64::try_from(value).expect("small key")), Some("a")))
+            .collect::<Vec<_>>();
+        let visited = std::cell::Cell::new(0);
+        assert!(
+            collect_runtime_keys(
+                oversized.iter().inspect(|_| visited.set(visited.get() + 1)),
+                2,
+            )
+            .is_none()
+        );
+        assert_eq!(visited.get(), RUNTIME_INDEX_MAX_KEYS + 1);
     }
 
     #[test]

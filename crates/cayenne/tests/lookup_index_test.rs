@@ -635,6 +635,88 @@ async fn lookup_index_plan_evidence() {
     println!("lookup-index counters: {:?}", counters_of(&indexed));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_dynamic_key_sets_fall_back_before_probing() {
+    const INDEXED: &str = "bounded_indexed";
+    const PLAIN: &str = "bounded_plain";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(&fixture, INDEXED, &INDEX_KEYS, Arc::clone(&runtime_env)).await;
+    let plain = build_table(&fixture, PLAIN, &[], runtime_env).await;
+    let batch = service_rows(0, ROWS);
+    insert(&indexed, INDEXED, batch.clone()).await;
+    insert(&plain, PLAIN, batch).await;
+    wait_for_index(&indexed, INDEXED).await;
+
+    let mut config = SessionConfig::new().with_target_partitions(4);
+    config
+        .options_mut()
+        .optimizer
+        .hash_join_inlist_pushdown_max_distinct_values = 8_192;
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_table(INDEXED, Arc::clone(&indexed) as Arc<dyn TableProvider>)
+        .expect("register indexed table");
+    ctx.register_table(PLAIN, plain as Arc<dyn TableProvider>)
+        .expect("register plain table");
+    let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+    let mut values = (0..4_096).map(Some).collect::<Vec<_>>();
+    values.extend([Some(7), Some(7), None]);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(values))],
+    )
+    .expect("key batch");
+    let keys =
+        datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).expect("key table");
+    ctx.register_table("keys", Arc::new(keys))
+        .expect("register keys");
+    let sql = |table| {
+        format!(
+            "SELECT s.\"AutoId\" FROM keys k INNER JOIN {table} s \
+             ON k.key = s.\"AutoId\" ORDER BY s.\"AutoId\""
+        )
+    };
+    let expected = ctx
+        .sql(&sql(PLAIN))
+        .await
+        .expect("plain join plan")
+        .collect()
+        .await
+        .expect("plain join");
+    let before = counters_of(&indexed);
+    let actual = ctx
+        .sql(&sql(INDEXED))
+        .await
+        .expect("indexed join plan")
+        .collect()
+        .await
+        .expect("indexed join");
+    let after = counters_of(&indexed);
+    assert_eq!(rendered(&actual), rendered(&expected));
+    assert_eq!(rendered(&actual).len(), 4_098);
+    assert_eq!(after.selected, before.selected);
+    assert_eq!(after.access_plans_attached, before.access_plans_attached);
+    assert_eq!(
+        after.runtime_fallback, before.runtime_fallback,
+        "extraction must decline the oversized key set before reaching an index probe"
+    );
+    let explain = ctx
+        .sql(&format!("EXPLAIN ANALYZE {}", sql(INDEXED)))
+        .await
+        .expect("explain plan")
+        .collect()
+        .await
+        .expect("explain execution");
+    let analyzed = arrow::util::pretty::pretty_format_batches(&explain)
+        .expect("format plan")
+        .to_string();
+    assert!(analyzed.contains("mode=CollectLeft"));
+    assert!(analyzed.contains("DynamicFilter") && analyzed.contains(" IN (SET)"));
+    println!("oversized exact runtime filter: 4098 matching rows, {before:?} -> {after:?}");
+}
+
 /// A hash join's exact runtime key set is batch-probed against the secondary
 /// index after physical planning. The scan-level `lookup_index_outcome` remains
 /// `not_applicable` because no literal existed at `TableProvider::scan` time;
