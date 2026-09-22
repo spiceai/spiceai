@@ -1013,7 +1013,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
     Ok(())
 }
 
-async fn drop_replication_slot_when_inactive(
+pub(super) async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,
 ) -> Result<(), anyhow::Error> {
