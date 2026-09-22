@@ -185,14 +185,25 @@ impl RefreshCompletion {
     /// been recorded since the table was built, or the signal was closed
     /// because no refresh will run here.
     ///
-    /// Results-cache warmup uses this instead of the reusable
-    /// `initial_load_completed` flag, which checkpoint-backed tables publish
-    /// at construction — before this process's first Full/Append refresh (if
-    /// any) has invalidated cached results.
+    /// Results-cache warmup uses [`Self::closed_without_a_refresh`] together
+    /// with this: `close()` answers schedule-creation waiters on a cluster
+    /// scheduler, but it does not mean distributed data is queryable.
     #[must_use]
     pub fn has_recorded(&self) -> bool {
         let state = self.state.borrow();
         state.closed || state.completed > 0
+    }
+
+    /// The signal was closed and no refresh was recorded.
+    ///
+    /// A cluster scheduler closes completion because accelerated tables are
+    /// not refreshed locally. Warmup must wait for the distributed
+    /// dataset-ready / `PartitionsLoaded` path instead of treating this as
+    /// settled.
+    #[must_use]
+    pub fn closed_without_a_refresh(&self) -> bool {
+        let state = self.state.borrow();
+        state.closed && state.completed == 0
     }
 
     /// The highest request id recorded complete so far.
@@ -523,12 +534,28 @@ mod tests {
             closed.has_recorded(),
             "closing is an answer that no refresh will run here"
         );
+        assert!(
+            closed.closed_without_a_refresh(),
+            "close() without a recorded refresh is the scheduler signal"
+        );
 
         let untriggered = RefreshCompletion::new();
         untriggered.record_untriggered();
         assert!(
             untriggered.has_recorded(),
             "an untriggered completion answers the initial-load poll without closing"
+        );
+        assert!(
+            !untriggered.closed_without_a_refresh(),
+            "record_untriggered is a recorded completion, not a scheduler close"
+        );
+
+        let recorded_then_closed = RefreshCompletion::new();
+        record_one(&recorded_then_closed);
+        recorded_then_closed.close();
+        assert!(
+            !recorded_then_closed.closed_without_a_refresh(),
+            "close after a recorded refresh is not the scheduler-without-refresh signal"
         );
     }
 

@@ -422,6 +422,44 @@ impl RuntimeStatus {
         self.get_component_status(&format!("dataset:{dataset}"))
     }
 
+    /// Dataset keys that are `Ready` now, or that have a `Ready` update held
+    /// for later apply (results-cache warmup).
+    ///
+    /// While [`Self::hold_dataset_ready`] is active, [`Self::update_dataset`]
+    /// of `Ready` does not change [`Self::get_dataset_status`]. Callers that
+    /// must learn "the cluster has marked this dataset ready" — for example
+    /// warmup on a scheduler waiting for `PartitionsLoaded` — have to look
+    /// here, not at the visible status.
+    #[must_use]
+    pub fn dataset_ready_or_held_keys(&self) -> Vec<TableReference> {
+        let mut keys: HashSet<TableReference> = self
+            .get_dataset_statuses()
+            .into_iter()
+            .filter(|(_, status)| matches!(status, ComponentStatus::Ready))
+            .map(|(key, _)| key)
+            .collect();
+        let hold = self
+            .dataset_ready_hold
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = hold.as_ref() {
+            keys.extend(pending.iter().cloned());
+        }
+        keys.into_iter().collect()
+    }
+
+    /// Whether this dataset is `Ready`, or has a held `Ready` update.
+    ///
+    /// Compares the registered key as stored. Callers that may hold a
+    /// catalog-qualified name for a bare registered dataset must resolve both
+    /// sides (see `evaluate_table_readiness` in the runtime crate).
+    #[must_use]
+    pub fn dataset_ready_is_held_or_applied(&self, dataset: &TableReference) -> bool {
+        self.dataset_ready_or_held_keys()
+            .iter()
+            .any(|key| key == dataset)
+    }
+
     /// Returns `true` if the dataset has reported `Ready` at least once since it was
     /// registered. A refresh task reports `Refreshing` from the moment a load starts,
     /// including the first one, so this is what tells a refresh of loaded data apart
@@ -1116,6 +1154,10 @@ mod tests {
             !status.is_ready(),
             "runtime ready must wait for the held dataset Ready"
         );
+        assert!(
+            status.dataset_ready_is_held_or_applied(&dataset),
+            "held Ready must be visible to waiters that cannot look at get_dataset_status"
+        );
 
         status.release_dataset_ready();
 
@@ -1124,6 +1166,10 @@ mod tests {
             Some(ComponentStatus::Ready)
         );
         assert!(status.is_ready());
+        assert!(
+            status.dataset_ready_is_held_or_applied(&dataset),
+            "applied Ready must still be visible after release"
+        );
     }
 
     #[test]

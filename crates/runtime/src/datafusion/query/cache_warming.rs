@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use app::App;
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
@@ -55,7 +56,7 @@ use tokio::sync::RwLock;
 use crate::accelerated::AcceleratedTable;
 use crate::accelerated::RefreshCompletion;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 use super::QueryBuilder;
 use super::ResultsCacheMode;
@@ -482,7 +483,7 @@ impl DataFusion {
             ) else {
                 continue;
             };
-            if !first_full_or_append_refresh_settled(table).await {
+            if !first_full_or_append_refresh_settled(table, status, &name).await {
                 return false;
             }
         }
@@ -561,21 +562,70 @@ impl DataFusion {
 /// cache invalidation. The reusable `initial_load_completed` flag is not
 /// enough: checkpoint-backed tables publish it at construction, before this
 /// process's startup refresh (if any) has run.
-async fn first_full_or_append_refresh_settled(table: &AcceleratedTable) -> bool {
+///
+/// A cluster scheduler closes that completion because it never refreshes
+/// locally. Warmup then waits for the dataset's `Ready` update from
+/// executor `PartitionsLoaded` acks. That update is often held (so
+/// `/v1/ready` stays false until warmup finishes); look at the hold, not
+/// the visible status.
+async fn first_full_or_append_refresh_settled(
+    table: &AcceleratedTable,
+    status: &status::RuntimeStatus,
+    name: &TableReference,
+) -> bool {
     first_full_or_append_refresh_settled_for(
         table.refresher().refresh_mode().await,
         table.refresher().refresh_completion().as_ref(),
+        status,
+        name,
     )
 }
 
 fn first_full_or_append_refresh_settled_for(
     mode: RefreshMode,
     completion: Option<&RefreshCompletion>,
+    status: &status::RuntimeStatus,
+    name: &TableReference,
 ) -> bool {
     if !matches!(mode, RefreshMode::Full | RefreshMode::Append) {
         return true;
     }
-    completion.is_none_or(RefreshCompletion::has_recorded)
+    let Some(completion) = completion else {
+        return true;
+    };
+    if completion.closed_without_a_refresh() {
+        // Scheduler: no local refresh will run. Wait for the distributed
+        // Ready (often held so `/v1/ready` stays false during warmup), or
+        // stop waiting if this dataset will never become ready.
+        return dataset_ready_for_warmup(status, name)
+            || dataset_will_not_become_ready(status, name);
+    }
+    completion.has_recorded()
+}
+
+fn same_spice_table(left: &TableReference, right: &TableReference) -> bool {
+    left.clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        == right
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+fn dataset_ready_for_warmup(status: &status::RuntimeStatus, name: &TableReference) -> bool {
+    status
+        .dataset_ready_or_held_keys()
+        .iter()
+        .any(|key| same_spice_table(key, name))
+}
+
+fn dataset_will_not_become_ready(status: &status::RuntimeStatus, name: &TableReference) -> bool {
+    status.get_dataset_statuses().iter().any(|(key, st)| {
+        same_spice_table(key, name)
+            && matches!(
+                st,
+                status::ComponentStatus::Error(_) | status::ComponentStatus::Disabled
+            )
+    })
 }
 
 /// Replay one parameterized template from streamed DISTINCT rows.
@@ -1620,27 +1670,54 @@ mod tests {
 
     #[test]
     fn warmup_waits_on_per_process_completion_not_reusable_flag() {
+        let status = status::RuntimeStatus::new();
+        let name = TableReference::bare("orders");
         let completion = RefreshCompletion::new();
         assert!(
-            !first_full_or_append_refresh_settled_for(RefreshMode::Full, Some(&completion)),
+            !first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
             "Full must wait for this process's refresh completion, even when the reusable flag is already true"
         );
         assert!(
-            !first_full_or_append_refresh_settled_for(RefreshMode::Append, Some(&completion)),
+            !first_full_or_append_refresh_settled_for(
+                RefreshMode::Append,
+                Some(&completion),
+                &status,
+                &name
+            ),
             "Append must wait for this process's refresh completion"
         );
         assert!(
-            first_full_or_append_refresh_settled_for(RefreshMode::Changes, Some(&completion)),
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Changes,
+                Some(&completion),
+                &status,
+                &name
+            ),
             "Changes is not a warmup gate"
         );
         assert!(
-            first_full_or_append_refresh_settled_for(RefreshMode::Caching, Some(&completion)),
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Caching,
+                Some(&completion),
+                &status,
+                &name
+            ),
             "Caching is not a warmup gate"
         );
 
         completion.record_untriggered();
         assert!(
-            first_full_or_append_refresh_settled_for(RefreshMode::Full, Some(&completion)),
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
             "Disabled startup (no scheduled refresh) must release warmup"
         );
 
@@ -1648,13 +1725,120 @@ mod tests {
         let id = recorded.issue();
         recorded.record(id);
         assert!(
-            first_full_or_append_refresh_settled_for(RefreshMode::Full, Some(&recorded)),
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&recorded),
+                &status,
+                &name
+            ),
             "a recorded refresh after invalidation must release warmup"
         );
 
         assert!(
-            first_full_or_append_refresh_settled_for(RefreshMode::Full, None),
+            first_full_or_append_refresh_settled_for(RefreshMode::Full, None, &status, &name),
             "a table with no completion signal cannot be waited on"
+        );
+    }
+
+    /// Scheduler tables call `RefreshCompletion::close()` because they never
+    /// refresh locally. `has_recorded()` is then true while the dataset is
+    /// still `Refreshing`, waiting on executor `PartitionsLoaded` acks.
+    /// Warmup is once-only, so settling on `close()` would replay before
+    /// distributed data is queryable and never retry.
+    #[test]
+    fn scheduler_close_does_not_settle_warmup_before_distributed_ready() {
+        let completion = RefreshCompletion::new();
+        completion.close();
+        let status = status::RuntimeStatus::new();
+        let name = TableReference::bare("orders");
+        status.update_dataset(&name, status::ComponentStatus::Refreshing);
+        status.hold_dataset_ready();
+
+        // Reproduction of the interleaving Copilot reported: close() answers
+        // has_recorded, visible status is still Refreshing, and the old settle
+        // predicate would have returned true.
+        let completion_closed = completion.has_recorded();
+        let dataset_ready =
+            status.get_dataset_status(&name) == Some(status::ComponentStatus::Ready);
+        let old_settled = completion_closed;
+        eprintln!(
+            "scheduler warmup interleaving: completion_closed={completion_closed} dataset_ready={dataset_ready} old_settled={old_settled}"
+        );
+        assert!(
+            completion_closed && !dataset_ready && old_settled,
+            "the close-before-PartitionsLoaded interleaving must still be observable"
+        );
+
+        assert!(
+            !first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
+            "scheduler close must not start warmup before PartitionsLoaded Ready"
+        );
+
+        status.update_dataset(&name, status::ComponentStatus::Ready);
+        assert_eq!(
+            status.get_dataset_status(&name),
+            Some(status::ComponentStatus::Refreshing),
+            "the ready-hold must keep Ready invisible so /v1/ready stays false"
+        );
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
+            "a held Ready from PartitionsLoaded must release warmup"
+        );
+
+        let qualified = TableReference::full("spice", "public", "orders");
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &qualified
+            ),
+            "bare and spice.public names must resolve as the same dataset"
+        );
+    }
+
+    #[test]
+    fn scheduler_error_or_disabled_does_not_block_warmup_forever() {
+        let completion = RefreshCompletion::new();
+        completion.close();
+        let status = status::RuntimeStatus::new();
+        let name = TableReference::bare("orders");
+        status.hold_dataset_ready();
+        status.update_dataset(
+            &name,
+            status::ComponentStatus::error_with_message("partition load failed"),
+        );
+
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
+            "a scheduler dataset that errored will never become Ready; do not hang warmup"
+        );
+
+        let disabled = TableReference::bare("legacy");
+        status.update_dataset(&disabled, status::ComponentStatus::Disabled);
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &disabled
+            ),
+            "Disabled is terminal for warmup the same way Error is"
         );
     }
 }
