@@ -600,7 +600,14 @@ fn first_full_or_append_refresh_settled_for(
         return dataset_ready_for_warmup(status, name)
             || dataset_will_not_become_ready(status, name);
     }
-    completion.has_recorded()
+    if completion.has_recorded() {
+        return true;
+    }
+    // Local Full/Append still in progress or retrying. Disabled is
+    // terminal. Error is not: a periodic refresh can still succeed,
+    // and warmup is once-only. A one-shot failure records completion
+    // in `after_refresh_task_completed` instead of settling on Error.
+    dataset_is_disabled(status, name)
 }
 
 fn same_spice_table(left: &TableReference, right: &TableReference) -> bool {
@@ -625,6 +632,12 @@ fn dataset_will_not_become_ready(status: &status::RuntimeStatus, name: &TableRef
                 st,
                 status::ComponentStatus::Error(_) | status::ComponentStatus::Disabled
             )
+    })
+}
+
+fn dataset_is_disabled(status: &status::RuntimeStatus, name: &TableReference) -> bool {
+    status.get_dataset_statuses().iter().any(|(key, st)| {
+        same_spice_table(key, name) && matches!(st, status::ComponentStatus::Disabled)
     })
 }
 
@@ -1839,6 +1852,73 @@ mod tests {
                 &disabled
             ),
             "Disabled is terminal for warmup the same way Error is"
+        );
+    }
+
+    #[test]
+    fn local_refresh_error_is_not_settled_until_completion_or_disable() {
+        let completion = RefreshCompletion::new();
+        let status = status::RuntimeStatus::new();
+        let name = TableReference::bare("orders");
+        status.hold_dataset_ready();
+        status.update_dataset(
+            &name,
+            status::ComponentStatus::error_with_message("source refresh failed"),
+        );
+
+        // Reproduction of the interleaving Copilot reported: a local Full
+        // refresh failed, completion is unrecorded (retries may still run),
+        // and the warmup hold keeps /v1/ready false even in OnRegistration.
+        status.set_ready_state(status::RuntimeReadyState::OnRegistration);
+        let settled_after_permanent_refresh_error = first_full_or_append_refresh_settled_for(
+            RefreshMode::Full,
+            Some(&completion),
+            &status,
+            &name,
+        );
+        let on_registration_without_warmup_hold = {
+            let unlocked = status::RuntimeStatus::new();
+            unlocked.set_ready_state(status::RuntimeReadyState::OnRegistration);
+            unlocked.update_dataset(
+                &name,
+                status::ComponentStatus::error_with_message("source refresh failed"),
+            );
+            unlocked.is_ready()
+        };
+        let on_registration_with_warmup_hold = status.is_ready();
+        eprintln!(
+            "local refresh error interleaving: settled_after_permanent_refresh_error={settled_after_permanent_refresh_error} on_registration_without_warmup_hold={on_registration_without_warmup_hold} on_registration_with_warmup_hold={on_registration_with_warmup_hold}"
+        );
+        assert!(
+            !settled_after_permanent_refresh_error
+                && on_registration_without_warmup_hold
+                && !on_registration_with_warmup_hold,
+            "Error without a recorded completion must not start once-only warmup"
+        );
+
+        let id = completion.issue();
+        completion.record(id);
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
+            "a one-shot failure records completion so warmup can finish"
+        );
+
+        let disabled = RefreshCompletion::new();
+        let disabled_name = TableReference::bare("legacy");
+        status.update_dataset(&disabled_name, status::ComponentStatus::Disabled);
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&disabled),
+                &status,
+                &disabled_name
+            ),
+            "Disabled is terminal for a local refresh that will never complete"
         );
     }
 }

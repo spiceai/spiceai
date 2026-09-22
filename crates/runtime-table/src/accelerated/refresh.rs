@@ -1167,6 +1167,7 @@ impl Refresher {
                                     record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
                                 }
                             },
+                            refresh_check_interval.is_some(),
                         ).await;
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
@@ -1323,15 +1324,24 @@ fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
 /// poller of that flag store entries this callback then evicts. The flag still
 /// precedes `record_done`, so a waiter woken by the completion observes the
 /// initial load as done — the same pairing as `RefreshTask::signal_dataset_ready`.
+///
+/// A failed refresh does not publish the ready flag. If `retry_scheduled` is
+/// true (`refresh_check_interval` will fire again), completion is also left
+/// unrecorded so warmup does not claim the once-only replay on a transient
+/// error. A one-shot failure records completion so warmup and the ready-hold
+/// do not wait forever.
 async fn after_refresh_task_completed(
     refresh_succeeded: bool,
     initial_load_completed: &AtomicBool,
     invalidate: impl std::future::Future<Output = ()>,
     record_done: impl std::future::Future<Output = ()>,
+    retry_scheduled: bool,
 ) {
     invalidate.await;
     if refresh_succeeded {
         initial_load_completed.store(true, Ordering::Relaxed);
+        record_done.await;
+    } else if !retry_scheduled {
         record_done.await;
     }
 }
@@ -1560,6 +1570,7 @@ mod tests {
                 );
                 recorded.store(true, Ordering::Relaxed);
             },
+            false,
         )
         .await;
 
@@ -1598,6 +1609,7 @@ mod tests {
                 invalidated.store(true, Ordering::Relaxed);
             },
             async {},
+            false,
         )
         .await;
 
@@ -1623,6 +1635,7 @@ mod tests {
             async {
                 recorded.store(true, Ordering::Relaxed);
             },
+            true,
         )
         .await;
 
@@ -1636,7 +1649,40 @@ mod tests {
         );
         assert!(
             !recorded.load(Ordering::Relaxed),
-            "a failed refresh must not record completion"
+            "a failed refresh that will retry must not record completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_refresh_task_completed_oneshot_failure_records_without_ready_flag() {
+        let initial_load_completed = AtomicBool::new(false);
+        let invalidated = AtomicBool::new(false);
+        let recorded = AtomicBool::new(false);
+
+        after_refresh_task_completed(
+            false,
+            &initial_load_completed,
+            async {
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {
+                recorded.store(true, Ordering::Relaxed);
+            },
+            false,
+        )
+        .await;
+
+        assert!(
+            invalidated.load(Ordering::Relaxed),
+            "a failed one-shot refresh must still invalidate"
+        );
+        assert!(
+            !initial_load_completed.load(Ordering::Relaxed),
+            "a failed refresh must not publish the ready flag"
+        );
+        assert!(
+            recorded.load(Ordering::Relaxed),
+            "a one-shot failure must record completion so warmup does not hang"
         );
     }
 
