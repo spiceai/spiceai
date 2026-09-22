@@ -295,6 +295,15 @@ fn is_probability(value: f64) -> bool {
 /// Half the step of the two-decimal rounding that responses commonly carry.
 const ROUNDING_HALF_STEP: f64 = 0.005;
 
+/// The most a distribution may sum from 1, however many values it holds.
+///
+/// Rounding alone can move a wide distribution further than this: 200 options that
+/// each sit just under half a step all round to zero. A distribution that has lost
+/// that much mass to rounding is not a calibrated answer to publish, so it fails
+/// with an error instead. No score rubric reaches the cap, since ten levels allow at
+/// most `0.051`, so it bounds only wide choice domains.
+const MAX_PROBABILITY_SUM_TOLERANCE: f64 = 0.1;
+
 /// How far a reported probability sum may sit from 1, for a distribution of `n`
 /// masses.
 ///
@@ -302,14 +311,18 @@ const ROUNDING_HALF_STEP: f64 = 0.005;
 /// may be independently rounded to two decimal places, so the aggregate error
 /// scales with `n` (half a step per value) plus a small floating-point fudge.
 /// A constant sized for two values (`0.011`) rejects a valid seven-way
-/// rounding such as `[0.15 × 6, 0.12]` from `[0.146 × 6, 0.124]`.
+/// rounding such as `[0.15 × 6, 0.12]` from `[0.146 × 6, 0.124]`. The allowance
+/// stops at [`MAX_PROBABILITY_SUM_TOLERANCE`], so a wide domain cannot grow it into
+/// acceptance of any sum.
 fn probability_sum_tolerance(n: usize) -> f64 {
     #[expect(
         clippy::cast_precision_loss,
         reason = "distribution size is the question domain, not a byte count"
     )]
     let n = n as f64;
-    ROUNDING_HALF_STEP.mul_add(n, 0.001)
+    ROUNDING_HALF_STEP
+        .mul_add(n, 0.001)
+        .min(MAX_PROBABILITY_SUM_TOLERANCE)
 }
 
 /// How far a reported score may sit from the weighted average recomputed from the
@@ -1446,6 +1459,64 @@ mod tests {
                 .contains("is not the probability-weighted average"),
             "{err}"
         );
+    }
+
+    /// A choice over `n` options named `o0`..`o{n-1}`, answered with `probabilities`
+    /// and choosing `o0`.
+    async fn evaluate_wide_choice(
+        n: usize,
+        probabilities: serde_json::Map<String, serde_json::Value>,
+    ) -> evaluate_api::Result<evaluate_api::EvaluateResponse> {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "o0",
+                "probabilities": probabilities, "confidence": 0.5
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+        let criteria = (0..n)
+            .map(|i| (format!("o{i}"), EntryType::String(format!("option {i}"))))
+            .collect();
+        client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: BTreeMap::from([(
+                    "q".to_string(),
+                    Question::Choice {
+                        instructions: "pick one".into(),
+                        criteria,
+                    },
+                )]),
+            })
+            .await
+    }
+
+    /// Regression for an unbounded rounding allowance: across 200 options the slack
+    /// grew past 1, so a distribution of all zeros was published as an answer.
+    #[tokio::test]
+    async fn evaluate_rejects_an_all_zero_distribution_over_a_wide_choice() {
+        let probabilities = (0..200).map(|i| (format!("o{i}"), json!(0.0))).collect();
+        let err = evaluate_wide_choice(200, probabilities)
+            .await
+            .expect_err("200 zero probabilities are not a distribution");
+        assert!(err.to_string().contains("sum to"), "{err}");
+    }
+
+    /// The cap bounds wide domains without rejecting a real distribution over one.
+    #[tokio::test]
+    async fn evaluate_accepts_a_valid_distribution_over_a_wide_choice() {
+        let mut probabilities: serde_json::Map<String, serde_json::Value> =
+            (1..200).map(|i| (format!("o{i}"), json!(0.0))).collect();
+        probabilities.insert("o0".into(), json!(1.0));
+        evaluate_wide_choice(200, probabilities)
+            .await
+            .expect("a distribution summing to 1 over 200 options is a valid answer");
     }
 
     #[tokio::test]
