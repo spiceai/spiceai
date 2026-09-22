@@ -65,6 +65,31 @@ def write_pack_file(local_packs: Path, relative: str) -> None:
     path.write_text("// query\n")
 
 
+class CodeQlTriggerTest(unittest.TestCase):
+    def test_codeql_does_not_scan_pull_requests(self):
+        import yaml
+
+        doc = yaml.safe_load(WORKFLOW.read_text())
+        # PyYAML 1.1 parses an unquoted `on` key as boolean true.
+        triggers = doc[True] if True in doc else doc["on"]
+        self.assertEqual(set(triggers), {"merge_group", "push"})
+        self.assertEqual(
+            triggers["merge_group"]["branches"],
+            ["trunk", "release-*", "release/*"],
+        )
+        self.assertEqual(
+            triggers["push"]["branches"],
+            ["trunk", "release-*", "release/*"],
+        )
+
+        upload = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "codeql-upload.yml").read_text()
+        )
+        script = upload["jobs"]["upload"]["steps"][0]["run"]
+        self.assertIn("pull_request|pull_request_target)", script)
+        self.assertNotIn("refs/pull/", script)
+
+
 class RelocateCodeQlQueryPathsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
