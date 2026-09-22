@@ -19,10 +19,10 @@ name: 'CodeQL'
 # build script shares that VM and can replace files under `runner.temp`
 # before `upload-artifact`. It uploads the finalized CodeQL database.
 # `Produce SARIF` runs on a fresh VM, analyzes that database, and publishes
-# the SARIF artifact. The database's query suite stores absolute paths from
-# the Analyze runner; Produce SARIF rewrites those onto its own CLI before
-# `database analyze`. `codeql-upload.yml` (`workflow_run`, default branch)
-# is what calls `upload-sarif`.
+# the SARIF artifact. It runs the code-scanning suite shipped with its own
+# CLI. The suite stored in the database is written on the Analyze VM, so it
+# is not used. `codeql-upload.yml` (`workflow_run`, default branch) is what
+# calls `upload-sarif`.
 on:
   merge_group:
     branches:
@@ -191,117 +191,6 @@ jobs:
             echo "::error::CodeQL CLI was not installed, so SARIF was not produced."
             exit 1
           fi
-          # Packs sit beside the CLI: <dist>/codeql/codeql and <dist>/codeql/qlpacks.
-          local_packs="$(dirname "${CODEQL_PATH}")/qlpacks"
-          if [[ ! -d "${local_packs}" ]]; then
-            echo "::error::CodeQL qlpacks directory '${local_packs}' was not found, so SARIF was not produced."
-            exit 1
-          fi
-          local_packs="$(cd "${local_packs}" && pwd -P)"
-          # `database init` writes temp/config-queries.qls with absolute paths on
-          # the Analyze runner (spiceai-dev-runners: /home/runner/_work/_tool/CodeQL).
-          # This job is a fresh hosted VM (/opt/hostedtoolcache/CodeQL), so those
-          # files are not here. Both jobs pin the same CodeQL action, so the pack
-          # tree matches and only the prefix differs. The suite is written on the
-          # untrusted Analyze VM: accept only query files inside this CLI's packs.
-          python3 - "${IMPORTED_ROOT}" "${local_packs}" <<'PY'
-          # relocate-codeql-query-paths
-          import pathlib
-          import re
-          import sys
-
-          _PACK_PREFIX = re.compile(r"/(?:[^ \t\r\n'\"]*?)/codeql/qlpacks/")
-
-
-          def relocate_suite_text(text, local_packs):
-              local = str(local_packs).rstrip("/")
-              return _PACK_PREFIX.sub(local + "/", text)
-
-
-          def suite_query_paths(text):
-              paths = []
-              for line in text.splitlines():
-                  stripped = line.strip()
-                  if not stripped.startswith("query:"):
-                      continue
-                  query = stripped.split(":", 1)[1].strip()
-                  if len(query) >= 2 and query[0] == query[-1] and query[0] in "'\"":
-                      query = query[1:-1]
-                  paths.append(query)
-              return paths
-
-
-          def query_is_in_packs(query, local_prefix):
-              if not query.startswith(local_prefix + "/"):
-                  return False
-              path = pathlib.Path(query)
-              if ".." in path.parts:
-                  return False
-              try:
-                  path.resolve().relative_to(pathlib.Path(local_prefix).resolve())
-              except ValueError:
-                  return False
-              return path.is_file()
-
-
-          def relocate_database_tree(root, local_packs):
-              root_path = pathlib.Path(root)
-              local_prefix = str(local_packs).rstrip("/")
-              if not pathlib.Path(local_prefix).is_dir():
-                  print(
-                      f"::error::CodeQL qlpacks directory '{local_prefix}' was not found, so SARIF was not produced.",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
-              suites = sorted(path for path in root_path.rglob("*.qls") if path.is_file())
-              if not suites:
-                  print(
-                      "::error::No CodeQL query suite was found in the imported database, so SARIF was not produced.",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
-              planned = []
-              missing = []
-              for suite in suites:
-                  original = suite.read_text()
-                  updated = relocate_suite_text(original, local_prefix)
-                  before = suite_query_paths(original)
-                  after = suite_query_paths(updated)
-                  if len(before) != len(after) or not after:
-                      print(
-                          f"::error::CodeQL query suite '{suite}' has no relocatable query paths, so SARIF was not produced.",
-                          file=sys.stderr,
-                      )
-                      sys.exit(1)
-                  for query in after:
-                      if not query_is_in_packs(query, local_prefix):
-                          missing.append(query)
-                  planned.append((suite, before, after, original, updated))
-              if missing:
-                  print(
-                      "::error::CodeQL query suite references files this CLI does not have, so SARIF was not produced.",
-                      file=sys.stderr,
-                  )
-                  for query in missing:
-                      print(query, file=sys.stderr)
-                  sys.exit(1)
-              for suite, before, after, original, updated in planned:
-                  changed = sum(1 for old, new in zip(before, after) if old != new)
-                  if updated != original:
-                      suite.write_text(updated)
-                  print(f"Relocated {changed} CodeQL query paths in {suite}")
-
-
-          if __name__ == "__main__":
-              if len(sys.argv) != 3:
-                  print(
-                      "::error::Expected the imported database root and the qlpacks directory, so SARIF was not produced.",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
-              relocate_database_tree(sys.argv[1], sys.argv[2])
-          # end-relocate-codeql-query-paths
-          PY
           mkdir -p "${SARIF_DIR}"
           found=0
           shopt -s nullglob
@@ -310,12 +199,15 @@ jobs:
               continue
             fi
             lang="$(basename "${db}")"
-            suite="${db}temp/config-queries.qls"
-            if [[ ! -f "${suite}" ]]; then
-              echo "::error::CodeQL database '${db}' has no temp/config-queries.qls, so SARIF was not produced."
-              exit 1
-            fi
+            # The suite inside the database is written on the Analyze VM, after
+            # the merge commit's build. That build can replace the default suite
+            # with one query from the standard pack, and path checks still pass.
+            # This job runs the code-scanning suite shipped with its CLI. Both
+            # jobs pin the same CodeQL action, so the pack matches the database.
+            # Do not pass the suite file stored in the database.
+            suite="codeql/${lang}-queries:codeql-suites/${lang}-code-scanning.qls"
             found=1
+            echo "Analyzing ${lang} with ${suite}"
             "${CODEQL_PATH}" database analyze \
               --format=sarifv2.1.0 \
               --output="${SARIF_DIR}/${lang}.sarif" \
