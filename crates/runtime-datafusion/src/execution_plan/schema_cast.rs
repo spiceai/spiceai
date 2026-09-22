@@ -196,7 +196,7 @@ impl SchemaCastScanExec {
     /// Projects the child's per-column statistics onto this exec's output schema.
     ///
     /// [`Statistics::column_statistics`] must hold exactly one entry per field of
-    /// the schema the statistics describe — DataFusion indexes it positionally,
+    /// the schema the statistics describe — `DataFusion` indexes it positionally,
     /// and a parent `FilterExec`'s boundary analysis reads
     /// `column_statistics[col_index]` for the filtered column. This exec advertises
     /// `output_schema`, which may drop, reorder, or retype the child's columns, so
