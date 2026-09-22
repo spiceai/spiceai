@@ -301,13 +301,16 @@ mod tests {
     use super::{home_dir, local_model_path, looks_like_local_model_path};
 
     /// A static-embedding model directory holding only the two files
-    /// `model2vec-rs` actually reads: the tokenizer and the embedding tensor.
+    /// `model2vec-rs` actually reads — the tokenizer and the embedding tensor,
+    /// named `tensor_key` — and no `config.json`.
     ///
     /// Written by hand rather than downloaded so the guard is offline and needs no
     /// fixture. `safetensors` is a length-prefixed JSON header followed by the raw
     /// tensor bytes, and the loader takes the first of `embeddings`,
-    /// `embedding.weight` or `0` that it finds.
-    fn sentence_transformers_style_model_dir() -> tempfile::TempDir {
+    /// `embedding.weight` or `0` that it finds. The key is a parameter because
+    /// upstream reads `embeddings` only, while a sentence-transformers export
+    /// names it `embedding.weight`.
+    fn sentence_transformers_style_model_dir(tensor_key: &str) -> tempfile::TempDir {
         use std::io::Write;
         use tokenizers::Tokenizer;
         use tokenizers::models::wordpiece::WordPiece;
@@ -331,7 +334,7 @@ mod tests {
             .save(dir.path().join("tokenizer.json"), false)
             .expect("writes the fixture tokenizer");
 
-        // A 4x2 f32 `embeddings` tensor, one row per vocabulary entry.
+        // A 4x2 f32 embedding tensor, one row per vocabulary entry.
         let rows: usize = 4;
         let cols: usize = 2;
         let mut data = Vec::with_capacity(rows * cols * 4);
@@ -343,7 +346,7 @@ mod tests {
             data.extend_from_slice(&(i as f32).to_le_bytes());
         }
         let header = format!(
-            r#"{{"embeddings":{{"dtype":"F32","shape":[{rows},{cols}],"data_offsets":[0,{}]}}}}"#,
+            r#"{{"{tensor_key}":{{"dtype":"F32","shape":[{rows},{cols}],"data_offsets":[0,{}]}}}}"#,
             data.len()
         );
         let mut safetensors = std::fs::File::create(dir.path().join("model.safetensors"))
@@ -372,7 +375,7 @@ mod tests {
     /// the model was never supposed to have.
     #[test]
     fn a_local_model_loads_without_a_config_json() {
-        let dir = sentence_transformers_style_model_dir();
+        let dir = sentence_transformers_style_model_dir("embeddings");
         assert!(
             !dir.path().join("config.json").exists(),
             "this guard needs a model directory with no config.json"
@@ -392,6 +395,37 @@ mod tests {
             panic!(
                 "a static-embedding model directory without a config.json must load, since \
                  sentence-transformers models do not ship one: {e}"
+            )
+        });
+    }
+
+    /// The embedding tensor has to be found under `embedding.weight` as well as
+    /// `embeddings`.
+    ///
+    /// The same fork commit carries this, and it is a separate contract: one line
+    /// (`.or_else(|_| safet.tensor("embedding.weight"))`) that upstream does not
+    /// have. It is the *same* use case as the row's other half — a
+    /// sentence-transformers export ships no `config.json` **and** names its
+    /// tensor `embedding.weight` — so a re-cut that carried only the optional
+    /// `config.json` would leave exactly the model the row is about still failing
+    /// to load, with the guard beside this one green.
+    ///
+    /// The control is the other test: it loads the same fixture under the
+    /// upstream name, so this one failing means the fallback is gone rather than
+    /// the fixture being malformed.
+    #[test]
+    fn a_local_model_loads_with_the_sentence_transformers_tensor_name() {
+        let dir = sentence_transformers_style_model_dir("embedding.weight");
+        let name = dir
+            .path()
+            .to_str()
+            .expect("the fixture model path is UTF-8");
+
+        Model2Vec::from_params(name, None, None, None, None, None, None).unwrap_or_else(|e| {
+            panic!(
+                "a static-embedding model whose tensor is named `embedding.weight` must load: \
+                 upstream reads `embeddings` only, so without the fork's fallback every \
+                 sentence-transformers export fails here: {e}"
             )
         });
     }
