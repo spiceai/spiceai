@@ -1182,8 +1182,9 @@ impl FileFormat for VortexFormat {
 /// The column's Vortex dtype is tried first because it reconstructs the types
 /// Vortex models directly (dictionaries, temporal extensions); the fallback
 /// converts on the value's own dtype and copies the column's tag onto the
-/// payload. A value that cannot carry the column's type is reported as no bound,
-/// which costs pruning but never a plan.
+/// payload. Decimal bounds also use the column's Arrow storage width: Vortex
+/// chooses their width from precision, independently of the Arrow field's width.
+/// A value that cannot carry the column's type is reported as no bound.
 fn stat_bound_to_df(
     stat: Stat,
     value: stats::Precision<VortexScalarValue>,
@@ -1220,6 +1221,30 @@ fn retag_bound_to_column(value: &ScalarValue, column_type: &DataType) -> Option<
     let value_type = value.data_type();
     if &value_type == column_type {
         return Some(value.clone());
+    }
+
+    // Vortex uses the narrowest decimal width for its precision. Restoring the
+    // Arrow field's width only widens storage, without rounding or rescaling.
+    if matches!(
+        (&value_type, column_type),
+        (
+            DataType::Decimal32(p, s),
+            DataType::Decimal64(target_p, target_s)
+                | DataType::Decimal128(target_p, target_s)
+                | DataType::Decimal256(target_p, target_s),
+        ) | (
+            DataType::Decimal64(p, s),
+            DataType::Decimal128(target_p, target_s)
+                | DataType::Decimal256(target_p, target_s),
+        ) | (
+            DataType::Decimal128(p, s),
+            DataType::Decimal256(target_p, target_s),
+        ) if p == target_p && s == target_s
+    ) {
+        return value
+            .cast_to(column_type)
+            .ok()
+            .filter(|bound| !bound.is_null());
     }
 
     match column_type {
@@ -1293,6 +1318,76 @@ mod tests {
 
     use super::*;
     use crate::common_tests::TestSessionContext;
+    use crate::convert::FromDataFusion;
+    use datafusion_common::arrow::datatypes::i256;
+
+    #[test]
+    fn decimal_bounds_preserve_arrow_width_and_statistical_precision() -> anyhow::Result<()> {
+        for expected in [
+            ScalarValue::Decimal32(Some(-4_200), 5, 2),
+            ScalarValue::Decimal64(Some(-4_200), 5, 2),
+            ScalarValue::Decimal128(Some(-4_200), 5, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(-4_200)), 5, 2),
+            ScalarValue::Decimal64(Some(4_200), 10, 2),
+            ScalarValue::Decimal128(Some(4_200), 10, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(4_200)), 10, 2),
+            ScalarValue::Decimal128(Some(i128::from(i64::MAX) + 1), 20, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(i128::from(i64::MAX) + 1)), 20, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(i128::MAX)), 50, 10),
+            ScalarValue::Decimal128(Some(99_999), 5, -2),
+            ScalarValue::Decimal256(Some(i256::ZERO), 5, 2),
+        ] {
+            let scalar = Scalar::from_df(&expected)?;
+            let raw = scalar
+                .value()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("expected a non-null decimal bound"))?;
+            let column_type = expected.data_type();
+            for stat in [Stat::Min, Stat::Max] {
+                for value in [
+                    stats::Precision::Exact(raw.clone()),
+                    stats::Precision::Inexact(raw.clone()),
+                ] {
+                    let expected_stat = value.as_ref().map(|_| expected.clone());
+                    assert_eq!(
+                        stat_bound_to_df(stat, value, scalar.dtype(), scalar.dtype(), &column_type),
+                        expected_stat,
+                        "{stat:?} bound for {column_type:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_bounds_reject_narrowing_rescaling_and_nulls() {
+        for (value, column_type) in [
+            (
+                ScalarValue::Decimal64(Some(42), 5, 2),
+                DataType::Decimal32(5, 2),
+            ),
+            (
+                ScalarValue::Decimal64(Some(4_200), 10, 2),
+                DataType::Decimal128(10, 3),
+            ),
+            (
+                ScalarValue::Decimal64(Some(4_200), 10, 2),
+                DataType::Decimal128(12, 2),
+            ),
+            (
+                ScalarValue::Decimal64(Some(i64::MAX), 9, 2),
+                DataType::Decimal32(9, 2),
+            ),
+            (
+                ScalarValue::Decimal32(None, 5, 2),
+                DataType::Decimal128(5, 2),
+            ),
+            (ScalarValue::Int64(Some(42)), DataType::Decimal128(10, 2)),
+        ] {
+            assert_eq!(retag_bound_to_column(&value, &column_type), None);
+        }
+    }
 
     #[test]
     fn string_bounds_take_the_columns_representation() {
