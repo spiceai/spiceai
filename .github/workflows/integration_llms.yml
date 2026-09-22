@@ -125,7 +125,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@08f1d2cc6f8998ac075bd2e9c2cd38728bb44afa # v0.11.0 assets; action does not require gh
+        uses: spiceai/spiceio/.github/actions/setup@323b0fd4e2b335c05a1edcb793766e1d3c8ef877 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -182,7 +182,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@08f1d2cc6f8998ac075bd2e9c2cd38728bb44afa # v0.11.0 assets; action does not require gh
+        uses: spiceai/spiceio/.github/actions/setup@323b0fd4e2b335c05a1edcb793766e1d3c8ef877 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
