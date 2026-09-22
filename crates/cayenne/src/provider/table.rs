@@ -33216,6 +33216,7 @@ impl CayenneTableProvider {
                 Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
                     Arc::clone(index),
                     snapshot_id.to_string(),
+                    self.file_set_version(),
                     Self::position_deletion_plans(&self.pk_deletion_strategy),
                     request_build,
                 )) as Arc<dyn VortexAccessPlanProvider>

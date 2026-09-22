@@ -728,7 +728,7 @@ impl SnapshotLookupIndex {
                     .columns
                     .iter()
                     .zip(columns)
-                    .all(|(indexed, requested)| indexed.name.eq_ignore_ascii_case(requested))
+                    .all(|(indexed, requested)| indexed.name == *requested)
         })?;
         let mut postings = Vec::new();
         for key in keys {
@@ -924,6 +924,7 @@ struct LookupAccessPlanProvider {
 /// Runtime row selection derived from a completed hash-join dynamic filter.
 struct RuntimeLookupSelection {
     index: Arc<SnapshotLookupIndex>,
+    shape: String,
     per_file: HashMap<String, Vec<u64>>,
 }
 
@@ -955,6 +956,7 @@ struct RuntimeLookupCache {
 pub(crate) struct DynamicLookupAccessPlanProvider {
     state: Arc<LookupIndexState>,
     visible_snapshot: String,
+    visible_file_set: FileSetVersion,
     table: Arc<dyn VortexAccessPlanProvider>,
     request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     selection: Mutex<RuntimeLookupCache>,
@@ -964,12 +966,14 @@ impl DynamicLookupAccessPlanProvider {
     pub(crate) fn new(
         state: Arc<LookupIndexState>,
         visible_snapshot: String,
+        visible_file_set: FileSetVersion,
         table: Arc<dyn VortexAccessPlanProvider>,
         request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             state,
             visible_snapshot,
+            visible_file_set,
             table,
             request_build,
             selection: Mutex::default(),
@@ -1004,6 +1008,27 @@ impl DynamicLookupAccessPlanProvider {
         cache.filter = Some(filter.identity);
         cache.selection.clone_from(&selection);
         selection
+    }
+
+    fn handle_file_mismatch(&self, selection: &Arc<RuntimeLookupSelection>) {
+        if selection.index.file_set == self.visible_file_set {
+            return;
+        }
+        self.state
+            .record_probe(&selection.shape, ProbeOutcome::SnapshotMismatch);
+        self.state.discard_stale(&selection.index);
+        let mut cache = self.selection.lock();
+        if cache
+            .selection
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(cached, selection))
+        {
+            cache.selection = None;
+        }
+        drop(cache);
+        if let Some(request_build) = &self.request_build {
+            request_build();
+        }
     }
 }
 
@@ -1191,13 +1216,21 @@ impl VortexAccessPlanProvider for DynamicLookupAccessPlanProvider {
         let path: &str = file.object_meta.location.as_ref();
 
         // A file absent from, or changed since, the indexed snapshot cannot use
-        // the selection. Returning no runtime plan leaves the exact Vortex
-        // predicate and hash probe to produce the result safely.
-        let &file_id = selection.index.file_ids.get(path)?;
-        let indexed = selection.index.files.get(file_id as usize)?;
+        // the selection. If the table's file-set version also advanced, this
+        // proves the index stale and requests a replacement; otherwise the scan
+        // may simply predate the index. This query scans the file normally.
+        let Some(&file_id) = selection.index.file_ids.get(path) else {
+            self.handle_file_mismatch(&selection);
+            return None;
+        };
+        let Some(indexed) = selection.index.files.get(file_id as usize) else {
+            self.handle_file_mismatch(&selection);
+            return None;
+        };
         if indexed.size != file.object_meta.size
             || indexed.last_modified_ms != file.object_meta.last_modified.timestamp_millis()
         {
+            self.handle_file_mismatch(&selection);
             return None;
         }
 
@@ -1784,6 +1817,7 @@ impl LookupIndexState {
         }
         Some(RuntimeLookupSelection {
             index,
+            shape: hit.shape,
             per_file: hit.per_file,
         })
     }
@@ -2977,6 +3011,7 @@ mod tests {
         let provider = DynamicLookupAccessPlanProvider::new(
             Arc::clone(&state),
             "snapshot".to_string(),
+            FileSetVersion::default(),
             Arc::new(NoAccessPlans),
             Some(Arc::new(move || {
                 request_counter.fetch_add(1, Ordering::Relaxed);
@@ -3059,6 +3094,63 @@ mod tests {
 
         assert!(in_list_matches_columns(in_list, &["tenant".to_string()]));
         assert!(!in_list_matches_columns(in_list, &["Tenant".to_string()]));
+    }
+
+    #[test]
+    fn runtime_probe_keeps_case_distinct_index_shapes_separate() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("Foo", DataType::Int64, false),
+            Field::new("foo", DataType::Int64, false),
+        ]);
+        let files = vec![IndexedFile {
+            path: "snapshot/file.vortex".to_string(),
+            size: 1,
+            last_modified_ms: 0,
+        }];
+        let mut build = BuildState::new(
+            &[spec(&["Foo"]), spec(&["foo"])],
+            build_reservation(&pool),
+            &schema,
+        )
+        .expect("build state");
+        let file_id = build.file_id(&files[0].path).expect("file id");
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .expect("case-distinct batch");
+        build
+            .ingest(file_id, RowPositions::Contiguous(0), &batch, &files[0].path)
+            .expect("ingest");
+        let index = build
+            .into_index(
+                "snapshot".to_string(),
+                &files,
+                Instant::now(),
+                None,
+                VortexSession::default(),
+                &table,
+                FileSetVersion::default(),
+            )
+            .expect("finish")
+            .expect("fits");
+
+        for (column, value) in [("Foo", 1), ("foo", 2)] {
+            let hit = index
+                .probe_keys(
+                    &[column.to_string()],
+                    &[vec![ScalarValue::Int64(Some(value))]],
+                    1,
+                )
+                .expect("matching case-distinct shape");
+            assert_eq!(hit.shape, column);
+            assert_eq!(hit.rows, 1);
+        }
     }
 
     #[test]
@@ -3282,8 +3374,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runtime_probe_declines_inputs_over_its_bounds() {
+    #[tokio::test]
+    async fn runtime_probe_declines_inputs_over_its_bounds_and_rebuilds_stale_indexes() {
         let rows = 4_096usize;
         let pool = unbounded_pool();
         let table = account(&pool);
@@ -3375,6 +3467,44 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.counters().runtime_fallback, 2);
+
+        let build_requests = Arc::new(AtomicU64::new(0));
+        let request_counter = Arc::clone(&build_requests);
+        let provider = DynamicLookupAccessPlanProvider::new(
+            Arc::clone(&state),
+            "snapshot".to_string(),
+            FileSetVersion {
+                dir_generation: 1,
+                listing_epoch: 0,
+            },
+            Arc::new(NoAccessPlans),
+            Some(Arc::new(move || {
+                request_counter.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic
+            .update(tenant_in_list(&column, &[8]))
+            .expect("runtime filter");
+        dynamic.mark_complete();
+        let predicate = dynamic as Arc<dyn PhysicalExpr>;
+
+        let selection = provider
+            .resolve(Some(&predicate))
+            .await
+            .expect("the runtime filter resolves against the stale index");
+        provider.handle_file_mismatch(&selection);
+        assert_eq!(state.counters().snapshot_mismatch, 1);
+        assert!(state.published().is_none(), "the stale index is discarded");
+        assert_eq!(
+            build_requests.load(Ordering::Relaxed),
+            1,
+            "the stale index requests one replacement build"
+        );
     }
 
     /// A single shifted address is reported, so the read-back verification can

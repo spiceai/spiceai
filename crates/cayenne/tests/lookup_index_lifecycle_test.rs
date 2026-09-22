@@ -205,6 +205,57 @@ async fn lookup(provider: &Arc<CayenneTableProvider>, name: &str, id: i64) {
     );
 }
 
+async fn dynamic_lookup(provider: &Arc<CayenneTableProvider>, name: &str, ids: &[i64]) -> Vec<i64> {
+    let ctx = SessionContext::new();
+    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
+        .expect("register target");
+    let key_schema = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Int64, false),
+        Field::new("service", DataType::Utf8, false),
+    ]));
+    let key_batch = RecordBatch::try_new(
+        Arc::clone(&key_schema),
+        vec![
+            Arc::new(Int64Array::from(
+                ids.iter().map(|id| id % 997).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|id| format!("SV{id:032x}"))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("key batch");
+    let keys = datafusion::datasource::MemTable::try_new(key_schema, vec![vec![key_batch]])
+        .expect("key table");
+    ctx.register_table("dynamic_keys", Arc::new(keys))
+        .expect("register keys");
+    let sql = format!(
+        "SELECT s.\"AutoId\" FROM dynamic_keys k INNER JOIN {name} s \
+         ON k.tenant = s.\"TenantId\" AND k.service = s.\"ServiceId\" \
+         ORDER BY s.\"AutoId\""
+    );
+
+    ctx.sql(&sql)
+        .await
+        .expect("dynamic lookup plan")
+        .collect()
+        .await
+        .expect("dynamic lookup")
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("AutoId")
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
 fn counters(provider: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
     provider
         .lookup_index_counters()
@@ -524,13 +575,13 @@ async fn dropping_an_indexed_table_releases_its_memory() {
 }
 
 /// Rows appended after the build make the index stale for the snapshot it was
-/// built on: it is dropped, rebuilt by later lookups, and serves the appended
-/// rows too.
+/// built on: a dynamic lookup drops it, scans safely, requests a replacement,
+/// and uses that replacement for later lookups of the appended rows.
 ///
-/// An append keeps the snapshot id, so a check on the snapshot id alone would
-/// leave the stale index published, resident and refused by every lookup.
+/// An append keeps the snapshot id, so runtime probes must also compare the file
+/// set captured by the scan with the one covered by the index.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_append_drops_the_stale_index_and_lookups_rebuild_it() {
+async fn an_append_drops_the_stale_index_and_dynamic_lookups_rebuild_it() {
     const ROWS: usize = 20_000;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
@@ -538,6 +589,7 @@ async fn an_append_drops_the_stale_index_and_lookups_rebuild_it() {
     let env = Arc::new(RuntimeEnv::default());
     let name = "appended";
     let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    table.init_scan_view_cache();
     overwrite(&table, rows(0, ROWS)).await;
     let before = lookups_until(
         &table,
@@ -550,17 +602,34 @@ async fn an_append_drops_the_stale_index_and_lookups_rebuild_it() {
 
     let appended = i64::try_from(ROWS).expect("fits");
     insert(&table, name, rows(appended, ROWS)).await;
-    // Lookups over both the original and the appended rows.
-    let all = appended * 2;
-    let after = lookups_until(&table, name, all, Duration::from_mins(1), |c| {
-        c.builds_published > before.builds_published && c.selected > before.selected + 10
-    })
-    .await;
+    let ids = [appended, appended + 1, appended * 2 - 1];
+    assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
+    let after_first = counters(&table);
     assert!(
-        after.snapshot_mismatch > before.snapshot_mismatch,
-        "the stale index must have been refused before its rebuild: {before:?} -> {after:?}"
+        after_first.snapshot_mismatch > before.snapshot_mismatch,
+        "the stale runtime index must be refused: {before:?} -> {after_first:?}"
     );
-    for id in [appended, appended + 1, all - 1] {
-        lookup(&table, name, id).await;
+
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while counters(&table).builds_published <= before.builds_published {
+        assert!(
+            Instant::now() < deadline,
+            "the replacement index did not publish: {:?}",
+            counters(&table)
+        );
+        assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        counters(&table).builds_started > before.builds_started,
+        "a paced dynamic lookup must claim the replacement build"
+    );
+
+    let selected_before = counters(&table).selected;
+    assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
+    assert_eq!(
+        counters(&table).selected,
+        selected_before + 1,
+        "the later dynamic lookup should use the replacement index"
+    );
 }
