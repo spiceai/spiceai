@@ -47,6 +47,7 @@ test_with_backends!(test_roundtrip_mixed_types);
 test_with_backends!(test_roundtrip_many_small_batches);
 test_with_backends!(test_inline_write_coalesces_into_one_batch);
 test_with_backends!(test_inline_scan_batches_scale_with_writes_not_rows);
+test_with_backends!(test_wide_rows_still_reach_the_coalesce);
 test_with_backends!(test_roundtrip_mixed_inline_and_vortex);
 test_with_backends!(test_roundtrip_across_reopen);
 test_with_backends!(test_roundtrip_exceeds_byte_threshold);
@@ -717,6 +718,20 @@ async fn test_inline_writer_fallback_preserves_buffered_and_remaining_batches(
 }
 
 /// Collect all rows from `SELECT * FROM t ORDER BY <key>` into a single batch.
+/// Batches an inline entry actually holds, decoded from its stored IPC blob.
+///
+/// `deserialize_ipc_to_batch` is module-private to the crate, so an integration
+/// test cannot call it; this is the same StreamReader round-trip.
+fn inline_entry_batches(entry: &cayenne::metadata::InlinedData) -> Vec<RecordBatch> {
+    arrow::ipc::reader::StreamReader::try_new(
+        std::io::Cursor::new(entry.data_ipc.as_slice()),
+        None,
+    )
+    .expect("inline entry is not a readable IPC stream")
+    .collect::<Result<_, _>>()
+    .expect("inline entry batches")
+}
+
 async fn collect_sorted(
     ctx: &SessionContext,
     sql: &str,
@@ -1522,11 +1537,7 @@ async fn test_inline_write_coalesces_into_one_batch(
         "one write should produce one inline entry"
     );
 
-    let decoded: Vec<RecordBatch> = arrow::ipc::reader::StreamReader::try_new(
-        std::io::Cursor::new(entries[0].data_ipc.as_slice()),
-        None,
-    )?
-    .collect::<Result<_, _>>()?;
+    let decoded = inline_entry_batches(&entries[0]);
 
     assert_eq!(
         decoded.len(),
@@ -1581,22 +1592,13 @@ async fn test_inline_scan_batches_scale_with_writes_not_rows(
     }
 
     let entries = fixture.catalog.get_inlined_data(&table_id).await?;
-    let total_batches: usize = entries
-        .iter()
-        .map(|e| {
-            arrow::ipc::reader::StreamReader::try_new(
-                std::io::Cursor::new(e.data_ipc.as_slice()),
-                None,
-            )
-            .expect("ipc reader")
-            .count()
-        })
-        .sum();
+    let total_batches: usize =
+        entries.iter().map(|e| inline_entry_batches(e).len()).sum();
 
     assert!(
         total_batches <= entries.len(),
-        "{total_batches} batches across {} entries for {TOTAL} rows: batch count \
-         tracks rows, so every scan walks the whole corpus one row at a time",
+        "{total_batches} batches across {} entries for {TOTAL} rows: a write did \
+         not coalesce",
         entries.len(),
     );
 
@@ -1615,5 +1617,66 @@ async fn test_inline_scan_batches_scale_with_writes_not_rows(
         .expect("id column");
     assert_eq!(ids.value(0), 0);
     assert_eq!(ids.value(usize::try_from(TOTAL)? - 1), TOTAL - 1);
+    Ok(())
+}
+
+/// A realistic wide row must still reach the coalesce, not be evicted before it.
+///
+/// `InlineBatchBuffer::push` sums `get_array_memory_size()` PER BATCH and trips
+/// `bytes_cap` at `inline_max_buffer_bytes` (4 MiB default) before the write path
+/// coalesces. On fragmented input that sum is inflated by the per-batch fixed
+/// cost, so a burst can be evicted to the Vortex fallback using an estimate that
+/// is only large BECAUSE it is fragmented -- and the coalesce never runs on the
+/// shape it exists to fix. This asserts the inline path is still taken.
+async fn test_wide_rows_still_reach_the_coalesce(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ROWS: i64 = 50; // one 500 ms batch-writer tick at 100 qps
+    let payload = "x".repeat(3200); // the scenario's response size
+
+    let mut fields = vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("content", DataType::Utf8, false),
+    ];
+    // 40 more leaves, approximating a nested source flattened by the connector.
+    for i in 0..40 {
+        fields.push(Field::new(format!("f{i}"), DataType::Utf8, true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+
+    let (table, _ctx) = create_table(&fixture, "wide", Arc::clone(&schema)).await?;
+    let table_id = fixture.catalog.get_table("wide").await?.table_id;
+
+    let batches: Vec<RecordBatch> = (0..ROWS)
+        .map(|i| {
+            let mut cols: Vec<Arc<dyn Array>> = vec![
+                Arc::new(Int64Array::from(vec![i])),
+                Arc::new(StringArray::from(vec![payload.clone()])),
+            ];
+            for _ in 0..40 {
+                cols.push(Arc::new(StringArray::from(vec![format!("v{i}")])));
+            }
+            RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch")
+        })
+        .collect();
+    let per_batch = batches[0].get_array_memory_size();
+    common::insert_batches(&table, batches).await?;
+
+    let entries = fixture.catalog.get_inlined_data(&table_id).await?;
+    assert!(
+        !entries.is_empty(),
+        "a {ROWS}-row burst of wide rows did not inline at all: the per-batch \
+         get_array_memory_size sum ({per_batch} B x {ROWS} = {} B) tripped \
+         inline_max_buffer_bytes before the coalesce could run, so the fix does \
+         not fire on the shape it targets",
+        per_batch * usize::try_from(ROWS)?,
+    );
+    let decoded: usize = entries.iter().map(|e| inline_entry_batches(e).len()).sum();
+    assert!(
+        decoded <= entries.len(),
+        "{decoded} batches across {} entries: wide rows reached the inline path \
+         but were not coalesced",
+        entries.len(),
+    );
     Ok(())
 }
