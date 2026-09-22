@@ -175,7 +175,7 @@ fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
 /// out of the batch entirely before it ever reaches that check.
 /// `ExecutionPlan::metrics()` lives on the plan tree, not the batch schema,
 /// so no column pruning can remove it — this is the fallback for that case.
-fn plan_saw_transient_http_failure(plan: &Arc<dyn ExecutionPlan>) -> bool {
+pub fn plan_saw_transient_http_failure(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if let Some(metrics) = plan.metrics()
         && let Some(value) = metrics.sum_by_name(HTTP_TRANSIENT_FAILURE_METRIC_NAME)
         && value.as_usize() > 0
@@ -260,6 +260,14 @@ pub fn to_cached_record_batch_stream(
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
         let mut records_size: usize = 0;
+        // Set on any `Err` the stream yields, at any position. A prefix of
+        // successful batches read before the error (or none at all) must
+        // never be admitted to the cache — an empty `records` from a
+        // first-page failure would otherwise be indistinguishable from a
+        // genuine empty result, which `batches_cacheable` (schema/column
+        // based) and `plan_saw_transient_http_failure` (paginated case: a
+        // later page's failure, not the first) cannot see on their own.
+        let mut stream_failed = false;
         let has_encoder = cache_provider.encoder().is_some();
         // moka-rs operates by `u32` for records size, so max single record size is `u32::MAX` / 4 GB
         let cache_max_size = usize::try_from(cache_provider.max_size().min(u64::from(u32::MAX))).unwrap_or_default();
@@ -275,6 +283,9 @@ pub fn to_cached_record_batch_stream(
         };
 
         while let Some(batch_result) = stream.next().await {
+            if batch_result.is_err() {
+                stream_failed = true;
+            }
             if records_size < raw_size_limit && let Ok(batch) = &batch_result {
                 // Accumulate compacted batches, not the batches as they arrive.
                 // A `LIMIT`/`OFFSET` plan yields zero-copy slices, so holding
@@ -311,7 +322,11 @@ pub fn to_cached_record_batch_stream(
             // result set — skip the write to avoid caching a partial result.
             // `batches_boundable` is the separate question of whether the entry
             // could be billed for what it would hold.
-            if cache_provider.tables_changed_since(&input_tables, read_started_at) {
+            if stream_failed {
+                tracing::debug!(
+                    "The query stream yielded an error, skipping cache storage"
+                );
+            } else if cache_provider.tables_changed_since(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
                 // already known to be unservable.
@@ -1248,6 +1263,149 @@ pub(crate) mod tests {
         assert!(
             cached.is_none(),
             "HTTP results should not be cached if any batch contains only transient errors"
+        );
+    }
+
+    /// Every real consumer of this stream (`QueryResult::collect_batches`'s
+    /// `try_collect`, the HTTP JSON writer's `?`-propagating loop in
+    /// `json_array_body_from_batches`, and the Flight encoder's `return` on
+    /// `Err` in `crates/runtime/src/flight/mod.rs`) stops polling on the
+    /// first `Err` item. `stream!` compiles to a generator that only
+    /// advances past a `yield` when polled again, so with every caller
+    /// stopping there, the cache-admission code after the loop is never
+    /// reached at all once a stream errors — proven by running this exact
+    /// reproduction: identical `cached.is_none()` result with the
+    /// `stream_failed` guard removed. This test documents that
+    /// non-reproduction under real drainage; the guard and
+    /// [`Self::test_to_cached_record_batch_stream_skips_caching_when_stream_errors_under_full_drain`]
+    /// below are defense-in-depth against a future caller that does fully
+    /// drain the stream.
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_skips_caching_when_stream_errors() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Err::<RecordBatch, DataFusionError>(
+                DataFusionError::Execution("origin fetch failed".to_string()),
+            )]),
+        ));
+
+        let raw_cache_key = crate::key::CacheKey::Query("stream-error-not-cached", None)
+            .as_raw_key(cache_provider.hasher());
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["some_table".into()])),
+            std::time::Instant::now(),
+            None,
+        );
+
+        let result = cached_stream.try_collect::<Vec<_>>().await;
+        assert!(
+            result.is_err(),
+            "the stream's own error must still reach the caller"
+        );
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "a stream that errored must never be cached as an empty result, \
+            regardless of position (first item or a later page)"
+        );
+    }
+
+    /// The `stream_failed` guard's actual regression coverage: a stream that
+    /// fully drains (an `Ok` page followed by an `Err` page, polled to
+    /// completion via a manual loop rather than `try_collect`, which no real
+    /// caller does today — see the sibling test above) must still not admit
+    /// the earlier `Ok` page to the cache as if it were the complete result.
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_skips_caching_when_stream_errors_under_full_drain()
+    {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::StreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let ok_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1_i64]))],
+        )
+        .expect("valid record batch");
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![
+                Ok::<RecordBatch, DataFusionError>(ok_batch),
+                Err::<RecordBatch, DataFusionError>(DataFusionError::Execution(
+                    "origin fetch failed on a later page".to_string(),
+                )),
+            ]),
+        ));
+
+        let raw_cache_key = crate::key::CacheKey::Query("stream-error-full-drain-not-cached", None)
+            .as_raw_key(cache_provider.hasher());
+        let mut cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["some_table".into()])),
+            std::time::Instant::now(),
+            None,
+        );
+
+        // Poll to completion regardless of the `Err` in the middle — unlike
+        // `try_collect`, which every real caller uses and which would stop
+        // here instead.
+        let mut saw_ok = false;
+        let mut saw_err = false;
+        while let Some(item) = cached_stream.next().await {
+            match item {
+                Ok(_) => saw_ok = true,
+                Err(_) => saw_err = true,
+            }
+        }
+        assert!(saw_ok && saw_err, "the drain must observe both items");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "the successful page must not be cached as a complete result once a later \
+            page in the same stream errored"
         );
     }
 

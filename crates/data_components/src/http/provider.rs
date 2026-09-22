@@ -2195,12 +2195,23 @@ impl HttpExec {
             existing.len(),
         );
 
-        Ok(Self::new(
+        // Share `self.metrics` rather than starting a fresh
+        // `ExecutionPlanMetricsSet`: `HttpWithDeferredParamsExec::execute`
+        // dynamically rewrites and runs a fresh `HttpExec` built from this
+        // method, discarding it once the stream completes, while the plan
+        // tree `cache::plan_saw_transient_http_failure` walks still holds
+        // only the original, pre-rewrite `HttpExec` template. Cloning
+        // `ExecutionPlanMetricsSet` shares its underlying metrics set, so a
+        // counter incremented on the rewritten exec is visible through the
+        // template's `metrics()` too.
+        let mut expanded = Self::new(
             Arc::clone(&self.projected_schema),
             Arc::clone(&self.provider),
             new_partitions,
             self.limit,
-        ))
+        );
+        expanded.metrics = self.metrics.clone();
+        Ok(expanded)
     }
 
     async fn fetch_and_create_batch(
@@ -9324,6 +9335,36 @@ mod tests {
         assert_eq!(result.partitions[4].1, Some("q2".to_string()));
         assert_eq!(result.partitions[5].0, Some("/b".to_string()));
         assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    /// `HttpWithDeferredParamsExec::execute` runs a fresh `HttpExec` built by
+    /// `with_expanded_params` and discards it once the stream completes, while
+    /// `cache::plan_saw_transient_http_failure` only ever walks the original,
+    /// pre-expansion template captured in the plan tree — so the expanded
+    /// exec must increment the *same* `HTTP_TRANSIENT_FAILURE_METRIC_NAME`
+    /// counter as its template, not a fresh one, for that fallback to see it.
+    #[test]
+    fn test_with_expanded_params_shares_metrics_with_template() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let expanded = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        MetricBuilder::new(&expanded.metrics)
+            .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, 0)
+            .add(1);
+
+        let template_count = exec
+            .metrics()
+            .and_then(|m| m.sum_by_name(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME))
+            .map(|v| v.as_usize());
+        assert_eq!(
+            template_count,
+            Some(1),
+            "a counter incremented on the expanded exec must be visible through the \
+            original template's metrics(), since that template is what the plan tree \
+            (and cache::plan_saw_transient_http_failure) still holds after expansion"
+        );
     }
 
     #[test]
