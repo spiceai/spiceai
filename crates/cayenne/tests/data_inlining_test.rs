@@ -1589,14 +1589,18 @@ async fn test_inline_scan_batches_scale_with_writes_not_rows(
     }
 
     let entries = fixture.catalog.get_inlined_data(&table_id).await?;
-    let total_batches: usize = entries.iter().map(|e| inline_entry_batches(e).len()).sum();
-
-    assert!(
-        total_batches <= entries.len(),
-        "{total_batches} batches across {} entries for {TOTAL} rows: a write did \
-         not coalesce",
+    assert_eq!(
         entries.len(),
+        usize::try_from(WRITES)?,
+        "every write should produce one inline entry"
     );
+    for entry in &entries {
+        assert_eq!(
+            inline_entry_batches(entry).len(),
+            1,
+            "an entry for {ROWS_PER_WRITE} rows did not coalesce into one batch"
+        );
+    }
 
     ctx.register_table("accumulated", Arc::new(table))?;
     let got = collect_sorted(&ctx, "SELECT id, payload FROM accumulated ORDER BY id").await?;
@@ -1667,12 +1671,12 @@ async fn test_wide_rows_still_reach_the_coalesce(
          not fire on the shape it targets",
         per_batch * usize::try_from(ROWS)?,
     );
-    let decoded: usize = entries.iter().map(|e| inline_entry_batches(e).len()).sum();
-    assert!(
-        decoded <= entries.len(),
-        "{decoded} batches across {} entries: wide rows reached the inline path \
-         but were not coalesced",
-        entries.len(),
-    );
+    for entry in &entries {
+        assert_eq!(
+            inline_entry_batches(entry).len(),
+            1,
+            "wide rows reached the inline path but were not coalesced into one batch"
+        );
+    }
     Ok(())
 }
