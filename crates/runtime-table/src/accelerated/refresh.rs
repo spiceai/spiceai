@@ -1134,32 +1134,32 @@ impl Refresher {
                         // query results must be invalidated even though the refresh reports an error.
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
-                        if refresh_succeeded {
-                            // Store the flag before recording the completion, so a
-                            // caller woken by the completion observes the initial
-                            // load as done. The CDC apply path already orders it
-                            // this way (`RefreshTask::signal_dataset_ready`).
-                            initial_load_completed.store(true, Ordering::Relaxed);
-                            if let Some(refresh_completion) = &refresh_completion {
-                                record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
-                            }
-                        }
-
-                        if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
-                            // No cache provider means runtime is shutting down and cache is already cleaned up
-                            if let Some(cache_provider) = cache_provider_ref.upgrade() {
-                                // The refresh rewrote every synchronized (e.g. localpod) child's
-                                // accelerator along with this dataset's, so cached results for the
-                                // children are exactly as stale as the parent's (#12887). Children
-                                // attach after their own initial load completes, so the set is
-                                // resolved live rather than captured when this loop started.
-                                for table_name in refresh_task.get_dataset_names().await {
-                                    if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                        after_refresh_task_completed(
+                            refresh_succeeded,
+                            &initial_load_completed,
+                            async {
+                                if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
+                                    // No cache provider means runtime is shutting down and cache is already cleaned up
+                                    if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                        // The refresh rewrote every synchronized (e.g. localpod) child's
+                                        // accelerator along with this dataset's, so cached results for the
+                                        // children are exactly as stale as the parent's (#12887). Children
+                                        // attach after their own initial load completes, so the set is
+                                        // resolved live rather than captured when this loop started.
+                                        for table_name in refresh_task.get_dataset_names().await {
+                                            if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
+                                                tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
+                            },
+                            async {
+                                if let Some(refresh_completion) = &refresh_completion {
+                                    record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
+                                }
+                            },
+                        ).await;
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                             let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
@@ -1305,6 +1305,27 @@ fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
         result,
         Ok(()) | Err(super::Error::FailedToApplyRetentionSql { .. })
     )
+}
+
+/// After a refresh task finishes: invalidate cached results, then publish
+/// `initial_load_completed`, then record the completion.
+///
+/// Results-cache warmup polls that flag after the first full/append refresh.
+/// Publishing the flag before invalidation lets warmup store entries this
+/// callback then evicts, so readiness is released on an empty cache. The flag
+/// still precedes `record_done`, so a waiter woken by the completion observes
+/// the initial load as done — the same pairing as `RefreshTask::signal_dataset_ready`.
+async fn after_refresh_task_completed(
+    refresh_succeeded: bool,
+    initial_load_completed: &AtomicBool,
+    invalidate: impl std::future::Future<Output = ()>,
+    record_done: impl std::future::Future<Output = ()>,
+) {
+    invalidate.await;
+    if refresh_succeeded {
+        initial_load_completed.store(true, Ordering::Relaxed);
+        record_done.await;
+    }
 }
 
 /// Numbers a refresh about to be requested, so its completion can be told from
@@ -1496,6 +1517,117 @@ mod tests {
         async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
+    }
+
+    /// Regression test for #14178. Results-cache warmup polls
+    /// `initial_load_completed`; that flag must stay down until
+    /// invalidation finishes so a store cannot be evicted by this
+    /// same completion.
+    #[tokio::test]
+    async fn after_refresh_task_completed_invalidates_before_ready_flag() {
+        let initial_load_completed = AtomicBool::new(false);
+        let invalidated = AtomicBool::new(false);
+        let recorded = AtomicBool::new(false);
+
+        after_refresh_task_completed(
+            true,
+            &initial_load_completed,
+            async {
+                assert!(
+                    !initial_load_completed.load(Ordering::Relaxed),
+                    "the ready flag must stay down while invalidation is running"
+                );
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {
+                assert!(
+                    initial_load_completed.load(Ordering::Relaxed),
+                    "the ready flag must be stored before the completion is recorded"
+                );
+                assert!(
+                    invalidated.load(Ordering::Relaxed),
+                    "invalidation must finish before the completion is recorded"
+                );
+                recorded.store(true, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        assert!(invalidated.load(Ordering::Relaxed), "invalidation must run");
+        assert!(
+            initial_load_completed.load(Ordering::Relaxed),
+            "successful refresh must publish the ready flag"
+        );
+        assert!(
+            recorded.load(Ordering::Relaxed),
+            "successful refresh must record the completion"
+        );
+    }
+
+    /// A poller that waits on `initial_load_completed` (warmup) must
+    /// observe invalidation as already finished, so a store after the
+    /// flag cannot be evicted by this completion.
+    #[tokio::test]
+    async fn after_refresh_task_completed_warmup_store_survives_invalidation() {
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let invalidated = Arc::new(AtomicBool::new(false));
+
+        let flag = Arc::clone(&initial_load_completed);
+        let inv = Arc::clone(&invalidated);
+        let warmup = tokio::spawn(async move {
+            while !flag.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            inv.load(Ordering::Relaxed)
+        });
+
+        after_refresh_task_completed(
+            true,
+            &initial_load_completed,
+            async {
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {},
+        )
+        .await;
+
+        let warmed_entry_survived = warmup.await.expect("warmup poller finishes");
+        assert!(
+            warmed_entry_survived,
+            "warmup that starts after the ready flag must see invalidation already done"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_refresh_task_completed_failed_refresh_invalidates_without_ready_flag() {
+        let initial_load_completed = AtomicBool::new(false);
+        let invalidated = AtomicBool::new(false);
+        let recorded = AtomicBool::new(false);
+
+        after_refresh_task_completed(
+            false,
+            &initial_load_completed,
+            async {
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {
+                recorded.store(true, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        assert!(
+            invalidated.load(Ordering::Relaxed),
+            "a failed refresh that rewrote the accelerator must still invalidate"
+        );
+        assert!(
+            !initial_load_completed.load(Ordering::Relaxed),
+            "a failed refresh must not publish the ready flag"
+        );
+        assert!(
+            !recorded.load(Ordering::Relaxed),
+            "a failed refresh must not record completion"
+        );
     }
 
     #[test]
