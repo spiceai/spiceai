@@ -1568,6 +1568,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::ApplySpicepod
             | Capability::AttachApp
             | Capability::GetStatus
+            | Capability::GetDatasets
             | Capability::ExecuteQuery => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
@@ -1584,6 +1585,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::ApplySpicepod
             | Capability::AttachApp
             | Capability::GetStatus
+            | Capability::GetDatasets
             | Capability::ExecuteQuery => format!(
                 "{} is not supported by this instance",
                 capability.wire_name()
@@ -1636,6 +1638,16 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             "models": models,
             "catalogs": catalogs,
             "views": views,
+        })
+    }
+
+    /// The `/v1/datasets?status=true` document for the app this instance
+    /// serves: the same rows the local HTTP endpoint answers, so `spice cloud
+    /// datasets` shows a self-hosted instance the way it shows a managed one.
+    async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
+        let infos = runtime::dataset_infos_with_status(&self.runtime).await;
+        serde_json::to_value(infos).map_err(|source| {
+            CommandError::internal(format!("Failed to encode the dataset list: {source}"))
         })
     }
 
@@ -1978,7 +1990,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .run()
             .await
             .map_err(|source| query_error(&source))?;
-        bounded_arrow_ipc(result.data, effective_max_rows(max_rows)).await
+        // Cloud Connect encodes owned batches to Arrow IPC. Match Stream vs
+        // CachedRaw the same way QueryEngine does (via `into_source` inside
+        // `into_record_batch_stream`); HTTP/Flight keep the Arc path with
+        // `into_source` directly.
+        bounded_arrow_ipc(
+            result.into_record_batch_stream(),
+            effective_max_rows(max_rows),
+        )
+        .await
     }
 }
 

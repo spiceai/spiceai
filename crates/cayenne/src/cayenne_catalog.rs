@@ -35,6 +35,7 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use turso_shared::{
     DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, is_retryable_write_conflict_message, retry_backoff_delay,
 };
@@ -104,13 +105,45 @@ fn ensure_reinsert_keys_have_key_based_delete_file(
 
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
-pub(crate) enum MetastoreImpl {
+enum MetastoreBackendImpl {
     Sqlite(SqliteMetastore),
     #[cfg(feature = "turso")]
     Turso(TursoMetastore),
 }
 
+/// Pluggable metastore plus a process-local op counter. Query / execute / begin
+/// increment the counter; shutdown / WAL checkpoint / vacuum do not (those are
+/// maintenance, not scan-path catalog I/O).
+#[derive(Debug)]
+struct MetastoreImpl {
+    backend: MetastoreBackendImpl,
+    query_count: AtomicU64,
+}
+
 impl MetastoreImpl {
+    fn sqlite(metastore: SqliteMetastore) -> Self {
+        Self {
+            backend: MetastoreBackendImpl::Sqlite(metastore),
+            query_count: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(feature = "turso")]
+    fn turso(metastore: TursoMetastore) -> Self {
+        Self {
+            backend: MetastoreBackendImpl::Turso(metastore),
+            query_count: AtomicU64::new(0),
+        }
+    }
+
+    fn note_query(&self) {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn query_count(&self) -> u64 {
+        self.query_count.load(Ordering::Relaxed)
+    }
+
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -121,28 +154,31 @@ impl MetastoreImpl {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.query_row(params, f).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.query_row(params, f).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.query_row(params, f).await,
+            MetastoreBackendImpl::Turso(m) => m.query_row(params, f).await,
         }
     }
 
     /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute(params).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.execute(params).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute(params).await,
+            MetastoreBackendImpl::Turso(m) => m.execute(params).await,
         }
     }
 
     /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute_transaction_batch(sql).await,
+            MetastoreBackendImpl::Turso(m) => m.execute_transaction_batch(sql).await,
         }
     }
 
@@ -156,36 +192,37 @@ impl MetastoreImpl {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.query(params, f).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.query(params, f).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.query(params, f).await,
+            MetastoreBackendImpl::Turso(m) => m.query(params, f).await,
         }
     }
 
     /// Shutdown the metastore, performing any necessary cleanup.
     pub(crate) async fn shutdown(&self) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.shutdown().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.shutdown().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.shutdown().await,
+            MetastoreBackendImpl::Turso(m) => m.shutdown().await,
         }
     }
 
     /// Run a non-blocking WAL checkpoint off the hot path (cycle-5 TASK 2b).
     pub(crate) async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.checkpoint_wal().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.checkpoint_wal().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.checkpoint_wal().await,
+            MetastoreBackendImpl::Turso(m) => m.checkpoint_wal().await,
         }
     }
 
     pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.incremental_vacuum().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
+            MetastoreBackendImpl::Turso(m) => m.incremental_vacuum().await,
         }
     }
 
@@ -197,10 +234,11 @@ impl MetastoreImpl {
     pub(crate) async fn begin_transaction(
         &self,
     ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.begin_transaction().await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.begin_transaction().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.begin_transaction().await,
+            MetastoreBackendImpl::Turso(m) => m.begin_transaction().await,
         }
     }
 }
@@ -245,20 +283,29 @@ impl CayenneCatalog {
         let metastore = if connection_string.starts_with("libsql://") {
             #[cfg(feature = "turso")]
             {
-                MetastoreImpl::Turso(TursoMetastore::new(&connection_string))
+                MetastoreImpl::turso(TursoMetastore::new(&connection_string))
             }
             #[cfg(not(feature = "turso"))]
             {
                 return Err(CatalogError::TursoNotEnabled);
             }
         } else {
-            MetastoreImpl::Sqlite(SqliteMetastore::new(&connection_string))
+            MetastoreImpl::sqlite(SqliteMetastore::new(&connection_string))
         };
 
         Ok(Self {
             connection_string,
             metastore,
         })
+    }
+
+    /// Number of metastore query / execute / begin operations this catalog has
+    /// issued. Tests and benches use this to prove a scan-view cache hit does
+    /// not round-trip the metastore. WAL checkpoint, vacuum, and shutdown are
+    /// not counted (maintenance, not scan-path I/O).
+    #[must_use]
+    pub fn metastore_query_count(&self) -> u64 {
+        self.metastore.query_count()
     }
 
     /// Get the database file path from the connection string.
@@ -301,6 +348,72 @@ impl CayenneCatalog {
     /// connection failure, busy timeout).
     pub async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         self.metastore.begin_transaction().await
+    }
+
+    /// Persist `schema` for `table_id`. When `drop_statistics` is true, also
+    /// drop table, snapshot-file, and cold-tier statistics in the same
+    /// transaction so a decimal scale change cannot decode leftover unscaled
+    /// min/max with the new scale.
+    async fn persist_table_schema(
+        &self,
+        table_id: &str,
+        schema: &arrow_schema::SchemaRef,
+        drop_statistics: bool,
+    ) -> CatalogResult<()> {
+        let schema_json = serialize_schema_ipc_base64(schema.as_ref())?;
+        let schema_err = |source: CatalogError| CatalogError::InvalidOperation {
+            message: format!("Failed to update schema for table {table_id}"),
+            source: Box::new(source),
+        };
+        if !drop_statistics {
+            return self
+                .metastore
+                .execute_helper(ExecuteParams {
+                    sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
+                    params: vec![
+                        MetastoreValue::Text(schema_json),
+                        MetastoreValue::Text(table_id.to_string()),
+                    ],
+                })
+                .await
+                .map_err(schema_err);
+        }
+
+        let txn = self.begin_transaction().await?;
+        let table_id_owned = table_id.to_string();
+        txn.execute(ExecuteParams {
+            sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
+            params: vec![
+                MetastoreValue::Text(schema_json),
+                MetastoreValue::Text(table_id_owned.clone()),
+            ],
+        })
+        .await
+        .map_err(schema_err)?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id_owned.clone())],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id_owned.clone())],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "UPDATE cayenne_cold_tier_file SET statistics_blob = ?1 WHERE table_id = ?2",
+            params: vec![
+                MetastoreValue::Blob(Vec::new()),
+                MetastoreValue::Text(table_id_owned),
+            ],
+        })
+        .await?;
+        txn.commit().await?;
+        tracing::debug!(
+            table_id,
+            "Dropped persisted column statistics because a decimal column's scale changed"
+        );
+        Ok(())
     }
 
     /// Return the durable current-snapshot pointer for a table ID.
@@ -1150,8 +1263,8 @@ impl CayenneCatalog {
 
     /// Reconcile a reopened table's stored `VortexConfig` with the currently
     /// configured options, for the fields that describe how the table is RUN
-    /// rather than how its data is written: the datalake (cold tier) settings
-    /// and the scan concurrency.
+    /// rather than whether existing files remain readable: clustering and
+    /// datalake settings plus scan concurrency.
     ///
     /// These are deliberately excluded from [`configuration_matches`] (changing
     /// them never recreates the table), and the provider runs with the STORED
@@ -1194,7 +1307,7 @@ impl CayenneCatalog {
         let new_vc = &options.vortex_config;
         let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
             || stored_vc.cold_tier_location != new_vc.cold_tier_location
-            || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
+            || stored_vc.cluster_by != new_vc.cluster_by
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
@@ -1213,8 +1326,8 @@ impl CayenneCatalog {
             .clone_from(&new_vc.cold_tier_location);
         stored
             .vortex_config
-            .cold_clustering_columns
-            .clone_from(&new_vc.cold_clustering_columns);
+            .cluster_by
+            .clone_from(&new_vc.cluster_by);
         stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
         stored.vortex_config.cold_clustering_run_size_mb = new_vc.cold_clustering_run_size_mb;
         stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
@@ -1349,8 +1462,17 @@ impl CayenneCatalog {
             SchemaEvolution::Widening(plan)
                 if options.vortex_config.schema_evolution.allows(&plan) =>
             {
-                self.update_table_schema(&stored_metadata.table_id, &plan.evolved_schema)
-                    .await?;
+                // A scale change and leftover stats blobs cannot be committed
+                // separately: the blobs store unscaled integers decoded with
+                // the *current* schema's scale (123.45 at scale 2 becomes
+                // 1.2345 at scale 4). One transaction publishes the schema
+                // and drops table, snapshot-file, and cold-tier stats.
+                self.persist_table_schema(
+                    &stored_metadata.table_id,
+                    &plan.evolved_schema,
+                    plan.changes_decimal_scale(),
+                )
+                .await?;
                 tracing::info!(
                     table = table_name,
                     "Cayenne table schema evolved in place: {}",
@@ -2142,10 +2264,10 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Initialize schema using the appropriate metastore backend
-        match &self.metastore {
-            MetastoreImpl::Sqlite(metastore) => metastore.init_schema().await?,
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(metastore) => metastore.init_schema().await?,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(metastore) => metastore.init_schema().await?,
+            MetastoreBackendImpl::Turso(metastore) => metastore.init_schema().await?,
         }
 
         Ok(())
@@ -2466,20 +2588,15 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         schema: &arrow_schema::SchemaRef,
     ) -> CatalogResult<()> {
-        let schema_json = serialize_schema_ipc_base64(schema.as_ref())?;
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
-                params: vec![
-                    MetastoreValue::Text(schema_json),
-                    MetastoreValue::Text(table_id.to_string()),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to update schema for table {table_id}"),
-                source: Box::new(e),
-            })
+        self.persist_table_schema(table_id, schema, false).await
+    }
+
+    async fn update_table_schema_dropping_statistics(
+        &self,
+        table_id: &str,
+        schema: &arrow_schema::SchemaRef,
+    ) -> CatalogResult<()> {
+        self.persist_table_schema(table_id, schema, true).await
     }
 
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
@@ -5097,12 +5214,12 @@ impl MetadataCatalog for CayenneCatalog {
         dataset_name: &str,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
-        match &self.metastore {
-            MetastoreImpl::Sqlite(m) => {
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => {
+            MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
         }
@@ -5113,12 +5230,12 @@ impl MetadataCatalog for CayenneCatalog {
         slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<()> {
-        match &self.metastore {
-            MetastoreImpl::Sqlite(m) => {
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => {
+            MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
         }
@@ -5506,6 +5623,39 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
         });
     }
 
+    let config = &options.vortex_config;
+    if !config.cluster_by.is_empty()
+        && !config.sort_columns.is_empty()
+        && config.sort_columns_origin == super::metadata::SortColumnsOrigin::User
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Failed to create Cayenne table '{}': `cluster_by` cannot be combined with `sort_columns`. Remove one configuration; sorting within clusters is not supported yet.",
+                options.table_name
+            ),
+        });
+    }
+
+    for column in &config.cluster_by {
+        let Some((_, field)) = options.schema.column_with_name(column) else {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to create Cayenne table '{}': clustering column '{column}' does not exist. Update `CLUSTER BY` or `cayenne_cluster_by` to use an existing column.",
+                    options.table_name
+                ),
+            });
+        };
+        if !crate::provider::clustering::is_clusterable(field.data_type()) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to create Cayenne table '{}': clustering column '{column}' has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from the cluster key.",
+                    options.table_name,
+                    field.data_type()
+                ),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -5756,6 +5906,131 @@ mod tests {
         drop(catalog);
 
         // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// A decimal scale change must drop every persisted statistics blob in the
+    /// same step as the schema update: table aggregate, snapshot-file cache,
+    /// and cold-tier manifests. Vortex stores unscaled integers and decodes
+    /// them with the current schema's scale, so a leftover blob from scale 2
+    /// would prune 123.45 as 1.2345 after widening to scale 4.
+    #[tokio::test]
+    async fn decimal_scale_change_drops_table_snapshot_and_cold_statistics() {
+        use crate::metadata::SchemaEvolutionMode;
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_decimal_scale_stats_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let scale2 = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Decimal128(10, 2), true),
+        ]));
+        let scale4 = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Decimal128(14, 4), true),
+        ]));
+        let options = |schema: arrow_schema::SchemaRef| CreateTableOptions {
+            table_name: "decimal_scale_stats".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                schema_evolution: SchemaEvolutionMode::Widen,
+                ..crate::metadata::VortexConfig::default()
+            },
+        };
+
+        let table_id = catalog
+            .create_table(options(Arc::clone(&scale2)))
+            .await
+            .expect("create table");
+
+        let cold = ColdTierFile {
+            table_id: table_id.clone(),
+            file_url: "s3://bucket/t/data/p1/c.vortex".to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: 0,
+            max_sequence: 1,
+            statistics_blob: vec![7, 8, 9],
+            pk_bloom: None,
+        };
+        catalog
+            .commit_overwrite_to_cold(
+                &table_id,
+                &uuid::Uuid::now_v7().to_string(),
+                std::slice::from_ref(&cold),
+            )
+            .await
+            .expect("seed a cold file whose statistics blob is the scale-2 bound");
+
+        // Overwrite clears table/snapshot stats, so seed them after the cold row.
+        catalog
+            .upsert_table_statistics(&TableStatistics {
+                table_id: table_id.clone(),
+                statistics_blob: vec![1, 2, 3],
+                num_rows: 10,
+                ndv_sketches: None,
+                num_rows_exact: true,
+            })
+            .await
+            .expect("seed table stats");
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: "f.vortex".to_string(),
+                file_size_bytes: 100,
+                num_rows: 10,
+                statistics_blob: vec![4, 5, 6],
+            })
+            .await
+            .expect("seed snapshot file stats");
+
+        catalog
+            .create_table(options(scale4))
+            .await
+            .expect("re-create with a wider decimal scale");
+
+        assert!(
+            catalog
+                .get_table_statistics(&table_id)
+                .await
+                .expect("read table stats")
+                .is_none(),
+            "table aggregate stats must be dropped so they cannot decode at the new scale"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &snapshot_id, "f.vortex")
+                .await
+                .expect("read snapshot file stats")
+                .is_none(),
+            "snapshot-file stats must be dropped so listing-time pruning cannot use the old scale"
+        );
+        let cold_files = catalog
+            .list_cold_tier_files(&table_id)
+            .await
+            .expect("list cold files");
+        assert_eq!(cold_files.len(), 1, "the cold file itself must survive");
+        assert!(
+            cold_files[0].statistics_blob.is_empty(),
+            "cold-tier statistics_blob must be cleared, got {} bytes",
+            cold_files[0].statistics_blob.len()
+        );
+
+        drop(catalog);
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

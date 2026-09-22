@@ -17,12 +17,16 @@ limitations under the License.
 use async_openai::types::embeddings::{CreateEmbeddingResponse, Embedding, EmbeddingVector};
 
 use crate::Sizeable;
-use crate::sizing::{ENTRY_OVERHEAD_BYTES, f32_vectors_heap_size};
+use crate::sizing::{ENTRY_OVERHEAD_BYTES, arc_heap_size, f32_vectors_heap_size};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum CachedEmbeddingResult {
-    Response(CreateEmbeddingResponse),
-    Vector(Vec<Vec<f32>>),
+    /// Shared so a cache hit is an `Arc` clone rather than a deep copy of the
+    /// `OpenAI` response (large embedding payloads).
+    Response(Arc<CreateEmbeddingResponse>),
+    /// Shared so a cache hit does not deep-clone `Vec<Vec<f32>>` on the get path.
+    Vector(Arc<Vec<Vec<f32>>>),
 }
 
 /// The heap one embedding owns, excluding the struct itself.
@@ -41,17 +45,26 @@ fn embedding_heap_size(embedding: &Embedding) -> usize {
 
 impl Sizeable for CachedEmbeddingResult {
     fn get_memory_size(&self) -> usize {
-        let payload = match self {
+        // `size_of::<Self>()` is only the enum discriminant + Arc pointer.
+        // Bill the Arc header and pointee struct via `arc_heap_size`, then the
+        // heap those pointees own (string/vec buffers, embedding payloads).
+        match self {
             CachedEmbeddingResult::Response(response) => {
-                response.object.capacity()
+                std::mem::size_of::<Self>()
+                    + arc_heap_size::<CreateEmbeddingResponse>()
+                    + response.object.capacity()
                     + response.model.capacity()
-                    + response.data.len() * std::mem::size_of::<Embedding>()
+                    + response.data.capacity() * std::mem::size_of::<Embedding>()
                     + response.data.iter().map(embedding_heap_size).sum::<usize>()
+                    + ENTRY_OVERHEAD_BYTES
             }
-            CachedEmbeddingResult::Vector(vectors) => f32_vectors_heap_size(vectors),
-        };
-
-        std::mem::size_of::<Self>() + payload + ENTRY_OVERHEAD_BYTES
+            CachedEmbeddingResult::Vector(vectors) => {
+                std::mem::size_of::<Self>()
+                    + arc_heap_size::<Vec<Vec<f32>>>()
+                    + f32_vectors_heap_size(vectors.as_ref())
+                    + ENTRY_OVERHEAD_BYTES
+            }
+        }
     }
 }
 
@@ -62,7 +75,7 @@ mod tests {
     use super::*;
 
     fn response(embeddings: Vec<EmbeddingVector>) -> CachedEmbeddingResult {
-        CachedEmbeddingResult::Response(CreateEmbeddingResponse {
+        CachedEmbeddingResult::Response(Arc::new(CreateEmbeddingResponse {
             object: "list".to_string(),
             model: "text-embedding-3-small".to_string(),
             data: embeddings
@@ -78,7 +91,7 @@ mod tests {
                 prompt_tokens: 0,
                 total_tokens: 0,
             },
-        })
+        }))
     }
 
     /// `EmbeddingVector::len()` decodes the whole string to count floats on the
@@ -104,7 +117,8 @@ mod tests {
     /// the vector arm charged every vector the *first* one's length.
     #[test]
     fn a_ragged_vector_batch_is_charged_per_vector() {
-        let ragged = CachedEmbeddingResult::Vector(vec![vec![0.0_f32; 1], vec![0.0_f32; 4_096]]);
+        let ragged =
+            CachedEmbeddingResult::Vector(Arc::new(vec![vec![0.0_f32; 1], vec![0.0_f32; 4_096]]));
 
         assert!(
             ragged.get_memory_size() > 4_096 * std::mem::size_of::<f32>(),
@@ -118,6 +132,24 @@ mod tests {
         assert!(
             response(Vec::new()).get_memory_size() > 0,
             "an entry the cache is holding is never free"
+        );
+    }
+
+    #[test]
+    fn arc_payloads_are_billed_beyond_the_enum_pointer() {
+        let empty = response(Vec::new());
+        let pointer_only = std::mem::size_of::<CachedEmbeddingResult>() + ENTRY_OVERHEAD_BYTES;
+        assert!(
+            empty.get_memory_size() > pointer_only,
+            "Arc header + pointee must be billed; got {} vs pointer_only {}",
+            empty.get_memory_size(),
+            pointer_only
+        );
+        let min_arc = pointer_only + crate::sizing::arc_heap_size::<CreateEmbeddingResponse>();
+        assert!(
+            empty.get_memory_size() >= min_arc,
+            "expected at least arc_heap_size over the enum pointer, got {}",
+            empty.get_memory_size()
         );
     }
 }

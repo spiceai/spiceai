@@ -4,6 +4,7 @@
 //! Persistent implementation of a Vortex table provider.
 mod access_plan;
 mod cache;
+mod write_observer;
 pub use cache::synthetic_object_meta;
 mod deferred_projection;
 mod format;
@@ -27,6 +28,7 @@ pub use segment_cache::{
     register_segment_cache_metrics,
 };
 pub use source::VortexSource;
+pub use write_observer::VortexWriteObserver;
 
 #[cfg(test)]
 mod tests {
@@ -1097,6 +1099,189 @@ mod tests {
             matched_decimal,
             i64::from(ROWS / 2),
             "the decimal IN list covers the upper half of the rows and nothing else"
+        );
+
+        Ok(())
+    }
+
+    /// Create a one-column Vortex table at its own location and fill it, one row
+    /// per value, in the order given.
+    async fn one_column_table(
+        ctx: &TestSessionContext,
+        table: &str,
+        sql_type: &str,
+        rows: &[&str],
+    ) -> anyhow::Result<()> {
+        ctx.session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE {table} (v {sql_type} NOT NULL) \
+                 STORED AS vortex \
+                 LOCATION '/{table}/'"
+            ))
+            .await?;
+        insert_rows(ctx, table, rows).await
+    }
+
+    /// Append `rows` to `table` in one statement, which the sink writes as one file.
+    async fn insert_rows(
+        ctx: &TestSessionContext,
+        table: &str,
+        rows: &[&str],
+    ) -> anyhow::Result<()> {
+        let values = rows
+            .iter()
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO {table} VALUES {values}"))
+            .await?
+            .collect()
+            .await?;
+        Ok(())
+    }
+
+    /// Count the rows of `table` whose only column is in `elements`, and assert on
+    /// the way that the filter reached the Vortex scan rather than a `FilterExec`
+    /// above it.
+    ///
+    /// The assertion is what keeps the guards below honest: an `IN` list DataFusion
+    /// answers for itself exercises none of the fork's code, and would leave them
+    /// passing on a pin that had lost the patch entirely.
+    async fn pushed_down_in_list_count(
+        ctx: &TestSessionContext,
+        table: &str,
+        elements: &[&str],
+    ) -> anyhow::Result<i64> {
+        let sql = format!(
+            "SELECT count(*) FROM {table} WHERE v IN ({})",
+            elements.join(", ")
+        );
+        let plan = physical_plan_display(&ctx.session, &sql).await?;
+        assert!(
+            plan.contains("predicate:"),
+            "the IN list has to be pushed into the Vortex scan for this to guard \
+             anything, but the plan left it above the scan:\n{plan}"
+        );
+        scalar_count(ctx, &sql).await
+    }
+
+    /// A null in an `IN` list must not cost the list its other elements.
+    ///
+    /// This is a regression test first and a fork guard second, because writing the
+    /// fork guard is what found the regression. `WHERE v IN (NULL, 10, 30, 50)`
+    /// against a Vortex-backed column panicked the scan on the pin this was written
+    /// against:
+    ///
+    /// ```text
+    /// vortex-array/src/scalar/constructor.rs:151:
+    ///   Other error: tried to create list of i64? with values of type i64
+    /// ```
+    ///
+    /// `Scalar::list` compares each element's dtype against the list's element
+    /// dtype including nullability and panics on a mismatch, and the converter
+    /// declared that dtype from the *first* element. DataFusion types a NULL in an
+    /// `IN` list as a nullable value of the list's type and the elements that carry
+    /// a value as non-nullable, so any list holding both disagreed with its own
+    /// declared type — whichever came first — and the panic surfaced as a panicked
+    /// task, not an error the query could report. Each placement below is its own
+    /// case for that reason.
+    ///
+    /// The fork's half is what the list falls back to once it is built. A null is
+    /// not a key on any probe path, so fork PR #95 sends a list holding one back to
+    /// the OR-of-equalities form before anything is decoded or keyed; a probe that
+    /// keyed such a list anyway would be a key short and would answer `false` for
+    /// rows matching a later element, which is rows silently dropped.
+    ///
+    /// SQL's own answer is the assertion: a null element makes a non-match UNKNOWN
+    /// rather than false, which `WHERE` discards either way, so the count is of the
+    /// rows matching the list's other elements — the same count the list gives
+    /// without the null at all, which is the comparison each case makes.
+    #[tokio::test]
+    async fn an_in_list_holding_a_null_still_answers_its_other_elements() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        one_column_table(
+            &ctx,
+            "null_element_i64",
+            "BIGINT",
+            &["10", "20", "30", "40", "50"],
+        )
+        .await?;
+        one_column_table(
+            &ctx,
+            "null_element_timestamp",
+            "TIMESTAMP",
+            &[
+                "TIMESTAMP '2024-01-01 00:00:00'",
+                "TIMESTAMP '2024-01-02 00:00:00'",
+                "TIMESTAMP '2024-01-03 00:00:00'",
+                "TIMESTAMP '2024-01-04 00:00:00'",
+                "TIMESTAMP '2024-01-05 00:00:00'",
+            ],
+        )
+        .await?;
+
+        let without_null =
+            pushed_down_in_list_count(&ctx, "null_element_i64", &["10", "30", "50"]).await?;
+        assert_eq!(
+            without_null, 3,
+            "the list selects the first, third and fifth row"
+        );
+
+        // Where the null sits decides which element disagrees with the dtype the
+        // list is built with, so each placement is its own case. Four elements
+        // once the null is counted, which also puts the list past the probe's
+        // threshold and so exercises the null fallback rather than missing it.
+        for elements in [
+            ["NULL", "10", "30", "50"],
+            ["10", "NULL", "30", "50"],
+            ["10", "30", "50", "NULL"],
+        ] {
+            let with_null = pushed_down_in_list_count(&ctx, "null_element_i64", &elements).await?;
+            assert_eq!(
+                with_null, without_null,
+                "a null element selects no row of its own and takes none away, \
+                 wherever it sits in the list: {elements:?}"
+            );
+        }
+
+        // A `TIMESTAMP` column is the `vortex.timestamp` extension type, whose
+        // elements are unwrapped to their storage values before the list is keyed,
+        // so it reaches the null through one more layer than the arms above.
+        let timestamps_with_null = pushed_down_in_list_count(
+            &ctx,
+            "null_element_timestamp",
+            &[
+                "NULL",
+                "TIMESTAMP '2024-01-01 00:00:00'",
+                "TIMESTAMP '2024-01-03 00:00:00'",
+                "TIMESTAMP '2024-01-05 00:00:00'",
+            ],
+        )
+        .await?;
+        assert_eq!(
+            timestamps_with_null, 3,
+            "a null element leaves a timestamp list selecting its other three"
+        );
+
+        // And a `Utf8` column, which is keyed as bytes rather than as a primitive.
+        one_column_table(
+            &ctx,
+            "null_element_utf8",
+            "VARCHAR",
+            &["'alpha'", "'bravo'", "'charlie'", "'delta'", "'echo'"],
+        )
+        .await?;
+        let text_with_null = pushed_down_in_list_count(
+            &ctx,
+            "null_element_utf8",
+            &["'alpha'", "'charlie'", "NULL", "'echo'"],
+        )
+        .await?;
+        assert_eq!(
+            text_with_null, 3,
+            "a null element leaves a text list selecting its other three"
         );
 
         Ok(())

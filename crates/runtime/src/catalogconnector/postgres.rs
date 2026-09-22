@@ -29,11 +29,19 @@ use crate::{
     dataconnector::parameters::ConnectorParams,
 };
 use async_trait::async_trait;
-use data_components::RefreshableCatalogProvider;
+use data_components::federation::create_spice_federated_table_provider;
 use data_components::postgres::provider::PostgresCatalogProvider;
+use data_components::{Read, RefreshableCatalogProvider};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::UnsupportedTypeAction;
-use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use snafu::Snafu;
 use std::any::Any;
 use std::collections::HashMap;
@@ -124,6 +132,104 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("The path to, or inline PEM content for, the SSL root certificate."),
 ];
 
+/// A [`Read`] for `PostgreSQL` catalog tables that installs the Spice function
+/// deny-list.
+///
+/// `PostgresTableFactory` carries no function-support seam: both of its read
+/// constructors hand to a private `finish_table_provider` that applies the
+/// dialect and federates unconditionally, so a catalog built on it unparses
+/// every Spice-only UDF -- the `json_get_*` set, the embedding and distance
+/// UDFs, every user-registered function -- into the SQL sent to `PostgreSQL`,
+/// which answers "function does not exist".
+///
+/// So this builds the `SqlTable` itself and routes the federation wrapping
+/// through [`create_spice_federated_table_provider`] with the deny-list,
+/// exactly as the `PostgreSQL` *dataset* connector's read path does. Keeping
+/// the synchronous `new_with_schema` constructor matters: the catalog resolves
+/// a whole namespace's schemas in one query, and a [`Read`] that implemented
+/// only [`Read::table_provider`] would turn discovery back into a round trip
+/// per table. See issues #10703 and #13664.
+struct FederatedPostgresTableFactory {
+    pool: Arc<DynPostgresConnectionPool>,
+    /// Built once per catalog rather than per table: the policy is the same for
+    /// every table, and deriving it walks the nested-function list and takes a
+    /// read lock on the user-function registry each time. Building it once also
+    /// means every table in a catalog federates under the same snapshot of the
+    /// registered user functions, instead of whichever one its own turn in the
+    /// refresh happened to see.
+    function_support: FunctionSupport,
+}
+
+impl FederatedPostgresTableFactory {
+    /// The dialect and federation wrapping both constructors share, so a table
+    /// cannot plan differently for having been discovered with its schema
+    /// already in hand.
+    fn finish<T: 'static, P: 'static>(
+        &self,
+        table: SqlTable<T, P>,
+        table_reference: TableReference,
+    ) -> Arc<dyn TableProvider + 'static> {
+        let table = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
+        let schema = table.schema();
+        Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            table_reference,
+            Some(self.function_support.clone()),
+        ))
+    }
+}
+
+#[async_trait]
+impl Read for FederatedPostgresTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let table = SqlTable::new(
+            "postgres",
+            &self.pool,
+            table_reference.clone(),
+            Some(Engine::Postgres),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(self.finish(table, table_reference))
+    }
+
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let table = SqlTable::new_with_schema(
+            "postgres",
+            &self.pool,
+            schema,
+            table_reference.clone(),
+            Some(Engine::Postgres),
+        );
+
+        Ok(self.finish(table, table_reference))
+    }
+}
+
+/// The read path a `PostgreSQL` catalog's tables are built through, with the
+/// Spice function deny-list installed.
+///
+/// Public so the integration tests in `tests/postgres/catalog.rs` build their
+/// providers the way the connector does. A test holding a bare
+/// `PostgresTableFactory` asserts against a provider no user is given, which
+/// is how this gap survived the connector's own test suite.
+#[must_use]
+pub fn build_table_factory(pool: Arc<PostgresConnectionPool>) -> Arc<dyn Read> {
+    Arc::new(FederatedPostgresTableFactory {
+        pool,
+        function_support: deny_spice_functions_for_postgres_table_providers(),
+    })
+}
+
 /// A catalog connector for `PostgreSQL`, providing access to schemas and tables
 /// within a `PostgreSQL` database. Also usable for Redshift.
 #[derive(Clone)]
@@ -181,7 +287,7 @@ impl CatalogConnector for PostgresCatalog {
             if let Some(acceleration) = catalog.acceleration.as_ref() {
                 Arc::new(AcceleratedCatalogProvider::new(catalog, acceleration, pool))
             } else {
-                let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
+                let table_factory = build_table_factory(Arc::clone(&pool));
                 Arc::new(PostgresCatalogProvider::new(
                     catalog.name.clone(),
                     pool,
