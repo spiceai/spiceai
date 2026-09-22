@@ -23,8 +23,8 @@ limitations under the License.
 //! the flip that makes the snapshot visible, so there is no window in which
 //! lookups lose the index. Anything else that changes the files — an append, a
 //! compaction, a restart — leaves the index stale; it is dropped, and a later
-//! lookup rebuilds it in the background, paced so rebuilding takes a bounded
-//! share of a core. Nothing is persisted.
+//! literal lookup or supported runtime join lookup rebuilds it in the background,
+//! paced so rebuilding takes a bounded share of a core. Nothing is persisted.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -61,6 +61,9 @@ limitations under the License.
 //! * A key is matched by its stored value. A predicate that casts the COLUMN can
 //!   hold for stored values other than the literal (`CAST(score AS BIGINT) = 5`
 //!   holds for 5.2), so such predicates must never reach [`LookupIndexState::probe`].
+//! * A runtime key set is usable only after its dynamic filter is complete and
+//!   only through conjunctions. A list nested under `OR` or `CASE` is not a
+//!   complete necessary condition and must not become a row selection.
 //! * The build sorts with Arrow's lexicographic sort and a lookup compares
 //!   `RowConverter` bytes. Those orders agree for every type the converter
 //!   supports, and the build re-checks them while it records block heads: a block
@@ -82,9 +85,15 @@ use arrow::compute::SortColumn;
 use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, FieldRef};
+use async_trait::async_trait;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_common::{ScalarValue, Statistics};
 use datafusion_datasource::{PartitionedFile, file_groups::FileGroup};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore};
 use parking_lot::Mutex;
@@ -106,6 +115,12 @@ const POSITION_BITS: u32 = 40;
 const POSITION_MASK: u64 = (1u64 << POSITION_BITS) - 1;
 /// File ids above this would not survive the shift into a packed posting.
 const MAX_FILE_ID: u32 = (1u32 << (u64::BITS - POSITION_BITS)) - 1;
+
+/// Runtime index scans accept only small exact build-side key sets.
+const RUNTIME_INDEX_MAX_KEYS: usize = 2_048;
+/// Candidate rows may scale with the table, but stay within a fixed memory bound.
+const RUNTIME_INDEX_MIN_ROWS: usize = 2_048;
+const RUNTIME_INDEX_MAX_ROWS: usize = 1_000_000;
 
 /// Sorted entries per block. A lookup decodes the block(s) its key can fall in,
 /// and one row-encoded key is retained per block to find them, so this trades
@@ -426,6 +441,8 @@ enum ShapeProbe {
     Postings(Vec<u64>),
     /// The key could not be resolved against this index, so it proves nothing.
     Unanswerable,
+    /// The posting list exceeded the caller's candidate-row budget.
+    TooBroad,
 }
 
 /// One indexed key over the snapshot, as sorted compressed arrays.
@@ -484,6 +501,25 @@ impl ShapeIndex {
     /// The packed postings of the key whose column values are `values`, in
     /// `columns` order.
     fn probe(&self, session: &VortexSession, values: &[ScalarValue]) -> ShapeProbe {
+        self.probe_with_limit(session, values, None)
+    }
+
+    /// The packed postings of one key, refusing to decode more than `max_rows`.
+    fn probe_bounded(
+        &self,
+        session: &VortexSession,
+        values: &[ScalarValue],
+        max_rows: usize,
+    ) -> ShapeProbe {
+        self.probe_with_limit(session, values, Some(max_rows))
+    }
+
+    fn probe_with_limit(
+        &self,
+        session: &VortexSession,
+        values: &[ScalarValue],
+        max_rows: Option<usize>,
+    ) -> ShapeProbe {
         if values.len() != self.columns.len() {
             return ShapeProbe::Unanswerable;
         }
@@ -510,8 +546,9 @@ impl ShapeIndex {
         if range.is_empty() {
             return ShapeProbe::Postings(Vec::new());
         }
-        match self.postings_in(session, range, key.as_ref()) {
-            Ok(postings) => ShapeProbe::Postings(postings),
+        match self.postings_in(session, range, key.as_ref(), max_rows) {
+            Ok(Some(postings)) => ShapeProbe::Postings(postings),
+            Ok(None) => ShapeProbe::TooBroad,
             Err(error) => {
                 tracing::debug!(shape = %self.label, %error, "Point-lookup index block could not be read; scanning instead");
                 ShapeProbe::Unanswerable
@@ -554,7 +591,8 @@ impl ShapeIndex {
         session: &VortexSession,
         range: Range<usize>,
         key: &[u8],
-    ) -> Result<Vec<u64>, String> {
+        max_rows: Option<usize>,
+    ) -> Result<Option<Vec<u64>>, String> {
         let mut ctx = session.create_execution_ctx();
         let rows = self
             .converter
@@ -563,11 +601,14 @@ impl ShapeIndex {
         let lo = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() < key);
         let hi = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() <= key);
         if lo == hi {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
+        }
+        if max_rows.is_some_and(|limit| hi - lo > limit) {
+            return Ok(None);
         }
         let postings =
             self.decode_postings(session, range.start + lo..range.start + hi, &mut ctx)?;
-        Ok(postings.values().to_vec())
+        Ok(Some(postings.values().to_vec()))
     }
 
     /// Every entry as `(row-encoded key, file path, position)`, sorted.
@@ -637,7 +678,7 @@ impl SnapshotLookupIndex {
             };
             let postings = match shape.probe(&self.session, &values) {
                 ShapeProbe::Postings(postings) => postings,
-                ShapeProbe::Unanswerable => continue,
+                ShapeProbe::Unanswerable | ShapeProbe::TooBroad => continue,
             };
 
             // Grouped under the index's own path strings, so each candidate
@@ -670,6 +711,57 @@ impl SnapshotLookupIndex {
             });
         }
         None
+    }
+
+    /// Resolves a batch of correlated keys and groups all of the resulting
+    /// postings by file. Returning `None` declines the index entirely; callers
+    /// must never use a partial batch.
+    fn probe_keys(
+        &self,
+        columns: &[String],
+        keys: &[Vec<ScalarValue>],
+        max_rows: usize,
+    ) -> Option<ProbeHit> {
+        let shape = self.shapes.iter().find(|shape| {
+            shape.columns.len() == columns.len()
+                && shape
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|(indexed, requested)| indexed.name.eq_ignore_ascii_case(requested))
+        })?;
+        let mut postings = Vec::new();
+        for key in keys {
+            if key.len() != columns.len() {
+                return None;
+            }
+            let remaining = max_rows.saturating_sub(postings.len());
+            match shape.probe_bounded(&self.session, key, remaining) {
+                ShapeProbe::Postings(key_postings) => postings.extend(key_postings),
+                ShapeProbe::Unanswerable | ShapeProbe::TooBroad => return None,
+            }
+        }
+        postings.sort_unstable();
+        postings.dedup();
+
+        let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
+        for &packed in &postings {
+            let (file_id, position) = unpack(packed);
+            let file = self.files.get(file_id)?;
+            by_file
+                .entry(file.path.as_str())
+                .or_default()
+                .push(position);
+        }
+        let per_file = by_file
+            .into_iter()
+            .map(|(path, positions)| (path.to_string(), positions))
+            .collect();
+        Some(ProbeHit {
+            shape: shape.label.clone(),
+            per_file,
+            rows: postings.len(),
+        })
     }
 }
 
@@ -829,6 +921,101 @@ struct LookupAccessPlanProvider {
     table: Arc<dyn VortexAccessPlanProvider>,
 }
 
+/// Runtime row selection derived from a completed hash-join dynamic filter.
+struct RuntimeLookupSelection {
+    index: Arc<SnapshotLookupIndex>,
+    per_file: HashMap<String, Vec<u64>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeLookupFilterIdentity {
+    expression_id: u64,
+    generation: u64,
+    columns: Vec<String>,
+}
+
+struct RuntimeLookupFilter {
+    identity: RuntimeLookupFilterIdentity,
+    keys: Vec<Vec<ScalarValue>>,
+}
+
+#[derive(Default)]
+struct RuntimeLookupCache {
+    filter: Option<RuntimeLookupFilterIdentity>,
+    selection: Option<Arc<RuntimeLookupSelection>>,
+}
+
+/// Adds exact dynamic-filter keys to the table's ordinary per-file access plan.
+///
+/// The provider is installed while the physical scan is built, but probes the
+/// lookup index only when Vortex opens a file. At that point a collect-left hash
+/// join may have populated its `DynamicFilterPhysicalExpr` with an exact `IN`
+/// list. The expression generation prevents an early, unresolved filter from
+/// becoming a permanent decision for later file openers.
+pub(crate) struct DynamicLookupAccessPlanProvider {
+    state: Arc<LookupIndexState>,
+    visible_snapshot: String,
+    table: Arc<dyn VortexAccessPlanProvider>,
+    request_build: Option<Arc<dyn Fn() + Send + Sync>>,
+    selection: Mutex<RuntimeLookupCache>,
+}
+
+impl DynamicLookupAccessPlanProvider {
+    pub(crate) fn new(
+        state: Arc<LookupIndexState>,
+        visible_snapshot: String,
+        table: Arc<dyn VortexAccessPlanProvider>,
+        request_build: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        Self {
+            state,
+            visible_snapshot,
+            table,
+            request_build,
+            selection: Mutex::default(),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<RuntimeLookupSelection>> {
+        let predicate = predicate?;
+        let (dynamic, columns) = self.state.specs.iter().find_map(|spec| {
+            dynamic_in_list_expr(predicate, &spec.columns)
+                .map(|dynamic| (dynamic, spec.columns.as_slice()))
+        })?;
+        dynamic.wait_complete().await;
+        let filter = snapshot_dynamic_in_list_filter(dynamic, columns)?;
+
+        let mut cache = self.selection.lock();
+        if cache.filter.as_ref() == Some(&filter.identity) {
+            return cache.selection.clone();
+        }
+        let selection = self
+            .state
+            .probe_runtime_filter(&self.visible_snapshot, &filter)
+            .map(Arc::new);
+        if selection.is_none()
+            && let Some(request_build) = &self.request_build
+        {
+            request_build();
+        }
+        cache.filter = Some(filter.identity);
+        cache.selection.clone_from(&selection);
+        selection
+    }
+}
+
+impl std::fmt::Debug for DynamicLookupAccessPlanProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicLookupAccessPlanProvider")
+            .field("visible_snapshot", &self.visible_snapshot)
+            .field("resolved", &self.selection.lock().filter.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for LookupAccessPlanProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LookupAccessPlanProvider")
@@ -846,6 +1033,115 @@ fn selection_keeps(selection: &Selection, position: u64) -> bool {
         Selection::ExcludeByIndex(rows) => rows.binary_search(&position).is_err(),
         Selection::IncludeRoaring(rows) => rows.contains(position),
         Selection::ExcludeRoaring(rows) => !rows.contains(position),
+    }
+}
+
+/// Returns the exact non-null keys carried for `columns` by a dynamic filter.
+/// Bounds and hash-membership expressions deliberately decline: only an
+/// `InListExpr` is an enumerable key set for the lookup index. Traversal is
+/// limited to conjunctions, where selecting candidates for one conjunct is
+/// conservative; extracting a list from `OR`, `CASE`, or another expression
+/// could omit rows.
+///
+/// `DataFusion` represents a multi-column join key as one `struct(...) IN`
+/// expression. Extracting each struct literal preserves the build rows' tuple
+/// correlation; independent per-column lists must never be combined here.
+fn dynamic_in_list_expr<'a>(
+    expr: &'a Arc<dyn PhysicalExpr>,
+    columns: &[String],
+) -> Option<&'a DynamicFilterPhysicalExpr> {
+    if let Some(dynamic) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        in_list_keys(&dynamic.current().ok()?, columns)?;
+        return Some(dynamic);
+    }
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    if binary.op() != &Operator::And {
+        return None;
+    }
+    dynamic_in_list_expr(binary.left(), columns)
+        .or_else(|| dynamic_in_list_expr(binary.right(), columns))
+}
+
+fn snapshot_dynamic_in_list_filter(
+    dynamic: &DynamicFilterPhysicalExpr,
+    columns: &[String],
+) -> Option<RuntimeLookupFilter> {
+    let generation = dynamic.snapshot_generation();
+    let current = dynamic.current().ok()?;
+    let keys = in_list_keys(&current, columns)?;
+    if dynamic.snapshot_generation() != generation {
+        return None;
+    }
+    Some(RuntimeLookupFilter {
+        identity: RuntimeLookupFilterIdentity {
+            expression_id: dynamic.expression_id()?,
+            generation,
+            columns: columns.to_vec(),
+        },
+        keys,
+    })
+}
+
+fn in_list_keys(expr: &Arc<dyn PhysicalExpr>, columns: &[String]) -> Option<Vec<Vec<ScalarValue>>> {
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>()
+        && !in_list.negated()
+        && in_list_matches_columns(in_list, columns)
+    {
+        let mut keys = Vec::with_capacity(in_list.len());
+        for value in in_list.list() {
+            let scalar = value.downcast_ref::<Literal>()?.value();
+            if columns.len() == 1 {
+                if !scalar.is_null() {
+                    keys.push(vec![scalar.clone()]);
+                }
+                continue;
+            }
+
+            let ScalarValue::Struct(struct_array) = scalar else {
+                return None;
+            };
+            if struct_array.len() != 1 {
+                return None;
+            }
+            if struct_array.is_null(0) {
+                continue;
+            }
+            let key = struct_array
+                .columns()
+                .iter()
+                .map(|array| ScalarValue::try_from_array(array, 0).ok())
+                .collect::<Option<Vec<_>>>()?;
+            if key.iter().all(|value| !value.is_null()) {
+                keys.push(key);
+            }
+        }
+        return Some(keys);
+    }
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    if binary.op() != &Operator::And {
+        return None;
+    }
+    in_list_keys(binary.left(), columns).or_else(|| in_list_keys(binary.right(), columns))
+}
+
+fn in_list_matches_columns(in_list: &InListExpr, columns: &[String]) -> bool {
+    match columns {
+        [column] => in_list
+            .expr()
+            .downcast_ref::<Column>()
+            .is_some_and(|candidate| candidate.name() == column),
+        [] => false,
+        columns => in_list
+            .expr()
+            .downcast_ref::<ScalarFunctionExpr>()
+            .filter(|function| function.name().eq_ignore_ascii_case("struct"))
+            .is_some_and(|function| {
+                function.args().len() == columns.len()
+                    && function.args().iter().zip(columns).all(|(arg, column)| {
+                        arg.downcast_ref::<Column>()
+                            .is_some_and(|candidate| candidate.name() == column)
+                    })
+            }),
     }
 }
 
@@ -880,6 +1176,55 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
     }
 }
 
+#[async_trait]
+impl VortexAccessPlanProvider for DynamicLookupAccessPlanProvider {
+    fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+        self.table.access_plan_for_file(file)
+    }
+
+    async fn runtime_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<VortexAccessPlan>> {
+        let selection = self.resolve(predicate).await?;
+        let path: &str = file.object_meta.location.as_ref();
+
+        // A file absent from, or changed since, the indexed snapshot cannot use
+        // the selection. Returning no runtime plan leaves the exact Vortex
+        // predicate and hash probe to produce the result safely.
+        let &file_id = selection.index.file_ids.get(path)?;
+        let indexed = selection.index.files.get(file_id as usize)?;
+        if indexed.size != file.object_meta.size
+            || indexed.last_modified_ms != file.object_meta.last_modified.timestamp_millis()
+        {
+            return None;
+        }
+
+        let candidates = selection.per_file.get(path).map_or(&[][..], Vec::as_slice);
+        let table_plan = self.table.access_plan_for_file(file);
+        let positions = match table_plan.as_deref().and_then(VortexAccessPlan::selection) {
+            None | Some(Selection::All) => Buffer::copy_from(candidates),
+            Some(table_selection) => candidates
+                .iter()
+                .copied()
+                .filter(|&position| selection_keeps(table_selection, position))
+                .collect::<Buffer<u64>>(),
+        };
+        self.state
+            .counters
+            .access_plans_attached
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(
+            VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions)),
+        ))
+    }
+
+    fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
+        self.table.adjust_statistics(object, statistics)
+    }
+}
+
 /// Probe and build accounting for one table. The probe outcomes also go to
 /// OpenTelemetry; these process-local counters are what a correctness check can
 /// assert on to prove a query really used row selection instead of silently
@@ -894,6 +1239,8 @@ pub struct LookupIndexCounters {
     pub unbuilt: u64,
     /// Probes refused because the scan's files are not the indexed ones.
     pub snapshot_mismatch: u64,
+    /// Runtime key sets declined because their shape or cost cannot be bounded.
+    pub runtime_fallback: u64,
     /// Candidate files summed over selected probes.
     pub candidate_files: u64,
     /// Candidate row positions summed over selected probes.
@@ -918,6 +1265,7 @@ pub(crate) struct Counters {
     empty: AtomicU64,
     unbuilt: AtomicU64,
     snapshot_mismatch: AtomicU64,
+    runtime_fallback: AtomicU64,
     candidate_files: AtomicU64,
     pub(crate) candidate_rows: AtomicU64,
     access_plans_attached: AtomicU64,
@@ -933,6 +1281,7 @@ impl Counters {
             empty: self.empty.load(Ordering::Relaxed),
             unbuilt: self.unbuilt.load(Ordering::Relaxed),
             snapshot_mismatch: self.snapshot_mismatch.load(Ordering::Relaxed),
+            runtime_fallback: self.runtime_fallback.load(Ordering::Relaxed),
             candidate_files: self.candidate_files.load(Ordering::Relaxed),
             candidate_rows: self.candidate_rows.load(Ordering::Relaxed),
             access_plans_attached: self.access_plans_attached.load(Ordering::Relaxed),
@@ -1387,6 +1736,58 @@ impl LookupIndexState {
         })
     }
 
+    /// Probes a completed hash-join dynamic filter as one batched lookup.
+    ///
+    /// Single-column membership arrives as `column IN (...)`; composite
+    /// membership arrives as `struct(columns...) IN (struct literals...)`, so
+    /// tuple correlation is preserved without a Cartesian product. Unsupported
+    /// shapes fall through to the ordinary Vortex predicate and hash probe.
+    fn probe_runtime_filter(
+        self: &Arc<Self>,
+        visible_snapshot: &str,
+        filter: &RuntimeLookupFilter,
+    ) -> Option<RuntimeLookupSelection> {
+        let shape = self
+            .specs
+            .iter()
+            .find(|spec| spec.columns == filter.identity.columns)?
+            .label
+            .clone();
+        let Some(index) = self.published() else {
+            self.record_probe(&shape, ProbeOutcome::Unbuilt);
+            return None;
+        };
+        if index.snapshot_id != visible_snapshot {
+            self.record_probe(&shape, ProbeOutcome::SnapshotMismatch);
+            self.discard_stale(&index);
+            return None;
+        }
+
+        let keys: HashSet<Vec<ScalarValue>> = filter.keys.iter().cloned().collect();
+        if keys.len() > RUNTIME_INDEX_MAX_KEYS {
+            self.record_runtime_fallback(&shape);
+            return None;
+        }
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let max_rows = RUNTIME_INDEX_MIN_ROWS
+            .max(usize_of(index.stats.rows) / 1_000)
+            .min(RUNTIME_INDEX_MAX_ROWS);
+        let Some(hit) = index.probe_keys(&filter.identity.columns, &keys, max_rows) else {
+            self.record_runtime_fallback(&shape);
+            return None;
+        };
+
+        if hit.rows == 0 {
+            self.record_probe(&hit.shape, ProbeOutcome::Empty);
+        } else {
+            self.record_selection(&hit.shape, hit.per_file.len() as u64, hit.rows as u64);
+        }
+        Some(RuntimeLookupSelection {
+            index,
+            per_file: hit.per_file,
+        })
+    }
+
     fn record_probe(&self, shape: &str, outcome: ProbeOutcome) {
         record_probe_outcome(&self.table_name, &self.counters, shape, outcome);
     }
@@ -1399,6 +1800,12 @@ impl LookupIndexState {
             .candidate_rows
             .fetch_add(rows, Ordering::Relaxed);
         self.record_probe(shape, ProbeOutcome::Selected);
+    }
+
+    fn record_runtime_fallback(&self, _shape: &str) {
+        self.counters
+            .runtime_fallback
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2510,6 +2917,34 @@ mod tests {
         KeySpec::new(columns.iter().map(|c| (*c).to_string()).collect()).expect("columns")
     }
 
+    #[derive(Debug)]
+    struct NoAccessPlans;
+
+    impl VortexAccessPlanProvider for NoAccessPlans {
+        fn access_plan_for_file(&self, _file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+            None
+        }
+    }
+
+    fn tenant_in_list(column: &Arc<dyn PhysicalExpr>, values: &[i64]) -> Arc<dyn PhysicalExpr> {
+        let schema = arrow_schema::Schema::new(vec![Field::new("tenant", DataType::Int64, true)]);
+        Arc::new(
+            InListExpr::try_new(
+                Arc::clone(column),
+                values
+                    .iter()
+                    .map(|value| {
+                        Arc::new(Literal::new(ScalarValue::Int64(Some(*value))))
+                            as Arc<dyn PhysicalExpr>
+                    })
+                    .collect(),
+                false,
+                &schema,
+            )
+            .expect("IN list"),
+        )
+    }
+
     #[test]
     fn keys_are_labelled_by_their_columns_and_deduplicated() {
         assert!(KeySpec::new(Vec::new()).is_none());
@@ -2525,6 +2960,105 @@ mod tests {
             specs.iter().map(KeySpec::label).collect::<Vec<_>>(),
             vec!["a", "(a, b)"]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_cache_tracks_expression_generation() {
+        let pool = unbounded_pool();
+        let state = LookupIndexState::new(
+            "dynamic_generation",
+            vec![spec(&["tenant"])],
+            Arc::clone(&pool),
+            account(&pool),
+        )
+        .expect("state");
+        let build_requests = Arc::new(AtomicU64::new(0));
+        let request_counter = Arc::clone(&build_requests);
+        let provider = DynamicLookupAccessPlanProvider::new(
+            Arc::clone(&state),
+            "snapshot".to_string(),
+            Arc::new(NoAccessPlans),
+            Some(Arc::new(move || {
+                request_counter.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
+
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(
+            state.counters().unbuilt,
+            0,
+            "an unresolved filter is not probed"
+        );
+        assert_eq!(build_requests.load(Ordering::Relaxed), 0);
+
+        dynamic
+            .update(tenant_in_list(&column, &[1, 2]))
+            .expect("first update");
+        dynamic.mark_complete();
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(state.counters().unbuilt, 1);
+        assert_eq!(build_requests.load(Ordering::Relaxed), 1);
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(
+            state.counters().unbuilt,
+            1,
+            "one generation is probed only once"
+        );
+        assert_eq!(build_requests.load(Ordering::Relaxed), 1);
+
+        dynamic
+            .update(tenant_in_list(&column, &[3]))
+            .expect("second update");
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(
+            state.counters().unbuilt,
+            2,
+            "a later generation is resolved independently"
+        );
+        assert_eq!(build_requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn runtime_filter_refuses_in_lists_nested_in_case() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = tenant_in_list(&column, &[1, 2]);
+        let case = Arc::new(
+            datafusion_physical_expr::expressions::CaseExpr::try_new(
+                None,
+                vec![(
+                    Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
+                        as Arc<dyn PhysicalExpr>,
+                    in_list,
+                )],
+                Some(Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))),
+            )
+            .expect("CASE"),
+        ) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic.update(case).expect("update");
+        dynamic.mark_complete();
+        let predicate = dynamic as Arc<dyn PhysicalExpr>;
+
+        assert!(dynamic_in_list_expr(&predicate, &["tenant".to_string()]).is_none());
+    }
+
+    #[test]
+    fn runtime_filter_column_names_are_case_sensitive() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = tenant_in_list(&column, &[1, 2]);
+        let in_list = in_list.downcast_ref::<InListExpr>().expect("IN list");
+
+        assert!(in_list_matches_columns(in_list, &["tenant".to_string()]));
+        assert!(!in_list_matches_columns(in_list, &["Tenant".to_string()]));
     }
 
     #[test]
@@ -2746,6 +3280,101 @@ mod tests {
                 "a key with an unpinned column must not be answered"
             );
         }
+    }
+
+    #[test]
+    fn runtime_probe_declines_inputs_over_its_bounds() {
+        let rows = 4_096usize;
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let files = vec![IndexedFile {
+            path: "snapshot/file.vortex".to_string(),
+            size: 1,
+            last_modified_ms: 0,
+        }];
+        let mut build = BuildState::new(
+            &[spec(&["tenant"])],
+            build_reservation(&pool),
+            &keyed_schema(),
+        )
+        .expect("build state");
+        let file_id = build.file_id(&files[0].path).expect("file id");
+        build
+            .ingest(
+                file_id,
+                RowPositions::Contiguous(0),
+                &keyed_batch(
+                    vec![Some(7); rows],
+                    vec![Some("service".to_string()); rows],
+                    vec![None; rows],
+                ),
+                &files[0].path,
+            )
+            .expect("ingest");
+        let index = Arc::new(
+            build
+                .into_index(
+                    "snapshot".to_string(),
+                    &files,
+                    Instant::now(),
+                    None,
+                    VortexSession::default(),
+                    &table,
+                    FileSetVersion::default(),
+                )
+                .expect("finish")
+                .expect("fits"),
+        );
+        let columns = vec!["tenant".to_string()];
+        let keys = vec![vec![ScalarValue::Int64(Some(7))]];
+
+        assert!(
+            index.probe_keys(&columns, &keys, 100).is_none(),
+            "the probe must fall back before materializing an oversized posting list"
+        );
+        assert_eq!(
+            index
+                .probe_keys(&columns, &keys, rows)
+                .expect("bounded hit")
+                .rows,
+            rows
+        );
+
+        let state = LookupIndexState::new(
+            "bounded_runtime_probe",
+            vec![spec(&["tenant"])],
+            Arc::clone(&pool),
+            Arc::clone(&table),
+        )
+        .expect("state");
+        state.store_index(Some(index));
+        let filter = RuntimeLookupFilter {
+            identity: RuntimeLookupFilterIdentity {
+                expression_id: 1,
+                generation: 1,
+                columns,
+            },
+            keys,
+        };
+        assert!(state.probe_runtime_filter("snapshot", &filter).is_none());
+        assert_eq!(state.counters().runtime_fallback, 1);
+
+        let too_many_keys = RuntimeLookupFilter {
+            identity: RuntimeLookupFilterIdentity {
+                expression_id: 1,
+                generation: 2,
+                columns: vec!["tenant".to_string()],
+            },
+            keys: (0..=RUNTIME_INDEX_MAX_KEYS)
+                .map(|value| vec![ScalarValue::Int64(i64::try_from(value).ok())])
+                .collect(),
+        };
+        assert!(
+            state
+                .probe_runtime_filter("snapshot", &too_many_keys)
+                .is_none()
+        );
+        assert_eq!(state.counters().runtime_fallback, 2);
     }
 
     /// A single shifted address is reported, so the read-back verification can

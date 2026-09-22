@@ -4,8 +4,10 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use datafusion_common::Statistics;
 use datafusion_datasource::PartitionedFile;
+use datafusion_physical_expr::PhysicalExprRef;
 use object_store::ObjectMeta;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::scan::selection::Selection;
@@ -27,9 +29,24 @@ pub struct VortexAccessPlan {
 /// can attach a [`VortexAccessPlan`] to each [`PartitionedFile`] before the scan
 /// is built and can adjust the footer-derived [`Statistics`] so `DataFusion` does
 /// not apply optimizations using stale metadata.
+#[async_trait]
 pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
     /// Returns the access plan to attach to a file, if any.
     fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>>;
+
+    /// Returns an access plan derived from the scan's runtime predicate.
+    ///
+    /// Unlike [`Self::access_plan_for_file`], this hook is invoked when a file is
+    /// opened, after dynamic expressions such as hash-join filters may have been
+    /// populated. The default declines runtime planning. A returned plan is
+    /// applied after the plan attached during physical planning.
+    async fn runtime_access_plan_for_file(
+        &self,
+        _file: &PartitionedFile,
+        _predicate: Option<&PhysicalExprRef>,
+    ) -> Option<Arc<VortexAccessPlan>> {
+        None
+    }
 
     /// Adjusts the statistics inferred from a file footer.
     ///
@@ -54,6 +71,19 @@ impl VortexAccessPlan {
     /// Returns the selection, if one was set.
     pub fn selection(&self) -> Option<&Selection> {
         self.selection.as_ref()
+    }
+
+    /// Returns whether this plan proves that the file contributes no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self.selection.as_ref() {
+            Some(Selection::IncludeByIndex(rows)) => rows.is_empty(),
+            Some(Selection::IncludeRoaring(rows)) => rows.is_empty(),
+            None
+            | Some(Selection::All | Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_)) => {
+                false
+            }
+        }
     }
 
     /// Apply the plan to the scan's builder.
