@@ -23,16 +23,16 @@ limitations under the License.
 //! request rate, then raises it again as the origin recovers.
 //!
 //! The control law is Google SRE client-side throttling over a time-decaying
-//! window of attempts and successes. It has exactly two hyperparameters, the two
-//! degrees of freedom of the control system:
+//! window of attempts and successes. It has two user-facing hyperparameters:
 //!
-//! * **magnitude** (`k`, `> 1`) — *where* the effective rate settles for a given
-//!   failure rate. Throttling begins only when the success rate falls below
-//!   `1 / k`, so a larger magnitude tolerates a higher failure rate before it
-//!   throttles.
-//! * **elasticity** (the window half-life, `> 0`) — *how fast* the controller
-//!   reacts to and recovers from a change in the failure rate. A shorter
-//!   half-life reacts and recovers faster; a longer one is smoother and slower.
+//! * **failure threshold** — the upstream error rate above which throttling
+//!   begins, as a fraction in `(0, 1)`. Below this error rate the configured
+//!   limits are used unchanged; above it, admission is scaled down in proportion
+//!   to the success rate. It maps to the SRE coefficient `k = 1 / (1 - threshold)`
+//!   (so a 50% threshold is `k = 2`), the form the math below runs on.
+//! * **window** — the reaction/recovery half-life (`> 0`). Request outcomes decay
+//!   with this half-life, so a shorter window reacts to and recovers from failures
+//!   faster; a longer one is smoother and slower.
 //!
 //! The controller exposes a single `admission_coefficient()` in `[0, 1]` — the
 //! fraction of requests to admit — and a deterministic
@@ -57,13 +57,13 @@ use tokio::time::Instant;
 /// recovering origin always gets at least one probe request through.
 const MIN_CEILING: f64 = 1.0;
 
-/// Default magnitude (`k`): throttle when the success rate drops below 1/2.
-pub const DEFAULT_ADAPTIVE_MAGNITUDE: f64 = 2.0;
+/// Default failure threshold: throttle once the error rate exceeds 50%
+/// (equivalently, the SRE coefficient `k = 1 / (1 - 0.5) = 2`).
+pub const DEFAULT_ADAPTIVE_FAILURE_THRESHOLD: f64 = 0.5;
 
-/// Default elasticity: an attempt recorded one half-life ago counts half as much
-/// toward the window as one recorded now, so a failure burst ages out over
-/// roughly this long.
-pub const DEFAULT_ADAPTIVE_ELASTICITY: Duration = Duration::from_secs(10);
+/// Default reaction/recovery window: the decay half-life over which a failure
+/// burst ages out of the window.
+pub const DEFAULT_ADAPTIVE_WINDOW: Duration = Duration::from_secs(10);
 
 /// How much admission credit the deterministic [`AdaptiveController::try_admit`]
 /// gate must accumulate before it admits one request. Kept at 1.0 so the
@@ -75,42 +75,44 @@ const ADMISSION_CREDIT_PER_REQUEST: f64 = 1.0;
 /// The wiring layer (`data-http-rate-control`) resolves the three
 /// `adaptive_rate_control*` parameters into this: [`parse_adaptive_mode`] for the
 /// on/off switch, then [`AdaptiveRateControl::enabled`] for the two
-/// hyperparameters.
+/// hyperparameters (which converts the user's failure threshold to `k`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AdaptiveRateControl {
     /// Adaptive control is off. The effective rate is exactly the static config.
     Disabled,
-    /// SRE client-side throttling with `magnitude` (`k > 1`) and `elasticity`
-    /// (the decaying-window half-life).
-    Enabled {
-        magnitude: f64,
-        elasticity: Duration,
-    },
+    /// SRE client-side throttling. `k` is the coefficient derived from the user's
+    /// failure threshold (`k = 1 / (1 - failure_threshold)`); `window` is the
+    /// decaying-window half-life.
+    Enabled { k: f64, window: Duration },
 }
 
 impl AdaptiveRateControl {
-    /// Build an enabled control from its two hyperparameters, validating both.
+    /// Build an enabled control from the user-facing hyperparameters, validating
+    /// both and converting the failure threshold to the SRE coefficient.
+    ///
+    /// `failure_threshold` is the error rate above which throttling begins, as a
+    /// fraction in `(0, 1)` (e.g. `0.5` = throttle above a 50% error rate). It maps
+    /// to the SRE coefficient `k = 1 / (1 - failure_threshold)`.
     ///
     /// # Errors
-    /// Returns [`AdaptiveRateControlParseError::MagnitudeInvalid`] when `magnitude`
-    /// is not a finite number greater than 1, and
-    /// [`AdaptiveRateControlParseError::ElasticityInvalid`] when `elasticity` is
-    /// zero or non-finite (an infinite half-life would never let the origin
-    /// recover).
+    /// Returns [`AdaptiveRateControlParseError::FailureThresholdInvalid`] when
+    /// `failure_threshold` is not a finite fraction strictly between 0 and 1, and
+    /// [`AdaptiveRateControlParseError::WindowInvalid`] when `window` is zero or
+    /// non-finite (an infinite window would never let the origin recover).
     pub fn enabled(
-        magnitude: f64,
-        elasticity: Duration,
+        failure_threshold: f64,
+        window: Duration,
     ) -> Result<Self, AdaptiveRateControlParseError> {
-        if !magnitude.is_finite() || magnitude <= 1.0 {
-            return Err(AdaptiveRateControlParseError::MagnitudeInvalid { magnitude });
+        if !failure_threshold.is_finite() || failure_threshold <= 0.0 || failure_threshold >= 1.0 {
+            return Err(AdaptiveRateControlParseError::FailureThresholdInvalid {
+                failure_threshold,
+            });
         }
-        if elasticity.is_zero() || elasticity == Duration::MAX {
-            return Err(AdaptiveRateControlParseError::ElasticityInvalid { elasticity });
+        if window.is_zero() || window == Duration::MAX {
+            return Err(AdaptiveRateControlParseError::WindowInvalid { window });
         }
-        Ok(Self::Enabled {
-            magnitude,
-            elasticity,
-        })
+        let k = 1.0 / (1.0 - failure_threshold);
+        Ok(Self::Enabled { k, window })
     }
 }
 
@@ -130,10 +132,10 @@ pub enum AdaptiveMode {
 pub enum AdaptiveRateControlParseError {
     /// The `adaptive_rate_control` value was neither `disabled` nor `enabled`.
     UnrecognizedMode { value: String },
-    /// The magnitude (SRE coefficient `k`) was not a finite number `> 1`.
-    MagnitudeInvalid { magnitude: f64 },
-    /// The elasticity (decay-window half-life) was not a positive, finite duration.
-    ElasticityInvalid { elasticity: Duration },
+    /// The failure threshold was not a finite fraction strictly between 0 and 1.
+    FailureThresholdInvalid { failure_threshold: f64 },
+    /// The window (decay half-life) was not a positive, finite duration.
+    WindowInvalid { window: Duration },
 }
 
 /// Parse the `adaptive_rate_control` on/off switch.
@@ -191,17 +193,14 @@ impl AdaptiveController {
             MIN_CEILING
         };
 
-        let (magnitude, elasticity) = match control {
+        let (k, window) = match control {
             AdaptiveRateControl::Disabled => return None,
-            AdaptiveRateControl::Enabled {
-                magnitude,
-                elasticity,
-            } => (magnitude, elasticity),
+            AdaptiveRateControl::Enabled { k, window } => (k, window),
         };
 
         Some(Self {
             ceiling,
-            sre: SreState::new(magnitude, elasticity),
+            sre: SreState::new(k, window),
             admission_credit: AtomicU64::new(0.0_f64.to_bits()),
         })
     }
@@ -281,8 +280,8 @@ impl AdaptiveController {
 /// Google SRE client-side throttling over a time-decaying window.
 ///
 /// `requests` counts attempts and `accepts` counts successes; both decay
-/// exponentially with the `half_life` (the elasticity). The admission
-/// coefficient is `min(1, (k*accepts + 1) / (requests + 1))`.
+/// exponentially with the window half-life. The admission coefficient is
+/// `min(1, (k*accepts + 1) / (requests + 1))`.
 #[derive(Debug)]
 struct SreState {
     k: f64,
@@ -330,7 +329,8 @@ impl SreState {
         // denominator `requests + 1`. At 100% success (accepts == requests) the
         // ratio is `(k*r + 1) / (r + 1) >= 1` for `k > 1` and any finite `r`, so
         // a healthy origin is never throttled. The coefficient falls below 1
-        // exactly when `accepts/requests < 1/k`.
+        // exactly when `accepts/requests < 1/k` — i.e. the error rate exceeds the
+        // configured failure threshold.
         let coefficient = (self.k * accepts + 1.0) / (requests + 1.0);
         coefficient.min(1.0)
     }
@@ -361,9 +361,17 @@ impl SreWindow {
 mod tests {
     use super::*;
 
-    fn enabled(magnitude: f64) -> AdaptiveRateControl {
-        AdaptiveRateControl::enabled(magnitude, DEFAULT_ADAPTIVE_ELASTICITY)
+    fn enabled(failure_threshold: f64) -> AdaptiveRateControl {
+        AdaptiveRateControl::enabled(failure_threshold, DEFAULT_ADAPTIVE_WINDOW)
             .expect("test control should be valid")
+    }
+
+    /// The `k` the controller runs on, for asserting the threshold conversion.
+    fn coefficient_k(control: AdaptiveRateControl) -> f64 {
+        match control {
+            AdaptiveRateControl::Enabled { k, .. } => k,
+            AdaptiveRateControl::Disabled => panic!("expected an enabled control"),
+        }
     }
 
     #[test]
@@ -383,7 +391,7 @@ mod tests {
                 value: "sometimes".to_string()
             })
         );
-        // A bare number is no longer a valid mode: magnitude is its own parameter.
+        // A bare number is no longer a valid mode: the threshold is its own parameter.
         assert_eq!(
             parse_adaptive_mode("2.0"),
             Err(AdaptiveRateControlParseError::UnrecognizedMode {
@@ -393,44 +401,62 @@ mod tests {
     }
 
     #[test]
-    fn enabled_validates_magnitude() {
+    fn failure_threshold_converts_to_k() {
+        // k = 1 / (1 - threshold): 50% -> 2, 75% -> 4, 90% -> 10.
+        assert!((coefficient_k(enabled(0.5)) - 2.0).abs() < 1e-9);
+        assert!((coefficient_k(enabled(0.75)) - 4.0).abs() < 1e-9);
+        assert!((coefficient_k(enabled(0.9)) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn enabled_validates_failure_threshold() {
+        assert!(matches!(
+            AdaptiveRateControl::enabled(0.5, DEFAULT_ADAPTIVE_WINDOW),
+            Ok(AdaptiveRateControl::Enabled { .. })
+        ));
+        // The threshold is an error rate strictly between 0 and 1.
         assert_eq!(
-            AdaptiveRateControl::enabled(2.0, DEFAULT_ADAPTIVE_ELASTICITY),
-            Ok(AdaptiveRateControl::Enabled {
-                magnitude: 2.0,
-                elasticity: DEFAULT_ADAPTIVE_ELASTICITY
+            AdaptiveRateControl::enabled(0.0, DEFAULT_ADAPTIVE_WINDOW),
+            Err(AdaptiveRateControlParseError::FailureThresholdInvalid {
+                failure_threshold: 0.0
             })
         );
-        // Magnitude must be strictly greater than 1.
         assert_eq!(
-            AdaptiveRateControl::enabled(1.0, DEFAULT_ADAPTIVE_ELASTICITY),
-            Err(AdaptiveRateControlParseError::MagnitudeInvalid { magnitude: 1.0 })
-        );
-        assert_eq!(
-            AdaptiveRateControl::enabled(0.5, DEFAULT_ADAPTIVE_ELASTICITY),
-            Err(AdaptiveRateControlParseError::MagnitudeInvalid { magnitude: 0.5 })
+            AdaptiveRateControl::enabled(1.0, DEFAULT_ADAPTIVE_WINDOW),
+            Err(AdaptiveRateControlParseError::FailureThresholdInvalid {
+                failure_threshold: 1.0
+            })
         );
         assert!(matches!(
-            AdaptiveRateControl::enabled(f64::INFINITY, DEFAULT_ADAPTIVE_ELASTICITY),
-            Err(AdaptiveRateControlParseError::MagnitudeInvalid { .. })
+            AdaptiveRateControl::enabled(-0.1, DEFAULT_ADAPTIVE_WINDOW),
+            Err(AdaptiveRateControlParseError::FailureThresholdInvalid { .. })
+        ));
+        // A bare percentage-like number (e.g. "50" read as 50.0) is out of range.
+        assert!(matches!(
+            AdaptiveRateControl::enabled(50.0, DEFAULT_ADAPTIVE_WINDOW),
+            Err(AdaptiveRateControlParseError::FailureThresholdInvalid { .. })
+        ));
+        assert!(matches!(
+            AdaptiveRateControl::enabled(f64::NAN, DEFAULT_ADAPTIVE_WINDOW),
+            Err(AdaptiveRateControlParseError::FailureThresholdInvalid { .. })
         ));
     }
 
     #[test]
-    fn enabled_validates_elasticity() {
-        // Zero half-life would make the window collapse.
+    fn enabled_validates_window() {
+        // Zero window would make the decay collapse.
         assert_eq!(
-            AdaptiveRateControl::enabled(2.0, Duration::ZERO),
-            Err(AdaptiveRateControlParseError::ElasticityInvalid {
-                elasticity: Duration::ZERO
+            AdaptiveRateControl::enabled(0.5, Duration::ZERO),
+            Err(AdaptiveRateControlParseError::WindowInvalid {
+                window: Duration::ZERO
             })
         );
-        // An infinite half-life (the saturated value a duration parser yields for
+        // An infinite window (the saturated value a duration parser yields for
         // "inf") would never let the origin recover.
         assert_eq!(
-            AdaptiveRateControl::enabled(2.0, Duration::MAX),
-            Err(AdaptiveRateControlParseError::ElasticityInvalid {
-                elasticity: Duration::MAX
+            AdaptiveRateControl::enabled(0.5, Duration::MAX),
+            Err(AdaptiveRateControlParseError::WindowInvalid {
+                window: Duration::MAX
             })
         );
     }
@@ -443,7 +469,7 @@ mod tests {
     #[test]
     fn sre_never_throttles_a_fully_healthy_origin() {
         let controller =
-            AdaptiveController::new(enabled(2.0), 100.0).expect("sre controller should build");
+            AdaptiveController::new(enabled(0.5), 100.0).expect("sre controller should build");
 
         // accepts == requests at every finite count => coefficient exactly 1.
         controller.record(RequestOutcome::Success);
@@ -455,14 +481,14 @@ mod tests {
     }
 
     #[test]
-    fn sre_throttles_exactly_below_one_over_magnitude() {
-        let magnitude = 4.0;
-        let controller = AdaptiveController::new(enabled(magnitude), 100.0)
-            .expect("sre controller should build");
+    fn sre_throttles_exactly_above_the_failure_threshold() {
+        // 75% failure threshold => k = 4 => throttle when success rate < 1/4.
+        let controller =
+            AdaptiveController::new(enabled(0.75), 100.0).expect("sre controller should build");
 
         // Build a large window so the "+1" terms are negligible and the
-        // threshold sits at accepts/requests == 1/magnitude.
-        // Just above 1/k (ratio 0.30 > 0.25): not throttled (coefficient == 1).
+        // threshold sits at accepts/requests == 1/k.
+        // Success ratio 0.30 > 0.25 (error rate 70% < 75%): not throttled.
         let total = 1000;
         let accepts_above = 300;
         for i in 0..total {
@@ -474,13 +500,13 @@ mod tests {
         }
         assert!(
             (controller.admission_coefficient() - 1.0).abs() < f64::EPSILON,
-            "ratio above 1/k must not throttle, got {}",
+            "error rate below the threshold must not throttle, got {}",
             controller.admission_coefficient()
         );
 
-        // Just below 1/k (ratio 0.20 < 0.25): throttled (coefficient < 1).
-        let controller = AdaptiveController::new(enabled(magnitude), 100.0)
-            .expect("sre controller should build");
+        // Success ratio 0.20 < 0.25 (error rate 80% > 75%): throttled.
+        let controller =
+            AdaptiveController::new(enabled(0.75), 100.0).expect("sre controller should build");
         let accepts_below = 200;
         for i in 0..total {
             controller.record(if i < accepts_below {
@@ -491,7 +517,7 @@ mod tests {
         }
         assert!(
             controller.admission_coefficient() < 1.0,
-            "ratio below 1/k must throttle, got {}",
+            "error rate above the threshold must throttle, got {}",
             controller.admission_coefficient()
         );
     }
@@ -499,9 +525,9 @@ mod tests {
     #[test]
     fn sre_coefficient_is_clamped_to_unit_interval() {
         let controller =
-            AdaptiveController::new(enabled(10.0), 100.0).expect("sre controller should build");
-        // A single success with a large magnitude would push the raw ratio above
-        // 1; the coefficient must still clamp to 1.
+            AdaptiveController::new(enabled(0.9), 100.0).expect("sre controller should build");
+        // A single success with a large k would push the raw ratio above 1;
+        // the coefficient must still clamp to 1.
         controller.record(RequestOutcome::Success);
         let coefficient = controller.admission_coefficient();
         assert!(

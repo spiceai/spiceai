@@ -27,7 +27,8 @@ pub mod adaptive;
 
 pub use adaptive::{
     AdaptiveController, AdaptiveMode, AdaptiveRateControl, AdaptiveRateControlParseError,
-    DEFAULT_ADAPTIVE_ELASTICITY, DEFAULT_ADAPTIVE_MAGNITUDE, RequestOutcome, parse_adaptive_mode,
+    DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW, RequestOutcome,
+    parse_adaptive_mode,
 };
 
 /// One throttle step the adaptive controller waits when it declines to admit a
@@ -621,7 +622,7 @@ mod tests {
     }
 
     use crate::rate_limit::adaptive::{
-        AdaptiveRateControl, DEFAULT_ADAPTIVE_ELASTICITY, RequestOutcome,
+        AdaptiveRateControl, DEFAULT_ADAPTIVE_WINDOW, RequestOutcome,
     };
     use reqwest::StatusCode;
 
@@ -653,9 +654,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn adaptive_sre_reduces_admitted_rate_under_failures_then_recovers() {
         // The origin's configured static rate limit that SRE scales by the
-        // admission coefficient. Its magnitude does not affect the coefficient.
+        // admission coefficient. Its size does not affect the coefficient.
         const STATIC_LIMIT: f64 = 32.0;
-        let control = AdaptiveRateControl::enabled(4.0, DEFAULT_ADAPTIVE_ELASTICITY)
+        // 75% failure threshold => k = 4 => throttle when success rate < 1/4.
+        let control = AdaptiveRateControl::enabled(0.75, DEFAULT_ADAPTIVE_WINDOW)
             .expect("sre control should be valid");
         let limiter = HttpRateLimiter::with_adaptive(control, STATIC_LIMIT);
 
