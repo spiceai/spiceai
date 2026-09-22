@@ -22,11 +22,13 @@ limitations under the License.
 //! (`WHERE id = 1` and `WHERE id = 2` are one plan). Warmup fills each
 //! placeholder from `SELECT DISTINCT` of that column in the dataset.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::Field;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, expr::Placeholder};
+use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
 
 /// A query shape that can be replayed with fresh key values from the dataset.
@@ -77,12 +79,69 @@ pub(super) fn template_from_plan(plan: &LogicalPlan) -> Option<WarmupTemplate> {
         .ok()?
         .data;
 
-    fill_missing_tables(plan, &mut bindings);
+    finalize_binding_tables(plan, &mut bindings);
 
     let sql = datafusion::sql::unparser::plan_to_sql(&rewritten)
         .ok()?
         .to_string();
     Some(WarmupTemplate { sql, bindings })
+}
+
+/// Resolve `FROM orders AS o` bindings to the input table, fill a missing
+/// name when the plan has one table, and drop names that are not a real
+/// input table (an alias over a subquery is not something DISTINCT can scan).
+fn finalize_binding_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
+    resolve_alias_tables(plan, bindings);
+    fill_missing_tables(plan, bindings);
+    drop_unresolved_alias_tables(plan, bindings);
+}
+
+fn resolve_alias_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
+    let aliases = alias_to_input_table(plan);
+    for binding in bindings.iter_mut() {
+        if let Some(table) = aliases.get(binding.table.as_str()) {
+            binding.table.clone_from(table);
+        }
+    }
+}
+
+fn alias_to_input_table(plan: &LogicalPlan) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && let Some(table) = underlying_table_scan(alias.input.as_ref())
+        {
+            map.insert(alias.alias.to_string(), table.clone());
+            map.insert(alias.alias.table().to_string(), table);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    map
+}
+
+/// Follow nested aliases down to a `TableScan`. A subquery or projection in
+/// between is not a table we can `SELECT DISTINCT` from.
+fn underlying_table_scan(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::TableScan(scan) => Some(scan.table_name.to_string()),
+        LogicalPlan::SubqueryAlias(alias) => underlying_table_scan(alias.input.as_ref()),
+        _ => None,
+    }
+}
+
+fn drop_unresolved_alias_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
+    let inputs = cache::get_logical_plan_input_tables(plan);
+    for binding in bindings.iter_mut() {
+        if !binding.table.is_empty() && !is_input_table(&binding.table, &inputs) {
+            binding.table.clear();
+        }
+    }
+}
+
+fn is_input_table(name: &str, inputs: &HashSet<TableReference>) -> bool {
+    inputs
+        .iter()
+        .any(|table| table.to_string() == name || table.table() == name)
 }
 
 fn fill_missing_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
@@ -267,6 +326,61 @@ mod tests {
         assert!(
             template_can_warm(&t),
             "no-variable templates run as-is at warmup"
+        );
+    }
+
+    #[tokio::test]
+    async fn aliased_single_table_query_resolves_binding_to_input_table() {
+        let t = template_from_plan(&plan_of("SELECT id FROM orders AS o WHERE o.id = 1").await)
+            .expect("template");
+        assert_eq!(t.bindings.len(), 1, "got {t:?}");
+        assert_eq!(
+            t.bindings[0].table, "orders",
+            "binding must name the input table, not the alias, got {t:?}"
+        );
+        assert_eq!(t.bindings[0].column, "id");
+        let distinct = distinct_keys_sql(&t).expect("distinct");
+        assert!(
+            distinct.contains("\"orders\""),
+            "DISTINCT must read the input table, got {distinct}"
+        );
+        assert!(
+            !distinct.contains("\"o\""),
+            "DISTINCT must not use the SQL alias as a table name, got {distinct}"
+        );
+        assert!(
+            template_can_warm(&t),
+            "an aliased single-table query must be warmable"
+        );
+
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT, status VARCHAR)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect create");
+        ctx.sql(&distinct)
+            .await
+            .expect("DISTINCT must execute against the input table, not the alias")
+            .collect()
+            .await
+            .expect("collect distinct");
+    }
+
+    #[tokio::test]
+    async fn subquery_alias_that_is_not_a_table_is_not_warmable() {
+        let t = template_from_plan(
+            &plan_of("SELECT id FROM (SELECT id FROM orders) AS o WHERE o.id = 1").await,
+        )
+        .expect("template");
+        assert!(
+            !template_can_warm(&t),
+            "an alias over a subquery is not a table we can DISTINCT from, got {t:?}"
+        );
+        assert!(
+            distinct_keys_sql(&t).is_none(),
+            "unresolved aliases must not produce DISTINCT SQL against the alias, got {t:?}"
         );
     }
 
