@@ -321,7 +321,7 @@ impl HttpRateLimiter {
                 break;
             }
 
-            let step = ADAPTIVE_THROTTLE_STEP.min(ADAPTIVE_MAX_THROTTLE_WAIT - waited);
+            let step = ADAPTIVE_THROTTLE_STEP.min(ADAPTIVE_MAX_THROTTLE_WAIT.saturating_sub(waited));
             tracing::debug!(
                 admission_coefficient = adaptive.admission_coefficient(),
                 "Adaptive rate control throttling HTTP request to a failing origin."
@@ -523,15 +523,16 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "input is guarded finite and non-negative, and clamped below u64::MAX before the cast"
+    clippy::cast_precision_loss,
+    reason = "input is guarded finite and non-negative, and clamped below u64::MAX before the cast; the ceiling's imprecision is intentional"
 )]
 fn f64_round_to_u64(value: f64) -> u64 {
-    if !value.is_finite() || value <= 0.0 {
-        return 0;
-    }
     // u64::MAX is not exactly representable as f64; this bound is a safe
     // saturating ceiling well above any rate limit or per-mille value.
     const SATURATING_CEILING: f64 = u64::MAX as f64;
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
     value.round().min(SATURATING_CEILING) as u64
 }
 
@@ -671,7 +672,7 @@ mod tests {
 
         // Let the failure burst age out of the decaying window, then resume
         // successes. The coefficient returns to 1.
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         for _ in 0..500 {
             limiter.record_request_outcome(outcome_for_status(StatusCode::OK));
         }
