@@ -140,6 +140,17 @@ fn parse_s3_record(record: &Value) -> Result<S3ObjectEvent, ParseError> {
 }
 
 fn parse_eventbridge_detail(value: &Value) -> Result<S3ObjectEvent, ParseError> {
+    // S3 EventBridge notifications set `source` to `aws.s3`. Any other
+    // EventBridge envelope that happens to carry `detail.bucket` /
+    // `detail.object` is not an S3 object event.
+    match value.get("source").and_then(Value::as_str).map(str::trim) {
+        Some("aws.s3") => {}
+        other => {
+            return Err(ParseError::Unrecognized {
+                detail: eventbridge_source_error_detail(other),
+            });
+        }
+    }
     let event_name = value
         .get("detail-type")
         .and_then(Value::as_str)
@@ -172,6 +183,13 @@ fn parse_eventbridge_detail(value: &Value) -> Result<S3ObjectEvent, ParseError> 
         bucket,
         key,
     })
+}
+
+fn eventbridge_source_error_detail(source: Option<&str>) -> String {
+    match source.filter(|got| !got.is_empty()) {
+        Some(got) => format!("EventBridge event `source` must be `aws.s3`, not '{got}'"),
+        None => "EventBridge event `source` must be `aws.s3`".to_string(),
+    }
 }
 
 #[must_use]
@@ -346,6 +364,57 @@ mod tests {
                 "events/"
             ),
             "object key `events` is not under prefix `events/`"
+        );
+    }
+
+    #[test]
+    fn parse_eventbridge_rejects_non_s3_source() {
+        let err = parse_notification_body(
+            r#"{
+                "source": "not.aws.s3",
+                "detail-type": "Object Created",
+                "detail": {
+                    "bucket": {"name": "my-bucket"},
+                    "object": {"key": "events/a.parquet"}
+                }
+            }"#,
+        )
+        .expect_err("non-S3 EventBridge source must fail closed");
+        assert!(matches!(err, ParseError::Unrecognized { .. }));
+        assert_eq!(
+            eventbridge_source_error_detail(Some("not.aws.s3")),
+            "EventBridge event `source` must be `aws.s3`, not 'not.aws.s3'"
+        );
+        assert!(
+            err.to_string().contains("`source`") && err.to_string().contains("`aws.s3`"),
+            "error must name the required EventBridge source, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("events/a.parquet"),
+            "error must not treat a non-S3 EventBridge body as an object event, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eventbridge_rejects_missing_source() {
+        let err = parse_notification_body(
+            r#"{
+                "detail-type": "Object Created",
+                "detail": {
+                    "bucket": {"name": "my-bucket"},
+                    "object": {"key": "events/a.parquet"}
+                }
+            }"#,
+        )
+        .expect_err("missing EventBridge source must fail closed");
+        assert!(matches!(err, ParseError::Unrecognized { .. }));
+        assert_eq!(
+            eventbridge_source_error_detail(None),
+            "EventBridge event `source` must be `aws.s3`"
+        );
+        assert!(
+            err.to_string().contains("`source`") && err.to_string().contains("`aws.s3`"),
+            "error must name the required EventBridge source, got: {err}"
         );
     }
 
