@@ -712,11 +712,11 @@ mod tests {
         )
     }
 
-    async fn register_table(df: &Arc<DataFusion>, name: &str, values: Vec<i64>) {
-        register_table_partitions(df, name, vec![values]).await;
+    fn register_table(df: &Arc<DataFusion>, name: &str, values: Vec<i64>) {
+        register_table_partitions(df, name, vec![values]);
     }
 
-    async fn register_table_partitions(
+    fn register_table_partitions(
         df: &Arc<DataFusion>,
         name: &str,
         partitions: Vec<Vec<i64>>,
@@ -757,7 +757,7 @@ mod tests {
             std::env::temp_dir().join(format!("spice-warmup-shapes-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&store);
         let df = prepare_runtime(None, store.clone()).await;
-        register_table(&df, "orders", vec![1, 2, 3]).await;
+        register_table(&df, "orders", vec![1, 2, 3]);
 
         let ctx = datafusion::prelude::SessionContext::new();
         ctx.sql("CREATE TABLE orders (id INT)")
@@ -789,7 +789,7 @@ mod tests {
             std::env::temp_dir().join(format!("spice-warmup-keys-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&store);
         let df = prepare_runtime(None, store.clone()).await;
-        register_table(&df, "orders", vec![1, 2, 3]).await;
+        register_table(&df, "orders", vec![1, 2, 3]);
 
         let template = WarmupTemplate {
             sql: "SELECT id FROM orders WHERE id = $1".to_string(),
@@ -1163,7 +1163,7 @@ mod tests {
 
         // Process B: reload catalog, hold ready, run warmup, release, observe hit.
         let df = prepare_runtime(None, store.clone()).await;
-        register_table(&df, "orders", vec![1, 2, 3]).await;
+        register_table(&df, "orders", vec![1, 2, 3]);
         assert!(
             df.results_cache_warmup_holds_ready(),
             "reloaded templates must hold ready until warmup finishes"
@@ -1247,8 +1247,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&store);
         let df = prepare_runtime(None, store.clone()).await;
-        register_table(&df, "orders", vec![1, 2, 3]).await;
-        register_table(&df, "customers", vec![10, 20]).await;
+        register_table(&df, "orders", vec![1, 2, 3]);
+        register_table(&df, "customers", vec![10, 20]);
 
         let template = WarmupTemplate {
             sql: "SELECT id FROM orders WHERE id = $1".to_string(),
@@ -1291,7 +1291,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&store);
         let df = prepare_runtime(None, store.clone()).await;
-        register_table(&df, "orders", vec![]).await;
+        register_table(&df, "orders", vec![]);
 
         let template = WarmupTemplate {
             sql: "SELECT id FROM orders WHERE id = $1".to_string(),
@@ -1321,7 +1321,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let key_count = 64_i64;
         let df = prepare_runtime(Some("2KiB"), store.clone()).await;
-        register_table(&df, "orders", (1..=key_count).collect()).await;
+        register_table(&df, "orders", (1..=key_count).collect());
 
         let template = WarmupTemplate {
             sql: "SELECT id FROM orders WHERE id = $1".to_string(),
@@ -1360,7 +1360,7 @@ mod tests {
         let partitions: Vec<Vec<i64>> = (0..16)
             .map(|partition| ((partition * 8 + 1)..=(partition * 8 + 8)).collect())
             .collect();
-        register_table_partitions(&df, "orders", partitions).await;
+        register_table_partitions(&df, "orders", partitions);
 
         let template = WarmupTemplate {
             sql: "SELECT id FROM orders".to_string(),

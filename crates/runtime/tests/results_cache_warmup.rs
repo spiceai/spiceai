@@ -65,7 +65,7 @@ async fn run_query(rt: &Arc<Runtime>, query: &str) -> CacheStatus {
 }
 
 async fn wait_ready(rt: &Arc<Runtime>) {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    tokio::time::timeout(Duration::from_mins(2), async {
         while !rt.status().is_ready() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -119,7 +119,7 @@ async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
                     .with_dataset(lookup_dataset(&fixture_dir))
                     .build();
                 let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-                tokio::time::timeout(Duration::from_secs(120), Arc::clone(&rt).load_components())
+                tokio::time::timeout(Duration::from_mins(2), Arc::clone(&rt).load_components())
                     .await
                     .expect("load");
                 wait_ready(&rt).await;
@@ -136,14 +136,13 @@ async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
                         }
                         // ObjectState may nest under a prefix; search the state dir.
                         if std::fs::read_dir(&state_dir)
-                            .map(|entries| {
+                            .is_ok_and(|entries| {
                                 entries.filter_map(Result::ok).any(|e| {
                                     e.file_name()
                                         .to_string_lossy()
                                         .contains("results_cache_warmup")
                                 })
                             })
-                            .unwrap_or(false)
                         {
                             break;
                         }
@@ -165,7 +164,7 @@ async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
                 .with_dataset(lookup_dataset(&fixture_dir))
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            tokio::time::timeout(Duration::from_secs(120), Arc::clone(&rt).load_components())
+            tokio::time::timeout(Duration::from_mins(2), Arc::clone(&rt).load_components())
                 .await
                 .expect("load after restart");
             wait_ready(&rt).await;
