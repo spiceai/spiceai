@@ -2499,6 +2499,7 @@ mod tests {
         let params = test_params(vec![
             ("s3_changes_queue_url", QUEUE_URL),
             ("s3_auth", "iam_role"),
+            ("file_format", "parquet"),
         ])
         .await;
         let mut dataset = DatasetSpec::new("s3://my-bucket/events/year=*/", "events".into());
@@ -2629,6 +2630,7 @@ mod tests {
         let params = test_params(vec![
             ("s3_changes_queue_url", QUEUE_URL),
             ("s3_changes_key_prefix", "other/"),
+            ("file_format", "parquet"),
         ])
         .await;
         let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
@@ -2690,6 +2692,7 @@ mod tests {
         let params = test_params(vec![
             ("s3_changes_queue_url", QUEUE_URL),
             ("s3_changes_backfill_interval", "0s"),
+            ("file_format", "parquet"),
         ])
         .await;
         let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
