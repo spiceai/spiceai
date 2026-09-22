@@ -1559,6 +1559,39 @@ async fn retry_until_complete_listing(
     }
 }
 
+/// One write, one applied-key/SQS commit, for every batch that belongs to the
+/// same snapshot / notification / backfill pass.
+///
+/// The consumer's default `max_coalesce_age_ms` of 0 applies the first buffered
+/// envelope immediately, and `max_coalesced_envelopes` / `max_coalesced_bytes`
+/// can split later envelopes into their own writes. A committer on only the last
+/// envelope then leaves earlier writes durable when a later write fails, aborts
+/// the key, and leaves the SQS message unacked — a retry appends those rows
+/// again. Concatenate first, matching [`listing_rebuild_envelope`].
+fn concat_object_envelopes(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    is_dataset_ready: bool,
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    keys: Vec<String>,
+    inner: Box<dyn CommitChange + Send + Sync>,
+) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
+    let generation = applied.lock().generation();
+    if batches.is_empty() {
+        applied.lock().commit(generation, &keys);
+        return Ok(Vec::new());
+    }
+    let data = concat_listing_batches(schema, batches)?;
+    let change_batch = wrap_data_as_change_batch(schema, &data)?;
+    let committer = applied_keys_committer(applied, generation, keys.clone(), inner);
+    applied.lock().mark_in_flight(keys);
+    Ok(vec![ChangeEnvelope::new(
+        committer,
+        change_batch,
+        is_dataset_ready,
+    )])
+}
+
 fn create_envelopes(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
@@ -1567,31 +1600,17 @@ fn create_envelopes(
     queue: &Arc<dyn MessageQueue>,
     receipt_handle: &str,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
-    let generation = applied.lock().generation();
-    let last = batches.len().saturating_sub(1);
-    let envelopes = batches
-        .into_iter()
-        .enumerate()
-        .map(|(i, batch)| {
-            let change_batch = wrap_data_as_change_batch(schema, &batch)?;
-            let inner: Box<dyn CommitChange + Send + Sync> = if i == last {
-                Box::new(SqsDeleteCommitter {
-                    queue: Arc::clone(queue),
-                    receipt_handle: receipt_handle.to_string(),
-                })
-            } else {
-                Box::new(NoOpCommitter)
-            };
-            let committer = if i == last {
-                applied_keys_committer(applied, generation, keys.clone(), inner)
-            } else {
-                inner
-            };
-            Ok::<_, StreamError>(ChangeEnvelope::new(committer, change_batch, true))
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    applied.lock().mark_in_flight(keys);
-    Ok(envelopes)
+    concat_object_envelopes(
+        schema,
+        batches,
+        true,
+        applied,
+        keys,
+        Box::new(SqsDeleteCommitter {
+            queue: Arc::clone(queue),
+            receipt_handle: receipt_handle.to_string(),
+        }),
+    )
 }
 
 fn backfill_envelopes(
@@ -1601,31 +1620,14 @@ fn backfill_envelopes(
     applied: &Arc<Mutex<AppliedKeySet>>,
     keys: Vec<String>,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
-    let generation = applied.lock().generation();
-    if batches.is_empty() {
-        applied.lock().commit(generation, &keys);
-        return Ok(Vec::new());
-    }
-    let last = batches.len().saturating_sub(1);
-    let envelopes = batches
-        .into_iter()
-        .enumerate()
-        .map(|(i, batch)| {
-            let change_batch = wrap_data_as_change_batch(schema, &batch)?;
-            let committer: Box<dyn CommitChange + Send + Sync> = if i == last {
-                applied_keys_committer(applied, generation, keys.clone(), Box::new(NoOpCommitter))
-            } else {
-                Box::new(NoOpCommitter)
-            };
-            Ok::<_, StreamError>(ChangeEnvelope::new(
-                committer,
-                change_batch,
-                is_dataset_ready,
-            ))
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    applied.lock().mark_in_flight(keys);
-    Ok(envelopes)
+    concat_object_envelopes(
+        schema,
+        batches,
+        is_dataset_ready,
+        applied,
+        keys,
+        Box::new(NoOpCommitter),
+    )
 }
 
 /// SQS long-poll change stream for one S3 listing dataset, with a periodic
@@ -3369,6 +3371,84 @@ mod tests {
         assert!(envelopes[1].is_empty());
     }
 
+    #[tokio::test]
+    async fn stream_empty_snapshot_concats_a_multi_batch_object() {
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/snap.parquet".to_string(),
+                multi_batch_object(),
+            )]),
+            fail_keys: vec![],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec!["events/snap.parquet".into()],
+        });
+        let stream = start_stream(
+            AccelerationContents::Empty,
+            queue,
+            reader,
+            lister,
+            default_config(),
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "a multi-batch snapshot object must be one create + ready, got {}",
+            envelopes.len()
+        );
+        assert_eq!(
+            names_in(&envelopes[0]),
+            vec!["batch-1".to_string(), "batch-2".to_string()]
+        );
+        assert!(envelopes[1].is_dataset_ready());
+    }
+
+    #[tokio::test]
+    async fn stream_object_created_concats_a_multi_batch_object() {
+        let queue = Arc::new(MockQueue::with_messages(vec![QueueMessage {
+            body: created_put_body("events/part.parquet"),
+            receipt_handle: "rh-part".into(),
+        }]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/part.parquet".to_string(),
+                multi_batch_object(),
+            )]),
+            fail_keys: vec![],
+        });
+        let stream = start_stream(
+            AccelerationContents::Empty,
+            Arc::clone(&queue),
+            reader,
+            empty_lister(),
+            default_config(),
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "a multi-batch ObjectCreated must be ready + one create, got {}",
+            envelopes.len()
+        );
+        assert!(envelopes[0].is_dataset_ready());
+        assert_eq!(
+            names_in(&envelopes[1]),
+            vec!["batch-1".to_string(), "batch-2".to_string()]
+        );
+        envelopes
+            .into_iter()
+            .nth(1)
+            .expect("create envelope")
+            .commit()
+            .await
+            .expect("SQS delete should succeed after the concat apply");
+        assert_eq!(*queue.deleted.lock().await, vec!["rh-part".to_string()]);
+    }
+
     /// Copilot harness: listed keys `a,b`, only `a` readable, must not mark
     /// ready or treat `b` as applied. `python3` fallback predicate
     /// `listed_matching > 0 && keys.is_empty()` produced
@@ -3478,22 +3558,19 @@ mod tests {
             config: default_config(),
             listing_files: parquet_files(),
         });
-        let envelopes = collect_until_idle(stream, 3).await;
-        assert!(
-            envelopes.len() >= 3,
-            "snapshot must retry until every listed object is read, then mark ready, got {}",
+        let envelopes = collect_until_idle(stream, 2).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "snapshot must retry until every listed object is read, then mark ready as one concat create, got {}",
             envelopes.len()
         );
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter(|envelope| !envelope.is_empty() && !envelope.is_dataset_ready())
-            .flat_map(names_in)
-            .collect();
-        assert!(
-            names.contains(&"a".to_string()) && names.contains(&"b".to_string()),
-            "retry must apply both listed objects, got {names:?}"
+        assert_eq!(
+            names_in(&envelopes[0]),
+            vec!["a".to_string(), "b".to_string()],
+            "retry must apply both listed objects in one envelope"
         );
-        assert!(envelopes.iter().any(ChangeEnvelope::is_dataset_ready));
+        assert!(envelopes[1].is_dataset_ready());
     }
 
     #[tokio::test]
@@ -3611,7 +3688,7 @@ mod tests {
             config,
             listing_files: parquet_files(),
         });
-        let envelopes = collect_until_idle(stream, 3).await;
+        let envelopes = collect_until_idle(stream, 2).await;
         let snapshot_names: Vec<String> = envelopes
             .iter()
             .filter(|envelope| !envelope.is_empty() && !envelope.is_dataset_ready())
@@ -4152,6 +4229,127 @@ mod tests {
         );
     }
 
+    fn multi_batch_object() -> Vec<RecordBatch> {
+        vec![
+            id_name_batch(&[1], &["batch-1"]),
+            id_name_batch(&[2], &["batch-2"]),
+        ]
+    }
+
+    /// One object (or one notification / backfill pass) that decodes into
+    /// several record batches must be one envelope. The consumer's default
+    /// `max_coalesce_age_ms` of 0 applies the first buffered envelope
+    /// immediately, and envelope/byte caps can split later ones into their own
+    /// writes.
+    #[tokio::test]
+    async fn create_envelopes_concats_object_batches_into_one_envelope() {
+        let applied = Arc::new(parking_lot::Mutex::new(AppliedKeySet::default()));
+        let queue: Arc<dyn MessageQueue> = Arc::new(MockQueue::with_messages(vec![]));
+        let envelopes = create_envelopes(
+            &id_name_schema(),
+            multi_batch_object(),
+            &applied,
+            vec!["events/part.parquet".to_string()],
+            &queue,
+            "rh-part",
+        )
+        .expect("create envelopes");
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "a multi-batch object must be one envelope so the consumer cannot split it across writes"
+        );
+        assert_eq!(
+            names_in(&envelopes[0]),
+            vec!["batch-1".to_string(), "batch-2".to_string()]
+        );
+        assert!(applied.lock().is_in_flight("events/part.parquet"));
+        assert!(!applied.lock().is_committed("events/part.parquet"));
+    }
+
+    /// Last-envelope committer plus a split write left the first batch durable,
+    /// aborted the key, and a retry appended `batch-1` twice. Concatenate first
+    /// so a failed apply drops the only envelope and retry appends the object
+    /// once.
+    #[tokio::test]
+    async fn create_envelopes_failed_apply_retries_the_object_once() {
+        let applied = Arc::new(parking_lot::Mutex::new(AppliedKeySet::default()));
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let queue_dyn: Arc<dyn MessageQueue> = Arc::clone(&queue) as Arc<dyn MessageQueue>;
+        let keys = vec!["events/part.parquet".to_string()];
+
+        {
+            let envelopes = create_envelopes(
+                &id_name_schema(),
+                multi_batch_object(),
+                &applied,
+                keys.clone(),
+                &queue_dyn,
+                "rh-part",
+            )
+            .expect("first apply");
+            assert_eq!(envelopes.len(), 1);
+            drop(envelopes);
+        }
+        assert!(
+            !applied.lock().is_known("events/part.parquet"),
+            "failed apply must release the key so retry can read it"
+        );
+        assert!(
+            queue.deleted.lock().await.is_empty(),
+            "failed apply must leave the SQS message unacked"
+        );
+
+        let envelopes = create_envelopes(
+            &id_name_schema(),
+            multi_batch_object(),
+            &applied,
+            keys,
+            &queue_dyn,
+            "rh-part",
+        )
+        .expect("retry");
+        assert_eq!(envelopes.len(), 1);
+        let durable = names_in(&envelopes[0]);
+        envelopes
+            .into_iter()
+            .next()
+            .expect("retry envelope")
+            .commit()
+            .await
+            .expect("retry commit should succeed");
+        assert_eq!(
+            durable,
+            vec!["batch-1".to_string(), "batch-2".to_string()],
+            "retry must append the object once, not duplicate the first batch"
+        );
+        assert!(applied.lock().is_committed("events/part.parquet"));
+        assert_eq!(*queue.deleted.lock().await, vec!["rh-part".to_string()]);
+    }
+
+    #[test]
+    fn backfill_envelopes_concats_object_batches_into_one_envelope() {
+        let applied = Arc::new(parking_lot::Mutex::new(AppliedKeySet::default()));
+        let envelopes = backfill_envelopes(
+            &id_name_schema(),
+            multi_batch_object(),
+            true,
+            &applied,
+            vec!["events/part.parquet".to_string()],
+        )
+        .expect("backfill envelopes");
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "a multi-batch backfill object must be one envelope"
+        );
+        assert_eq!(
+            names_in(&envelopes[0]),
+            vec!["batch-1".to_string(), "batch-2".to_string()]
+        );
+        assert!(applied.lock().is_in_flight("events/part.parquet"));
+    }
+
     #[tokio::test]
     async fn stream_lists_backfill_after_sqs_receive_failures() {
         let queue: Arc<dyn MessageQueue> = Arc::new(FailingQueue {
@@ -4278,7 +4476,7 @@ mod tests {
             config,
             id_name_batch(&[99], &["stale-federated"]),
         );
-        let envelopes = collect_until_idle(stream, 3).await;
+        let envelopes = collect_until_idle(stream, 2).await;
         let snapshot_names: Vec<String> = envelopes
             .iter()
             .filter(|envelope| !envelope.is_empty() && !envelope.is_dataset_ready())
