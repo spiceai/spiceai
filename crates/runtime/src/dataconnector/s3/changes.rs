@@ -940,6 +940,30 @@ fn prefix_display(bucket: &str, key_prefix: &str) -> String {
     }
 }
 
+/// Snapshot and non-empty restart list `dataset_prefix` (`from:`), not a
+/// nested `s3_changes_key_prefix`. The startup line must name that listing.
+fn empty_snapshot_starting_log(
+    dataset_name: &impl std::fmt::Display,
+    bucket: &str,
+    dataset_prefix: &str,
+) -> String {
+    format!(
+        "Dataset '{dataset_name}' is starting S3 event capture from an empty accelerator, so existing objects under {} will be snapshotted before SQS events are applied. See: {S3_DOCS}",
+        prefix_display(bucket, dataset_prefix)
+    )
+}
+
+fn nonempty_restart_starting_log(
+    dataset_name: &impl std::fmt::Display,
+    bucket: &str,
+    dataset_prefix: &str,
+) -> String {
+    format!(
+        "Dataset '{dataset_name}' is starting S3 event capture with a non-empty accelerator, so the accelerator will be replaced from the listing prefix {} before SQS events are applied. An in-memory applied-key set cannot prove which objects are already present after a restart. See: {S3_DOCS}",
+        prefix_display(bucket, dataset_prefix)
+    )
+}
+
 /// How SQS credentials are selected — the same rules as the S3 object store
 /// (`determine_s3_credential_config`): explicit `s3_key`/`s3_secret` win even
 /// without `s3_auth: key`; `s3_iam_role_source: metadata|env` restricts the chain.
@@ -1674,9 +1698,8 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
 
         if acceleration.is_provably_empty() {
             tracing::info!(
-                "Dataset '{}' is starting S3 event capture from an empty accelerator, so existing objects under {} will be snapshotted before SQS events are applied. See: {S3_DOCS}",
-                dataset.name,
-                prefix_display(&config.bucket, &config.key_prefix)
+                "{}",
+                empty_snapshot_starting_log(&dataset.name, &config.bucket, &config.dataset_prefix)
             );
             // One listing is both the snapshot and the applied-key manifest.
             // A later listing can include objects that were never read here; those
@@ -1711,9 +1734,8 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             }
         } else {
             tracing::info!(
-                "Dataset '{}' is starting S3 event capture with a non-empty accelerator, so the accelerator will be replaced from the listing prefix {} before SQS events are applied. An in-memory applied-key set cannot prove which objects are already present after a restart. See: {S3_DOCS}",
-                dataset.name,
-                prefix_display(&config.bucket, &config.key_prefix)
+                "{}",
+                nonempty_restart_starting_log(&dataset.name, &config.bucket, &config.dataset_prefix)
             );
             // One listing is both the replacement rows and the applied-key
             // manifest. A later federated scan can include objects this listing
@@ -2885,6 +2907,36 @@ mod tests {
         assert_eq!(config.key_prefix, "events/year=2026/");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Rebuild);
         assert_eq!(config.backfill_interval, Duration::from_mins(30));
+    }
+
+    /// Snapshot and restart list `dataset_prefix`, so the startup line must
+    /// not name a nested `s3_changes_key_prefix`. Regression for #14121.
+    #[test]
+    fn startup_logs_report_the_dataset_prefix_not_a_nested_key_prefix() {
+        let snapshot = empty_snapshot_starting_log("events", "my-bucket", "events/");
+        let restart = nonempty_restart_starting_log("events", "my-bucket", "events/");
+        for message in [&snapshot, &restart] {
+            assert!(
+                message.contains("s3://my-bucket/events"),
+                "startup log must name the from: listing prefix, got: {message}"
+            );
+            assert!(
+                !message.contains("year=2026"),
+                "startup log must not name a nested s3_changes_key_prefix, got: {message}"
+            );
+            assert!(
+                message.contains(S3_DOCS),
+                "startup log must include the docs pointer, got: {message}"
+            );
+        }
+        assert_eq!(
+            prefix_display("my-bucket", "events/year=2026/"),
+            "s3://my-bucket/events/year=2026"
+        );
+        assert_ne!(
+            prefix_display("my-bucket", "events/year=2026/"),
+            prefix_display("my-bucket", "events/")
+        );
     }
 
     #[tokio::test]
