@@ -35,7 +35,6 @@ use runtime_datafusion::refresh_scan::session_is_refresh_scan;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
 use runtime_table::accelerated::materialization::MaterializationIdentity;
 use runtime_table::accelerated::refresh::Refresh;
-use tokio::sync::RwLock as TokioRwLock;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use spice_table::TableLayer;
@@ -45,6 +44,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
+use tokio::sync::RwLock as TokioRwLock;
 
 /// The binding half of the accelerated-view snapshot consistency check.
 ///
@@ -332,10 +332,7 @@ impl ViewReadShape {
                 tables,
             } => {
                 let count_clause = if *exact_count {
-                    format!(
-                        "reads its sources {reads} times ({})",
-                        quoted_list(tables)
-                    )
+                    format!("reads its sources {reads} times ({})", quoted_list(tables))
                 } else {
                     // Fan-out / opaque contributors do not expose a child count, so a
                     // single partitioned scan must not be reported as "reads its sources
@@ -351,7 +348,7 @@ impl ViewReadShape {
                 Some(format!(
                     "its query {count_clause}, so a snapshot would capture each read at a different source position and could store rows that never existed together in the source"
                 ))
-            },
+            }
         }
     }
 }
@@ -595,14 +592,7 @@ pub(crate) fn view_definition_closure(
     params: &HashMap<String, String>,
     app: &app::App,
 ) -> String {
-    view_definition_closure_with_live_refresh_sql(
-        name,
-        sql,
-        columns,
-        params,
-        app,
-        &HashMap::new(),
-    )
+    view_definition_closure_with_live_refresh_sql(name, sql, columns, params, app, &HashMap::new())
 }
 
 /// Like [`view_definition_closure`], but each dataset dependency's identity uses
@@ -1193,7 +1183,6 @@ fn push_dataset_shape_fields(
         fields.insert("embeddings".to_string(), identity_value(&embeddings));
     }
 }
-
 
 /// Overlay the effective runtime refresh SQL onto dataset identity fields.
 ///
@@ -1971,8 +1960,11 @@ mod tests {
             );
             assert!(matches!(
                 shape,
-                ViewReadShape::MultipleReads { reads: 2,
-                exact_count: true, .. }
+                ViewReadShape::MultipleReads {
+                    reads: 2,
+                    exact_count: true,
+                    ..
+                }
             ));
         }
 
@@ -2090,8 +2082,14 @@ mod tests {
             let plan = df.create_physical_plan().await.expect("physical plan");
             let shape = classify_executed_read(plan.as_ref());
             assert!(
-                matches!(shape, ViewReadShape::MultipleReads { reads: 2,
-                exact_count: true, .. }),
+                matches!(
+                    shape,
+                    ViewReadShape::MultipleReads {
+                        reads: 2,
+                        exact_count: true,
+                        ..
+                    }
+                ),
                 "the executing plan of a two-table join must be two reads: {shape:?}"
             );
         }
@@ -2202,7 +2200,11 @@ mod tests {
             });
             identity.set_configured(true);
 
-            let gate = ViewSnapshotPublishGate::new(TableReference::bare("orders_us"), attestation, vec![]);
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation,
+                vec![],
+            );
             gate.bind_materialization_epoch(epoch);
             gate.check_publish()
                 .await
@@ -2392,8 +2394,14 @@ mod tests {
                 attestation.last_stamped().map(|(stamped_epoch, shape)| {
                     (
                         stamped_epoch,
-                        matches!(shape, ViewReadShape::MultipleReads { reads: 2,
-                exact_count: true, .. }),
+                        matches!(
+                            shape,
+                            ViewReadShape::MultipleReads {
+                                reads: 2,
+                                exact_count: true,
+                                ..
+                            }
+                        ),
                     )
                 }),
                 Some((epoch, true)),
@@ -3265,8 +3273,8 @@ mod tests {
 
         #[test]
         fn live_dataset_refresh_sql_moves_the_view_fingerprint() {
-            use spicepod::component::dataset::Dataset as SpicepodDataset;
             use spicepod::acceleration::{Acceleration, RefreshMode};
+            use spicepod::component::dataset::Dataset as SpicepodDataset;
 
             let mut dataset = SpicepodDataset::new("file:orders.parquet", "orders");
             dataset.acceleration = Some(Acceleration {
@@ -3275,13 +3283,15 @@ mod tests {
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });
-            let app = app::AppBuilder::new("test")
-                .with_dataset(dataset)
-                .build();
+            let app = app::AppBuilder::new("test").with_dataset(dataset).build();
             let outer = TableReference::bare("orders_us");
             let sql = "SELECT * FROM orders";
             let spicepod_fp = definition_fingerprint(&view_definition_closure(
-                &outer, sql, &[], &HashMap::new(), &app,
+                &outer,
+                sql,
+                &[],
+                &HashMap::new(),
+                &app,
             ));
             let mut live = HashMap::new();
             live.insert(
@@ -3289,7 +3299,12 @@ mod tests {
                 Some("SELECT * FROM orders WHERE region = 'eu'".to_string()),
             );
             let live_fp = definition_fingerprint(&view_definition_closure_with_live_refresh_sql(
-                &outer, sql, &[], &HashMap::new(), &app, &live,
+                &outer,
+                sql,
+                &[],
+                &HashMap::new(),
+                &app,
+                &live,
             ));
             assert_ne!(
                 spicepod_fp, live_fp,

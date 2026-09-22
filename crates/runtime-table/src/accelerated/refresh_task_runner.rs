@@ -466,8 +466,7 @@ impl RefreshTaskRunner {
     ) {
         let _guard = accelerator_write_mutex.lock().await;
         let live = refresh.read().await;
-        let configured =
-            pending_configured && live.live_refresh_sql_matches_configured();
+        let configured = pending_configured && live.live_refresh_sql_matches_configured();
         live.set_materialization_is_configured(configured);
     }
 
@@ -660,13 +659,13 @@ mod tests {
         let mutex = write_mutex();
 
         // Dequeue-time decision: this run would be configured.
-        let (_request, pending_configured) = RefreshTaskRunner::create_refresh_from_overrides(
-            Arc::clone(&defaults),
-            None,
-            &mutex,
-        )
-        .await;
-        assert!(pending_configured, "precondition: dequeue decided configured");
+        let (_request, pending_configured) =
+            RefreshTaskRunner::create_refresh_from_overrides(Arc::clone(&defaults), None, &mutex)
+                .await;
+        assert!(
+            pending_configured,
+            "precondition: dequeue decided configured"
+        );
 
         // While the run is in flight, PATCH replaces live SQL and retracts.
         {

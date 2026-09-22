@@ -340,8 +340,9 @@ fn current_snapshot_id_of(slice: &DatasetMetastoreSlice) -> Result<Option<&str>,
         .get("cayenne_table")
         .and_then(|rows| rows.first())
         .ok_or_else(|| "the slice carries no `cayenne_table` row".to_string())?;
-    let idx = column_index("cayenne_table", "current_snapshot_id")
-        .ok_or_else(|| "`cayenne_table` has no `current_snapshot_id` column in this build".to_string())?;
+    let idx = column_index("cayenne_table", "current_snapshot_id").ok_or_else(|| {
+        "`cayenne_table` has no `current_snapshot_id` column in this build".to_string()
+    })?;
     Ok(slice_text(table_row, idx))
 }
 
@@ -350,8 +351,10 @@ fn manifest_rows_for_current_snapshot(slice: &DatasetMetastoreSlice) -> Result<u
     let Some(current_snapshot_id) = current_snapshot_id_of(slice)? else {
         return Ok(0);
     };
-    let snapshot_id_idx = column_index("cayenne_snapshot_file", "snapshot_id")
-        .ok_or_else(|| "`cayenne_snapshot_file` has no `snapshot_id` column in this build".to_string())?;
+    let snapshot_id_idx =
+        column_index("cayenne_snapshot_file", "snapshot_id").ok_or_else(|| {
+            "`cayenne_snapshot_file` has no `snapshot_id` column in this build".to_string()
+        })?;
     Ok(slice
         .tables
         .get("cayenne_snapshot_file")

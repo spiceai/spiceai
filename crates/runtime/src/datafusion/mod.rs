@@ -5067,7 +5067,10 @@ impl DataFusion {
             table.clone(),
             attestation,
             dependency_refreshes,
-        )) as Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>)
+        ))
+            as Arc<
+                dyn runtime_acceleration::snapshot::SnapshotPublishGate,
+            >)
     }
 
     /// Live `Refresh` handles for accelerated datasets in `view`'s definition closure.
@@ -5078,8 +5081,7 @@ impl DataFusion {
         TableReference,
         Arc<tokio::sync::RwLock<crate::accelerated::refresh::Refresh>>,
     )> {
-        let names =
-            crate::view::dataset_names_in_view_closure(&view.name, &view.sql, &view.app);
+        let names = crate::view::dataset_names_in_view_closure(&view.name, &view.sql, &view.app);
         let mut out = Vec::new();
         for name in names {
             let Ok(provider) = self.get_accelerated_table_provider(&name).await else {
@@ -5295,7 +5297,9 @@ impl DataFusion {
                 // Consistency was decided before bootstrap. Only install the
                 // publish veto when this view will also write archives.
                 if !acceleration.snapshot_behavior.is_disabled() {
-                    let publish_gate = self.view_snapshot_publish_gate(table, view, refresh_attestation).await;
+                    let publish_gate = self
+                        .view_snapshot_publish_gate(table, view, refresh_attestation)
+                        .await;
 
                     if acceleration.snapshot_behavior.create_enabled() {
                         let snapshot_engine_override = match self
@@ -6271,7 +6275,8 @@ async fn build_snapshot_creation_config(
                     ),
                 ),
                 accept_unstamped: false,
-                materialization: runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,
+                materialization:
+                    runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,
             };
             sm.with_source_identity(
                 Some(definition),
