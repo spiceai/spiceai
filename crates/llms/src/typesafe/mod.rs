@@ -247,18 +247,19 @@ impl TypeSafe {
                     )
                     .map_err(bad)?;
                     // `TypeSafe` defines `score` as the probability-weighted average of
-                    // the rubric indices. A value that contradicts the distribution is
-                    // a wrong result, not a successful evaluation; the slack absorbs
-                    // only the rounding a valid response carries.
-                    let weighted: f64 = probabilities
-                        .iter()
-                        .map(|(key, p)| key.parse::<f64>().unwrap_or(f64::NAN) * p)
-                        .sum();
-                    if !weighted.is_finite()
-                        || (score - weighted).abs() > weighted_score_tolerance(top)
-                    {
+                    // the rubric indices. The reported probabilities pin that average to
+                    // an interval, and a score outside it contradicts them: a wrong
+                    // result, not a successful evaluation.
+                    let Some((lowest, highest)) = weighted_score_interval(probabilities) else {
                         return Err(bad(format!(
-                            "question '{id}': score {score} is not the probability-weighted average ({weighted})"
+                            "question '{id}': its probabilities are not a rounding of any distribution over the rubric"
+                        )));
+                    };
+                    // The score may itself be rounded.
+                    let slack = ROUNDING_HALF_STEP + FLOAT_SLACK;
+                    if !(lowest - slack..=highest + slack).contains(score) {
+                        return Err(bad(format!(
+                            "question '{id}': score {score} is not the probability-weighted average of its distribution, which allows [{lowest}, {highest}]"
                         )));
                     }
                 }
@@ -295,6 +296,10 @@ fn is_probability(value: f64) -> bool {
 /// Half the step of the two-decimal rounding that responses commonly carry.
 const ROUNDING_HALF_STEP: f64 = 0.005;
 
+/// Allowance for the floating-point representation of a rounded total, so an exact
+/// shortfall such as `1.0 - 0.99` is not rejected in its last bit.
+const FLOAT_SLACK: f64 = 0.001;
+
 /// The most a distribution may sum from 1, however many values it holds.
 ///
 /// Rounding alone can move a wide distribution further than this: 200 options that
@@ -321,21 +326,55 @@ fn probability_sum_tolerance(n: usize) -> f64 {
     )]
     let n = n as f64;
     ROUNDING_HALF_STEP
-        .mul_add(n, 0.001)
+        .mul_add(n, FLOAT_SLACK)
         .min(MAX_PROBABILITY_SUM_TOLERANCE)
 }
 
-/// How far a reported score may sit from the weighted average recomputed from the
-/// reported probabilities, for a rubric whose top index is `top`.
+/// The range a probability-weighted score can take, given the reported
+/// probabilities and the rounding each may carry, or `None` when no distribution
+/// that sums to 1 could have been rounded to them.
 ///
-/// Rounding each probability by up to half a step moves that average by up to half a
-/// step times the level's index, and the score may itself be rounded, so the bound is
-/// half a step times the sum of the indices plus one. A tolerance sized for a sum of
-/// probabilities in [0, 1] is too tight once the score spans [0, top]: on a ten-level
-/// rubric, rounding alone can move the average by more than 0.2.
-fn weighted_score_tolerance(top: f64) -> f64 {
-    let index_sum = top * (top + 1.0) / 2.0;
-    ROUNDING_HALF_STEP.mul_add(index_sum + 1.0, 0.001)
+/// Each reported value stands for a true value within half a step of it, and the true
+/// values sum to 1. Starting every value at its lower bound and spreading the mass
+/// that leaves over the lowest indices first gives the smallest average; over the
+/// highest first, the largest. The range is exact for the values reported, so a
+/// one-hot `{9: 1.0}` allows only `[8.955, 9.0]`, not the slack a ten-level rubric
+/// could need in the worst case.
+fn weighted_score_interval(probabilities: &BTreeMap<String, f64>) -> Option<(f64, f64)> {
+    let mut levels = probabilities
+        .iter()
+        .map(|(key, &p)| {
+            let index = f64::from(key.parse::<u32>().ok()?);
+            let low = (p - ROUNDING_HALF_STEP).max(0.0);
+            let high = (p + ROUNDING_HALF_STEP).min(1.0);
+            Some((index, low, high))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    levels.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let spare = 1.0 - levels.iter().map(|&(_, low, _)| low).sum::<f64>();
+    let room: f64 = levels.iter().map(|&(_, low, high)| high - low).sum();
+    if spare < -FLOAT_SLACK || spare > room + FLOAT_SLACK {
+        return None;
+    }
+    let base: f64 = levels.iter().map(|&(index, low, _)| index * low).sum();
+    Some((
+        base + spread_mass(levels.iter(), spare),
+        base + spread_mass(levels.iter().rev(), spare),
+    ))
+}
+
+/// Adds `spare` probability mass to `levels` in the order given, each up to its upper
+/// bound, and returns how far that moves the weighted average.
+fn spread_mass<'a>(levels: impl Iterator<Item = &'a (f64, f64, f64)>, spare: f64) -> f64 {
+    let mut left = spare.max(0.0);
+    let mut moved = 0.0;
+    for &(index, low, high) in levels {
+        let added = left.min(high - low);
+        moved += index * added;
+        left -= added;
+    }
+    moved
 }
 
 fn check_distribution<'a>(
@@ -1517,6 +1556,44 @@ mod tests {
         evaluate_wide_choice(200, probabilities)
             .await
             .expect("a distribution summing to 1 over 200 options is a valid answer");
+    }
+
+    /// Regression for a rubric-wide slack: an exact one-hot `{9: 1.0}` fixes the
+    /// average at 9 however it was rounded, so a score of 8.8 contradicts it even
+    /// though it sits inside the slack a ten-level rubric could need at worst.
+    #[tokio::test]
+    async fn evaluate_rejects_a_score_its_one_hot_distribution_contradicts() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 8.8,
+                "legend": {"9": "top"},
+                "probabilities": {
+                    "0": 0.0, "1": 0.0, "2": 0.0, "3": 0.0, "4": 0.0,
+                    "5": 0.0, "6": 0.0, "7": 0.0, "8": 0.0, "9": 1.0
+                },
+                "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: score_question("q", 10),
+            })
+            .await
+            .expect_err("a score of 8.8 contradicts a one-hot distribution on level 9");
+        assert!(
+            err.to_string()
+                .contains("is not the probability-weighted average"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
