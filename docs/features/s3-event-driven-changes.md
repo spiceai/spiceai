@@ -75,6 +75,7 @@ Registration fails with an S3-specific error that names the param, says **queue 
 - `s3_changes_backfill_interval` is not a duration greater than 0
 - `s3_auth` is `public`
 - no SQS region can be resolved
+- the dataset is unstructured text: no structured `file_format`, no structured `file_extension` (the same parser the listing table uses, including `.parquet.gz`), and no structured extension on `from`
 - `from` contains a wildcard, or names a single object rather than a prefix. Every key under the prefix is the dataset, so a `from` that resolves to one object has no prefix to derive: it would snapshot an empty accelerator and treat notifications for that object as outside the dataset. S3 has no directories, so only a trailing `/` marks a prefix for certain — a `from` without one is checked against the object store, and refused when an object of that name exists. Keep single objects on `refresh_mode: full`.
 
 ## Gaps (MVP)

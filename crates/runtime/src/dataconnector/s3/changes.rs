@@ -27,7 +27,10 @@ use super::event::{
 };
 use super::{S3, S3_DOCS};
 use crate::dataconnector::federated::FederatedTableProvider;
-use crate::dataconnector::listing::{ListingTableConnector, file_matches_extension};
+use crate::dataconnector::listing::{
+    ListingTableConnector, detect_file_extension_from_url_or_path, file_matches_extension,
+    parse_file_extension_param,
+};
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnectorResult};
 use arrow::array::{ArrayRef, RecordBatch, StringArray, new_null_array};
@@ -135,7 +138,7 @@ pub enum Error {
     FromNamesAnObject { dataset_name: String, from: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` does not support unstructured text objects. Set `file_format` to `parquet`, `csv`, or `json` (or point `from` at objects with one of those extensions). See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` does not support unstructured text objects. Set `file_format` to `parquet`, `csv`, or `json`, set `file_extension` to one of those, or point `from` at objects with one of those extensions. See: {S3_DOCS}"
     ))]
     UnstructuredTextUnsupported { dataset_name: String },
 
@@ -691,6 +694,12 @@ impl S3ChangesConfig {
 /// Changes-mode object reads go through `create_listing_table`, which cannot
 /// open unstructured text. Refuse at validate time so startup does not accept
 /// a config that then errors on every notification.
+///
+/// Format is resolved the same way the listing table does: explicit
+/// `file_format`, then `file_extension` (`parse_file_extension_param`), then
+/// the `from` path (`detect_file_extension_from_url_or_path`). A prefix
+/// dataset with `file_extension: .parquet` and no `file_format` is therefore
+/// accepted here, matching `get_file_format_and_extension`.
 fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> Result<()> {
     const STRUCTURED: &[&str] = &["parquet", "csv", "json", "tsv", "jsonl", "ndjson", "ldjson"];
 
@@ -700,24 +709,28 @@ fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> 
         .ok()
         .map(str::to_ascii_lowercase)
         .filter(|v| !v.is_empty());
-    let path_extension = dataset
-        .from
-        .rsplit('/')
-        .next()
-        .and_then(|name| name.rsplit_once('.'))
-        .map(|(_, ext)| ext.to_ascii_lowercase());
+    let file_extension = params
+        .get("file_extension")
+        .expose()
+        .ok()
+        .and_then(parse_file_extension_param)
+        .and_then(|parsed| parsed.format_extension);
+    let path_extension = detect_file_extension_from_url_or_path(&dataset.from)
+        .and_then(|parsed| parsed.format_extension);
 
     let explicit_ok = file_format
         .as_deref()
         .is_some_and(|fmt| STRUCTURED.contains(&fmt));
+    let extension_ok = file_extension
+        .as_deref()
+        .is_some_and(|ext| STRUCTURED.contains(&ext));
     let inferred_ok = path_extension
         .as_deref()
         .is_some_and(|ext| STRUCTURED.contains(&ext));
 
-    // `auto` still needs a structured path extension; a bare prefix has none.
-    let auto_ok = file_format.as_deref() == Some("auto") && inferred_ok;
-
-    if explicit_ok || inferred_ok || auto_ok {
+    // `file_format: auto` is not itself structured; a bare prefix still needs
+    // `file_extension` or a structured `from` path.
+    if explicit_ok || extension_ok || inferred_ok {
         return Ok(());
     }
 
@@ -2461,6 +2474,63 @@ mod tests {
         S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect("parquet changes config")
             .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_a_structured_file_extension_without_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_extension", ".parquet"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("file_extension .parquet is structured, matching listing inference")
+            .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_a_compressed_file_extension_without_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_extension", ".parquet.gz"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("file_extension .parquet.gz is structured")
+            .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_a_compressed_from_path_without_file_format() {
+        let mut dataset = events_dataset();
+        dataset.from = "s3://my-bucket/events/part.parquet.gz".to_string();
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &dataset)
+            .expect("a .parquet.gz from path is structured, matching listing inference")
+            .expect("changes enabled");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_an_unstructured_file_extension() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_extension", ".txt"),
+        ])
+        .await;
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect_err("file_extension .txt is unstructured text");
+        let message = error.to_string();
+        assert!(
+            message.contains("unstructured text"),
+            "must name unstructured text, got: {message}"
+        );
     }
 
     #[tokio::test]
