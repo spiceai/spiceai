@@ -69,7 +69,7 @@ Registration fails with an S3-specific error that names the param, says **queue 
 
 - `refresh_mode: changes` is set without `s3_changes_queue_url`
 - `s3_changes_queue_url` is set but `refresh_mode` is not `changes`
-- the queue value is an ARN or empty
+- the queue value is an ARN, empty, or not an HTTPS SQS queue URL (`https://sqs.<region>.amazonaws.com/<account>/<queue>`)
 - `s3_on_object_removed` is not `ignore` or `rebuild`
 - `s3_changes_key_prefix` is not under the dataset `from` prefix
 - `s3_changes_backfill_interval` is not a duration greater than 0

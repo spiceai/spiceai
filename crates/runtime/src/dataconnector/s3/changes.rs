@@ -590,10 +590,10 @@ impl ObjectLister for ListingPrefixScanner {
 ///
 /// Returns [`DataConnectorError::InvalidConfigurationNoSource`] when
 /// `refresh_mode: changes` is missing `s3_changes_queue_url` (or the reverse),
-/// the queue value is an ARN, `s3_auth` is `public`, `s3_on_object_removed` is
-/// unknown, `s3_changes_key_prefix` is outside the dataset path,
-/// `s3_changes_backfill_interval` is not a positive duration, or no SQS region
-/// can be resolved.
+/// the queue value is an ARN or is not an HTTPS SQS queue URL, `s3_auth` is
+/// `public`, `s3_on_object_removed` is unknown, `s3_changes_key_prefix` is
+/// outside the dataset path, `s3_changes_backfill_interval` is not a positive
+/// duration, or no SQS region can be resolved.
 pub fn validate_s3_changes_config(
     params: &Parameters,
     dataset: &DatasetSpec,
@@ -634,7 +634,7 @@ impl S3ChangesConfig {
                 if url.starts_with("arn:") {
                     return QueueUrlIsArnSnafu { dataset_name }.fail();
                 }
-                if !(url.starts_with("https://") || url.starts_with("http://")) {
+                if !is_sqs_queue_url(url) {
                     return QueueUrlNotHttpSnafu { dataset_name }.fail();
                 }
                 if params.get("auth").expose().ok() == Some("public") {
@@ -821,6 +821,79 @@ pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// An HTTPS SQS queue URL: AWS partition host and `/account/queue` path.
+///
+/// Loopback and instance-metadata URLs are not SQS queues and must fail at
+/// registration. Custom SQS endpoints are not a parameter.
+#[must_use]
+fn is_sqs_queue_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    sqs_host_is_allowed(host) && sqs_queue_path_is_allowed(parsed.path())
+}
+
+fn sqs_host_is_allowed(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    match labels.as_slice() {
+        ["sqs", region, "amazonaws", "com"]
+        | ["sqs-fips", region, "amazonaws", "com"]
+        | ["sqs", region, "amazonaws", "com", "cn"]
+            if is_aws_region(region) =>
+        {
+            true
+        }
+        ["sqs", region, "vpce", "amazonaws", "com"] if is_aws_region(region) => true,
+        [_, "sqs", region, "vpce", "amazonaws", "com"] if is_aws_region(region) => true,
+        _ => false,
+    }
+}
+
+fn is_aws_region(region: &str) -> bool {
+    let bytes = region.as_bytes();
+    (2..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes.contains(&b'-')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && !region.starts_with('-')
+        && !region.ends_with('-')
+        && !region.contains("--")
+}
+
+fn sqs_queue_path_is_allowed(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let Some((account, queue)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+        return false;
+    };
+    account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && !queue.is_empty()
+        && !queue.contains('/')
+        && queue.len() <= 80
+        && {
+            let name = queue.strip_suffix(".fifo").unwrap_or(queue);
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
 }
 
 fn applied_keys_committer(
@@ -2263,6 +2336,65 @@ mod tests {
                 && !message.contains("private-events")
                 && !message.contains("sqs://"),
             "must not interpolate the configured queue value, got: {message}"
+        );
+    }
+
+    #[test]
+    fn is_sqs_queue_url_accepts_aws_partition_urls() {
+        assert!(is_sqs_queue_url(QUEUE_URL));
+        assert!(is_sqs_queue_url(
+            "https://sqs.cn-north-1.amazonaws.com.cn/123456789012/s3-events"
+        ));
+        assert!(is_sqs_queue_url(
+            "https://sqs-fips.us-east-1.amazonaws.com/123456789012/s3-events"
+        ));
+        assert!(is_sqs_queue_url(
+            "https://vpce-abc.sqs.us-east-1.vpce.amazonaws.com/123456789012/s3-events"
+        ));
+        assert!(is_sqs_queue_url(
+            "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events.fifo"
+        ));
+    }
+
+    /// Scheme-only validation accepted loopback and instance-metadata URLs
+    /// (Copilot reproduction on #14121). Those must fail closed at registration.
+    #[test]
+    fn is_sqs_queue_url_rejects_non_sqs_hosts() {
+        assert!(!is_sqs_queue_url("https://127.0.0.1/admin"));
+        assert!(!is_sqs_queue_url("http://169.254.169.254/latest/meta-data"));
+        assert!(!is_sqs_queue_url(
+            "https://localhost:4566/000000000000/queue"
+        ));
+        assert!(!is_sqs_queue_url(
+            "http://sqs.us-east-1.amazonaws.com/123456789012/s3-events"
+        ));
+        assert!(!is_sqs_queue_url(
+            "https://example.com/123456789012/s3-events"
+        ));
+        assert!(!is_sqs_queue_url(
+            "https://sqs.us-east-1.amazonaws.com/123/s3-events"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_a_non_sqs_queue_host() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", "https://127.0.0.1/admin"),
+            ("s3_auth", "iam_role"),
+            ("s3_changes_region", "us-east-1"),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect_err("loopback is not an SQS queue URL");
+        let message = error.to_string();
+        assert!(
+            message.contains("not an SQS queue URL"),
+            "must reject a non-SQS host, got: {message}"
+        );
+        assert!(
+            !message.contains("127.0.0.1") && !message.contains("admin"),
+            "`s3_changes_queue_url` is secret; the error must not interpolate the value, got: {message}"
         );
     }
 
