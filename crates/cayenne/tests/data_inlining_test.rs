@@ -721,7 +721,7 @@ async fn test_inline_writer_fallback_preserves_buffered_and_remaining_batches(
 /// Batches an inline entry actually holds, decoded from its stored IPC blob.
 ///
 /// `deserialize_ipc_to_batch` is module-private to the crate, so an integration
-/// test cannot call it; this is the same StreamReader round-trip.
+/// test cannot call it; this is the same `StreamReader` round-trip.
 fn inline_entry_batches(entry: &cayenne::metadata::InlinedData) -> Vec<RecordBatch> {
     arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(entry.data_ipc.as_slice()), None)
         .expect("inline entry is not a readable IPC stream")
