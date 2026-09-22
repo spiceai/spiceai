@@ -26844,18 +26844,16 @@ impl CayenneTableProvider {
         // row, and both the IPC stream and the decode are structure-preserving, so
         // without this the entry is stored, decoded and cached as N single-row
         // batches -- paying one schema header and a 64-byte-padded buffer per leaf
-        // once per ROW instead of once per write.
-        let coalesced: RecordBatch;
-        let batches = if batches.len() > 1 {
-            coalesced = arrow::compute::concat_batches(batches[0].schema_ref(), batches)
+        // once per ROW instead of once per write. Scoped so the coalesced copy is
+        // dropped before the awaits below.
+        let ipc_bytes = if batches.len() > 1 {
+            let coalesced = arrow::compute::concat_batches(batches[0].schema_ref(), batches)
                 .map_err(|e| Error::Arrow { source: e })?;
-            std::slice::from_ref(&coalesced)
+            serialize_batches_to_ipc(std::slice::from_ref(&coalesced))
         } else {
-            batches
-        };
-
-        let ipc_bytes =
-            serialize_batches_to_ipc(batches).map_err(|e| Error::Arrow { source: e })?;
+            serialize_batches_to_ipc(batches)
+        }
+        .map_err(|e| Error::Arrow { source: e })?;
         if ipc_bytes.len() > inline_max_bytes {
             return Ok(false);
         }
