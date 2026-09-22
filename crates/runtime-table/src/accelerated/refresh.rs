@@ -1164,7 +1164,14 @@ impl Refresher {
                             },
                             async {
                                 if let Some(refresh_completion) = &refresh_completion {
-                                    record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
+                                    record_refresh_done(
+                                        &dataset_name,
+                                        &refresh,
+                                        refresh_completion,
+                                        request_id,
+                                        refresh_succeeded,
+                                    )
+                                    .await;
                                 }
                             },
                             retry_is_scheduled(
@@ -1371,15 +1378,29 @@ fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> Refr
 }
 
 /// Records a completed refresh under the request that started it: releases the
-/// callers waiting on that request, then publishes the refresh-time metric.
+/// callers waiting on that request. The last-refresh metric is published only
+/// when the refresh succeeded — it is the time the load reached Ready, not the
+/// time warmup was allowed to settle after a terminal failure.
 async fn record_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
     refresh_completion: &RefreshCompletion,
     request_id: RefreshRequestId,
-) {
+    refresh_succeeded: bool,
+) -> bool {
     refresh_completion.record(request_id);
+    if !refresh_succeeded {
+        return false;
+    }
 
+    record_last_refresh_time_ms(dataset_name, refresh).await;
+    true
+}
+
+async fn record_last_refresh_time_ms(
+    dataset_name: &TableReference,
+    refresh: &Arc<RwLock<Refresh>>,
+) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -1698,6 +1719,37 @@ mod tests {
         assert!(
             recorded.load(Ordering::Relaxed),
             "a one-shot failure must record completion so warmup does not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_refresh_done_oneshot_failure_does_not_publish_last_refresh_metric() {
+        let completion = RefreshCompletion::new();
+        let request_id = completion.issue();
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
+        let dataset = TableReference::bare("orders");
+
+        let last_refresh_metric_recorded =
+            record_refresh_done(&dataset, &refresh, &completion, request_id, false).await;
+        eprintln!(
+            "failed_one_shot: completion_recorded={} last_refresh_metric_recorded={last_refresh_metric_recorded}",
+            completion.has_recorded()
+        );
+        assert!(
+            completion.has_recorded(),
+            "a one-shot failure must still record completion for warmup"
+        );
+        assert!(
+            !last_refresh_metric_recorded,
+            "a failed refresh must not publish dataset_acceleration_last_refresh_unix_time_ms"
+        );
+
+        let request_id = completion.issue();
+        let last_refresh_metric_recorded =
+            record_refresh_done(&dataset, &refresh, &completion, request_id, true).await;
+        assert!(
+            last_refresh_metric_recorded,
+            "a successful refresh must publish the last-refresh metric"
         );
     }
 
