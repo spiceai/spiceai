@@ -44,17 +44,12 @@ impl ScheduledTask for DatasetRefreshTask {
                 .await
             {
                 Ok(completion) => {
-                    if let Some(completion) = completion
-                        && completion.wait().await.is_abandoned()
-                    {
-                        // The dataset was removed while its scheduled refresh
-                        // was in flight. The task acts on nothing after the
-                        // wait, so there is no phantom completion to guard
-                        // against; raising it would report a task failure on
-                        // every ordinary removal and shutdown.
-                        let dataset_name = &dataset.name;
-                        tracing::debug!(
-                            "{dataset_name} was removed before its scheduled refresh completed."
+                    // Abandoned (removal/shutdown) stays Ok. A terminal
+                    // one-shot failure must fail the scheduled task.
+                    if let Some(completion) = completion {
+                        return super::scheduled_refresh_wait_result(
+                            completion.wait().await,
+                            &dataset.name,
                         );
                     }
                     Ok(())
