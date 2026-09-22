@@ -723,13 +723,10 @@ async fn test_inline_writer_fallback_preserves_buffered_and_remaining_batches(
 /// `deserialize_ipc_to_batch` is module-private to the crate, so an integration
 /// test cannot call it; this is the same StreamReader round-trip.
 fn inline_entry_batches(entry: &cayenne::metadata::InlinedData) -> Vec<RecordBatch> {
-    arrow::ipc::reader::StreamReader::try_new(
-        std::io::Cursor::new(entry.data_ipc.as_slice()),
-        None,
-    )
-    .expect("inline entry is not a readable IPC stream")
-    .collect::<Result<_, _>>()
-    .expect("inline entry batches")
+    arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(entry.data_ipc.as_slice()), None)
+        .expect("inline entry is not a readable IPC stream")
+        .collect::<Result<_, _>>()
+        .expect("inline entry batches")
 }
 
 async fn collect_sorted(
@@ -1592,8 +1589,7 @@ async fn test_inline_scan_batches_scale_with_writes_not_rows(
     }
 
     let entries = fixture.catalog.get_inlined_data(&table_id).await?;
-    let total_batches: usize =
-        entries.iter().map(|e| inline_entry_batches(e).len()).sum();
+    let total_batches: usize = entries.iter().map(|e| inline_entry_batches(e).len()).sum();
 
     assert!(
         total_batches <= entries.len(),
