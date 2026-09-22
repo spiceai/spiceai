@@ -399,12 +399,12 @@ mod tests {
         });
     }
 
-    /// The embedding tensor has to be found under `embedding.weight` as well as
-    /// `embeddings`.
+    /// The embedding tensor has to be found under the alternative names too, not
+    /// only `embeddings`.
     ///
     /// The same fork commit carries this, and it is a separate contract: one line
-    /// (`.or_else(|_| safet.tensor("embedding.weight"))`) that upstream does not
-    /// have. It is the *same* use case as the row's other half — a
+    /// chain (`.or_else(|_| safet.tensor("embedding.weight"))`, then `"0"`) that
+    /// upstream does not have. It is the *same* use case as the row's other half — a
     /// sentence-transformers export ships no `config.json` **and** names its
     /// tensor `embedding.weight` — so a re-cut that carried only the optional
     /// `config.json` would leave exactly the model the row is about still failing
@@ -414,20 +414,22 @@ mod tests {
     /// upstream name, so this one failing means the fallback is gone rather than
     /// the fixture being malformed.
     #[test]
-    fn a_local_model_loads_with_the_sentence_transformers_tensor_name() {
-        let dir = sentence_transformers_style_model_dir("embedding.weight");
-        let name = dir
-            .path()
-            .to_str()
-            .expect("the fixture model path is UTF-8");
+    fn a_local_model_loads_with_the_sentence_transformers_tensor_names() {
+        for tensor_key in ["embedding.weight", "0"] {
+            let dir = sentence_transformers_style_model_dir(tensor_key);
+            let name = dir
+                .path()
+                .to_str()
+                .expect("the fixture model path is UTF-8");
 
-        Model2Vec::from_params(name, None, None, None, None, None, None).unwrap_or_else(|e| {
-            panic!(
-                "a static-embedding model whose tensor is named `embedding.weight` must load: \
-                 upstream reads `embeddings` only, so without the fork's fallback every \
-                 sentence-transformers export fails here: {e}"
-            )
-        });
+            Model2Vec::from_params(name, None, None, None, None, None, None).unwrap_or_else(|e| {
+                panic!(
+                    "a static-embedding model whose tensor is named `{tensor_key}` must load: \
+                     upstream reads `embeddings` only, so without the fork's fallback chain \
+                     every export using this name fails here: {e}"
+                )
+            });
+        }
     }
 
     #[test]
