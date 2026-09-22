@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
-use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
+use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
@@ -852,6 +852,10 @@ pub enum DeferredRefreshOutcome {
     /// Every recorder was dropped before a completion was recorded: no refresh
     /// ran, and none can.
     Abandoned,
+    /// The refresh failed and will not be retried. The table may still be
+    /// registered, but it did not load; do not broadcast readiness or create
+    /// a follow-on schedule.
+    Failed,
     /// A refresh landed, but the table has since been removed, or rebuilt as a
     /// new instance, so the action is no longer about the table registered under
     /// this name.
@@ -1295,7 +1299,9 @@ impl DataFusion {
     /// caller cannot answer the first and forget the second. `Abandoned` alone is
     /// not enough: it reports only a drop that happens *before* any completion
     /// was recorded, while a completion recorded and *then* invalidated by a
-    /// removal or a rebuild still reads as answered.
+    /// removal or a rebuild still reads as answered. A terminal failure is
+    /// reported as [`DeferredRefreshOutcome::Failed`] so a one-shot load error
+    /// cannot be mistaken for a successful refresh.
     ///
     /// A `None` waiter is a caller with nothing to wait for; the table is still
     /// re-resolved, since it may have gone in the meantime.
@@ -1305,10 +1311,16 @@ impl DataFusion {
         instance: TableInstance,
         waiter: Option<RefreshCompletionWaiter>,
     ) -> DeferredRefreshOutcome {
-        if let Some(waiter) = waiter
-            && waiter.wait().await.is_abandoned()
-        {
-            return DeferredRefreshOutcome::Abandoned;
+        if let Some(waiter) = waiter {
+            match waiter.wait().await {
+                RefreshCompletionOutcome::Abandoned => {
+                    return DeferredRefreshOutcome::Abandoned;
+                }
+                RefreshCompletionOutcome::TerminalFailure => {
+                    return DeferredRefreshOutcome::Failed;
+                }
+                RefreshCompletionOutcome::Answered => {}
+            }
         }
 
         if self.table_instance_is_current(&instance).await {
@@ -7246,6 +7258,24 @@ mod tests {
                 df.await_refresh_completion(instance, Some(waiter)).await,
                 DeferredRefreshOutcome::Apply,
                 "an untouched table must still apply, or every deferred action is dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_terminal_failure_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record_terminal_failure(completion.issue());
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Failed,
+                "a failed one-shot refresh must not broadcast PartitionsLoaded"
             );
         }
 

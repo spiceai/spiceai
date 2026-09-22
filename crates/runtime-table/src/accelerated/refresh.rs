@@ -1327,19 +1327,22 @@ fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
 }
 
 /// After a refresh task finishes: invalidate cached results, then publish
-/// `initial_load_completed`, then record the completion.
+/// `initial_load_completed`, then record the outcome.
 ///
-/// Results-cache warmup waits on the completion recorded here after the first
+/// Results-cache warmup waits on the outcome recorded here after the first
 /// full/append refresh. Publishing the flag before invalidation would let a
 /// poller of that flag store entries this callback then evicts. The flag still
-/// precedes `record_done`, so a waiter woken by the completion observes the
-/// initial load as done — the same pairing as `RefreshTask::signal_dataset_ready`.
+/// precedes `record_done`, so a waiter woken by a successful completion
+/// observes the initial load as done — the same pairing as
+/// `RefreshTask::signal_dataset_ready`.
 ///
-/// A failed refresh does not publish the ready flag. If `retry_scheduled` is
-/// true (`refresh_check_interval` will fire again), completion is also left
-/// unrecorded so warmup does not claim the once-only replay on a transient
-/// error. A one-shot failure records completion so warmup and the ready-hold
-/// do not wait forever.
+/// A failed refresh does not publish the ready flag and does not record a
+/// successful completion. If `retry_scheduled` is true
+/// (`refresh_check_interval` will fire again), no outcome is recorded so
+/// warmup does not claim the once-only replay on a transient error. A
+/// one-shot failure records a terminal-failure outcome so warmup and the
+/// ready-hold do not wait forever, without answering success waiters (hot
+/// reload, `PartitionsLoaded`).
 async fn after_refresh_task_completed(
     refresh_succeeded: bool,
     initial_load_completed: &AtomicBool,
@@ -1377,10 +1380,15 @@ fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> Refr
     refresh_completion.map_or(0, RefreshCompletion::issue)
 }
 
-/// Records a completed refresh under the request that started it: releases the
-/// callers waiting on that request. The last-refresh metric is published only
-/// when the refresh succeeded — it is the time the load reached Ready, not the
-/// time warmup was allowed to settle after a terminal failure.
+/// Records a completed refresh under the request that started it.
+///
+/// A successful refresh records a completion: releases callers waiting on
+/// that request as a successful answer and publishes the last-refresh metric
+/// (the time the load reached Ready).
+///
+/// A failed refresh records a terminal-failure outcome so warmup and the
+/// ready-hold can settle, without publishing the last-refresh metric or
+/// answering success waiters.
 async fn record_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
@@ -1388,13 +1396,14 @@ async fn record_refresh_done(
     request_id: RefreshRequestId,
     refresh_succeeded: bool,
 ) -> bool {
-    refresh_completion.record(request_id);
-    if !refresh_succeeded {
-        return false;
+    if refresh_succeeded {
+        refresh_completion.record(request_id);
+        record_last_refresh_time_ms(dataset_name, refresh).await;
+        return true;
     }
 
-    record_last_refresh_time_ms(dataset_name, refresh).await;
-    true
+    refresh_completion.record_terminal_failure(request_id);
+    false
 }
 
 async fn record_last_refresh_time_ms(
@@ -1718,7 +1727,7 @@ mod tests {
         );
         assert!(
             recorded.load(Ordering::Relaxed),
-            "a one-shot failure must record completion so warmup does not hang"
+            "a one-shot failure must record a terminal-failure outcome so warmup does not hang"
         );
     }
 
@@ -1732,12 +1741,17 @@ mod tests {
         let last_refresh_metric_recorded =
             record_refresh_done(&dataset, &refresh, &completion, request_id, false).await;
         eprintln!(
-            "failed_one_shot: completion_recorded={} last_refresh_metric_recorded={last_refresh_metric_recorded}",
-            completion.has_recorded()
+            "failed_one_shot: completion_recorded={} terminal_failure={} last_refresh_metric_recorded={last_refresh_metric_recorded}",
+            completion.has_recorded(),
+            completion.has_terminal_failure()
         );
         assert!(
-            completion.has_recorded(),
-            "a one-shot failure must still record completion for warmup"
+            !completion.has_recorded(),
+            "a one-shot failure must not look like a successful completion"
+        );
+        assert!(
+            completion.has_terminal_failure(),
+            "a one-shot failure must record a terminal-failure outcome for warmup"
         );
         assert!(
             !last_refresh_metric_recorded,

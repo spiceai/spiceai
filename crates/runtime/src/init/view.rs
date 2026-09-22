@@ -390,6 +390,12 @@ impl Runtime {
                             );
                             return;
                         }
+                        DeferredRefreshOutcome::Failed => {
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' initial refresh failed terminally; not creating a refresh schedule."
+                            );
+                            return;
+                        }
                         DeferredRefreshOutcome::TableChanged => {
                             // A `remove_view` landed after the completion was
                             // recorded, so this would give a removed view a live

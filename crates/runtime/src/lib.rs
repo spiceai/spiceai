@@ -1128,6 +1128,15 @@ impl Runtime {
                         );
                         return;
                     }
+                    DeferredRefreshOutcome::Failed => {
+                        // A one-shot refresh failed. Advertising those
+                        // partitions as queryable would tell the scheduler a
+                        // lie it then caches.
+                        tracing::debug!(
+                            "{table_name} partition refresh failed terminally; not broadcasting PartitionsLoaded."
+                        );
+                        return;
+                    }
                     DeferredRefreshOutcome::TableChanged => {
                         // A refresh did land, but not on the table this ack is
                         // about — the name has since been removed or rebuilt,

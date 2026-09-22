@@ -558,9 +558,10 @@ impl DataFusion {
 
 /// Whether warmup may start for this accelerated table.
 ///
-/// Full/Append wait for a per-process refresh completion recorded after
-/// cache invalidation. The reusable `initial_load_completed` flag is not
-/// enough: checkpoint-backed tables publish it at construction, before this
+/// Full/Append wait for a per-process refresh outcome recorded after
+/// cache invalidation: a successful completion, or a terminal (non-retrying)
+/// failure. The reusable `initial_load_completed` flag is not enough:
+/// checkpoint-backed tables publish it at construction, before this
 /// process's startup refresh (if any) has run.
 ///
 /// A cluster scheduler closes that completion because it never refreshes
@@ -600,13 +601,14 @@ fn first_full_or_append_refresh_settled_for(
         return dataset_ready_for_warmup(status, name)
             || dataset_will_not_become_ready(status, name);
     }
-    if completion.has_recorded() {
+    if completion.has_recorded() || completion.has_terminal_failure() {
         return true;
     }
     // Local Full/Append still in progress or retrying. Disabled is
     // terminal. Error is not: a periodic refresh can still succeed,
-    // and warmup is once-only. A one-shot failure records completion
-    // in `after_refresh_task_completed` instead of settling on Error.
+    // and warmup is once-only. A one-shot failure records a
+    // terminal-failure outcome in `after_refresh_task_completed`
+    // instead of settling on Error or on a successful completion.
     dataset_is_disabled(status, name)
 }
 
@@ -1897,7 +1899,11 @@ mod tests {
         );
 
         let id = completion.issue();
-        completion.record(id);
+        completion.record_terminal_failure(id);
+        assert!(
+            !completion.has_recorded(),
+            "a one-shot failure must not look like a successful completion"
+        );
         assert!(
             first_full_or_append_refresh_settled_for(
                 RefreshMode::Full,
@@ -1905,7 +1911,7 @@ mod tests {
                 &status,
                 &name
             ),
-            "a one-shot failure records completion so warmup can finish"
+            "a one-shot failure records a terminal-failure outcome so warmup can finish"
         );
 
         let disabled = RefreshCompletion::new();

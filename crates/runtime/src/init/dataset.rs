@@ -2223,9 +2223,9 @@ pub struct RegisterDatasetContext {
 /// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
 /// [`Error::HotReloadRefreshTimedOut`] when the table is still unloaded once
 /// there is nothing left to wait for, which drops the in-place swap in favour of
-/// a full reload. That is either the bound expiring or the new table being
-/// dropped before its first refresh: waiting out the rest of the bound on a
-/// table nobody can refresh only delays the same verdict.
+/// a full reload. That is the bound expiring, a terminal refresh failure, or
+/// the new table being dropped before its first refresh: waiting out the rest
+/// of the bound on a table nobody can refresh only delays the same verdict.
 async fn await_hot_reload_initial_refresh(
     dataset_name: &TableReference,
     initial_load_completed: &(dyn Fn() -> bool + Sync),
@@ -2239,11 +2239,11 @@ async fn await_hot_reload_initial_refresh(
 
     tokio::select! {
         // A `RefreshCompletionWaiter` for any completion is satisfied by a
-        // refresh that finished before this wait began, so the load cannot be
-        // missed by arriving here late. An abandoned wait falls through to the
-        // flag re-check below rather than returning: every recorder is gone, so
-        // no refresh is coming, but a load that landed before they went still
-        // counts.
+        // *successful* refresh that finished before this wait began, so the
+        // load cannot be missed by arriving here late. An abandoned wait or a
+        // terminal failure falls through to the flag re-check below rather
+        // than returning: no successful load is coming, but a load that
+        // landed before the recorders went still counts.
         outcome = completion.wait() => if outcome.is_answered() {
             return Ok(());
         },
@@ -3571,6 +3571,35 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             )
             .await
             .expect("a load that lands at the bound must not discard the table");
+        }
+
+        /// A one-shot load failure must not accept the unloaded table. Recording
+        /// that failure as an ordinary completion would return `Ok` here.
+        #[tokio::test(start_paused = true)]
+        async fn a_terminal_failure_does_not_accept_an_unloaded_table() {
+            let completion = RefreshCompletion::new();
+            completion.record_terminal_failure(completion.issue());
+
+            let started = tokio::time::Instant::now();
+            let err = await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                completion.any(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect_err("a failed one-shot load is not a loaded table");
+
+            assert!(
+                matches!(err, Error::HotReloadRefreshTimedOut { .. }),
+                "expected the hot-reload bound to be reported, got: {err}"
+            );
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a terminal failure must end the wait immediately, not spend the bound"
+            );
         }
 
         /// Shutdown ends the wait without reporting a reload failure.
