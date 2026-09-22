@@ -1311,9 +1311,30 @@ async fn process_message(
         return ProcessOutcome::Ack { receipt_handle };
     }
 
+    let mut readable = Vec::new();
+    for event in created {
+        if let Err(error) = s3_object_from(&event.bucket, &event.key) {
+            tracing::warn!(
+                "{}",
+                unrepresentable_object_key_warning(
+                    &dataset.name,
+                    &event.bucket,
+                    &event.key,
+                    &error,
+                    "the SQS message was acknowledged without applying that object"
+                )
+            );
+            continue;
+        }
+        readable.push(event);
+    }
+    if readable.is_empty() {
+        return ProcessOutcome::Ack { receipt_handle };
+    }
+
     let mut batches = Vec::new();
     let mut keys = Vec::new();
-    for event in created {
+    for event in readable {
         match object_reader.read_object(&event.bucket, &event.key).await {
             Ok(object_batches) => {
                 match align_object_batches(table_schema, &event.key, object_batches) {
@@ -1395,6 +1416,18 @@ fn incomplete_listing_warning(
     )
 }
 
+fn unrepresentable_object_key_warning(
+    dataset_name: impl std::fmt::Display,
+    bucket: &str,
+    key: &str,
+    error: &impl std::fmt::Display,
+    impact: &str,
+) -> String {
+    format!(
+        "Dataset '{dataset_name}' dropped s3://{bucket}/{key} because that object key cannot be a listing URL, so {impact}. Cause: {error}. See: {S3_DOCS}"
+    )
+}
+
 fn unread_object_warning(
     dataset_name: impl std::fmt::Display,
     bucket: &str,
@@ -1445,6 +1478,19 @@ async fn apply_unapplied_objects(
             continue;
         }
         if skip_known && applied_keys.lock().is_known(&key) {
+            continue;
+        }
+        if let Err(error) = s3_object_from(&config.bucket, &key) {
+            tracing::warn!(
+                "{}",
+                unrepresentable_object_key_warning(
+                    &dataset.name,
+                    &config.bucket,
+                    &key,
+                    &error,
+                    "that object is omitted from this listing pass"
+                )
+            );
             continue;
         }
         match object_reader.read_object(&config.bucket, &key).await {
@@ -3186,6 +3232,55 @@ mod tests {
             }
             other => panic!("expected Creates, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn process_created_acks_keys_that_url_dot_segments_would_rewrite() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/b.parquet".to_string(),
+                vec![id_name_batch(&[2], &["wrong-object"])],
+            )]),
+            fail_keys: vec![],
+        };
+        let outcome = process_message(
+            &events_dataset(),
+            &default_config(),
+            &parquet_files(),
+            &id_name_schema(),
+            &reader,
+            &applied_mutex([]),
+            &QueueMessage {
+                body: created_put_body("events/a/../b.parquet"),
+                receipt_handle: "rh-dot-segment".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, ProcessOutcome::Ack { .. }),
+            "a key that WHATWG path normalization would rewrite must be dropped, not applied or retried, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_object_key_warning_names_dataset_key_and_impact() {
+        let error = s3_object_from("my-bucket", "events/a/../b.parquet")
+            .expect_err("dot-segment keys are unrepresentable");
+        let message = unrepresentable_object_key_warning(
+            "events",
+            "my-bucket",
+            "events/a/../b.parquet",
+            &error,
+            "the SQS message was acknowledged without applying that object",
+        );
+        assert!(
+            message.contains("Dataset 'events'")
+                && message.contains("s3://my-bucket/events/a/../b.parquet")
+                && message.contains("acknowledged without applying")
+                && message.contains("events/b.parquet")
+                && message.contains(S3_DOCS),
+            "warning must name the dataset, original key, rewritten object, impact, and docs link, got {message}"
+        );
     }
 
     #[tokio::test]

@@ -246,16 +246,59 @@ pub fn decode_from_path_key(encoded: &str) -> String {
     percent_decode_str(encoded).decode_utf8_lossy().into_owned()
 }
 
+/// Error from [`s3_object_from`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectUrlError {
+    InvalidBucket { detail: String },
+    UnrepresentableKey { key: String, as_url: String },
+}
+
+impl std::fmt::Display for ObjectUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidBucket { detail } => {
+                write!(f, "bucket is not a valid URL host: {detail}")
+            }
+            Self::UnrepresentableKey { key, as_url } => write!(
+                f,
+                "object key '{key}' cannot be a listing URL without WHATWG path normalization reading {as_url} instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObjectUrlError {}
+
 /// Build an `s3://` URL for a decoded object key. `Url::set_path` percent-encodes
 /// spaces and reserved characters so `Url::parse` in the listing connector accepts it.
 ///
+/// `.` and `..` are valid S3 key segments, but `Url::set_path` and a later
+/// `Url::parse` apply WHATWG dot-segment removal (`events/a/../b.parquet` →
+/// `events/b.parquet`). Those keys are rejected so a notification cannot read
+/// the wrong object. `path_segments_mut` is not a fix: it drops `.` / `..`
+/// rather than preserving them.
+///
 /// # Errors
 ///
-/// Returns a parse error when `bucket` is not a valid URL host.
-pub fn s3_object_from(bucket: &str, key: &str) -> Result<String, url::ParseError> {
-    let mut url = Url::parse(&format!("s3://{bucket}"))?;
+/// Returns [`ObjectUrlError::InvalidBucket`] when `bucket` is not a valid URL
+/// host, and [`ObjectUrlError::UnrepresentableKey`] when the key does not
+/// survive a WHATWG path round-trip.
+pub fn s3_object_from(bucket: &str, key: &str) -> Result<String, ObjectUrlError> {
+    let mut url = Url::parse(&format!("s3://{bucket}")).map_err(|error| {
+        ObjectUrlError::InvalidBucket {
+            detail: error.to_string(),
+        }
+    })?;
     url.set_path(key);
-    Ok(url.to_string())
+    let as_url = url.to_string();
+    let reconstructed = decode_from_path_key(url.path().trim_start_matches('/'));
+    if reconstructed != key {
+        return Err(ObjectUrlError::UnrepresentableKey {
+            key: key.to_string(),
+            as_url,
+        });
+    }
+    Ok(as_url)
 }
 
 /// Whether `event` belongs to this dataset's bucket and key prefix.
@@ -549,6 +592,37 @@ mod tests {
         assert_eq!(
             s3_object_from("my-bucket", "events/a.parquet").expect("valid"),
             "s3://my-bucket/events/a.parquet"
+        );
+        assert_eq!(
+            s3_object_from("my-bucket", "events/foo..bar.parquet").expect("valid"),
+            "s3://my-bucket/events/foo..bar.parquet"
+        );
+    }
+
+    #[test]
+    fn s3_object_from_rejects_keys_that_url_dot_segment_normalization_would_rewrite() {
+        let mut collapsed = Url::parse("s3://my-bucket").expect("valid bucket URL");
+        collapsed.set_path("events/a/../b.parquet");
+        assert_eq!(
+            collapsed.as_str(),
+            "s3://my-bucket/events/b.parquet",
+            "Url::set_path applies WHATWG dot-segment removal"
+        );
+
+        let err = s3_object_from("my-bucket", "events/a/../b.parquet")
+            .expect_err("a key with a `..` segment must not become a listing URL");
+        assert!(
+            matches!(
+                err,
+                ObjectUrlError::UnrepresentableKey { ref key, ref as_url }
+                    if key == "events/a/../b.parquet"
+                        && as_url == "s3://my-bucket/events/b.parquet"
+            ),
+            "must name the original key and the object the URL would read, got: {err}"
+        );
+        assert!(
+            s3_object_from("my-bucket", "events/./b.parquet").is_err(),
+            "a `.` path segment is also rewritten"
         );
     }
 
