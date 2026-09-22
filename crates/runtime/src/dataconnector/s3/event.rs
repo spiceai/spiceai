@@ -198,6 +198,14 @@ pub fn decode_s3_key(encoded: &str) -> String {
         .into_owned()
 }
 
+/// Percent-decode a `from:` / `s3_changes_key_prefix` path the way `Url` decodes
+/// a path (`%20` → space, `%3D` → `=`). Unlike [`decode_s3_key`], a `+` stays
+/// `+`: it is a literal character in a URI path, not a space.
+#[must_use]
+pub fn decode_from_path_key(encoded: &str) -> String {
+    percent_decode_str(encoded).decode_utf8_lossy().into_owned()
+}
+
 /// Build an `s3://` URL for a decoded object key. `Url::set_path` percent-encodes
 /// spaces and reserved characters so `Url::parse` in the listing connector accepts it.
 ///
@@ -394,6 +402,19 @@ mod tests {
         assert_eq!(
             s3_object_from("my-bucket", "events/a.parquet").expect("valid"),
             "s3://my-bucket/events/a.parquet"
+        );
+    }
+
+    #[test]
+    fn decode_from_path_key_percent_decodes_without_treating_plus_as_space() {
+        assert_eq!(
+            decode_from_path_key("events/data%20files/"),
+            "events/data files/"
+        );
+        assert_eq!(decode_from_path_key("events/foo+bar/"), "events/foo+bar/");
+        assert_eq!(
+            decode_from_path_key("events/year%3D2026/"),
+            "events/year=2026/"
         );
     }
 }

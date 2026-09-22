@@ -22,7 +22,8 @@ limitations under the License.
 //! across poll/yield points without changing behavior.
 
 use super::event::{
-    ObjectEventKind, S3ObjectEvent, matches_dataset, parse_notification_body, s3_object_from,
+    ObjectEventKind, S3ObjectEvent, decode_from_path_key, matches_dataset, parse_notification_body,
+    s3_object_from,
 };
 use super::{S3, S3_DOCS};
 use crate::dataconnector::federated::FederatedTableProvider;
@@ -655,7 +656,7 @@ impl S3ChangesConfig {
                 let key_prefix = match params.get("changes_key_prefix").expose().ok() {
                     None => dataset_prefix.clone(),
                     Some(configured) => {
-                        let normalized = normalize_prefix(configured);
+                        let normalized = normalize_prefix(&decode_from_path_key(configured));
                         ensure!(
                             prefix_is_nested_under(&normalized, &dataset_prefix),
                             KeyPrefixOutsideDatasetSnafu {
@@ -752,11 +753,14 @@ fn bucket_and_key_prefix(dataset: &DatasetSpec) -> Result<(String, String)> {
             from: dataset.from.clone(),
         }
     );
+    // `DatasetSpec::path()` keeps URI escapes. Notification keys (and the
+    // object store) use the decoded key, so derive the prefix from that.
+    let rest = decode_from_path_key(rest);
     // Every key under the prefix is the dataset, so a `from` the listing table
     // resolves to one object or to a glob has no prefix to derive: appending a
     // `/` to it produces a prefix nothing is under, which would snapshot an
     // empty accelerator and put every notification for the object outside the
-    // dataset. Refuse both instead.
+    // dataset. Refuse both instead. Check after decode so `%2A` is a glob too.
     ensure!(
         !rest.contains(['*', '?', '[']),
         FromIsGlobSnafu {
@@ -764,7 +768,7 @@ fn bucket_and_key_prefix(dataset: &DatasetSpec) -> Result<(String, String)> {
             from: dataset.from.clone(),
         }
     );
-    Ok((bucket.to_string(), normalize_prefix(rest)))
+    Ok((bucket.to_string(), normalize_prefix(&rest)))
 }
 
 /// The object key a `from` names outright, if it can name one: S3 has no
@@ -776,7 +780,7 @@ fn key_from_may_name(dataset: &DatasetSpec) -> Option<String> {
         return None;
     }
     let (_, rest) = path.split_once('/')?;
-    (!rest.is_empty()).then(|| rest.to_string())
+    (!rest.is_empty()).then(|| decode_from_path_key(rest))
 }
 
 fn normalize_prefix(prefix: &str) -> String {
@@ -2431,6 +2435,43 @@ mod tests {
         assert_eq!(key_from_may_name(&bucket_root), None);
     }
 
+    /// `DatasetSpec::path()` keeps URI escapes, but notification keys are
+    /// decoded. Matching the raw `from` path would leave every object under an
+    /// encoded prefix on the queue forever. Regression test for the Copilot
+    /// finding on #14121.
+    #[test]
+    fn an_encoded_from_prefix_matches_a_decoded_notification_key() {
+        let dataset = DatasetSpec::new("s3://my-bucket/events/data%20files/", "events".into());
+        let (bucket, dataset_prefix) =
+            bucket_and_key_prefix(&dataset).expect("encoded from is a valid prefix");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(dataset_prefix, "events/data files/");
+        assert_eq!(
+            key_from_may_name(&DatasetSpec::new(
+                "s3://my-bucket/events/data%20files/part.parquet",
+                "events".into()
+            ))
+            .as_deref(),
+            Some("events/data files/part.parquet")
+        );
+
+        let events = parse_notification_body(&created_put_body("events/data%20files/part.parquet"))
+            .expect("valid notification");
+        assert_eq!(events[0].key, "events/data files/part.parquet");
+        assert!(
+            matches_dataset(&events[0], &bucket, &dataset_prefix),
+            "decoded notification key must match the decoded from prefix, prefix={dataset_prefix:?} key={:?}",
+            events[0].key
+        );
+    }
+
+    #[test]
+    fn a_from_path_keeps_a_literal_plus() {
+        let dataset = DatasetSpec::new("s3://my-bucket/events/foo+bar/", "events".into());
+        let (_, prefix) = bucket_and_key_prefix(&dataset).expect("plus is a valid path character");
+        assert_eq!(prefix, "events/foo+bar/");
+    }
+
     #[tokio::test]
     async fn validate_rejects_prefix_outside_dataset() {
         let params = test_params(vec![
@@ -2460,6 +2501,36 @@ mod tests {
         assert_eq!(config.key_prefix, "events/year=2026/");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Rebuild);
         assert_eq!(config.backfill_interval, Duration::from_mins(30));
+    }
+
+    #[tokio::test]
+    async fn validate_decodes_a_percent_encoded_from_prefix() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let mut dataset = DatasetSpec::new("s3://my-bucket/events/data%20files/", "events".into());
+        dataset.acceleration = Some(Acceleration {
+            refresh_mode: Some(RefreshMode::Changes),
+            ..Acceleration::default()
+        });
+        let config = S3ChangesConfig::try_from_params(&params, &dataset)
+            .expect("encoded from is valid")
+            .expect("changes enabled");
+        assert_eq!(config.dataset_prefix, "events/data files/");
+        assert_eq!(config.key_prefix, "events/data files/");
+
+        let nested = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_changes_key_prefix", "events/data files/2026"),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let nested_config = S3ChangesConfig::try_from_params(&nested, &dataset)
+            .expect("decoded nested prefix is under the decoded from")
+            .expect("changes enabled");
+        assert_eq!(nested_config.key_prefix, "events/data files/2026/");
     }
 
     #[tokio::test]
