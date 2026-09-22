@@ -33204,7 +33204,7 @@ impl CayenneTableProvider {
         let runtime_lookup_provider: Option<Arc<dyn VortexAccessPlanProvider>> = self
             .lookup_index
             .as_ref()
-            .filter(|_| allow_runtime_lookup)
+            .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
             .map(|index| {
                 let request_build = self.weak_self.get().cloned().map(|weak| {
                     Arc::new(move || {
@@ -33217,6 +33217,11 @@ impl CayenneTableProvider {
                     Arc::clone(index),
                     snapshot_id.to_string(),
                     self.file_set_version(),
+                    partitioned_file_lists
+                        .iter()
+                        .flat_map(FileGroup::iter)
+                        .map(|file| file.object_meta.clone())
+                        .collect(),
                     Self::position_deletion_plans(&self.pk_deletion_strategy),
                     request_build,
                 )) as Arc<dyn VortexAccessPlanProvider>
@@ -34487,25 +34492,40 @@ impl CayenneTableProvider {
         };
         let provider = Arc::clone(self);
         tokio::spawn(async move {
-            let file_set = provider.file_set_version();
             let read_schema = provider.read_schema();
             let ctx = provider.create_session_context();
-            let session = ctx.state();
-            match provider
-                .lookup_index_snapshot_files(&session, &visible_snapshot, &read_schema)
-                .await
-            {
-                Some((store, files)) => super::lookup_index::spawn_build(
-                    claim,
-                    visible_snapshot,
-                    store,
-                    files,
-                    provider.table_schema(),
-                    file_set,
-                ),
-                None => claim.unpublished(),
-            }
+            provider
+                .start_lookup_index_build(claim, visible_snapshot, &ctx.state(), &read_schema)
+                .await;
         });
+    }
+
+    /// Lists `snapshot_id`'s files and starts the background build `claim`
+    /// holds, or frees the claim when the files cannot be listed.
+    async fn start_lookup_index_build(
+        &self,
+        claim: super::lookup_index::BuildClaim,
+        snapshot_id: String,
+        state: &dyn Session,
+        read_schema: &SchemaRef,
+    ) {
+        // Sampled before listing, so a file added while listing makes the
+        // index's file set older than the table's, never newer.
+        let file_set = self.file_set_version();
+        match self
+            .lookup_index_snapshot_files(state, &snapshot_id, read_schema)
+            .await
+        {
+            Some((store, files)) => super::lookup_index::spawn_build(
+                claim,
+                snapshot_id,
+                store,
+                files,
+                self.table_schema(),
+                file_set,
+            ),
+            None => claim.unpublished(),
+        }
     }
 
     /// Resolves the secondary index for this scan.
@@ -34562,21 +34582,8 @@ impl CayenneTableProvider {
         };
         if should_build && let Some(claim) = index_state.claim_build(&visible_snapshot) {
             // The claim frees its slot if this scan is dropped while listing.
-            let file_set = self.file_set_version();
-            match self
-                .lookup_index_snapshot_files(state, &visible_snapshot, read_schema)
-                .await
-            {
-                Some((store, files)) => super::lookup_index::spawn_build(
-                    claim,
-                    visible_snapshot.clone(),
-                    store,
-                    files,
-                    self.table_schema(),
-                    file_set,
-                ),
-                None => claim.unpublished(),
-            }
+            self.start_lookup_index_build(claim, visible_snapshot, state, read_schema)
+                .await;
         }
         Some((selection, explain))
     }

@@ -699,8 +699,9 @@ async fn oversized_dynamic_key_sets_fall_back_before_probing() {
     assert_eq!(after.selected, before.selected);
     assert_eq!(after.access_plans_attached, before.access_plans_attached);
     assert_eq!(
-        after.runtime_fallback, before.runtime_fallback,
-        "extraction must decline the oversized key set before reaching an index probe"
+        after.runtime_fallback,
+        before.runtime_fallback + 1,
+        "extraction declines the oversized key set once per filter, before any index probe"
     );
     let explain = ctx
         .sql(&format!("EXPLAIN ANALYZE {}", sql(INDEXED)))

@@ -483,12 +483,20 @@ impl FileOpener for VortexOpener {
 
             let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
 
-            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
-                scan_builder = vortex_plan.apply_to_builder(scan_builder);
-            }
-
-            if let Some(runtime_plan) = runtime_access_plan {
-                scan_builder = runtime_plan.apply_to_builder(scan_builder);
+            // A runtime plan narrows the planning-time plan rather than replacing
+            // it, so rows the planning-time plan excludes (deleted rows, say) stay
+            // excluded whatever the runtime provider returns.
+            match (
+                file.extensions.get::<VortexAccessPlan>(),
+                runtime_access_plan.as_deref(),
+            ) {
+                (Some(planned), Some(runtime)) => {
+                    scan_builder = planned.intersect(runtime).apply_to_builder(scan_builder);
+                }
+                (Some(plan), None) | (None, Some(plan)) => {
+                    scan_builder = plan.apply_to_builder(scan_builder);
+                }
+                (None, None) => {}
             }
 
             if let Some(row_range) = row_range {
