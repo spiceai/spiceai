@@ -849,11 +849,10 @@ fn region_from_sqs_host(host: &str) -> Option<String> {
     let host = host.to_ascii_lowercase();
     let labels: Vec<&str> = host.split('.').collect();
     let region = match labels.as_slice() {
-        ["sqs", region, "amazonaws", "com"]
-        | ["sqs-fips", region, "amazonaws", "com"]
+        ["sqs" | "sqs-fips", region, "amazonaws", "com"]
         | ["sqs", region, "amazonaws", "com", "cn"]
-        | ["sqs", region, "vpce", "amazonaws", "com"] => *region,
-        [_, "sqs", region, "vpce", "amazonaws", "com"] => *region,
+        | ["sqs", region, "vpce", "amazonaws", "com"]
+        | [_, "sqs", region, "vpce", "amazonaws", "com"] => *region,
         _ => return None,
     };
     is_aws_region(region).then(|| region.to_string())
@@ -2253,6 +2252,13 @@ mod tests {
         );
         assert_eq!(
             region_from_queue_url(
+                "https://sqs.us-west-2.vpce.amazonaws.com/123456789012/s3-events"
+            )
+            .as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(
+            region_from_queue_url(
                 "https://vpce-abc.sqs.us-west-2.vpce.amazonaws.com/123456789012/s3-events"
             )
             .as_deref(),
@@ -2399,6 +2405,9 @@ mod tests {
         ));
         assert!(is_sqs_queue_url(
             "https://sqs-fips.us-east-1.amazonaws.com/123456789012/s3-events"
+        ));
+        assert!(is_sqs_queue_url(
+            "https://sqs.us-east-1.vpce.amazonaws.com/123456789012/s3-events"
         ));
         assert!(is_sqs_queue_url(
             "https://vpce-abc.sqs.us-east-1.vpce.amazonaws.com/123456789012/s3-events"
