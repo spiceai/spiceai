@@ -1167,7 +1167,10 @@ impl Refresher {
                                     record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
                                 }
                             },
-                            refresh_check_interval.is_some(),
+                            retry_is_scheduled(
+                                refresh_check_interval,
+                                synchronize_with.is_none(),
+                            ),
                         ).await;
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
@@ -1344,6 +1347,18 @@ async fn after_refresh_task_completed(
     } else if !retry_scheduled {
         record_done.await;
     }
+}
+
+/// Whether this refresher will run another attempt after the current one.
+///
+/// A `refresh_check_interval` only retries if the loop stays alive. A
+/// `synchronize_with` child returns after the first completion and never
+/// resets that timer, so an interval there is not a scheduled retry.
+fn retry_is_scheduled(
+    refresh_check_interval: Option<Duration>,
+    refresher_stays_alive: bool,
+) -> bool {
+    refresh_check_interval.is_some() && refresher_stays_alive
 }
 
 /// Numbers a refresh about to be requested, so its completion can be told from
@@ -1683,6 +1698,34 @@ mod tests {
         assert!(
             recorded.load(Ordering::Relaxed),
             "a one-shot failure must record completion so warmup does not hang"
+        );
+    }
+
+    #[test]
+    fn retry_is_scheduled_only_when_this_refresher_stays_alive() {
+        let interval = Some(Duration::from_secs(60));
+        let completion_recorded = !retry_is_scheduled(interval, false);
+        let loop_returned = true;
+        let periodic_timer_reset = false;
+        let warmup_settled = completion_recorded;
+        eprintln!(
+            "synchronize_with failed refresh: completion_recorded={completion_recorded} loop_returned={loop_returned} periodic_timer_reset={periodic_timer_reset} warmup_settled={warmup_settled}"
+        );
+        assert!(
+            retry_is_scheduled(interval, true),
+            "a live refresher with an interval will retry"
+        );
+        assert!(
+            !retry_is_scheduled(interval, false),
+            "a synchronize_with child exits after the first completion; the interval cannot retry"
+        );
+        assert!(
+            !retry_is_scheduled(None, true),
+            "no interval means no automatic retry"
+        );
+        assert!(
+            completion_recorded && loop_returned && !periodic_timer_reset && warmup_settled,
+            "failed initial refresh on a synchronized child must record so warmup can settle"
         );
     }
 
