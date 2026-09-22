@@ -1516,7 +1516,11 @@ async fn test_inline_write_coalesces_into_one_batch(
     common::insert_batches(&table, batches).await?;
 
     let entries = fixture.catalog.get_inlined_data(&table_id).await?;
-    assert_eq!(entries.len(), 1, "one write should produce one inline entry");
+    assert_eq!(
+        entries.len(),
+        1,
+        "one write should produce one inline entry"
+    );
 
     let decoded: Vec<RecordBatch> = arrow::ipc::reader::StreamReader::try_new(
         std::io::Cursor::new(entries[0].data_ipc.as_slice()),
@@ -1598,7 +1602,11 @@ async fn test_inline_scan_batches_scale_with_writes_not_rows(
 
     ctx.register_table("accumulated", Arc::new(table))?;
     let got = collect_sorted(&ctx, "SELECT id, payload FROM accumulated ORDER BY id").await?;
-    assert_eq!(got.num_rows(), usize::try_from(TOTAL)?, "every row must be visible");
+    assert_eq!(
+        got.num_rows(),
+        usize::try_from(TOTAL)?,
+        "every row must be visible"
+    );
 
     let ids = got
         .column(0)
