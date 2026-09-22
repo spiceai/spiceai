@@ -811,16 +811,22 @@ fn resolve_region(params: &Parameters, queue_url: &str) -> Option<String> {
 #[must_use]
 pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
     let parsed = url::Url::parse(queue_url).ok()?;
-    let host = parsed.host_str()?;
-    // `sqs.us-east-1.amazonaws.com` or `sqs.cn-north-1.amazonaws.com.cn`
-    let mut labels = host.split('.');
-    let service = labels.next()?;
-    let region = labels.next()?;
-    if service == "sqs" && region != "amazonaws" && region != "localhost" {
-        Some(region.to_string())
-    } else {
-        None
-    }
+    region_from_sqs_host(parsed.host_str()?)
+}
+
+/// Region embedded in an SQS queue-URL host, including FIPS and VPC endpoints.
+fn region_from_sqs_host(host: &str) -> Option<String> {
+    let host = host.to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let region = match labels.as_slice() {
+        ["sqs", region, "amazonaws", "com"]
+        | ["sqs-fips", region, "amazonaws", "com"]
+        | ["sqs", region, "amazonaws", "com", "cn"]
+        | ["sqs", region, "vpce", "amazonaws", "com"] => *region,
+        [_, "sqs", region, "vpce", "amazonaws", "com"] => *region,
+        _ => return None,
+    };
+    is_aws_region(region).then(|| region.to_string())
 }
 
 /// An HTTPS SQS queue URL: AWS partition host and `/account/queue` path.
@@ -844,24 +850,7 @@ fn is_sqs_queue_url(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    sqs_host_is_allowed(host) && sqs_queue_path_is_allowed(parsed.path())
-}
-
-fn sqs_host_is_allowed(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let labels: Vec<&str> = host.split('.').collect();
-    match labels.as_slice() {
-        ["sqs", region, "amazonaws", "com"]
-        | ["sqs-fips", region, "amazonaws", "com"]
-        | ["sqs", region, "amazonaws", "com", "cn"]
-            if is_aws_region(region) =>
-        {
-            true
-        }
-        ["sqs", region, "vpce", "amazonaws", "com"] if is_aws_region(region) => true,
-        [_, "sqs", region, "vpce", "amazonaws", "com"] if is_aws_region(region) => true,
-        _ => false,
-    }
+    region_from_sqs_host(host).is_some() && sqs_queue_path_is_allowed(parsed.path())
 }
 
 fn is_aws_region(region: &str) -> bool {
@@ -2223,6 +2212,20 @@ mod tests {
             region_from_queue_url("https://localhost:4566/000000000000/queue"),
             None
         );
+        assert_eq!(
+            region_from_queue_url(
+                "https://sqs-fips.us-east-1.amazonaws.com/123456789012/s3-events"
+            )
+            .as_deref(),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            region_from_queue_url(
+                "https://vpce-abc.sqs.us-west-2.vpce.amazonaws.com/123456789012/s3-events"
+            )
+            .as_deref(),
+            Some("us-west-2")
+        );
     }
 
     #[tokio::test]
@@ -2242,6 +2245,23 @@ mod tests {
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Ignore);
         assert_eq!(config.backfill_interval, Duration::from_hours(1));
+    }
+
+    #[tokio::test]
+    async fn validate_resolves_region_from_a_fips_queue_url() {
+        let params = test_params(vec![
+            (
+                "s3_changes_queue_url",
+                "https://sqs-fips.us-east-1.amazonaws.com/123456789012/s3-events",
+            ),
+            ("s3_auth", "iam_role"),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let config = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("FIPS queue URL is valid")
+            .expect("changes should be enabled");
+        assert_eq!(config.region, "us-east-1");
     }
 
     #[tokio::test]
