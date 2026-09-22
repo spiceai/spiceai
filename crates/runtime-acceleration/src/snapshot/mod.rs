@@ -581,7 +581,9 @@ pub enum SnapshotUploadError {
         index: String,
         source: datafusion::error::DataFusionError,
     },
-    #[snafu(display("Failed to create local staging directory for index {index} snapshot: {source}"))]
+    #[snafu(display(
+        "Failed to create local staging directory for index {index} snapshot: {source}"
+    ))]
     IndexStagingDir {
         index: String,
         source: std::io::Error,
@@ -1310,9 +1312,12 @@ impl SnapshotManager {
             let Some(identity) = index.snapshot_identity() else {
                 continue;
             };
-            let directory = index.freeze_for_snapshot().await.context(IndexFreezeSnafu {
-                index: identity.kind,
-            })?;
+            let directory = index
+                .freeze_for_snapshot()
+                .await
+                .context(IndexFreezeSnafu {
+                    index: identity.kind,
+                })?;
             let temp_dir = tempfile::tempdir().context(IndexStagingDirSnafu {
                 index: identity.kind,
             })?;
@@ -7598,7 +7603,8 @@ mod tests {
             columns: vec!["body".to_string()],
             discriminator: None,
         };
-        let artifact = write_index_artifact(&store, &manager, &identity, "content", b"content").await;
+        let artifact =
+            write_index_artifact(&store, &manager, &identity, "content", b"content").await;
         let index = Arc::new(MockSnapshotIndex {
             identity,
             should_fail: true,
