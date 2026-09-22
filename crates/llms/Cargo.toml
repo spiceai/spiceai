@@ -82,6 +82,14 @@ rstest = "0.26.1"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
+[[test]]
+name = "model2vec_hf_cache"
+path = "tests/model2vec_hf_cache.rs"
+# The guard drives `llms::model2vec`, which only exists behind this feature, so
+# without the declaration a `--no-default-features` build of the test targets
+# fails on an unresolved import rather than skipping the target.
+required-features = ["local_embed"]
+
 [features]
 cuda = [
     "tei_backend/cuda",
