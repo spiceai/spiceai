@@ -5156,9 +5156,15 @@ impl DataFusion {
                         let attestation = crate::view::ViewRefreshReadAttestation::with_identity(
                             identity.clone(),
                         );
+                        // Sampled again into the publish gate; captured here so the
+                        // refresh scan stamps the same dependency generations the gate
+                        // will require at publish.
+                        let dependency_refreshes =
+                            self.accelerated_dependency_refreshes(view).await;
                         view_table = crate::view::wrap_view_refresh_attestation(
                             view_table,
                             attestation.clone(),
+                            dependency_refreshes,
                         );
                         refresh_attestation = Some(attestation);
                         materialization_identity = Some(identity);

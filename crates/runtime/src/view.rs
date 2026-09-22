@@ -33,7 +33,7 @@ use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor};
 use runtime_acceleration::snapshot::SnapshotPublishGate;
 use runtime_datafusion::refresh_scan::session_is_refresh_scan;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
-use runtime_table::accelerated::materialization::MaterializationIdentity;
+use runtime_table::accelerated::materialization::{MaterializationIdentity, MaterializationSample};
 use runtime_table::accelerated::refresh::Refresh;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
@@ -122,29 +122,68 @@ fn dependency_override_reason(view_name: &TableReference, dependency: &TableRefe
     )
 }
 
+fn dependency_generation_mismatch_reason(
+    view_name: &TableReference,
+    dependency: &TableReference,
+) -> String {
+    format!(
+        "view '{view_name}' was refreshed against a different materialization of '{dependency}' than is present now, so publishing would stamp rows that fingerprint cannot vouch for"
+    )
+}
+
+fn dependency_unattested_reason(view_name: &TableReference, dependency: &TableReference) -> String {
+    format!(
+        "view '{view_name}' has no refresh attestation for dependency '{dependency}', so Spice cannot confirm these rows came from the generation now in that accelerator"
+    )
+}
+
+fn dependency_unconfigured_at_scan_reason(
+    view_name: &TableReference,
+    dependency: &TableReference,
+) -> String {
+    format!(
+        "view '{view_name}' refreshed while dependency '{dependency}' was not proven configured, so publishing would stamp rows that fingerprint cannot vouch for"
+    )
+}
+
 #[async_trait]
 impl SnapshotPublishGate for ViewSnapshotPublishGate {
     async fn check_publish(&self) -> Result<(), String> {
         match self.attestation.last_stamped() {
             None => Err(missing_refresh_attestation_reason(&self.view_name)),
-            Some((epoch, shape)) => {
+            Some(stamp) => {
                 if let Some(expected) = *self.expected_epoch.lock()
-                    && epoch != expected
+                    && stamp.epoch != expected
                 {
                     return Err(attestation_epoch_mismatch_reason(&self.view_name));
                 }
-                // A dependency's PATCH /acceleration can replace live refresh SQL
-                // without updating this view's Spicepod fingerprint. Withhold until
-                // every accelerated dependency is again the configured definition.
+                // Bind each dependency to the generation the view refresh actually read.
+                // Checking only "configured now" would allow: refresh under override B →
+                // withhold → dependency returns to A without the view refreshing → publish
+                // B-derived rows under fingerprint A.
                 for (dependency, refresh) in &self.dependency_refreshes {
                     let live = refresh.read().await;
-                    if !live.live_refresh_sql_matches_configured()
-                        || !live.materialization_is_configured()
-                    {
+                    let current = live.sample_materialization();
+                    let Some(attested) = stamp.dependency_sample(dependency) else {
+                        return Err(dependency_unattested_reason(&self.view_name, dependency));
+                    };
+                    if attested.epoch != current.epoch {
+                        return Err(dependency_generation_mismatch_reason(
+                            &self.view_name,
+                            dependency,
+                        ));
+                    }
+                    if !attested.configured {
+                        return Err(dependency_unconfigured_at_scan_reason(
+                            &self.view_name,
+                            dependency,
+                        ));
+                    }
+                    if !live.live_refresh_sql_matches_configured() || !current.configured {
                         return Err(dependency_override_reason(&self.view_name, dependency));
                     }
                 }
-                shape.refusal_reason().map_or(Ok(()), Err)
+                stamp.shape.refusal_reason().map_or(Ok(()), Err)
             }
         }
     }
@@ -154,15 +193,32 @@ impl SnapshotPublishGate for ViewSnapshotPublishGate {
     }
 }
 
-/// Last refresh-plan read shape written by the executing refresh scan, read by
+/// One refresh-scan stamp: the view's materialization epoch, the executed read
+/// shape, and each accelerated dependency's `(epoch, configured)` at scan time.
+#[derive(Clone, Debug)]
+pub(crate) struct ViewRefreshAttestationStamp {
+    pub epoch: u64,
+    pub shape: ViewReadShape,
+    pub dependencies: Vec<(TableReference, MaterializationSample)>,
+}
+
+impl ViewRefreshAttestationStamp {
+    fn dependency_sample(&self, dependency: &TableReference) -> Option<MaterializationSample> {
+        self.dependencies.iter().find_map(|(name, sample)| {
+            (name == dependency || name.to_string() == dependency.to_string()).then_some(*sample)
+        })
+    }
+}
+
+/// Last refresh-plan attestation written by the executing refresh scan, read by
 /// [`ViewSnapshotPublishGate`]. `None` means no refresh has attested this process.
-/// Each record is stamped with the [`MaterializationIdentity`] epoch at scan time.
-/// Production writes go through [`AttestingViewProvider`], which only calls
-/// [`Self::record`] on a refresh session.
+/// Each record is stamped with the [`MaterializationIdentity`] epoch at scan time
+/// and the dependency generations that scan observed. Production writes go through
+/// [`AttestingViewProvider`], which only calls [`Self::record`] on a refresh session.
 #[derive(Clone, Debug)]
 pub(crate) struct ViewRefreshReadAttestation {
     identity: MaterializationIdentity,
-    shape: Arc<parking_lot::RwLock<Option<(u64, ViewReadShape)>>>,
+    stamp: Arc<parking_lot::RwLock<Option<ViewRefreshAttestationStamp>>>,
 }
 
 impl ViewRefreshReadAttestation {
@@ -170,18 +226,30 @@ impl ViewRefreshReadAttestation {
     pub(crate) fn with_identity(identity: MaterializationIdentity) -> Self {
         Self {
             identity,
-            shape: Arc::new(parking_lot::RwLock::new(None)),
+            stamp: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
     pub(crate) fn record(&self, shape: ViewReadShape) {
+        self.record_with_dependencies(shape, Vec::new());
+    }
+
+    pub(crate) fn record_with_dependencies(
+        &self,
+        shape: ViewReadShape,
+        dependencies: Vec<(TableReference, MaterializationSample)>,
+    ) {
         let epoch = self.identity.epoch();
-        *self.shape.write() = Some((epoch, shape));
+        *self.stamp.write() = Some(ViewRefreshAttestationStamp {
+            epoch,
+            shape,
+            dependencies,
+        });
     }
 
     #[must_use]
-    pub(crate) fn last_stamped(&self) -> Option<(u64, ViewReadShape)> {
-        self.shape.read().clone()
+    pub(crate) fn last_stamped(&self) -> Option<ViewRefreshAttestationStamp> {
+        self.stamp.read().clone()
     }
 }
 
@@ -196,8 +264,15 @@ impl ViewRefreshReadAttestation {
 pub(crate) fn wrap_view_refresh_attestation(
     inner: Arc<dyn TableProvider>,
     attestation: ViewRefreshReadAttestation,
+    dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
 ) -> Arc<dyn TableProvider> {
-    spice_table::SpiceTable::over(Arc::new(AttestingViewProvider { attestation }), inner)
+    spice_table::SpiceTable::over(
+        Arc::new(AttestingViewProvider {
+            attestation,
+            dependency_refreshes,
+        }),
+        inner,
+    )
 }
 
 /// Federated-side layer for an accelerated view. `scan_with_args` classifies the
@@ -207,6 +282,7 @@ pub(crate) fn wrap_view_refresh_attestation(
 /// [`TableLayer`] method keeps its default and forwards to `below`.
 struct AttestingViewProvider {
     attestation: ViewRefreshReadAttestation,
+    dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
 }
 
 impl std::fmt::Debug for AttestingViewProvider {
@@ -214,12 +290,6 @@ impl std::fmt::Debug for AttestingViewProvider {
         f.debug_struct("AttestingViewProvider")
             .field("attestation", &self.attestation)
             .finish()
-    }
-}
-
-impl AttestingViewProvider {
-    fn record_executed(&self, plan: &dyn ExecutionPlan) {
-        self.attestation.record(classify_executed_read(plan));
     }
 }
 
@@ -244,7 +314,13 @@ impl TableLayer for AttestingViewProvider {
         let result = below.scan_with_args(state, args).await?;
         let plan = result.into_inner();
         if session_is_refresh_scan(state) {
-            self.record_executed(plan.as_ref());
+            let mut dependencies = Vec::with_capacity(self.dependency_refreshes.len());
+            for (name, refresh) in &self.dependency_refreshes {
+                let live = refresh.read().await;
+                dependencies.push((name.clone(), live.sample_materialization()));
+            }
+            self.attestation
+                .record_with_dependencies(classify_executed_read(plan.as_ref()), dependencies);
         }
         Ok(ScanResult::new(plan))
     }
@@ -2129,6 +2205,76 @@ mod tests {
                 .expect("a single-read executing-plan attestation may publish");
         }
 
+        /// Sequential model of Copilot `discussion_r4069124296`.
+        ///
+        /// View refreshes while dependency override B is active (configured=false).
+        /// Publish is withheld. Dependency later returns to configured A on a new
+        /// epoch without the view refreshing. Checking only "configured now" would
+        /// approve publishing B-derived rows under fingerprint A; binding the
+        /// dependency generation recorded at view-refresh time refuses that.
+        #[tokio::test]
+        async fn publish_gate_refuses_when_dependency_generation_moved_since_view_refresh() {
+            use runtime_component::dataset::acceleration::RefreshMode;
+            use runtime_table::accelerated::refresh::Refresh;
+            use tokio::sync::RwLock;
+
+            let dep_name = TableReference::bare("orders");
+            let dep_identity = MaterializationIdentity::new();
+            let dep_refresh = Arc::new(RwLock::new(
+                Refresh::new(RefreshMode::Full).with_materialization_identity(dep_identity.clone()),
+            ));
+
+            // Dependency is on override B: epoch 1, not configured.
+            let epoch_b = dep_identity.begin_refresh();
+            assert_eq!(epoch_b, 1);
+            dep_identity.set_configured(false);
+
+            let view_identity = MaterializationIdentity::new();
+            let attestation = ViewRefreshReadAttestation::with_identity(view_identity.clone());
+            let _view_epoch = view_identity.begin_refresh();
+            attestation.record_with_dependencies(
+                ViewReadShape::SingleScan {
+                    tables: vec![dep_name.clone()],
+                },
+                vec![(
+                    dep_name.clone(),
+                    MaterializationSample {
+                        epoch: epoch_b,
+                        configured: false,
+                    },
+                )],
+            );
+
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation.clone(),
+                vec![(dep_name.clone(), Arc::clone(&dep_refresh))],
+            );
+
+            let withheld = gate
+                .check_publish()
+                .await
+                .expect_err("publish while dependency override B must refuse");
+            assert!(
+                withheld.contains("not proven configured") || withheld.contains("orders"),
+                "{withheld}"
+            );
+
+            // Dependency returns to configured A on a new epoch; view has not refreshed.
+            let epoch_a = dep_identity.begin_refresh();
+            assert_eq!(epoch_a, 2);
+            dep_identity.set_configured(true);
+
+            let refused = gate
+                .check_publish()
+                .await
+                .expect_err("must refuse B-derived rows after dependency returns to A");
+            assert!(
+                refused.contains("different materialization") || refused.contains("orders"),
+                "refusal must name the generation mismatch, got {refused}"
+            );
+        }
+
         /// Sequential model of Copilot `discussion_r4010927556`.
         ///
         /// A snapshot holds the write mutex and samples `configured = true` at
@@ -2171,7 +2317,7 @@ mod tests {
                 tables: vec![TableReference::bare("orders")],
             });
             assert_eq!(
-                attestation.last_stamped().map(|(epoch, _)| epoch),
+                attestation.last_stamped().map(|stamp| stamp.epoch),
                 Some(epoch_next),
                 "the in-flight refresh stamps the new epoch"
             );
@@ -2243,7 +2389,8 @@ mod tests {
             let view_table = ViewTable::new(logical, Some("join view".to_string()));
             let attestation =
                 ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
-            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+            let wrapped =
+                wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone(), vec![]);
 
             let mut state = ctx.state();
             runtime_datafusion::refresh_scan::mark_refresh_scan(&mut state);
@@ -2282,7 +2429,8 @@ mod tests {
             let view_table = ViewTable::new(logical, Some("join view".to_string()));
             let attestation =
                 ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
-            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+            let wrapped =
+                wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone(), vec![]);
 
             let mut state = ctx.state();
             runtime_datafusion::refresh_scan::mark_refresh_scan(&mut state);
@@ -2312,7 +2460,8 @@ mod tests {
             let view_table = ViewTable::new(logical, Some("join view".to_string()));
             let attestation =
                 ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
-            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+            let wrapped =
+                wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone(), vec![]);
 
             let _plan = wrapped
                 .scan(&ctx.state(), None, &[], None)
@@ -2378,7 +2527,8 @@ mod tests {
                 .await
                 .expect("logical plan");
             let view_table = ViewTable::new(logical, Some("fallback scan".to_string()));
-            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+            let wrapped =
+                wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone(), vec![]);
             let _plan = wrapped
                 .scan(&ctx.state(), None, &[], None)
                 .await
@@ -2391,11 +2541,11 @@ mod tests {
                 "fallback must not flip MultipleReads→SingleScan at epoch {epoch}"
             );
             assert_eq!(
-                attestation.last_stamped().map(|(stamped_epoch, shape)| {
+                attestation.last_stamped().map(|stamp| {
                     (
-                        stamped_epoch,
+                        stamp.epoch,
                         matches!(
-                            shape,
+                            stamp.shape,
                             ViewReadShape::MultipleReads {
                                 reads: 2,
                                 exact_count: true,
