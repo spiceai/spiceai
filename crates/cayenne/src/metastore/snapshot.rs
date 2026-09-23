@@ -191,8 +191,10 @@ pub type SliceRow = Vec<SliceValue>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetMetastoreSlice {
     /// Slice format version: [`SLICE_FORMAT_VERSION`], or
-    /// [`SLICE_FORMAT_VERSION_FULL_CLEANUP`] when the slice carries partition
-    /// child tables. A build reads both and writes the lower of the two
+    /// [`SLICE_FORMAT_VERSION_FULL_CLEANUP`] when the slice carries anything
+    /// [`Self::rows_an_older_import_cannot_clear`] names — partition child
+    /// tables, *or* the blob-keyed marker rows an unpartitioned dataset can
+    /// carry on its own. A build reads both and writes the lower of the two
     /// whenever the payload allows it.
     pub format_version: u32,
     /// Engine identifier; must equal [`SLICE_ENGINE`] (`"cayenne"`).
@@ -592,7 +594,12 @@ impl DatasetMetastoreSlice {
         // Keyed by name rather than collected into two independent sets: the
         // name and the path have to be checked *together*, or a slice that
         // swaps two children's paths satisfies both sets on its own.
-        let mut expected_children: HashMap<String, &str> = HashMap::new();
+        // Keyed to the partition's *position*, not its path: `cayenne_partition`
+        // puts no unique constraint on `path`, so two partitions can name one
+        // directory, and covering "the path" would let a single child row stand
+        // in for both — leaving the other partition's child table absent from a
+        // slice this check is supposed to declare complete.
+        let mut expected_children: HashMap<String, usize> = HashMap::new();
         let mut partition_paths: Vec<&str> = Vec::new();
         let partition_owner_index = table_id_column_index("cayenne_partition");
         // Every `table_id` the slice carries a `cayenne_table` row for. A
@@ -628,6 +635,7 @@ impl DatasetMetastoreSlice {
             let Some(partition_path) = text_at(row, CAYENNE_PARTITION_PATH_INDEX) else {
                 continue;
             };
+            let partition_index = partition_paths.len();
             partition_paths.push(partition_path);
             let Some(values_json) = text_at(row, CAYENNE_PARTITION_VALUES_INDEX) else {
                 continue;
@@ -639,13 +647,13 @@ impl DatasetMetastoreSlice {
                 &self.dataset_name,
                 &values,
             ) {
-                expected_children.insert(name, partition_path);
+                expected_children.insert(name, partition_index);
             }
         }
 
         // Both sides were rewritten relative to the exporter's anchor, so a
         // child's path is comparable to its partition's without re-anchoring.
-        let mut partitions_with_a_child: HashSet<&str> = HashSet::new();
+        let mut partitions_with_a_child: HashSet<usize> = HashSet::new();
         for row in table_rows {
             let Some(name) = text_at(row, CAYENNE_TABLE_NAME_INDEX) else {
                 return refuse("one of its table rows has no readable name".to_string());
@@ -653,11 +661,12 @@ impl DatasetMetastoreSlice {
             if name == self.dataset_name {
                 continue;
             }
-            let Some(partition_path) = expected_children.get(name).copied() else {
+            let Some(partition_index) = expected_children.get(name).copied() else {
                 return refuse(format!(
                     "it carries a table '{name}' that is not one of this dataset's partition children, and importing it would replace an unrelated dataset's metadata"
                 ));
             };
+            let partition_path = partition_paths[partition_index];
             let child_path = text_at(row, CAYENNE_TABLE_PATH_INDEX);
             if child_path != Some(partition_path) {
                 return refuse(format!(
@@ -665,12 +674,13 @@ impl DatasetMetastoreSlice {
                     child_path.unwrap_or("no readable path")
                 ));
             }
-            partitions_with_a_child.insert(partition_path);
+            partitions_with_a_child.insert(partition_index);
         }
 
-        if let Some(orphan) = partition_paths
+        if let Some((_, orphan)) = partition_paths
             .iter()
-            .find(|path| !partitions_with_a_child.contains(*path))
+            .enumerate()
+            .find(|(index, _)| !partitions_with_a_child.contains(index))
         {
             return refuse(format!(
                 "its partition at '{orphan}' has no child table row, so the restored dataset could not be opened"
@@ -2215,5 +2225,70 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("upgrade the runtime"), "{message}");
+    }
+
+    /// Two partitions may name one directory — `cayenne_partition` puts no
+    /// unique constraint on `path` — so covering "the path" would let a single
+    /// child row stand in for both and pass a slice whose second child table is
+    /// missing. The restored dataset then fails to open at
+    /// `infer_existing_partitions`, which is exactly what the completeness half
+    /// of `validate` exists to prevent.
+    ///
+    /// Reported by Copilot on #14238 and reproduced before the fix: `export`
+    /// returned `Ok` and `validate` returned `Ok` for a slice carrying two
+    /// parent partitions at one path and one child table.
+    #[tokio::test]
+    async fn refuses_two_partitions_at_one_path_covered_by_a_single_child() {
+        let (ms, tmp) = fresh_metastore().await;
+        insert_dataset_without_children(
+            &ms,
+            "events",
+            tmp.path(),
+            &[
+                ("p1", "k1", "events.dir/shared"),
+                ("p2", "k2", "events.dir/shared"),
+            ],
+        )
+        .await;
+        // One child, for `k1` only, rooted at the directory both partitions name.
+        insert_partition_child(&ms, "events", "k1", tmp.path(), "events.dir/shared").await;
+
+        let err = export_dataset(ms.as_ref(), "events", tmp.path())
+            .await
+            .expect_err("a partition with no child table of its own must stop the export");
+        assert!(
+            err.to_string().contains("has no child table row"),
+            "err={err}"
+        );
+    }
+
+    /// The companion to the test above: two partitions at one path, each with
+    /// its own child, is legitimate and must still be accepted. Without this
+    /// the fix could have been "refuse duplicate paths", which would reject a
+    /// slice that restores perfectly well.
+    #[tokio::test]
+    async fn accepts_two_partitions_at_one_path_each_with_its_own_child() {
+        let (ms, tmp) = fresh_metastore().await;
+        insert_dataset_without_children(
+            &ms,
+            "events",
+            tmp.path(),
+            &[
+                ("p1", "k1", "events.dir/shared"),
+                ("p2", "k2", "events.dir/shared"),
+            ],
+        )
+        .await;
+        insert_partition_child(&ms, "events", "k1", tmp.path(), "events.dir/shared").await;
+        insert_partition_child(&ms, "events", "k2", tmp.path(), "events.dir/shared").await;
+
+        let slice = export_dataset(ms.as_ref(), "events", tmp.path())
+            .await
+            .expect("both partitions have a child, so the slice is complete");
+        assert_eq!(
+            slice.tables["cayenne_table"].len(),
+            3,
+            "the parent plus one child per partition"
+        );
     }
 }
