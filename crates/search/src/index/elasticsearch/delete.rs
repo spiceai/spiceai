@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -101,6 +101,14 @@ pub fn document_key_columns(primary_key: &[Field]) -> Vec<String> {
 /// comfortably under Elasticsearch's default `indices.query.bool.max_clause_count` (1024) and
 /// request-size limits, regardless of how many keys the caller is deleting in one call.
 const DELETE_CHUNK_ROWS: usize = 512;
+
+/// Member budget for one group-remainder `_delete_by_query` ([`group_requests`]). Whole key
+/// groups are accumulated until their members reach this many, which bounds both halves of the
+/// request at once: the `bool.should` clause count (one clause per group, and every group holds at
+/// least one member) and the `ids` list inside each clause. Spent in members rather than in
+/// clauses for that reason — [`DELETE_CHUNK_ROWS`] bounds one `should` clause per *row*, which is
+/// a different accounting.
+const PRUNE_MEMBERS_PER_REQUEST: usize = 512;
 
 /// Deletes every document whose `key_columns` match a row of `keys` — an exact-key delete when
 /// `key_columns` covers every `primary_key` column, a prefix delete when it's a strict subset
@@ -273,7 +281,7 @@ pub async fn delete_group_remainder(
     let groups = collect_groups(primary_key, es_index, &key_paths, members)?;
 
     let mut failure: Option<DataFusionError> = None;
-    for request in group_requests(&groups) {
+    for request in group_requests(groups) {
         let outcome = issue_delete_chunk(client, es_index, &request).await;
         if let Some(e) = outcome.failure {
             failure.get_or_insert(e);
@@ -300,11 +308,14 @@ struct MemberGroup {
 /// Gather `members` into one [`MemberGroup`] per distinct value of the group columns, in
 /// first-seen order.
 ///
-/// Rows are grouped by their rendered term values rather than by position, so nothing here
-/// depends on a group's rows being adjacent in `members`. A row that cannot be expressed as a
-/// `term` filter, or whose `_id` the write path would not have derived, drops the *whole* group
-/// it belongs to: those two halves address the same documents from opposite sides, so a group
-/// that loses either one can no longer name what to keep.
+/// Rows are grouped by the term values their key columns render to, so nothing here depends on a
+/// group's rows being adjacent in `members`, and two rows group together exactly when the same
+/// `term` filter would reach both — which is the property the emitted query relies on. A row that
+/// cannot be expressed as a `term` filter, or whose `_id` the write path would not have derived,
+/// drops the *whole* group it belongs to, whichever end of the batch it sits at: those two halves
+/// address the same documents from opposite sides, so a group that loses either one can no longer
+/// name what to keep. A dropped group is held as `None` in place rather than removed, so a later
+/// row for the same key cannot resurrect it.
 fn collect_groups(
     primary_key: &[Field],
     es_index: &str,
@@ -314,97 +325,94 @@ fn collect_groups(
     let ids = write::extract_primary_key_from_fields(primary_key, es_index, members)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let arrays: Vec<_> = key_paths
-        .iter()
-        .map(|p| members.column_by_name(&p.column).cloned())
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
-            DataFusionError::Plan(format!(
-                "group-remainder member batch is missing one of the group columns: {columns:?}"
-            ))
-        })?;
+    let arrays = key_column_arrays(key_paths, members, "group-remainder member batch")?;
 
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, MemberGroup> = HashMap::new();
-    let mut unaddressable: HashSet<String> = HashSet::new();
+    // Groups in first-seen order, `None` for one that turned out to be unaddressable; the map
+    // only locates a key's slot.
+    let mut groups: Vec<Option<MemberGroup>> = Vec::new();
+    let mut slots: HashMap<Vec<String>, usize> = HashMap::new();
 
-    for row in 0..members.num_rows() {
-        let mut terms = Vec::with_capacity(key_paths.len());
-        let mut values = Vec::with_capacity(key_paths.len());
-        for (key_path, array) in key_paths.iter().zip(&arrays) {
-            let value = ScalarValue::try_from_array(array.as_ref(), row)?;
-            let Some(json_value) = scalar_to_term_value(&value) else {
-                terms.clear();
-                break;
-            };
-            values.push(json_value.to_string());
-            terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
-        }
-        if terms.is_empty() {
+    for (row, id) in ids.into_iter().enumerate() {
+        let Some(values) = row_term_values(key_paths, &arrays, row)? else {
             // No group identity, so this row names no group to protect or prune.
-            continue;
-        }
-        let identity = values.join("\u{1}");
-
-        let Some(id) = ids.get(row).and_then(Option::as_ref) else {
-            // The write path stores no document for a row whose `_id` it cannot derive, so this
-            // group's membership is not fully known — leave it alone entirely.
-            unaddressable.insert(identity);
             continue;
         };
 
-        match groups.entry(identity.clone()) {
-            Entry::Occupied(mut e) => e.get_mut().survivors.push(id.clone()),
+        let slot = match slots.entry(values.iter().map(ToString::to_string).collect()) {
+            Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
-                order.push(identity);
-                e.insert(MemberGroup {
-                    terms,
-                    survivors: vec![id.clone()],
-                });
+                groups.push(Some(MemberGroup {
+                    terms: term_clauses(key_paths, &values),
+                    survivors: Vec::new(),
+                }));
+                *e.insert(groups.len() - 1)
             }
+        };
+
+        match id {
+            Some(id) => {
+                if let Some(group) = groups[slot].as_mut() {
+                    group.survivors.push(id);
+                }
+            }
+            // The write path stores no document for a row whose `_id` it cannot derive, so this
+            // group's membership is not fully known — leave it alone entirely.
+            None => groups[slot] = None,
         }
     }
 
-    Ok(order
+    Ok(groups
         .into_iter()
-        .filter(|identity| !unaddressable.contains(identity))
-        .filter_map(|identity| groups.remove(&identity))
+        .flatten()
+        // Belt and braces: an empty `must_not` would make the group's filter delete the whole
+        // group, members included. Every surviving group holds at least one member by
+        // construction, since each row either contributes one or drops the group.
+        .filter(|group| !group.survivors.is_empty())
         .collect())
 }
 
 /// Split `groups` into `_delete_by_query` bodies, never splitting a group across two of them.
 ///
-/// Each request holds whole groups up to [`DELETE_CHUNK_ROWS`] members, so both the `should`
-/// clause count and the `_id` list stay bounded regardless of how many chunks a row produced; a
-/// single group larger than that budget is issued on its own rather than split.
-fn group_requests(groups: &[MemberGroup]) -> Vec<Value> {
+/// Each request holds whole groups up to [`PRUNE_MEMBERS_PER_REQUEST`] members; a single group
+/// larger than that budget is issued on its own rather than split.
+fn group_requests(groups: Vec<MemberGroup>) -> Vec<Value> {
     let mut requests = Vec::new();
     let mut clauses: Vec<Value> = Vec::new();
     let mut members = 0usize;
 
     for group in groups {
-        if !clauses.is_empty() && members + group.survivors.len() > DELETE_CHUNK_ROWS {
-            requests.push(json!({
-                "bool": { "should": std::mem::take(&mut clauses), "minimum_should_match": 1 }
-            }));
+        if !clauses.is_empty() && members + group.survivors.len() > PRUNE_MEMBERS_PER_REQUEST {
+            requests.push(should_match_one(std::mem::take(&mut clauses)));
             members = 0;
         }
-        let survivors: Vec<Value> = group.survivors.iter().cloned().map(Value::String).collect();
+        members += group.survivors.len();
         clauses.push(json!({
             "bool": {
                 "filter": group.terms,
-                "must_not": [{ "ids": { "values": survivors } }]
+                "must_not": [ids_query(&group.survivors)]
             }
         }));
-        members += group.survivors.len();
     }
 
     if !clauses.is_empty() {
-        requests.push(json!({ "bool": { "should": clauses, "minimum_should_match": 1 } }));
+        requests.push(should_match_one(clauses));
     }
 
     requests
+}
+
+/// `{"bool": {"should": [...], "minimum_should_match": 1}}` — the clauses ORed.
+///
+/// Assembled rather than written as a `json!` literal so `clauses` is moved into the body; the
+/// macro would take it by reference and rebuild every clause it already holds.
+fn should_match_one(clauses: Vec<Value>) -> Value {
+    let mut bool_query = serde_json::Map::new();
+    bool_query.insert("should".to_string(), Value::Array(clauses));
+    bool_query.insert("minimum_should_match".to_string(), Value::from(1));
+
+    let mut query = serde_json::Map::new();
+    query.insert("bool".to_string(), Value::Object(bool_query));
+    Value::Object(query)
 }
 
 /// What issuing one `_delete_by_query` chunk produced: the failure to report, if any, and
@@ -466,11 +474,10 @@ pub async fn delete_by_ids(
     let mut failure: Option<DataFusionError> = None;
 
     for chunk in ids.chunks(DELETE_CHUNK_ROWS) {
-        let values: Vec<Value> = chunk.iter().cloned().map(Value::String).collect();
-        if values.is_empty() {
+        if chunk.is_empty() {
             continue;
         }
-        let query = json!({ "ids": { "values": values } });
+        let query = ids_query(chunk);
 
         let outcome = issue_delete_chunk(client, es_index, &query).await;
         if let Some(e) = outcome.failure {
@@ -665,12 +672,12 @@ fn build_ids_query(
     let ids = write::extract_primary_key_from_fields(primary_key, es_index, keys)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let values: Vec<Value> = ids.into_iter().flatten().map(Value::String).collect();
+    let values: Vec<String> = ids.into_iter().flatten().collect();
     if values.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(json!({ "ids": { "values": values } })))
+    Ok(Some(ids_query(&values)))
 }
 
 /// Builds `{"bool": {"should": [{"bool": {"filter": [{"term": {...}}, ...]}}, ...], "minimum_should_match": 1}}`
@@ -687,32 +694,14 @@ fn build_or_of_row_term_queries(
         return Ok(None);
     }
 
-    let arrays: Vec<_> = key_paths
-        .iter()
-        .map(|p| keys.column_by_name(&p.column).cloned())
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
-            DataFusionError::Plan(format!(
-                "delete key batch is missing one of the requested key columns: {columns:?}"
-            ))
-        })?;
+    let arrays = key_column_arrays(key_paths, keys, "delete key batch")?;
 
     let mut row_clauses = Vec::with_capacity(keys.num_rows());
     for row in 0..keys.num_rows() {
-        let mut terms = Vec::with_capacity(key_paths.len());
-        for (key_path, array) in key_paths.iter().zip(&arrays) {
-            let value = ScalarValue::try_from_array(array.as_ref(), row)?;
-            let Some(json_value) = scalar_to_term_value(&value) else {
-                // A NULL/unsupported key column can never equal anything via `term` — skip this
-                // row's clause entirely rather than emit a filter that matches everything.
-                terms.clear();
-                break;
-            };
-            terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
-        }
-        if !terms.is_empty() {
-            row_clauses.push(json!({ "bool": { "filter": terms } }));
+        // A row with a value no `term` can express is skipped entirely rather than filtered on
+        // what is left of its key — see `row_term_values`.
+        if let Some(values) = row_term_values(key_paths, &arrays, row)? {
+            row_clauses.push(json!({ "bool": { "filter": term_clauses(key_paths, &values) } }));
         }
     }
 
@@ -720,12 +709,65 @@ fn build_or_of_row_term_queries(
         return Ok(None);
     }
 
-    Ok(Some(json!({
-        "bool": {
-            "should": row_clauses,
-            "minimum_should_match": 1
-        }
-    })))
+    Ok(Some(should_match_one(row_clauses)))
+}
+
+/// The arrays `key_paths` names in `batch`, in the same order. `what` names the batch in the
+/// error, which is the caller's own vocabulary for it.
+fn key_column_arrays(
+    key_paths: &[KeyFieldPath],
+    batch: &RecordBatch,
+    what: &str,
+) -> DataFusionResult<Vec<ArrayRef>> {
+    key_paths
+        .iter()
+        .map(|p| batch.column_by_name(&p.column).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
+            DataFusionError::Plan(format!(
+                "{what} is missing one of the requested key columns: {columns:?}"
+            ))
+        })
+}
+
+/// The values one row of `arrays` would be matched on, or `None` when any of its key columns
+/// holds a value no `term` can express.
+///
+/// `None` is the whole row, not the one column: a filter built from the rest would name fewer
+/// columns than the key has and so match documents the row does not identify — reporting that as
+/// a successful delete is the failure this addressing exists to avoid (#13714). Both
+/// [`build_or_of_row_term_queries`] and [`collect_groups`] read the rule from here so the two
+/// cannot drift on it.
+fn row_term_values(
+    key_paths: &[KeyFieldPath],
+    arrays: &[ArrayRef],
+    row: usize,
+) -> DataFusionResult<Option<Vec<Value>>> {
+    let mut values = Vec::with_capacity(key_paths.len());
+    for array in arrays {
+        let value = ScalarValue::try_from_array(array.as_ref(), row)?;
+        let Some(json_value) = scalar_to_term_value(&value) else {
+            return Ok(None);
+        };
+        values.push(json_value);
+    }
+    Ok(Some(values))
+}
+
+/// One `{"term": {path: value}}` per key column, naming the field path each column's stored value
+/// is matched on.
+fn term_clauses(key_paths: &[KeyFieldPath], values: &[Value]) -> Vec<Value> {
+    key_paths
+        .iter()
+        .zip(values)
+        .map(|(key_path, value)| json!({ "term": { key_path.path.as_str(): value } }))
+        .collect()
+}
+
+/// `{"ids": {"values": [...]}}` — documents addressed by the `_id` the write path stored.
+fn ids_query(values: &[String]) -> Value {
+    json!({ "ids": { "values": values } })
 }
 
 /// The Elasticsearch field a key column's values are matched on, and the length past which that
@@ -1356,11 +1398,10 @@ mod tests {
         .expect("member batch should build")
     }
 
+    /// The primary key a chunked index actually has, taken from the augmentation the chunking
+    /// layer applies rather than re-spelled here, so these tests cannot drift from it.
     fn chunked_key() -> Vec<Field> {
-        vec![
-            pk("id", DataType::Utf8),
-            pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
-        ]
+        ChunkedSearchIndex::augment_primary_key(vec![pk("id", DataType::Utf8)])
     }
 
     /// The `_id`s a `must_not` clause protects, for every `should` clause of `query`.

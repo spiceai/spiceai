@@ -1468,7 +1468,6 @@ mod chunked_group_pruning_tests {
     #[derive(Debug, Default)]
     struct StoreClient {
         docs: StdMutex<Vec<(String, Value)>>,
-        queries: StdMutex<Vec<Value>>,
     }
 
     impl StoreClient {
@@ -1482,13 +1481,6 @@ mod chunked_group_pruning_tests {
                 .collect();
             chunk_ids.sort_unstable();
             chunk_ids
-        }
-
-        fn queries(&self) -> Vec<Value> {
-            self.queries
-                .lock()
-                .expect("queries mutex should not be poisoned")
-                .clone()
         }
     }
 
@@ -1505,32 +1497,24 @@ mod chunked_group_pruning_tests {
             let field = path.strip_suffix(".keyword").unwrap_or(path);
             return Some(doc.get(field) == Some(wanted));
         }
+        // `filter` / `should` / `must_not` are always arrays in the bodies this module emits, so
+        // any other spelling is a shape the model does not implement rather than an empty one.
         let b = query.get("bool")?.as_object()?;
         let all = |key: &str| -> Option<bool> {
             match b.get(key) {
                 None => Some(true),
-                Some(Value::Array(clauses)) => {
-                    let mut ok = true;
-                    for clause in clauses {
-                        ok &= matches(clause, id, doc)?;
-                    }
-                    Some(ok)
-                }
-                Some(one) => matches(one, id, doc),
+                Some(Value::Array(clauses)) => clauses
+                    .iter()
+                    .try_fold(true, |ok, clause| Some(ok & matches(clause, id, doc)?)),
+                Some(_) => None,
             }
         };
-        let mut ok = all("filter")? && all("must")?;
-        if let Some(Value::Array(shoulds)) = b.get("should") {
-            let minimum = b
-                .get("minimum_should_match")
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
-            let mut hits = 0u64;
-            for clause in shoulds {
-                if matches(clause, id, doc)? {
-                    hits += 1;
-                }
-            }
+        let mut ok = all("filter")?;
+        if let Some(shoulds) = b.get("should") {
+            let minimum = b.get("minimum_should_match")?.as_u64()?;
+            let hits = shoulds.as_array()?.iter().try_fold(0u64, |hits, clause| {
+                Some(hits + u64::from(matches(clause, id, doc)?))
+            })?;
             ok &= hits >= minimum;
         }
         match b.get("must_not") {
@@ -1540,7 +1524,7 @@ mod chunked_group_pruning_tests {
                     ok &= !matches(clause, id, doc)?;
                 }
             }
-            Some(one) => ok &= !matches(one, id, doc)?,
+            Some(_) => return None,
         }
         Some(ok)
     }
@@ -1576,11 +1560,6 @@ mod chunked_group_pruning_tests {
         }
 
         async fn delete_by_query(&self, _index: &str, query: &Value) -> EsResult<Value> {
-            self.queries
-                .lock()
-                .expect("queries mutex should not be poisoned")
-                .push(query.clone());
-
             let mut store = self.docs.lock().expect("docs mutex should not be poisoned");
             let mut doomed = HashSet::new();
             for (id, doc) in store.iter() {
@@ -1751,16 +1730,6 @@ mod chunked_group_pruning_tests {
         idx.write(content_rows(&[(1, "ccc")]))
             .await
             .expect("the rewrite lands");
-
-        println!("PROBE queries issued = {:#}", json!(client.queries()));
-        println!(
-            "PROBE stored chunk ids for id=1 = {:?}",
-            client.stored_chunk_ids(1)
-        );
-        println!(
-            "PROBE stored chunk ids for id=2 = {:?}",
-            client.stored_chunk_ids(2)
-        );
 
         assert_eq!(
             client.stored_chunk_ids(1),
