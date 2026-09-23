@@ -1588,6 +1588,7 @@ mod chunked_group_pruning_tests {
                 fields: None,
                 ignore_above: None,
                 index: None,
+                normalizer: None,
                 dims: None,
                 similarity: None,
             };

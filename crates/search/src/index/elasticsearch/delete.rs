@@ -71,6 +71,15 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped with the normalizer '{normalizer}', so an exact-match filter on it also matches every other value that normalizes the same way — deleting one row's documents would reach another row's — and it has no unnormalized exact-match sub-field either; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword` with no `normalizer`; Elasticsearch cannot change an existing field's normalizer. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyColumnNormalized {
+        index: String,
+        column: String,
+        normalizer: String,
+    },
+
+    #[snafu(display(
         "Failed to delete rows from the search index '{index}' (elasticsearch): a key in column '{column}' is {length} characters, past the `ignore_above: {ignore_above}` of the '{path}' field it is matched on, so Elasticsearch never indexed it and no filter can address its documents; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword` with no `ignore_above`. See: https://spiceai.org/docs/features/search"
     ))]
     KeyValueNotIndexed {
@@ -816,6 +825,10 @@ const TERM_EXACT_FIELD_TYPES: &[&str] = &[
 /// matches nothing however exact its type is.
 fn is_term_exact(mapping: &FieldMapping) -> bool {
     mapping.is_indexed()
+        // A normalizer is applied to the query's value as well as the stored one, so `term` on a
+        // normalized field matches every value that normalizes the same way. That is exact
+        // enough to find a row's documents and not exact enough to stop at them.
+        && mapping.normalizer.is_none()
         && mapping
             .field_type
             .as_deref()
@@ -906,6 +919,16 @@ async fn resolve_term_exact_paths(
             });
 
         let Some((sub_name, sub_mapping)) = exact_sub else {
+            // A normalized column is refused by name: the generic message would say it cannot be
+            // matched at all, when the real hazard is that it matches too much.
+            if let Some(normalizer) = mapping.normalizer.as_deref() {
+                return KeyColumnNormalizedSnafu {
+                    index: es_index.to_string(),
+                    column: column.clone(),
+                    normalizer: normalizer.to_string(),
+                }
+                .fail();
+            }
             return KeyColumnNotExactlyMatchableSnafu {
                 index: es_index.to_string(),
                 column: column.clone(),
@@ -1242,6 +1265,7 @@ mod tests {
             fields: None,
             ignore_above: None,
             index: None,
+            normalizer: None,
             dims: None,
             similarity: None,
         }
@@ -1585,6 +1609,93 @@ mod tests {
             protected_ids(&client.queries()[0]),
             vec![vec!["{\"_spice.chunk_id\":0,\"id\":\"b\"}".to_string()]],
             "only the group whose every member could be named is pruned"
+        );
+    }
+
+    fn normalized_keyword(normalizer: &str) -> FieldMapping {
+        FieldMapping {
+            normalizer: Some(normalizer.to_string()),
+            ..field_mapping("keyword")
+        }
+    }
+
+    /// A `keyword` key column with a normalizer looks exactly matchable and is not: Elasticsearch
+    /// normalizes a `term` query's value too, so a filter on `A` also matches the documents of a
+    /// distinct row keyed `a`.
+    ///
+    /// On the prune that is worse than over-deleting, which is what it would be on a delete: the
+    /// sibling's `_id`s are in no group's `must_not`, so an ordinary write of `A` would remove the
+    /// chunks of a row `a` that still exists and was never written. The mapping is refused before
+    /// a request is issued instead.
+    #[tokio::test]
+    async fn a_normalized_group_column_refuses_before_issuing() {
+        let client = RecordingClient::mapped(vec![("id", normalized_keyword("lowercase"))]);
+
+        let err = delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("A"), 0)]),
+        )
+        .await
+        .expect_err("a normalized group column must fail the prune");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id'") && message.contains("lowercase"),
+            "the error must name the column and its normalizer, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued against a key field that matches sibling values"
+        );
+    }
+
+    /// The same mapping is refused on the partial-key delete, which shares the resolution. There
+    /// the filter over-deletes rather than crossing into a live row, but it is the same field that
+    /// cannot address one row's documents and the same refusal.
+    #[tokio::test]
+    async fn a_normalized_key_column_refuses_a_partial_key_delete_too() {
+        let client = RecordingClient::mapped(vec![("id", normalized_keyword("lowercase"))]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &string_key_batch(vec![Some("A")]),
+        )
+        .await
+        .expect_err("a normalized key column must fail the delete");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// A normalized column that also carries an unnormalized exact sub-field is still addressable
+    /// — on that sub-field. Refusing it would fail a delete the index can serve exactly.
+    #[tokio::test]
+    async fn a_normalized_column_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut normalized = normalized_keyword("lowercase");
+        normalized.fields = Some(std::collections::HashMap::from([(
+            "exact".to_string(),
+            field_mapping("keyword"),
+        )]));
+        let client = RecordingClient::mapped(vec![("id", normalized)]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("A"), 0)]),
+        )
+        .await
+        .expect("the prune should succeed on the exact sub-field");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.exact": "A"}}]),
         );
     }
 
