@@ -529,7 +529,11 @@ pub enum SnapshotUploadError {
         "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema, and the change is not a lossless widening that snapshot schema versioning can record. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
     ))]
     UploadSchemaMismatch { dataset: String, details: String },
-    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
+    #[snafu(display(
+        "Failed to snapshot dataset '{dataset}': there is no acceleration file at {path:?} to snapshot, so no snapshot was created and the dataset's newest snapshot is unchanged. Check the acceleration is loaded and that its file has not been removed. See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MissingAccelerationFile { dataset: String, path: PathBuf },
+    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}: {source}"))]
     CopyLocal {
         source_path: PathBuf,
         dest_path: PathBuf,
@@ -1286,6 +1290,20 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
+        // Every engine hook below opens the accelerator file as a database, and each
+        // driver's open CREATES one at a path that has none — so an absent file would be
+        // materialized as an empty database and published by the copy below as this
+        // dataset's snapshot. Refuse it here, where the answer is the same for every
+        // engine and the message can name the dataset. The caller holds the accelerator
+        // write lock, so nothing removes the file between this check and the copy.
+        ensure!(
+            source_local_path.is_file(),
+            MissingAccelerationFileSnafu {
+                dataset: self.dataset_name.clone(),
+                path: source_local_path.clone(),
+            }
+        );
+
         // Step 0: Engine-specific live checkpoint while the lock is held.
         // For DuckDB/SQLite/Turso this drains the write-ahead log into the main
         // file so that the subsequent `fs::copy` produces a self-contained
@@ -5171,14 +5189,14 @@ mod tests {
         );
     }
 
-    /// An absent accelerator file must fail the snapshot, not become one. `DuckDB`'s
-    /// `Connection::open` creates a database at a path that has none, so a checkpoint hook
-    /// that opened unconditionally would materialize an empty database and the copy would
-    /// publish it as this dataset's snapshot — leaving `current_snapshot_id` pointing at
-    /// an empty database for the next restore to bootstrap from.
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn an_absent_accelerator_file_fails_the_snapshot_rather_than_becoming_one() {
+    /// An absent accelerator file must fail the snapshot, not become one. Every engine
+    /// hook opens that file as a database, and each driver's open creates one at a path
+    /// that has none — so without the guard in `create_file_snapshot` the hook would
+    /// materialize an empty database and the copy would publish it as this dataset's
+    /// snapshot, leaving `current_snapshot_id` pointing at an empty database for the next
+    /// restore to bootstrap from. Generic because the contract is the caller's, not any
+    /// one engine's (#13912).
+    async fn generic_an_absent_accelerator_file_fails_the_snapshot(engine: &AccelerationEngine) {
         let store = Arc::new(InMemory::new());
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("absent.db");
@@ -5193,7 +5211,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            &AccelerationEngine::DuckDB,
+            engine,
             false,
         );
 
@@ -5205,13 +5223,35 @@ mod tests {
             .expect_err("an absent accelerator file must fail the snapshot");
 
         assert!(
-            matches!(err, SnapshotUploadError::CopyLocal { .. }),
-            "the copy must be what fails, not a checkpoint of a database the hook made: {err}"
+            matches!(err, SnapshotUploadError::MissingAccelerationFile { .. }),
+            "the missing file must be named, not reached as a copy failure: {err}"
         );
         assert!(
             !local_path.exists(),
-            "the hook must not bring the accelerator file into existence"
+            "no engine hook may bring the accelerator file into existence"
         );
+        assert!(
+            store.list(None).next().await.is_none(),
+            "nothing may be published when there is no accelerator file to snapshot"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::DuckDB).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Turso).await;
     }
 
     #[cfg(feature = "duckdb")]
