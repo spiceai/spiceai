@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use app::AppBuilder;
-use arrow::array::{Array, StringArray, UInt16Array};
+use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt16Array};
 use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use datafusion::error::DataFusionError;
@@ -96,6 +96,7 @@ struct Origin {
     fetches: Arc<AtomicUsize>,
     status: Arc<AtomicU16>,
     empty_fault_body: Arc<std::sync::atomic::AtomicBool>,
+    delay_ms: Arc<AtomicUsize>,
     shutdown: oneshot::Sender<()>,
 }
 
@@ -107,6 +108,8 @@ impl Origin {
         let status_for_handler = Arc::clone(&status);
         let empty_fault_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let empty_fault_body_for_handler = Arc::clone(&empty_fault_body);
+        let delay_ms = Arc::new(AtomicUsize::new(0));
+        let delay_for_handler = Arc::clone(&delay_ms);
         let (tx, rx) = oneshot::channel::<()>();
 
         let app = Router::new().route(
@@ -115,8 +118,13 @@ impl Origin {
                 let counter = Arc::clone(&counter);
                 let status = Arc::clone(&status_for_handler);
                 let empty_fault_body = Arc::clone(&empty_fault_body_for_handler);
+                let delay_ms = Arc::clone(&delay_for_handler);
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(
+                        u64::try_from(delay_ms.load(Ordering::SeqCst)).expect("delay fits in u64"),
+                    ))
+                    .await;
                     let current_status = status.load(Ordering::SeqCst);
                     if current_status != 200 {
                         let code =
@@ -160,6 +168,7 @@ impl Origin {
             fetches,
             status,
             empty_fault_body,
+            delay_ms,
             shutdown: tx,
         }
     }
@@ -175,6 +184,13 @@ impl Origin {
     /// (see `cache::batches_cacheable`), not a send error.
     fn set_status(&self, status: u16) {
         self.status.store(status, Ordering::SeqCst);
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay_ms.store(
+            usize::try_from(delay.as_millis()).expect("test delay fits in usize"),
+            Ordering::SeqCst,
+        );
     }
 
     /// Like [`Self::set_status`], but the fault body is empty instead of
@@ -393,6 +409,27 @@ async fn cached_rows(rt: &Runtime) -> usize {
         .sum()
 }
 
+/// The stored fetch timestamp from an unfiltered acceleration read.
+async fn cached_fetch_timestamp(rt: &Runtime) -> i64 {
+    let batches = rt
+        .datafusion()
+        .ctx
+        .table("http_data")
+        .await
+        .expect("table")
+        .select(vec![col("_fetched_at")])
+        .expect("timestamp column")
+        .collect()
+        .await
+        .expect("cached timestamp query");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("nanosecond timestamp")
+        .value(0)
+}
+
 /// Polls `cached_rows` until it reaches `want`, returning the instant it did —
 /// the reference the read points below are measured from.
 async fn wait_for_cached_rows(
@@ -559,6 +596,129 @@ async fn enabled_serves_stale_with_no_bound() -> Result<(), anyhow::Error> {
         vec![200; ROWS],
         "`enabled` keeps serving the stale rows where a finite window would have stopped"
     );
+    Ok(())
+}
+
+/// The zero-TTL fallback fetches the origin on every keyed read, but reads the
+/// accelerator only if that fetch fails and its stored row fits the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_ttl_fallback_handles_success_failures_timeout_and_recovery()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+    let origin = Origin::start().await;
+    let mut dataset = caching_dataset(
+        &origin,
+        "4s",
+        None,
+        Mode::Memory,
+        vec![
+            ("caching_ttl".to_string(), "0s".to_string()),
+            (
+                "caching_stale_while_revalidate_ttl".to_string(),
+                "0s".to_string(),
+            ),
+        ],
+    );
+    dataset.params.as_mut().expect("params").data.insert(
+        "client_timeout".to_string(),
+        spicepod::param::ParamValue::String("1".to_string()),
+    );
+    let rt = build_runtime(dataset, "zero_ttl_backend_first").await;
+
+    let first = fetch_statuses(&rt, "key=a").await?;
+    assert_eq!(first, vec![200; ROWS]);
+    wait_for_cached_rows(&rt, ROWS, Duration::from_secs(10))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let before = origin.fetches();
+    let stored_before = cached_fetch_timestamp(&rt).await;
+    // The origin's HTTP Date header has whole-second precision.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(fetch_statuses(&rt, "key=a").await?, first);
+    assert!(
+        origin.fetches() > before,
+        "a cache hit must not hide a healthy origin"
+    );
+    let refresh_deadline = Instant::now() + Duration::from_secs(10);
+    while cached_fetch_timestamp(&rt).await <= stored_before && Instant::now() < refresh_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cached_fetch_timestamp(&rt).await > stored_before,
+        "the successful backend response must replace the stored entry: before={stored_before} after={} rows={} origin_fetches={}",
+        cached_fetch_timestamp(&rt).await,
+        cached_rows(&rt).await,
+        origin.fetches(),
+    );
+
+    origin.set_status(503);
+    assert_eq!(
+        fetch_statuses(&rt, "key=a").await?,
+        first,
+        "503 uses the stored response"
+    );
+    origin.set_delay(Duration::from_secs(2));
+    assert_eq!(
+        fetch_statuses(&rt, "key=a").await?,
+        first,
+        "timeout uses the stored response"
+    );
+    origin.set_delay(Duration::ZERO);
+    assert_eq!(
+        fetch_statuses(&rt, "key=missing").await?,
+        vec![503],
+        "a missing key cannot fall back"
+    );
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let expired = fetch_statuses(&rt, "key=a").await?;
+    assert_eq!(
+        expired,
+        vec![503],
+        "a row past the configured window is not served"
+    );
+    origin.set_status(200);
+    let recovered = fetch_statuses(&rt, "key=a").await?;
+    assert_eq!(recovered, first);
+    let observed = origin.fetches();
+    assert_eq!(fetch_statuses(&rt, "key=a").await?, first);
+    assert!(
+        origin.fetches() > observed,
+        "recovery keeps the backend-first path"
+    );
+    Ok(())
+}
+
+/// The disabled fallback uses the cache-first path even with zero TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_ttl_disabled_fallback_preserves_origin_error_and_cache_writes()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+    let origin = Origin::start().await;
+    let dataset = caching_dataset(
+        &origin,
+        "disabled",
+        None,
+        Mode::Memory,
+        vec![
+            ("caching_ttl".to_string(), "0s".to_string()),
+            (
+                "caching_stale_while_revalidate_ttl".to_string(),
+                "0s".to_string(),
+            ),
+        ],
+    );
+    let rt = build_runtime(dataset, "zero_ttl_disabled").await;
+    assert_eq!(fetch_statuses(&rt, "key=a").await?, vec![200; ROWS]);
+    wait_for_cached_rows(&rt, ROWS, Duration::from_secs(10))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    origin.set_status(503);
+    assert_eq!(fetch_statuses(&rt, "key=a").await?, vec![503]);
+    origin.set_status(200);
+    assert_eq!(fetch_statuses(&rt, "key=a").await?, vec![200; ROWS]);
     Ok(())
 }
 
