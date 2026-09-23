@@ -30,7 +30,7 @@ chrono.workspace = true
 data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["mysql"] }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["mysql", "mysql-federation"] }
+datafusion-table-providers = { workspace = true, features = ["mysql"] }
 fundu.workspace = true
 futures.workspace = true
 linkme.workspace = true

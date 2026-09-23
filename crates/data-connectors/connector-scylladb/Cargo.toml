@@ -29,7 +29,7 @@ async-trait.workspace = true
 data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["federation"] }
+datafusion-table-providers = { workspace = true }
 futures.workspace = true
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }

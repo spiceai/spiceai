@@ -34,7 +34,7 @@ serde_json.workspace = true
 data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["postgres"] }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }
+datafusion-table-providers = { workspace = true, features = ["postgres"] }
 fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true

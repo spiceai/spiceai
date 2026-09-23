@@ -30,7 +30,7 @@ async-trait.workspace = true
 blake3.workspace = true
 data_components = { path = "../../data_components", features = ["adbc"] }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["adbc-federation"] }
+datafusion-table-providers = { workspace = true, features = ["adbc"] }
 futures.workspace = true
 parking_lot.workspace = true
 runtime-component = { path = "../../runtime-component" }
