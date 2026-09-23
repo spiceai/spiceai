@@ -3930,6 +3930,63 @@ fn compact_sampled_views(picked: ArrayRef) -> ArrayRef {
     }
 }
 
+/// Query-pool charge taken *before* a sample allocation, then settled to the
+/// bytes the allocation actually holds. A refused grow leaves the copy
+/// unstarted, so a first load that cannot afford the sample hashes instead of
+/// running it outside `runtime.query.memory_limit`.
+struct SampleAdmission<'a> {
+    charge: &'a MemoryReservation,
+    estimate: usize,
+}
+
+impl<'a> SampleAdmission<'a> {
+    fn try_begin(charge: &'a MemoryReservation, estimate: usize) -> Option<Self> {
+        charge.try_grow(estimate).ok()?;
+        Some(Self { charge, estimate })
+    }
+
+    fn settle(self, actual: usize) -> Option<()> {
+        match actual.cmp(&self.estimate) {
+            std::cmp::Ordering::Equal => Some(()),
+            std::cmp::Ordering::Less => {
+                self.charge.shrink(self.estimate - actual);
+                Some(())
+            }
+            std::cmp::Ordering::Greater => self.charge.try_grow(actual - self.estimate).ok(),
+        }
+    }
+}
+
+/// Bytes `take` of `n` values may hold before compaction: the parent buffers
+/// (shared by a view) plus a compact copy of the picked slots.
+fn estimate_take_bytes(column: &dyn Array, n: usize) -> usize {
+    column
+        .get_array_memory_size()
+        .saturating_add(n.saturating_mul(8))
+        .saturating_add(64)
+}
+
+fn estimate_concat_bytes(parts: &[ArrayRef]) -> usize {
+    parts
+        .iter()
+        .map(Array::get_array_memory_size)
+        .fold(64_usize, usize::saturating_add)
+}
+
+fn estimate_cast_bytes(sample: &dyn Array, key_type: &DataType) -> usize {
+    let n = sample.len();
+    let dest = match key_type {
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView => n.saturating_mul(48),
+        _ => n.saturating_mul(16),
+    };
+    sample.get_array_memory_size().max(dest).saturating_add(64)
+}
+
 /// Up to `shards - 1` strictly ascending split points cutting the non-NULL
 /// values of `sample` into equal-count slices, for any type the range router can
 /// compare (see [`is_range_routable_type`]). NULLs are skipped; the router keeps
@@ -17706,31 +17763,30 @@ impl CayenneTableProvider {
                 }
             }
             if !indices.is_empty() {
+                let column = batch.column(key_index).as_ref();
+                let admission = SampleAdmission::try_begin(
+                    &sample_charge,
+                    estimate_take_bytes(column, indices.len()),
+                )?;
                 let picked = compact_sampled_views(
-                    arrow::compute::take(
-                        batch.column(key_index).as_ref(),
-                        &UInt32Array::from(indices),
-                        None,
-                    )
-                    .ok()?,
+                    arrow::compute::take(column, &UInt32Array::from(indices), None).ok()?,
                 );
-                sample_charge
-                    .try_grow(picked.get_array_memory_size())
-                    .ok()?;
+                admission.settle(picked.get_array_memory_size())?;
                 parts.push(picked);
             }
             position = position.saturating_add(rows);
         }
         let refs: Vec<&dyn Array> = parts.iter().map(AsRef::as_ref).collect();
+        let admission = SampleAdmission::try_begin(&sample_charge, estimate_concat_bytes(&parts))?;
         let sample = arrow::compute::concat(&refs).ok()?;
-        sample_charge
-            .try_grow(sample.get_array_memory_size())
-            .ok()?;
+        admission.settle(sample.get_array_memory_size())?;
         let sample = if sample.data_type() == key_type {
             sample
         } else {
+            let admission =
+                SampleAdmission::try_begin(&sample_charge, estimate_cast_bytes(&sample, key_type))?;
             let cast = arrow::compute::cast(&sample, key_type).ok()?;
-            sample_charge.try_grow(cast.get_array_memory_size()).ok()?;
+            admission.settle(cast.get_array_memory_size())?;
             cast
         };
         // NULL keys all route to the first shard; past one shard's share of the
@@ -46793,6 +46849,85 @@ mod tests {
         MemoryConsumer::new("input_range_sample_test").register(&pool)
     }
 
+    /// Records each successful `try_grow` / `grow` so a test can see that the
+    /// sample is charged *before* `take` / `concat` / `cast`, not after.
+    struct RecordingPool {
+        inner: datafusion::execution::memory_pool::GreedyMemoryPool,
+        grows: ParkingMutex<Vec<usize>>,
+    }
+
+    impl std::fmt::Debug for RecordingPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingPool")
+                .field(
+                    "reserved",
+                    &datafusion::execution::memory_pool::MemoryPool::reserved(&self.inner),
+                )
+                .field("grows", &*self.grows.lock())
+                .finish()
+        }
+    }
+
+    impl RecordingPool {
+        fn new(max_memory: usize) -> Self {
+            Self {
+                inner: datafusion::execution::memory_pool::GreedyMemoryPool::new(max_memory),
+                grows: ParkingMutex::new(Vec::new()),
+            }
+        }
+
+        fn grows(&self) -> Vec<usize> {
+            self.grows.lock().clone()
+        }
+    }
+
+    impl std::fmt::Display for RecordingPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingPool({})", self.inner)
+        }
+    }
+
+    impl datafusion::execution::memory_pool::MemoryPool for RecordingPool {
+        fn name(&self) -> &'static str {
+            "RecordingPool"
+        }
+
+        fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+            self.inner.register(consumer);
+        }
+
+        fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+            self.inner.unregister(consumer);
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.inner.grow(reservation, additional);
+            self.grows.lock().push(additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+        }
+
+        fn try_grow(
+            &self,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) -> DataFusionResult<()> {
+            self.inner.try_grow(reservation, additional)?;
+            self.grows.lock().push(additional);
+            Ok(())
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+
+        fn memory_limit(&self) -> datafusion::execution::memory_pool::MemoryLimit {
+            self.inner.memory_limit()
+        }
+    }
+
     /// Asserts that `provider`'s current snapshot holds `rows` rows in `files`
     /// files, each in order of the Int64 key in the schema's first column and
     /// covering a key range no other file overlaps.
@@ -46961,6 +47096,71 @@ mod tests {
             "a pool that cannot hold the sample refuses it"
         );
         assert!(bounds(16 * 1024 * 1024).is_some_and(|cuts| cuts.len() == 3));
+
+        // Allocate-then-charge would grow by the compact take (~13 KiB). The
+        // first grow must be the parent-plus-slots estimate, taken before `take`.
+        let pool = Arc::new(RecordingPool::new(16 * 1024 * 1024));
+        let as_pool: Arc<dyn MemoryPool> = Arc::clone(&pool) as Arc<dyn MemoryPool>;
+        let reservation = MemoryConsumer::new("input_range_sample_precharge").register(&as_pool);
+        assert!(
+            CayenneTableProvider::sampled_input_bounds(
+                &head,
+                0,
+                &DataType::Int64,
+                4,
+                false,
+                65_536,
+                &reservation,
+            )
+            .is_some_and(|cuts| cuts.len() == 3)
+        );
+        let first_column = head[0].column(0);
+        let stride = N.div_ceil(65_536).max(1);
+        let first = (stride - 0 % stride) % stride;
+        let n = (first..ROWS).step_by(stride).count();
+        let expected = estimate_take_bytes(first_column.as_ref(), n);
+        let grows = pool.grows();
+        assert_eq!(
+            grows.first().copied(),
+            Some(expected),
+            "first grow must be the pre-copy estimate, not the compact take; grows={grows:?}"
+        );
+    }
+
+    /// Charge-then-settle: the estimate is in the pool before any copy exists,
+    /// and a refused begin leaves that copy unstarted.
+    #[test]
+    fn sample_admission_charges_before_the_copy() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let reservation = MemoryConsumer::new("sample_admission").register(&pool);
+        assert!(
+            SampleAdmission::try_begin(&reservation, 2048).is_none(),
+            "a pool that cannot hold the estimate refuses before any copy"
+        );
+        assert_eq!(pool.reserved(), 0, "a refused begin does not charge");
+
+        let admission =
+            SampleAdmission::try_begin(&reservation, 400).expect("estimate fits the pool");
+        assert_eq!(
+            pool.reserved(),
+            400,
+            "the estimate is charged before the copy exists"
+        );
+        admission
+            .settle(120)
+            .expect("settle down to the actual copy");
+        assert_eq!(pool.reserved(), 120);
+        assert!(
+            SampleAdmission::try_begin(&reservation, 1000).is_none(),
+            "a second copy that would exceed the pool is refused"
+        );
+        assert_eq!(
+            pool.reserved(),
+            120,
+            "a refused begin leaves the prior charge"
+        );
     }
 
     /// The first-load head stays charged until the poll *after* the consumer
@@ -46988,7 +47188,7 @@ mod tests {
         // Control: inspect shrinks during poll, before next() returns.
         {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
-            let mut reservation = MemoryConsumer::new("inspect_control").register(&pool);
+            let reservation = MemoryConsumer::new("inspect_control").register(&pool);
             reservation
                 .try_grow(first_bytes)
                 .expect("charge the inspect-control batch");
@@ -47005,7 +47205,7 @@ mod tests {
         }
 
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
-        let mut reservation = MemoryConsumer::new("charged_input_head").register(&pool);
+        let reservation = MemoryConsumer::new("charged_input_head").register(&pool);
         reservation
             .try_grow(first_bytes.saturating_add(second_bytes))
             .expect("charge both head batches");
