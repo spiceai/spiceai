@@ -489,6 +489,12 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     )
     .description("Current adaptive admission coefficient for this upstream origin, in parts-per-thousand (1000 = admit all); 0 when adaptive rate control is disabled")
     .auto_register(),
+    MetricSpec::new(
+        "adaptive_rate_control_throttled_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total HTTP requests adaptive rate control throttled for this upstream origin (charged an above-normal weight because the origin was failing); 0 when adaptive rate control is disabled or the origin has stayed healthy")
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -607,6 +613,9 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             "adaptive_rate_control_admission_coefficient_permille" => {
                 observe_metric!(metrics.adaptive_admission_coefficient_permille())
             }
+            "adaptive_rate_control_throttled_total" => observe_metric!(
+                metrics.rate_controller_metric(RateControllerMetrics::adaptive_throttled_total)
+            ),
             _ => None,
         }
     }
