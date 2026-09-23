@@ -18,7 +18,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "aws-config",
@@ -78,7 +78,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "byte-unit",
@@ -135,7 +135,7 @@ name = "accelerator-sqlite"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "data-accelerator-api",
@@ -163,7 +163,7 @@ name = "accelerator-turso"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "data-accelerator-api",
@@ -926,6 +926,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-flight"
+version = "59.2.0"
+dependencies = [
+ "arrow-arith 59.2.0",
+ "arrow-array 59.2.0",
+ "arrow-buffer 59.2.0",
+ "arrow-cast 59.2.0",
+ "arrow-data 59.2.0",
+ "arrow-ipc 59.2.0",
+ "arrow-ord 59.2.0",
+ "arrow-row 59.2.0",
+ "arrow-schema 59.2.0",
+ "arrow-select 59.2.0",
+ "arrow-string 59.2.0",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "once_cell",
+ "prost 0.14.4",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "arrow-ipc"
 version = "58.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1084,6 +1109,7 @@ name = "arrow-schema"
 version = "59.2.0"
 dependencies = [
  "bitflags 2.13.2",
+ "serde",
  "serde_core",
  "serde_json",
 ]
@@ -1151,10 +1177,10 @@ name = "arrow_tools"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-cast 58.4.0",
- "arrow-ipc 58.4.0",
- "arrow-json 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-cast 59.2.0",
+ "arrow-ipc 59.2.0",
+ "arrow-json 59.2.0",
+ "arrow-schema 59.2.0",
  "base64 0.22.1",
  "criterion 0.7.0",
  "datafusion 55.1.0",
@@ -2701,7 +2727,7 @@ name = "ballista-core"
 version = "54.0.0"
 source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0#f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0"
 dependencies = [
- "arrow-flight",
+ "arrow-flight 58.4.0",
  "async-trait",
  "aws-config",
  "aws-credential-types",
@@ -2739,7 +2765,7 @@ version = "54.0.0"
 source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0#f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0"
 dependencies = [
  "arrow 58.4.0",
- "arrow-flight",
+ "arrow-flight 58.4.0",
  "async-trait",
  "backoff",
  "ballista-core",
@@ -2774,7 +2800,7 @@ name = "ballista-scheduler"
 version = "54.0.0"
 source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0#f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0"
 dependencies = [
- "arrow-flight",
+ "arrow-flight 58.4.0",
  "async-trait",
  "axum",
  "ballista-core",
@@ -3798,10 +3824,10 @@ dependencies = [
  "aegis",
  "arc-swap",
  "arrow 59.2.0",
- "arrow-flight",
- "arrow-ipc 58.4.0",
- "arrow-row 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-flight 59.2.0",
+ "arrow-ipc 59.2.0",
+ "arrow-row 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -4686,7 +4712,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-array 58.4.0",
+ "arrow-array 59.2.0",
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
@@ -4743,7 +4769,7 @@ name = "connector-flightsql"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "async-trait",
  "data-connector-api",
  "data_components",
@@ -4826,7 +4852,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "chrono",
@@ -4932,7 +4958,7 @@ dependencies = [
 name = "connector-kafka"
 version = "2.4.0-unstable"
 dependencies = [
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -4965,7 +4991,7 @@ name = "connector-mongodb"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-buffer 58.4.0",
+ "arrow-buffer 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -5106,7 +5132,7 @@ name = "connector-postgres"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -6346,7 +6372,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "datafusion 55.1.0",
@@ -6374,7 +6400,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "aws-config",
@@ -6466,11 +6492,11 @@ dependencies = [
  "ahash",
  "apache-avro",
  "arrow 59.2.0",
- "arrow-array 58.4.0",
- "arrow-buffer 58.4.0",
- "arrow-flight",
- "arrow-row 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-array 59.2.0",
+ "arrow-buffer 59.2.0",
+ "arrow-flight 59.2.0",
+ "arrow-row 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -7317,9 +7343,9 @@ name = "datafusion-flightsql"
 version = "0.1.0"
 dependencies = [
  "arrow 59.2.0",
- "arrow-flight",
- "arrow-ipc 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-flight 59.2.0",
+ "arrow-ipc 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "bytes",
@@ -7667,7 +7693,7 @@ name = "datafusion-optimizer-rules"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "async-stream",
  "async-trait",
  "cache",
@@ -9515,9 +9541,9 @@ dependencies = [
 name = "flight-cookie-server"
 version = "2.4.0-unstable"
 dependencies = [
- "arrow-array 58.4.0",
- "arrow-flight",
- "arrow-schema 58.4.0",
+ "arrow-array 59.2.0",
+ "arrow-flight 59.2.0",
+ "arrow-schema 59.2.0",
  "bytes",
  "clap",
  "futures",
@@ -9534,7 +9560,7 @@ name = "flight_client"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "base64 0.22.1",
  "bytes",
  "futures",
@@ -9555,7 +9581,7 @@ name = "flightpublisher"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "clap",
  "futures",
  "parquet 59.2.0",
@@ -9567,7 +9593,7 @@ dependencies = [
 name = "flightsubscriber"
 version = "2.4.0-unstable"
 dependencies = [
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "clap",
  "futures",
  "tokio",
@@ -10614,10 +10640,10 @@ name = "hash-index"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-array 58.4.0",
- "arrow-buffer 58.4.0",
- "arrow-row 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-array 59.2.0",
+ "arrow-buffer 59.2.0",
+ "arrow-row 59.2.0",
+ "arrow-schema 59.2.0",
  "criterion 0.6.0",
  "parking_lot",
  "rand 0.10.3",
@@ -15619,7 +15645,7 @@ name = "otel-arrow"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-buffer 58.4.0",
+ "arrow-buffer 59.2.0",
  "async-trait",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -17771,8 +17797,8 @@ version = "2.4.0-unstable"
 dependencies = [
  "ansi_colors",
  "arrow 59.2.0",
- "arrow-flight",
- "arrow-json 58.4.0",
+ "arrow-flight 59.2.0",
+ "arrow-json 59.2.0",
  "clap",
  "dialoguer",
  "dirs",
@@ -18322,12 +18348,12 @@ dependencies = [
  "app",
  "arc-swap",
  "arrow 59.2.0",
- "arrow-csv 58.4.0",
- "arrow-flight",
- "arrow-ipc 58.4.0",
- "arrow-json 58.4.0",
- "arrow-row 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-csv 59.2.0",
+ "arrow-flight 59.2.0",
+ "arrow-ipc 59.2.0",
+ "arrow-json 59.2.0",
+ "arrow-row 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-graphql",
  "async-graphql-axum",
@@ -18573,7 +18599,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -18777,9 +18803,9 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-flight",
- "arrow-ipc 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-flight 59.2.0",
+ "arrow-ipc 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -18820,7 +18846,7 @@ name = "runtime-component"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "clap",
  "data_components",
@@ -18843,7 +18869,7 @@ name = "runtime-datafusion"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -18910,9 +18936,9 @@ version = "2.4.0-unstable"
 dependencies = [
  "ahash",
  "arrow 59.2.0",
- "arrow-ipc 58.4.0",
- "arrow-json 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-ipc 59.2.0",
+ "arrow-json 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-openai",
  "async-stream",
@@ -18956,7 +18982,7 @@ name = "runtime-drasi"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-json 58.4.0",
+ "arrow-json 59.2.0",
  "async-trait",
  "chrono",
  "percent-encoding",
@@ -18975,7 +19001,7 @@ dependencies = [
 name = "runtime-execution-plans"
 version = "2.4.0-unstable"
 dependencies = [
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "data_components",
  "datafusion 55.1.0",
  "futures",
@@ -19090,7 +19116,7 @@ name = "runtime-query-engine"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "async-trait",
  "datafusion 55.1.0",
  "globset",
@@ -19153,7 +19179,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-openai",
  "async-stream",
@@ -19255,7 +19281,7 @@ name = "runtime-table"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -19315,7 +19341,7 @@ name = "runtime-table-partition"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "async-trait",
  "chrono",
  "criterion 0.5.1",
@@ -19359,8 +19385,8 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "arrow 59.2.0",
- "arrow-json 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-json 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-openai",
  "async-trait",
@@ -20080,8 +20106,8 @@ name = "search"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-json 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-json 59.2.0",
+ "arrow-schema 59.2.0",
  "async-stream",
  "async-trait",
  "chunking",
@@ -21007,7 +21033,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "ansi_colors",
  "arrow 59.2.0",
- "arrow-json 58.4.0",
+ "arrow-json 59.2.0",
  "assert_cmd",
  "chrono",
  "clap",
@@ -21097,7 +21123,7 @@ name = "spice-substrait-compliance"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "bytes",
  "chrono",
  "clap",
@@ -21128,7 +21154,7 @@ version = "3.2.0"
 source = "git+https://github.com/spiceai/spice-rs.git?rev=3267ff355f1bc2e0f382aa0b1e0113e5b98f1d76#3267ff355f1bc2e0f382aa0b1e0113e5b98f1d76"
 dependencies = [
  "arrow 58.4.0",
- "arrow-flight",
+ "arrow-flight 58.4.0",
  "arrow-json 58.4.0",
  "backoff",
  "base64 0.22.1",
@@ -21352,7 +21378,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "anyhow",
  "arrow 59.2.0",
- "arrow-flight",
+ "arrow-flight 59.2.0",
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
@@ -22390,8 +22416,8 @@ dependencies = [
  "anyhow",
  "app",
  "arrow 59.2.0",
- "arrow-json 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow-json 59.2.0",
+ "arrow-schema 59.2.0",
  "arrow_tools",
  "async-channel 2.5.0",
  "async-openai",
@@ -22474,7 +22500,7 @@ name = "testoperator"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
- "arrow-json 58.4.0",
+ "arrow-json 59.2.0",
  "arrow_tools",
  "async-trait",
  "aws-config",
@@ -24382,7 +24408,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "ansi_colors",
  "arrow 59.2.0",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "backoff",
  "chrono",
  "ctrlc",
@@ -24799,7 +24825,7 @@ name = "vortex-datafusion"
 version = "2.4.0-unstable"
 dependencies = [
  "anyhow",
- "arrow-schema 58.4.0",
+ "arrow-schema 59.2.0",
  "async-trait",
  "cpu-budget",
  "criterion 0.7.0",
@@ -26994,8 +27020,4 @@ dependencies = [
 
 [[patch.unused]]
 name = "arrow-avro"
-version = "59.2.0"
-
-[[patch.unused]]
-name = "arrow-flight"
 version = "59.2.0"

@@ -186,16 +186,20 @@ anyhow = "1.0.103"
 async-channel = "1.9"
 arc-swap = "1.7"
 arrow = { version = "59.2.0", features = ["prettyprint"] }
-arrow-array = "58.0.0"
-arrow-buffer = "58.0.0"
-arrow-cast = "58.0.0"
-arrow-csv = "58.0.0"
-arrow-flight = "58.0.0"
-arrow-ipc = "58.0.0"
-arrow-json = "58.0.0"
-arrow-odbc = "22" # crates.io 22+ accepts arrow ">=29, <59" so it resolves to the workspace Arrow 58 (the prior git pin v21 was capped at arrow <58, which forced a separate Arrow-57 subtree + an IPC bridge)
-arrow-row = "58.0.0"
-arrow-schema = "58.0.0"
+arrow-array = "59.2.0"
+arrow-buffer = "59.2.0"
+arrow-cast = "59.2.0"
+arrow-csv = "59.2.0"
+arrow-flight = "59.2.0"
+arrow-ipc = "59.2.0"
+arrow-json = "59.2.0"
+# TODO(datafusion-55): arrow-odbc 22 caps its own arrow dependency at "<59"
+# (see the comment this replaced) - it will not resolve against Arrow 59.2.0
+# without a newer arrow-odbc release. Check crates.io/upstream for a version
+# that raises the cap before this can build with the `odbc` feature enabled.
+arrow-odbc = "22"
+arrow-row = "59.2.0"
+arrow-schema = "59.2.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "6bda5533dd118afcf80aa6f5ef59ad35277627a7", features = [
     "byot",
     "embedding",
