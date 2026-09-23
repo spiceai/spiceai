@@ -49,9 +49,9 @@ use tokio::time::Instant;
 /// recovering origin always keeps at least a probe's worth of headroom.
 const MIN_CEILING: f64 = 1.0;
 
-/// Default failure threshold: throttle once the error rate exceeds 50%
-/// (equivalently, the SRE coefficient `k = 1 / (1 - 0.5) = 2`).
-pub const DEFAULT_ADAPTIVE_FAILURE_THRESHOLD: f64 = 0.5;
+/// Default failure threshold: throttle once the error rate exceeds 10%
+/// (equivalently, the SRE coefficient `k = 1 / (1 - 0.1) ≈ 1.11`).
+pub const DEFAULT_ADAPTIVE_FAILURE_THRESHOLD: f64 = 0.1;
 
 /// Default reaction/recovery window: the decay half-life over which a failure
 /// burst ages out of the window.

@@ -1634,13 +1634,19 @@ impl HttpTableProvider {
         let response_headers = response.headers().clone();
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
-        // A retryable status (408/429/5xx) is a failure signal for adaptive rate
-        // control; any other status counts as a success.
-        self.record_request_outcome(if crate::resilient_http::status_is_retryable(status) {
-            RequestOutcome::Failure
-        } else {
-            RequestOutcome::Success
-        });
+        // Classify the response for adaptive rate control:
+        // - retryable (408/429/5xx): a failure signal — the origin is struggling,
+        //   so admit fewer requests until it recovers.
+        // - 2xx: a success — the origin served the request under load.
+        // - anything else (a non-retryable 4xx such as 401/403/404): discarded, not
+        //   recorded. The origin answered promptly, but the failure is a
+        //   client/auth/config condition that throttling cannot remediate, so it
+        //   must move the coefficient in neither direction.
+        if crate::resilient_http::status_is_retryable(status) {
+            self.record_request_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_request_outcome(RequestOutcome::Success);
+        }
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting)
         // After retries exhausted, we'll accept the response as valid data.
