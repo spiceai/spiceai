@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use elasticsearch::{Elasticsearch, FieldMapping};
@@ -80,12 +80,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which indexes a rounded form of the value rather than the value, so an exact-match filter on it also matches every other value that rounds the same way — deleting one row's documents would reach another row's — and it has no exactly-indexed sub-field either; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword`; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' holds {source_type} values but is mapped `{mapped_as}`, which {why}, so an exact-match filter on it also reaches every other value indexed under that same term — deleting one row's documents would reach another row's — and it has no exactly-addressable sub-field either; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword`; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
     ))]
-    KeyColumnLossilyIndexed {
+    KeyColumnOverMatches {
         index: String,
         column: String,
         mapped_as: String,
+        source_type: String,
+        why: &'static str,
     },
 
     #[snafu(display(
@@ -193,7 +195,7 @@ pub async fn delete_by_keys(
     let key_paths = if addresses_whole_key {
         Vec::new()
     } else {
-        match resolve_term_exact_paths(client, es_index, key_columns).await {
+        match resolve_term_exact_paths(client, es_index, key_columns, keys.schema_ref()).await {
             Ok(Some(paths)) => paths,
             // No document carries these columns, so there is nothing this delete can address.
             Ok(None) => return Ok(()),
@@ -287,12 +289,14 @@ pub async fn delete_group_remainder(
         return Ok(());
     }
 
-    let key_paths = match resolve_term_exact_paths(client, es_index, group_columns).await {
-        Ok(Some(paths)) => paths,
-        // No document carries these columns, so there is no group here to prune.
-        Ok(None) => return Ok(()),
-        Err(e) => return Err(DataFusionError::External(Box::new(e))),
-    };
+    let key_paths =
+        match resolve_term_exact_paths(client, es_index, group_columns, members.schema_ref()).await
+        {
+            Ok(Some(paths)) => paths,
+            // No document carries these columns, so there is no group here to prune.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(DataFusionError::External(Box::new(e))),
+        };
     ensure_keys_are_indexable(es_index, &key_paths, members)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -806,27 +810,34 @@ struct KeyFieldPath {
 /// query matches what the write path stored.
 ///
 /// `text` (and its variants) is deliberately absent: it holds the value's *analyzed* tokens, so a
-/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing. The
-/// types that index a *rounded* form of the value are absent for the opposite reason — a `term`
-/// on one of those matches too much; they are enumerated in [`TERM_LOSSY_FIELD_TYPES`]. Being one
-/// of these types is necessary but not sufficient — see [`is_term_exact`].
+/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing.
+///
+/// Being one of these types is necessary and not sufficient — see [`is_term_exact`]. In
+/// particular several of them index a *rounded* form of the value, so a `term` is unanalyzed and
+/// still reaches more than the key names; [`term_over_matches`] is what rejects those, and it
+/// stays a separate question because the answer depends on the column's own type.
 const TERM_EXACT_FIELD_TYPES: &[&str] = &[
     "boolean",
     "byte",
+    "constant_keyword",
+    "date",
     "date_nanos",
     "double",
+    "float",
+    "half_float",
     "integer",
     "ip",
     "keyword",
     "long",
+    "scaled_float",
     "short",
     "unsigned_long",
     "version",
     "wildcard",
 ];
 
-/// Field types whose indexed form is a *rounded* form of the value, so one term stands for a
-/// range of values and a `term` on it reaches documents the key never named.
+/// Field types whose indexed form is a *rounded* form of the value, whatever it holds, so one
+/// term stands for a range of values and a `term` on one reaches documents the key never named.
 ///
 /// These are exact-match types in the sense that a `term` is not analyzed, which is why they read
 /// as safe; they are not exact in the sense this addressing needs, which is that the value the
@@ -840,25 +851,101 @@ const TERM_EXACT_FIELD_TYPES: &[&str] = &[
 /// | `half_float` | `1.0001`, `1.0002` | both — an 11-bit mantissa is coarser still |
 /// | `date` | `…:00.123456Z`, `…:00.123789Z` | both — `date` quantizes to milliseconds |
 /// | `constant_keyword` | any two | *every* document — the index stores one value for the field |
-///
-/// `date_nanos` and `double` are absent because they round nothing a source value can carry:
-/// nanoseconds is Arrow's finest timestamp unit, and `double` is its widest float.
-///
-/// The hazard is [`Error::KeyColumnNormalized`]'s, one layer down: over-matching is what turns a
-/// prune of one row's superseded chunks into a delete of a whole sibling row (#13717).
-const TERM_LOSSY_FIELD_TYPES: &[&str] = &[
-    "constant_keyword",
-    "date",
-    "float",
-    "half_float",
-    "scaled_float",
+/// Stands in for a key column the delete batch does not carry, until `key_column_arrays` fails
+/// on it: the renderable type that the most mappings are refused for, so an absent column can
+/// never resolve to a mapping a present one would have been refused for.
+const ASSUMED_KEY_TYPE: DataType = DataType::Int64;
+
+const TERM_ROUNDING_FIELD_TYPES: &[(&str, &str)] = &[
+    (
+        "constant_keyword",
+        "indexes one value for the whole index rather than the row's",
+    ),
+    ("date", "indexes the value rounded to the millisecond"),
+    ("float", "indexes the value rounded to a 24-bit mantissa"),
+    (
+        "half_float",
+        "indexes the value rounded to an 11-bit mantissa",
+    ),
+    (
+        "scaled_float",
+        "indexes `round(value * scaling_factor)` rather than the value",
+    ),
 ];
 
-/// Whether a `term` on this field matches the value the write path stored: an exact type, and
-/// searchable at all. A field mapped `index: false` — which is what a column the user declared
-/// non-filterable gets — is stored in `_source` and indexed nowhere, so a filter naming it
-/// matches nothing however exact its type is.
-fn is_term_exact(mapping: &FieldMapping) -> bool {
+/// Why a `term` on this field would reach more than the key names, or `None` when it would not.
+///
+/// Two ways one term can stand for several keys, and the caller needs to tell them apart only to
+/// say so in the message:
+///
+/// - the type rounds every value it holds ([`TERM_ROUNDING_FIELD_TYPES`]);
+/// - the type is exact but too narrow for this column. `double` is the only such pairing that
+///   arises: Elasticsearch indexes it as an IEEE-754 binary64, whose integers are exact only up
+///   to 2^53, so an `Int64`/`UInt64` column mapped `double` collapses `9007199254740992` and
+///   `9007199254740993` onto one term — measured against Elasticsearch 8.15.0, a `term` for the
+///   first returns both rows' documents, while the same two keys under `long` return one each.
+///   `long` holds every Arrow integer, and `byte`/`short`/`integer` reject an out-of-range value
+///   at index time rather than rounding it, so the write fails where this would have had to.
+///
+/// Only asked of a column whose values [`scalar_to_term_value`] can render, because a column it
+/// cannot render issues no `term` at all: its group is dropped by [`collect_groups`] instead.
+/// That is what keeps this rule pointed at over-matching rather than at mappings the runtime
+/// itself writes — `primary_key_mapping` maps a `Float32` key column `float` and a timestamp key
+/// column `date`, and neither renders a term.
+fn term_over_matches(mapping: &FieldMapping, source_type: &DataType) -> Option<TermOverMatch> {
+    let field_type = mapping.field_type.as_deref()?;
+    if !renders_a_term(source_type) {
+        return None;
+    }
+    if let Some((mapped_as, why)) = TERM_ROUNDING_FIELD_TYPES
+        .iter()
+        .find(|(t, _)| *t == field_type)
+    {
+        return Some(TermOverMatch { mapped_as, why });
+    }
+    let too_narrow =
+        field_type == "double" && matches!(source_type, DataType::Int64 | DataType::UInt64);
+    too_narrow.then_some(TermOverMatch {
+        mapped_as: "double",
+        why: "indexes integers past 2^53 rounded, being an IEEE-754 binary64",
+    })
+}
+
+/// A mapping that would make a `term` reach more than the key it names: the type, and the clause
+/// [`Error::KeyColumnOverMatches`] states it with.
+struct TermOverMatch {
+    mapped_as: &'static str,
+    why: &'static str,
+}
+
+/// Whether a value of `source_type` has a `term` form at all, mirroring [`scalar_to_term_value`].
+///
+/// `term_renderable_types_match_scalar_to_term_value` pins the two together, so a type added to
+/// one is caught if it is not added to the other.
+fn renders_a_term(source_type: &DataType) -> bool {
+    matches!(
+        source_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// Whether a `term` on this field matches the value the write path stored, and no other row's:
+/// an exact type, searchable at all, unnormalized, and not standing for a range of values. A
+/// field mapped `index: false` — which is what a column the user declared non-filterable gets —
+/// is stored in `_source` and indexed nowhere, so a filter naming it matches nothing however
+/// exact its type is.
+fn is_term_exact(mapping: &FieldMapping, source_type: &DataType) -> bool {
     mapping.is_indexed()
         // A normalizer is applied to the query's value as well as the stored one, so `term` on a
         // normalized field matches every value that normalizes the same way. That is exact
@@ -868,6 +955,7 @@ fn is_term_exact(mapping: &FieldMapping) -> bool {
             .field_type
             .as_deref()
             .is_some_and(|t| TERM_EXACT_FIELD_TYPES.contains(&t))
+        && term_over_matches(mapping, source_type).is_none()
 }
 
 /// Resolves each of `key_columns` to the field path an exact-match `term` query has to name, by
@@ -894,6 +982,7 @@ async fn resolve_term_exact_paths(
     client: &dyn Elasticsearch,
     es_index: &str,
     key_columns: &[String],
+    source_schema: &Schema,
 ) -> Result<Option<Vec<KeyFieldPath>>> {
     if key_columns.is_empty() {
         return Ok(None);
@@ -924,7 +1013,14 @@ async fn resolve_term_exact_paths(
             return Ok(None);
         };
 
-        if is_term_exact(mapping) {
+        // A column the batch does not carry fails later in `key_column_arrays`; until then
+        // `ASSUMED_KEY_TYPE` stands in, so an unknown column cannot resolve to a mapping a known
+        // one would have been refused for.
+        let source_type = source_schema
+            .column_with_name(column)
+            .map_or(&ASSUMED_KEY_TYPE, |(_, f)| f.data_type());
+
+        if is_term_exact(mapping, source_type) {
             paths.push(KeyFieldPath {
                 column: column.clone(),
                 path: column.clone(),
@@ -941,14 +1037,14 @@ async fn resolve_term_exact_paths(
             .and_then(|fields| {
                 fields
                     .get("keyword")
-                    .filter(|m| is_term_exact(m))
+                    .filter(|m| is_term_exact(m, source_type))
                     .map(|m| ("keyword", m))
             })
             .or_else(|| {
                 sub_fields
                     .into_iter()
                     .flatten()
-                    .filter(|(_, m)| is_term_exact(m))
+                    .filter(|(_, m)| is_term_exact(m, source_type))
                     .min_by(|(a, _), (b, _)| a.cmp(b))
                     .map(|(n, m)| (n.as_str(), m))
             });
@@ -964,17 +1060,15 @@ async fn resolve_term_exact_paths(
                 }
                 .fail();
             }
-            // Likewise for a column whose type rounds the value: the generic message would say it
-            // cannot be matched at all, when the real hazard is that it matches too much.
-            if let Some(lossy) = mapping
-                .field_type
-                .as_deref()
-                .filter(|t| TERM_LOSSY_FIELD_TYPES.contains(t))
-            {
-                return KeyColumnLossilyIndexedSnafu {
+            // Likewise for a mapping that reaches past the key it names: the generic message
+            // would say the column cannot be matched at all, when the hazard is the opposite.
+            if let Some(over) = term_over_matches(mapping, source_type) {
+                return KeyColumnOverMatchesSnafu {
                     index: es_index.to_string(),
                     column: column.clone(),
-                    mapped_as: lossy.to_string(),
+                    mapped_as: over.mapped_as.to_string(),
+                    source_type: source_type.to_string(),
+                    why: over.why,
                 }
                 .fail();
             }
@@ -1076,7 +1170,7 @@ mod tests {
     use std::sync::Mutex;
 
     use arrow::array::{Int64Array, StringArray};
-    use arrow_schema::{DataType, Schema};
+    use arrow_schema::{DataType, Schema, TimeUnit};
     use elasticsearch::{
         Error as EsError, IndexMapping, MappingResponse, Mappings, Result as EsResult,
         SearchRequest, SearchResponse,
@@ -1453,20 +1547,24 @@ mod tests {
     /// Member rows as [`spice_table::Index::delete_group_remainder`] receives them from a
     /// chunked index: the base key plus the chunk id of every chunk the row still produces.
     fn member_batch(rows: &[(Option<&str>, u64)]) -> RecordBatch {
+        member_batch_keyed(
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )),
+            &rows.iter().map(|(_, chunk)| *chunk).collect::<Vec<_>>(),
+        )
+    }
+
+    /// The same batch for a key column of any type — the shape is one place so the chunk key's
+    /// spelling cannot drift between the tests that build it.
+    fn member_batch_keyed(ids: ArrayRef, chunks: &[u64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, true),
+            Field::new("id", ids.data_type().clone(), true),
             Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
         ]));
         RecordBatch::try_new(
             schema,
-            vec![
-                Arc::new(StringArray::from(
-                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                )),
-                Arc::new(UInt64Array::from(
-                    rows.iter().map(|(_, chunk)| *chunk).collect::<Vec<_>>(),
-                )),
-            ],
+            vec![ids, Arc::new(UInt64Array::from(chunks.to_vec()))],
         )
         .expect("member batch should build")
     }
@@ -1474,7 +1572,12 @@ mod tests {
     /// The primary key a chunked index actually has, taken from the augmentation the chunking
     /// layer applies rather than re-spelled here, so these tests cannot drift from it.
     fn chunked_key() -> Vec<Field> {
-        ChunkedSearchIndex::augment_primary_key(vec![pk("id", DataType::Utf8)])
+        chunked_key_of(DataType::Utf8)
+    }
+
+    /// The same, for a key column of another type.
+    fn chunked_key_of(data_type: DataType) -> Vec<Field> {
+        ChunkedSearchIndex::augment_primary_key(vec![pk("id", data_type)])
     }
 
     /// The `_id`s a `must_not` clause protects, for every `should` clause of `query`.
@@ -1760,8 +1863,8 @@ mod tests {
     /// `float`, `half_float` and `date` collide the same way, and `constant_keyword` matches every
     /// document in the index.
     #[tokio::test]
-    async fn a_lossily_indexed_group_column_refuses_before_issuing() {
-        for field_type in TERM_LOSSY_FIELD_TYPES {
+    async fn a_rounding_group_column_refuses_before_issuing() {
+        for (field_type, _) in TERM_ROUNDING_FIELD_TYPES {
             let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
 
             let err = delete_group_remainder(
@@ -1772,7 +1875,7 @@ mod tests {
                 &member_batch(&[(Some("A"), 0)]),
             )
             .await
-            .expect_err("a lossily indexed group column must fail the prune");
+            .expect_err("a rounding group column must fail the prune");
 
             let message = err.to_string();
             assert!(
@@ -1791,8 +1894,8 @@ mod tests {
     /// filter over-deletes there rather than crossing into a live row, but it is the same field
     /// that cannot address one row's documents.
     #[tokio::test]
-    async fn a_lossily_indexed_key_column_refuses_a_partial_key_delete_too() {
-        for field_type in TERM_LOSSY_FIELD_TYPES {
+    async fn a_rounding_key_column_refuses_a_partial_key_delete_too() {
+        for (field_type, _) in TERM_ROUNDING_FIELD_TYPES {
             let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
 
             delete_by_keys(
@@ -1803,7 +1906,7 @@ mod tests {
                 &string_key_batch(vec![Some("A")]),
             )
             .await
-            .expect_err("a lossily indexed key column must fail the delete");
+            .expect_err("a rounding key column must fail the delete");
 
             assert!(client.queries().is_empty());
         }
@@ -1812,13 +1915,13 @@ mod tests {
     /// A rounded column that also carries an exactly-indexed sub-field is still addressable — on
     /// that sub-field, which is the shape a `text` column with a `keyword` multi-field has too.
     #[tokio::test]
-    async fn a_lossily_indexed_column_with_an_exact_sub_field_uses_the_sub_field() {
-        let mut lossy = field_mapping("scaled_float");
-        lossy.fields = Some(std::collections::HashMap::from([(
+    async fn a_rounding_column_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut rounding = field_mapping("scaled_float");
+        rounding.fields = Some(std::collections::HashMap::from([(
             "exact".to_string(),
             field_mapping("keyword"),
         )]));
-        let client = RecordingClient::mapped(vec![("id", lossy)]);
+        let client = RecordingClient::mapped(vec![("id", rounding)]);
 
         delete_group_remainder(
             &client,
@@ -1836,14 +1939,236 @@ mod tests {
         );
     }
 
-    /// The two type lists answer one question between them, so a type that drifts into both — or
-    /// out of both — would make the refusal depend on which check runs first.
+    /// `double` is an exact type and still cannot address an `Int64` key: Elasticsearch indexes
+    /// it as an IEEE-754 binary64, exact for integers only up to 2^53.
+    ///
+    /// Measured against Elasticsearch 8.15.0, not reasoned from the mapping. Two documents keyed
+    /// `9007199254740992` and `9007199254740993` under `{"type": "double"}` are both returned by
+    /// `{"term": {"k": 9007199254740992}}`; the same two keys under `long` and under
+    /// `unsigned_long` return one document each. So the prune would protect one row's chunk
+    /// `_id`s and delete the other row's, which is the [`Error::KeyColumnNormalized`] hazard
+    /// reached through the mapping's *width* rather than its kind.
+    #[tokio::test]
+    async fn an_int64_key_column_mapped_double_refuses_before_issuing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("double"))]);
+
+        let err = delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key_of(DataType::Int64),
+            &["id".to_string()],
+            &member_batch_keyed(
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_992_i64])),
+                &[0],
+            ),
+        )
+        .await
+        .expect_err("an Int64 key column mapped `double` must fail the prune");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id'") && message.contains("double") && message.contains("Int64"),
+            "the error must name the column, its mapping and the source type, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued against a mapping that collapses distinct keys"
+        );
+    }
+
+    /// The width rule is about the pairing, not about `double`: a `UInt32` column mapped
+    /// `double` still addresses its group, because binary64 holds every `u32` apart, and the
+    /// same `Int64` column mapped `long` does too. A blanket refusal of `double` would fail the
+    /// first of these and cost an index a delete it can serve exactly.
+    #[tokio::test]
+    async fn a_mapping_wide_enough_for_the_source_type_still_resolves() {
+        for (source, mapped_as, key, expected) in [
+            (
+                DataType::Int64,
+                "long",
+                ScalarValue::Int64(Some(9_007_199_254_740_993)),
+                json!(9_007_199_254_740_993_i64),
+            ),
+            (
+                DataType::UInt32,
+                "double",
+                ScalarValue::UInt32(Some(4_294_967_295)),
+                json!(4_294_967_295_u32),
+            ),
+        ] {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+            let members =
+                member_batch_keyed(key.to_array().expect("key should render to an array"), &[0]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(source.clone()),
+                &["id".to_string()],
+                &members,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{source} under `{mapped_as}` must be addressable: {e}"));
+
+            assert_eq!(
+                client.queries().len(),
+                1,
+                "{source} under `{mapped_as}` must reach the index, not return early"
+            );
+            assert_eq!(
+                client.queries()[0]["bool"]["should"][0]["bool"]["filter"][0]["term"]["id"],
+                expected,
+                "the group must be filtered on the column itself"
+            );
+        }
+    }
+
+    /// `renders_a_term` has to agree with [`scalar_to_term_value`], which is the function that
+    /// decides whether a `term` is emitted at all. They are separate because one answers on a
+    /// type and the other on a value, so this pins them together: a type added to either without
+    /// the other shows up here rather than as a refusal for a delete that never issues, or a
+    /// missed refusal for one that does.
     #[test]
-    fn the_exact_and_lossy_type_lists_are_disjoint() {
-        for lossy in TERM_LOSSY_FIELD_TYPES {
+    fn term_renderable_types_match_scalar_to_term_value() {
+        let cases = [
+            ScalarValue::Utf8(Some("a".to_string())),
+            ScalarValue::LargeUtf8(Some("a".to_string())),
+            ScalarValue::Utf8View(Some("a".to_string())),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Int8(Some(1)),
+            ScalarValue::Int16(Some(1)),
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::UInt8(Some(1)),
+            ScalarValue::UInt16(Some(1)),
+            ScalarValue::UInt32(Some(1)),
+            ScalarValue::UInt64(Some(1)),
+            ScalarValue::Float32(Some(1.0)),
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Date32(Some(1)),
+            ScalarValue::Date64(Some(1)),
+            ScalarValue::TimestampMillisecond(Some(1), None),
+            ScalarValue::Decimal128(Some(1), 10, 2),
+            ScalarValue::Binary(Some(vec![1])),
+        ];
+        for value in cases {
+            assert_eq!(
+                renders_a_term(&value.data_type()),
+                scalar_to_term_value(&value).is_some(),
+                "`renders_a_term` and `scalar_to_term_value` disagree about {}",
+                value.data_type()
+            );
+        }
+    }
+
+    /// The width rule must be threaded into the sub-field fallback as well as the column itself,
+    /// which is two call sites — a regression that dropped it from one would leave the other's
+    /// test green.
+    #[tokio::test]
+    async fn an_int64_column_mapped_double_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut narrow = field_mapping("double");
+        narrow.fields = Some(std::collections::HashMap::from([(
+            "exact".to_string(),
+            field_mapping("long"),
+        )]));
+        let client = RecordingClient::mapped(vec![("id", narrow)]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key_of(DataType::Int64),
+            &["id".to_string()],
+            &member_batch_keyed(
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_992_i64])),
+                &[0],
+            ),
+        )
+        .await
+        .expect("the prune should succeed on the exact sub-field");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.exact": 9_007_199_254_740_992_i64}}]),
+        );
+    }
+
+    /// The refusal must not fire on a mapping the runtime itself writes. `primary_key_mapping`
+    /// maps a `Float32` key column `float` and a `Date32`/`Date64`/`Timestamp` one `date`, both
+    /// of which round their values — but [`scalar_to_term_value`] renders neither type, so those
+    /// columns emit no `term` and the group is dropped by [`collect_groups`] rather than
+    /// refused. Refusing them would fail a delete with a message telling the user to re-map a
+    /// column the runtime chose the mapping for.
+    #[tokio::test]
+    async fn a_rounding_mapping_the_runtime_writes_is_not_refused() {
+        for (source, mapped_as) in [
+            (DataType::Float32, "float"),
+            (DataType::Float64, "double"),
+            (DataType::Date32, "date"),
+            (DataType::Date64, "date"),
+            (DataType::Timestamp(TimeUnit::Millisecond, None), "date"),
+        ] {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(source.clone()),
+                &["id".to_string()],
+                &member_batch_keyed(arrow::array::new_null_array(&source, 1), &[0]),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{source} under `{mapped_as}` is what the runtime writes; it must not be refused: {e}")
+            });
+        }
+    }
+
+    /// The refusal's wording is what a user acts on, so it is asserted rather than left to a
+    /// reword to quietly drop the column, the mapping, the source type or the remedy.
+    #[test]
+    fn the_over_match_refusal_names_the_column_mapping_source_and_remedy() {
+        let message = Error::KeyColumnOverMatches {
+            index: "reviews".to_string(),
+            column: "order_id".to_string(),
+            mapped_as: "scaled_float".to_string(),
+            source_type: "Int64".to_string(),
+            why: "indexes `round(value * scaling_factor)` rather than the value",
+        }
+        .to_string();
+
+        for expected in [
+            "'reviews'",
+            "'order_id'",
+            "Int64",
+            "`scaled_float`",
+            "round(value * scaling_factor)",
+            "reaches every other value indexed under that same term",
+            "the delete was not issued",
+            "`keyword`",
+            "https://spiceai.org/docs/features/search",
+        ] {
             assert!(
-                !TERM_EXACT_FIELD_TYPES.contains(lossy),
-                "`{lossy}` cannot be both exactly and lossily indexed"
+                message.contains(expected),
+                "the refusal must carry {expected:?}, got: {message}"
+            );
+        }
+        assert!(
+            !message.contains('\n'),
+            "a log line must stay on one line, got: {message}"
+        );
+    }
+
+    /// Every rounding type must also be an exact-match type, because `term_over_matches` is only
+    /// consulted for a mapping that got that far. Dropping one from
+    /// [`TERM_EXACT_FIELD_TYPES`] does not make it *more* refused — it makes it refused with the
+    /// wrong message ("no exact-match filter can address") and, worse, refused even for a source
+    /// type that renders no term, which is a mapping the runtime itself writes.
+    #[test]
+    fn every_rounding_type_is_also_an_exact_match_type() {
+        for (rounding, _) in TERM_ROUNDING_FIELD_TYPES {
+            assert!(
+                TERM_EXACT_FIELD_TYPES.contains(rounding),
+                "`{rounding}` must be in TERM_EXACT_FIELD_TYPES for term_over_matches to reach it"
             );
         }
     }
@@ -1853,7 +2178,11 @@ mod tests {
     /// `date_nanos` are the two that were re-examined and kept.
     #[tokio::test]
     async fn an_exactly_indexed_group_column_still_resolves_to_the_column() {
+        let rounding: Vec<&str> = TERM_ROUNDING_FIELD_TYPES.iter().map(|(t, _)| *t).collect();
         for field_type in TERM_EXACT_FIELD_TYPES {
+            if rounding.contains(field_type) {
+                continue;
+            }
             let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
 
             delete_group_remainder(
