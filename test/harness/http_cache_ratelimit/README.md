@@ -122,7 +122,7 @@ directly in a browser; nothing to serve.
  - `recovery_resumes_freshness`: fresh serving resumes once the origin recovers.
 
  ### Phase 2
- - `backoff_on_failure`: p2's admission coefficient drops well below 1000‰ and throttled_total rises during the fault window; p2's upstream arrival rate falls below the offered rate.
+ - `backoff_on_failure`: p2's admission coefficient drops well below 1000‰ during the fault window; p2's upstream arrival rate falls below the offered rate. (No separate throttled-request counter exists — #14143 exposes only the admission-coefficient and effective-limit gauges.)
  - `sre_shape`: admission tracks min(1, (K·accepts+1)/(requests+1)) over the ~10s decaying window, within tolerance.
  - `cooldown_retry_after`: rate_limit_retry_after_* metrics move and p2's arrival log shows a gap ≈ the advertised Retry-After duration.
  - `p1_isolation`: the healthy origin (p1) stays at 1000‰ admission throughout, proving rate control is per-origin.
@@ -264,8 +264,8 @@ The console prints a per-scrape trace of p2's admission coefficient and
 effective limit, the driver timeline, and the assertion table. The `evidence`
 block in `assertions.json` is the quick read — e.g.
 `p2_admission_min_permille_fault`, `p2_effective_limit_min_fault`,
-`p2_throttled_total_delta_fault`, `p2_upstream_arrivals_fault` vs
-`p2_offered_fault`, and `p1_admission_min_permille_all`.
+`p2_upstream_arrivals_fault` vs `p2_offered_fault`, and
+`p1_admission_min_permille_all`.
 
 **Verdict codes:** `0` PASS (all assertions held) · `1` FAIL (an assertion
 failed on a binary that does expose the feature) · `2` BLOCKED (no adaptive
@@ -382,9 +382,33 @@ limit and admission both fully recover after the origin heals, and p1
 (never faulted) stayed at 1000‰ admission the entire run — per-origin
 isolation holds.
 
-`ratecontrol-sre`, `ratecontrol-cooldown`, and `ratecontrol-ietf-headers`
-have not been scored against the current SRE-only build yet — treat them
-as PENDING until their own `assertions.json` is pasted in here.
+### Phase 2 status (current): `ratecontrol-sre` scored against the SRE-only build
+
+Verified against `~/.spice/bin/spiced` v2.4.0-unstable-build.1450ccd8d0
+(has the shipped `http_adaptive_rate_control`/`_failure_threshold`/`_window`
+params baked in). `--probe` confirmed the two adaptive gauges exist and no
+`throttled_total`/`throttle_wait_duration_ms` series does — see 2.3 — then
+a full scored run:
+
+```
+[PASS] cache_never_ahead_of_origin: 0 samples returned a version above the origin high-water mark
+[PASS] warmup_load_flowing: 465/538 warmup queries returned rows
+[PASS] p2_admission_drops_during_fault: min admission_coefficient_permille[p2] during fault = 272.0 (need < 800.0)
+[PASS] sre_admission_matches_formula: mean|predicted-observed| admission over fault (2nd half) = 0.001 (need <= 0.2)
+[PASS] p2_recovers_admission: end-of-recovery admission[p2] = 1000.0 (need >= 950.0)
+[PASS] p1_admission_stays_full: min admission[p1] over the whole run = 1000.0 (need >= 1000.0)
+
+VERDICT: PASS  (exit 0)
+```
+
+6/6 assertions PASS: admission drops sharply during the fault window and
+tracks the SRE formula `min(1, (K·accepts+1)/(requests+1))` within 0.001 of
+predicted, fully recovers to 1000‰ after the origin heals, and p1 (never
+faulted) stays at 1000‰ throughout — per-origin isolation holds.
+
+`ratecontrol-cooldown` and `ratecontrol-ietf-headers` have not been scored
+against the current SRE-only build yet — treat them as PENDING until their
+own `assertions.json` is pasted in here.
 
 Branch facts confirmed by reading `crates/data-http-rate-control` and
 `crates/data_components/src/rate_limit/adaptive.rs` on

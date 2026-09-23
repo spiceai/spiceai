@@ -42,11 +42,9 @@ If a scenario also puts the SQL results cache in front (not the default plan), t
 
 Rate control is fully observable through `runtime.metrics` (Prometheus/OpenTelemetry). The metrics are registered as OTel observable instruments in `crates/data-http-rate-control/src/lib.rs:363-472` and are labeled per origin by an `origin` attribute (`callback_to_observe_metric`, `lib.rs:522-532`; the label value is `rate_control_key(base_url)`).
 
-Adaptive metrics (per origin):
+Adaptive metrics (per origin) — only these two gauges are registered; #14143 exposes no separate throttled-request counter, so "was this request throttled" is read off the admission coefficient dropping below 1000:
 - `adaptive_rate_control_effective_limit` (gauge; `0` when disabled)
 - `adaptive_rate_control_admission_coefficient_permille` (gauge, `0..=1000`; `1000` = admit all)
-- `adaptive_rate_control_throttled_total` (counter)
-- `adaptive_rate_control_throttle_wait_duration_ms` (counter, ms)
 
 Cooldown/Retry-After metrics (per origin):
 - `rate_limit_retry_after_updates_total`, `rate_limit_retry_after_waits_total`, `rate_limit_retry_after_wait_duration_ms`, `rate_limit_retry_after_remaining_ms`
@@ -309,7 +307,7 @@ Caching (per scenario window):
 - Fresh-band-no-fetch: while `a <= M`, the origin request-log arrival count is ~0 beyond the periodic refreshes, proving fresh entries are served without upstream calls.
 
 Rate control (per origin, diffed over the fault window):
-- Backoff-on-failure: during the p2 error window, `adaptive_rate_control_admission_coefficient_permille{origin=p2}` drops well below 1000 and `adaptive_rate_control_throttled_total{origin=p2}` increases; the p2 origin arrival rate (from its request log) falls below the offered rate.
+- Backoff-on-failure: during the p2 error window, `adaptive_rate_control_admission_coefficient_permille{origin=p2}` drops well below 1000; the p2 origin arrival rate (from its request log) falls below the offered rate. (No separate throttled-request counter exists — see 2.3.)
 - SRE shape: with `http_adaptive_rate_control: enabled` and `http_adaptive_rate_control_failure_threshold: "50%"` (K=2.0), admission ≈ `min(1, (K*accepts+1)/(requests+1))` within tolerance, using accept/request counts reconstructed from the origin log over the 10s decaying window (`SRE_WINDOW_HALF_LIFE`, `adaptive.rs:52`).
 - Recovery: after the origin heals, `admission_coefficient_permille` returns to 1000 and `effective_limit` climbs back to the ceiling within a bounded time.
 - Cooldown headers: when the origin sends `Retry-After`/`RateLimit`, `rate_limit_retry_after_updates_total` and `rate_limit_retry_after_remaining_ms` move; the origin arrival log shows a gap of about the advertised duration.
@@ -325,7 +323,7 @@ Topology:
 2. `caching-sie-503` (spicepod.caching). t=30 p2 -> 50% 503 + 20ms latency; t=90 recover. Expect SIE serves stale within `E`; SWR refreshes fail silently; d1 unaffected.
 3. `caching-sie-timeout` (spicepod.caching, MANDATORY). t=30 p2 -> `hang 5000ms` with `client_timeout=2s`; t=120 recover. Expect timeout classified as error, SIE serves stale within `E`, connector timed out (evidence: origin hang log + ~2s refresh latency).
 4. `caching-sie-expiry` (spicepod.caching, `caching_stale_if_error: "10s"`). Long error window > `E`. Expect stale served until `E`, then errors propagate (fail closed).
-5. `ratecontrol-sre` (spicepod.ratecontrol.sre, K=2.0). Offered QPS above ceiling; t=30 p2 90% 503; t=120 recover. Expect admission ≈ SRE formula over the decaying window, throttled_total rises, p2 upstream arrivals capped, p1 clean.
+5. `ratecontrol-sre` (spicepod.ratecontrol.sre, K=2.0). Offered QPS above ceiling; t=30 p2 90% 503; t=120 recover. Expect admission ≈ SRE formula over the decaying window and drops well below 1000, p2 upstream arrivals capped, p1 clean.
 6. `ratecontrol-cooldown` (spicepod.ratecontrol.sre). p2 returns 429 + `Retry-After: 2`. Expect retry-after metrics move and a ~2s arrival gap.
 7. `ratecontrol-ietf-headers` (spicepod.ratecontrol.sre). p2 sends only `RateLimit`/`RateLimit-Policy`. Expect NO admission change today (assertion flips when #14136 lands).
 8. `topology-isolation` (spicepod.composition). Fault p2 only. Expect both p2 datasets throttled/stale, p1 untouched; one shared p2 limiter series.

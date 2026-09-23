@@ -361,7 +361,6 @@ def run(args: argparse.Namespace) -> int:
     # ---- Resolve the origin metric label values from the live scrape ----
     adm = cfg["adaptive"]["admission_coefficient_permille"]
     eff = cfg["adaptive"]["effective_limit"]
-    thr = cfg["adaptive"]["throttled_total"]
     observed_origins = sorted(scraper.origins(adm) | scraper.origins(eff))
 
     def origin_key(name: str) -> Optional[str]:
@@ -393,7 +392,6 @@ def run(args: argparse.Namespace) -> int:
     # Metric windows.
     p2_adm_min_fault = scraper.min_in_window(adm, p2_key, fs, fe) if p2_key else None
     p2_eff_min_fault = scraper.min_in_window(eff, p2_key, fs, fe) if p2_key else None
-    p2_thr_delta = scraper.counter_delta(thr, p2_key, fs, fe) if p2_key else None
     p2_adm_recovery = scraper.latest_in_window(adm, p2_key, fe, re_end) if p2_key else None
     p2_eff_recovery = scraper.latest_in_window(eff, p2_key, fe, re_end) if p2_key else None
     p1_adm_min_all = scraper.min_in_window(adm, p1_key, 0.0, re_end) if p1_key else None
@@ -440,11 +438,6 @@ def run(args: argparse.Namespace) -> int:
             p2_adm_min_fault is not None and p2_adm_min_fault < args.admission_drop_permille,
             f"min admission_coefficient_permille[p2] during fault = {p2_adm_min_fault} "
             f"(need < {args.admission_drop_permille})",
-        )
-        add(
-            "p2_throttled_total_increases",
-            p2_thr_delta is not None and p2_thr_delta > 0,
-            f"throttled_total[p2] delta over fault = {p2_thr_delta} (need > 0)",
         )
         # Reconstruct the SRE admission from the p2 arrival log at each scrape
         # time in the second half of the fault window (after the decaying
@@ -565,7 +558,6 @@ def run(args: argparse.Namespace) -> int:
             "samples": len(load.samples),
             "p2_admission_min_permille_fault": p2_adm_min_fault,
             "p2_effective_limit_min_fault": p2_eff_min_fault,
-            "p2_throttled_total_delta_fault": p2_thr_delta,
             "p2_admission_permille_end_recovery": p2_adm_recovery,
             "p2_effective_limit_end_recovery": p2_eff_recovery,
             "p1_admission_min_permille_all": p1_adm_min_all,

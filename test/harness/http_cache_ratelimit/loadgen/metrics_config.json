@@ -18,9 +18,7 @@
   "origin_label": "origin",
   "adaptive": {
     "effective_limit": "dataset_http_adaptive_rate_control_effective_limit",
-    "admission_coefficient_permille": "dataset_http_adaptive_rate_control_admission_coefficient_permille",
-    "throttled_total": "dataset_http_adaptive_rate_control_throttled_total",
-    "throttle_wait_duration_ms": "dataset_http_adaptive_rate_control_throttle_wait_duration_ms"
+    "admission_coefficient_permille": "dataset_http_adaptive_rate_control_admission_coefficient_permille"
   },
   "cooldown": {
     "retry_after_updates_total": "dataset_http_rate_limit_retry_after_updates_total",
