@@ -76,7 +76,7 @@ use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::{RowConverter, SortField};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow::array::{Array, ArrayRef, AsArray, UInt32Array, UInt64Array};
 use arrow::compute::SortColumn;
 use arrow::datatypes::UInt64Type;
@@ -1030,8 +1030,32 @@ pub(crate) struct LookupIndexState {
     /// Whether an index has been published yet, so only the first is logged at
     /// `info`.
     published_once: AtomicBool,
+    /// Write-time indexes over snapshots other than the visible current one,
+    /// keyed by snapshot id: every protected snapshot a checkpoint, upsert or
+    /// merge wrote, and a compaction rewrite's replacement snapshot until its
+    /// flip promotes it. See [`Self::register_snapshot`].
+    snapshots: ArcSwap<HashMap<String, Arc<SnapshotIndexEntry>>>,
+    /// Serializes changes to `snapshots`. Probes never take it.
+    snapshots_lock: Mutex<()>,
+    /// Whether a failed per-snapshot build has been logged at `warn` yet. Such
+    /// builds run on every checkpoint, so later failures are logged at `debug`.
+    snapshot_build_warned: AtomicBool,
     counters: Counters,
 }
+
+/// A write-time index over one snapshot directory other than the current one.
+struct SnapshotIndexEntry {
+    index: Arc<SnapshotLookupIndex>,
+    /// Set once the snapshot has been seen in the table's protected set. A live
+    /// entry whose snapshot has left that set was folded away and is dropped; an
+    /// entry that was never live belongs to a write still publishing.
+    live: AtomicBool,
+}
+
+/// Registered indexes whose snapshot has not been published yet. Only a write
+/// in flight holds one, so more than this means writes were abandoned without
+/// discarding their index; the oldest are dropped.
+const MAX_UNPUBLISHED_SNAPSHOT_INDEXES: usize = 32;
 
 impl LookupIndexState {
     /// The index state for `specs`, or `None` when the table declares no index.
@@ -1062,6 +1086,9 @@ impl LookupIndexState {
             pending: Mutex::new(None),
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
+            snapshots: ArcSwap::from_pointee(HashMap::new()),
+            snapshots_lock: Mutex::new(()),
+            snapshot_build_warned: AtomicBool::new(false),
             counters: Counters::default(),
         }))
     }
@@ -1290,6 +1317,227 @@ impl LookupIndexState {
     pub(crate) fn discard_pending(&self) {
         *self.pending.lock() = None;
         *self.staged.lock() = None;
+    }
+
+    /// Starts a write-time build for a NEW snapshot directory that a checkpoint,
+    /// upsert or compaction is about to write. Unlike
+    /// [`Self::begin_incremental_build`] it claims no table-wide slot: several
+    /// such writes can be in flight at once, and each finishes its own build
+    /// with [`Self::finish_snapshot_build`].
+    pub(crate) fn begin_snapshot_build(
+        &self,
+        snapshot_id: &str,
+        schema: &arrow_schema::Schema,
+    ) -> Option<Arc<IncrementalIndexBuilder>> {
+        match IncrementalIndexBuilder::new(
+            self.table_name.clone(),
+            snapshot_id.to_string(),
+            &self.specs,
+            self.build_reservation(),
+            schema,
+        ) {
+            Ok(builder) => Some(Arc::new(builder)),
+            Err(error) => {
+                self.snapshot_build_failed(snapshot_id, &error);
+                None
+            }
+        }
+    }
+
+    /// Finishes a build begun by [`Self::begin_snapshot_build`] once its
+    /// snapshot's files are final, and registers the index under the snapshot
+    /// id. `files` is that snapshot's file set as the scan lists it.
+    ///
+    /// Registration happens BEFORE the write's visibility flip, which is what
+    /// lets a scan find the index for every snapshot it can see. A registered
+    /// index is only consulted for a snapshot a scan is actually reading, and a
+    /// snapshot directory is never written again once published, so an index
+    /// registered early can never be applied to files it does not describe.
+    ///
+    /// Best-effort by construction: a refused or failed build leaves that
+    /// snapshot to the ordinary scan, and the write publishes regardless.
+    pub(crate) async fn finish_snapshot_build(
+        &self,
+        builder: Arc<IncrementalIndexBuilder>,
+        files: Vec<IndexedFile>,
+        file_set: FileSetVersion,
+    ) {
+        let snapshot_id = builder.snapshot_id().to_string();
+        let account = Arc::clone(&self.account);
+        let started = Instant::now();
+        // A compaction rewrite indexes the whole table, which is seconds of sort
+        // and compression, so it runs on the blocking pool like the refresh build.
+        let finished =
+            match tokio::task::spawn_blocking(move || builder.finish(&files, &account, file_set))
+                .await
+            {
+                Ok(finished) => finished,
+                Err(error) => Err(format!("index build task failed: {error}")),
+            };
+        super::table::record_cayenne_write_phase(&self.table_name, "lookup_index", started);
+        match finished {
+            Ok(Some(index)) => self.register_snapshot(Arc::new(index)),
+            Ok(None) => {
+                self.counters
+                    .builds_unpublished
+                    .fetch_add(1, Ordering::Relaxed);
+                if self.snapshot_build_warned.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(table = %self.table_name, snapshot_id = %snapshot_id, "{}", refused_build_message(&self.table_name));
+                } else {
+                    tracing::warn!(table = %self.table_name, snapshot_id = %snapshot_id, "{}", refused_build_message(&self.table_name));
+                }
+            }
+            Err(error) => self.snapshot_build_failed(&snapshot_id, &error),
+        }
+    }
+
+    fn snapshot_build_failed(&self, snapshot_id: &str, error: &str) {
+        self.counters
+            .builds_unpublished
+            .fetch_add(1, Ordering::Relaxed);
+        if self.snapshot_build_warned.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                table = %self.table_name,
+                snapshot_id = %snapshot_id,
+                %error,
+                "Secondary index build for a written snapshot failed again"
+            );
+        } else {
+            tracing::warn!(
+                table = %self.table_name,
+                snapshot_id = %snapshot_id,
+                "Dataset '{}' (cayenne): failed to build its secondary index for newly written rows, so lookups read those rows without the index until compaction rewrites them. Cause: {error}",
+                self.table_name
+            );
+        }
+    }
+
+    /// Adds `index` to the per-snapshot indexes, replacing any for the same
+    /// snapshot. Unpublished entries beyond [`MAX_UNPUBLISHED_SNAPSHOT_INDEXES`]
+    /// can only come from writes abandoned without discarding their index, so
+    /// the oldest of those are dropped.
+    fn register_snapshot(&self, index: Arc<SnapshotLookupIndex>) {
+        {
+            let _changing = self.snapshots_lock.lock();
+            let mut next = HashMap::clone(&self.snapshots.load());
+            next.insert(
+                index.snapshot_id.clone(),
+                Arc::new(SnapshotIndexEntry {
+                    index: Arc::clone(&index),
+                    live: AtomicBool::new(false),
+                }),
+            );
+            let mut unpublished: Vec<String> = next
+                .iter()
+                .filter(|(_, entry)| !entry.live.load(Ordering::Acquire))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if unpublished.len() > MAX_UNPUBLISHED_SNAPSHOT_INDEXES {
+                // Snapshot ids are UUIDv7, so lexicographic order is creation order.
+                unpublished.sort_unstable();
+                let excess = unpublished.len() - MAX_UNPUBLISHED_SNAPSHOT_INDEXES;
+                for id in unpublished.into_iter().take(excess) {
+                    next.remove(&id);
+                }
+            }
+            self.snapshots.store(Arc::new(next));
+        }
+        self.record_published(&index);
+    }
+
+    /// Records that `snapshot_id` joined the table's protected set, so its index
+    /// is dropped once the snapshot later leaves it. Called where the snapshot
+    /// is published.
+    pub(crate) fn mark_snapshot_live(&self, snapshot_id: &str) {
+        if let Some(entry) = self.snapshots.load().get(snapshot_id) {
+            entry.live.store(true, Ordering::Release);
+        }
+    }
+
+    /// Drops the index of a snapshot whose write was abandoned.
+    pub(crate) fn discard_snapshot(&self, snapshot_id: &str) {
+        if !self.snapshots.load().contains_key(snapshot_id) {
+            return;
+        }
+        let _changing = self.snapshots_lock.lock();
+        let mut next = HashMap::clone(&self.snapshots.load());
+        if next.remove(snapshot_id).is_some() {
+            self.snapshots.store(Arc::new(next));
+        }
+    }
+
+    /// Drops every published per-snapshot index whose snapshot `is_live` no
+    /// longer reports: a merge or rewrite folded it away. Entries not yet
+    /// published are kept, because their write is still in flight.
+    pub(crate) fn retain_live_snapshots(&self, is_live: impl Fn(&str) -> bool) {
+        let folded =
+            |id: &str, entry: &SnapshotIndexEntry| entry.live.load(Ordering::Acquire) && !is_live(id);
+        if !self
+            .snapshots
+            .load()
+            .iter()
+            .any(|(id, entry)| folded(id, entry))
+        {
+            return;
+        }
+        let _changing = self.snapshots_lock.lock();
+        let mut next = HashMap::clone(&self.snapshots.load());
+        next.retain(|id, entry| !folded(id, entry));
+        self.snapshots.store(Arc::new(next));
+    }
+
+    /// Publishes the registered index of `snapshot_id` as the index of the
+    /// table's current snapshot. Called inside the flip that makes a compaction
+    /// rewrite's snapshot current, exactly as a refresh publishes its staged
+    /// index. Returns whether there was one to publish.
+    pub(crate) fn promote_snapshot(&self, snapshot_id: &str) -> bool {
+        let entry = {
+            let _changing = self.snapshots_lock.lock();
+            let mut next = HashMap::clone(&self.snapshots.load());
+            let entry = next.remove(snapshot_id);
+            if entry.is_some() {
+                self.snapshots.store(Arc::new(next));
+            }
+            entry
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        let _publishing = self.publish_lock.lock();
+        self.store_index(Some(Arc::clone(&entry.index)));
+        true
+    }
+
+    /// Resolves a candidate row selection for a lookup reading the snapshot
+    /// `snapshot_id` that is not the table's current one — a protected snapshot
+    /// written by a checkpoint, upsert or merge. `None` means the scan of that
+    /// snapshot reads it in full: no key is pinned, the snapshot has no index,
+    /// or the key could not be answered.
+    ///
+    /// `scalar_for` must only answer for predicates that compare the bare column
+    /// with a value: see the module's note on column-side casts.
+    pub(crate) fn probe_snapshot(
+        self: &Arc<Self>,
+        snapshot_id: &str,
+        scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
+    ) -> Option<LookupSelection> {
+        let shape = self.matched_shape(scalar_for)?;
+        let Some(entry) = self.snapshots.load().get(snapshot_id).map(Arc::clone) else {
+            // A snapshot written before this process started, or whose build was
+            // refused.
+            self.record_probe(shape, ProbeOutcome::Unbuilt);
+            return None;
+        };
+        // The scan found this snapshot in the protected set it captured.
+        entry.live.store(true, Ordering::Release);
+        let hit = entry.index.probe(scalar_for)?;
+        Some(LookupSelection {
+            state: Arc::clone(self),
+            index: Arc::clone(&entry.index),
+            shape: hit.shape,
+            per_file: hit.per_file,
+            rows: hit.rows,
+        })
     }
 
     fn record_published(&self, index: &SnapshotLookupIndex) {

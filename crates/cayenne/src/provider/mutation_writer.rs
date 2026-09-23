@@ -1254,7 +1254,7 @@ impl<'a> AppendMutationWriter<'a> {
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = self
             .table
-            .write_to_snapshot(
+            .write_to_indexed_snapshot(
                 prepared_stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -1270,6 +1270,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // fan-out sizing and the full default delta encoding.
                 estimated_bytes,
                 crate::provider::delta_encoding::WritePolicy::DELTA,
+                None,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);

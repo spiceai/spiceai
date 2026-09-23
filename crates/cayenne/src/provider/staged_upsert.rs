@@ -552,7 +552,7 @@ impl CayenneTableProvider {
         let target_size_bytes = self.target_file_size_bytes();
 
         let (row_count, _writer_ops, stats) = match self
-            .write_to_snapshot(
+            .write_to_indexed_snapshot(
                 prepared.stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -561,6 +561,7 @@ impl CayenneTableProvider {
                 // across the full write concurrency, matching `begin_staged_append`.
                 None,
                 WritePolicy::DELTA,
+                None,
             )
             .await
         {
@@ -599,6 +600,7 @@ impl CayenneTableProvider {
 /// (S3) have no atomic "remove dir" and are left to the next successful
 /// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
 async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
+    table.discard_snapshot_lookup_index(snapshot_id);
     if table.table_path().starts_with("s3://") {
         return;
     }
