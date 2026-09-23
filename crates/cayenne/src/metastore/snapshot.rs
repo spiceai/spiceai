@@ -1742,7 +1742,8 @@ mod tests {
             .await
             .expect_err("a slice with no row for its own dataset must be refused");
         assert!(
-            err.to_string().contains("carries no readable 'cayenne_table' row"),
+            err.to_string()
+                .contains("carries no readable 'cayenne_table' row"),
             "err={err}"
         );
         assert_eq!(
