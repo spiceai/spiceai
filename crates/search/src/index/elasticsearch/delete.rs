@@ -239,6 +239,13 @@ pub async fn delete_by_keys(
 /// derived either. Deleting a group whose survivors cannot all be named would remove documents
 /// this write just wrote, which is worse than leaving a superseded chunk behind.
 ///
+/// Like every other delete on this write path, this is a `_delete_by_query` — a *search* — and a
+/// document `_bulk` wrote is not searchable until the index refreshes. A prune issued inside the
+/// same refresh window as the write that superseded its targets can therefore match nothing and
+/// report a clean delete. That is shared with the eviction deletes either side of it rather than
+/// introduced here, and closing it trades against `bulk_load_refresh_interval`'s whole purpose:
+/// #14318 owns the decision.
+///
 /// Addressing, chunking, and error reporting are [`delete_by_keys`]': the group columns are
 /// resolved to the field path a `term` matches their stored value on (a `text`-mapped column is
 /// matched on its `keyword` multi-field), every request is issued even after an earlier one
