@@ -836,6 +836,11 @@ const TERM_EXACT_FIELD_TYPES: &[&str] = &[
     "wildcard",
 ];
 
+/// Stands in for a key column the delete batch does not carry, until `key_column_arrays` fails
+/// on it: the renderable type that the most mappings are refused for, so an absent column can
+/// never resolve to a mapping a present one would have been refused for.
+const ASSUMED_KEY_TYPE: DataType = DataType::Int64;
+
 /// Field types whose indexed form is a *rounded* form of the value, whatever it holds, so one
 /// term stands for a range of values and a `term` on one reaches documents the key never named.
 ///
@@ -851,11 +856,6 @@ const TERM_EXACT_FIELD_TYPES: &[&str] = &[
 /// | `half_float` | `1.0001`, `1.0002` | both — an 11-bit mantissa is coarser still |
 /// | `date` | `…:00.123456Z`, `…:00.123789Z` | both — `date` quantizes to milliseconds |
 /// | `constant_keyword` | any two | *every* document — the index stores one value for the field |
-/// Stands in for a key column the delete batch does not carry, until `key_column_arrays` fails
-/// on it: the renderable type that the most mappings are refused for, so an absent column can
-/// never resolve to a mapping a present one would have been refused for.
-const ASSUMED_KEY_TYPE: DataType = DataType::Int64;
-
 const TERM_ROUNDING_FIELD_TYPES: &[(&str, &str)] = &[
     (
         "constant_keyword",
