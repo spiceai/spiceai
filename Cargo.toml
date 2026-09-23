@@ -603,8 +603,12 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 # once pushed. No Spice patches needed porting (both historical patches are upstreamed).
 delta_kernel = { path = "/Users/viktor/workspace/df55-prep/delta-kernel-rs/kernel" }
 
-# TODO(datafusion-55): pending spiceai/duckdb-rs rev (agent: arrow-only-forks-bundle)
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b1e4dfc886de561759b70ead48b96" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
+# LOCAL ONLY: branch spiceai-1.4.4-arrow59 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/duckdb-rs.git", rev = "875974763e847eb4dc4e071f875f5bbecdd63b47"` # branch: spiceai-1.4.4-arrow59
+# once pushed. Must still match whatever rev datafusion-table-providers pins
+# for duckdb once that fork's own DF55 prep lands, or cargo resolves two
+# copies of duckdb - reconcile then.
+duckdb = { path = "/Users/viktor/workspace/df55-prep/duckdb-rs/crates/duckdb" }
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
