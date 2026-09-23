@@ -263,6 +263,44 @@ mod tests {
         );
     }
 
+    /// A merge publishes its replacement before dropping its claim, so liveness
+    /// must be read while the claims mutex is held: a snapshot loaded earlier can
+    /// still list inputs that a merge finishing in between has already removed.
+    #[test]
+    fn liveness_is_read_under_the_claims_mutex() {
+        use std::collections::HashMap;
+
+        let published = arc_swap::ArcSwap::from_pointee(HashMap::from([
+            ("a".to_string(), 0_i64),
+            ("b".to_string(), 0_i64),
+        ]));
+        let claims = Arc::new(Mutex::new(ProtectedMergeClaims::default()));
+
+        let stale = published.load_full();
+        let merge =
+            ProtectedMergeClaimGuard::try_claim(&claims, ids(&["a", "b"]), 1, 10, None, live)
+                .expect("the finishing merge holds the runs");
+        // The finishing merge publishes its replacement, then drops its claim.
+        published.store(Arc::new(HashMap::from([("merged".to_string(), 0_i64)])));
+        drop(merge);
+
+        assert!(
+            ProtectedMergeClaimGuard::try_claim(&claims, ids(&["a", "b"]), 0, 10, None, |id| {
+                stale.contains_key(id)
+            })
+            .is_some(),
+            "a snapshot loaded before the lock admits inputs that are already gone"
+        );
+        claims.lock().claims.clear();
+        assert!(
+            ProtectedMergeClaimGuard::try_claim(&claims, ids(&["a", "b"]), 0, 10, None, |id| {
+                published.load().contains_key(id)
+            })
+            .is_none(),
+            "reading liveness inside the callback rejects them"
+        );
+    }
+
     #[test]
     fn claim_guard_releases_on_drop() {
         let claims = Arc::new(Mutex::new(ProtectedMergeClaims::default()));

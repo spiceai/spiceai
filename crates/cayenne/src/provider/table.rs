@@ -23284,16 +23284,17 @@ impl CayenneTableProvider {
         );
 
         // Claim the inputs atomically. Held until the pass returns, past the
-        // in-memory publish, so no other merge can select these runs.
+        // in-memory publish, so no other merge can select these runs. Liveness is
+        // read inside the callback, under the claims mutex: a finishing merge
+        // publishes before it drops its claim, so the read cannot be stale.
         let input_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
-        let live = self.protected_snapshots.load();
         let Some(_claim) = ProtectedMergeClaimGuard::try_claim(
             &self.protected_merge_claims,
             input_ids,
             selected_tier,
             total_input_bytes,
             max_pass_bytes,
-            |id| live.contains_key(id),
+            |id| self.protected_snapshots.load().contains_key(id),
         ) else {
             maintenance_metrics::track_compaction(
                 table_name,
@@ -23308,7 +23309,6 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         };
-        drop(live);
 
         tracing::debug!(
             target: "cayenne::compaction",
