@@ -111,9 +111,17 @@ pub(super) enum ShardSpec {
         run_sort_bytes: Option<u64>,
     },
     /// `n` writers, rows hash-partitioned by `exprs` (parallel encode + key-clustered files).
+    ///
+    /// A hash split gives every file the whole key domain, so file statistics
+    /// cannot prune an equality on the key. `run_sort_bytes` orders each
+    /// shard's rows by the LEADING key expression in runs of at most that many
+    /// uncompressed bytes, exactly as for [`ShardSpec::Range`], so the zone maps
+    /// inside each file are narrow and an equality on the key reads about one
+    /// zone per run of every file instead of every zone.
     Hash {
         exprs: Vec<PhysicalExprRef>,
         partitions: usize,
+        run_sort_bytes: Option<u64>,
     },
 }
 
@@ -613,25 +621,31 @@ async fn write_record_batch_stream_to_files(
     let mut senders = Vec::with_capacity(num_shards);
     let mut handles = Vec::with_capacity(num_shards);
     let started_paths = Arc::new(Mutex::new(HashSet::new()));
-    // Run sorting only means something when the rows were routed by range: it
-    // orders each range's rows by the same key the routing split on.
-    let run_sort = match output_options.shard_spec {
+    // Run sorting orders each shard's rows by the key the rows were routed on:
+    // the range key, or the leading column of a hash key. Round-robin and
+    // single-writer writes have no key to sort by.
+    let run_sort_key = match output_options.shard_spec {
         ShardSpec::Range {
             expr,
             run_sort_bytes: Some(bytes),
             ..
-        } if num_shards > 1
+        } => Some((Arc::clone(expr), *bytes)),
+        ShardSpec::Hash {
+            exprs,
+            run_sort_bytes: Some(bytes),
+            ..
+        } => exprs.first().map(|expr| (Arc::clone(expr), *bytes)),
+        _ => None,
+    };
+    let run_sort = run_sort_key.filter(|(_, bytes)| {
+        num_shards > 1
             && *bytes > 0
             && data
                 .schema()
                 .fields()
                 .iter()
-                .all(|field| run_sort_supports(field.data_type())) =>
-        {
-            Some((Arc::clone(expr), *bytes))
-        }
-        _ => None,
-    };
+                .all(|field| run_sort_supports(field.data_type()))
+    });
     for shard_id in 0..num_shards {
         let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(1);
         senders.push(tx);
@@ -834,7 +848,7 @@ fn sort_scratch_bytes_per_row(data_type: &DataType) -> usize {
 }
 
 /// Buffers one shard's rows up to a byte budget, then emits them sorted by the
-/// shard key. See [`ShardSpec::Range`].
+/// shard key. See [`ShardSpec::Range`] and [`ShardSpec::Hash`].
 ///
 /// Each batch is charged to the task's memory pool on arrival, together with
 /// the scratch its share of the sort will need, so a run that was admitted can
@@ -3373,6 +3387,64 @@ mod tests {
         Ok(())
     }
 
+    /// Hash routing with run sorting must still write every row exactly once,
+    /// and each shard's file must hold its rows in key order — one run here — so
+    /// its zone maps are narrow although the hash gives every file the whole key
+    /// domain.
+    #[tokio::test]
+    async fn test_hash_sharding_with_run_sort_writes_each_shard_in_key_order() -> anyhow::Result<()>
+    {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // 0..1000 in a scrambled arrival order, 100 rows per batch.
+        let scrambled: Vec<i64> = (0..1000).map(|i| (i * 7919) % 1000).collect();
+        let batches: Vec<RecordBatch> = scrambled
+            .chunks(100)
+            .map(|chunk| one_col_batch(&schema, chunk.to_vec()))
+            .collect();
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Hash {
+                exprs: vec![Arc::new(Column::new("a", 0))],
+                partitions: 4,
+                run_sort_bytes: Some(64 * 1024 * 1024),
+            },
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 1000, "no row may be dropped or duplicated");
+        assert_eq!(results.len(), 4, "one file per hash shard");
+
+        let got = ctx
+            .session
+            .sql("SELECT a FROM '/table/' ORDER BY a")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(int64_values(&got), (0..1000).map(Some).collect::<Vec<_>>());
+
+        for (path, _) in &results {
+            let values = int64_values(
+                &ctx.session
+                    .sql(&format!("SELECT a FROM '/{path}'"))
+                    .await?
+                    .collect()
+                    .await?,
+            );
+            assert!(values.len() > 1, "{path}: every shard receives rows");
+            assert!(
+                values.is_sorted(),
+                "{path}: a run-sorted hash shard is written in key order: {values:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// A memory pool with no room must cost the write its sort order only: every
     /// row still lands once, in the file for its range, and nothing stays
     /// reserved.
@@ -3632,6 +3704,7 @@ mod tests {
             ShardSpec::Hash {
                 exprs,
                 partitions: 4,
+                run_sort_bytes: None,
             },
         )
         .await?;
@@ -3859,6 +3932,7 @@ mod tests {
             ShardSpec::Hash {
                 exprs,
                 partitions: 4,
+                run_sort_bytes: None,
             },
         )
         .await?;
@@ -3906,6 +3980,7 @@ mod tests {
             ShardSpec::Hash {
                 exprs,
                 partitions: 4,
+                run_sort_bytes: None,
             },
         )
         .await?;

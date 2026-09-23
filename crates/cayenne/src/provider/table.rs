@@ -3966,6 +3966,56 @@ fn equal_count_bounds(sample: &ArrayRef, shards: usize) -> Option<Vec<ScalarValu
     (!bounds.is_empty()).then_some(bounds)
 }
 
+/// Whether the sampled keys of an input's head spread over the head's key range
+/// window by window, rather than arriving in key order or in narrow key
+/// clusters. `windows[i]` is the input window sample value `i` came from.
+///
+/// Rank-based, so it judges every key type the range router can split, strings
+/// included: a window's span is the distance between the lowest and highest rank
+/// its sampled keys take in the whole sample, as a share of the sample. See
+/// [`CayenneTableProvider::input_range_plan`].
+fn head_is_spread_over_key(sample: &ArrayRef, windows: &[usize]) -> bool {
+    let Ok(order) = arrow::compute::sort_to_indices(
+        sample.as_ref(),
+        Some(arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: true,
+        }),
+        None,
+    ) else {
+        return false;
+    };
+    let n = order.len();
+    if n == 0 || windows.len() != n {
+        return false;
+    }
+    let mut rank = vec![0_usize; n];
+    for (position, &row) in order.values().iter().enumerate() {
+        if let Some(slot) = usize::try_from(row).ok().and_then(|row| rank.get_mut(row)) {
+            *slot = position;
+        }
+    }
+    let window_count = windows.iter().copied().max().map_or(0, |last| last + 1);
+    let mut low = vec![usize::MAX; window_count];
+    let mut high = vec![0_usize; window_count];
+    let mut samples = vec![0_usize; window_count];
+    for (&window, &rank) in windows.iter().zip(&rank) {
+        low[window] = low[window].min(rank);
+        high[window] = high[window].max(rank);
+        samples[window] += 1;
+    }
+    // Each window's span as a percentage of the sample's ranks.
+    let mut spans: Vec<usize> = (0..window_count)
+        .filter(|&window| samples[window] >= INPUT_RANGE_MIN_WINDOW_SAMPLES)
+        .map(|window| (high[window] - low[window]).saturating_mul(100) / n)
+        .collect();
+    if spans.len() < INPUT_RANGE_MIN_WINDOWS {
+        return false;
+    }
+    spans.sort_unstable();
+    spans[spans.len() / 2] >= INPUT_RANGE_MIN_WINDOW_RANK_SPAN_PERCENT
+}
+
 /// Whether a range split is worth taking over hashing.
 ///
 /// A partial split — fewer cuts than shards, because the domain could not be
@@ -4529,29 +4579,49 @@ pub(crate) enum ClusterSortSpan {
     BoundedRuns,
 }
 
-/// In-memory bytes of rows each range shard of a whole-table replace sorts by the
-/// routing key at a time (see `WriteShardConfig::range_run_sort_bytes`).
+/// In-memory bytes of rows each shard of a whole-table replace sorts by the
+/// routing key at a time (see `WriteShardConfig::run_sort_bytes`).
 ///
-/// A range file then holds a few key-sorted runs instead of arrival order, so an
+/// A file then holds a few key-sorted runs instead of arrival order, so an
 /// equality lookup reads about one zone per run rather than every zone of the
-/// key. One run per shard is resident at a time, charged to the query memory
-/// pool; a refused charge seals the run early rather than failing the write.
-const OVERWRITE_RUN_SORT_BYTES: u64 = 128 * 1024 * 1024;
+/// key. This holds for a range-routed replace and for one that hashes the key
+/// (the first load of a table has no rows to sample split points from). One run
+/// per shard is resident at a time, charged to the query memory pool; a refused
+/// charge seals the run early rather than failing the write.
+pub(crate) const OVERWRITE_RUN_SORT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Most-filtered columns considered when choosing a routing key, so a hot
 /// column of a type the router cannot split does not rule the others out.
 const DEFAULT_ROUTING_CANDIDATES: usize = 4;
 
-/// A range-partitioned write: split points on one key column.
+/// How a write splits rows across its shards: split points on one key column,
+/// or — with no `bounds` — a hash of the shard key, optionally sorted within
+/// each shard.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RangePartitioning<'a> {
     /// The column `bounds` describe. `None` means the leading column of the
     /// table's shard key, which is what a rewrite merge splits on.
     pub(crate) column: Option<&'a str>,
-    /// Ascending split points; see `WriteShardConfig::range_bounds`.
+    /// Ascending split points; see `WriteShardConfig::range_bounds`. Empty ⇒
+    /// the write hashes its shard key.
     pub(crate) bounds: &'a [ScalarValue],
-    /// Sort each range's rows by the key in runs of this many bytes.
+    /// Sort each shard's rows by the key in runs of this many bytes.
     pub(crate) run_sort_bytes: Option<u64>,
+}
+
+impl RangePartitioning<'_> {
+    /// A whole-table replace with no split points to route on: the shard key
+    /// is hashed as before, and each shard's rows are still sorted by its
+    /// leading column, so the zone maps inside every file prune an equality on
+    /// the key. This is the shape of a table's first load, which has no rows
+    /// to sample split points from.
+    pub(crate) const fn hashed_run_sorted() -> Self {
+        Self {
+            column: None,
+            bounds: &[],
+            run_sort_bytes: Some(OVERWRITE_RUN_SORT_BYTES),
+        }
+    }
 }
 
 /// How a whole-table replace routes rows into key-range files; see
@@ -4571,6 +4641,40 @@ impl OverwriteRangePlan {
         }
     }
 }
+
+/// How a whole-table replace should route its rows, from
+/// [`CayenneTableProvider::overwrite_range_plan`].
+#[derive(Debug)]
+pub(crate) enum OverwriteRouting {
+    /// Route rows into key-range files on split points sampled from the table
+    /// being replaced.
+    Range(OverwriteRangePlan),
+    /// The table being replaced holds no rows to sample split points from — its
+    /// first load. The replace may take them from the head of its own input
+    /// instead; see [`CayenneTableProvider::input_range_plan`].
+    NothingToSample,
+    /// Hash the shard key, as every replace did before range routing.
+    Hash,
+}
+
+/// Bytes of a first load's leading rows [`CayenneTableProvider::input_range_plan`]
+/// buffers to sample its routing key from, charged to the query memory pool.
+const INPUT_RANGE_SAMPLE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Consecutive input rows [`CayenneTableProvider::input_range_plan`] treats as
+/// one window when judging whether the input's head is a fair sample of its key.
+const INPUT_RANGE_WINDOW_ROWS: usize = 8192;
+
+/// Windows needed before a head that did not hold the whole input is trusted.
+const INPUT_RANGE_MIN_WINDOWS: usize = 4;
+
+/// Sampled keys a window needs for its rank span to count.
+const INPUT_RANGE_MIN_WINDOW_SAMPLES: usize = 16;
+
+/// Median share, in percent, of the head's key ranks a window must span: a
+/// source in random key order gives every window nearly the whole range; one
+/// ordered or clustered by the key gives each window a sliver of it.
+const INPUT_RANGE_MIN_WINDOW_RANK_SPAN_PERCENT: usize = 50;
 
 /// Where a range-routed replace takes its key from, for the debug log.
 #[derive(Debug, Clone, Copy)]
@@ -9310,16 +9414,18 @@ impl CayenneTableProvider {
                 range.as_ref().map(|range| range.bounds),
             )
             .map(|mut config| {
-                if let Some(range) = range.as_ref()
-                    && config.range_bounds.is_some()
-                {
+                if let Some(range) = range.as_ref() {
                     // The bounds describe `range.column` when the caller named
                     // one (a table without a primary key routes on a column that
                     // is not its shard key), so the router must split that column.
-                    if let Some(column) = range.column {
+                    if config.range_bounds.is_some()
+                        && let Some(column) = range.column
+                    {
                         config.shard_key_columns = vec![column.to_string()];
                     }
-                    config.range_run_sort_bytes = range.run_sort_bytes;
+                    // Without bounds the write hashes the shard key; the run sort
+                    // then orders each shard by its leading column instead.
+                    config.run_sort_bytes = range.run_sort_bytes;
                 }
                 config
             });
@@ -10464,7 +10570,7 @@ impl CayenneTableProvider {
             range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
             // Run sorting is the caller's opt-in (see
             // `write_to_snapshot_range_partitioned`).
-            range_run_sort_bytes: None,
+            run_sort_bytes: None,
         })
     }
 
@@ -17162,20 +17268,17 @@ impl CayenneTableProvider {
     /// (`cayenne_sort_columns`, `cayenne_cluster_by`) keep their single sorted
     /// writer. The first load has nothing to sample and hashes, as does a table
     /// too small to cut.
-    pub(crate) async fn overwrite_range_plan(
-        &self,
-        target_partitions: usize,
-    ) -> Option<OverwriteRangePlan> {
+    pub(crate) async fn overwrite_range_plan(&self, target_partitions: usize) -> OverwriteRouting {
         // Places equal-count cuts within a fraction of a percent of their target
         // for any shard count a write uses.
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
         if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
-            return None;
+            return OverwriteRouting::Hash;
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
         if shards < 2 {
-            return None;
+            return OverwriteRouting::Hash;
         }
         let schema = self.table_schema();
         for (column, source) in self.range_routing_candidates(&schema) {
@@ -17188,7 +17291,7 @@ impl CayenneTableProvider {
                 Ok(Some(sample)) => sample,
                 // Nothing to sample, or no trustworthy row count: the same for
                 // every column.
-                Ok(None) => return None,
+                Ok(None) => return OverwriteRouting::NothingToSample,
                 Err(error) => {
                     // Placement only: hashing keeps the replace correct, just unclustered.
                     tracing::debug!(
@@ -17197,7 +17300,7 @@ impl CayenneTableProvider {
                         %error,
                         "Could not sample the routing key of a whole-table replace; hashing it instead"
                     );
-                    return None;
+                    return OverwriteRouting::Hash;
                 }
             };
             // NULL keys all route to the first shard; past one shard's share of
@@ -17223,9 +17326,198 @@ impl CayenneTableProvider {
                 elapsed_ms = started.elapsed().as_millis(),
                 "Routing whole-table replace into key-range files"
             );
-            return Some(OverwriteRangePlan { column, bounds });
+            return OverwriteRouting::Range(OverwriteRangePlan { column, bounds });
         }
-        None
+        OverwriteRouting::Hash
+    }
+
+    /// Split points for a whole-table replace taken from the head of its own
+    /// input, for a table with no rows to sample them from — its first load.
+    ///
+    /// [`Self::overwrite_range_plan`] samples the table being replaced, which a
+    /// first load does not have, so without this every table's first load hashes
+    /// its key: each file spans the whole key domain and a lookup on the key
+    /// opens every file until the next refresh routes on ranges. The input's
+    /// leading rows can stand in for the table when they are a fair sample of the
+    /// key — which a source emitting rows in random key order gives, and one
+    /// ordered or clustered by the key does not. So up to
+    /// [`INPUT_RANGE_SAMPLE_BYTES`] of the head are buffered (charged to the query
+    /// memory pool; a refused charge ends the buffering) and a plan is taken only
+    /// when either
+    ///
+    /// * the input ended inside the buffer, so the sample is the whole table; or
+    /// * the head is spread: consecutive runs of [`INPUT_RANGE_WINDOW_ROWS`] rows
+    ///   each span, at the median, at least
+    ///   [`INPUT_RANGE_MIN_WINDOW_RANK_SPAN_PERCENT`] of the head's key ranks. A source in key order, or in narrow key
+    ///   clusters, gives every window a sliver of the range; its head says
+    ///   nothing about the rest of the table, and cutting on it would pile most
+    ///   rows onto one shard. Such an input keeps the hash, and each shard still
+    ///   sorts its rows by the key.
+    ///
+    /// Split points only place rows, so poor ones cost balance, never
+    /// correctness: every row still reaches exactly one file, and each file's
+    /// statistics describe what it holds. The next refresh derives them from the
+    /// table itself. The returned stream yields the buffered head, then the rest
+    /// of `data`, unchanged.
+    pub(crate) async fn input_range_plan(
+        &self,
+        mut data: SendableRecordBatchStream,
+        target_partitions: usize,
+    ) -> DataFusionResult<(SendableRecordBatchStream, Option<OverwriteRangePlan>)> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        // Places equal-count cuts within a fraction of a percent of their target
+        // for any shard count a write uses (as `overwrite_range_plan`).
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return Ok((data, None));
+        }
+        let shards = self.snapshot_write_concurrency(target_partitions);
+        if shards < 2 {
+            return Ok((data, None));
+        }
+        let input_schema = data.schema();
+        let table_schema = self.table_schema();
+        let Some((column, key_index, key_type)) = self
+            .range_routing_candidates(&table_schema)
+            .into_iter()
+            .find_map(|(column, _)| {
+                let key_index = input_schema.index_of(&column).ok()?;
+                let key_type = table_schema
+                    .field_with_name(&column)
+                    .ok()?
+                    .data_type()
+                    .clone();
+                Some((column, key_index, key_type))
+            })
+        else {
+            return Ok((data, None));
+        };
+
+        let started = Instant::now();
+        let reservation =
+            MemoryConsumer::new(format!("cayenne_input_range_sample:{}", self.table_name()))
+                .register(&self.context.runtime_env().memory_pool);
+        let mut head: Vec<RecordBatch> = Vec::new();
+        let mut head_bytes = 0_usize;
+        let mut exhausted = false;
+        while head_bytes < INPUT_RANGE_SAMPLE_BYTES {
+            let Some(batch) = data.next().await.transpose()? else {
+                exhausted = true;
+                break;
+            };
+            let bytes = batch.get_array_memory_size();
+            let admitted = reservation.try_grow(bytes).is_ok();
+            head_bytes = head_bytes.saturating_add(bytes);
+            head.push(batch);
+            if !admitted {
+                break;
+            }
+        }
+
+        let plan = Self::sampled_input_bounds(
+            &head,
+            key_index,
+            &key_type,
+            shards,
+            exhausted,
+            MAX_SAMPLE_ROWS,
+        )
+        .map(|bounds| OverwriteRangePlan {
+            column: column.clone(),
+            bounds,
+        });
+        tracing::debug!(
+            table = self.table_name(),
+            column = column.as_str(),
+            head_rows = head.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            head_bytes,
+            input_exhausted = exhausted,
+            routed = plan.is_some(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Sampled the routing key of a first load from its input"
+        );
+        // The head stays charged until the writer has taken every buffered batch.
+        let mut unread_head = head.len();
+        let mut reservation = (unread_head > 0).then_some(reservation);
+        let rest = stream::iter(head.into_iter().map(Ok))
+            .chain(data)
+            .inspect(move |_| {
+                if unread_head > 0 {
+                    unread_head -= 1;
+                    if unread_head == 0 {
+                        drop(reservation.take());
+                    }
+                }
+            });
+        let data: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(input_schema, rest));
+        Ok((data, plan))
+    }
+
+    /// Equal-count split points for `shards` from the key column of an input's
+    /// buffered head, or `None` when the head is not a fair sample of the key.
+    /// See [`Self::input_range_plan`].
+    fn sampled_input_bounds(
+        head: &[RecordBatch],
+        key_index: usize,
+        key_type: &DataType,
+        shards: usize,
+        exhausted: bool,
+        max_sample_rows: usize,
+    ) -> Option<Vec<ScalarValue>> {
+        use arrow::array::UInt32Array;
+
+        let total_rows: usize = head.iter().map(RecordBatch::num_rows).sum();
+        if total_rows == 0 {
+            return None;
+        }
+        let stride = total_rows.div_ceil(max_sample_rows.max(1)).max(1);
+        let mut parts: Vec<ArrayRef> = Vec::with_capacity(head.len());
+        // The input window each sampled key came from, in sample order.
+        let mut windows: Vec<usize> = Vec::new();
+        let mut position = 0_usize;
+        for batch in head {
+            let rows = batch.num_rows();
+            let first = (stride - position % stride) % stride;
+            let mut indices: Vec<u32> = Vec::new();
+            for row in (first..rows).step_by(stride) {
+                if let Ok(index) = u32::try_from(row) {
+                    indices.push(index);
+                    windows.push((position + row) / INPUT_RANGE_WINDOW_ROWS);
+                }
+            }
+            if !indices.is_empty() {
+                let picked = arrow::compute::take(
+                    batch.column(key_index).as_ref(),
+                    &UInt32Array::from(indices),
+                    None,
+                )
+                .ok()?;
+                parts.push(compact_sampled_views(picked));
+            }
+            position = position.saturating_add(rows);
+        }
+        let refs: Vec<&dyn Array> = parts.iter().map(AsRef::as_ref).collect();
+        let sample = arrow::compute::concat(&refs).ok()?;
+        let sample = if sample.data_type() == key_type {
+            sample
+        } else {
+            arrow::compute::cast(&sample, key_type).ok()?
+        };
+        // NULL keys all route to the first shard; past one shard's share of the
+        // rows they would pile the write onto one encoder.
+        if sample.null_count().saturating_mul(shards) > sample.len() {
+            return None;
+        }
+        if !exhausted && !head_is_spread_over_key(&sample, &windows) {
+            return None;
+        }
+        let bounds = equal_count_bounds(&sample, shards)?;
+        // Too few distinct values to fill every shard would pile the rows onto
+        // fewer encoders than hashing uses.
+        (bounds.len() + 1 >= shards).then_some(bounds)
     }
 
     /// Columns a whole-table replace may be range-routed on, most preferred
@@ -32965,10 +33257,9 @@ impl CayenneTableProvider {
         // When true, this scan is highly selective (PK point lookup / small IN /
         // tight BETWEEN). Report `supports_repartitioning() == false` on the
         // Vortex source so DataFusion's `repartition_file_scans` rule does NOT
-        // byte-range-split the file group into `target_partitions` — a 1-row
-        // lookup would otherwise pay a Vortex footer-open per split. The inner
-        // `with_target_partitions(1)` alone is insufficient: the physical
-        // optimizer re-splits using the OUTER session's `target_partitions`.
+        // byte-range-split a file into `target_partitions` pieces — a 1-row
+        // lookup would otherwise pay a Vortex footer-open per split. Whole files
+        // are still spread across partitions at listing.
         disable_repartition: bool,
         // Auto-variant of `disable_repartition` for small scans: when the TOTAL
         // bytes across ALL listed file groups (the set the optimizer would
@@ -33179,11 +33470,10 @@ impl CayenneTableProvider {
                 && group_bytes < small_group_repartition_opt_out_bytes);
 
         // Selective scans opt the Vortex source out of `repartition_file_scans`
-        // so the matching file group is not byte-range-split into N partitions
-        // (see `disable_repartition`). `supports_repartitioning() == false` is the
-        // gate the physical optimizer actually honors; the inner
-        // `with_target_partitions(1)` is undone by the rule's use of the OUTER
-        // session `target_partitions`.
+        // so no file is byte-range-split into N partitions (see
+        // `disable_repartition`). `supports_repartitioning() == false` is the gate
+        // the physical optimizer honors; the partition count used at listing only
+        // decides how whole files are grouped.
         if disable_repartition {
             let replacement: Option<Arc<dyn FileSource>> = file_source
                 .downcast_ref::<VortexSource>()
@@ -35263,12 +35553,20 @@ impl TableProvider for CayenneTableProvider {
             .resolve_lookup_index_selection(state, scan_filters, &read_schema)
             .await;
 
-        // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
-        // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT
-        // byte-range-split the matching file across N file_groups. The fan-out
-        // pays per-group Vortex footer-open cost (~50 µs each) without speeding
-        // up the lookup because only one chunk in one file_group actually
-        // contains K. See `pk_lookup_file_group_fanout` bench.
+        // A PK point lookup (e.g. `WHERE pk_col = K`), small IN / tight BETWEEN,
+        // or an index-restricted file set is selective: each file that survives
+        // listing-time pruning is read by exactly ONE stream, never
+        // byte-range-split into `target_partitions` pieces that each pay a
+        // Vortex footer-open and zone prune for a chunk that cannot hold K
+        // (`disable_repartition` below; see `pk_lookup_file_group_fanout`).
+        //
+        // The surviving FILES are still spread across the session's partitions.
+        // Where the key is range-clustered, pruning leaves one file and this is
+        // one partition. Where every file spans the key domain — a load that
+        // hashed the key, or a table without a key-clustered layout — they all
+        // survive, and reading them one after another in a single partition
+        // would make a lookup cost the sum of every file's open and zone prune
+        // rather than the slowest one.
         let index_selected = lookup_resolution
             .as_ref()
             .is_some_and(|(selection, _)| selection.is_some());
@@ -35277,12 +35575,13 @@ impl TableProvider for CayenneTableProvider {
             .map_or((None, None), |(selection, explain)| {
                 (selection, Some(explain))
             });
-        let scan_listing_config_override;
-        let scan_listing_config = if is_pk_selective_scan {
-            scan_listing_config_override = state.config().clone().with_target_partitions(1);
-            &scan_listing_config_override
+        let scan_listing_config = state.config();
+        // The in-memory branches (inline corpus, RAM tier) hold few rows for a
+        // selective predicate; fanning them across cores costs more than it saves.
+        let memory_branch_partitions = if is_pk_selective_scan {
+            1
         } else {
-            state.config()
+            scan_listing_config.target_partitions()
         };
 
         // `current_snapshot_id` was captured under the read fence in
@@ -35437,11 +35736,9 @@ impl TableProvider for CayenneTableProvider {
                 // gated off whenever scan filters are present.
                 let inline_partitions = Self::partition_memory_batches(
                     projected_batches,
-                    // Scan-resolved partition count, NOT the session's: a PK point
-                    // lookup forces `scan_listing_config` to target_partitions=1
-                    // (the file branch does the same), so the in-RAM branch must
-                    // not re-introduce fan-out for point lookups.
-                    scan_listing_config.target_partitions(),
+                    // One partition for a selective scan; see
+                    // `memory_branch_partitions`.
+                    memory_branch_partitions,
                 );
                 let inline_exec: Arc<dyn ExecutionPlan> =
                     datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
@@ -35474,8 +35771,8 @@ impl TableProvider for CayenneTableProvider {
                 indexed_segments.unwrap_or(&visible_segments[..]),
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
-                // Scan-resolved (1 for PK point lookups) — see the inline branch.
-                scan_listing_config.target_partitions(),
+                // One partition for a selective scan — see the inline branch.
+                memory_branch_partitions,
                 &read_schema,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
@@ -46195,11 +46492,274 @@ mod tests {
         );
     }
 
+    /// Key column of `batches` of `rows_per_batch` Int64 keys, for the input
+    /// sampling tests: `key(batch, row)` gives each key.
+    fn int64_key_batches(
+        batches: usize,
+        rows_per_batch: usize,
+        key: impl Fn(usize, usize) -> i64,
+    ) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        (0..batches)
+            .map(|batch| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from_iter_values(
+                        (0..rows_per_batch).map(|row| key(batch, row)),
+                    ))],
+                )
+                .expect("key batch")
+            })
+            .collect()
+    }
+
+    /// A scrambled permutation of `0..n`: position `i` holds `(i * 7919) % n`
+    /// for `n` coprime with 7919.
+    fn scrambled(i: usize, n: usize) -> i64 {
+        i64::try_from((i * 7919) % n).expect("fits i64")
+    }
+
+    /// A head in random key order is a fair sample of the key even though the
+    /// input continues past it, so a first load cuts equal-count split points
+    /// from it; a head in key order, or in narrow key clusters, says nothing
+    /// about the rows after it and hashes instead — unless the input ended
+    /// inside the head, when the head IS the table.
+    #[test]
+    fn sampled_input_bounds_trust_only_a_spread_head() {
+        const BATCHES: usize = 40;
+        const ROWS: usize = 8192;
+        const N: usize = BATCHES * ROWS;
+        const SHARDS: usize = 4;
+        let bounds = |head: &[RecordBatch], exhausted: bool| {
+            CayenneTableProvider::sampled_input_bounds(
+                head,
+                0,
+                &DataType::Int64,
+                SHARDS,
+                exhausted,
+                65_536,
+            )
+        };
+
+        let shuffled = int64_key_batches(BATCHES, ROWS, |b, r| scrambled(b * ROWS + r, N));
+        let cuts = bounds(&shuffled, false).expect("a shuffled head is a fair sample");
+        assert_eq!(cuts.len(), SHARDS - 1);
+        for (cut, quartile) in cuts.iter().zip(1..) {
+            let ScalarValue::Int64(Some(value)) = cut else {
+                panic!("an Int64 key cuts on Int64 bounds: {cut:?}");
+            };
+            let expected = i64::try_from(N * quartile / SHARDS).expect("fits i64");
+            let tolerance = i64::try_from(N / 100).expect("fits i64");
+            assert!(
+                (value - expected).abs() <= tolerance,
+                "cut {quartile} = {value}, expected about {expected}"
+            );
+        }
+
+        let sorted = int64_key_batches(BATCHES, ROWS, |b, r| {
+            i64::try_from(b * ROWS + r).expect("fits i64")
+        });
+        assert_eq!(
+            bounds(&sorted, false),
+            None,
+            "a head in key order does not describe the rows after it"
+        );
+        assert!(
+            bounds(&sorted, true).is_some_and(|cuts| cuts.len() == SHARDS - 1),
+            "an input that ended inside the head is sampled whole"
+        );
+
+        // Every batch a random order over its own narrow slice of the key.
+        let clustered = int64_key_batches(BATCHES, ROWS, |b, r| {
+            i64::try_from(b * ROWS).expect("fits i64") + scrambled(r, ROWS)
+        });
+        assert_eq!(
+            bounds(&clustered, false),
+            None,
+            "a head in narrow key clusters does not describe the rows after it"
+        );
+    }
+
+    /// The spread test is rank-based, so string keys — the range router splits
+    /// them too — are judged the same way as integers.
+    #[test]
+    fn sampled_input_bounds_judge_string_keys_by_rank() {
+        use arrow::array::StringArray;
+
+        const BATCHES: usize = 16;
+        const ROWS: usize = 8192;
+        const N: usize = BATCHES * ROWS;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+        let head = |key: &dyn Fn(usize) -> usize| -> Vec<RecordBatch> {
+            (0..BATCHES)
+                .map(|batch| {
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(StringArray::from_iter_values(
+                            (0..ROWS).map(|row| format!("key-{:08}", key(batch * ROWS + row))),
+                        ))],
+                    )
+                    .expect("string key batch")
+                })
+                .collect()
+        };
+        let bounds = |head: &[RecordBatch]| {
+            CayenneTableProvider::sampled_input_bounds(head, 0, &DataType::Utf8, 4, false, 65_536)
+        };
+        assert!(bounds(&head(&|i| (i * 7919) % N)).is_some_and(|cuts| cuts.len() == 3));
+        assert_eq!(bounds(&head(&|i| i)), None);
+    }
+
+    /// A table's first load has no snapshot to sample split points from, so it
+    /// takes them from its own input: the files it writes each hold a disjoint
+    /// slice of the key domain, in key order, and a lookup on the key is pruned
+    /// to the one file whose statistics can hold it — where a hashed first load
+    /// gives every file the whole domain.
+    #[tokio::test]
+    async fn test_first_load_routes_rows_into_key_range_files_from_its_input() {
+        const ROWS: usize = 40_000;
+        const SHARDS: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "first_load_range_routed",
+            Arc::clone(&schema),
+            VortexConfig {
+                // Keep the load out of the metastore so it writes files.
+                inline_max_rows: 0,
+                write_concurrency: Some(SHARDS),
+                ..VortexConfig::default()
+            },
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(matches!(
+            provider.overwrite_range_plan(SHARDS).await,
+            OverwriteRouting::NothingToSample
+        ));
+
+        let batches: Vec<DataFusionResult<RecordBatch>> = (0..ROWS)
+            .step_by(1024)
+            .map(|start| {
+                let keys: Vec<i64> = (start..ROWS.min(start + 1024))
+                    .map(|i| scrambled(i, ROWS))
+                    .collect();
+                let values: Vec<i64> = keys.iter().map(|k| k * 10).collect();
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(Int64Array::from(values)),
+                    ],
+                )
+                .expect("load batch"))
+            })
+            .collect();
+        let prepared = provider
+            .begin_overwrite(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    stream::iter(batches),
+                )),
+                SHARDS,
+            )
+            .await
+            .expect("begin_overwrite");
+        prepared.apply_owned_txn().await.expect("apply_owned_txn");
+        prepared.finish().await.expect("finish");
+
+        let snapshot_id = provider.current_snapshot_id();
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("list snapshot files");
+        assert_eq!(files.len(), SHARDS, "one file per key range: {files:?}");
+        let file_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut ranges = Vec::with_capacity(files.len());
+        let mut total = 0_usize;
+        for (name, _) in &files {
+            let path = provider.snapshot_dir_path_for(&snapshot_id).join(name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(&schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing table");
+            let keys: Vec<i64> = file_ctx
+                .read_table(table)
+                .expect("read file")
+                .collect()
+                .await
+                .expect("scan file")
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id is Int64")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert!(
+                keys.is_sorted(),
+                "{name}: a range file's rows are in key order"
+            );
+            let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
+                panic!("{name}: every range of a scrambled key domain receives rows");
+            };
+            total += keys.len();
+            ranges.push((first, last));
+        }
+        assert_eq!(total, ROWS, "every row is written exactly once");
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "key ranges of a first load's files must not overlap: {ranges:?}"
+            );
+        }
+
+        let provider = Arc::new(provider);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register table");
+        let rows = ctx
+            .sql("SELECT val FROM t WHERE id = 31337")
+            .await
+            .expect("lookup")
+            .collect()
+            .await
+            .expect("run lookup");
+        let values: Vec<i64> = rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("val is Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(values, vec![313_370]);
+    }
+
     /// A whole-table replace of a keyed table routes its rows into key-range
     /// files once a previous snapshot exists to sample: each file holds its own
     /// slice of the key domain in key order, the slices do not overlap, and no
-    /// row is lost or duplicated. The first load has nothing to sample and
-    /// hashes.
+    /// row is lost or duplicated. The first load has no snapshot to sample, so
+    /// `overwrite_range_plan` reports `NothingToSample` and the replace samples
+    /// its own input instead (see
+    /// `test_first_load_routes_rows_into_key_range_files_from_its_input`).
     #[tokio::test]
     async fn test_overwrite_routes_rows_into_disjoint_sorted_key_range_files() {
         use arrow::array::StringArray;
@@ -46264,15 +46824,17 @@ mod tests {
         };
 
         assert!(
-            provider.overwrite_range_plan(SHARDS).await.is_none(),
+            matches!(
+                provider.overwrite_range_plan(SHARDS).await,
+                OverwriteRouting::NothingToSample
+            ),
             "an empty table has nothing to sample"
         );
         replace(&provider, refresh(0)).await;
 
-        let plan = provider
-            .overwrite_range_plan(SHARDS)
-            .await
-            .expect("a loaded keyed table is split into ranges");
+        let OverwriteRouting::Range(plan) = provider.overwrite_range_plan(SHARDS).await else {
+            panic!("a loaded keyed table is split into ranges");
+        };
         assert_eq!(plan.column, "sid");
         assert_eq!(plan.bounds.len(), SHARDS - 1);
 
@@ -47519,15 +48081,14 @@ mod tests {
         );
     }
 
-    /// REGRESSION — point-lookup file-group fan-out. `is_pk_selective_scan`
-    /// forces `target_partitions = 1` on the inner listing config so a 1-row PK
-    /// lookup does not pay 16× Vortex footer-opens. This proves whether the
-    /// override (a) is even chosen for `id = K`, and (b) SURVIVES the physical
-    /// optimizer's `repartition_file_scans` rule (which runs with the OUTER
-    /// session's `target_partitions`, here 16). The diagnostic
-    /// `pk_lookup_file_group_fanout` bench only forced the OUTER session tp, so it
-    /// never exercised this production wiring — and no test guards the final-plan
-    /// group count.
+    /// REGRESSION — point-lookup file-group fan-out. A selective scan opts the
+    /// Vortex source out of byte-range splitting so a 1-row PK lookup over one
+    /// file does not pay 16× Vortex footer-opens. This proves the opt-out (a) is
+    /// chosen for `id = K`, and (b) SURVIVES the physical optimizer's
+    /// `repartition_file_scans` rule (which runs with the session's
+    /// `target_partitions`, here 16). The diagnostic `pk_lookup_file_group_fanout`
+    /// bench only forced the OUTER session tp, so it never exercised this
+    /// production wiring — and no test guards the final-plan group count.
     #[tokio::test]
     async fn pk_point_lookup_fast_path_survives_physical_optimizer() {
         fn max_leaf_partitions(plan: &dyn ExecutionPlan) -> usize {
@@ -47642,6 +48203,118 @@ mod tests {
              supports_repartitioning()=false must stop repartition_file_scans from \
              byte-range-splitting the selective scan"
         );
+    }
+
+    /// A point lookup whose files all survive listing-time pruning — a
+    /// hash-routed load, where every file spans the key domain — reads those
+    /// files concurrently, one stream per whole file, rather than one after
+    /// another in a single partition. Each file still gets exactly one stream:
+    /// no file is byte-range-split, so no split pays a footer-open for a range
+    /// that cannot hold the key.
+    #[tokio::test]
+    async fn pk_point_lookup_reads_surviving_files_concurrently() {
+        use arrow::array::AsArray;
+
+        const FILES: i64 = 4;
+
+        fn scan_file_groups(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<FileGroup>> {
+            if let Some(exec) = plan.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+            {
+                return exec
+                    .data_source()
+                    .downcast_ref::<FileScanConfig>()
+                    .map(|config| config.file_groups.clone());
+            }
+            plan.children().into_iter().find_map(scan_file_groups)
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let mut config = SessionConfig::new().with_target_partitions(16);
+        config.options_mut().optimizer.repartition_file_min_size = 1;
+        let ctx = SessionContext::new_with_config(config);
+        // inline_max_rows = 0 ⇒ each insert lands as its own on-disk Vortex file.
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_concurrent_files",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Four files whose id ranges all OVERLAP (file f holds ids ≡ f mod 4), so
+        // file statistics cannot prune a lookup to fewer than all four.
+        let n: i64 = 40_000;
+        for f in 0..FILES {
+            let ids: Vec<i64> = (0..n).filter(|id| id % FILES == f).collect();
+            let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .expect("batch built");
+            insert_batch_with_context(&ctx, &provider, batch).await;
+        }
+
+        let provider = Arc::new(provider);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register table");
+        let target_id = 20_001_i64;
+        let sql = format!("SELECT value FROM t WHERE id = {target_id}");
+        let plan = ctx
+            .sql(&sql)
+            .await
+            .expect("selective sql")
+            .create_physical_plan()
+            .await
+            .expect("selective physical plan");
+        let groups = scan_file_groups(&plan).expect("plan has a file scan");
+        let files: Vec<&PartitionedFile> = groups.iter().flat_map(FileGroup::iter).collect();
+
+        assert_eq!(
+            files.len(),
+            usize::try_from(FILES).expect("fits usize"),
+            "every overlapping file survives pruning, each listed once: {groups:?}"
+        );
+        assert!(
+            files.iter().all(|file| file.range.is_none()),
+            "a selective scan must not byte-range-split a file: {groups:?}"
+        );
+        assert_eq!(
+            groups.len(),
+            files.len(),
+            "surviving files must be read concurrently, one per partition, \
+             not serially in one partition: {groups:?}"
+        );
+
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("lookup sql")
+            .collect()
+            .await
+            .expect("lookup");
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(values, vec![target_id * 10]);
     }
 
     /// Small file groups opt the Vortex source out of `repartition_file_scans`
