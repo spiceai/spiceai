@@ -613,24 +613,28 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 # [patch.crates-io] block higher up in this file. Keeping those here would be
 # a duplicate-key error.
 
-# arrow-rs 58 with spice patches (spiceai-58, merged PRs #24, #25, #26, and #27)
-# TODO(datafusion-55): pending spiceai/arrow-rs spiceai-59 rev (agent: arrow-rs)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }        # branch: spiceai-58
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }  # branch: spiceai-58
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }  # branch: spiceai-58
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" } # branch: spiceai-58
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }   # branch: spiceai-58
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }    # branch: spiceai-58
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }   # branch: spiceai-58
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" } # branch: spiceai-58
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }    # branch: spiceai-58
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }   # branch: spiceai-58
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }    # branch: spiceai-58
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }    # branch: spiceai-58
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" } # branch: spiceai-58
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" } # branch: spiceai-58
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" } # branch: spiceai-58
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "22ff09c419766c9e3b1ecb8d911fb3a9abf723b3" }      # branch: spiceai-58
+# arrow-rs 59.2.0 with spice patches. LOCAL ONLY: branch spiceai-59-patches is
+# not pushed yet (nothing on origin/spiceai/arrow-rs); these `path` overrides
+# point at the local prep clone so `make build` can be verified before that
+# branch is pushed. Once pushed, replace every entry below with
+# `git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"` # branch: spiceai-59-patches
+arrow = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow" }
+arrow-arith = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-arith" }
+arrow-array = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-array" }
+arrow-avro = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-avro" } # new in DF55: datafusion's own Cargo.toml now depends on arrow-avro directly
+arrow-buffer = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-buffer" }
+arrow-cast = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-cast" }
+arrow-csv = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-csv" }
+arrow-data = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-data" }
+arrow-flight = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-flight" }
+arrow-ipc = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-ipc" }
+arrow-json = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-json" }
+arrow-ord = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-ord" }
+arrow-row = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-row" }
+arrow-schema = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-schema" }
+arrow-select = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-select" }
+arrow-string = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-string" }
+parquet = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/parquet" }
 
 # TODO(datafusion-55): pending spiceai/vortex spiceai-55 rev (agent: vortex)
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
