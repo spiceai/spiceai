@@ -46,7 +46,6 @@ use runtime::datafusion::query::QueryBuilder;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, Scheduler as SchedulerConfig};
 use std::time::Duration;
-use tokio::time::sleep;
 
 use crate::{configure_test_datafusion, utils::test_request_context};
 
@@ -159,12 +158,21 @@ async fn distributed_scan_reads_each_task_its_own_file_group() -> Result<(), any
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            // Give the scheduler a moment to observe executor capacity
-            // before planning. Without this, the first query can race with
-            // cluster-capacity propagation and fail with a transient
-            // non-successful completed job status.
-            sleep(Duration::from_secs(2)).await;
 
+            // The scheduler sizes `target_partitions` from currently-registered
+            // executor capacity, so the plan can still show one file group
+            // immediately after both executors report in. Poll the actual
+            // condition instead of sleeping a fixed duration and hoping
+            // capacity has propagated by then.
+            let ready = crate::utils::wait_until_true(Duration::from_secs(15), || async {
+                harness
+                    .explain("SELECT COUNT(*) FROM orders")
+                    .await
+                    .ok()
+                    .and_then(|rows| arrow::util::pretty::pretty_format_batches(&rows).ok())
+                    .is_some_and(|plan| !plan.to_string().contains("file_groups={1 group"))
+            })
+            .await;
             let plan_rows = harness
                 .explain("SELECT COUNT(*) FROM orders")
                 .await
@@ -173,7 +181,7 @@ async fn distributed_scan_reads_each_task_its_own_file_group() -> Result<(), any
                 .expect("format explain")
                 .to_string();
             assert!(
-                !plan_fmt.contains("file_groups={1 group"),
+                ready,
                 "expected the scan to plan with more than one file group, so the leaf \
                  stage has more than one task — each on its own plan instance, which is \
                  what the loss needs — got:\n{plan_fmt}"
