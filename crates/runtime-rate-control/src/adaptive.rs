@@ -45,10 +45,6 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-/// The smallest ceiling a controller will scale within. Never below one, so a
-/// recovering origin always keeps at least a probe's worth of headroom.
-const MIN_CEILING: f64 = 1.0;
-
 /// Default failure threshold: throttle once the error rate exceeds 10%
 /// (equivalently, the SRE coefficient `k = 1 / (1 - 0.1) ≈ 1.11`).
 pub const DEFAULT_ADAPTIVE_FAILURE_THRESHOLD: f64 = 0.1;
@@ -130,26 +126,14 @@ pub enum RequestOutcome {
 /// recovery even with no new outcomes recorded.
 #[derive(Debug)]
 pub struct AdaptiveController {
-    ceiling: f64,
     sre: SreState,
 }
 
 impl AdaptiveController {
     /// Build a controller for `control`.
-    ///
-    /// `ceiling` is the origin's configured static rate limit — the reference the
-    /// [`Self::effective_limit`] gauge scales. It is clamped to be at least
-    /// [`MIN_CEILING`]; it does not affect the admission coefficient.
     #[must_use]
-    pub fn new(control: AdaptiveRateControl, ceiling: f64) -> Self {
-        let ceiling = if ceiling.is_finite() && ceiling >= MIN_CEILING {
-            ceiling
-        } else {
-            MIN_CEILING
-        };
-
+    pub fn new(control: AdaptiveRateControl) -> Self {
         Self {
-            ceiling,
             sre: SreState::new(control.k, control.window),
         }
     }
@@ -170,44 +154,22 @@ impl AdaptiveController {
         self.sre.admission_coefficient(now).clamp(0.0, 1.0)
     }
 
-    /// How many cells/permits one request should charge right now: `round(1 /
-    /// coefficient)`, at least 1. `1` when the origin is healthy.
+    /// The real-valued weight one request should charge right now: `1 /
+    /// coefficient` (`1.0` when the origin is healthy; `+inf` at coefficient 0).
     ///
     /// Charging `weight` cells against a fixed bucket scales the effective rate by
     /// the admission coefficient without mutating the bucket. This is the *desired*
-    /// weight; each caller clamps it to the individual limiter's capacity, so one
-    /// small limit never bounds how deeply a larger one throttles, and reaching a
-    /// limiter's capacity is its deepest throttle — roughly one request per window.
+    /// weight; each caller clamps it to the individual limiter's capacity and
+    /// rounds to whole cells, so one small limit never bounds how deeply a larger
+    /// one throttles, and reaching a limiter's capacity is its deepest throttle —
+    /// roughly one request per window.
     #[must_use]
-    pub fn acquire_weight(&self) -> u32 {
+    pub fn acquire_weight(&self) -> f64 {
         let coefficient = self.admission_coefficient();
         if coefficient >= 1.0 {
-            return 1;
+            return 1.0;
         }
-        // coefficient is in [0, 1); 1/coefficient is >= 1 (or +inf at 0). Clamp to
-        // the u32 range so a near-zero coefficient can't overflow the cast; each
-        // limiter clamps further to its own (much smaller) capacity.
-        let weight = (1.0 / coefficient).round().clamp(1.0, f64::from(u32::MAX));
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "clamped to [1.0, u32::MAX] before the cast"
-        )]
-        let weight = weight as u32;
-        weight
-    }
-
-    /// The effective request-rate limit the controller currently allows: the
-    /// admission coefficient scaled by the ceiling. Reported as a gauge.
-    #[must_use]
-    pub fn effective_limit(&self) -> f64 {
-        self.admission_coefficient_at(Instant::now()) * self.ceiling
-    }
-
-    /// The static ceiling the effective-limit gauge scales within.
-    #[must_use]
-    pub fn ceiling(&self) -> f64 {
-        self.ceiling
+        1.0 / coefficient
     }
 }
 
@@ -359,7 +321,7 @@ mod tests {
 
     #[test]
     fn never_throttles_a_fully_healthy_origin() {
-        let controller = AdaptiveController::new(enabled(0.5), 100.0);
+        let controller = AdaptiveController::new(enabled(0.5));
         controller.record(RequestOutcome::Success);
         assert!((controller.admission_coefficient() - 1.0).abs() < f64::EPSILON);
         for _ in 0..999 {
@@ -371,7 +333,7 @@ mod tests {
     #[test]
     fn throttles_exactly_above_the_failure_threshold() {
         // 75% failure threshold => k = 4 => throttle when success rate < 1/4.
-        let controller = AdaptiveController::new(enabled(0.75), 100.0);
+        let controller = AdaptiveController::new(enabled(0.75));
         let total = 1000;
         // Success ratio 0.30 > 0.25 (error rate 70% < 75%): not throttled.
         for i in 0..total {
@@ -388,7 +350,7 @@ mod tests {
         );
 
         // Success ratio 0.20 < 0.25 (error rate 80% > 75%): throttled.
-        let controller = AdaptiveController::new(enabled(0.75), 100.0);
+        let controller = AdaptiveController::new(enabled(0.75));
         for i in 0..total {
             controller.record(if i < 200 {
                 RequestOutcome::Success
@@ -405,7 +367,7 @@ mod tests {
 
     #[test]
     fn coefficient_is_clamped_to_unit_interval() {
-        let controller = AdaptiveController::new(enabled(0.9), 100.0);
+        let controller = AdaptiveController::new(enabled(0.9));
         controller.record(RequestOutcome::Success);
         let coefficient = controller.admission_coefficient();
         assert!(
@@ -420,7 +382,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn coefficient_recovers_after_failures_decay() {
         // 75% failure threshold => k = 4.
-        let controller = AdaptiveController::new(enabled(0.75), 32.0);
+        let controller = AdaptiveController::new(enabled(0.75));
 
         for _ in 0..50 {
             controller.record(RequestOutcome::Success);

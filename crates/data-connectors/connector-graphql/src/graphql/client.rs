@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime_rate_control::RateController;
+use runtime_rate_control::{RateController, RequestOutcome};
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
@@ -933,6 +933,14 @@ pub(crate) struct GraphQLQueryResult {
 }
 
 impl GraphQLClient {
+    /// Feed a request outcome to the origin's adaptive rate controller, if one is
+    /// configured. A no-op when adaptive control is disabled.
+    fn record_adaptive_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
+        }
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
@@ -1212,7 +1220,14 @@ impl GraphQLClient {
         let semaphore_wait = semaphore_started.elapsed();
 
         let http_started = Instant::now();
-        let response = request.send().await.context(ReqwestInternalSnafu)?;
+        // A transport/timeout/connection error is a failure signal for adaptive
+        // rate control: the origin is unreachable or too slow, so admit fewer
+        // requests until it recovers.
+        let response = request
+            .send()
+            .await
+            .inspect_err(|_| self.record_adaptive_outcome(RequestOutcome::Failure))
+            .context(ReqwestInternalSnafu)?;
 
         if let Some(permit) = permit {
             drop(permit);
@@ -1230,6 +1245,17 @@ impl GraphQLClient {
         }
 
         let status = response.status();
+
+        // Feed the response outcome to adaptive rate control, matching the HTTP
+        // provider's classification: a retryable status (408/429/5xx) is a failure
+        // signal; a 2xx is a success; any other status (a non-retryable 4xx such as
+        // 401/403/404) is discarded — the origin answered promptly, but the failure
+        // is a client/auth/config condition that throttling cannot remediate.
+        if data_components::resilient_http::status_is_retryable(status) {
+            self.record_adaptive_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_adaptive_outcome(RequestOutcome::Success);
+        }
 
         // Get the response body as text first, so we can log it if JSON parsing fails
         let response_text = response.text().await.context(ReqwestInternalSnafu)?;

@@ -167,7 +167,7 @@ pub struct RateControllerBuilder {
     weighted_quota: Option<QuotaDefinition>,
     metrics: Option<Arc<RateControllerMetrics>>,
     persistence: Option<PersistenceConfig>,
-    adaptive: Option<(AdaptiveRateControl, f64)>,
+    adaptive: Option<AdaptiveRateControl>,
 }
 
 impl RateControllerBuilder {
@@ -195,11 +195,10 @@ impl RateControllerBuilder {
     }
 
     /// Attach an adaptive controller that dynamically scales every configured
-    /// limit by its admission coefficient. `ceiling` is the origin's configured
-    /// static rate limit, used only for the effective-limit gauge.
+    /// limit by its admission coefficient.
     #[must_use]
-    pub fn with_adaptive(mut self, control: AdaptiveRateControl, ceiling: f64) -> Self {
-        self.adaptive = Some((control, ceiling));
+    pub fn with_adaptive(mut self, control: AdaptiveRateControl) -> Self {
+        self.adaptive = Some(control);
         self
     }
 
@@ -345,7 +344,7 @@ impl RateControllerBuilder {
 
         let adaptive = self
             .adaptive
-            .map(|(control, ceiling)| Arc::new(AdaptiveController::new(control, ceiling)));
+            .map(|control| Arc::new(AdaptiveController::new(control)));
 
         RateController::new(
             jitter,
@@ -570,7 +569,7 @@ impl RateController {
 
         // Local in-memory limiters: pace per replica.
         for (limiter, capacity) in &self.local_limiters {
-            let weight = desired.min(*capacity).max(1);
+            let weight = clamp_weight(desired, *capacity);
             if weight <= 1 {
                 limiter.until_ready().await;
             } else if let Some(nonzero_weight) = NonZeroU32::new(weight) {
@@ -583,7 +582,7 @@ impl RateController {
         // Cluster leased buckets: each acquire consumes one token, may wait.
         // A weighted request consumes `weight` tokens from the cluster budget.
         for (bucket, capacity) in &self.leased_buckets {
-            let weight = desired.min(*capacity).max(1);
+            let weight = clamp_weight(desired, *capacity);
             for _ in 0..weight {
                 bucket.acquire().await.map_err(|e| match e {
                     leased::Error::FailClosed { origin } => {
@@ -665,23 +664,15 @@ impl RateController {
             .map(|adaptive| adaptive.admission_coefficient())
     }
 
-    /// The adaptive effective request-rate limit (coefficient × ceiling), or
-    /// `None` when adaptive control is disabled. Computed live.
-    #[must_use]
-    pub fn effective_limit(&self) -> Option<f64> {
+    /// The real-valued weight one request wants to charge right now, before any
+    /// per-limiter capacity clamp. `1.0` when adaptive control is disabled;
+    /// otherwise the controller's [`AdaptiveController::acquire_weight`]. Each
+    /// limiter clamps this to its own capacity (see [`clamp_weight`]) at the point
+    /// of acquisition.
+    fn adaptive_desired_weight(&self) -> f64 {
         self.adaptive
             .as_ref()
-            .map(|adaptive| adaptive.effective_limit())
-    }
-
-    /// The weight one request wants to charge right now, before any per-limiter
-    /// capacity clamp. `1` when adaptive control is disabled; otherwise the
-    /// controller's [`AdaptiveController::acquire_weight`]. Each limiter clamps
-    /// this to its own capacity at the point of acquisition.
-    fn adaptive_desired_weight(&self) -> u32 {
-        self.adaptive
-            .as_ref()
-            .map_or(1, |adaptive| adaptive.acquire_weight())
+            .map_or(1.0, |adaptive| adaptive.acquire_weight())
     }
 
     async fn wait_for_rate_limiters(self: &Arc<Self>, weight: Option<u32>) -> Result<()> {
@@ -726,7 +717,7 @@ impl RateController {
         // request (1 when disabled or healthy), scaling concurrency by the same
         // coefficient as the rate quotas, clamped to this semaphore's capacity.
         let semaphore = if let Some((semaphore, capacity)) = &self.semaphore {
-            let permits = self.adaptive_desired_weight().min(*capacity).max(1);
+            let permits = clamp_weight(self.adaptive_desired_weight(), *capacity);
             match Arc::clone(semaphore).acquire_many_owned(permits).await {
                 Ok(permit) => Some(permit),
                 Err(source) => {
@@ -754,6 +745,22 @@ impl RateController {
             rate_controller: self_cloned,
         })
     }
+}
+
+/// Convert a real-valued desired weight into the whole cells/permits one request
+/// charges against a limiter of the given `capacity`: clamp to the capacity, then
+/// round, floored at 1. Clamping before the cast keeps the value finite and in
+/// `[1, capacity]`, so a near-zero coefficient (desired == +inf) resolves to the
+/// capacity — the limiter's deepest throttle — rather than overflowing.
+fn clamp_weight(desired: f64, capacity: u32) -> u32 {
+    let weight = desired.min(f64::from(capacity)).round();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to [1, capacity] before the cast"
+    )]
+    let weight = weight as u32;
+    weight.clamp(1, capacity.max(1))
 }
 
 fn other_origin(e: &leased::Error) -> String {

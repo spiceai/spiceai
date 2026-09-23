@@ -180,28 +180,15 @@ impl HttpRateControlConfig {
             || !self.jitter_max.is_zero()
     }
 
-    /// The origin's configured static rate limit that adaptive control adjusts:
-    /// the largest of the configured per-second / per-minute / concurrency
-    /// limits, or `None` when the origin defines no static rate limit at all.
-    ///
-    /// Adaptive control is a modifier on a defined limit, so this being `None`
-    /// while [`Self::adaptive_rate_control`] is enabled is a configuration error
-    /// (see [`ensure_adaptive_has_static_limit`]). The reference is the ceiling
-    /// the admission coefficient scales within; that single coefficient scales
-    /// every configured limit uniformly, so any one of them serves as the
-    /// reference.
+    /// Whether the origin defines any static rate limit for adaptive control to
+    /// scale. Adaptive control is a modifier on a defined limit, so this being
+    /// `false` while adaptive control is enabled is a configuration error (see
+    /// [`ensure_adaptive_has_static_limit`]).
     #[must_use]
-    pub fn static_limit_reference(&self) -> Option<f64> {
-        [
-            self.requests_per_second.map(|limit| f64::from(limit.get())),
-            self.requests_per_minute.map(|limit| f64::from(limit.get())),
-            self.max_concurrent_requests.map(usize_to_f64),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(None, |max: Option<f64>, value| {
-            Some(max.map_or(value, |current| current.max(value)))
-        })
+    pub fn has_static_limit(&self) -> bool {
+        self.max_concurrent_requests.is_some()
+            || self.requests_per_second.is_some()
+            || self.requests_per_minute.is_some()
     }
 
     /// Whether adaptive control is enabled for this origin.
@@ -384,23 +371,6 @@ impl HttpRateControlMetrics {
             .unwrap_or_default()
     }
 
-    /// Current adaptive effective request-rate limit (coefficient × ceiling),
-    /// rounded to a whole number. 0 when adaptive rate control is disabled. Read
-    /// live from the controller.
-    #[must_use]
-    pub fn adaptive_effective_limit(&self) -> u64 {
-        self.rate_controller
-            .read()
-            .ok()
-            .and_then(|controller| {
-                controller
-                    .as_ref()
-                    .and_then(|controller| controller.effective_limit())
-            })
-            .map(f64_round_to_u64)
-            .unwrap_or_default()
-    }
-
     fn rate_controller_metric(
         &self,
         observe_metric: impl FnOnce(&RateControllerMetrics) -> u64,
@@ -513,12 +483,6 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     // TODO(#14136): honor server-advertised RateLimit/RateLimit-Policy headers
     // (the IETF advertised-quota headers) here, alongside the reset-hint metrics
     // above, once that separate work lands.
-    MetricSpec::new(
-        "adaptive_rate_control_effective_limit",
-        MetricType::ObservableGaugeU64,
-    )
-    .description("Current adaptive client-side effective request-rate limit for this upstream origin; 0 when adaptive rate control is disabled")
-    .auto_register(),
     MetricSpec::new(
         "adaptive_rate_control_admission_coefficient_permille",
         MetricType::ObservableGaugeU64,
@@ -640,9 +604,6 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             "rate_limit_retry_after_remaining_ms" => observe_metric!(
                 metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_remaining_ms)
             ),
-            "adaptive_rate_control_effective_limit" => {
-                observe_metric!(metrics.adaptive_effective_limit())
-            }
             "adaptive_rate_control_admission_coefficient_permille" => {
                 observe_metric!(metrics.adaptive_admission_coefficient_permille())
             }
@@ -754,7 +715,7 @@ pub fn ensure_adaptive_has_static_limit(
     connector_component: &ConnectorComponent,
     dataconnector: &'static str,
 ) -> DataConnectorResult<()> {
-    if config.adaptive_enabled() && config.static_limit_reference().is_none() {
+    if config.adaptive_enabled() && !config.has_static_limit() {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.to_string(),
             connector_component: connector_component.clone(),
@@ -1264,10 +1225,7 @@ fn build_shared_rate_controller(
         );
     }
     if let Some(control) = config.adaptive_rate_control {
-        // The ceiling is only for the effective-limit gauge; validation
-        // guarantees a static limit exists when adaptive control is enabled.
-        let ceiling = config.static_limit_reference().unwrap_or(1.0);
-        builder = builder.with_adaptive(control, ceiling);
+        builder = builder.with_adaptive(control);
     }
 
     SharedRateController {
@@ -1638,14 +1596,6 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "adaptive ceiling only needs approximate magnitude, not exact representation"
-)]
-fn usize_to_f64(value: usize) -> f64 {
-    value as f64
-}
-
 /// Round a non-negative, finite `f64` to the nearest `u64`, saturating. Negative
 /// or non-finite inputs map to 0. Used only for metric gauges, where an
 /// approximate whole number is all that is reported.
@@ -1703,13 +1653,12 @@ mod tests {
     }
 
     #[test]
-    fn static_limit_reference_is_the_max_configured_limit() {
+    fn has_static_limit_reflects_any_configured_limit() {
         let mut config = HttpRateControlConfig::disabled();
-        assert_eq!(config.static_limit_reference(), None);
+        assert!(!config.has_static_limit());
 
         config.requests_per_second = NonZeroU32::new(5);
-        config.max_concurrent_requests = Some(20);
-        assert_eq!(config.static_limit_reference(), Some(20.0));
+        assert!(config.has_static_limit());
     }
 
     #[test]

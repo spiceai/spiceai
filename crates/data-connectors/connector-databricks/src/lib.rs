@@ -862,6 +862,22 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
         CONNECTOR_NAME,
     )?;
 
+    // Adaptive rate control reacts to per-request outcomes, but the Databricks
+    // clients (Unity Catalog, SQL Warehouse, Spark Connect) do not surface them,
+    // so it could never take effect. Reject it rather than accept it as a no-op.
+    if rate_control.adaptive_enabled() {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message:
+                "`adaptive_rate_control` is not supported for the Databricks connector, which cannot observe per-request outcomes. \
+                Remove `adaptive_rate_control` (and `runtime.params.http_adaptive_rate_control`) for this dataset; \
+                the static `requests_per_second_limit` / `requests_per_minute_limit` / `max_concurrent_requests` limits still apply. \
+                See: https://spiceai.org/docs/components/data-connectors/databricks"
+                    .to_string(),
+        });
+    }
+
     Arc::clone(&rate_control_registry)
         .reserve_shared_rate_controller_for_component(
             &base_url,
