@@ -171,6 +171,8 @@ pub enum Capability {
     GetLogs,
     /// Report runtime readiness.
     GetStatus,
+    /// List the datasets this instance serves, with the status of each.
+    GetDatasets,
     /// Execute a bounded SQL query through the in-process runtime.
     ExecuteQuery,
 }
@@ -181,6 +183,7 @@ impl Capability {
         Self::ApplySpicepod,
         Self::AttachApp,
         Self::ExecuteQuery,
+        Self::GetDatasets,
         Self::GetLogs,
         Self::GetStatus,
         Self::Restart,
@@ -198,6 +201,7 @@ impl Capability {
             Self::UpgradeRuntime => "upgrade_runtime",
             Self::GetLogs => "get_logs",
             Self::GetStatus => "get_status",
+            Self::GetDatasets => "get_datasets",
             Self::ExecuteQuery => "execute_query",
         }
     }
@@ -486,6 +490,19 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         ))
     }
 
+    /// List the datasets this instance serves, for a `GetDatasets` command:
+    /// the JSON array `GET /v1/datasets?status=true` answers locally, so the
+    /// control plane and a local operator read the same document.
+    ///
+    /// The default reports the command as unsupported so mocks don't
+    /// fabricate an empty list a control plane would read as "no datasets".
+    /// Real adapters override this.
+    async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
+        Err(CommandError::unsupported(
+            "GetDatasets is not implemented in this build",
+        ))
+    }
+
     /// The configuration sections whose deployed value is not the one this
     /// process is running with, sorted and deduplicated: what a restart would
     /// put into effect. Stamped on every heartbeat.
@@ -680,6 +697,41 @@ mod tests {
         );
     }
 
+    /// `get_datasets` follows the same rule: advertised only by a handle that
+    /// answers it, and the default answer is unsupported rather than an empty
+    /// list a control plane would read as "no datasets".
+    #[tokio::test]
+    async fn get_datasets_is_advertised_only_by_a_handle_that_lists() {
+        struct ListingHandle;
+
+        #[async_trait]
+        impl RuntimeHandle for ListingHandle {
+            fn supports(&self, capability: Capability) -> bool {
+                capability == Capability::GetDatasets
+            }
+
+            // This list-only test handle cannot hold delivered secrets.
+            async fn clear_cloud_delivered_secrets(&self) {}
+
+            async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
+                Ok(serde_json::json!([{ "name": "taxi_trips", "status": "Ready" }]))
+            }
+        }
+
+        assert_eq!(
+            advertised_capabilities(&ListingHandle),
+            vec!["get_datasets"]
+        );
+        assert!(
+            !advertised_capabilities(&NoopRuntimeHandle).contains(&"get_datasets".to_string()),
+            "a handle that cannot list must not advertise get_datasets"
+        );
+        assert!(matches!(
+            NoopRuntimeHandle.datasets_json().await,
+            Err(CommandError::Unsupported { .. })
+        ));
+    }
+
     #[test]
     fn zero_requested_rows_means_the_default_cap() {
         assert_eq!(effective_max_rows(0), MAX_QUERY_ROWS);
@@ -776,6 +828,7 @@ mod tests {
                 | Capability::UpgradeRuntime
                 | Capability::GetLogs
                 | Capability::GetStatus
+                | Capability::GetDatasets
                 | Capability::ExecuteQuery => {}
             }
         }
@@ -791,6 +844,7 @@ mod tests {
                 "apply_spicepod",
                 "attach_app",
                 "execute_query",
+                "get_datasets",
                 "get_logs",
                 "get_status",
                 "restart",

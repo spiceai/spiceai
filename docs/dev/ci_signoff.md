@@ -720,9 +720,17 @@ Required checks in the merge queue (the `trunk` ruleset):
 - `Build (release profile)`
 - `Integration Tests (part 1/2/3)`
 - `ADBC Integration Tests`
-- `Features Check`
 - `Check Rust Licenses`
 - `E2E Test CI` (a summary "gate" job over the whole E2E matrix)
+- `Verify Verus proofs` (one context for every crate that carries Verus proofs —
+  `crates/hash-index` and `crates/cache` today; a normal `cargo build` erases the
+  specifications, so no other check would notice a postcondition that stopped
+  holding. Crate-agnostic on purpose: a crate opting in changes the verify loop
+  in `verus_verify.yml`, not the required-check name)
+
+`Features Check` (features.yml) is **not** required: that workflow is disabled,
+and a required check nothing reports blocks every pull request instead of
+passing it. Re-enable the workflow before adding it back to `REQUIRED_CHECKS`.
 
 Advisory checks that also run on `merge_group` but don't block (they can be
 promoted to required with a gate job later): `integration tests (llms)`,

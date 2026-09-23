@@ -271,6 +271,20 @@ pub trait MetadataCatalog: Send + Sync {
     /// a plain single-row UPDATE to the same value.
     async fn update_table_schema(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()>;
 
+    /// Persist `schema` and drop every persisted statistics blob for this table
+    /// in the same transaction: the table aggregate, the snapshot-file cache,
+    /// and `cayenne_cold_tier_file.statistics_blob`.
+    ///
+    /// Used when a widening changes a decimal column's scale. Vortex stores
+    /// unscaled integers and decodes them with the current schema's scale, so
+    /// publishing the new schema while leaving those blobs in place would
+    /// prune matching rows (123.45 at scale 2 becomes 1.2345 at scale 4).
+    async fn update_table_schema_dropping_statistics(
+        &self,
+        table_id: &str,
+        schema: &SchemaRef,
+    ) -> CatalogResult<()>;
+
     /// Set the current snapshot ID for a table (`UUIDv7` string).
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 

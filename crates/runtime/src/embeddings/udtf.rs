@@ -749,11 +749,11 @@ impl VectorSearchUDTFProvider {
                 self.args.tbl, cfg.model_name
             )));
         };
-        let mut resp = embedding_model
+        let resp = embedding_model
             .embed(EmbeddingInput::String(self.args.query.clone()))
             .await
             .boxed()?;
-        let Some(v) = resp.pop() else {
+        let Some(v) = resp.first().cloned() else {
             return Err(Box::from(format!(
                 "Embedding model '{}' produced no embedding for the query '{}'.",
                 cfg.model_name,

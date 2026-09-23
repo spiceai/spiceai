@@ -83,7 +83,6 @@ use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningP
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
-use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use data_components::poly::PolyTableProvider;
@@ -934,6 +933,10 @@ pub struct DataFusion {
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    /// Whether a query's output preview is recorded: task history is enabled and the
+    /// `captured_output` column of `runtime.task_history` is not `none`. When nothing
+    /// records it, queries do not build it.
+    pub(crate) task_history_captured_output: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
@@ -1794,6 +1797,11 @@ impl DataFusion {
     /// compaction setup would silently un-cap a fleet of simultaneously-refreshing
     /// tables, and leave a `mode: memory` pod's RAM tier unbounded.
     pub fn install_cayenne_global_budgets(&self) {
+        // These process-global limits must be ready for a Cayenne table added
+        // through DDL. Only announce them at startup when the initial Spicepod
+        // actually configures a Cayenne workload.
+        let cayenne_configured = self.cayenne_workload.is_configured();
+
         // Cap the aggregate number of concurrent Vortex encode shards across ALL
         // Cayenne tables. Per-table `cayenne_write_concurrency` is sized in
         // isolation — its unset default is conservative, but it can be raised per
@@ -1810,10 +1818,12 @@ impl DataFusion {
         // has its own dedicated runtime and memory carve-out.
         let encode_budget = cpu_budget::cpu_budget().cayenne_encode_permits();
         cayenne::set_global_encode_concurrency(encode_budget);
-        tracing::info!(
-            encode_budget,
-            "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
-        );
+        if cayenne_configured {
+            tracing::info!(
+                encode_budget,
+                "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
+            );
+        }
 
         // Install the process-global query-admission governor so the per-table
         // adaptive CDC controller can SHED concurrent analytical queries when a
@@ -1828,10 +1838,12 @@ impl DataFusion {
             // full capacity (`max_concurrent_queries`).
             let max = semaphore.available_permits();
             cayenne::set_query_admission_governor(Arc::clone(semaphore), max);
-            tracing::info!(
-                max_concurrent_queries = max,
-                "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
-            );
+            if cayenne_configured {
+                tracing::info!(
+                    max_concurrent_queries = max,
+                    "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
+                );
+            }
         }
 
         // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
@@ -1842,10 +1854,12 @@ impl DataFusion {
         // `get_total_memory` rebuilds a sysinfo System on every call.
         let memory_budget = self.total_memory;
         cayenne::set_global_memory_budget(memory_budget);
-        tracing::info!(
-            memory_budget,
-            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
-        );
+        if cayenne_configured {
+            tracing::info!(
+                memory_budget,
+                "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+            );
+        }
 
         let rt = self.ctx.runtime_env();
 
@@ -1893,11 +1907,13 @@ impl DataFusion {
         // bloom, which is the fallback an over-budget table already takes.
         let pk_keyset_budget_bytes = self.total_memory / 16;
         cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
-        tracing::info!(
-            pk_keyset_budget_bytes,
-            total_memory = self.total_memory,
-            "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
-        );
+        if cayenne_configured {
+            tracing::info!(
+                pk_keyset_budget_bytes,
+                total_memory = self.total_memory,
+                "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
+            );
+        }
 
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
@@ -3296,7 +3312,7 @@ impl DataFusion {
             // accelerator is bounded by a retention policy, a cache budget, or
             // nothing at all.
             match caching_retention::caching_retention(
-                acceleration_settings.caching_stale_if_error.is_enabled(),
+                acceleration_settings.caching_stale_if_error,
                 acceleration_settings.caching_ttl,
                 acceleration_settings.caching_stale_while_revalidate_ttl,
                 declared_retention_runs,
@@ -3345,7 +3361,7 @@ impl DataFusion {
                 acceleration_settings.caching_stale_while_revalidate_ttl,
             );
             accelerated_table_builder
-                .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
+                .caching_stale_if_error(acceleration_settings.caching_stale_if_error);
             accelerated_table_builder
                 .caching_max_size_bytes(acceleration_settings.caching_max_size);
             accelerated_table_builder.caching_max_items(acceleration_settings.caching_max_items);
@@ -5096,7 +5112,7 @@ impl DataFusion {
                 && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
             {
                 tracing::trace!("using cached plan for {sql}");
-                return Ok(plan);
+                return Ok(std::sync::Arc::unwrap_or_clone(plan));
             }
             plans_cache
         } else {
@@ -5124,8 +5140,7 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let dialect = session.config().options().sql_parser.dialect;
-        let statement = session.sql_to_statement(sql, &dialect)?;
+        let statement = planner::parse_sql_statement(sql, session)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 
@@ -5378,14 +5393,14 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let QueryResult { data, .. } =
+        let query_result =
             qb.build()
                 .run()
                 .await
                 .map_err(|e| QueryEngineError::QueryExecution {
                     source: DataFusionError::External(Box::new(e)),
                 })?;
-        Ok(data)
+        Ok(query_result.into_record_batch_stream())
     }
 
     async fn execute_plan(
@@ -5402,13 +5417,13 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
                         .to_string(),
                 ),
             })?;
-        let QueryResult { data, .. } = Query::from_logical_plan(&arc_self, plan)
+        let query_result = Query::from_logical_plan(&arc_self, plan)
             .run()
             .await
             .map_err(|e| QueryEngineError::QueryExecution {
                 source: DataFusionError::External(Box::new(e)),
             })?;
-        Ok(data)
+        Ok(query_result.into_record_batch_stream())
     }
 
     async fn write_data(
@@ -5575,9 +5590,9 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
 }
 
-// Normalizes a table reference to a full table reference with catalog, schema, and table name
-// so it can be used for comparison.
-fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
+/// Normalizes a table reference to a full table reference with catalog, schema, and table name
+/// so it can be used for comparison.
+pub(crate) fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 

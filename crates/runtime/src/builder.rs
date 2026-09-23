@@ -24,8 +24,7 @@ use crate::cluster::partition::service::PartitionService;
 #[cfg(not(windows))]
 use crate::config::ClusterRole;
 use crate::config::Config;
-#[cfg(not(windows))]
-use crate::datafusion::builder::CayenneOptimizerRules;
+use crate::datafusion::builder::{CayenneOptimizerRules, OutputPreview};
 use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
@@ -382,6 +381,7 @@ impl RuntimeBuilder {
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
 
         let task_history = spicepod_rt.task_history.enabled;
+        let output_preview = task_history_output_preview(&spicepod_rt.task_history);
 
         let runtime_ready_state = spicepod_rt.ready_state;
 
@@ -413,7 +413,11 @@ impl RuntimeBuilder {
         let cayenne_segment_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
-        install_segment_cache(cayenne_segment_cache_mb);
+        // The cache decision must exist before a Cayenne table added through DDL can
+        // initialize, but an initially non-Cayenne Spicepod has no user-visible
+        // Cayenne cache to report at startup.
+        let cayenne_configured = cayenne_configured_for_startup_log(self.app.as_ref());
+        install_segment_cache(cayenne_segment_cache_mb, cayenne_configured);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -756,6 +760,7 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
+        .with_output_preview(output_preview)
         .with_caching(caching)
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
@@ -1087,7 +1092,7 @@ fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
 /// nothing until something inserts into it, so installing costs nothing, while
 /// reserving against the query pool for a cache no table can read would shrink
 /// every other query's budget for nothing.
-fn install_segment_cache(configured_mb: Option<usize>) {
+fn install_segment_cache(configured_mb: Option<usize>, cayenne_configured: bool) {
     // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
     // sized a per-table cache; there is no conversion from them to a shared budget
     // that is not invented, and a single dataset's setting must not decide the
@@ -1102,10 +1107,12 @@ fn install_segment_cache(configured_mb: Option<usize>) {
         return;
     }
     if vortex_datafusion::install_process_segment_cache(bytes) {
-        tracing::info!(
-            "Vortex segment cache installed: {} MB shared across all Cayenne tables",
-            bytes / (1024 * 1024)
-        );
+        if cayenne_configured {
+            tracing::info!(
+                "Vortex segment cache installed: {} MB shared across all Cayenne tables",
+                bytes / (1024 * 1024)
+            );
+        }
     } else {
         // A second runtime in one process (tests, embedded hosts) keeps the cache
         // the first one installed; the budget is process-wide by construction.
@@ -1456,6 +1463,24 @@ fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
             .next()
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cayenne"))
     })
+}
+
+/// Whether the pod has anything a user would call "Cayenne" at startup — the
+/// same union [`estimate_cayenne_reservation_bytes`] uses to decide whether the
+/// pod draws on the shared segment cache. A `from: cayenne` catalog declares no
+/// acceleration of its own (see [`reads_from_cayenne_catalog`]), so gating the
+/// startup log on [`CayenneWorkload::is_configured`] alone would suppress it for
+/// a catalog-only pod even though that pod installs and uses the cache.
+#[cfg(not(windows))]
+fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
+    cayenne_workload(app).is_configured() || app.is_some_and(reads_from_cayenne_catalog)
+}
+
+/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a
+/// `cfg(not(windows))` dependency), so no catalog can read from it either.
+#[cfg(windows)]
+fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
+    cayenne_workload(app).is_configured()
 }
 
 /// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
@@ -2037,9 +2062,66 @@ fn parse_cayenne_optimizer_rules(
     }
 }
 
+/// Whether queries build the output preview. Only the `captured_output` column of
+/// `runtime.task_history` records it, so it is built when task history is enabled and
+/// `captured_output` is not `none`. A Zipkin export of the task spans never carries it:
+/// the Zipkin exporter turns each span event into an annotation holding only the event's
+/// name, and the preview is a field of its event.
+///
+/// A `captured_output` the runtime cannot read counts as recorded, so a misconfigured
+/// value costs a preview rather than losing one.
+fn task_history_output_preview(
+    task_history: &spicepod::component::runtime::TaskHistory,
+) -> OutputPreview {
+    let recorded = task_history.enabled
+        && !matches!(
+            task_history.get_captured_output(),
+            Ok(spicepod::component::runtime::TaskHistoryCapturedOutput::None)
+        );
+    if recorded {
+        OutputPreview::Build
+    } else {
+        OutputPreview::Skip
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A query's output preview is built only when something records it.
+    #[test]
+    fn a_query_output_preview_is_built_only_when_it_is_recorded() {
+        use spicepod::component::runtime::TaskHistory;
+
+        let captured = |captured_output: &str| TaskHistory {
+            captured_output: captured_output.into(),
+            ..TaskHistory::default()
+        };
+
+        assert_eq!(
+            task_history_output_preview(&TaskHistory::default()),
+            OutputPreview::Skip,
+            "the default `captured_output: none` records no preview"
+        );
+        assert_eq!(
+            task_history_output_preview(&captured("truncated")),
+            OutputPreview::Build
+        );
+        assert_eq!(
+            task_history_output_preview(&TaskHistory {
+                enabled: false,
+                ..captured("truncated")
+            }),
+            OutputPreview::Skip,
+            "with task history disabled nothing records the preview"
+        );
+        assert_eq!(
+            task_history_output_preview(&captured("everything")),
+            OutputPreview::Build,
+            "a value the runtime cannot read keeps the preview"
+        );
+    }
 
     #[cfg(not(windows))]
     fn dataset_with_cayenne(

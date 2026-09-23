@@ -96,6 +96,7 @@ opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
+evaluate-api = { path = "../evaluate-api" }
 mediatype = "0.21.0"
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
@@ -235,9 +236,6 @@ aws-credential-types = { workspace = true, features = [
 # SDK). A dev-dependency, so it stays out of the shipped runtime and is exempt from
 # the `restricted_deps` driver-confinement guard.
 aws-sdk-dynamodb.workspace = true
-azure_core = "0.31.0"
-azure_storage = "0.21.0"
-azure_storage_blobs = "0.21.0"
 ballista-core.workspace = true
 bcder = "0.7.4"
 bollard = "0.18.1"
@@ -382,6 +380,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "evaluate-api/openapi",
     "runtime-acceleration/openapi",
     "runtime-table/openapi",
     "runtime-api-types/openapi",

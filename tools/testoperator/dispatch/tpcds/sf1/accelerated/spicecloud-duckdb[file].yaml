@@ -5,6 +5,7 @@ tests:
     query_overrides: duckdb
     runner_type: spiceai-dev-runners
     ready_wait: 300
+    validate_results: true
   throughput:
     spicepod_path: accelerated/spicecloud-duckdb[file].yaml
     query_set: tpcds

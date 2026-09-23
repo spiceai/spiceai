@@ -52,7 +52,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           cache: npm
@@ -87,7 +87,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       # Cache the browser mermaid-cli renders in, keyed by the lockfile — the
-      # pinned mermaid-cli pins puppeteer, which pins the browser build, so the
+      # pinned mermaid-cli and puppeteer versions pin the browser build, so the
       # lockfile is exactly the key that changes when a different browser is
       # needed.
       - name: Cache the headless browser

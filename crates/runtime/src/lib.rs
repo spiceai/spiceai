@@ -106,6 +106,7 @@ pub mod extension;
 pub use runtime_table::federated;
 pub mod flight;
 mod http;
+pub use http::v1::datasets::dataset_infos_with_status;
 
 pub mod http_types {
     pub use crate::http::v1::queries::SubmitQueryRequest;
@@ -771,6 +772,11 @@ impl Runtime {
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         self.llm_runtime_stores.completion_llms()
+    }
+
+    #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<crate::model::EvaluateModelStore>> {
+        self.llm_runtime_stores.evaluate_models()
     }
 
     #[must_use]

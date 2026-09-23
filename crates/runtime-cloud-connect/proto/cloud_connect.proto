@@ -178,6 +178,7 @@ message ControlMessage {
     DeleteSecrets delete_secrets = 15;
     ExecuteQuery execute_query = 18;
     AttachApp attach_app = 19;
+    GetDatasets get_datasets = 20;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
@@ -254,7 +255,8 @@ message StandaloneRuntimeStatus {
 // reverse). Absent means the command produced no payload.
 message CommandResult {
   oneof payload {
-    // A JSON document (GetRuntimeInfo, GetStatus, ApplySpicepod, Adopt).
+    // A JSON document (GetRuntimeInfo, GetStatus, GetDatasets, ApplySpicepod,
+    // Adopt).
     string json = 1;
     // Verbatim text, not JSON-encoded (GetLogs).
     string text = 2;
@@ -370,6 +372,14 @@ message Remove {}
 // document carrying the `RuntimePhase` as its `phase`, a `reason`, and
 // whatever per-component detail the instance can supply.
 message GetStatus {}
+
+// Lists the datasets this instance serves, with the status of each. The reply
+// is the JSON array the instance's own `GET /v1/datasets?status=true` answers,
+// so the control plane reads the same document a local operator does; the
+// `spice cloud datasets` and `spice cloud status` dataset-health views relay
+// it. Advertised as `get_datasets`. A standalone instance lists itself; a
+// cluster instance is addressed by `ControlMessage.target`.
+message GetDatasets {}
 
 // GetLogs returns recent stdout/stderr of a spiced runtime. A cluster (BYOC)
 // instance reads them from the customer cluster's kube API for the workload
