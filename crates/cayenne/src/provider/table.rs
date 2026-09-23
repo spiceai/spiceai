@@ -40056,13 +40056,12 @@ mod tests {
                         id_name_batch(&schema, &[NEW_KEY], &["new"]),
                     )
                     .await;
-                    let fresh: Vec<String> = provider_in_hook
+                    let fresh = provider_in_hook
                         .protected_snapshot_ids()
                         .difference(&large_runs)
-                        .cloned()
-                        .collect();
+                        .count();
                     // A write-driven pass may already have merged them.
-                    if fresh.len() >= 2 {
+                    if fresh >= 2 {
                         let merged = provider_in_hook
                             .compact_protected_snapshots_subset(usize::MAX)
                             .await
