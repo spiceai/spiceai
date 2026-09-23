@@ -135,6 +135,10 @@ impl ResultsCacheWarmer {
                 "SQL results cache warmup is enabled: the first {MAX_WARMUP_PLANS} distinct query plans will be recorded and replayed after the first full or append refresh until the cache is full"
             );
         }
+        // Persisted catalogs are not trusted: a stale or edited file can
+        // exceed the advertised cap or repeat the same shape. Dedup and
+        // cap here so replay (which holds readiness) cannot run unbounded.
+        let loaded = merge_templates(&[], &loaded);
         let ids = loaded.iter().map(template_id).collect::<HashSet<_>>();
         let count = loaded.len();
         Self {
@@ -281,9 +285,9 @@ fn object_state_prefix(base_prefix: &str) -> String {
 }
 
 fn merge_templates(base: &[WarmupTemplate], extra: &[WarmupTemplate]) -> Vec<WarmupTemplate> {
-    let mut out = base.to_vec();
-    let mut ids: HashSet<u64> = out.iter().map(template_id).collect();
-    for template in extra {
+    let mut out = Vec::new();
+    let mut ids = HashSet::new();
+    for template in base.iter().chain(extra.iter()) {
         if out.len() >= MAX_WARMUP_PLANS {
             break;
         }
@@ -1064,6 +1068,73 @@ mod tests {
         assert_eq!(
             capped[MAX_WARMUP_PLANS - 1].sql,
             format!("SELECT {}", MAX_WARMUP_PLANS - 1)
+        );
+
+        // An already-oversized base (stale or edited persist) must also
+        // drop duplicates and stop at the advertised cap.
+        let mut oversized = full.clone();
+        oversized.push(WarmupTemplate {
+            sql: "SELECT 0".to_string(),
+            bindings: vec![],
+        });
+        oversized.extend((MAX_WARMUP_PLANS..25).map(|i| WarmupTemplate {
+            sql: format!("SELECT {i}"),
+            bindings: vec![],
+        }));
+        assert_eq!(oversized.len(), 26);
+        let normalized = merge_templates(&oversized, &[]);
+        assert_eq!(normalized.len(), MAX_WARMUP_PLANS);
+        assert_eq!(normalized[0].sql, "SELECT 0");
+        assert_eq!(
+            normalized[MAX_WARMUP_PLANS - 1].sql,
+            format!("SELECT {}", MAX_WARMUP_PLANS - 1)
+        );
+    }
+
+    /// Copilot model: a 25-template persist must not replay 25 shapes.
+    #[test]
+    fn from_loaded_caps_and_dedups_persisted_templates() {
+        let mut persisted: Vec<WarmupTemplate> = (0..25)
+            .map(|i| WarmupTemplate {
+                sql: format!("SELECT {i}"),
+                bindings: vec![],
+            })
+            .collect();
+        persisted.push(WarmupTemplate {
+            sql: "SELECT 0".to_string(),
+            bindings: vec![],
+        });
+
+        let warmer = ResultsCacheWarmer::from_loaded(
+            persisted,
+            true,
+            WarmupPersist::Local(std::env::temp_dir().join("spice-warmup-from-loaded.json")),
+        );
+        let snapshot = warmer.templates_snapshot();
+        let loaded_templates = snapshot.len();
+
+        eprintln!(
+            "loaded_templates={loaded_templates} replayed_templates={loaded_templates} cap_enforced={}",
+            loaded_templates <= MAX_WARMUP_PLANS
+        );
+
+        assert_eq!(
+            loaded_templates, MAX_WARMUP_PLANS,
+            "persisted catalogs must be capped at {MAX_WARMUP_PLANS} distinct plans before replay"
+        );
+        assert_eq!(snapshot[0].sql, "SELECT 0");
+        assert_eq!(
+            snapshot[MAX_WARMUP_PLANS - 1].sql,
+            format!("SELECT {}", MAX_WARMUP_PLANS - 1)
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(template_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            MAX_WARMUP_PLANS,
+            "loaded catalog must not keep duplicate plan shapes"
         );
     }
 
