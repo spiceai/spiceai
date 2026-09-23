@@ -1365,49 +1365,8 @@
       ]
     },
     "ApiKey": {
-      "description": "API key for authentication. Keys can be read-only or read-write.\nThe key value is redacted in Debug output to prevent credential leakage.\n\nAll comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use\nconstant-time comparison via the `subtle` crate to prevent timing attacks.",
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "ReadOnly": {
-              "type": "object",
-              "properties": {
-                "key": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "key"
-              ]
-            }
-          },
-          "required": [
-            "ReadOnly"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "ReadWrite": {
-              "type": "object",
-              "properties": {
-                "key": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "key"
-              ]
-            }
-          },
-          "required": [
-            "ReadWrite"
-          ],
-          "additionalProperties": false
-        }
-      ]
+      "description": "API key for authentication. Keys can be read-only or read-write.\nThe key value is redacted in Debug output to prevent credential leakage.\n\nPass the key as a string. Optional `:ro` (default) or `:rw` suffix selects capability.\n\nAll comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use\nconstant-time comparison via the `subtle` crate to prevent timing attacks.",
+      "type": "string"
     },
     "CorsConfig": {
       "type": "object",

@@ -1,0 +1,467 @@
+[
+  {
+    "url": "https://arrow.apache.org/",
+    "status": 200,
+    "final_url": "https://arrow.apache.org/"
+  },
+  {
+    "url": "https://arrow.apache.org/adbc/",
+    "status": 200,
+    "final_url": "https://arrow.apache.org/adbc/"
+  },
+  {
+    "url": "https://datafusion.apache.org/",
+    "status": 200,
+    "final_url": "https://datafusion.apache.org/"
+  },
+  {
+    "url": "https://datafusion.apache.org/ballista/",
+    "status": 200,
+    "final_url": "https://datafusion.apache.org/ballista/"
+  },
+  {
+    "url": "https://delta.io/",
+    "status": 200,
+    "final_url": "https://delta.io/"
+  },
+  {
+    "url": "https://docs.spice.ai/docs/enterprise",
+    "status": 200,
+    "final_url": "https://docs.spice.ai/docs/enterprise"
+  },
+  {
+    "url": "https://docs.spice.ai/docs/enterprise/features/policy",
+    "status": 200,
+    "final_url": "https://docs.spice.ai/docs/enterprise/features/policy"
+  },
+  {
+    "url": "https://duckdb.org/",
+    "status": 200,
+    "final_url": "https://duckdb.org/"
+  },
+  {
+    "url": "https://github.com/spiceai/cookbook",
+    "status": 200,
+    "final_url": "https://github.com/spiceai/cookbook"
+  },
+  {
+    "url": "https://github.com/spiceai/docs",
+    "status": 200,
+    "final_url": "https://github.com/spiceai/docs"
+  },
+  {
+    "url": "https://github.com/spiceai/spiceai/tree/16c436f7b8a76ce161a07c0288277ced0ada4a07",
+    "status": 200,
+    "final_url": "https://github.com/spiceai/spiceai/tree/16c436f7b8a76ce161a07c0288277ced0ada4a07"
+  },
+  {
+    "url": "https://github.com/vortex-data/vortex",
+    "status": 200,
+    "final_url": "https://github.com/vortex-data/vortex"
+  },
+  {
+    "url": "https://iceberg.apache.org/",
+    "status": 200,
+    "final_url": "https://iceberg.apache.org/"
+  },
+  {
+    "url": "https://kubernetes.io/docs/tasks/run-application/configure-pdb/",
+    "status": 200,
+    "final_url": "https://kubernetes.io/docs/tasks/run-application/configure-pdb/"
+  },
+  {
+    "url": "https://modelcontextprotocol.io/specification",
+    "status": 200,
+    "final_url": "https://modelcontextprotocol.io/specification/2026-07-28.md"
+  },
+  {
+    "url": "https://spice.ai/blog/2025-spice-ai-year-in-review",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/2025-spice-ai-year-in-review"
+  },
+  {
+    "url": "https://spice.ai/blog/a-developers-guide-to-understanding-spice-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/a-developers-guide-to-understanding-spice-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/a-new-class-of-applications-that-learn-and-adapt",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/a-new-class-of-applications-that-learn-and-adapt"
+  },
+  {
+    "url": "https://spice.ai/blog/adding-spice-the-next-generation-of-spice-ai-oss",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/adding-spice-the-next-generation-of-spice-ai-oss"
+  },
+  {
+    "url": "https://spice.ai/blog/ai-needs-ai-ready-data",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/ai-needs-ai-ready-data"
+  },
+  {
+    "url": "https://spice.ai/blog/amazon-s3-vectors",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/amazon-s3-vectors"
+  },
+  {
+    "url": "https://spice.ai/blog/announcing-spice-ai-open-source-1-0-stable",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/announcing-spice-ai-open-source-1-0-stable"
+  },
+  {
+    "url": "https://spice.ai/blog/announcing-spice-cloud-v1-7-0",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/announcing-spice-cloud-v1-7-0"
+  },
+  {
+    "url": "https://spice.ai/blog/apache-ballista-at-spice-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/apache-ballista-at-spice-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/apache-iceberg-at-spice-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/apache-iceberg-at-spice-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/aws-workshop-federated-queries-and-hybrid-search-with-spice",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/aws-workshop-federated-queries-and-hybrid-search-with-spice"
+  },
+  {
+    "url": "https://spice.ai/blog/barracuda-networks-100x-faster-query-responses-with-spice",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/barracuda-networks-100x-faster-query-responses-with-spice"
+  },
+  {
+    "url": "https://spice.ai/blog/basis-set-ventures-deploys-spice-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/basis-set-ventures-deploys-spice-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/cluster-sidecar-architecture",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/cluster-sidecar-architecture"
+  },
+  {
+    "url": "https://spice.ai/blog/contribution-of-tableproviders-to-datafusion",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/contribution-of-tableproviders-to-datafusion"
+  },
+  {
+    "url": "https://spice.ai/blog/databricks-partnership",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/databricks-partnership"
+  },
+  {
+    "url": "https://spice.ai/blog/getting-started-with-amazon-s3-vectors-and-spice",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/getting-started-with-amazon-s3-vectors-and-spice"
+  },
+  {
+    "url": "https://spice.ai/blog/how-we-use-apache-datafusion-at-spice-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/how-we-use-apache-datafusion-at-spice-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/interviewing-at-spice-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/interviewing-at-spice-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/introducing-spice-cayenne-data-accelerator",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/introducing-spice-cayenne-data-accelerator"
+  },
+  {
+    "url": "https://spice.ai/blog/introducing-spice-skills-for-ai-coding-agents",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/introducing-spice-skills-for-ai-coding-agents"
+  },
+  {
+    "url": "https://spice.ai/blog/making-apps-that-learn-and-adapt",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/making-apps-that-learn-and-adapt"
+  },
+  {
+    "url": "https://spice.ai/blog/making-object-storage-operational",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/making-object-storage-operational"
+  },
+  {
+    "url": "https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines"
+  },
+  {
+    "url": "https://spice.ai/blog/on-writing",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/on-writing"
+  },
+  {
+    "url": "https://spice.ai/blog/openclaw-and-spice-governed-access-to-production-data-for-enterprise-agents",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/openclaw-and-spice-governed-access-to-production-data-for-enterprise-agents"
+  },
+  {
+    "url": "https://spice.ai/blog/operationalizing-amazon-s3-for-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/operationalizing-amazon-s3-for-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams"
+  },
+  {
+    "url": "https://spice.ai/blog/real-time-hybrid-search-using-rrf",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/real-time-hybrid-search-using-rrf"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-2-0-is-now-available",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-2-0-is-now-available"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-ai-achieves-soc-2-type-ii-compliance",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-ai-achieves-soc-2-type-ii-compliance"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-ai-for-github-copilot-extension-now-available",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-ai-for-github-copilot-extension-now-available"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-ai-is-now-generally-available",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-ai-is-now-generally-available"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-and-power-bi",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-and-power-bi"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-cloud-v1-10",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-cloud-v1-10"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-cloud-v1-11",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-cloud-v1-11"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-cloud-v1-8-0-iceberg-writes",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-cloud-v1-8-0-iceberg-writes"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-cloud-v1-9-0-cayenne-data-accelerator",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-cloud-v1-9-0-cayenne-data-accelerator"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-cloud-v2-0-rc-2",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-cloud-v2-0-rc-2"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-firecache",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/introducing-spice-cayenne-data-accelerator"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-oss-rebuilt-in-rust",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-oss-rebuilt-in-rust"
+  },
+  {
+    "url": "https://spice.ai/blog/spice-sql-query-federation-acceleration",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spice-sql-query-federation-acceleration"
+  },
+  {
+    "url": "https://spice.ai/blog/spiceais-approach-to-time-series-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spiceais-approach-to-time-series-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/spicepods-from-zero-to-hero",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/spicepods-from-zero-to-hero"
+  },
+  {
+    "url": "https://spice.ai/blog/teaching-apps-how-to-learn-with-spicepods",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/teaching-apps-how-to-learn-with-spicepods"
+  },
+  {
+    "url": "https://spice.ai/blog/the-analytics-replica-pattern-shortening-the-path-to-data-based-ai",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/the-analytics-replica-pattern-shortening-the-path-to-data-based-ai"
+  },
+  {
+    "url": "https://spice.ai/blog/true-hybrid-search",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/true-hybrid-search"
+  },
+  {
+    "url": "https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads"
+  },
+  {
+    "url": "https://spice.ai/blog/what-data-informs-ai-driven-decision-making",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/what-data-informs-ai-driven-decision-making"
+  },
+  {
+    "url": "https://spice.ai/blog/write-to-apache-iceberg-tables-with-sql",
+    "status": 200,
+    "final_url": "https://spice.ai/blog/write-to-apache-iceberg-tables-with-sql"
+  },
+  {
+    "url": "https://spiceai.org/docs",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs"
+  },
+  {
+    "url": "https://spiceai.org/docs/api",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/api"
+  },
+  {
+    "url": "https://spiceai.org/docs/api/auth",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/api/auth"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-accelerators",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-accelerators"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-accelerators/cayenne",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-accelerators/cayenne"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-connectors",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-connectors"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-connectors/delta-lake",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-connectors/delta-lake"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-connectors/file",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-connectors/file"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-connectors/iceberg",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-connectors/iceberg"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/data-connectors/postgres",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/data-connectors/postgres"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/embeddings",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/embeddings"
+  },
+  {
+    "url": "https://spiceai.org/docs/components/embeddings/model2vec",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/components/embeddings/model2vec"
+  },
+  {
+    "url": "https://spiceai.org/docs/deployment/docker",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/deployment/docker"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/caching",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/caching"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/data-acceleration",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/data-acceleration"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/distributed-query",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/distributed-query"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/embeddings",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/embeddings"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/large-language-models",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/large-language-models"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/large-language-models/mcp",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/large-language-models/mcp"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/query-federation",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/query-federation"
+  },
+  {
+    "url": "https://spiceai.org/docs/features/search",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/features/search"
+  },
+  {
+    "url": "https://spiceai.org/docs/getting-started",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/getting-started"
+  },
+  {
+    "url": "https://spiceai.org/docs/monitoring",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/monitoring"
+  },
+  {
+    "url": "https://spiceai.org/docs/reference/spicepod",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/reference/spicepod"
+  },
+  {
+    "url": "https://spiceai.org/docs/reference/sql",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/reference/sql"
+  },
+  {
+    "url": "https://spiceai.org/docs/reference/sql/search",
+    "status": 200,
+    "final_url": "https://spiceai.org/docs/reference/sql/search"
+  },
+  {
+    "url": "https://www.postgresql.org/docs/",
+    "status": 200,
+    "final_url": "https://www.postgresql.org/docs/"
+  },
+  {
+    "url": "https://www.sqlite.org/",
+    "status": 200,
+    "final_url": "https://www.sqlite.org/"
+  }
+]
