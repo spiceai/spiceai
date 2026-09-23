@@ -431,4 +431,64 @@ async fn position_deletes_compose_with_the_index() {
             && after.unbuilt == before.unbuilt,
         "lookups on a table with position deletes were not served from the index: {before:?} -> {after:?}"
     );
+
+    let dynamic_keys = &keys[..64];
+    let key_schema = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("service", DataType::Utf8, false),
+    ]));
+    let key_batch = RecordBatch::try_new(
+        Arc::clone(&key_schema),
+        vec![
+            Arc::new(StringArray::from(
+                dynamic_keys
+                    .iter()
+                    .map(|id| format!("AC{:032x}", id % 97))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                dynamic_keys
+                    .iter()
+                    .map(|id| format!("MG{id:032x}"))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("dynamic keys");
+    let run_join = |provider: Arc<CayenneTableProvider>, table: &'static str| {
+        let key_schema = Arc::clone(&key_schema);
+        let key_batch = key_batch.clone();
+        async move {
+            let ctx = SessionContext::new();
+            ctx.register_table(table, provider as Arc<dyn TableProvider>)
+                .expect("register target");
+            let key_table =
+                datafusion::datasource::MemTable::try_new(key_schema, vec![vec![key_batch]])
+                    .expect("key table");
+            ctx.register_table("dynamic_keys", Arc::new(key_table))
+                .expect("register keys");
+            ctx.sql(&format!(
+                "SELECT s.\"AutoId\" FROM dynamic_keys k INNER JOIN {table} s \
+                 ON k.tenant = s.\"TenantId\" AND k.service = s.\"ServiceId\" \
+                 ORDER BY s.\"AutoId\""
+            ))
+            .await
+            .expect("join plan")
+            .collect()
+            .await
+            .expect("join execution")
+        }
+    };
+    let expected = rendered(&run_join(Arc::clone(&plain), PLAIN).await);
+    let selected_before = counters(&indexed).selected;
+    let actual = rendered(&run_join(Arc::clone(&indexed), INDEXED).await);
+    assert_eq!(
+        actual, expected,
+        "dynamic indexed join exposed position-deleted rows"
+    );
+    assert_eq!(
+        counters(&indexed).selected,
+        selected_before + 1,
+        "the dynamic join did not compose its index selection with position deletes"
+    );
 }
