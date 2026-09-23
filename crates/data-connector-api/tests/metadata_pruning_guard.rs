@@ -34,7 +34,7 @@ use datafusion_datasource::metadata::MetadataColumn;
 use futures::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 
 #[tokio::test]
 async fn metadata_predicate_prunes_the_listing_before_opening_files() {
