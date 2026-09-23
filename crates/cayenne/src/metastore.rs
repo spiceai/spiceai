@@ -453,22 +453,16 @@ pub(crate) async fn partition_child_table_ids(
                     "cannot resolve the partition child tables of '{parent_name}': a partition's stored values are unreadable: {e}"
                 ),
             })?;
+        let [composite_name, legacy_name] =
+            crate::partition_naming::partition_child_candidate_names(parent_name, &values);
         let matched: Vec<String> = metastore
             .query(
                 QueryParams {
                     sql: "SELECT table_id FROM cayenne_table \
                           WHERE table_name IN (?1, ?2) AND path = ?3",
                     params: vec![
-                        MetastoreValue::Text(crate::partition_naming::partition_child_table_name(
-                            parent_name,
-                            &crate::metadata::composite_partition_key(&values),
-                        )),
-                        MetastoreValue::Text(
-                            crate::partition_naming::legacy_partition_child_table_name(
-                                parent_name,
-                                &values,
-                            ),
-                        ),
+                        MetastoreValue::Text(composite_name),
+                        MetastoreValue::Text(legacy_name),
                         MetastoreValue::Text(path),
                     ],
                 },

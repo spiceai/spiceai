@@ -102,9 +102,27 @@ const OLDER_IMPORT_CLEARS: &str = "cayenne_insert_record";
 /// Engine identifier embedded in slices to detect cross-engine misuse.
 pub const SLICE_ENGINE: &str = "cayenne";
 
-/// Whether this build reads a slice written at `version`.
-fn supported_format_version(version: u32) -> bool {
-    (SLICE_FORMAT_VERSION..=SLICE_FORMAT_VERSION_FULL_CLEANUP).contains(&version)
+/// Refuse a slice this build does not read.
+///
+/// One definition for both entry points — parsing an archive's slice and
+/// importing it — so the two cannot come to disagree about the range, and one
+/// message, so a reword cannot drop the upgrade instruction from whichever
+/// caller is not the one being edited. `unsupported_version_message` is pure so
+/// the wording is asserted in a test rather than only read.
+fn ensure_supported_format_version(version: u32) -> CatalogResult<()> {
+    if (SLICE_FORMAT_VERSION..=SLICE_FORMAT_VERSION_FULL_CLEANUP).contains(&version) {
+        return Ok(());
+    }
+    Err(CatalogError::Database {
+        message: unsupported_version_message(version),
+    })
+}
+
+/// The message a slice this build cannot read is refused with.
+fn unsupported_version_message(version: u32) -> String {
+    format!(
+        "refusing the metastore slice: unsupported format_version {version} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}); upgrade the runtime that reads this snapshot"
+    )
 }
 
 /// JSON-friendly mirror of [`MetastoreValue`]. Blobs are base64-encoded so the
@@ -209,14 +227,7 @@ impl DatasetMetastoreSlice {
         let slice: Self = serde_json::from_slice(bytes).map_err(|e| CatalogError::Database {
             message: format!("failed to parse metastore slice JSON: {e}"),
         })?;
-        if !supported_format_version(slice.format_version) {
-            return Err(CatalogError::Database {
-                message: format!(
-                    "unsupported metastore slice format_version {} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}); upgrade the runtime that reads this snapshot",
-                    slice.format_version
-                ),
-            });
-        }
+        ensure_supported_format_version(slice.format_version)?;
         if slice.engine != SLICE_ENGINE {
             return Err(CatalogError::Database {
                 message: format!(
@@ -462,6 +473,18 @@ impl DatasetMetastoreSlice {
         names
     }
 
+    /// The `cayenne_table` rows this slice carries that are not the dataset's
+    /// own — i.e. its partition children.
+    ///
+    /// Three places turn on this distinction (the names import must clear, the
+    /// rows an older import cannot clear, and the per-child validation), so it
+    /// is spelled once.
+    fn child_table_rows(&self) -> impl Iterator<Item = &SliceRow> {
+        slice_rows(self, "cayenne_table").iter().filter(|row| {
+            text_at(row, CAYENNE_TABLE_NAME_INDEX) != Some(self.dataset_name.as_str())
+        })
+    }
+
     /// The first table this slice carries rows in that a
     /// [`SLICE_FORMAT_VERSION`] import would not clear before inserting.
     ///
@@ -479,10 +502,7 @@ impl DatasetMetastoreSlice {
     /// Derived from the registry rather than from a list, so a blob-keyed table
     /// added later is covered without anyone remembering to add it here.
     fn rows_an_older_import_cannot_clear(&self) -> Option<&'static str> {
-        if slice_rows(self, "cayenne_table")
-            .iter()
-            .any(|row| text_at(row, CAYENNE_TABLE_NAME_INDEX) != Some(self.dataset_name.as_str()))
-        {
+        if self.child_table_rows().next().is_some() {
             return Some("cayenne_table");
         }
         super::blob_keyed_tables()
@@ -563,11 +583,11 @@ impl DatasetMetastoreSlice {
         };
 
         // The parent's partitions: for each name a child may legally take, the
-        // directory that child must be rooted at. Names are derived exactly as
-        // `metastore::partition_child_table_ids` derives them, so a slice this
-        // build wrote always satisfies the check it will be read under, and
-        // both names the derivation can produce are accepted since a partition
-        // created by an older runtime still answers to the legacy one.
+        // directory that child must be rooted at. The names come from
+        // `partition_child_candidate_names`, which is also what
+        // `metastore::partition_child_table_ids` binds its lookup to, so the
+        // rule that resolves a child and the rule that accepts a restored one
+        // cannot drift apart.
         //
         // Keyed by name rather than collected into two independent sets: the
         // name and the path have to be checked *together*, or a slice that
@@ -589,20 +609,12 @@ impl DatasetMetastoreSlice {
             let Ok(values) = serde_json::from_str::<Vec<String>>(values_json) else {
                 continue;
             };
-            expected_children.insert(
-                crate::partition_naming::partition_child_table_name(
-                    &self.dataset_name,
-                    &crate::metadata::composite_partition_key(&values),
-                ),
-                partition_path,
-            );
-            expected_children.insert(
-                crate::partition_naming::legacy_partition_child_table_name(
-                    &self.dataset_name,
-                    &values,
-                ),
-                partition_path,
-            );
+            for name in crate::partition_naming::partition_child_candidate_names(
+                &self.dataset_name,
+                &values,
+            ) {
+                expected_children.insert(name, partition_path);
+            }
         }
 
         // Both sides were rewritten relative to the exporter's anchor, so a
@@ -673,14 +685,7 @@ pub async fn import_dataset(
     slice: &DatasetMetastoreSlice,
     data_dir_anchor: &Path,
 ) -> CatalogResult<()> {
-    if !supported_format_version(slice.format_version) {
-        return Err(CatalogError::Database {
-            message: format!(
-                "refusing to import metastore slice: unsupported format_version {} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}); upgrade the runtime that reads this snapshot",
-                slice.format_version
-            ),
-        });
-    }
+    ensure_supported_format_version(slice.format_version)?;
     if slice.engine != SLICE_ENGINE {
         return Err(CatalogError::Database {
             message: format!(
@@ -2008,5 +2013,33 @@ mod tests {
                 "a refused import must leave the reader's metastore untouched"
             );
         }
+    }
+
+    /// `OLDER_IMPORT_CLEARS` is matched against `ExpectedTable::name` by string,
+    /// so a rename of that table would silently stop excluding it and flip every
+    /// marker-carrying slice from one format version to the other with no
+    /// compile error. Pin the name against the registry it is matched in.
+    #[test]
+    fn older_import_clears_names_a_blob_keyed_table() {
+        assert!(
+            super::super::blob_keyed_tables().any(|table| table.name == OLDER_IMPORT_CLEARS),
+            "OLDER_IMPORT_CLEARS must name one of the blob-keyed tables it is filtered out of"
+        );
+    }
+
+    /// The refusal a reader too old for a slice shows its operator. Built by a
+    /// pure function and asserted here so a reword cannot quietly drop the
+    /// version range or the action to take.
+    #[test]
+    fn the_unsupported_version_message_names_the_range_and_the_fix() {
+        let message = unsupported_version_message(99);
+        assert!(message.contains("format_version 99"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("upgrade the runtime"), "{message}");
     }
 }

@@ -5670,16 +5670,16 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
-    // Only `CayenneSnapshotEngine` writes the per-dataset metastore slice a
-    // Cayenne bootstrap reads; the default engine archives the raw `cayenne.db`
-    // instead, which the reader cannot apply because its own metastore already
-    // exists at extract time. `snapshot_engine_for_source` answers `None` when
-    // the catalog or the data directory cannot be resolved, and creating a
-    // snapshot makes whatever it uploads the store's `current-snapshot-id` — so
-    // publishing on that path would replace a restorable current snapshot with
-    // one nothing can load. `snapshot_before_recreate` declines on exactly this
-    // condition; this is the same gate on the periodic publish path.
-    if acceleration_settings.engine == Engine::Cayenne && snapshot_engine_override.is_none() {
+    // The same rule `snapshot_before_recreate` applies, read from the one place
+    // that states it — rationale on `archive_would_be_unrestorable`. A copy per
+    // publish path is how the periodic path came to publish an archive the
+    // pre-recreation path already refused.
+    if engine_to_acceleration_engine(acceleration_settings.engine).is_some_and(|engine| {
+        data_accelerator_api::snapshots::archive_would_be_unrestorable(
+            &engine,
+            snapshot_engine_override.as_ref(),
+        )
+    }) {
         tracing::warn!(
             dataset = %dataset.name,
             "Dataset '{}' will not publish snapshots: its Cayenne metastore catalog is unavailable, so an archive of it would carry no metastore slice and could not be restored. Check that this dataset's `cayenne_metadata_dir` and data directory are readable.",

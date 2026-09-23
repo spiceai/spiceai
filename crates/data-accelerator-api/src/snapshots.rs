@@ -173,6 +173,31 @@ pub async fn download_snapshot_if_needed(
     download_snapshot(acceleration, source, layout, engine, engine_override).await
 }
 
+/// Whether publishing a snapshot for this dataset would upload an archive
+/// nothing can restore.
+///
+/// A Cayenne bootstrap needs the per-dataset metastore slice that only
+/// `CayenneSnapshotEngine` writes. `DataAccelerator::snapshot_engine_for_source`
+/// answers `None` both when an engine needs no archive writer of its own and
+/// when Cayenne needed one and could not build it (a catalog or data-directory
+/// failure), so the engine has to be named here to tell the two apart.
+/// Publishing on that path would replace a restorable `current-snapshot-id`
+/// with a raw `cayenne.db` no reader can apply.
+///
+/// Shared rather than written at each publish path. Both paths are governed by
+/// the same rule, and a copy of it per path is exactly the asymmetry that let
+/// the periodic path publish such an archive while the pre-recreation path
+/// declined (spiceai/spiceai#13241). The two still word their own log lines,
+/// because "skipping the pre-recreation snapshot" and "this dataset will not
+/// publish snapshots" are different things to tell an operator.
+#[must_use]
+pub fn archive_would_be_unrestorable(
+    engine: &AccelerationEngine,
+    engine_override: Option<&Arc<dyn SnapshotEngine>>,
+) -> bool {
+    *engine == AccelerationEngine::Cayenne && engine_override.is_none()
+}
+
 /// Creates a snapshot of the existing acceleration file before it is deleted or recreated.
 ///
 /// Called during `file_create` and `file_update` (on schema mismatch) modes to preserve
@@ -208,13 +233,10 @@ pub async fn snapshot_before_recreate(
         return;
     }
 
-    // A Cayenne bootstrap needs the per-dataset metastore slice that only
-    // `CayenneSnapshotEngine` writes, and creating a snapshot makes whatever it uploads
-    // the store's `current-snapshot-id`. Publishing a default-engine archive (a raw
-    // `cayenne.db`, no slice) would replace a restorable current snapshot with one
-    // nothing can load, which is worse than keeping no backup of this wipe. The caller
-    // still recreates the acceleration either way.
-    if engine == AccelerationEngine::Cayenne && engine_override.is_none() {
+    // Rationale on `archive_would_be_unrestorable`. The caller still recreates the
+    // acceleration either way, so declining costs a backup of this wipe rather than
+    // the wipe itself.
+    if archive_would_be_unrestorable(&engine, engine_override.as_ref()) {
         tracing::warn!(
             dataset = %dataset_name,
             "Skipping the pre-recreation snapshot: this dataset's Cayenne metastore catalog is unavailable, and an archive without its metastore slice could not be restored"
