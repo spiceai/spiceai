@@ -184,9 +184,19 @@ async fn test_postgres_checkpoint_set_schema_preserves_the_freshness_clock()
     ]));
 
     checkpointer
-        .checkpoint(&original, Some("SELECT 1"), None)
+        .checkpoint(&original, Some("SELECT 1"), Some("sha256:A"))
         .await
         .map_err(|e| anyhow!("Failed to seed the checkpoint: {e}"))?;
+
+    assert_eq!(
+        checkpointer
+            .get_source_fingerprint()
+            .await
+            .map_err(|e| anyhow!("Failed to read the seeded source fingerprint: {e}"))?
+            .as_deref(),
+        Some("sha256:A"),
+        "the seeded producing identity must round-trip through PostgreSQL"
+    );
 
     // Backdate the recorded refresh by seven days, as a dataset bootstrapping from a
     // legacy snapshot would be.
@@ -244,6 +254,29 @@ async fn test_postgres_checkpoint_set_schema_preserves_the_freshness_clock()
             .map_err(|e| anyhow!("Failed to read the refresh SQL: {e}"))?,
         Some("SELECT 1".to_string()),
         "a schema-only write must preserve the stored refresh SQL"
+    );
+
+    assert_eq!(
+        reader
+            .get_source_fingerprint()
+            .await
+            .map_err(|e| anyhow!("Failed to read the source fingerprint: {e}"))?
+            .as_deref(),
+        Some("sha256:A"),
+        "a schema-only write must preserve the persisted producing identity"
+    );
+
+    reader
+        .checkpoint(&repaired, Some("SELECT 1"), None)
+        .await
+        .map_err(|e| anyhow!("Failed to retract the source fingerprint: {e}"))?;
+    assert!(
+        reader
+            .get_source_fingerprint()
+            .await
+            .map_err(|e| anyhow!("Failed to read the retracted source fingerprint: {e}"))?
+            .is_none(),
+        "a later checkpoint with no fingerprint must retract the previous stamp"
     );
 
     // A dataset with no checkpoint must not gain one: a row created here would carry a

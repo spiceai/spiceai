@@ -2421,7 +2421,7 @@ mod tests {
 
             let shape = attestation
                 .last_stamped()
-                .map(|(_, shape)| shape)
+                .map(|stamp| stamp.shape)
                 .expect("refresh TableScan must record the executing-plan attestation");
             assert!(
                 matches!(shape, ViewReadShape::MultipleReads { .. }),
@@ -2452,7 +2452,7 @@ mod tests {
 
             let shape = attestation
                 .last_stamped()
-                .map(|(_, shape)| shape)
+                .map(|stamp| stamp.shape)
                 .expect("refresh scan records the executing-plan attestation");
             assert!(
                 matches!(shape, ViewReadShape::MultipleReads { .. }),
