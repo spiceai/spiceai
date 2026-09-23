@@ -25,8 +25,5 @@ tracing.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
-[dev-dependencies]
-runtime-component = { path = "../runtime-component" }
-
 [lints]
 workspace = true

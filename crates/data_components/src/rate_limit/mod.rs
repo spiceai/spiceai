@@ -23,25 +23,6 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-pub mod adaptive;
-
-pub use adaptive::{
-    AdaptiveController, AdaptiveMode, AdaptiveRateControl, AdaptiveRateControlParseError,
-    DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW, RequestOutcome,
-    parse_adaptive_mode,
-};
-
-/// One throttle step the adaptive controller waits when it declines to admit a
-/// request. Small and bounded: a declined request re-checks admission after this
-/// pause rather than failing, so a throttled origin sees a lower request rate
-/// without any request being dropped.
-const ADAPTIVE_THROTTLE_STEP: Duration = Duration::from_millis(50);
-
-/// Cap on the total time [`HttpRateLimiter::check_rate_limit`] will spend
-/// waiting for the adaptive gate to admit a single request, so even a controller
-/// pinned near its floor cannot stall a request indefinitely.
-const ADAPTIVE_MAX_THROTTLE_WAIT: Duration = Duration::from_secs(5);
-
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
 const RATE_LIMIT_REMAINING_HEADER: &str = "ratelimit-remaining";
@@ -58,16 +39,6 @@ pub trait RateLimiter: Debug + Send + Sync {
     async fn update_from_headers(&self, headers: &HeaderMap);
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Record the outcome of one request so an adaptive controller can raise or
-    /// lower the effective rate for this origin.
-    ///
-    /// Defaults to a no-op: only [`HttpRateLimiter`] runs an adaptive controller;
-    /// the per-connector limiters (GitHub, Git) deliberately do not participate.
-    /// A decorator/wrapper over another `RateLimiter` MUST forward this to the
-    /// inner limiter — inheriting the no-op would silently disable adaptive
-    /// control for the wrapped origin.
-    fn record_request_outcome(&self, _outcome: RequestOutcome) {}
 }
 
 #[derive(Debug, Default)]
@@ -76,62 +47,12 @@ pub struct HttpRateLimiterMetrics {
     waits_total: AtomicU64,
     wait_duration_ms_total: AtomicU64,
     deadline_unix_ms: AtomicU64,
-    adaptive_effective_limit: AtomicU64,
-    adaptive_admission_coefficient_permille: AtomicU64,
-    adaptive_throttled_total: AtomicU64,
-    adaptive_throttle_wait_duration_ms_total: AtomicU64,
 }
 
 impl HttpRateLimiterMetrics {
     #[must_use]
     pub fn retry_after_updates_total(&self) -> u64 {
         self.updates_total.load(Ordering::Relaxed)
-    }
-
-    /// Current adaptive effective request-rate limit, rounded to a whole number.
-    /// Zero when adaptive control is disabled for this origin.
-    #[must_use]
-    pub fn adaptive_effective_limit(&self) -> u64 {
-        self.adaptive_effective_limit.load(Ordering::Relaxed)
-    }
-
-    /// Current adaptive admission coefficient in parts-per-thousand (0..=1000):
-    /// 1000 means "admit everything", lower means the origin is being throttled.
-    /// Zero when adaptive control is disabled for this origin.
-    #[must_use]
-    pub fn adaptive_admission_coefficient_permille(&self) -> u64 {
-        self.adaptive_admission_coefficient_permille
-            .load(Ordering::Relaxed)
-    }
-
-    /// Total requests the adaptive controller has throttled (declined to admit
-    /// on first check) for this origin.
-    #[must_use]
-    pub fn adaptive_throttled_total(&self) -> u64 {
-        self.adaptive_throttled_total.load(Ordering::Relaxed)
-    }
-
-    /// Cumulative time requests have spent waiting on the adaptive throttle gate.
-    #[must_use]
-    pub fn adaptive_throttle_wait_duration_ms_total(&self) -> u64 {
-        self.adaptive_throttle_wait_duration_ms_total
-            .load(Ordering::Relaxed)
-    }
-
-    fn record_adaptive_state(&self, effective_limit: f64, admission_coefficient: f64) {
-        self.adaptive_effective_limit
-            .store(f64_round_to_u64(effective_limit), Ordering::Relaxed);
-        self.adaptive_admission_coefficient_permille.store(
-            f64_round_to_u64(admission_coefficient.clamp(0.0, 1.0) * 1000.0),
-            Ordering::Relaxed,
-        );
-    }
-
-    fn record_adaptive_throttle(&self, waited: Duration) {
-        self.adaptive_throttled_total
-            .fetch_add(1, Ordering::Relaxed);
-        self.adaptive_throttle_wait_duration_ms_total
-            .fetch_add(duration_millis_u64(waited), Ordering::Relaxed);
     }
 
     #[must_use]
@@ -172,7 +93,6 @@ impl HttpRateLimiterMetrics {
 pub struct HttpRateLimiter {
     retry_after: RwLock<Option<Instant>>,
     metrics: Arc<HttpRateLimiterMetrics>,
-    adaptive: Option<Arc<AdaptiveController>>,
 }
 
 impl HttpRateLimiter {
@@ -186,53 +106,12 @@ impl HttpRateLimiter {
         Self {
             retry_after: RwLock::new(None),
             metrics,
-            adaptive: None,
         }
-    }
-
-    /// Build a limiter with an adaptive controller for `control`, growing back
-    /// toward `ceiling`. A [`AdaptiveRateControl::Disabled`] control leaves the
-    /// limiter with no adaptive controller.
-    #[must_use]
-    pub fn with_adaptive(control: AdaptiveRateControl, ceiling: f64) -> Self {
-        Self::with_metrics_and_adaptive(Arc::default(), control, ceiling)
-    }
-
-    /// Build a limiter with both explicit metrics and an adaptive controller.
-    #[must_use]
-    pub fn with_metrics_and_adaptive(
-        metrics: Arc<HttpRateLimiterMetrics>,
-        control: AdaptiveRateControl,
-        ceiling: f64,
-    ) -> Self {
-        let adaptive = AdaptiveController::new(control, ceiling).map(Arc::new);
-        let limiter = Self {
-            retry_after: RwLock::new(None),
-            metrics,
-            adaptive,
-        };
-        limiter.publish_adaptive_state();
-        limiter
     }
 
     #[must_use]
     pub fn metrics(&self) -> Arc<HttpRateLimiterMetrics> {
         Arc::clone(&self.metrics)
-    }
-
-    /// The adaptive controller for this origin, if adaptive control is enabled.
-    #[must_use]
-    pub fn adaptive_controller(&self) -> Option<&Arc<AdaptiveController>> {
-        self.adaptive.as_ref()
-    }
-
-    fn publish_adaptive_state(&self) {
-        if let Some(adaptive) = &self.adaptive {
-            self.metrics.record_adaptive_state(
-                adaptive.effective_limit(),
-                adaptive.admission_coefficient(),
-            );
-        }
     }
 }
 
@@ -279,18 +158,7 @@ impl RateLimiter for HttpRateLimiter {
             self.clear_elapsed_retry_after(Instant::now()).await;
         }
 
-        self.wait_for_adaptive_admission().await;
         Ok(())
-    }
-
-    fn record_request_outcome(&self, outcome: RequestOutcome) {
-        if let Some(adaptive) = &self.adaptive {
-            adaptive.record(outcome);
-            self.metrics.record_adaptive_state(
-                adaptive.effective_limit(),
-                adaptive.admission_coefficient(),
-            );
-        }
     }
 }
 
@@ -300,39 +168,6 @@ impl HttpRateLimiter {
         if current_retry_after.is_some_and(|retry_after| retry_after <= now) {
             *current_retry_after = None;
             self.metrics.clear_retry_after_deadline();
-        }
-    }
-
-    /// Block until the adaptive controller admits this request, or until the
-    /// bounded throttle budget is spent. A declined request pauses for one
-    /// [`ADAPTIVE_THROTTLE_STEP`] and re-checks rather than being dropped, so a
-    /// failing origin is served a lower request rate without any request being
-    /// turned into an error.
-    async fn wait_for_adaptive_admission(&self) {
-        let Some(adaptive) = &self.adaptive else {
-            return;
-        };
-
-        let started = Instant::now();
-        let mut throttled = false;
-        while !adaptive.try_admit() {
-            throttled = true;
-            let waited = started.elapsed();
-            if waited >= ADAPTIVE_MAX_THROTTLE_WAIT {
-                break;
-            }
-
-            let step =
-                ADAPTIVE_THROTTLE_STEP.min(ADAPTIVE_MAX_THROTTLE_WAIT.saturating_sub(waited));
-            tracing::debug!(
-                admission_coefficient = adaptive.admission_coefficient(),
-                "Adaptive rate control throttling HTTP request to a failing origin."
-            );
-            tokio::time::sleep(step).await;
-        }
-
-        if throttled {
-            self.metrics.record_adaptive_throttle(started.elapsed());
         }
     }
 }
@@ -519,25 +354,6 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Round a non-negative, finite `f64` to the nearest `u64`, saturating. Negative
-/// or non-finite inputs map to 0. Used only for metric gauges, where an
-/// approximate whole number is all that is reported.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "input is guarded finite and non-negative, and clamped below u64::MAX before the cast; the ceiling's imprecision is intentional"
-)]
-fn f64_round_to_u64(value: f64) -> u64 {
-    // u64::MAX is not exactly representable as f64; this bound is a safe
-    // saturating ceiling well above any rate limit or per-mille value.
-    const SATURATING_CEILING: f64 = u64::MAX as f64;
-    if !value.is_finite() || value <= 0.0 {
-        return 0;
-    }
-    value.round().min(SATURATING_CEILING) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,88 +434,6 @@ mod tests {
         assert_eq!(
             retry_after_duration(&headers, SystemTime::now()),
             Some(Duration::from_secs(5))
-        );
-    }
-
-    use crate::rate_limit::adaptive::{
-        AdaptiveRateControl, DEFAULT_ADAPTIVE_WINDOW, RequestOutcome,
-    };
-    use reqwest::StatusCode;
-
-    /// Classify a stub HTTP status the way the request path does, reusing the
-    /// shared retry-reason classification so the demonstration exercises the
-    /// same success/failure boundary the connector uses.
-    fn outcome_for_status(status: StatusCode) -> RequestOutcome {
-        if crate::resilient_http::status_is_retryable(status) {
-            RequestOutcome::Failure
-        } else {
-            RequestOutcome::Success
-        }
-    }
-
-    /// Measure the fraction of requests the limiter's adaptive gate admits over
-    /// `samples` decisions — the effective admitted rate right now.
-    fn admitted_fraction(limiter: &HttpRateLimiter, samples: u32) -> f64 {
-        let controller = limiter
-            .adaptive_controller()
-            .expect("adaptive control should be enabled");
-        let admitted = (0..samples).filter(|_| controller.try_admit()).count();
-        f64::from(u32::try_from(admitted).unwrap_or(samples)) / f64::from(samples)
-    }
-
-    /// Behavioral demonstration (Google SRE throttling): the admission
-    /// coefficient must fall below 1 once the success ratio drops under `1/k`,
-    /// and return to 1 after the failure burst decays out of the window. Uses
-    /// paused tokio time so the decaying window is driven deterministically.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn adaptive_sre_reduces_admitted_rate_under_failures_then_recovers() {
-        // The origin's configured static rate limit that SRE scales by the
-        // admission coefficient. Its size does not affect the coefficient.
-        const STATIC_LIMIT: f64 = 32.0;
-        // 75% failure threshold => k = 4 => throttle when success rate < 1/4.
-        let control = AdaptiveRateControl::enabled(0.75, DEFAULT_ADAPTIVE_WINDOW)
-            .expect("sre control should be valid");
-        let limiter = HttpRateLimiter::with_adaptive(control, STATIC_LIMIT);
-
-        // Healthy origin: accepts == requests, coefficient is exactly 1.
-        for _ in 0..50 {
-            limiter.record_request_outcome(outcome_for_status(StatusCode::OK));
-        }
-        let healthy = admitted_fraction(&limiter, 2000);
-
-        // A long burst of 503s drives the success ratio well below 1/k.
-        for _ in 0..2000 {
-            limiter.record_request_outcome(outcome_for_status(StatusCode::SERVICE_UNAVAILABLE));
-        }
-        let failing = admitted_fraction(&limiter, 2000);
-
-        // Let the failure burst age out of the decaying window, then resume
-        // successes. The coefficient returns to 1.
-        tokio::time::advance(Duration::from_mins(1)).await;
-        for _ in 0..500 {
-            limiter.record_request_outcome(outcome_for_status(StatusCode::OK));
-        }
-        let recovered = admitted_fraction(&limiter, 2000);
-
-        eprintln!(
-            "SRE admitted fraction: healthy={healthy:.3} failing={failing:.3} recovered={recovered:.3}"
-        );
-
-        assert!(
-            healthy > 0.95,
-            "healthy origin (accepts==requests) must never be throttled, got {healthy:.3}"
-        );
-        assert!(
-            failing < 0.5,
-            "sustained failures should throttle admissions, got {failing:.3}"
-        );
-        assert!(
-            failing < healthy,
-            "failures must reduce the admitted rate ({failing:.3} !< {healthy:.3})"
-        );
-        assert!(
-            recovered > 0.95,
-            "recovered origin should stop throttling once failures decay, got {recovered:.3}"
         );
     }
 

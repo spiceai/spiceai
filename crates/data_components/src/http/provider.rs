@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
-use crate::rate_limit::{RateLimiter, RequestOutcome};
+use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     compute::cast,
@@ -45,7 +45,7 @@ use reqwest::{
     Client,
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
-use runtime_rate_control::{Permit, RateController};
+use runtime_rate_control::{Permit, RateController, RequestOutcome};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -1503,8 +1503,8 @@ impl HttpTableProvider {
     /// controller can raise or lower the effective rate. A no-op for limiters
     /// without adaptive control.
     fn record_request_outcome(&self, outcome: RequestOutcome) {
-        if let Some(rate_limiter) = &self.rate_limiter {
-            rate_limiter.record_request_outcome(outcome);
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
         }
     }
 
