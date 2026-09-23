@@ -3388,6 +3388,7 @@ dependencies = [
  "pingora-lru",
  "rand 0.10.1",
  "rstest 0.25.0",
+ "sharded-cache",
  "snafu",
  "spicepod",
  "tokio",
@@ -6212,6 +6213,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
+ "bytes",
  "chrono",
  "data-connector-types",
  "data-http-rate-control",
@@ -8208,6 +8210,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bb7ef65b3777a325d1eeefefab5b6d4959da54747e33bd6258e789640f307ad"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "evaluate-api"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "utoipa",
 ]
 
 [[package]]
@@ -11740,6 +11755,7 @@ dependencies = [
  "dotenv 2.4.0-unstable",
  "either",
  "embed-api",
+ "evaluate-api",
  "futures",
  "google-genai",
  "governor",
@@ -11778,6 +11794,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
+ "wiremock",
 ]
 
 [[package]]
@@ -17205,6 +17222,7 @@ dependencies = [
  "duckdb",
  "duration-parse",
  "elasticsearch",
+ "evaluate-api",
  "event_stream",
  "flight_client",
  "fundu",
@@ -19274,6 +19292,14 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sharded-cache"
+version = "2.4.0-unstable"
+dependencies = [
+ "parking_lot",
+ "vstd",
 ]
 
 [[package]]

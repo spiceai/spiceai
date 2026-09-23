@@ -80,6 +80,17 @@ pub const OPENAI_COMMON: &[PassthroughParam] = &openai_common();
 /// `openai_`-prefixed forms kept as deprecated aliases.
 pub const PREFIXED_COMMON: &[PassthroughParam] = &prefixed_common();
 
+/// Rate-control tunables for evaluation-only providers (credentials/endpoint are
+/// typed fields). Omits chat-only settings (`tools`, `system_prompt`, `temperature`,
+/// `tool_choice`, deprecated `openai_*` overrides) that evaluation loaders ignore.
+pub const EVALUATE_RATE_CONTROLS: &[PassthroughParam] = &[
+    PassthroughParam::runtime("max_concurrency").description(
+        "Maximum number of concurrent requests for this model. Overrides provider defaults.",
+    ),
+    PassthroughParam::runtime("requests_per_minute_limit")
+        .description("Maximum requests per minute for this model. Overrides provider defaults."),
+];
+
 // OpenAI: 6 runtime tunables + 22 runtime overrides + (`openai_tools` + 22
 // `openai_*` overrides) deprecated component forms = 51 (legacy PARAM_LEN).
 const OPENAI_LEN: usize = RUNTIME_TUNABLES.len() + OVERRIDES.len() + (1 + OVERRIDES.len());
@@ -249,5 +260,16 @@ mod tests {
         assert!(keys.contains(&("openai_tools".to_string(), true)));
         // Runtime tunables stay unprefixed.
         assert!(keys.contains(&("system_prompt".to_string(), false)));
+    }
+
+    #[test]
+    fn evaluate_rate_controls_are_rate_only() {
+        let keys = user_keys(EVALUATE_RATE_CONTROLS, "typesafe");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&("max_concurrency".to_string(), false)));
+        assert!(keys.contains(&("requests_per_minute_limit".to_string(), false)));
+        assert!(!keys.iter().any(|(k, _)| {
+            k.contains("temperature") || k.contains("tools") || k.contains("system_prompt")
+        }));
     }
 }

@@ -149,6 +149,9 @@
               }
             }
           },
+          "400": {
+            "description": "The specified model is an evaluation model; use POST /v1/evaluate"
+          },
           "404": {
             "description": "The specified model was not found"
           },
@@ -589,6 +592,62 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/evaluate": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Evaluate",
+        "description": "Evaluate unstructured `state` against a map of typed System One questions\n(noul / choice / score). Returns structured answers with calibrated\nprobabilities and confidence. Chat completions are not supported for these\nmodels — use this endpoint instead of `/v1/chat/completions`.",
+        "operationId": "post_evaluate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluation succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Upstream authentication failed"
+          },
+          "403": {
+            "description": "Upstream permission denied"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "422": {
+            "description": "Malformed JSON request body (Axum Json extractor)"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "503": {
+            "description": "Upstream provider unavailable"
+          },
+          "500": {
+            "description": "Evaluation failed"
           }
         }
       }
@@ -2621,6 +2680,109 @@
             "description": "A path to a file."
           }
         ]
+      },
+      "Answer": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "noul",
+              "type"
+            ],
+            "properties": {
+              "noul": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "choice",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "choice": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "score",
+              "legend",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "legend": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "score": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A typed answer returned for one question."
       },
       "ApplyPatchCallOutputStatus": {
         "type": "string",
@@ -6588,6 +6750,29 @@
           "base64"
         ]
       },
+      "EntryType": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null",
+            "default": null
+          }
+        ],
+        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
+      },
       "ErrorObject": {
         "type": "object",
         "description": "Error returned by the API when a request fails.",
@@ -6605,6 +6790,82 @@
             "description": "A human-readable description of the error."
           }
         }
+      },
+      "EvaluateRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/evaluate` and provider System One calls.",
+        "required": [
+          "model",
+          "state",
+          "questions"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Spicepod model name (runtime) or provider model id (provider forward)."
+          },
+          "questions": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Question"
+            },
+            "minProperties": 1
+          },
+          "state": {
+            "$ref": "#/components/schemas/EvaluateState",
+            "description": "State for the model to evaluate: string, object, or array."
+          }
+        }
+      },
+      "EvaluateResponse": {
+        "type": "object",
+        "description": "Response body for evaluation: typed answers plus provider metadata.",
+        "required": [
+          "model",
+          "answers"
+        ],
+        "properties": {
+          "answers": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Answer"
+            },
+            "minProperties": 1
+          },
+          "model": {
+            "type": "string",
+            "description": "Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
+          }
+        }
+      },
+      "EvaluateState": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Evaluation `state`: string, object, or array (not bool/number/null)."
       },
       "FileCitationBody": {
         "type": "object",
@@ -9391,6 +9652,37 @@
           }
         }
       },
+      "NonNullEntry": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Non-null `EntryType` values: string, object, or array (not JSON null).\n\nUsed for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s\nnon-empty `list[str | object | array]` criteria shape."
+      },
+      "NoulCriteria": {
+        "type": "object",
+        "description": "Optional yes/no rubric for a noul question.\n\n`true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when\nforwarding to `TypeSafe` (unlike `Option<EntryType>`, which drops nulls).",
+        "properties": {
+          "false": {
+            "$ref": "#/components/schemas/NullableEntry"
+          },
+          "true": {
+            "$ref": "#/components/schemas/NullableEntry"
+          }
+        }
+      },
       "NsqlColumnContext": {
         "type": "object",
         "required": [
@@ -9923,6 +10215,29 @@
             "minimum": 0
           }
         }
+      },
+      "NullableEntry": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null",
+            "default": null
+          }
+        ],
+        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
       },
       "OutputItem": {
         "oneOf": [
@@ -10579,6 +10894,96 @@
             "minimum": 0
           }
         }
+      },
+      "Question": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Yes/no probability question. Answer is `noul` in \\[0, 1\\] (P(yes)).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/NoulCriteria"
+                  }
+                ]
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Closed-set selection. Answer is the highest-probability option plus the full distribution.",
+            "required": [
+              "criteria",
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "object",
+                "description": "Option id → description (`EntryType`, or JSON null).",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Ordered rubric score. Answer is a probability-weighted value across levels.",
+            "required": [
+              "criteria",
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/NonNullEntry"
+                },
+                "description": "Two to ten non-null rubric levels: `TypeSafe` documents score criteria as\n\"at least two levels and takes up to 10\"\n(<https://docs.typesafe.ai/primitives/score>).",
+                "maxItems": 10,
+                "minItems": 2
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A typed question sent to a System One evaluation model.\n\n`instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round\ntrip to `TypeSafe` instead of collapsing into an omitted field."
       },
       "RankVersionType": {
         "type": "string",
@@ -12504,6 +12909,23 @@
           "url": {
             "type": "string",
             "description": "The URL of the web resource."
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token usage reported by the provider.",
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Defaulted: the provider may report one count without the other, and a partial\n`usage` block must not fail an otherwise successful evaluation.",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
