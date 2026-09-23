@@ -24,10 +24,23 @@ limitations under the License.
 //!
 //! Taking the lock where the plan is *built* would not have closed that: a
 //! `TableProvider`'s write methods return an `ExecutionPlan`, and the rows do
-//! not move until DataFusion executes it, which is after those methods have
+//! not move until `DataFusion` executes it, which is after those methods have
 //! returned and any guard they held has been dropped. So the guard has to be
 //! acquired inside `execute` and held for as long as the write's output stream
 //! lives — which is what this plan does, and all it does.
+//!
+//! It also owns *when the table's freshness marker moves*. `last_updated_at`
+//! used to be stamped where the plan was built, which was close enough to the
+//! write while nothing made the two far apart. Holding the lock does make them
+//! far apart, and the marker is what `SnapshotsCreationPolicy::OnChange` compares
+//! against the last snapshot's own `snapshot_last_updated_at_ms` to decide
+//! whether anything changed. A write that stamped at plan time and then waited
+//! would hand its timestamp to the snapshot running ahead of it — which would
+//! record it, having not written those rows — and the next on-change snapshot
+//! would then read an unchanged marker and skip, leaving the acknowledged write
+//! out of every snapshot until some later mutation moved the marker again. So
+//! the stamp happens here, once the write's stream has ended without an error
+//! and while the guard is still held.
 //!
 //! Lock ordering: this is taken *before* any lock the wrapped write takes
 //! (a partitioned Cayenne dual write takes that table's write coordinator
@@ -37,6 +50,7 @@ limitations under the License.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use arrow_schema::SchemaRef;
 use datafusion::common::Result as DataFusionResult;
@@ -55,6 +69,11 @@ use tokio::sync::Mutex;
 pub(crate) struct AcceleratorWriteLockExec {
     input: Arc<dyn ExecutionPlan>,
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// Stamped when the write ends without an error, before the guard drops.
+    /// `None` for write-back, whose sinks mark the table themselves once the
+    /// accelerator accepts the write — stamping here too would move the marker
+    /// for a write its own validation went on to refuse.
+    last_updated_at: Option<Arc<AtomicI64>>,
     dataset_name: Arc<str>,
     plan_properties: Arc<PlanProperties>,
 }
@@ -67,6 +86,7 @@ impl AcceleratorWriteLockExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        last_updated_at: Option<Arc<AtomicI64>>,
         dataset_name: Arc<str>,
     ) -> Self {
         let plan_properties = Arc::new(
@@ -80,6 +100,7 @@ impl AcceleratorWriteLockExec {
         Self {
             input,
             accelerator_write_mutex,
+            last_updated_at,
             dataset_name,
             plan_properties,
         }
@@ -88,9 +109,15 @@ impl AcceleratorWriteLockExec {
     pub(crate) fn new_arc(
         input: Arc<dyn ExecutionPlan>,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        last_updated_at: Option<Arc<AtomicI64>>,
         dataset_name: Arc<str>,
     ) -> Arc<dyn ExecutionPlan> {
-        Arc::new(Self::new(input, accelerator_write_mutex, dataset_name))
+        Arc::new(Self::new(
+            input,
+            accelerator_write_mutex,
+            last_updated_at,
+            dataset_name,
+        ))
     }
 }
 
@@ -131,15 +158,17 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let Some(input) = children.into_iter().next() else {
-            return Err(DataFusionError::Internal(
-                "AcceleratorWriteLockExec requires exactly one child".to_string(),
-            ));
-        };
+        let [input] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|children| {
+            DataFusionError::Internal(format!(
+                "AcceleratorWriteLockExec wraps exactly one write plan, got {}",
+                children.len()
+            ))
+        })?;
 
         Ok(Arc::new(Self::new(
             input,
             Arc::clone(&self.accelerator_write_mutex),
+            self.last_updated_at.clone(),
             Arc::clone(&self.dataset_name),
         )))
     }
@@ -152,6 +181,7 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
         let schema = self.schema();
         let input = Arc::clone(&self.input);
         let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
+        let last_updated_at = self.last_updated_at.clone();
         let dataset_name = Arc::clone(&self.dataset_name);
 
         // The guard is threaded through the stream's own state, so it is
@@ -166,12 +196,26 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
             let input_stream = input.execute(partition, context)?;
 
             Ok::<_, DataFusionError>(futures::stream::unfold(
-                (input_stream, guard),
-                |(mut input_stream, guard)| async move {
-                    input_stream
-                        .next()
-                        .await
-                        .map(|batch| (batch, (input_stream, guard)))
+                Some((input_stream, guard, last_updated_at, false)),
+                |state| async move {
+                    let (mut input_stream, guard, last_updated_at, failed) = state?;
+
+                    let Some(batch) = input_stream.next().await else {
+                        // The write has finished. Move the freshness marker
+                        // here, under the guard, so the next holder of the lock
+                        // — an acceleration snapshot — reads a timestamp that
+                        // already accounts for these rows.
+                        if !failed && let Some(last_updated_at) = last_updated_at.as_ref() {
+                            crate::accelerated::AcceleratedTable::set_timestamp_to_now(
+                                last_updated_at,
+                            );
+                        }
+                        drop(guard);
+                        return None;
+                    };
+
+                    let failed = failed || batch.is_err();
+                    Some((batch, Some((input_stream, guard, last_updated_at, failed))))
                 },
             ))
         })
