@@ -283,6 +283,13 @@ pub struct WriteShardConfig {
     /// has no key to sort by and ignores it. `None` ⇒ rows keep their arrival
     /// order within a shard.
     pub run_sort_bytes: Option<u64>,
+    /// The `range_bounds` were estimated from a sample that may not describe
+    /// every row the write will see (a table's first load samples the head of
+    /// its own input). If one range shard then receives far more than its share
+    /// of the rows, the writer hashes the key for the rest of the write instead
+    /// of leaving one encoder the remainder. Bounds read off the rows being
+    /// rewritten keep their split however the rows fall.
+    pub range_bounds_estimated: bool,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
@@ -761,6 +768,7 @@ impl VortexFormat {
                 bounds: bounds.clone(),
                 partitions,
                 run_sort_bytes: write_shard.run_sort_bytes,
+                hash_fallback: write_shard.range_bounds_estimated,
             };
         }
         ShardSpec::Hash {
@@ -1731,6 +1739,7 @@ mod tests {
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
             range_bounds,
             run_sort_bytes: None,
+            range_bounds_estimated: false,
         })
     }
 

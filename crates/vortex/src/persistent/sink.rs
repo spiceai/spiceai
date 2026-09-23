@@ -104,11 +104,17 @@ pub(super) enum ShardSpec {
     /// than the whole write a global sort would buffer. The runs are charged to
     /// the task's memory pool and cut short when it refuses (see
     /// [`RunSorter`]), so the sort never takes memory the pool does not have.
+    ///
+    /// `hash_fallback` marks bounds estimated from a sample that may not describe
+    /// the rows still to come. If one shard then receives far more than its share
+    /// (see [`RangeImbalanceGuard`]), the rest of the write hashes the key
+    /// instead, so one encoder is not left with the remainder of the write.
     Range {
         expr: PhysicalExprRef,
         bounds: Vec<ScalarValue>,
         partitions: usize,
         run_sort_bytes: Option<u64>,
+        hash_fallback: bool,
     },
     /// `n` writers, rows hash-partitioned by `exprs` (parallel encode + key-clustered files).
     ///
@@ -159,6 +165,52 @@ impl ShardSpec {
                 BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1),
             )),
         }
+    }
+}
+
+/// Watches a range split whose bounds were estimated from a sample
+/// ([`ShardSpec::Range`] with `hash_fallback`), and reports when one shard has
+/// received far more than its share of the rows routed so far — the sign that
+/// the sample did not describe the rows that followed it.
+///
+/// "Far more" is more than twice a fair share (half the rows at four shards),
+/// capped at three quarters so a two-shard split can trip it too. Nothing is
+/// judged before [`Self::MIN_ROWS`] rows, which keeps a batch or two of
+/// clustered keys from tripping it.
+struct RangeImbalanceGuard {
+    expr: PhysicalExprRef,
+    rows: Vec<u64>,
+    total: u64,
+}
+
+impl RangeImbalanceGuard {
+    const MIN_ROWS: u64 = 262_144;
+
+    fn new(expr: PhysicalExprRef, shards: usize) -> Self {
+        Self {
+            expr,
+            rows: vec![0; shards],
+            total: 0,
+        }
+    }
+
+    fn record(&mut self, shard: usize, rows: usize) {
+        let rows = u64::try_from(rows).unwrap_or(u64::MAX);
+        if let Some(slot) = self.rows.get_mut(shard) {
+            *slot = slot.saturating_add(rows);
+        }
+        self.total = self.total.saturating_add(rows);
+    }
+
+    fn is_imbalanced(&self) -> bool {
+        let shards = u64::try_from(self.rows.len()).unwrap_or(u64::MAX);
+        if shards < 2 || self.total < Self::MIN_ROWS {
+            return false;
+        }
+        let busiest = self.rows.iter().copied().max().unwrap_or(0);
+        // busiest / total > min(2 / shards, 3 / 4)
+        busiest.saturating_mul(shards).saturating_mul(4)
+            > self.total.saturating_mul(shards.saturating_mul(3).min(8))
     }
 }
 
@@ -678,6 +730,14 @@ async fn write_record_batch_stream_to_files(
     let mut router = (num_shards > 1)
         .then(|| output_options.shard_spec.router(num_shards))
         .transpose()?;
+    let mut imbalance_guard = match output_options.shard_spec {
+        ShardSpec::Range {
+            expr,
+            hash_fallback: true,
+            ..
+        } if num_shards > 1 => Some(RangeImbalanceGuard::new(Arc::clone(expr), num_shards)),
+        _ => None,
+    };
 
     // A failed send means a shard writer already dropped its receiver — i.e. it
     // exited early with an error (the happy path holds the receiver open until
@@ -707,6 +767,26 @@ async fn write_record_batch_stream_to_files(
                 Some(router) => {
                     let mut assignments: Vec<(usize, RecordBatch)> = Vec::new();
                     router.route(batch, &mut assignments)?;
+                    if let Some(guard) = imbalance_guard.as_mut() {
+                        for (idx, sub) in &assignments {
+                            guard.record(*idx, sub.num_rows());
+                        }
+                        if guard.is_imbalanced() {
+                            tracing::debug!(
+                                rows = guard.total,
+                                shard_rows = ?guard.rows,
+                                "Estimated range bounds left one shard with most rows; hashing the key for the rest of the write"
+                            );
+                            *router = ShardRouter::Partitioned(
+                                BatchPartitioner::new_hash_partitioner(
+                                    vec![Arc::clone(&guard.expr)],
+                                    num_shards,
+                                    Time::default(),
+                                )?,
+                            );
+                            imbalance_guard = None;
+                        }
+                    }
                     for (idx, sub) in assignments {
                         if senders[idx].send(sub).await.is_err() {
                             shard_closed_early = true;
@@ -1463,6 +1543,7 @@ mod tests {
     use crate::persistent::VortexTableOptions;
     use crate::persistent::sink::ActiveFileWriter;
     use crate::persistent::sink::RUN_SORT_OUTPUT_ROWS;
+    use crate::persistent::sink::RangeImbalanceGuard;
     use crate::persistent::sink::RunSorter;
     use crate::persistent::sink::ShardSpec;
     use crate::persistent::sink::WriteOutputOptions;
@@ -3138,6 +3219,7 @@ mod tests {
                 ],
                 partitions: 4,
                 run_sort_bytes: None,
+                hash_fallback: false,
             },
         )
         .await?;
@@ -3352,6 +3434,7 @@ mod tests {
                 bounds: vec![ScalarValue::Int64(Some(499))],
                 partitions: 2,
                 run_sort_bytes: Some(per_run),
+                hash_fallback: false,
             },
         )
         .await?;
@@ -3385,6 +3468,137 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Estimated range bounds that misdescribe the rows after the sample they
+    /// came from — every later key above the last bound — must not leave one
+    /// encoder with the rest of the write: with `hash_fallback` the writer
+    /// hashes the key once the last shard holds most rows, so every shard
+    /// receives keys from beyond the sampled range. Without it the last shard
+    /// takes them all. Either way every row lands exactly once.
+    #[tokio::test]
+    async fn test_range_sharding_hash_fallback_rebalances_misestimated_bounds() -> anyhow::Result<()>
+    {
+        const SAMPLED: i64 = 40_000;
+        const TOTAL: i64 = 400_000;
+        let schema = one_col_schema();
+        // The first SAMPLED keys are a shuffle of [0, SAMPLED), which the bounds
+        // were cut from; the rest are all above it.
+        let keys: Vec<i64> = (0..SAMPLED)
+            .map(|i| (i * 7919) % SAMPLED)
+            .chain(SAMPLED..TOTAL)
+            .collect();
+        let bounds = vec![
+            ScalarValue::Int64(Some(SAMPLED / 4)),
+            ScalarValue::Int64(Some(SAMPLED / 2)),
+            ScalarValue::Int64(Some(SAMPLED * 3 / 4)),
+        ];
+
+        for hash_fallback in [false, true] {
+            let ctx = TestSessionContext::default();
+            let batches: Vec<RecordBatch> = keys
+                .chunks(8192)
+                .map(|chunk| one_col_batch(&schema, chunk.to_vec()))
+                .collect();
+            let results = run_sharded_write(
+                ctx.store.clone(),
+                Arc::clone(&schema),
+                batches_to_stream(Arc::clone(&schema), batches),
+                None,
+                ShardSpec::Range {
+                    expr: Arc::new(Column::new("a", 0)),
+                    bounds: bounds.clone(),
+                    partitions: 4,
+                    run_sort_bytes: Some(64 * 1024 * 1024),
+                    hash_fallback,
+                },
+            )
+            .await?;
+
+            let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+            assert_eq!(
+                total_rows,
+                u64::try_from(TOTAL)?,
+                "no row may be dropped or duplicated"
+            );
+            let got = ctx
+                .session
+                .sql("SELECT a FROM '/table/' ORDER BY a")
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(int64_values(&got), (0..TOTAL).map(Some).collect::<Vec<_>>());
+
+            let mut shards_beyond_sample = 0;
+            for (path, _) in &results {
+                let values = int64_values(
+                    &ctx.session
+                        .sql(&format!("SELECT a FROM '/{path}'"))
+                        .await?
+                        .collect()
+                        .await?,
+                );
+                if values.iter().any(|v| v.is_some_and(|v| v >= SAMPLED)) {
+                    shards_beyond_sample += 1;
+                }
+            }
+            if hash_fallback {
+                assert_eq!(
+                    shards_beyond_sample, 4,
+                    "the fallback spreads keys beyond the sampled range over every shard"
+                );
+            } else {
+                assert_eq!(
+                    shards_beyond_sample, 1,
+                    "without the fallback every key above the last bound reaches the last shard"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The imbalance guard trips only once enough rows have been routed and one
+    /// shard holds far more than its share.
+    #[test]
+    fn range_imbalance_guard_trips_on_a_dominant_shard_only() {
+        let expr: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let mut balanced = RangeImbalanceGuard::new(Arc::clone(&expr), 4);
+        for _ in 0..100 {
+            for shard in 0..4 {
+                balanced.record(shard, 8192);
+            }
+        }
+        assert!(!balanced.is_imbalanced(), "an even split is not imbalanced");
+
+        let mut early = RangeImbalanceGuard::new(Arc::clone(&expr), 4);
+        early.record(3, 100_000);
+        assert!(
+            !early.is_imbalanced(),
+            "too few rows routed to judge the split yet"
+        );
+
+        let mut dominant = RangeImbalanceGuard::new(Arc::clone(&expr), 4);
+        for shard in 0..4 {
+            dominant.record(shard, 40_000);
+        }
+        dominant.record(3, 200_000);
+        assert!(
+            dominant.is_imbalanced(),
+            "240,000 of 360,000 rows on one of four shards"
+        );
+
+        let mut two = RangeImbalanceGuard::new(expr, 2);
+        two.record(0, 100_000);
+        two.record(1, 200_000);
+        assert!(
+            !two.is_imbalanced(),
+            "two thirds on one of two shards is tolerated"
+        );
+        two.record(1, 700_000);
+        assert!(
+            two.is_imbalanced(),
+            "nine tenths on one of two shards is not"
+        );
     }
 
     /// Hash routing with run sorting must still write every row exactly once,
@@ -3470,6 +3684,7 @@ mod tests {
                 bounds: vec![ScalarValue::Int64(Some(499))],
                 partitions: 2,
                 run_sort_bytes: Some(1024 * 1024),
+                hash_fallback: false,
             },
             &pool,
         )
@@ -3581,6 +3796,7 @@ mod tests {
                 bounds: vec![ScalarValue::Int64(Some(99))],
                 partitions: 2,
                 run_sort_bytes: Some(1024 * 1024),
+                hash_fallback: false,
             },
         )
         .await?;
