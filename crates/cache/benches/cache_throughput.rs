@@ -89,6 +89,7 @@ fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
 fn all_caching_policies() -> Vec<(&'static str, CachingPolicy)> {
     vec![
         ("lru", CachingPolicy::Lru),
+        ("lfu", CachingPolicy::Lfu),
         ("tinylfu", CachingPolicy::TinyLfu),
     ]
 }

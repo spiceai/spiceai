@@ -120,10 +120,8 @@ runtime:
     api_key:
       enabled: true
       keys:
-        - ReadOnly:
-            key: read-only-api-key-12345
-        - ReadWrite:
-            key: read-write-api-key-67890
+        - read-only-api-key-12345
+        - read-write-api-key-67890:rw
 
   # CORS configuration
   cors:
