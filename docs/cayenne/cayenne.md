@@ -1512,7 +1512,7 @@ The samples differ by orders of magnitude in cost, so they run on separate clock
 
 | sample | cadence | cost |
 |---|---|---|
-| deletion index, PK index format/size, memory account, inline cache, fleet budgets, write shape | every tick | atomic loads plus one `try_lock`, and one `get_array_memory_size` per inline batch; nothing to throttle |
+| deletion index, PK index format/size, memory account, inline cache, fleet budgets, write shape | ≥ 2 s per table | atomic loads plus one `try_lock`, except the inline-cache figure, which walks the cached batches' Arrow buffers and counts each distinct allocation once — 477 µs over a 57-batch corpus. Cheap, not free, which is why the group has a floor rather than riding every tick |
 | `cayenne_storage_*`, `cayenne_snapshot_manifest_*`, `cayenne_metastore_table_rows` | ≥ 30 s per table | one aggregate query over the table's own metastore rows; the manifest scan, which is indexed on `table_id` and aggregates without grouping, is the bulk of it |
 | `cayenne_data_dir_*` | ≥ 5 min per table | one `stat` per file — cost scales with exactly the file count it measures |
 
@@ -1548,7 +1548,7 @@ A resident figure far above `query_memory_pool_used_bytes` has two possible caus
 
 **Off-pool structures.** Nothing registers these against the query pool, so they are invisible in every pool gauge:
 
-- `cayenne_inline_cache_bytes{table}` and `cayenne_inline_cache_batches{table}` — the decoded inline (level-0) view cache. These are *decoded* Arrow bytes, so they legitimately exceed the serialized `cayenne_storage_bytes{tier="inline"}` the same rows occupy in the metastore.
+- `cayenne_inline_cache_bytes{table}` and `cayenne_inline_cache_batches{table}` — the decoded inline (level-0) view cache. These are *decoded* Arrow bytes, so they legitimately exceed the serialized `cayenne_storage_bytes{tier="inline"}` the same rows occupy in the metastore. The byte figure counts each physical Arrow allocation once: the IPC reader decodes a message body into one allocation and points every column and child buffer at a slice of it, so summing each buffer's capacity would bill that allocation once per buffer in the batch.
 - `cayenne_deletion_index_bytes{table}` — the deletion index's own view of its residency, published beside `cayenne_memory_account_bytes{kind="deletion_index"}`, which is the pool-facing figure. A divergence between the two is itself the finding.
 
 **Fleet ceilings.** A table whose index refuses to grow because the *process-global* budget is exhausted looks, in every per-table gauge, exactly like a table that is simply small:
@@ -1557,7 +1557,7 @@ A resident figure far above `query_memory_pool_used_bytes` has two possible caus
 
 Together with `cayenne_pk_index_budget_bytes{table, site}` — the per-table budget the `auto` tier derived, which is what multiplies across tables into a large fleet total — that accounts for the whole PK-keyset hypothesis: how large each table's index is, what it is allowed to reach, whether the fleet is at its ceiling, and which format each table settled on.
 
-All of these are lock-free atomic loads (the inline-cache figure is one `get_array_memory_size` per batch, not per row), so they ride every tick with no throttle.
+All of these are lock-free atomic loads, except the inline-cache figure, which walks the cached batches' Arrow buffers to count each distinct allocation once. That is why the whole group sits behind a 2-second floor rather than riding every tick.
 
 ## The primary-key index
 
