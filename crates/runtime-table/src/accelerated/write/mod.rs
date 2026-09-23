@@ -43,6 +43,7 @@ limitations under the License.
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
 pub mod dual_write;
+pub(crate) mod lock;
 pub(crate) mod write_back;
 
 use std::sync::Arc;
