@@ -988,6 +988,14 @@ async fn answer_or_error(rt: &Arc<Runtime>, sql: &str) -> Result<String, anyhow:
 /// `regexp_count` refuses one because the two engines iterate empty matches
 /// differently, and asking *whether* a pattern matches or replacing *a* match
 /// does not.
+///
+/// `regexp_replace(s, 'a*', 'X', 'g')` is the row that earns that last clause
+/// rather than asserting it. `screen_flags` admits `g` and `screen_pattern`
+/// admits an empty-matching pattern, each for its own reason — and their
+/// composition is the one shape where the empty-match iteration the count
+/// screen exists for could still reach a replace, because `g` is what makes a
+/// replace iterate at all. Covering `a*` and `g` separately leaves exactly
+/// that gap open.
 #[tokio::test]
 async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
 -> Result<(), anyhow::Error> {
@@ -1012,7 +1020,7 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
 
             // `None` — must not reach DuckDB at all; `Some(f)` — must still be
             // rendered as DuckDB's `f`.
-            let calls: [(&str, &str, Option<&str>); 18] = [
+            let calls: [(&str, &str, Option<&str>); 19] = [
                 (r"regexp_like(s, '\d')", "a Perl digit class", None),
                 (r"regexp_like(s, '\w')", "a Perl word class", None),
                 (r"regexp_like(s, '\ba')", "a word boundary", None),
@@ -1089,6 +1097,11 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
                 (
                     r"regexp_replace(s, 'a', 'X', 'g')",
                     "a global replace",
+                    Some("regexp_replace("),
+                ),
+                (
+                    r"regexp_replace(s, 'a*', 'X', 'g')",
+                    "a global replace over a pattern that can match empty",
                     Some("regexp_replace("),
                 ),
             ];
