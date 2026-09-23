@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use datafusion::common::ScalarValue;
@@ -211,6 +214,190 @@ pub async fn delete_by_keys(
     }
 
     Ok(())
+}
+
+/// Delete every document that agrees with a row of `members` on `group_columns` but whose own
+/// `_id` is not one of that group's members — the rest of each named group, with the listed
+/// members kept. See [`spice_table::Index::delete_group_remainder`] for what a caller expects
+/// of it.
+///
+/// This is what removes the chunks a shortened row no longer produces (#13717). A row rewritten
+/// to fewer chunks is upserted under chunk ids `0..n`, so every higher chunk id its previous
+/// text produced stays in the index and keeps answering searches for content the row no longer
+/// has. The write path knows the chunks it produced, not how many the previous text had, so it
+/// names the survivors and Elasticsearch removes the rest.
+///
+/// One `should` clause per group, each carrying its own group's filter *and* its own group's
+/// surviving `_id`s in `must_not`. The scoping is per group rather than per request so that a
+/// group split across two requests cannot have one request delete the members the other
+/// request's clause was protecting: every clause carries the whole of the group it names, or
+/// the group is not named at all.
+///
+/// A group is skipped outright — nothing deleted, nothing reported — when it cannot be
+/// addressed on both halves at once: a group-column value no `term` can express (NULL, or a
+/// type that has no JSON term form), or a member whose `_id` the write path would not have
+/// derived either. Deleting a group whose survivors cannot all be named would remove documents
+/// this write just wrote, which is worse than leaving a superseded chunk behind.
+///
+/// Addressing, chunking, and error reporting are [`delete_by_keys`]': the group columns are
+/// resolved to the field path a `term` matches their stored value on (a `text`-mapped column is
+/// matched on its `keyword` multi-field), every request is issued even after an earlier one
+/// comes back partially applied, and only a refused connection ends the batch early.
+pub async fn delete_group_remainder(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    primary_key: &[Field],
+    group_columns: &[String],
+    members: &RecordBatch,
+) -> DataFusionResult<()> {
+    if members.num_rows() == 0 {
+        return Ok(());
+    }
+
+    let key_paths = match resolve_term_exact_paths(client, es_index, group_columns).await {
+        Ok(Some(paths)) => paths,
+        // No document carries these columns, so there is no group here to prune.
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(DataFusionError::External(Box::new(e))),
+    };
+    ensure_keys_are_indexable(es_index, &key_paths, members)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let groups = collect_groups(primary_key, es_index, &key_paths, members)?;
+
+    let mut failure: Option<DataFusionError> = None;
+    for request in group_requests(&groups) {
+        let outcome = issue_delete_chunk(client, es_index, &request).await;
+        if let Some(e) = outcome.failure {
+            failure.get_or_insert(e);
+        }
+        if outcome.never_reached {
+            break;
+        }
+    }
+
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// One key group of a [`delete_group_remainder`] call: the `term` clauses that address its
+/// documents, and the `_id`s of the members to keep.
+struct MemberGroup {
+    terms: Vec<Value>,
+    survivors: Vec<String>,
+}
+
+/// Gather `members` into one [`MemberGroup`] per distinct value of the group columns, in
+/// first-seen order.
+///
+/// Rows are grouped by their rendered term values rather than by position, so nothing here
+/// depends on a group's rows being adjacent in `members`. A row that cannot be expressed as a
+/// `term` filter, or whose `_id` the write path would not have derived, drops the *whole* group
+/// it belongs to: those two halves address the same documents from opposite sides, so a group
+/// that loses either one can no longer name what to keep.
+fn collect_groups(
+    primary_key: &[Field],
+    es_index: &str,
+    key_paths: &[KeyFieldPath],
+    members: &RecordBatch,
+) -> DataFusionResult<Vec<MemberGroup>> {
+    let ids = write::extract_primary_key_from_fields(primary_key, es_index, members)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let arrays: Vec<_> = key_paths
+        .iter()
+        .map(|p| members.column_by_name(&p.column).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
+            DataFusionError::Plan(format!(
+                "group-remainder member batch is missing one of the group columns: {columns:?}"
+            ))
+        })?;
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, MemberGroup> = HashMap::new();
+    let mut unaddressable: HashSet<String> = HashSet::new();
+
+    for row in 0..members.num_rows() {
+        let mut terms = Vec::with_capacity(key_paths.len());
+        let mut values = Vec::with_capacity(key_paths.len());
+        for (key_path, array) in key_paths.iter().zip(&arrays) {
+            let value = ScalarValue::try_from_array(array.as_ref(), row)?;
+            let Some(json_value) = scalar_to_term_value(&value) else {
+                terms.clear();
+                break;
+            };
+            values.push(json_value.to_string());
+            terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
+        }
+        if terms.is_empty() {
+            // No group identity, so this row names no group to protect or prune.
+            continue;
+        }
+        let identity = values.join("\u{1}");
+
+        let Some(id) = ids.get(row).and_then(Option::as_ref) else {
+            // The write path stores no document for a row whose `_id` it cannot derive, so this
+            // group's membership is not fully known — leave it alone entirely.
+            unaddressable.insert(identity);
+            continue;
+        };
+
+        match groups.entry(identity.clone()) {
+            Entry::Occupied(mut e) => e.get_mut().survivors.push(id.clone()),
+            Entry::Vacant(e) => {
+                order.push(identity);
+                e.insert(MemberGroup {
+                    terms,
+                    survivors: vec![id.clone()],
+                });
+            }
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .filter(|identity| !unaddressable.contains(identity))
+        .filter_map(|identity| groups.remove(&identity))
+        .collect())
+}
+
+/// Split `groups` into `_delete_by_query` bodies, never splitting a group across two of them.
+///
+/// Each request holds whole groups up to [`DELETE_CHUNK_ROWS`] members, so both the `should`
+/// clause count and the `_id` list stay bounded regardless of how many chunks a row produced; a
+/// single group larger than that budget is issued on its own rather than split.
+fn group_requests(groups: &[MemberGroup]) -> Vec<Value> {
+    let mut requests = Vec::new();
+    let mut clauses: Vec<Value> = Vec::new();
+    let mut members = 0usize;
+
+    for group in groups {
+        if !clauses.is_empty() && members + group.survivors.len() > DELETE_CHUNK_ROWS {
+            requests.push(json!({
+                "bool": { "should": std::mem::take(&mut clauses), "minimum_should_match": 1 }
+            }));
+            members = 0;
+        }
+        let survivors: Vec<Value> = group.survivors.iter().cloned().map(Value::String).collect();
+        clauses.push(json!({
+            "bool": {
+                "filter": group.terms,
+                "must_not": [{ "ids": { "values": survivors } }]
+            }
+        }));
+        members += group.survivors.len();
+    }
+
+    if !clauses.is_empty() {
+        requests.push(json!({ "bool": { "should": clauses, "minimum_should_match": 1 } }));
+    }
+
+    requests
 }
 
 /// What issuing one `_delete_by_query` chunk produced: the failure to report, if any, and
@@ -1139,6 +1326,265 @@ mod tests {
                 }
             })],
         );
+    }
+
+    /// Member rows as [`spice_table::Index::delete_group_remainder`] receives them from a
+    /// chunked index: the base key plus the chunk id of every chunk the row still produces.
+    fn member_batch(rows: &[(Option<&str>, u64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, chunk)| *chunk).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("member batch should build")
+    }
+
+    fn chunked_key() -> Vec<Field> {
+        vec![
+            pk("id", DataType::Utf8),
+            pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+        ]
+    }
+
+    /// The `_id`s a `must_not` clause protects, for every `should` clause of `query`.
+    fn protected_ids(query: &Value) -> Vec<Vec<String>> {
+        query["bool"]["should"]
+            .as_array()
+            .expect("the request ORs one clause per group")
+            .iter()
+            .map(|clause| {
+                clause["bool"]["must_not"][0]["ids"]["values"]
+                    .as_array()
+                    .expect("each clause protects its group's members by _id")
+                    .iter()
+                    .map(|v| v.as_str().expect("an _id is a string").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Each group is pruned against its own surviving members: the filter names the group and the
+    /// `must_not` beside it names only that group's `_id`s, so one group's members cannot be
+    /// protected by another group's clause (or, worse, deleted by it).
+    #[tokio::test]
+    async fn each_group_is_pruned_against_only_its_own_members() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("a"), 0), (Some("b"), 0), (Some("b"), 1)]),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [
+                        {"bool": {
+                            "filter": [{"term": {"id": "a"}}],
+                            "must_not": [{"ids": {"values": [
+                                "{\"_spice.chunk_id\":0,\"id\":\"a\"}"
+                            ]}}]
+                        }},
+                        {"bool": {
+                            "filter": [{"term": {"id": "b"}}],
+                            "must_not": [{"ids": {"values": [
+                                "{\"_spice.chunk_id\":0,\"id\":\"b\"}",
+                                "{\"_spice.chunk_id\":1,\"id\":\"b\"}"
+                            ]}}]
+                        }}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// A group is never split across two requests. Splitting it would leave one request deleting
+    /// the very members the other request's clause was protecting — the write's own chunks —
+    /// so the budget is spent in whole groups even when that overshoots it.
+    #[tokio::test]
+    async fn a_group_is_never_split_across_two_requests() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        // Two groups whose members do not fit one request together, and a third that starts a
+        // second request; `big` alone is over the budget, so it is issued on its own.
+        let mut rows: Vec<(Option<&str>, u64)> = Vec::new();
+        for chunk in 0..(DELETE_CHUNK_ROWS as u64 + 10) {
+            rows.push((Some("big"), chunk));
+        }
+        rows.push((Some("small"), 0));
+        rows.push((Some("small"), 1));
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&rows),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        let queries = client.queries();
+        assert_eq!(queries.len(), 2, "the two groups do not fit one request");
+        assert_eq!(
+            protected_ids(&queries[0])
+                .into_iter()
+                .map(|ids| ids.len())
+                .collect::<Vec<_>>(),
+            vec![DELETE_CHUNK_ROWS + 10],
+            "an oversized group is issued whole rather than split"
+        );
+        assert_eq!(
+            protected_ids(&queries[1])
+                .into_iter()
+                .map(|ids| ids.len())
+                .collect::<Vec<_>>(),
+            vec![2],
+        );
+    }
+
+    /// A NULL group-column value can be expressed by no `term`, so the group it belongs to is
+    /// left alone entirely rather than addressed by a filter that would match every document.
+    #[tokio::test]
+    async fn a_null_group_key_prunes_nothing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(None, 0)]),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert!(
+            client.queries().is_empty(),
+            "a group with no expressible key must not be addressed at all"
+        );
+    }
+
+    /// An empty member batch names no group, so it must not reach the index — not even for the
+    /// mapping read, whose failure would report a prune of nothing as failed.
+    #[tokio::test]
+    async fn an_empty_member_batch_issues_no_request() {
+        let client = RecordingClient::default();
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[]),
+        )
+        .await
+        .expect("an empty prune should succeed without reaching the index");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// A member whose `_id` the write path would not have derived leaves that member unnamed in
+    /// `must_not` — so the group is left alone entirely rather than pruned against a survivor
+    /// list that is missing one of its own documents.
+    #[tokio::test]
+    async fn a_group_with_an_underivable_member_id_is_left_alone() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        // The chunk id is NULL, so `_id` derivation yields nothing for that member while the
+        // group's own key stays perfectly expressible.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, true),
+        ]));
+        let members = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(UInt64Array::from(vec![Some(0), None, Some(0)])),
+            ],
+        )
+        .expect("member batch should build");
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &members,
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert_eq!(
+            protected_ids(&client.queries()[0]),
+            vec![vec!["{\"_spice.chunk_id\":0,\"id\":\"b\"}".to_string()]],
+            "only the group whose every member could be named is pruned"
+        );
+    }
+
+    /// The group columns are resolved the same way [`delete_by_keys`] resolves them, so a
+    /// `text`-mapped key column is filtered on its `keyword` multi-field rather than on the
+    /// analyzed tokens the column itself indexes (#13714).
+    #[tokio::test]
+    async fn a_text_mapped_group_column_is_filtered_on_its_keyword_sub_field() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("ORDER-1024"), 0)]),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.keyword": "ORDER-1024"}}]),
+        );
+    }
+
+    /// A group column with no exact-match field fails the prune before a request is issued, for
+    /// the same reason [`delete_by_keys`] refuses it: a filter that matches nothing would delete
+    /// nothing and report success.
+    #[tokio::test]
+    async fn a_group_column_with_no_exact_match_field_refuses_before_issuing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("text"))]);
+
+        let err = delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("ORDER-1024"), 0)]),
+        )
+        .await
+        .expect_err("a group column with no exact-match field must fail the prune");
+
+        assert!(
+            err.to_string().contains("'id'"),
+            "the error must name the group column, got: {err}"
+        );
+        assert!(client.queries().is_empty());
     }
 
     /// The reported bug (#13714) on the half `_id` addressing cannot reach: a chunked index's

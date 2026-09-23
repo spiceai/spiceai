@@ -40,7 +40,7 @@ use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
 use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -608,6 +608,28 @@ impl Index for ElasticsearchIndex {
     fn deletes_by_partial_key(&self) -> bool {
         true
     }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        delete::delete_group_remainder(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            group_columns,
+            &members,
+        )
+        .await
+    }
+
+    /// The same field-value addressing [`Index::deletes_by_partial_key`] reports, applied to the
+    /// rest of a key group: a `_delete_by_query` reaches every document sharing the group's key,
+    /// and `must_not` on the surviving `_id`s keeps the members.
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
+    }
 }
 
 impl ElasticsearchIndex {
@@ -866,6 +888,26 @@ impl Index for ElasticsearchTextIndex {
     /// Same `_delete_by_query` addressing as [`ElasticsearchIndex`].
     fn deletes_by_partial_key(&self) -> bool {
         true
+    }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        delete::delete_group_remainder(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            group_columns,
+            &members,
+        )
+        .await
+    }
+
+    /// Same group addressing as [`ElasticsearchIndex`].
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
     }
 }
 
@@ -1369,5 +1411,366 @@ mod write_maintenance_tests {
         compound
             .list_table_provider()
             .expect("list fallback plan should build over the augmented primary key + metadata");
+    }
+}
+
+#[cfg(test)]
+mod chunked_group_pruning_tests {
+    use super::*;
+
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
+
+    use arrow::array::{Int64Array, StringArray};
+    use elasticsearch::{
+        Elasticsearch as ElasticsearchTrait, Error as EsError, FieldMapping, IndexMapping,
+        MappingResponse, Mappings, Result as EsResult, SearchRequest, SearchResponse,
+    };
+    use llms::embeddings::EmbeddingInput;
+    use serde_json::{Value, json};
+
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex, DelimChunker};
+    use crate::metadata::MetadataColumn;
+
+    const DIMS: i32 = 3;
+
+    /// One unit vector per input, so the write path's embedding count matches its row count.
+    #[derive(Debug)]
+    struct OnesEmbed;
+
+    #[async_trait::async_trait]
+    impl Embed for OnesEmbed {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> llms::embeddings::Result<Arc<Vec<Vec<f32>>>> {
+            let n = match input {
+                EmbeddingInput::String(_) => 1,
+                EmbeddingInput::StringArray(v) => v.len(),
+                _ => 0,
+            };
+            Ok(Arc::new(vec![vec![1.0, 0.0, 0.0]; n]))
+        }
+        fn size(&self) -> i32 {
+            DIMS
+        }
+    }
+
+    /// An Elasticsearch stand-in that holds documents by `_id` and answers `_delete_by_query`
+    /// by evaluating the query against them.
+    ///
+    /// It is a model, not a cluster: it understands exactly the clause kinds this module emits
+    /// (`term`, `ids`, and `bool` with `filter` / `should` / `must_not` /
+    /// `minimum_should_match`), and a query naming anything else fails the test rather than
+    /// matching nothing. Modelling the boolean semantics — rather than asserting a literal
+    /// request body — is what makes the surviving document set, not the spelling of the query,
+    /// the thing under test.
+    #[derive(Debug, Default)]
+    struct StoreClient {
+        docs: StdMutex<Vec<(String, Value)>>,
+        queries: StdMutex<Vec<Value>>,
+    }
+
+    impl StoreClient {
+        /// The `_spice.chunk_id`s the store holds for source row `id`, ascending.
+        fn stored_chunk_ids(&self, id: i64) -> Vec<u64> {
+            let docs = self.docs.lock().expect("docs mutex should not be poisoned");
+            let mut chunk_ids: Vec<u64> = docs
+                .iter()
+                .filter(|(_, doc)| doc["id"].as_i64() == Some(id))
+                .filter_map(|(_, doc)| doc[CHUNKED_INDEX_CHUNK_KEY].as_u64())
+                .collect();
+            chunk_ids.sort_unstable();
+            chunk_ids
+        }
+
+        fn queries(&self) -> Vec<Value> {
+            self.queries
+                .lock()
+                .expect("queries mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    /// Does `doc` (stored under `_id`) satisfy `query`? `None` for a clause shape this model does
+    /// not implement, which the caller turns into a failed request.
+    fn matches(query: &Value, id: &str, doc: &Value) -> Option<bool> {
+        if let Some(values) = query.get("ids").and_then(|ids| ids.get("values")) {
+            let values = values.as_array()?;
+            return Some(values.iter().any(|v| v.as_str() == Some(id)));
+        }
+        if let Some(term) = query.get("term").and_then(Value::as_object) {
+            let (path, wanted) = term.iter().next()?;
+            // A `keyword` multi-field matches on its parent field's stored value.
+            let field = path.strip_suffix(".keyword").unwrap_or(path);
+            return Some(doc.get(field) == Some(wanted));
+        }
+        let b = query.get("bool")?.as_object()?;
+        let all = |key: &str| -> Option<bool> {
+            match b.get(key) {
+                None => Some(true),
+                Some(Value::Array(clauses)) => {
+                    let mut ok = true;
+                    for clause in clauses {
+                        ok &= matches(clause, id, doc)?;
+                    }
+                    Some(ok)
+                }
+                Some(one) => matches(one, id, doc),
+            }
+        };
+        let mut ok = all("filter")? && all("must")?;
+        if let Some(Value::Array(shoulds)) = b.get("should") {
+            let minimum = b
+                .get("minimum_should_match")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let mut hits = 0u64;
+            for clause in shoulds {
+                if matches(clause, id, doc)? {
+                    hits += 1;
+                }
+            }
+            ok &= hits >= minimum;
+        }
+        match b.get("must_not") {
+            None => {}
+            Some(Value::Array(clauses)) => {
+                for clause in clauses {
+                    ok &= !matches(clause, id, doc)?;
+                }
+            }
+            Some(one) => ok &= !matches(one, id, doc)?,
+        }
+        Some(ok)
+    }
+
+    fn unexpected(method: &str) -> EsError {
+        EsError::ElasticsearchError {
+            status: 500,
+            message: format!("unexpected call to {method}"),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ElasticsearchTrait for StoreClient {
+        async fn bulk_index(
+            &self,
+            _index: &str,
+            docs: &[(Option<String>, Value)],
+        ) -> EsResult<Value> {
+            let mut store = self.docs.lock().expect("docs mutex should not be poisoned");
+            let mut items = Vec::with_capacity(docs.len());
+            for (id, doc) in docs {
+                let id = id.clone().ok_or_else(|| EsError::ElasticsearchError {
+                    status: 400,
+                    message: "a chunked write must name every document's _id".to_string(),
+                })?;
+                match store.iter_mut().find(|(existing, _)| *existing == id) {
+                    Some(slot) => slot.1 = doc.clone(),
+                    None => store.push((id.clone(), doc.clone())),
+                }
+                items.push(json!({"index": {"_id": id, "status": 200}}));
+            }
+            Ok(json!({"errors": false, "items": items}))
+        }
+
+        async fn delete_by_query(&self, _index: &str, query: &Value) -> EsResult<Value> {
+            self.queries
+                .lock()
+                .expect("queries mutex should not be poisoned")
+                .push(query.clone());
+
+            let mut store = self.docs.lock().expect("docs mutex should not be poisoned");
+            let mut doomed = HashSet::new();
+            for (id, doc) in store.iter() {
+                let hit = matches(query, id, doc).ok_or_else(|| EsError::ElasticsearchError {
+                    status: 400,
+                    message: format!("query shape not modelled: {query}"),
+                })?;
+                if hit {
+                    doomed.insert(id.clone());
+                }
+            }
+            let deleted = doomed.len() as u64;
+            store.retain(|(id, _)| !doomed.contains(id));
+
+            Ok(json!({
+                "took": 1, "timed_out": false, "total": deleted, "deleted": deleted,
+                "batches": 1, "version_conflicts": 0, "noops": 0,
+                "retries": {"bulk": 0, "search": 0}, "throttled_millis": 0, "failures": [],
+            }))
+        }
+
+        async fn get_mapping(&self, index: &str) -> EsResult<MappingResponse> {
+            let keyword = FieldMapping {
+                field_type: Some("keyword".to_string()),
+                properties: None,
+                fields: None,
+                ignore_above: None,
+                index: None,
+                dims: None,
+                similarity: None,
+            };
+            Ok(MappingResponse::from([(
+                index.to_string(),
+                IndexMapping {
+                    mappings: Mappings {
+                        properties: HashMap::from([("id".to_string(), keyword)]),
+                    },
+                },
+            )]))
+        }
+
+        async fn search(&self, _index: &str, _body: &SearchRequest) -> EsResult<SearchResponse> {
+            Err(unexpected("search"))
+        }
+        async fn search_raw(&self, _index: &str, _body: &Value) -> EsResult<SearchResponse> {
+            Err(unexpected("search_raw"))
+        }
+        async fn open_point_in_time(&self, _index: &str, _keep_alive: &str) -> EsResult<String> {
+            Err(unexpected("open_point_in_time"))
+        }
+        async fn search_point_in_time(&self, _body: &Value) -> EsResult<SearchResponse> {
+            Err(unexpected("search_point_in_time"))
+        }
+        async fn close_point_in_time(&self, _pit_id: &str) -> EsResult<()> {
+            Err(unexpected("close_point_in_time"))
+        }
+        async fn index_exists(&self, _index: &str) -> EsResult<bool> {
+            Err(unexpected("index_exists"))
+        }
+        async fn create_index(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("create_index"))
+        }
+        async fn put_mapping(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("put_mapping"))
+        }
+        async fn get_index_refresh_interval(&self, _index: &str) -> EsResult<Option<String>> {
+            Err(unexpected("get_index_refresh_interval"))
+        }
+        async fn put_index_settings(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("put_index_settings"))
+        }
+        async fn refresh_index(&self, _index: &str) -> EsResult<Value> {
+            Err(unexpected("refresh_index"))
+        }
+        async fn force_merge(&self, _index: &str, _max_num_segments: u32) -> EsResult<Value> {
+            Err(unexpected("force_merge"))
+        }
+        async fn index_document(&self, _index: &str, _id: &str, _doc: &Value) -> EsResult<Value> {
+            Err(unexpected("index_document"))
+        }
+    }
+
+    /// An [`ElasticsearchIndex`] shaped as the inner index of a [`ChunkedSearchIndex`]: keyed by
+    /// the source row's `id` plus the chunk id, one document per chunk.
+    fn chunked_index(client: &Arc<StoreClient>) -> Arc<ElasticsearchIndex> {
+        let embedded_column = "content".to_string();
+        let primary_key =
+            ChunkedSearchIndex::augment_primary_key(vec![Field::new("id", DataType::Int64, false)]);
+        let offset_field = Field::new(
+            ChunkedSearchIndex::chunking_offset_col(&embedded_column),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+            false,
+        );
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(Arc::new(
+            offset_field.clone(),
+        ))]
+        .into();
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            offset_field,
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+            Field::new(
+                embedding_col(&embedded_column),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    DIMS,
+                ),
+                true,
+            ),
+        ]));
+
+        Arc::new(ElasticsearchIndex {
+            client: Arc::clone(client) as Arc<dyn Elasticsearch>,
+            es_index: "idx".to_string(),
+            embedded_column,
+            vector_field: embedding_col("content"),
+            text_fields: vec![],
+            primary_key,
+            compute_query: Arc::new(OnesEmbed),
+            dims: DIMS,
+            similarity: "cosine".to_string(),
+            source_schema,
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+        })
+    }
+
+    /// Source rows as the chunking layer receives them: the base key and the text to chunk.
+    fn content_rows(rows: &[(i64, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    /// Regression test for #13717 over a real [`ElasticsearchIndex`]: a row rewritten to text
+    /// that chunks into fewer pieces is upserted under chunk ids `0..n` and nothing above them,
+    /// so every higher chunk id the previous text produced stays in the index — the row keeps
+    /// answering searches for a word its current text does not contain.
+    #[tokio::test]
+    async fn a_shortened_row_drops_the_chunks_it_no_longer_produces() {
+        let client = Arc::new(StoreClient::default());
+        let idx = ChunkedSearchIndex::new(
+            chunked_index(&client) as Arc<dyn SearchIndex>,
+            Arc::new(DelimChunker { delim: ' ' }),
+        );
+
+        idx.write(content_rows(&[(1, "aaa bbb"), (2, "ddd eee")]))
+            .await
+            .expect("the first write lands");
+        assert_eq!(client.stored_chunk_ids(1), vec![0, 1]);
+        assert_eq!(client.stored_chunk_ids(2), vec![0, 1]);
+
+        idx.write(content_rows(&[(1, "ccc")]))
+            .await
+            .expect("the rewrite lands");
+
+        println!("PROBE queries issued = {:#}", json!(client.queries()));
+        println!(
+            "PROBE stored chunk ids for id=1 = {:?}",
+            client.stored_chunk_ids(1)
+        );
+        println!(
+            "PROBE stored chunk ids for id=2 = {:?}",
+            client.stored_chunk_ids(2)
+        );
+
+        assert_eq!(
+            client.stored_chunk_ids(1),
+            vec![0],
+            "the chunk 'bbb' produced goes with the text that produced it"
+        );
+        assert_eq!(
+            client.stored_chunk_ids(2),
+            vec![0, 1],
+            "a row the write did not touch keeps every chunk"
+        );
     }
 }
