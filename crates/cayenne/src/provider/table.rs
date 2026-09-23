@@ -2453,15 +2453,30 @@ pub struct CayenneTableProvider {
     /// wall-clock time escalates the (otherwise TRACE-level) skip to a
     /// one-shot WARN.
     position_compaction_skip_streak: Arc<ParkingMutex<ResourceStarvationTracker>>,
-    /// Serializes concurrent compaction passes on this table so a write-driven
-    /// inline trigger and the background scheduler can't both rewrite the
-    /// current snapshot at the same time. Held across the *entire* trigger
-    /// sequence — up to `compaction_max_levels` consecutive snapshot rewrites
-    /// per call to [`Self::maybe_compact_small_files`] — so that competing
-    /// triggers no-op via `try_lock` rather than chaining onto a backlog. The
-    /// per-table write lock continues to serialize ordinary inserts
-    /// independently.
-    compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Coordinates compaction passes on this table so a write-driven inline
+    /// trigger and the background scheduler can't both rewrite the same state.
+    ///
+    /// Every pass that repoints or re-reads the WHOLE protected set or the
+    /// current snapshot takes it exclusively (`write`/`try_write`): the
+    /// current-snapshot rewrite, the seq-prefix bake, the post-write manifest
+    /// rebuild, cold promotion, and the reopen drain barrier. Competing
+    /// exclusive triggers no-op via `try_write` rather than chaining onto a
+    /// backlog.
+    ///
+    /// The protected-snapshot subset merge on a key-delete table takes it
+    /// SHARED (`try_read`): it rewrites only the runs it selected and commits
+    /// them with a catalog CAS, so several can run at once as long as their
+    /// inputs are disjoint — which [`Self::protected_merge_claims`] enforces.
+    /// That is what keeps small runs leveling while one large-tier merge runs
+    /// for minutes (#14291). The per-table write lock continues to serialize
+    /// ordinary inserts independently.
+    compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Protected-snapshot runs currently being rewritten by an in-flight subset
+    /// merge. A merge excludes claimed runs from selection and registers its own
+    /// under this mutex in one check-and-insert, so concurrent merges (allowed by
+    /// the shared [`Self::compaction_lock`]) never select the same run. Released
+    /// by [`ProtectedMergeClaimGuard`]'s `Drop`, on every exit.
+    protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
     /// Coalesces write-driven compaction notifications so a high-ingest table
     /// does not spawn one background compaction task per append while a prior
     /// notification is still pending.
@@ -3783,6 +3798,167 @@ impl ProtectedMergeSelection {
             Self::Merge(inputs) => inputs,
             Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
         }
+    }
+}
+
+/// The protected-snapshot runs in-flight subset merges are rewriting.
+///
+/// Key-delete subset merges share the compaction lock, so this is what keeps
+/// them apart: a merge may start only on runs no other merge holds, and only at
+/// a strictly lower size tier than every running merge. The tier rule is what
+/// makes the concurrent lane a small-tier lane — a large merge never waits
+/// behind another large merge's rewrite of the same bytes, and small checkpoint
+/// runs keep leveling while a large merge runs (#14291). The catalog CAS in
+/// `swap_protected_snapshots` remains the correctness backstop; claims only
+/// ensure the CAS never has to reject a whole rewrite.
+#[derive(Debug, Default)]
+struct ProtectedMergeClaims {
+    next_claim_id: u64,
+    claims: Vec<ProtectedMergeClaim>,
+}
+
+#[derive(Debug)]
+struct ProtectedMergeClaim {
+    claim_id: u64,
+    snapshot_ids: Vec<String>,
+    tier: u32,
+    bytes: u64,
+}
+
+impl ProtectedMergeClaims {
+    /// Copy of the claimed state for a pass to plan against without holding the
+    /// mutex across its I/O.
+    fn view(&self) -> ProtectedMergeClaimsView {
+        ProtectedMergeClaimsView {
+            snapshot_ids: self
+                .claims
+                .iter()
+                .flat_map(|claim| claim.snapshot_ids.iter().cloned())
+                .collect(),
+            bytes: self
+                .claims
+                .iter()
+                .fold(0u64, |total, claim| total.saturating_add(claim.bytes)),
+            min_tier: self.claims.iter().map(|claim| claim.tier).min(),
+            merges: self.claims.len(),
+        }
+    }
+
+    /// Register a merge of `snapshot_ids` at `tier`, unless a run is already
+    /// claimed, is no longer live, or `tier` is not strictly below every running
+    /// merge's tier. Returns the new claim's id on success.
+    fn try_insert(
+        &mut self,
+        snapshot_ids: Vec<String>,
+        tier: u32,
+        bytes: u64,
+        is_live: impl Fn(&str) -> bool,
+    ) -> Option<u64> {
+        if snapshot_ids.len() < 2 {
+            return None;
+        }
+        if self.claims.iter().any(|claim| claim.tier <= tier) {
+            return None;
+        }
+        let overlaps = snapshot_ids.iter().any(|id| {
+            !is_live(id)
+                || self
+                    .claims
+                    .iter()
+                    .any(|claim| claim.snapshot_ids.contains(id))
+        });
+        if overlaps {
+            return None;
+        }
+        let claim_id = self.next_claim_id;
+        self.next_claim_id = self.next_claim_id.wrapping_add(1);
+        self.claims.push(ProtectedMergeClaim {
+            claim_id,
+            snapshot_ids,
+            tier,
+            bytes,
+        });
+        Some(claim_id)
+    }
+
+    fn remove(&mut self, claim_id: u64) {
+        self.claims.retain(|claim| claim.claim_id != claim_id);
+    }
+}
+
+/// Snapshot of [`ProtectedMergeClaims`] taken under the Phase 1 fence.
+#[derive(Debug)]
+struct ProtectedMergeClaimsView {
+    snapshot_ids: HashSet<String>,
+    bytes: u64,
+    min_tier: Option<u32>,
+    merges: usize,
+}
+
+impl ProtectedMergeClaimsView {
+    fn is_empty(&self) -> bool {
+        self.merges == 0
+    }
+
+    fn len(&self) -> usize {
+        self.merges
+    }
+
+    fn is_claimed(&self, snapshot_id: &str) -> bool {
+        self.snapshot_ids.contains(snapshot_id)
+    }
+
+    /// Whether a run of `tier` may be merged alongside the running merges.
+    fn admits_tier(&self, tier: u32) -> bool {
+        self.min_tier.is_none_or(|running| tier < running)
+    }
+
+    /// The pass budget left after the running merges' inputs. `None` (no
+    /// finite pool) stays unbounded.
+    fn remaining_budget(&self, max_pass_bytes: Option<u64>) -> Option<u64> {
+        max_pass_bytes.map(|budget| budget.saturating_sub(self.bytes))
+    }
+
+    /// A decline while another merge runs is reported as `declined_lock_busy`:
+    /// before merges could run concurrently the pass stopped at the lock with
+    /// that outcome, so the series keeps meaning "another pass is in the way".
+    fn decline_outcome(&self, otherwise: CompactionOutcome) -> CompactionOutcome {
+        if self.is_empty() {
+            otherwise
+        } else {
+            CompactionOutcome::DeclinedLockBusy
+        }
+    }
+}
+
+/// Releases a [`ProtectedMergeClaims`] entry when the merge that holds it ends,
+/// on every exit: commit, decline, error, CAS abort, or task cancellation.
+struct ProtectedMergeClaimGuard {
+    claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
+    claim_id: u64,
+}
+
+impl ProtectedMergeClaimGuard {
+    fn try_claim(
+        claims: &Arc<ParkingMutex<ProtectedMergeClaims>>,
+        snapshot_ids: Vec<String>,
+        tier: u32,
+        bytes: u64,
+        is_live: impl Fn(&str) -> bool,
+    ) -> Option<Self> {
+        let claim_id = claims
+            .lock()
+            .try_insert(snapshot_ids, tier, bytes, is_live)?;
+        Some(Self {
+            claims: Arc::clone(claims),
+            claim_id,
+        })
+    }
+}
+
+impl Drop for ProtectedMergeClaimGuard {
+    fn drop(&mut self) {
+        self.claims.lock().remove(self.claim_id);
     }
 }
 
@@ -8691,7 +8867,8 @@ impl CayenneTableProvider {
             )),
             current_dir_generation: Arc::new(AtomicU64::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
-            compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            compaction_lock: Arc::new(tokio::sync::RwLock::new(())),
+            protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
             orphan_dv_sweep_state: Arc::new(AtomicU8::new(ORPHAN_DV_SWEEP_IDLE)),
             footprint_sample_gate: Arc::new(SampleGate::default()),
@@ -10665,6 +10842,7 @@ impl CayenneTableProvider {
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
+            protected_merge_claims: Arc::clone(&self.protected_merge_claims),
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
@@ -17706,7 +17884,7 @@ impl CayenneTableProvider {
     ///
     /// Best-effort by design: errors are returned to the caller for logging,
     /// but never bubble up to fail the originating write or query. The
-    /// per-table `compaction_lock` is acquired with `try_lock` — if another
+    /// per-table `compaction_lock` is acquired exclusively with `try_write` — if another
     /// pass is already in flight (inline or background), we skip this trigger
     /// rather than queueing more work.
     ///
@@ -17726,7 +17904,7 @@ impl CayenneTableProvider {
         // maintenance/compaction holds it, so an explicit pass runs
         // deterministically instead of racing the background tasks that share
         // this lock.
-        let _guard = self.compaction_lock.lock().await;
+        let _guard = self.compaction_lock.write().await;
 
         let max_passes = self.context.compaction_max_levels();
         let mut total_passes = 0_usize;
@@ -17828,7 +18006,7 @@ impl CayenneTableProvider {
             (None, None)
         };
 
-        let Ok(_guard) = self.compaction_lock.try_lock() else {
+        let Ok(_guard) = self.compaction_lock.try_write() else {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
@@ -18636,7 +18814,7 @@ impl CayenneTableProvider {
         // Final barrier: serialize behind any compaction pass that grabbed the
         // lock without one of the flags above; once held, nothing is mid-flight.
         // Released immediately — the caller is about to drop/replace this instance.
-        drop(self.compaction_lock.lock().await);
+        drop(self.compaction_lock.write().await);
         Ok(())
     }
 
@@ -19591,7 +19769,7 @@ impl CayenneTableProvider {
         // The append path itself never clears tombstones, so deferring the
         // manifest off the publish fence cannot resurrect or vanish a row.
         if state.refresh_listing || had_stats || retention_deleted > 0 {
-            if let Ok(_compaction_guard) = self.compaction_lock.try_lock() {
+            if let Ok(_compaction_guard) = self.compaction_lock.try_write() {
                 self.rebuild_live_snapshot_manifests().await;
             } else {
                 tracing::trace!(
@@ -22405,9 +22583,9 @@ impl CayenneTableProvider {
         //
         // Lock order matches compaction: `compaction_lock` before `write_lock`.
         // A position-delete compaction path may briefly try `write_lock` first, but
-        // it uses `try_lock` on `compaction_lock`; if promotion owns the compaction
+        // it uses `try_write` on `compaction_lock`; if promotion owns the compaction
         // lock it skips and drops `write_lock`, so no cycle can form.
-        let _compaction_guard = self.compaction_lock.lock().await;
+        let _compaction_guard = self.compaction_lock.write().await;
 
         // Trigger: warm tier large/numerous enough to graduate.
         let current_snapshot_id = self.get_current_snapshot_id();
@@ -22958,7 +23136,22 @@ impl CayenneTableProvider {
             None
         };
 
-        let Ok(_guard) = self.compaction_lock.try_lock() else {
+        // Key-delete merges share the compaction lock, so a small-tier merge can
+        // level fresh checkpoints while a large-tier merge runs for minutes
+        // (#14291); `protected_merge_claims` keeps their inputs disjoint.
+        // Position-delete merges already serialize with writers above and take
+        // it exclusively, as does every pass that repoints the whole protected
+        // set (current-snapshot rewrite, bake, promotion, manifest rebuild).
+        let compaction_guards = if serialize_position_deletes {
+            self.compaction_lock
+                .try_write()
+                .map(|guard| (Some(guard), None))
+        } else {
+            self.compaction_lock
+                .try_read()
+                .map(|guard| (None, Some(guard)))
+        };
+        let Ok(_compaction_guards) = compaction_guards else {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::ProtectedSubset,
@@ -22984,15 +23177,38 @@ impl CayenneTableProvider {
         // pass re-inserting the merged snapshot into the emptied map — that
         // would resurrect the whole pre-overwrite warm row set next to its
         // cold/new copies.
-        let (candidates, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture) = {
+        //
+        // Runs another in-flight merge has claimed are invisible to this pass.
+        // The view is only a pre-filter: admission re-checks it atomically once
+        // the inputs are chosen.
+        let (candidates, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture, in_flight) = {
             let _fence = self.listing_fence.read().await;
             let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
+            let in_flight = self.protected_merge_claims.lock().view();
             if protected.len() < 2 {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::ProtectedSubset,
-                    CompactionOutcome::DeclinedNoCandidates,
+                    in_flight.decline_outcome(CompactionOutcome::DeclinedNoCandidates),
+                );
+                return Ok(false);
+            }
+            let unclaimed = protected
+                .keys()
+                .filter(|id| !in_flight.is_claimed(id))
+                .count();
+            if unclaimed < 2 {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::ProtectedSubset,
+                    CompactionOutcome::DeclinedLockBusy,
+                );
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    claimed = protected.len() - unclaimed,
+                    "Skipping protected-snapshot subset compaction: the remaining runs are being merged by another pass",
                 );
                 return Ok(false);
             }
@@ -23030,6 +23246,7 @@ impl CayenneTableProvider {
             // snapshots.
             let mut ids: Vec<String> = protected
                 .iter()
+                .filter(|&(id, _)| !in_flight.is_claimed(id))
                 .filter(|&(_, &threshold)| {
                     pending_floor.is_none() || threshold <= fence_max_delete_seq
                 })
@@ -23039,13 +23256,13 @@ impl CayenneTableProvider {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::ProtectedSubset,
-                    CompactionOutcome::DeclinedAboveDeleteFence,
+                    in_flight.decline_outcome(CompactionOutcome::DeclinedAboveDeleteFence),
                 );
                 tracing::trace!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     fence_max_delete_seq,
-                    above_fence = protected.len() - ids.len(),
+                    above_fence = unclaimed - ids.len(),
                     "Skipping protected-snapshot subset compaction: fewer than two inputs at or below the delete fence",
                 );
                 return Ok(false);
@@ -23066,6 +23283,7 @@ impl CayenneTableProvider {
                 fence_max_delete_seq,
                 deletion_snapshot,
                 snapshot_at_capture,
+                in_flight,
             )
         };
         let phase1_fence_ms = compaction_start.elapsed().as_millis();
@@ -23107,6 +23325,23 @@ impl CayenneTableProvider {
         }
         let sizing_ms = sizing_start.elapsed().as_millis();
 
+        // While another merge is in flight, this pass may only level runs in a
+        // strictly lower tier than every running merge, and only with the budget
+        // those merges have not already taken. The first keeps the concurrent
+        // lane a short small-tier lane (never two large merges at once, never a
+        // merge into the tier a running merge is producing); the second keeps
+        // the merges together inside the single-pass memory bound.
+        if !in_flight.is_empty() {
+            sized_candidates.retain(|(_, _, bytes)| {
+                in_flight.admits_tier(protected_snapshot_size_tier(
+                    *bytes,
+                    PROTECTED_TIER_BASE_BYTES,
+                    PROTECTED_TIER_GROWTH,
+                ))
+            });
+        }
+        let selection_budget_bytes = in_flight.remaining_budget(max_pass_bytes);
+
         // --- Size-tier selection (replaces the single-threshold PoC skip). ---
         // Consolidate only the lowest size tier that has accumulated at least
         // `min_runs` same-size runs, capped at `PROTECTED_MERGE_MAX_WIDTH`. This
@@ -23124,7 +23359,7 @@ impl CayenneTableProvider {
             PROTECTED_MERGE_MAX_WIDTH,
             PROTECTED_TIER_BASE_BYTES,
             PROTECTED_TIER_GROWTH,
-            max_pass_bytes,
+            selection_budget_bytes,
         );
 
         if let ProtectedMergeSelection::OverPassBudget {
@@ -23146,14 +23381,14 @@ impl CayenneTableProvider {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedOverPassBudget,
+                in_flight.decline_outcome(CompactionOutcome::DeclinedOverPassBudget),
             );
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 tier_runs,
                 oldest_pair_bytes,
-                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
                 "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
                  runs exceed the pass memory budget"
             );
@@ -23165,7 +23400,7 @@ impl CayenneTableProvider {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::ProtectedSubset,
-                CompactionOutcome::DeclinedNoQualifyingTier,
+                in_flight.decline_outcome(CompactionOutcome::DeclinedNoQualifyingTier),
             );
             tracing::debug!(
                 target: "cayenne::compaction",
@@ -23173,7 +23408,7 @@ impl CayenneTableProvider {
                 candidates = sized_candidates.len(),
                 min_runs,
                 tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+                max_pass_bytes = selection_budget_bytes.unwrap_or(u64::MAX),
                 "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
             );
             return Ok(false);
@@ -23204,11 +23439,41 @@ impl CayenneTableProvider {
             PROTECTED_TIER_GROWTH,
         );
 
+        // Admission: claim the inputs in one check-and-insert, so a merge that
+        // chose the same runs (or a larger tier) since the Phase 1 view loses
+        // here instead of rewriting them for a CAS that would reject it. Held to
+        // the end of the pass — past the in-memory publish — so no other merge
+        // can select these runs while they are still in the protected map.
+        let input_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
+        let live = self.protected_snapshots.load();
+        let Some(_claim) = ProtectedMergeClaimGuard::try_claim(
+            &self.protected_merge_claims,
+            input_ids,
+            selected_tier,
+            total_input_bytes,
+            |id| live.contains_key(id),
+        ) else {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::ProtectedSubset,
+                CompactionOutcome::DeclinedLockBusy,
+            );
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                selected_tier,
+                "Skipping protected-snapshot subset compaction: another pass claimed these runs or a larger tier first",
+            );
+            return Ok(false);
+        };
+        drop(live);
+
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = inputs.len(),
             candidate_count = sized_candidates.len(),
+            concurrent_merges = in_flight.len(),
             selected_tier,
             min_runs,
             fence_max_delete_seq,
@@ -23801,7 +24066,7 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        let Ok(_guard) = self.compaction_lock.try_lock() else {
+        let Ok(_guard) = self.compaction_lock.try_write() else {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::Bake,
@@ -39237,7 +39502,7 @@ mod tests {
         // already consolidated has nothing left for the assertions below to
         // decline or merge.
         {
-            let setup_guard = finite.compaction_lock.lock().await;
+            let setup_guard = finite.compaction_lock.write().await;
             for i in 0..ROWS {
                 insert_batch(
                     &finite,
@@ -39313,7 +39578,7 @@ mod tests {
         )
         .await;
         {
-            let setup_guard = unbounded.compaction_lock.lock().await;
+            let setup_guard = unbounded.compaction_lock.write().await;
             for i in 0..ROWS {
                 insert_batch(
                     &unbounded,
@@ -39412,7 +39677,7 @@ mod tests {
             .await
             .expect("table created");
 
-        let compaction_setup_guard = provider.compaction_lock.lock().await;
+        let compaction_setup_guard = provider.compaction_lock.write().await;
 
         // Each insert into an upsert table publishes a new protected snapshot.
         // Create more than the trigger floor of small (tier-0) snapshots.
@@ -39737,7 +40002,7 @@ mod tests {
         // Hold the compaction lock across setup so write-driven maintenance
         // lanes skip instead of merging the snapshots the test needs (see
         // `build_seq_prefix_fixture` for the full rationale).
-        let compaction_setup_guard = provider.compaction_lock.lock().await;
+        let compaction_setup_guard = provider.compaction_lock.write().await;
         let n = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
         for i in 0..n {
             insert_batch(
@@ -39809,6 +40074,303 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "subset_mid_pass_overwrite").await,
             Vec::<(i64, i64)>::new(),
             "no pre-overwrite rows may survive the mid-pass overwrite"
+        );
+    }
+
+    /// Regression test for #14291: while a large-tier protected-snapshot merge
+    /// is in flight, fresh small runs must still level. The large merge is
+    /// parked between its catalog CAS and its in-memory publish — the lock and
+    /// its claim are held there, as they are throughout its rewrite — and the
+    /// small runs written meanwhile (an upsert of a key the large merge is
+    /// rewriting, plus a new key) must merge before it publishes, without either
+    /// merge losing or resurrecting a row.
+    #[tokio::test]
+    async fn small_tier_merge_runs_while_large_tier_merge_is_in_flight() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // ~4 KiB rows over a 64-symbol alphabet (~3 KiB each on disk); 3,600 per
+        // run puts each large run above the 8 MiB tier-0 ceiling ON DISK
+        // (asserted below, not assumed).
+        const LARGE_RUN_ROWS: i64 = 3_600;
+        const PAYLOAD_BYTES: usize = 4096;
+        const NEW_KEY: i64 = 1_000_000;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "small_tier_under_large_merge",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_trigger_protected_snapshots: 2,
+                compaction_background_interval_ms: 3_600_000,
+                // Key mode: the mode whose merges share the compaction lock.
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        let payload_batch = |ids: Vec<i64>, payload: &dyn Fn(i64) -> String| {
+            let payloads: Vec<String> = ids.iter().map(|id| payload(*id)).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(payloads)),
+                ],
+            )
+            .expect("payload batch")
+        };
+        let original = |id: i64| format!("{id:08}_{}", entropy_payload(id, PAYLOAD_BYTES));
+
+        // Hold the lock across setup so write-driven maintenance cannot merge the
+        // two large runs before the test does.
+        let setup_guard = provider.compaction_lock.write().await;
+        for run in 0..2 {
+            let start = run * LARGE_RUN_ROWS;
+            insert_batch(
+                &provider,
+                payload_batch((start..start + LARGE_RUN_ROWS).collect(), &original),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+        let large_runs: Vec<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(large_runs.len(), 2, "fixture must produce two large runs");
+        for run in &large_runs {
+            let bytes: u64 = provider
+                .list_snapshot_files_with_sizes(run)
+                .await
+                .expect("size large run")
+                .iter()
+                .map(|(_, size)| *size)
+                .sum();
+            assert!(
+                protected_snapshot_size_tier(
+                    bytes,
+                    PROTECTED_TIER_BASE_BYTES,
+                    PROTECTED_TIER_GROWTH
+                ) >= 1,
+                "large run {run} is {bytes} bytes on disk, still tier 0 — the fixture \
+                 would not exercise a small merge under a larger one"
+            );
+        }
+        drop(setup_guard);
+
+        // Runs while the large merge is parked after its CAS, holding the
+        // compaction lock and its claim.
+        let small_runs = Arc::new(ParkingMutex::new(Vec::<String>::new()));
+        let small_merged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let small_runs = Arc::clone(&small_runs);
+            let small_merged = Arc::clone(&small_merged);
+            let large_runs = large_runs.clone();
+            let schema = Arc::clone(&schema);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let batch = |id: i64, payload: &str| {
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(Int64Array::from(vec![id])),
+                                Arc::new(StringArray::from(vec![payload.to_string()])),
+                            ],
+                        )
+                        .expect("small batch")
+                    };
+                    // Upsert a key the large merge is rewriting, then add a key.
+                    insert_batch(&provider_in_hook, batch(0, "updated")).await;
+                    insert_batch(&provider_in_hook, batch(NEW_KEY, "new")).await;
+                    let fresh: Vec<String> = provider_in_hook
+                        .protected_snapshots
+                        .load_full()
+                        .keys()
+                        .filter(|id| !large_runs.contains(id))
+                        .cloned()
+                        .collect();
+                    // A write-driven pass may already have merged them; either
+                    // way they must not wait for the large merge.
+                    if fresh.len() >= 2 {
+                        let merged = provider_in_hook
+                            .compact_protected_snapshots_subset(usize::MAX)
+                            .await
+                            .expect("small-tier merge must not error");
+                        assert!(
+                            merged,
+                            "the small-tier merge must run while the large merge is in \
+                             flight (#14291), not decline on the compaction lock"
+                        );
+                    }
+                    let protected = provider_in_hook.protected_snapshots.load_full();
+                    assert!(
+                        large_runs.iter().all(|run| protected.contains_key(run)),
+                        "the large merge's inputs stay published until it publishes"
+                    );
+                    *small_runs.lock() = fresh;
+                    small_merged.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let merged_large = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("large-tier merge must not error");
+        assert!(
+            small_merged.load(Ordering::SeqCst),
+            "the large merge must reach the post-CAS window (hook consumed)"
+        );
+        assert!(merged_large, "the two large runs must merge");
+
+        let protected = provider.protected_snapshots.load_full();
+        let small_runs = small_runs.lock().clone();
+        assert!(
+            !small_runs.is_empty(),
+            "the hook must have written small runs"
+        );
+        assert!(
+            small_runs
+                .iter()
+                .chain(large_runs.iter())
+                .all(|run| !protected.contains_key(run)),
+            "both merges' inputs must be gone from the protected set: {protected:?}"
+        );
+        assert_eq!(
+            protected.len(),
+            2,
+            "one output per merge must remain: {protected:?}"
+        );
+        assert!(
+            provider.protected_merge_claims.lock().claims.is_empty(),
+            "both merges must release their claims"
+        );
+
+        // Correctness: every key once, the upsert's value wins, the new key is
+        // present.
+        ctx.register_table(
+            "small_tier_under_large_merge",
+            Arc::new(provider.clone_for_write()),
+        )
+        .expect("table registered");
+        let batches = ctx
+            .sql(
+                "SELECT COUNT(*), COUNT(DISTINCT id), \
+                 MAX(CASE WHEN id = 0 THEN payload END), \
+                 MAX(CASE WHEN id = 1000000 THEN payload END) \
+                 FROM small_tier_under_large_merge",
+            )
+            .await
+            .expect("query planned")
+            .collect()
+            .await
+            .expect("query ran");
+        let row = &batches[0];
+        let count = |col: usize| {
+            row.column(col)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0)
+        };
+        let text = |col: usize| {
+            ScalarValue::try_from_array(row.column(col).as_ref(), 0)
+                .expect("payload scalar")
+                .to_string()
+        };
+        assert_eq!(count(0), 2 * LARGE_RUN_ROWS + 1, "row count");
+        assert_eq!(count(1), 2 * LARGE_RUN_ROWS + 1, "no key may appear twice");
+        assert_eq!(text(2), "updated", "the concurrent upsert must win");
+        assert_eq!(text(3), "new", "the key written mid-merge must be visible");
+    }
+
+    #[test]
+    fn protected_merge_claims_keep_concurrent_merges_disjoint() {
+        let ids = |names: &[&str]| names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>();
+        let live = |_: &str| true;
+        let mut claims = ProtectedMergeClaims::default();
+
+        let large = claims
+            .try_insert(ids(&["a", "b"]), 2, 400, live)
+            .expect("first merge claims its runs");
+        assert!(
+            claims.try_insert(ids(&["b", "c"]), 0, 1, live).is_none(),
+            "a run another merge holds cannot be claimed"
+        );
+        assert!(
+            claims.try_insert(ids(&["c", "d"]), 2, 1, live).is_none(),
+            "a second merge at the running merge's tier is refused"
+        );
+        assert!(
+            claims.try_insert(ids(&["c", "d"]), 3, 1, live).is_none(),
+            "a larger-tier merge is refused while a merge runs"
+        );
+        assert!(
+            claims
+                .try_insert(ids(&["c", "d"]), 0, 1, |id| id != "d")
+                .is_none(),
+            "a run already merged away (no longer live) cannot be claimed"
+        );
+        let small = claims
+            .try_insert(ids(&["c", "d"]), 0, 8, live)
+            .expect("disjoint lower-tier merge is admitted");
+
+        let view = claims.view();
+        assert_eq!(view.len(), 2);
+        assert!(view.is_claimed("a") && view.is_claimed("d") && !view.is_claimed("e"));
+        assert!(!view.admits_tier(0), "below the lowest running tier only");
+        assert_eq!(view.remaining_budget(Some(1_000)), Some(592));
+        assert_eq!(view.remaining_budget(Some(100)), Some(0));
+        assert_eq!(view.remaining_budget(None), None);
+        assert_eq!(
+            view.decline_outcome(CompactionOutcome::DeclinedNoQualifyingTier),
+            CompactionOutcome::DeclinedLockBusy
+        );
+
+        claims.remove(large);
+        claims.remove(small);
+        let view = claims.view();
+        assert!(view.is_empty() && view.admits_tier(u32::MAX));
+        assert_eq!(
+            view.decline_outcome(CompactionOutcome::DeclinedNoQualifyingTier),
+            CompactionOutcome::DeclinedNoQualifyingTier
+        );
+    }
+
+    #[test]
+    fn protected_merge_claim_guard_releases_on_drop() {
+        let claims = Arc::new(ParkingMutex::new(ProtectedMergeClaims::default()));
+        let runs = vec!["a".to_string(), "b".to_string()];
+        let guard = ProtectedMergeClaimGuard::try_claim(&claims, runs.clone(), 1, 10, |_| true)
+            .expect("claim");
+        assert!(
+            ProtectedMergeClaimGuard::try_claim(&claims, runs.clone(), 0, 10, |_| true).is_none(),
+            "held runs cannot be claimed again"
+        );
+        drop(guard);
+        assert!(claims.lock().claims.is_empty(), "drop releases the claim");
+        assert!(
+            ProtectedMergeClaimGuard::try_claim(&claims, runs, 1, 10, |_| true).is_some(),
+            "released runs can be claimed by a later merge"
         );
     }
 
@@ -39888,7 +40450,7 @@ mod tests {
             .await
             .expect("table created");
 
-        let compaction_setup_guard = provider.compaction_lock.lock().await;
+        let compaction_setup_guard = provider.compaction_lock.write().await;
 
         let snapshots = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
         let mut expected_rows: usize = 0;
@@ -40146,7 +40708,7 @@ mod tests {
             "fixture must resolve to position mode or this test pins nothing"
         );
 
-        let compaction_setup_guard = provider.compaction_lock.lock().await;
+        let compaction_setup_guard = provider.compaction_lock.write().await;
         let snapshots = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
         let mut expected_rows: usize = 0;
         for snapshot in 0..snapshots {
@@ -49865,7 +50427,7 @@ mod tests {
         // drains the loop so it exits rather than firing after we release. (The
         // write path never takes this lock, so holding it across the inserts is
         // safe.)
-        let compaction_guard = provider.compaction_lock.lock().await;
+        let compaction_guard = provider.compaction_lock.write().await;
 
         // Each distinct-key insert publishes its own file-backed protected
         // snapshot (inline disabled in the fixture).
@@ -50162,7 +50724,7 @@ mod tests {
         // kept snapshots (newest 3, incl. the SURVIVOR) strictly above `D`, so the
         // SURVIVOR is referenced in place and the OLD-100 snapshot is baked.
         {
-            let _guard = provider.compaction_lock.lock().await;
+            let _guard = provider.compaction_lock.write().await;
             provider.rebuild_live_snapshot_manifests().await;
         }
         let mut ids: Vec<String> = provider
@@ -50204,7 +50766,7 @@ mod tests {
         }
 
         // Best-effort bake, driven the way the production maintenance tick drives
-        // it: `bake_seq_prefix_protected_snapshots` `try_lock`s `compaction_lock` and
+        // it: `bake_seq_prefix_protected_snapshots` `try_write`s `compaction_lock` and
         // returns `Ok(false)` when it loses (a straggler pass still releasing after
         // the drain), which the tick simply retries next time. Mirror that with a
         // bounded retry — yielding (not sleeping) so any lock holder makes progress —
@@ -50425,7 +50987,7 @@ mod tests {
             .await;
         }
         {
-            let _guard = provider.compaction_lock.lock().await;
+            let _guard = provider.compaction_lock.write().await;
             provider.rebuild_live_snapshot_manifests().await;
         }
         let before = provider.protected_snapshots.load_full().len();
@@ -50657,7 +51219,7 @@ mod tests {
         // Hold the compaction lock across setup so the debounced post-write pass
         // cannot merge the snapshots this test arranges (same rationale as
         // `build_seq_prefix_fixture`).
-        let setup_guard = provider.compaction_lock.lock().await;
+        let setup_guard = provider.compaction_lock.write().await;
         // Three upserts of ONE key: each publishes its own protected snapshot,
         // and the second/third durably record a supersede key-delete for the
         // prior version — the hot-key shape of a CDC write-back counter.
@@ -50764,7 +51326,7 @@ mod tests {
         // the oldest snapshot, key 1 superseded once so its LIVE version sits in
         // the prefix's newest snapshot, then K filler snapshots on key 2 so the
         // key-1 snapshots all land in the bake prefix.
-        let setup_guard = provider.compaction_lock.lock().await;
+        let setup_guard = provider.compaction_lock.write().await;
         insert_batch(
             &provider,
             id_value_batch(Arc::clone(&schema), &[10], &[111]),
@@ -51341,7 +51903,7 @@ mod tests {
         // Run the production manifest rebuild (under the compaction lock the real
         // post-write maintenance lane holds).
         {
-            let _guard = provider.compaction_lock.lock().await;
+            let _guard = provider.compaction_lock.write().await;
             provider.rebuild_live_snapshot_manifests().await;
         }
 
