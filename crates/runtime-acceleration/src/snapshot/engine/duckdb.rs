@@ -22,7 +22,7 @@ use super::SnapshotEngine;
 #[derive(Debug, Snafu)]
 pub enum DuckDBSnapshotError {
     #[snafu(display(
-        "Failed to snapshot dataset '{dataset}' (duckdb): its acceleration file at {path:?} could not be opened to flush pending writes. Check the file is readable and not in use by another process. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
+        "Failed to snapshot dataset '{dataset}' (duckdb): its acceleration file at {path:?} could not be opened to flush pending writes: {source}. Check the file is readable and not in use by another process. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
     ))]
     CheckpointConnect {
         dataset: String,
@@ -30,7 +30,7 @@ pub enum DuckDBSnapshotError {
         source: duckdb::Error,
     },
     #[snafu(display(
-        "Failed to snapshot dataset '{dataset}' (duckdb): pending writes in {path:?} could not be flushed, and snapshotting without them would omit the most recent rows. Retry the snapshot; if it keeps failing, check for another process writing the file. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
+        "Failed to snapshot dataset '{dataset}' (duckdb): pending writes in {path:?} could not be flushed, and snapshotting without them would omit the most recent rows: {source}. Retry the snapshot; if it keeps failing, check for another process writing the file. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
     ))]
     Checkpoint {
         dataset: String,
@@ -151,6 +151,16 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
         live_path: &Path,
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
+        // `Connection::open` CREATES a database at a path that has none, so opening
+        // unconditionally would turn an absent accelerator file into a fresh empty one —
+        // which the `fs::copy` on the next line would then publish as this dataset's
+        // snapshot. There is nothing to flush in that case: leave the path alone and let
+        // the copy raise its own error for it. The caller holds the accelerator write
+        // lock, so nothing creates or removes the file underneath this check.
+        if !live_path.is_file() {
+            return Ok(());
+        }
+
         let live_path = live_path.to_path_buf();
         let dataset = dataset_name.to_string();
         tokio::task::spawn_blocking(move || {
@@ -320,6 +330,11 @@ mod tests {
         assert!(
             message.contains("spiceai.org/docs"),
             "the message must point at the docs: {message}"
+        );
+        assert!(
+            message.contains("not a valid DuckDB database file"),
+            "the message must carry what DuckDB said, so the reader can tell which failure \
+             this was: {message}"
         );
     }
 }

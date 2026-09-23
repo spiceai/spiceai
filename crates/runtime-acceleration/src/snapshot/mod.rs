@@ -5171,6 +5171,49 @@ mod tests {
         );
     }
 
+    /// An absent accelerator file must fail the snapshot, not become one. `DuckDB`'s
+    /// `Connection::open` creates a database at a path that has none, so a checkpoint hook
+    /// that opened unconditionally would materialize an empty database and the copy would
+    /// publish it as this dataset's snapshot — leaving `current_snapshot_id` pointing at
+    /// an empty database for the next restore to bootstrap from.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_absent_accelerator_file_fails_the_snapshot_rather_than_becoming_one() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("absent.db");
+        assert!(
+            !local_path.exists(),
+            "the accelerator file must be absent for this test to mean anything"
+        );
+
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let err = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect_err("an absent accelerator file must fail the snapshot");
+
+        assert!(
+            matches!(err, SnapshotUploadError::CopyLocal { .. }),
+            "the copy must be what fails, not a checkpoint of a database the hook made: {err}"
+        );
+        assert!(
+            !local_path.exists(),
+            "the hook must not bring the accelerator file into existence"
+        );
+    }
+
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn duckdb_download_snapshot_with_valid_metadata() {
