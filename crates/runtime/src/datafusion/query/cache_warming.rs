@@ -521,6 +521,7 @@ impl DataFusion {
         true
     }
 
+    #[cfg(test)]
     async fn run_warmup_templates(
         self: &Arc<Self>,
         templates: &[WarmupTemplate],
@@ -732,15 +733,20 @@ enum WarmupBound {
 }
 
 async fn bound_warmup_op<T>(
-    shutdown: &CancellationToken,
+    cancel: &CancellationToken,
     timeout: Duration,
     fut: impl Future<Output = T>,
 ) -> Result<T, WarmupBound> {
     tokio::select! {
         biased;
-        () = shutdown.cancelled() => Err(WarmupBound::Cancelled),
+        () = cancel.cancelled() => Err(WarmupBound::Cancelled),
         result = tokio::time::timeout(timeout, fut) => {
-            result.map_err(|_elapsed| WarmupBound::TimedOut)
+            result.map_err(|_elapsed| {
+                // Same token Query::run is armed with, so dropping the
+                // timed-out future also stops in-flight query work.
+                cancel.cancel();
+                WarmupBound::TimedOut
+            })
         }
     }
 }
@@ -786,6 +792,7 @@ async fn warm_distinct_key_rows(
     let query = QueryBuilder::new(distinct_sql, Arc::clone(df))
         .for_results_cache_warming()
         .results_cache_mode(ResultsCacheMode::Bypass)
+        .cancellation_token(cancel.clone())
         .build();
     let result = match bound_warmup_op(
         &cancel,
@@ -846,15 +853,17 @@ async fn execute_warmup_sql(
     parameters: Option<Vec<ScalarValue>>,
     request_context: &Arc<RequestContext>,
 ) -> Result<bool, WarmupBound> {
-    let mut builder = QueryBuilder::new(sql, Arc::clone(df)).for_results_cache_warming();
-    if let Some(values) = parameters {
-        builder = builder.parameters(Some(ParamValues::from(values)));
-    }
-    let query = builder.build();
     let timeout = request_context
         .query_timeout()
         .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
     let cancel = request_context.child_cancellation_token();
+    let mut builder = QueryBuilder::new(sql, Arc::clone(df))
+        .for_results_cache_warming()
+        .cancellation_token(cancel.clone());
+    if let Some(values) = parameters {
+        builder = builder.parameters(Some(ParamValues::from(values)));
+    }
+    let query = builder.build();
     let result = bound_warmup_op(
         &cancel,
         timeout,
@@ -1844,6 +1853,22 @@ mod tests {
         )
         .await;
         assert_eq!(result, Err(WarmupBound::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn bound_warmup_op_cancels_token_on_timeout() {
+        let cancel = CancellationToken::new();
+        let result = bound_warmup_op(
+            &cancel,
+            Duration::from_millis(20),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_eq!(result, Err(WarmupBound::TimedOut));
+        assert!(
+            cancel.is_cancelled(),
+            "timeout must cancel the replay token so Query::run stops"
+        );
     }
 
     #[tokio::test]
