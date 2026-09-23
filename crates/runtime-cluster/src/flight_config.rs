@@ -27,10 +27,14 @@ pub const KEEPALIVE_APP_METADATA: &[u8] = b"spice-keepalive";
 /// The sentinel alone cannot decide it. `app_metadata` is the writer's to set, so any message
 /// can wear it, and a receiver that skips on the sentinel alone discards whatever it was
 /// attached to while the write still reports success. Requiring the envelope to be empty is what
-/// makes the skip lossless: a message with no header declares nothing and a message with no body
-/// carries no bytes, so anything either half is populated is client data and has to reach the
-/// receiver's own decode or count path. A heartbeat has neither -- see [`keepalive`], which is
-/// what every sender builds one with.
+/// makes the skip lossless: a message with no header declares nothing, a message with no body
+/// carries no bytes, and a message with no descriptor names no stream, so a message populating
+/// any of the three is client data and has to reach the receiver's own decode or count path. A
+/// heartbeat has none of them -- see [`keepalive`], which is what every sender builds one with.
+///
+/// The envelope is *every* field `FlightData` carries besides the sentinel itself, checked one
+/// by one rather than by a shape that looks empty. That is the rule for the next field as much
+/// as for these ones, which is why the fields are destructured below.
 ///
 /// Asking instead what the header *declares* cannot give that guarantee, because such a
 /// predicate is open over the kinds it does not know: a schema message, a trailer, a `Tensor`
@@ -48,9 +52,21 @@ pub const KEEPALIVE_APP_METADATA: &[u8] = b"spice-keepalive";
 /// where the two receivers are reconciled.
 #[must_use]
 pub fn is_keepalive(message: &arrow_flight::FlightData) -> bool {
-    message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
-        && message.data_header.is_empty()
-        && message.data_body.is_empty()
+    // Destructured rather than read through `message.`: the doc above claims the envelope is
+    // every field, and this is what makes that claim fail to compile when an `arrow-flight`
+    // release adds one, instead of leaving the predicate quietly answering `true` for a message
+    // carrying it.
+    let arrow_flight::FlightData {
+        app_metadata,
+        data_header,
+        data_body,
+        flight_descriptor,
+    } = message;
+
+    app_metadata.as_ref() == KEEPALIVE_APP_METADATA
+        && data_header.is_empty()
+        && data_body.is_empty()
+        && flight_descriptor.is_none()
 }
 
 /// The keepalive a sender emits -- the one message [`is_keepalive`] recognises.

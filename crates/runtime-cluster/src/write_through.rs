@@ -1785,8 +1785,8 @@ mod tests {
     /// heartbeat.
     ///
     /// This is the sentinel-alone arm: the fixture carries a header as well as a body, so it
-    /// stays green under any predicate stricter than the sentinel by itself. The two tests
-    /// below are the ones that pin a clause each.
+    /// stays green under any predicate stricter than the sentinel by itself. The tests below
+    /// are the ones that pin a clause each.
     ///
     /// Skipping on the sentinel alone takes that body with it while the write still reports
     /// success -- the silent row loss this module refuses everywhere else, reintroduced one
@@ -1843,6 +1843,36 @@ mod tests {
             ..Default::default()
         })
         .await;
+    }
+
+    /// A sentinel-tagged message carrying a `flight_descriptor` names a stream; it is not a
+    /// heartbeat.
+    ///
+    /// This is the descriptor clause, and it is the half neither a header nor a body check can
+    /// reach: `flight_descriptor` is a fourth field, so a message can be empty in every other
+    /// respect and still be saying something. Untagged the same message is already refused as
+    /// carrying no record batch, and that half is run here rather than assumed -- without the
+    /// clause the sentinel buys it a silent skip and the write is acknowledged, which is the
+    /// exact trade this predicate exists to refuse.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_carrying_a_descriptor_is_refused_not_skipped() {
+        // The path is the shape the real sender attaches to its *first* message
+        // (catalog/schema/table); its contents are never read here, only its presence.
+        let tagged = FlightData {
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            flight_descriptor: Some(arrow_flight::FlightDescriptor::new_path(vec![
+                "test".to_string(),
+                "s".to_string(),
+                "events".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        let mut untagged = tagged.clone();
+        untagged.app_metadata = bytes::Bytes::new();
+        assert_refused(untagged).await;
+
+        assert_refused(tagged).await;
     }
 
     /// A first message whose header declares a schema but which carries a body is lost client
