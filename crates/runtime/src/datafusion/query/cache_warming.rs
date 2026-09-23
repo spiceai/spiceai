@@ -730,18 +730,20 @@ enum WarmupBound {
 }
 
 async fn bound_warmup_op<T>(
-    cancel: &CancellationToken,
+    shutdown: &CancellationToken,
+    query_cancel: &CancellationToken,
     timeout: Duration,
     fut: impl Future<Output = T>,
 ) -> Result<T, WarmupBound> {
     tokio::select! {
         biased;
-        () = cancel.cancelled() => Err(WarmupBound::Cancelled),
+        () = shutdown.cancelled() => Err(WarmupBound::Cancelled),
         result = tokio::time::timeout(timeout, fut) => {
             result.map_err(|_elapsed| {
-                // Same token Query::run is armed with, so dropping the
-                // timed-out future also stops in-flight query work.
-                cancel.cancel();
+                // Query::run is armed with this child; cancel it so
+                // in-flight replay work stops. Do not cancel `shutdown`:
+                // that would abort the rest of warmup (and the runtime).
+                query_cancel.cancel();
                 WarmupBound::TimedOut
             })
         }
@@ -792,14 +794,16 @@ async fn warm_distinct_key_rows(
     let timeout = request_context
         .query_timeout()
         .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
-    let cancel = request_context.child_cancellation_token();
+    let shutdown = request_context.cancellation_token();
+    let query_cancel = request_context.child_cancellation_token();
     let query = QueryBuilder::new(distinct_sql, Arc::clone(df))
         .for_results_cache_warming()
         .results_cache_mode(ResultsCacheMode::Bypass)
-        .cancellation_token(cancel.clone())
+        .cancellation_token(query_cancel.clone())
         .build();
     let result = match bound_warmup_op(
-        &cancel,
+        shutdown,
+        &query_cancel,
         timeout,
         Arc::clone(request_context).scope(async move { query.run().await }),
     )
@@ -814,12 +818,13 @@ async fn warm_distinct_key_rows(
     let max_size = cache_provider.max_size();
 
     loop {
-        let batch = match bound_warmup_op(&cancel, timeout, stream.try_next()).await? {
-            Ok(Some(batch)) => batch,
-            Ok(None) | Err(_) => break,
-        };
+        let batch =
+            match bound_warmup_op(shutdown, &query_cancel, timeout, stream.try_next()).await? {
+                Ok(Some(batch)) => batch,
+                Ok(None) | Err(_) => break,
+            };
         for row_idx in 0..batch.num_rows() {
-            if cancel.is_cancelled() {
+            if shutdown.is_cancelled() {
                 return Err(WarmupBound::Cancelled);
             }
             cache_provider.run_pending_tasks().await;
@@ -860,16 +865,18 @@ async fn execute_warmup_sql(
     let timeout = request_context
         .query_timeout()
         .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
-    let cancel = request_context.child_cancellation_token();
+    let shutdown = request_context.cancellation_token();
+    let query_cancel = request_context.child_cancellation_token();
     let mut builder = QueryBuilder::new(sql, Arc::clone(df))
         .for_results_cache_warming()
-        .cancellation_token(cancel.clone());
+        .cancellation_token(query_cancel.clone());
     if let Some(values) = parameters {
         builder = builder.parameters(Some(ParamValues::from(values)));
     }
     let query = builder.build();
     let result = bound_warmup_op(
-        &cancel,
+        shutdown,
+        &query_cancel,
         timeout,
         Arc::clone(request_context).scope(async move { query.run().await }),
     )
@@ -879,13 +886,15 @@ async fn execute_warmup_sql(
         // the stream is consumed; warmup does not need the rows itself, and
         // holding them here would scale RAM with the full result while
         // datasets stay not ready.
-        Ok(query_result) => match bound_warmup_op(&cancel, timeout, query_result.drain()).await? {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                tracing::debug!("SQL results cache warmup query failed: {e}");
-                Ok(false)
+        Ok(query_result) => {
+            match bound_warmup_op(shutdown, &query_cancel, timeout, query_result.drain()).await? {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    tracing::debug!("SQL results cache warmup query failed: {e}");
+                    Ok(false)
+                }
             }
-        },
+        }
         Err(e) => {
             tracing::debug!("SQL results cache warmup query failed: {e}");
             Ok(false)
@@ -1809,6 +1818,7 @@ mod tests {
                 run_warmup_releasing_ready(status, shutdown, async {
                     let bound = bound_warmup_op(
                         &CancellationToken::new(),
+                        &CancellationToken::new(),
                         Duration::from_millis(50),
                         std::future::pending::<()>(),
                     )
@@ -1822,18 +1832,16 @@ mod tests {
                 .await;
             }
         });
-        let task_done = tokio::time::timeout(Duration::from_secs(2), task)
+        tokio::time::timeout(Duration::from_secs(2), task)
             .await
-            .is_ok();
+            .expect("warmup task must finish after the bound fires")
+            .expect("warmup task must not panic");
+        let task_done = true;
         let warmup_hung = !task_done;
         let ready_released = status.is_ready();
         eprintln!(
             "warmup_hung={warmup_hung} ready_released={ready_released} task_done={task_done} elapsed_ms={}",
             start.elapsed().as_millis()
-        );
-        assert!(
-            task_done,
-            "a stalled replay must finish once the bound fires"
         );
         assert!(
             ready_released,
@@ -1924,9 +1932,11 @@ mod tests {
                 .await;
             }
         });
-        let task_done = tokio::time::timeout(Duration::from_secs(5), task)
+        tokio::time::timeout(Duration::from_secs(5), task)
             .await
-            .is_ok();
+            .expect("warmup task must finish after the bound fires")
+            .expect("warmup task must not panic");
+        let task_done = true;
         let warmup_hung = !task_done;
         let ready_released = status.is_ready();
         eprintln!(
@@ -1934,12 +1944,59 @@ mod tests {
             start.elapsed().as_millis()
         );
         assert!(
-            task_done,
-            "a stalled QueryBuilder replay must finish once the bound fires"
-        );
-        assert!(
             ready_released,
             "a stalled QueryBuilder replay must release the ready-hold"
+        );
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+    }
+
+    /// A timed-out first plan must not abort later plans.
+    #[tokio::test]
+    async fn timed_out_plan_does_not_skip_remaining_warmup_templates() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-timeout-continue-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        df.ctx
+            .register_table(
+                TableReference::bare("stuck"),
+                Arc::new(PendingScanTable {
+                    schema: Arc::clone(&schema),
+                }) as Arc<dyn TableProvider>,
+            )
+            .expect("register pending table");
+        register_table(&df, "orders", vec![1, 2, 3]);
+
+        let templates = [
+            WarmupTemplate {
+                sql: "SELECT id FROM stuck".to_string(),
+                bindings: Vec::new(),
+            },
+            WarmupTemplate {
+                sql: "SELECT id FROM orders".to_string(),
+                bindings: Vec::new(),
+            },
+        ];
+        df.run_warmup_templates_bounded(
+            &templates,
+            None,
+            CancellationToken::new(),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let hit = request_context()
+            .scope(run_sql(&df, "SELECT id FROM orders"))
+            .await;
+        assert_eq!(
+            hit,
+            CacheStatus::CacheHit,
+            "timing out the first plan must still warm the next plan"
         );
 
         let _ = std::fs::remove_file(&store);
@@ -1990,6 +2047,7 @@ mod tests {
         shutdown.cancel();
         let result = bound_warmup_op(
             &shutdown,
+            &CancellationToken::new(),
             Duration::from_secs(60),
             std::future::pending::<()>(),
         )
@@ -1999,17 +2057,58 @@ mod tests {
 
     #[tokio::test]
     async fn bound_warmup_op_cancels_token_on_timeout() {
-        let cancel = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let query_cancel = CancellationToken::new();
         let result = bound_warmup_op(
-            &cancel,
+            &shutdown,
+            &query_cancel,
             Duration::from_millis(20),
             std::future::pending::<()>(),
         )
         .await;
         assert_eq!(result, Err(WarmupBound::TimedOut));
         assert!(
-            cancel.is_cancelled(),
+            query_cancel.is_cancelled(),
             "timeout must cancel the replay token so Query::run stops"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a per-query timeout must not cancel runtime shutdown"
+        );
+    }
+
+    /// Query::lifetime_guards cancels the child token when `runtime.query.timeout`
+    /// fires. That must be TimedOut (skip this plan), not Cancelled (abort the rest).
+    #[tokio::test]
+    async fn query_lifetime_cancel_is_timeout_not_shutdown() {
+        let shutdown = CancellationToken::new();
+        let query_cancel = CancellationToken::new();
+        let query_cancel_timer = query_cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            query_cancel_timer.cancel();
+        });
+        let start = std::time::Instant::now();
+        let result = bound_warmup_op(
+            &shutdown,
+            &query_cancel,
+            Duration::from_millis(200),
+            std::future::pending::<()>(),
+        )
+        .await;
+        eprintln!(
+            "drain_result={result:?} elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
+        assert_eq!(
+            result,
+            Err(WarmupBound::TimedOut),
+            "a Query lifetime cancel during drain must skip one plan, not abort warmup"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(180),
+            "must wait for the per-op bound, not return at the child-token fire, took {:?}",
+            start.elapsed()
         );
     }
 
