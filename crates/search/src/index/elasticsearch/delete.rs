@@ -80,6 +80,15 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which indexes a rounded form of the value rather than the value, so an exact-match filter on it also matches every other value that rounds the same way — deleting one row's documents would reach another row's — and it has no exactly-indexed sub-field either; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword`; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyColumnLossilyIndexed {
+        index: String,
+        column: String,
+        mapped_as: String,
+    },
+
+    #[snafu(display(
         "Failed to delete rows from the search index '{index}' (elasticsearch): a key in column '{column}' is {length} characters, past the `ignore_above: {ignore_above}` of the '{path}' field it is matched on, so Elasticsearch never indexed it and no filter can address its documents; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword` with no `ignore_above`. See: https://spiceai.org/docs/features/search"
     ))]
     KeyValueNotIndexed {
@@ -797,26 +806,52 @@ struct KeyFieldPath {
 /// query matches what the write path stored.
 ///
 /// `text` (and its variants) is deliberately absent: it holds the value's *analyzed* tokens, so a
-/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing. Being
-/// one of these types is necessary but not sufficient — see [`is_term_exact`].
+/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing. The
+/// types that index a *rounded* form of the value are absent for the opposite reason — a `term`
+/// on one of those matches too much; they are enumerated in [`TERM_LOSSY_FIELD_TYPES`]. Being one
+/// of these types is necessary but not sufficient — see [`is_term_exact`].
 const TERM_EXACT_FIELD_TYPES: &[&str] = &[
     "boolean",
     "byte",
-    "constant_keyword",
-    "date",
     "date_nanos",
     "double",
-    "float",
-    "half_float",
     "integer",
     "ip",
     "keyword",
     "long",
-    "scaled_float",
     "short",
     "unsigned_long",
     "version",
     "wildcard",
+];
+
+/// Field types whose indexed form is a *rounded* form of the value, so one term stands for a
+/// range of values and a `term` on it reaches documents the key never named.
+///
+/// These are exact-match types in the sense that a `term` is not analyzed, which is why they read
+/// as safe; they are not exact in the sense this addressing needs, which is that the value the
+/// write path stored is recoverable from the term. Measured against Elasticsearch 8.15.0, a
+/// `term` for one row's value returns a second row's documents as well:
+///
+/// | type | two distinct values | `term` for the first matches |
+/// |---|---|---|
+/// | `scaled_float` (factor 100) | `1.234`, `1.2337` | both — `round(v * 100)` is `123` for each |
+/// | `float` | `1.0000000000000002`, `1.0` | both — a 24-bit mantissa holds neither apart |
+/// | `half_float` | `1.0001`, `1.0002` | both — an 11-bit mantissa is coarser still |
+/// | `date` | `…:00.123456Z`, `…:00.123789Z` | both — `date` quantizes to milliseconds |
+/// | `constant_keyword` | any two | *every* document — the index stores one value for the field |
+///
+/// `date_nanos` and `double` are absent because they round nothing a source value can carry:
+/// nanoseconds is Arrow's finest timestamp unit, and `double` is its widest float.
+///
+/// The hazard is [`Error::KeyColumnNormalized`]'s, one layer down: over-matching is what turns a
+/// prune of one row's superseded chunks into a delete of a whole sibling row (#13717).
+const TERM_LOSSY_FIELD_TYPES: &[&str] = &[
+    "constant_keyword",
+    "date",
+    "float",
+    "half_float",
+    "scaled_float",
 ];
 
 /// Whether a `term` on this field matches the value the write path stored: an exact type, and
@@ -926,6 +961,20 @@ async fn resolve_term_exact_paths(
                     index: es_index.to_string(),
                     column: column.clone(),
                     normalizer: normalizer.to_string(),
+                }
+                .fail();
+            }
+            // Likewise for a column whose type rounds the value: the generic message would say it
+            // cannot be matched at all, when the real hazard is that it matches too much.
+            if let Some(lossy) = mapping
+                .field_type
+                .as_deref()
+                .filter(|t| TERM_LOSSY_FIELD_TYPES.contains(t))
+            {
+                return KeyColumnLossilyIndexedSnafu {
+                    index: es_index.to_string(),
+                    column: column.clone(),
+                    mapped_as: lossy.to_string(),
                 }
                 .fail();
             }
@@ -1697,6 +1746,132 @@ mod tests {
             client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
             json!([{"term": {"id.exact": "A"}}]),
         );
+    }
+
+    /// A key column whose type indexes a *rounded* form of the value is the normalizer hazard
+    /// under a different name, and the same refusal answers it.
+    ///
+    /// Measured against Elasticsearch 8.15.0 rather than reasoned from the mapping: two documents
+    /// carrying distinct `scaled_float` values `1.234` and `1.2337` (scaling factor 100) are both
+    /// returned by `{"term": {"pk": 1.234}}`, because each indexes as `123`. Issuing the prune's
+    /// own body for the first row — `filter` that term, `must_not` its surviving chunk `_id`s —
+    /// then deleted three documents and reported no failures: the row's one superseded chunk, and
+    /// both chunks of the *other* row, which no `must_not` named because it is not in the group.
+    /// `float`, `half_float` and `date` collide the same way, and `constant_keyword` matches every
+    /// document in the index.
+    #[tokio::test]
+    async fn a_lossily_indexed_group_column_refuses_before_issuing() {
+        for field_type in TERM_LOSSY_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
+
+            let err = delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key(),
+                &["id".to_string()],
+                &member_batch(&[(Some("A"), 0)]),
+            )
+            .await
+            .expect_err("a lossily indexed group column must fail the prune");
+
+            let message = err.to_string();
+            assert!(
+                message.contains("'id'") && message.contains(*field_type),
+                "the error must name the column and its mapping, got: {message}"
+            );
+            assert!(
+                client.queries().is_empty(),
+                "no _delete_by_query may be issued against a key field mapped `{field_type}`, \
+                 whose terms stand for a range of values"
+            );
+        }
+    }
+
+    /// The same mapping is refused on the partial-key delete, which shares the resolution — the
+    /// filter over-deletes there rather than crossing into a live row, but it is the same field
+    /// that cannot address one row's documents.
+    #[tokio::test]
+    async fn a_lossily_indexed_key_column_refuses_a_partial_key_delete_too() {
+        for field_type in TERM_LOSSY_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
+
+            delete_by_keys(
+                &client,
+                "idx",
+                &chunked_key(),
+                &["id".to_string()],
+                &string_key_batch(vec![Some("A")]),
+            )
+            .await
+            .expect_err("a lossily indexed key column must fail the delete");
+
+            assert!(client.queries().is_empty());
+        }
+    }
+
+    /// A rounded column that also carries an exactly-indexed sub-field is still addressable — on
+    /// that sub-field, which is the shape a `text` column with a `keyword` multi-field has too.
+    #[tokio::test]
+    async fn a_lossily_indexed_column_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut lossy = field_mapping("scaled_float");
+        lossy.fields = Some(std::collections::HashMap::from([(
+            "exact".to_string(),
+            field_mapping("keyword"),
+        )]));
+        let client = RecordingClient::mapped(vec![("id", lossy)]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("A"), 0)]),
+        )
+        .await
+        .expect("the prune should succeed on the exact sub-field");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.exact": "A"}}]),
+        );
+    }
+
+    /// The two type lists answer one question between them, so a type that drifts into both — or
+    /// out of both — would make the refusal depend on which check runs first.
+    #[test]
+    fn the_exact_and_lossy_type_lists_are_disjoint() {
+        for lossy in TERM_LOSSY_FIELD_TYPES {
+            assert!(
+                !TERM_EXACT_FIELD_TYPES.contains(lossy),
+                "`{lossy}` cannot be both exactly and lossily indexed"
+            );
+        }
+    }
+
+    /// The counterpart of the refusal: a type whose indexed form *is* the value still resolves to
+    /// the column itself, so tightening the list did not cost an index its delete. `double` and
+    /// `date_nanos` are the two that were re-examined and kept.
+    #[tokio::test]
+    async fn an_exactly_indexed_group_column_still_resolves_to_the_column() {
+        for field_type in TERM_EXACT_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key(),
+                &["id".to_string()],
+                &member_batch(&[(Some("A"), 0)]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("`{field_type}` must still address the group: {e}"));
+
+            assert_eq!(
+                client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+                json!([{"term": {"id": "A"}}]),
+                "`{field_type}` must be filtered on the column itself"
+            );
+        }
     }
 
     /// The group columns are resolved the same way [`delete_by_keys`] resolves them, so a
