@@ -3233,12 +3233,18 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `SQLite`/`Turso`, creates a real (empty) `SQLite` WAL-mode database
-    /// so that the engine's `checkpoint_live` hook can open it. For other
-    /// engines, writes opaque test bytes since no engine-side validation
-    /// runs against the file pre-snapshot.
+    /// For `DuckDB`/`SQLite`/`Turso`, creates a real (empty) database so that the
+    /// engine's `checkpoint_live` hook can open it. For other engines, writes opaque
+    /// test bytes since no engine-side validation runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
+            #[cfg(feature = "duckdb")]
+            AccelerationEngine::DuckDB => {
+                let conn = duckdb::Connection::open(path).expect("open sample duckdb db");
+                conn.execute_batch("CREATE TABLE sample(id INTEGER)")
+                    .expect("create sample table");
+                drop(conn);
+            }
             #[cfg(any(feature = "sqlite", feature = "turso"))]
             AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
@@ -3292,6 +3298,12 @@ mod tests {
         }
     }
 
+    /// A manager over an engine with nothing to flush before the copy, for the tests
+    /// about the manager's own file path — metadata, schema versioning, snapshot
+    /// policies, streaming upload. Those tests hand it a local file of arbitrary bytes
+    /// and assert the uploaded object matches, which an engine that opens that file as a
+    /// database cannot do. Tests that are about a particular engine name it through
+    /// [`build_manager_for_engine`] instead.
     #[cfg(feature = "duckdb")]
     fn build_manager(
         store: Arc<InMemory>,
@@ -3305,7 +3317,7 @@ mod tests {
             local_path,
             behavior,
             schema,
-            &AccelerationEngine::DuckDB,
+            &AccelerationEngine::Cayenne,
             compaction_enabled,
         )
     }
@@ -4388,11 +4400,12 @@ mod tests {
         let local_path = temp_dir.path().join("snapshot.db");
 
         // Build manager with DuckDB engine (mismatches SQLite snapshot)
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            &AccelerationEngine::DuckDB,
             false,
         );
         let factory = Arc::clone(
@@ -4496,11 +4509,12 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            &AccelerationEngine::DuckDB,
             false,
         );
 
@@ -4569,11 +4583,12 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            &AccelerationEngine::DuckDB,
             false,
         );
 
@@ -4675,11 +4690,12 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            &AccelerationEngine::DuckDB,
             false,
         );
 
@@ -4778,11 +4794,12 @@ mod tests {
             .len();
 
         let schema = sample_schema();
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            &AccelerationEngine::DuckDB,
             true,
         );
 

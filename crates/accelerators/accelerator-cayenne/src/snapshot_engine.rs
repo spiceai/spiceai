@@ -171,6 +171,17 @@ impl CayenneSnapshotEngine {
 
 #[async_trait]
 impl SnapshotEngine for CayenneSnapshotEngine {
+    /// Nothing to flush here: Cayenne snapshots are directory-layout, and only the
+    /// file-layout path invokes this hook. What Cayenne does have to capture — the
+    /// per-dataset metastore slice — is exported by `prepare_directory_snapshot`.
+    async fn checkpoint_live(
+        &self,
+        _live_path: &std::path::Path,
+        _dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        Ok(())
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &std::path::Path,
