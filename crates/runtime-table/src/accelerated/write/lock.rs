@@ -42,6 +42,21 @@ limitations under the License.
 //! the stamp happens here, once the write's stream has ended without an error
 //! and while the guard is still held.
 //!
+//! Two things about the scope of that hold, both deliberate and neither
+//! obvious from the outside:
+//!
+//! - This wraps the *whole* write plan, so for `INSERT INTO <accelerated>
+//!   SELECT … FROM <source>` the input scan runs inside the guarded window and
+//!   a slow source stalls refresh, CDC and snapshot creation for the length of
+//!   the read, not just the commit. There is no narrower placement: the sink
+//!   streams rows to the accelerator as they arrive, so no point exists where
+//!   the scan is finished and the write has yet to start.
+//! - The unit is one `ExecutionPlan`, not one statement. A statement that
+//!   composes two write plans — a `MERGE` that runs a delete and then an
+//!   insert — acquires and releases once per plan, leaving a window between
+//!   them. Anything composing writes that way has to decide whether it needs
+//!   the guard across the pair.
+//!
 //! Lock ordering: this is taken *before* any lock the wrapped write takes
 //! (a partitioned Cayenne dual write takes that table's write coordinator
 //! inside its own write), which is the order snapshot creation and refresh
@@ -51,6 +66,8 @@ limitations under the License.
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
+
+use datafusion::sql::TableReference;
 
 use arrow_schema::SchemaRef;
 use datafusion::common::Result as DataFusionResult;
@@ -74,7 +91,7 @@ pub(crate) struct AcceleratorWriteLockExec {
     /// accelerator accepts the write — stamping here too would move the marker
     /// for a write its own validation went on to refuse.
     last_updated_at: Option<Arc<AtomicI64>>,
-    dataset_name: Arc<str>,
+    dataset_name: TableReference,
     plan_properties: Arc<PlanProperties>,
 }
 
@@ -87,7 +104,7 @@ impl AcceleratorWriteLockExec {
         input: Arc<dyn ExecutionPlan>,
         accelerator_write_mutex: Arc<Mutex<()>>,
         last_updated_at: Option<Arc<AtomicI64>>,
-        dataset_name: Arc<str>,
+        dataset_name: TableReference,
     ) -> Self {
         let plan_properties = Arc::new(
             input
@@ -104,20 +121,6 @@ impl AcceleratorWriteLockExec {
             dataset_name,
             plan_properties,
         }
-    }
-
-    pub(crate) fn new_arc(
-        input: Arc<dyn ExecutionPlan>,
-        accelerator_write_mutex: Arc<Mutex<()>>,
-        last_updated_at: Option<Arc<AtomicI64>>,
-        dataset_name: Arc<str>,
-    ) -> Arc<dyn ExecutionPlan> {
-        Arc::new(Self::new(
-            input,
-            accelerator_write_mutex,
-            last_updated_at,
-            dataset_name,
-        ))
     }
 }
 
@@ -169,7 +172,7 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
             input,
             Arc::clone(&self.accelerator_write_mutex),
             self.last_updated_at.clone(),
-            Arc::clone(&self.dataset_name),
+            self.dataset_name.clone(),
         )))
     }
 
@@ -182,24 +185,22 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
         let input = Arc::clone(&self.input);
         let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
         let last_updated_at = self.last_updated_at.clone();
-        let dataset_name = Arc::clone(&self.dataset_name);
+        let dataset_name = self.dataset_name.clone();
 
         // The guard is threaded through the stream's own state, so it is
         // released exactly when the write's output stream is dropped —
         // including on an error or an early abort, which is when leaving it
         // held would wedge every later refresh and snapshot of this table.
         let stream = futures::stream::once(async move {
-            let guard = Arc::clone(&accelerator_write_mutex).lock_owned().await;
+            let guard = accelerator_write_mutex.lock_owned().await;
             tracing::debug!(
                 "Holding the accelerator write lock for a direct write to dataset {dataset_name}"
             );
             let input_stream = input.execute(partition, context)?;
 
             Ok::<_, DataFusionError>(futures::stream::unfold(
-                Some((input_stream, guard, last_updated_at, false)),
-                |state| async move {
-                    let (mut input_stream, guard, last_updated_at, failed) = state?;
-
+                (input_stream, guard, last_updated_at, false),
+                |(mut input_stream, guard, last_updated_at, failed)| async move {
                     let Some(batch) = input_stream.next().await else {
                         // The write has finished. Move the freshness marker
                         // here, under the guard, so the next holder of the lock
@@ -215,7 +216,7 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
                     };
 
                     let failed = failed || batch.is_err();
-                    Some((batch, Some((input_stream, guard, last_updated_at, failed))))
+                    Some((batch, (input_stream, guard, last_updated_at, failed)))
                 },
             ))
         })

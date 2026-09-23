@@ -1958,38 +1958,43 @@ impl AcceleratedTable {
     /// it serializes against acceleration snapshot creation the way refresh,
     /// CDC and the cache writer already do (#13548).
     ///
-    /// Applied to every write mode that reaches the accelerator, and to all of
-    /// `insert_into` / `update` / `delete_from` / `truncate`: a snapshot taken
-    /// beside an unserialized write of any of those shapes can capture a row
-    /// set no single point in time produced. `WriteMode::WriteThrough` is the
-    /// one mode left alone — it writes only to the federated source, and the
-    /// accelerator learns of the change through refresh or CDC, both of which
-    /// take this lock themselves.
+    /// Every write verb routes its finished plan through here, rather than each
+    /// `write_mode` arm wrapping its own: which modes reach the accelerator is
+    /// one decision, `WriteMode::reaches_accelerator`, and a mode added later
+    /// is guarded by default instead of by whoever remembers.
     ///
-    /// The guarded modes also hand over `last_updated_at`, so the freshness
-    /// marker moves when the write finishes rather than when its plan was
-    /// built — see `write::lock`. Write-back passes `None`: its own sinks mark
-    /// the table once the accelerator accepts the write, and it refuses a write
-    /// outside a transaction, which is decided when the sink executes.
-    fn guard_accelerator_write(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        last_updated_at: Option<Arc<AtomicI64>>,
-    ) -> Arc<dyn ExecutionPlan> {
-        write::lock::AcceleratorWriteLockExec::new_arc(
+    /// The wrapper also stamps `last_updated_at` when the write finishes —
+    /// except for write-back, whose own sinks mark the table once the
+    /// accelerator accepts the write, and which refuses a write outside a
+    /// transaction at execute time. Stamping there too would move the marker
+    /// for a write its own validation went on to refuse.
+    fn guard_accelerator_write(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        if !self.write_mode.reaches_accelerator() {
+            return plan;
+        }
+
+        let last_updated_at = match self.write_mode {
+            WriteMode::WriteBack => None,
+            _ => Some(Arc::clone(&self.last_updated_at)),
+        };
+
+        Arc::new(write::lock::AcceleratorWriteLockExec::new(
             plan,
             Arc::clone(&self.accelerator_write_mutex),
             last_updated_at,
-            Arc::from(self.dataset_name.to_string()),
-        )
+            self.dataset_name.clone(),
+        ))
     }
 
-    /// The freshness handle for a write this table guards, or `None` for
-    /// write-back (see `guard_accelerator_write`).
-    fn write_freshness_handle(&self) -> Option<Arc<AtomicI64>> {
-        match self.write_mode {
-            WriteMode::WriteBack => None,
-            _ => Some(Arc::clone(&self.last_updated_at)),
+    /// Move the freshness marker for a write that never reaches the
+    /// accelerator, which is the only kind still stamped where its plan is
+    /// built. A guarded write is stamped by `guard_accelerator_write` once it
+    /// finishes: stamping it here would hand the new timestamp to a snapshot
+    /// running while the write is still waiting for the lock, which would then
+    /// record a freshness it does not have.
+    fn stamp_unguarded_write(&self) {
+        if !self.write_mode.reaches_accelerator() {
+            self.update_last_updated_at();
         }
     }
 }
@@ -2135,19 +2140,9 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        // Only the unguarded mode stamps here. A write-back write is refused
-        // unless it is inside a transaction, and that is decided when the sink
-        // executes rather than here — so this path cannot yet know whether the
-        // table will change, and its sinks mark the table themselves once the
-        // accelerator accepts the write. Every other mode reaches the
-        // accelerator under `guard_accelerator_write`, which stamps when the
-        // write finishes: stamping here would hand the new timestamp to a
-        // snapshot that runs while the write is still waiting for the lock.
-        if matches!(self.write_mode, WriteMode::WriteThrough) {
-            self.update_last_updated_at();
-        }
+        self.stamp_unguarded_write();
 
-        match &self.write_mode {
+        let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
                 // When on_conflict is configured, writes go only to the accelerator
                 // (the federated source may not support writes, e.g., file connector).
@@ -2156,17 +2151,14 @@ impl TableLayer for AcceleratedTable {
                     .insert_into(state, input, overwrite)
                     .await?;
                 self.refresher().set_initial_load_completed(true);
-                Ok(self.guard_accelerator_write(
-                    accelerated_insert_plan,
-                    self.write_freshness_handle(),
-                ))
+                accelerated_insert_plan
             }
             WriteMode::WriteThrough => {
                 // Writes go to the federated source synchronously. The acceleration
                 // refresh mechanism (CDC for refresh_mode: changes, otherwise the
                 // periodic refresh cycle) propagates the change to the accelerator.
                 let federated_table = self.federated.table_provider().await;
-                federated_table.insert_into(state, input, overwrite).await
+                federated_table.insert_into(state, input, overwrite).await?
             }
             WriteMode::WriteBack => {
                 write::write_back::validate_insert_op(overwrite)?;
@@ -2178,8 +2170,7 @@ impl TableLayer for AcceleratedTable {
                     Arc::clone(&self.refresher),
                     self.schema(),
                     &self.dataset_name.to_string(),
-                )
-                .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle()))
+                )?
             }
             WriteMode::DualWrite {
                 cayenne_target,
@@ -2191,9 +2182,10 @@ impl TableLayer for AcceleratedTable {
                 Arc::clone(federated_provider),
                 &self.refresher,
                 self.schema(),
-            )
-            .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
-        }
+            )?,
+        };
+
+        Ok(self.guard_accelerator_write(plan))
     }
 
     async fn delete_from(
@@ -2217,34 +2209,30 @@ impl TableLayer for AcceleratedTable {
             ));
         }
 
-        // See `insert_into`: the guarded modes stamp when the write finishes.
-        if matches!(self.write_mode, WriteMode::WriteThrough) {
-            self.update_last_updated_at();
-        }
+        self.stamp_unguarded_write();
 
-        match &self.write_mode {
-            WriteMode::AcceleratorOnly => self
-                .accelerator
-                .delete_from(state, filters)
-                .await
-                .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
+        let plan = match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await?,
             WriteMode::WriteThrough => {
                 let federated_table = self.federated.table_provider().await;
-                federated_table.delete_from(state, filters).await
+                federated_table.delete_from(state, filters).await?
             }
             WriteMode::WriteBack => unreachable!("refused above, before the timestamp moves"),
             WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
-            } => write::dual_write::delete_dual_write(
-                state,
-                filters,
-                cayenne_target.as_ref(),
-                Arc::clone(federated_provider),
-            )
-            .await
-            .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
-        }
+            } => {
+                write::dual_write::delete_dual_write(
+                    state,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await?
+            }
+        };
+
+        Ok(self.guard_accelerator_write(plan))
     }
 
     async fn update(
@@ -2261,51 +2249,43 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        // Only the unguarded mode stamps here. A write-back write is refused
-        // unless it is inside a transaction, and that is decided when the sink
-        // executes rather than here — so this path cannot yet know whether the
-        // table will change, and its sinks mark the table themselves once the
-        // accelerator accepts the write. Every other mode reaches the
-        // accelerator under `guard_accelerator_write`, which stamps when the
-        // write finishes: stamping here would hand the new timestamp to a
-        // snapshot that runs while the write is still waiting for the lock.
-        if matches!(self.write_mode, WriteMode::WriteThrough) {
-            self.update_last_updated_at();
-        }
+        self.stamp_unguarded_write();
 
-        match &self.write_mode {
-            WriteMode::AcceleratorOnly => self
-                .accelerator
-                .update(state, assignments, filters)
-                .await
-                .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
+        let plan = match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                self.accelerator.update(state, assignments, filters).await?
+            }
             WriteMode::WriteThrough => {
                 let federated_table = self.federated.table_provider().await;
-                federated_table.update(state, assignments, filters).await
+                federated_table.update(state, assignments, filters).await?
             }
-            WriteMode::WriteBack => write::write_back::update_write_back(
-                state,
-                assignments,
-                filters,
-                Arc::clone(&self.accelerator),
-                &self.dataset_name.to_string(),
-                Arc::clone(&self.last_updated_at),
-            )
-            .await
-            .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
+            WriteMode::WriteBack => {
+                write::write_back::update_write_back(
+                    state,
+                    assignments,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    &self.dataset_name.to_string(),
+                    Arc::clone(&self.last_updated_at),
+                )
+                .await?
+            }
             WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
-            } => write::dual_write::update_dual_write(
-                state,
-                assignments,
-                filters,
-                cayenne_target.as_ref(),
-                Arc::clone(federated_provider),
-            )
-            .await
-            .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
-        }
+            } => {
+                write::dual_write::update_dual_write(
+                    state,
+                    assignments,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await?
+            }
+        };
+
+        Ok(self.guard_accelerator_write(plan))
     }
 
     async fn truncate(
@@ -2332,25 +2312,20 @@ impl TableLayer for AcceleratedTable {
             ));
         }
 
-        // See `insert_into`: the guarded modes stamp when the write finishes.
-        if matches!(self.write_mode, WriteMode::WriteThrough) {
-            self.update_last_updated_at();
-        }
+        self.stamp_unguarded_write();
 
-        match &self.write_mode {
-            WriteMode::AcceleratorOnly => self
-                .accelerator
-                .truncate(state)
-                .await
-                .map(|plan| self.guard_accelerator_write(plan, self.write_freshness_handle())),
+        let plan = match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.truncate(state).await?,
             WriteMode::WriteThrough => {
                 let federated_table = self.federated.table_provider().await;
-                federated_table.truncate(state).await
+                federated_table.truncate(state).await?
             }
             WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
                 unreachable!("refused above, before the timestamp moves")
             }
-        }
+        };
+
+        Ok(self.guard_accelerator_write(plan))
     }
 
     async fn scan_with_args<'a>(
@@ -3189,25 +3164,24 @@ mod tests {
     }
     // ── Direct writes serialize against acceleration snapshot creation (#13548) ──
 
-    /// Build a one-column accelerated table in `write_mode`, handing back the
-    /// accelerator and the write lock so a test can hold the lock the way
-    /// `create_checkpoint_and_snapshot` does and watch what a direct write does
-    /// beside it.
+    fn write_lock_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    /// Build a one-column accelerated table, handing back the accelerator and
+    /// the write lock so a test can hold the lock the way
+    /// `create_checkpoint_and_snapshot` does and watch what a direct write
+    /// does beside it.
     async fn table_with_write_lock(
-        accelerator_only: bool,
-    ) -> (
-        AcceleratedTable,
-        Arc<dyn TableProvider>,
-        Arc<Mutex<()>>,
-        SchemaRef,
-    ) {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        write_mode: WriteMode,
+    ) -> (AcceleratedTable, Arc<dyn TableProvider>, Arc<Mutex<()>>) {
+        let schema = write_lock_test_schema();
         let source = Arc::new(
             data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
                 .expect("source table builds"),
         );
         let accelerator = Arc::new(
-            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
                 .expect("accelerator table builds"),
         ) as Arc<dyn TableProvider>;
 
@@ -3222,27 +3196,45 @@ mod tests {
             refresh::Refresh::new(RefreshMode::Disabled),
             Handle::current(),
         );
-        if accelerator_only {
+        if matches!(write_mode, WriteMode::AcceleratorOnly) {
             builder.write_to_accelerator_only();
         }
         builder.accelerator_write_mutex(Arc::clone(&write_mutex));
 
         let table = builder.build().await.expect("accelerated table builds");
-        (table, accelerator, write_mutex, schema)
+        (table, accelerator, write_mutex)
     }
 
-    fn three_row_input(schema: &SchemaRef) -> Arc<dyn ExecutionPlan> {
+    fn three_row_input() -> Arc<dyn ExecutionPlan> {
         use arrow::array::Int64Array;
         use arrow::record_batch::RecordBatch;
         use datafusion::datasource::memory::MemorySourceConfig;
 
+        let schema = write_lock_test_schema();
         let batch = RecordBatch::try_new(
-            Arc::clone(schema),
+            Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
         )
         .expect("batch builds");
-        MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(schema), None)
-            .expect("input plan builds")
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).expect("input plan builds")
+    }
+
+    /// The three-row append every test below drives, planned through the real
+    /// `TableLayer::insert_into` rather than straight at the accelerator.
+    async fn insert_plan(
+        table: &AcceleratedTable,
+        accelerator: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+    ) -> Arc<dyn ExecutionPlan> {
+        TableLayer::insert_into(
+            table,
+            accelerator,
+            state,
+            three_row_input(),
+            InsertOp::Append,
+        )
+        .await
+        .expect("the insert plan builds")
     }
 
     async fn accelerator_row_count(accelerator: &Arc<dyn TableProvider>) -> usize {
@@ -3263,32 +3255,21 @@ mod tests {
     /// the rows move when the plan executes, which is what this drives.
     #[tokio::test]
     async fn test_a_direct_insert_waits_for_the_accelerator_write_lock() {
-        let (table, accelerator, write_mutex, schema) = table_with_write_lock(true).await;
+        let (table, accelerator, write_mutex) =
+            table_with_write_lock(WriteMode::AcceleratorOnly).await;
 
         let guard = Arc::clone(&write_mutex).lock_owned().await;
 
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let plan = TableLayer::insert_into(
-            &table,
-            &accelerator,
-            &state,
-            three_row_input(&schema),
-            InsertOp::Append,
-        )
-        .await
-        .expect("the insert plan builds");
+        let plan = insert_plan(&table, &accelerator, &state).await;
 
         let write = tokio::spawn(datafusion::physical_plan::collect(plan, ctx.task_ctx()));
 
         // Long enough that a write which does not wait would have finished:
         // the unguarded path completed this insert in well under a
         // millisecond, and the assertion below is what proves it now waits.
-        tokio::time::timeout(Duration::from_millis(500), async {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        })
-        .await
-        .expect("the sleep itself must not time out");
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
         assert!(
             !write.is_finished(),
@@ -3324,22 +3305,15 @@ mod tests {
     /// out of every snapshot until some later mutation moved it again.
     #[tokio::test]
     async fn test_a_waiting_write_does_not_move_the_freshness_marker_early() {
-        let (table, accelerator, write_mutex, schema) = table_with_write_lock(true).await;
+        let (table, accelerator, write_mutex) =
+            table_with_write_lock(WriteMode::AcceleratorOnly).await;
 
         let guard = Arc::clone(&write_mutex).lock_owned().await;
         let before = table.last_updated_at.load(Ordering::Acquire);
 
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let plan = TableLayer::insert_into(
-            &table,
-            &accelerator,
-            &state,
-            three_row_input(&schema),
-            InsertOp::Append,
-        )
-        .await
-        .expect("the insert plan builds");
+        let plan = insert_plan(&table, &accelerator, &state).await;
         let write = tokio::spawn(datafusion::physical_plan::collect(plan, ctx.task_ctx()));
 
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -3369,21 +3343,14 @@ mod tests {
     /// never touch the accelerator.
     #[tokio::test]
     async fn test_a_write_through_insert_does_not_take_the_accelerator_write_lock() {
-        let (table, accelerator, write_mutex, schema) = table_with_write_lock(false).await;
+        let (table, accelerator, write_mutex) =
+            table_with_write_lock(WriteMode::WriteThrough).await;
 
         let guard = Arc::clone(&write_mutex).lock_owned().await;
 
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let plan = TableLayer::insert_into(
-            &table,
-            &accelerator,
-            &state,
-            three_row_input(&schema),
-            InsertOp::Append,
-        )
-        .await
-        .expect("the insert plan builds");
+        let plan = insert_plan(&table, &accelerator, &state).await;
 
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -3401,20 +3368,13 @@ mod tests {
     /// row set no point in time produced just as an `INSERT` does.
     #[tokio::test]
     async fn test_a_direct_delete_waits_for_the_accelerator_write_lock() {
-        let (table, accelerator, write_mutex, schema) = table_with_write_lock(true).await;
+        let (table, accelerator, write_mutex) =
+            table_with_write_lock(WriteMode::AcceleratorOnly).await;
 
         // Seed three rows with the lock free, so the delete has something to do.
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let seed = TableLayer::insert_into(
-            &table,
-            &accelerator,
-            &state,
-            three_row_input(&schema),
-            InsertOp::Append,
-        )
-        .await
-        .expect("the seed insert plan builds");
+        let seed = insert_plan(&table, &accelerator, &state).await;
         datafusion::physical_plan::collect(seed, ctx.task_ctx())
             .await
             .expect("the seed insert succeeds");
