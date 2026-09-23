@@ -16,8 +16,8 @@
 
 A run is divided into phases by wall-clock offset from the shared ``t0``.
 ``phase_at`` maps a relative time to its phase name so every sample can be
-tagged consistently. The optional burst window (used by the overshoot
-scenario) is disabled by leaving ``burst_start`` at its default of infinity.
+tagged consistently. The optional burst window is disabled by leaving
+``burst_start`` at its default of infinity; no scenario currently exercises it.
 
 Scenarios that add their own sub-window (e.g. Phase 1's stale-if-error window,
 which starts partway through the fault window) layer that classification on top

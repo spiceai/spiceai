@@ -16,17 +16,15 @@
 # (default below is that branch build's target/release/spiced.)
 #
 # Usage:
-#   ./run_phase2.sh ratecontrol-aimd
 #   ./run_phase2.sh ratecontrol-sre
 #   ./run_phase2.sh ratecontrol-cooldown
 #   ./run_phase2.sh ratecontrol-ietf-headers
-#   ./run_phase2.sh overshoot-recovery
-#   ./run_phase2.sh --probe ratecontrol-aimd   # start, scrape /metrics once, exit
+#   ./run_phase2.sh --probe ratecontrol-sre   # start, scrape /metrics once, exit
 set -euo pipefail
 
 PROBE=0
 if [[ "${1:-}" == "--probe" ]]; then PROBE=1; shift; fi
-SCENARIO="${1:-ratecontrol-aimd}"
+SCENARIO="${1:-ratecontrol-sre}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
@@ -56,9 +54,8 @@ P1_LOG="${P1_LOG:-$RUN_DIR/origin_p1.jsonl}"
 P2_LOG="${P2_LOG:-$RUN_DIR/origin_p2.jsonl}"
 
 case "$SCENARIO" in
-  ratecontrol-sre) POD="$HERE/spicepod/spicepod.ratecontrol.sre.yaml" ;;
-  ratecontrol-aimd|ratecontrol-cooldown|ratecontrol-ietf-headers|overshoot-recovery)
-    POD="$HERE/spicepod/spicepod.ratecontrol.aimd.yaml" ;;
+  ratecontrol-sre|ratecontrol-cooldown|ratecontrol-ietf-headers)
+    POD="$HERE/spicepod/spicepod.ratecontrol.sre.yaml" ;;
   *) echo "unknown scenario: $SCENARIO"; exit 2 ;;
 esac
 

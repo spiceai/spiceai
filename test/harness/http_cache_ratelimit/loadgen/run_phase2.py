@@ -32,11 +32,6 @@ The oracle correlates the scraped metrics, the origin request logs, and the
 per-response samples on ``t_rel = now - T0`` and writes ``assertions.json``.
 
 Scenarios (harness plan Section 7):
-  ratecontrol-aimd     AIMD. p2 -> 50% 503 during the fault window; recover.
-                       Expect effective_limit multiplicative-decrease, admission
-                       coefficient well below 1000, throttled_total rising, p2
-                       upstream arrivals capped below the offered rate, and full
-                       recovery. p1 stays clean.
   ratecontrol-sre      SRE throttle, K=2. p2 -> 90% 503 (accepts/requests < 1/K
                        so it actually throttles). Expect admission near the SRE
                        steady state (2*accepts/requests) within tolerance.
@@ -46,9 +41,10 @@ Scenarios (harness plan Section 7):
                        (no error, no Retry-After). Expect admission does NOT
                        change today (server-advertised quota not yet honored,
                        TODO(#14136)); the assertion flips when that lands.
-  overshoot-recovery   AIMD. After recovery, a burst on p2. Expect any re-trip
-                       of the controller to be bounded and to converge, not to
-                       oscillate unbounded.
+
+#14143 ships one admission-coefficient strategy (Google SRE client-side
+throttling); there is no separate AIMD control law, so the scenarios above all
+exercise the same mechanism under different fault shapes.
 
 Verdict / exit code:
   PASS     0   every assertion holds.
@@ -82,14 +78,6 @@ from harness.timeline import Step, Timeline  # noqa: E402
 # Scenario fault profiles POSTed to the p2 origin during the fault window.
 # --------------------------------------------------------------------------
 SCENARIOS: dict[str, dict[str, Any]] = {
-    "ratecontrol-aimd": {
-        "id": "p2-503-half",
-        "mode": "status",
-        "error_status": 503,
-        "error_rate": 0.5,
-        "latency_ms": {"base": 20, "jitter": 10},
-        "seed": 12345,
-    },
     "ratecontrol-sre": {
         # SRE with K=2 only throttles when accepts/requests < 1/K = 0.5, so the
         # failure fraction must exceed 0.5. 0.9 -> steady-state admission
@@ -120,14 +108,6 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "RateLimit": "limit=5, remaining=0, reset=2",
             "RateLimit-Policy": "5;w=1",
         },
-        "seed": 12345,
-    },
-    "overshoot-recovery": {
-        "id": "p2-503-half",
-        "mode": "status",
-        "error_status": 503,
-        "error_rate": 0.5,
-        "latency_ms": {"base": 20, "jitter": 10},
         "seed": 12345,
     },
 }
@@ -227,7 +207,7 @@ class OpenLoopLoad:
         self, dataset: str, origin_name: str, base_query: str, qps: float, tl: "Phases"
     ) -> None:
         """Open-loop pacer for one dataset. Submits at fixed cadence; QPS may
-        ramp for the burst window (overshoot scenario)."""
+        ramp for the burst window (unused by any current scenario)."""
         interval = 1.0 / qps if qps > 0 else 1.0
         next_send = time.time()
         while not self._stop.is_set():
@@ -318,10 +298,6 @@ def run(args: argparse.Namespace) -> int:
         fault_start=args.warmup_s,
         fault_end=args.warmup_s + args.fault_s,
         run_end=args.warmup_s + args.fault_s + args.recovery_s,
-        burst_start=(args.warmup_s + args.fault_s + args.burst_after_s)
-        if scenario == "overshoot-recovery"
-        else 1e12,
-        burst_qps=args.burst_qps if scenario == "overshoot-recovery" else 0.0,
     )
 
     # p1 stays healthy the whole run; only p2 is stepped.
@@ -457,63 +433,7 @@ def run(args: argparse.Namespace) -> int:
         f"{warm_ok}/{len(warm)} warmup queries returned rows",
     )
 
-    if scenario in ("ratecontrol-aimd", "overshoot-recovery"):
-        add(
-            "p2_admission_drops_during_fault",
-            p2_adm_min_fault is not None and p2_adm_min_fault < args.admission_drop_permille,
-            f"min admission_coefficient_permille[p2] during fault = {p2_adm_min_fault} "
-            f"(need < {args.admission_drop_permille}; 1000 = admit all)",
-        )
-        add(
-            "p2_effective_limit_multiplicative_decrease",
-            p2_eff_min_fault is not None and p2_eff_min_fault <= ceiling / 2.0,
-            f"min effective_limit[p2] during fault = {p2_eff_min_fault} "
-            f"(need <= ceiling/2 = {ceiling / 2.0}; ceiling = {ceiling})",
-        )
-        add(
-            "p2_throttled_total_increases",
-            p2_thr_delta is not None and p2_thr_delta > 0,
-            f"throttled_total[p2] delta over fault = {p2_thr_delta} (need > 0)",
-        )
-        add(
-            "p2_arrivals_capped_below_offered",
-            len(p2_fault_arrivals) > 0
-            and len(p2_fault_arrivals) < p2_offered_fault,
-            f"p2 upstream arrivals during fault = {len(p2_fault_arrivals)} "
-            f"({p2_arrival_rate:.1f}/s) vs offered ~{p2_offered_fault:.0f} "
-            f"({args.p2_qps:.0f}/s); the limiter capped the origin",
-        )
-        add(
-            "p2_recovers_admission_and_limit",
-            p2_adm_recovery is not None
-            and p2_adm_recovery >= args.recovery_permille
-            and p2_eff_recovery is not None
-            and p2_eff_recovery >= ceiling * args.recovery_limit_frac,
-            f"end-of-recovery admission[p2] = {p2_adm_recovery} "
-            f"(need >= {args.recovery_permille}), effective_limit[p2] = "
-            f"{p2_eff_recovery} (need >= {ceiling * args.recovery_limit_frac})",
-        )
-        add(
-            "p1_admission_stays_full",
-            p1_adm_min_all is not None and p1_adm_min_all >= args.p1_full_permille,
-            f"min admission_coefficient_permille[p1] over the whole run = "
-            f"{p1_adm_min_all} (need >= {args.p1_full_permille}; p1 never faulted)",
-        )
-        if scenario == "overshoot-recovery":
-            # After the origin heals, the additive-increase probe may briefly
-            # re-trip on the burst. Assert the re-trip is bounded and converges:
-            # admission ends high even though it may dip mid-burst.
-            burst_adm = scraper.series(adm, p2_key) if p2_key else []
-            burst_pts = [s.value for s in burst_adm if tl.burst_start <= s.t_rel_s <= re_end]
-            end_adm = burst_pts[-1] if burst_pts else None
-            add(
-                "overshoot_retrip_bounded_and_converges",
-                end_adm is not None and end_adm >= args.recovery_permille,
-                f"admission[p2] over burst window = {burst_pts}; ends at {end_adm} "
-                f"(need >= {args.recovery_permille}: converges, not oscillating to floor)",
-            )
-
-    elif scenario == "ratecontrol-sre":
+    if scenario == "ratecontrol-sre":
         k = args.sre_k  # must match `http_adaptive_rate_control` in the SRE pod
         add(
             "p2_admission_drops_during_fault",
@@ -724,13 +644,9 @@ def main() -> int:
     p.add_argument("--max-workers", type=int, default=cli.env_int("MAX_WORKERS", 128))
     p.add_argument("--request-timeout-s", type=float, default=cli.env_float("REQUEST_TIMEOUT_S", 15.0))
     p.add_argument("--scrape-interval-s", type=float, default=cli.env_float("SCRAPE_INTERVAL_S", 1.0))
-    # burst (overshoot scenario only)
-    p.add_argument("--burst-after-s", type=float, default=cli.env_float("BURST_AFTER_S", 10.0))
-    p.add_argument("--burst-qps", type=float, default=cli.env_float("BURST_QPS", 60.0))
     # assertion thresholds
     p.add_argument("--admission-drop-permille", type=float, default=800.0)
     p.add_argument("--recovery-permille", type=float, default=950.0)
-    p.add_argument("--recovery-limit-frac", type=float, default=0.75)
     p.add_argument("--p1-full-permille", type=float, default=1000.0)
     p.add_argument("--sre-tolerance", type=float, default=0.2)
     p.add_argument("--sre-k", type=float, default=cli.env_float("SRE_K", 2.0))

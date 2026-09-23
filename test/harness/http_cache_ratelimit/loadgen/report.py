@@ -21,7 +21,7 @@ hand-drawn inline SVG, so the output opens in a browser with no server and no
 network access.
 
 Usage:
-  python loadgen/report.py --run-dir /tmp/http_cache_phase2_run/ratecontrol-aimd
+  python loadgen/report.py --run-dir /tmp/http_cache_phase2_run/ratecontrol-sre
   # writes <run-dir>/report.html by default; --out to change the path.
 
 The phase is auto-detected from which files/columns are present:

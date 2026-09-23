@@ -85,8 +85,8 @@ QPS=10 DURATION_S=20 ./run_phase0.sh
 
 # Phase 2 (adaptive rate control) needs a spiced built with the
 # `rate-control` feature
-./run_phase2.sh --probe ratecontrol-aimd
-SPICED_BIN=/path/to/spiced ./run_phase2.sh ratecontrol-aimd
+./run_phase2.sh --probe ratecontrol-sre
+SPICED_BIN=/path/to/spiced ./run_phase2.sh ratecontrol-sre
 ```
 
 Artifacts land in `$RUN_DIR`. Notably:
@@ -123,11 +123,9 @@ directly in a browser; nothing to serve.
 
  ### Phase 2
  - `backoff_on_failure`: p2's admission coefficient drops well below 1000‰ and throttled_total rises during the fault window; p2's upstream arrival rate falls below the offered rate.
- - `aimd_shape`: effective limit roughly halves on failure (≤ ceiling/2) and recovers by ~1/success up to ≥ ceiling·0.75, clamped to the configured ceiling.
  - `sre_shape`: admission tracks min(1, (K·accepts+1)/(requests+1)) over the ~10s decaying window, within tolerance.
  - `cooldown_retry_after`: rate_limit_retry_after_* metrics move and p2's arrival log shows a gap ≈ the advertised Retry-After duration.
  - `p1_isolation`: the healthy origin (p1) stays at 1000‰ admission throughout, proving rate control is per-origin.
- - `overshoot_recovery_bounded`: a post-recovery burst may re-trip a smaller backoff, but it must converge, not oscillate unbounded.
 
 ## Phase 1 scenarios and what the oracle asserts
 Process:
@@ -202,8 +200,9 @@ timeout, it did not wait the full hang.
 Puts a real `spiced` in front of both origins, breaks p2 on a schedule, and
 lets the oracle decide — from scraped metrics and both origins' request
 logs — whether the per-origin rate controller backs off the failing origin
-and leaves the healthy one alone. Two strategies are exercised: **AIMD**
-and **Google SRE** client-side throttling.
+and leaves the healthy one alone, using #14143's **Google SRE** client-side
+throttling strategy (the only adaptive strategy it ships — see the status
+note below on an earlier AIMD-shaped run against a prior branch build).
 
 ### Requirements
 
@@ -226,10 +225,10 @@ Point the harness at it with `SPICED_BIN` (it otherwise defaults to
 ```bash
 # ALWAYS probe first on a new binary: start everything, scrape /metrics once,
 # and print the exact metric names + origin label the runtime exposes.
-SPICED_BIN=/path/to/spiced ./run_phase2.sh --probe ratecontrol-aimd
+SPICED_BIN=/path/to/spiced ./run_phase2.sh --probe ratecontrol-sre
 
 # Then score a scenario. Exit code is the verdict: 0 PASS, 1 FAIL, 2 BLOCKED.
-SPICED_BIN=/path/to/spiced ./run_phase2.sh ratecontrol-aimd
+SPICED_BIN=/path/to/spiced ./run_phase2.sh ratecontrol-sre
 ```
 
 `run_phase2.sh` starts origin p1 (:9001) and p2 (:9002), starts `spiced`
@@ -238,11 +237,9 @@ returns the oracle verdict.
 
 | scenario | p2 fault | what the oracle checks | pod |
 |----------|----------|------------------------|-----|
-| `ratecontrol-aimd` | 50% 503 | effective limit halves (≤ ceiling/2), admission drops below 1000‰, `throttled_total` rises, p2 upstream arrivals fall below the offered rate, then recovers — while p1 stays at 1000‰ | `ratecontrol.aimd` |
 | `ratecontrol-sre` | 90% 503 | admission tracks `min(1, (K·accepts+1)/(requests+1))` reconstructed from p2's arrival log, within `--sre-tolerance` | `ratecontrol.sre` |
-| `ratecontrol-cooldown` | 429 + `Retry-After: 2` | `rate_limit_retry_after_*` metrics move and p2 arrivals show a ≈2 s gap | `ratecontrol.aimd` |
-| `ratecontrol-ietf-headers` | 200 + `RateLimit`/`RateLimit-Policy` only | admission does **not** change (advertised quota not honored yet, `TODO(#14136)`) | `ratecontrol.aimd` |
-| `overshoot-recovery` | 50% 503, then a burst after recovery | any re-trip is bounded and converges, not oscillating to the floor | `ratecontrol.aimd` |
+| `ratecontrol-cooldown` | 429 + `Retry-After: 2` | `rate_limit_retry_after_*` metrics move and p2 arrivals show a ≈2 s gap | `ratecontrol.sre` |
+| `ratecontrol-ietf-headers` | 200 + `RateLimit`/`RateLimit-Policy` only | admission does **not** change (advertised quota not honored yet, `TODO(#14136)`) | `ratecontrol.sre` |
 
 Each scenario runs `warmup → fault → recovery` (default 15 s / 60 s / 45 s, so
 ~2 min). p1 stays healthy throughout; only p2 is faulted, which is how
@@ -286,7 +283,7 @@ rename is a one-line edit there, not a code change.
 Confirm them against the live endpoint before trusting a run:
 
 ```bash
-SPICED_BIN=/path/to/spiced ./run_phase2.sh --probe ratecontrol-aimd
+SPICED_BIN=/path/to/spiced ./run_phase2.sh --probe ratecontrol-sre
 # → prints kept series + per-origin values; also writes
 #   <RUN_DIR>/metrics_probe.txt and metrics_raw_ratecontrol.txt
 ```
@@ -318,17 +315,16 @@ Load, timeline, and thresholds (passed through to `loadgen/run_phase2.py`):
 |-----|---------|---------|
 | `WARMUP_S` / `FAULT_S` / `RECOVERY_S` | `15` / `60` / `45` | timeline windows (seconds) |
 | `P1_QPS` / `P2_QPS` | `10` / `30` | offered query rate per origin (drive p2 above the ceiling; p1 stays >=10 so its charts have enough points/sec to read) |
-| `RPS_LIMIT` | `20` | the ceiling the pods set (`http_requests_per_second_limit`); also the AIMD-shape reference |
+| `RPS_LIMIT` | `20` | the ceiling the pods set (`http_requests_per_second_limit`) |
 | `SRE_K` | `2.0` | SRE hyperparameter; must match the SRE pod |
 | `SCRAPE_INTERVAL_S` | `1` | `/metrics` poll cadence |
 | `REQUEST_TIMEOUT_S` | `15` | per-SQL-query client timeout |
 | `MAX_WORKERS` | `128` | open-loop sender pool size |
-| `BURST_AFTER_S` / `BURST_QPS` | `10` / `60` | `overshoot-recovery` burst timing/rate |
 
 Assertion thresholds are `run_phase2.py` flags:
 `--admission-drop-permille` (800), `--recovery-permille` (950),
-`--recovery-limit-frac` (0.75), `--p1-full-permille` (1000),
-`--sre-tolerance` (0.2), `--cooldown-gap-min-s` (1.5). Run
+`--p1-full-permille` (1000), `--sre-tolerance` (0.2),
+`--cooldown-gap-min-s` (1.5). Run
 `.venv/bin/python loadgen/run_phase2.py --help` for the full list.
 
 To run the load generator by hand against an already-running stack, point it
@@ -336,18 +332,35 @@ with `SPICED_SQL_URL`, `METRICS_ENDPOINT`, `P{1,2}_CONTROL_URL`,
 `P{1,2}_STATS_URL`, `P{1,2}_REQUEST_LOG`, and `OUT_DIR`.
 
 Datasets are plain (non-accelerated) federated HTTP datasets, so **one SQL
-query is one upstream request** — the cleanest signal for the AIMD/SRE
+query is one upstream request** — the cleanest signal for the SRE
 math. Adaptive control is a *modifier* on a static limit, so the pods set
 `http_requests_per_second_limit: 20`; without a static limit the dataset is
 rejected at load.
 
-### Phase 2 status: `ratecontrol-aimd` PASS, verified against a live `rate-control` build
+### Phase 2 status (historical, superseded): an earlier `14136` build exercised AIMD-shaped dynamics
 
-Verified against `spiced` built from `14136-adaptive-rate-control` (PR
-#14143, still open/draft) with the `rate-control` feature. `--probe`
-confirmed every `adaptive_rate_control_*`/`rate_control_*` series exists
-under a **`dataset_http_`** prefix (see "Metric names" above), then a full
-scored run:
+**This section documents a run against a *prior* revision of
+`14136-adaptive-rate-control`, kept as evidence rather than deleted, not
+as the current scenario.** #14143's PR description ships one strategy
+(Google SRE client-side throttling, `http_adaptive_rate_control`
+`enabled`/`disabled` + `_failure_threshold` + `_window`); no AIMD mode is
+in scope there, and the code on that branch (`crates/data-http-rate-control`)
+has no `aimd`-named path. The `ratecontrol-aimd`/`overshoot-recovery`
+scenarios and `spicepod.ratecontrol.aimd.yaml` were removed from this
+harness accordingly. **Flagging for the PR author**: the run below shows a
+real, separately-tracked `effective_limit` gauge halving under fault and
+recovering additively against an earlier build of that same branch — worth
+confirming whether that AIMD-shaped ceiling dynamic was simplified away
+before #14143's current description, or whether it still exists alongside
+the SRE admission coefficient and this doc's description of "one strategy"
+is incomplete.
+
+Verified against `spiced` built from `14136-adaptive-rate-control` (an
+earlier revision than #14143's current description) with the
+`rate-control` feature. `--probe` confirmed every
+`adaptive_rate_control_*`/`rate_control_*` series exists under a
+**`dataset_http_`** prefix (see "Metric names" above), then a full scored
+run:
 
 ```
 [PASS] cache_never_ahead_of_origin: 0 samples returned a version above the origin high-water mark
@@ -369,9 +382,9 @@ limit and admission both fully recover after the origin heals, and p1
 (never faulted) stayed at 1000‰ admission the entire run — per-origin
 isolation holds.
 
-`ratecontrol-sre`, `ratecontrol-cooldown`, `ratecontrol-ietf-headers`, and
-`overshoot-recovery` have not been scored yet — treat them as PENDING
-until their own `assertions.json` is pasted in here.
+`ratecontrol-sre`, `ratecontrol-cooldown`, and `ratecontrol-ietf-headers`
+have not been scored against the current SRE-only build yet — treat them
+as PENDING until their own `assertions.json` is pasted in here.
 
 Branch facts confirmed by reading `crates/data-http-rate-control` and
 `crates/data_components/src/rate_limit/adaptive.rs` on

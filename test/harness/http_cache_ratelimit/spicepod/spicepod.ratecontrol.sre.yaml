@@ -2,17 +2,19 @@ version: v1
 kind: Spicepod
 name: http-cache-ratelimit-ratecontrol-sre
 
-# Phase 2, SRE variant. Identical topology to spicepod.ratecontrol.aimd.yaml
-# (two federated HTTP datasets, one per origin) but the adaptive strategy is
-# Google SRE client-side throttling with hyperparameter K = 2.0 instead of
-# AIMD.
+# Phase 2, SRE strategy. Two federated HTTP datasets, one per origin. #14143
+# ships a single admission-coefficient strategy (Google SRE client-side
+# throttling) — `http_adaptive_rate_control` is only `enabled`/`disabled`;
+# there is no separate AIMD control law. Every ratecontrol-* scenario in
+# run_phase2.py (ratecontrol-sre, ratecontrol-cooldown,
+# ratecontrol-ietf-headers) shares this one pod. K = 2.0 here comes from the
+# `_failure_threshold` param, not a numeric value on the switch itself:
 #
-#   http_adaptive_rate_control: "2.0"  -> SRE throttle, K = 2.0
+#   http_adaptive_rate_control: enabled
+#   http_adaptive_rate_control_failure_threshold: "50%"  -> K = 1/(1-0.5) = 2.0
 #
-# A float value > 1 selects SRE; the admission coefficient is
-#   min(1, (K*accepts + 1) / (requests + 1))
-# over a ~10s exponentially-decaying window of request outcomes. See the
-# adaptive controller for the exact window half-life.
+# coefficient = min(1, (K*accepts + 1) / (requests + 1))
+# over the `_window` exponentially-decaying half-life (default 10s).
 #
 # The static limit is still required (adaptive control modifies a defined
 # limit); it is the scale the reported effective_limit is expressed on.
@@ -24,7 +26,8 @@ runtime:
     sql_results:
       enabled: false
   params:
-    http_adaptive_rate_control: "2.0"
+    http_adaptive_rate_control: enabled
+    http_adaptive_rate_control_failure_threshold: "50%"
     http_requests_per_second_limit: "20"
     http_max_concurrent_requests: "8"
 
