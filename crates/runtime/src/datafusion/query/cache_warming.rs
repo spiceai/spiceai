@@ -828,9 +828,11 @@ async fn warm_distinct_key_rows(
                 }
             };
         for row_idx in 0..batch.num_rows() {
-            if shutdown.is_cancelled() {
-                return Err(WarmupBound::Cancelled);
-            }
+            // The DISTINCT query lifetime timer cancels `query_cancel`
+            // independently of runtime shutdown. Stop before starting
+            // another nested replay so a large batch cannot outlive the
+            // replay deadline and hold `/v1/ready`.
+            warmup_row_deadline(shutdown, &query_cancel)?;
             cache_provider.run_pending_tasks().await;
             let size_before = cache_provider.size().await;
             if size_before >= max_size {
@@ -914,6 +916,19 @@ fn warmup_bound_from_shutdown(shutdown: &CancellationToken) -> WarmupBound {
     } else {
         WarmupBound::TimedOut
     }
+}
+
+/// Stop DISTINCT-key replay when runtime shutdown or the DISTINCT query
+/// lifetime timer has fired. A cancelled child with shutdown still live is
+/// TimedOut so later templates can still warm.
+fn warmup_row_deadline(
+    shutdown: &CancellationToken,
+    query_cancel: &CancellationToken,
+) -> Result<(), WarmupBound> {
+    if shutdown.is_cancelled() || query_cancel.is_cancelled() {
+        return Err(warmup_bound_from_shutdown(shutdown));
+    }
+    Ok(())
 }
 
 /// Map a DISTINCT/`drain` stream error. Timeout and cancel become
@@ -2323,6 +2338,54 @@ mod tests {
             classify_stream_result(&shutdown, result),
             "Cancelled",
             "a QueryCancelled observed after shutdown must abort remaining warmup"
+        );
+    }
+
+    /// Copilot: after the DISTINCT lifetime timer cancels `query_cancel`,
+    /// the row loop kept issuing nested replays (`query_cancelled=true
+    /// processed=40 elapsed_ms=83 timeout_ms=20`) and held `/v1/ready`.
+    #[tokio::test]
+    async fn distinct_row_loop_stops_when_query_token_cancels() {
+        let shutdown = CancellationToken::new();
+        let query_cancel = CancellationToken::new();
+        let query_cancel_timer = query_cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            query_cancel_timer.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let mut processed = 0_u32;
+        let mut result = Ok(());
+        for _ in 0..40 {
+            if let Err(bound) = warmup_row_deadline(&shutdown, &query_cancel) {
+                result = Err(bound);
+                break;
+            }
+            processed += 1;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let elapsed_ms = start.elapsed().as_millis();
+        eprintln!(
+            "query_cancelled={} processed={processed} elapsed_ms={elapsed_ms} timeout_ms=20",
+            query_cancel.is_cancelled()
+        );
+        assert_eq!(
+            result,
+            Err(WarmupBound::TimedOut),
+            "a DISTINCT lifetime cancel mid-batch must skip the rest of the batch"
+        );
+        assert!(
+            processed < 40,
+            "must stop before the remaining DISTINCT keys, processed={processed}"
+        );
+        assert!(
+            query_cancel.is_cancelled(),
+            "the DISTINCT query token must have fired"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a query-token cancel must not look like runtime shutdown"
         );
     }
 
