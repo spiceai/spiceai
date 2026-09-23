@@ -59,11 +59,13 @@ use leased::{LeasedBucket, LeasedBucketConfig, LeasedBucketMetrics};
 const DEFAULT_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(90);
 
 /// Resolution multiplier for adaptive weighting. When adaptive control is
-/// enabled, every limiter is built at `M`× its configured capacity and a healthy
-/// request charges `M` cells (instead of 1), so the per-request charge
-/// `round(M / coefficient)` has ~`1/M` resolution. Without it the integer weight
-/// `round(1 / coefficient)` stays 1 for any coefficient above ~0.67, leaving
-/// mild throttling a no-op. This is a purely internal scale: the buckets stay
+/// enabled, every limiter is built at a [`ADAPTIVE_WEIGHT_RESOLUTION`]
+/// multiple of its configured capacity and a healthy
+/// request charges [`ADAPTIVE_WEIGHT_RESOLUTION`] cells instead of 1. This enables
+/// fractional weights (to 0.01 resolution) for a integer based bucket. Therefore, the
+///  per-request charge `round(M / coefficient)` has ~`1/M` resolution. Without it,
+///  the integer weight `round(1 / coefficient)` stays 1 for any coefficient above ~0.67,
+/// leaving mild throttling a no-op. This is a purely internal scale: the buckets stay
 /// logically the same size and every public metric reports logical (unscaled)
 /// units.
 const ADAPTIVE_WEIGHT_RESOLUTION: u32 = 100;
@@ -298,8 +300,8 @@ impl RateControllerBuilder {
         let jitter = self.jitter;
         let metrics = self.metrics.unwrap_or_default();
 
-        // With adaptive control, every limiter is built at `resolution`x capacity
-        // and a healthy request charges `resolution` cells, so the adaptive weight
+        // With adaptive control, every limiter is built at `ADAPTIVE_WEIGHT_RESOLUTION` x capacity
+        // and a healthy request charges `ADAPTIVE_WEIGHT_RESOLUTION` cells, so the adaptive weight
         // has sub-integer resolution (see [`ADAPTIVE_WEIGHT_RESOLUTION`]). Without
         // adaptive control the resolution is 1 and nothing is scaled.
         let resolution = if self.adaptive.is_some() {
