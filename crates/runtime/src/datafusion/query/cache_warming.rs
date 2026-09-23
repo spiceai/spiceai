@@ -598,9 +598,15 @@ impl DataFusion {
         cache_provider: &cache::QueryResultsCacheProvider,
     ) -> Result<u64, WarmupBound> {
         if template.bindings.is_empty() {
-            return execute_warmup_sql(self, &template.sql, None, request_context)
-                .await
-                .map(u64::from);
+            return execute_warmup_sql(
+                self,
+                &template.sql,
+                None,
+                request_context,
+                request_context.cancellation_token(),
+            )
+            .await
+            .map(u64::from);
         }
         let Some(distinct_sql) = distinct_keys_sql(template) else {
             return Ok(0);
@@ -846,7 +852,15 @@ async fn warm_distinct_key_rows(
                 continue;
             };
 
-            match execute_warmup_sql(df, template_sql, Some(values), request_context).await {
+            match execute_warmup_sql(
+                df,
+                template_sql,
+                Some(values),
+                request_context,
+                &query_cancel,
+            )
+            .await
+            {
                 Ok(true) => {
                     stored += 1;
                     cache_provider.run_pending_tasks().await;
@@ -867,12 +881,43 @@ async fn execute_warmup_sql(
     sql: &str,
     parameters: Option<Vec<ScalarValue>>,
     request_context: &Arc<RequestContext>,
+    parent_cancel: &CancellationToken,
 ) -> Result<bool, WarmupBound> {
     let timeout = request_context
         .query_timeout()
         .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
     let shutdown = request_context.cancellation_token();
-    let query_cancel = request_context.child_cancellation_token();
+    // Child of the DISTINCT (or request) token so a lifetime-timer fire
+    // cancels this replay. Nested timeout cancels only this child.
+    let query_cancel = parent_cancel.child_token();
+    let work = execute_warmup_sql_inner(
+        df,
+        sql,
+        parameters,
+        request_context,
+        shutdown,
+        query_cancel.clone(),
+        timeout,
+    );
+    tokio::select! {
+        biased;
+        () = parent_cancel.cancelled() => {
+            query_cancel.cancel();
+            Err(warmup_bound_from_shutdown(shutdown))
+        }
+        result = work => result
+    }
+}
+
+async fn execute_warmup_sql_inner(
+    df: &Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<Vec<ScalarValue>>,
+    request_context: &Arc<RequestContext>,
+    shutdown: &CancellationToken,
+    query_cancel: CancellationToken,
+    timeout: Duration,
+) -> Result<bool, WarmupBound> {
     let mut builder = QueryBuilder::new(sql, Arc::clone(df))
         .for_results_cache_warming()
         .cancellation_token(query_cancel.clone());
@@ -1575,11 +1620,13 @@ mod tests {
 
         // Binding-free templates replay the stored SQL as-is. Without read-only
         // enforcement, a corrupted catalog could INSERT/DDL at startup.
+        let ctx = request_context();
         let ok = execute_warmup_sql(
             &df,
             "INSERT INTO orders VALUES (1)",
             None,
-            &request_context(),
+            &ctx,
+            ctx.cancellation_token(),
         )
         .await
         .expect("warmup DML is rejected, not timed out");
@@ -2387,6 +2434,60 @@ mod tests {
             !shutdown.is_cancelled(),
             "a query-token cancel must not look like runtime shutdown"
         );
+    }
+
+    /// Copilot: nested `execute_warmup_sql` used a sibling of the DISTINCT
+    /// token, so a lifetime-timer fire at 20 ms left the nested replay
+    /// running (`nested_cancelled=false` finished at 102 ms).
+    #[tokio::test]
+    async fn nested_replay_cancels_when_distinct_token_fires() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-nested-cancel-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        df.ctx
+            .register_table(
+                TableReference::bare("orders"),
+                Arc::new(PendingScanTable { schema }) as Arc<dyn TableProvider>,
+            )
+            .expect("register pending table");
+
+        let distinct_cancel = CancellationToken::new();
+        let ctx = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(CacheControl::Cache(CacheKeyType::Default))
+                .with_cache_namespace(CacheNamespace::Public)
+                .with_query_timeout(Some(Duration::from_millis(200)))
+                .build(),
+        );
+        let distinct_timer = distinct_cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            distinct_timer.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result =
+            execute_warmup_sql(&df, "SELECT id FROM orders", None, &ctx, &distinct_cancel).await;
+        let elapsed_ms = start.elapsed().as_millis();
+        let nested_cancelled = distinct_cancel.is_cancelled();
+        eprintln!("nested_cancelled={nested_cancelled} elapsed_ms={elapsed_ms}");
+        assert_eq!(
+            result,
+            Err(WarmupBound::TimedOut),
+            "a DISTINCT token fire must drop the nested replay, not wait for its own timeout"
+        );
+        assert!(nested_cancelled, "the DISTINCT token must have fired");
+        assert!(
+            elapsed_ms < 80,
+            "nested replay must stop at the DISTINCT cancel, not finish at the 200ms bound, took {elapsed_ms}ms"
+        );
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
     }
 
     #[tokio::test]
