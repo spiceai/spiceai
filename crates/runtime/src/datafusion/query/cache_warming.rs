@@ -460,24 +460,21 @@ impl DataFusion {
                 return;
             }
             let replay_timeout = warmup_replay_timeout(app.as_ref());
-            let run = {
+            let shutdown = status.shutdown_token();
+            // Build the hold *before* hopping onto the refresh runtime so
+            // dropping an unpolled spawned task still releases `/v1/ready`.
+            let run = run_warmup_releasing_ready(Arc::clone(&status), shutdown.clone(), {
                 let df = Arc::clone(&df);
-                let status = Arc::clone(&status);
                 async move {
-                    let shutdown = status.shutdown_token();
-                    run_warmup_releasing_ready(
-                        Arc::clone(&status),
-                        shutdown.clone(),
-                        df.run_warmup_templates_bounded(
-                            &templates,
-                            app.as_ref(),
-                            shutdown,
-                            replay_timeout,
-                        ),
+                    df.run_warmup_templates_bounded(
+                        &templates,
+                        app.as_ref(),
+                        shutdown,
+                        replay_timeout,
                     )
                     .await;
                 }
-            };
+            });
             if let Some(runtime) = refresh_runtime {
                 runtime.spawn(run);
             } else {
@@ -751,24 +748,31 @@ async fn bound_warmup_op<T>(
     }
 }
 
-/// Run warmup, then always release the ready-hold. A stalled replay is
-/// interrupted when `shutdown` is cancelled (runtime shutdown).
-async fn run_warmup_releasing_ready<F>(
+/// Run warmup, then always release the ready-hold. The hold is created
+/// before the returned future is polled, so dropping an unpolled task
+/// (refresh runtime shutting down) still releases `/v1/ready`. A stalled
+/// replay is interrupted when `shutdown` is cancelled (runtime shutdown).
+#[must_use]
+fn run_warmup_releasing_ready<F>(
     status: Arc<status::RuntimeStatus>,
     shutdown: CancellationToken,
     warmup: F,
-) where
+) -> impl Future<Output = ()>
+where
     F: Future<Output = ()>,
 {
-    let _release = DatasetReadyHold { status };
-    tokio::select! {
-        biased;
-        () = shutdown.cancelled() => {
-            tracing::debug!(
-                "SQL results cache warmup stopped because the runtime is shutting down"
-            );
+    let release = DatasetReadyHold { status };
+    async move {
+        let _release = release;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                tracing::debug!(
+                    "SQL results cache warmup stopped because the runtime is shutting down"
+                );
+            }
+            () = warmup => {}
         }
-        () = warmup => {}
     }
 }
 
@@ -975,6 +979,34 @@ mod tests {
             .with_results_cache_warmup_enabled(false)
             .build(),
         )
+    }
+
+    /// `scan` never completes, so a warmup replay of this table hangs until the
+    /// per-op bound fires. Used to exercise `QueryBuilder` + `query.run()`.
+    #[derive(Debug)]
+    struct PendingScanTable {
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for PendingScanTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            datafusion::datasource::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[datafusion::prelude::Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            std::future::pending().await
+        }
     }
 
     fn register_table(df: &Arc<DataFusion>, name: &str, values: Vec<i64>) {
@@ -1771,27 +1803,37 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let start = std::time::Instant::now();
-        run_warmup_releasing_ready(Arc::clone(&status), shutdown, async {
-            let bound = bound_warmup_op(
-                &CancellationToken::new(),
-                Duration::from_millis(50),
-                std::future::pending::<()>(),
-            )
-            .await;
-            assert_eq!(
-                bound,
-                Err(WarmupBound::TimedOut),
-                "a non-completing replay must be bounded"
-            );
-        })
-        .await;
-
-        let task_done = true;
+        let task = tokio::spawn({
+            let status = Arc::clone(&status);
+            async move {
+                run_warmup_releasing_ready(status, shutdown, async {
+                    let bound = bound_warmup_op(
+                        &CancellationToken::new(),
+                        Duration::from_millis(50),
+                        std::future::pending::<()>(),
+                    )
+                    .await;
+                    assert_eq!(
+                        bound,
+                        Err(WarmupBound::TimedOut),
+                        "a non-completing replay must be bounded"
+                    );
+                })
+                .await;
+            }
+        });
+        let task_done = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .is_ok();
         let warmup_hung = !task_done;
         let ready_released = status.is_ready();
         eprintln!(
             "warmup_hung={warmup_hung} ready_released={ready_released} task_done={task_done} elapsed_ms={}",
             start.elapsed().as_millis()
+        );
+        assert!(
+            task_done,
+            "a stalled replay must finish once the bound fires"
         );
         assert!(
             ready_released,
@@ -1802,6 +1844,106 @@ mod tests {
             "the stalled replay must not block readiness, took {:?}",
             start.elapsed()
         );
+    }
+
+    /// Dropping the warmup future before its first poll (refresh runtime
+    /// shutting down) must still release the ready-hold.
+    #[tokio::test]
+    async fn dropped_unpolled_warmup_future_releases_ready_hold() {
+        let status = status::RuntimeStatus::new();
+        status.set_ready_state(status::RuntimeReadyState::OnRegistration);
+        status.update_dataset(
+            &TableReference::bare("orders"),
+            status::ComponentStatus::Initializing,
+        );
+        status.hold_dataset_ready();
+        assert!(!status.is_ready());
+
+        let fut = run_warmup_releasing_ready(
+            Arc::clone(&status),
+            CancellationToken::new(),
+            std::future::pending(),
+        );
+        let guard_body_ran = false;
+        drop(fut);
+        let ready_released = status.is_ready();
+        eprintln!("guard_body_ran={guard_body_ran} ready_released={ready_released}");
+        assert!(
+            ready_released,
+            "dropping an unpolled warmup future must release the ready-hold"
+        );
+    }
+
+    /// Stalls the real warmup replay (`run_warmup_templates_bounded` →
+    /// `QueryBuilder` → `query.run()` → table `scan`) and proves the bound
+    /// finishes the task and releases readiness.
+    #[tokio::test]
+    async fn stalled_warmup_query_run_releases_ready_hold() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-stall-scan-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        df.ctx
+            .register_table(
+                TableReference::bare("orders"),
+                Arc::new(PendingScanTable { schema }) as Arc<dyn TableProvider>,
+            )
+            .expect("register pending table");
+
+        let status = status::RuntimeStatus::new();
+        status.set_ready_state(status::RuntimeReadyState::OnRegistration);
+        status.update_dataset(
+            &TableReference::bare("orders"),
+            status::ComponentStatus::Initializing,
+        );
+        status.hold_dataset_ready();
+        assert!(!status.is_ready());
+
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders".to_string(),
+            bindings: Vec::new(),
+        };
+        let shutdown = CancellationToken::new();
+        let start = std::time::Instant::now();
+        let task = tokio::spawn({
+            let status = Arc::clone(&status);
+            async move {
+                run_warmup_releasing_ready(
+                    status,
+                    shutdown,
+                    df.run_warmup_templates_bounded(
+                        std::slice::from_ref(&template),
+                        None,
+                        CancellationToken::new(),
+                        Duration::from_millis(200),
+                    ),
+                )
+                .await;
+            }
+        });
+        let task_done = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .is_ok();
+        let warmup_hung = !task_done;
+        let ready_released = status.is_ready();
+        eprintln!(
+            "warmup_hung={warmup_hung} ready_released={ready_released} task_done={task_done} elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
+        assert!(
+            task_done,
+            "a stalled QueryBuilder replay must finish once the bound fires"
+        );
+        assert!(
+            ready_released,
+            "a stalled QueryBuilder replay must release the ready-hold"
+        );
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
     }
 
     #[tokio::test]
