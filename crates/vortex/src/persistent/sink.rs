@@ -108,7 +108,9 @@ pub(super) enum ShardSpec {
     /// `hash_fallback` marks bounds estimated from a sample that may not describe
     /// the rows still to come. If one shard then receives far more than its share
     /// (see [`RangeImbalanceGuard`]), the rest of the write hashes the key
-    /// instead, so one encoder is not left with the remainder of the write.
+    /// instead, so one encoder is not left with the remainder of the write. The
+    /// guard checks at most every `RangeImbalanceGuard::SLICE_ROWS` rows, slicing
+    /// larger batches, so it can act inside a batch as well as between batches.
     Range {
         expr: PhysicalExprRef,
         bounds: Vec<ScalarValue>,
@@ -185,6 +187,12 @@ struct RangeImbalanceGuard {
 
 impl RangeImbalanceGuard {
     const MIN_ROWS: u64 = 262_144;
+
+    /// Most rows routed between two checks while the guard is armed. A larger
+    /// batch is routed in zero-copy slices of this many rows, so a batch holding
+    /// most of the input cannot be placed whole by the estimated bounds before
+    /// the guard has seen any of it.
+    const SLICE_ROWS: usize = 65_536;
 
     fn new(expr: PhysicalExprRef, shards: usize) -> Self {
         Self {
@@ -765,31 +773,52 @@ async fn write_record_batch_stream_to_files(
                     }
                 }
                 Some(router) => {
-                    let mut assignments: Vec<(usize, RecordBatch)> = Vec::new();
-                    router.route(batch, &mut assignments)?;
-                    if let Some(guard) = imbalance_guard.as_mut() {
-                        for (idx, sub) in &assignments {
-                            guard.record(*idx, sub.num_rows());
+                    let rows = batch.num_rows();
+                    let slices: Vec<RecordBatch> = if imbalance_guard.is_some()
+                        && rows > RangeImbalanceGuard::SLICE_ROWS
+                    {
+                        (0..rows)
+                            .step_by(RangeImbalanceGuard::SLICE_ROWS)
+                            .map(|offset| {
+                                batch.slice(
+                                    offset,
+                                    RangeImbalanceGuard::SLICE_ROWS.min(rows - offset),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        vec![batch]
+                    };
+                    for batch in slices {
+                        let mut assignments: Vec<(usize, RecordBatch)> = Vec::new();
+                        router.route(batch, &mut assignments)?;
+                        if let Some(guard) = imbalance_guard.as_mut() {
+                            for (idx, sub) in &assignments {
+                                guard.record(*idx, sub.num_rows());
+                            }
+                            if guard.is_imbalanced() {
+                                tracing::debug!(
+                                    rows = guard.total,
+                                    shard_rows = ?guard.rows,
+                                    "Estimated range bounds left one shard with most rows; hashing the key for the rest of the write"
+                                );
+                                *router = ShardRouter::Partitioned(
+                                    BatchPartitioner::new_hash_partitioner(
+                                        vec![Arc::clone(&guard.expr)],
+                                        num_shards,
+                                        Time::default(),
+                                    )?,
+                                );
+                                imbalance_guard = None;
+                            }
                         }
-                        if guard.is_imbalanced() {
-                            tracing::debug!(
-                                rows = guard.total,
-                                shard_rows = ?guard.rows,
-                                "Estimated range bounds left one shard with most rows; hashing the key for the rest of the write"
-                            );
-                            *router = ShardRouter::Partitioned(
-                                BatchPartitioner::new_hash_partitioner(
-                                    vec![Arc::clone(&guard.expr)],
-                                    num_shards,
-                                    Time::default(),
-                                )?,
-                            );
-                            imbalance_guard = None;
+                        for (idx, sub) in assignments {
+                            if senders[idx].send(sub).await.is_err() {
+                                shard_closed_early = true;
+                                break;
+                            }
                         }
-                    }
-                    for (idx, sub) in assignments {
-                        if senders[idx].send(sub).await.is_err() {
-                            shard_closed_early = true;
+                        if shard_closed_early {
                             break;
                         }
                     }
@@ -3494,12 +3523,22 @@ mod tests {
             ScalarValue::Int64(Some(SAMPLED * 3 / 4)),
         ];
 
-        for hash_fallback in [false, true] {
+        // (hash fallback, rows per input batch): `None` delivers the sampled head
+        // as one batch and everything after it as another, so the fallback has to
+        // act partway through a single batch.
+        for (hash_fallback, batch_rows) in [(false, Some(8192)), (true, Some(8192)), (true, None)] {
             let ctx = TestSessionContext::default();
-            let batches: Vec<RecordBatch> = keys
-                .chunks(8192)
-                .map(|chunk| one_col_batch(&schema, chunk.to_vec()))
-                .collect();
+            let batches: Vec<RecordBatch> = if let Some(rows) = batch_rows {
+                keys.chunks(rows)
+                    .map(|chunk| one_col_batch(&schema, chunk.to_vec()))
+                    .collect()
+            } else {
+                let (head, rest) = keys.split_at(usize::try_from(SAMPLED)?);
+                vec![
+                    one_col_batch(&schema, head.to_vec()),
+                    one_col_batch(&schema, rest.to_vec()),
+                ]
+            };
             let results = run_sharded_write(
                 ctx.store.clone(),
                 Arc::clone(&schema),
@@ -3545,7 +3584,8 @@ mod tests {
             if hash_fallback {
                 assert_eq!(
                     shards_beyond_sample, 4,
-                    "the fallback spreads keys beyond the sampled range over every shard"
+                    "the fallback spreads keys beyond the sampled range over every shard \
+                     (rows per input batch: {batch_rows:?})"
                 );
             } else {
                 assert_eq!(

@@ -98,6 +98,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -17470,7 +17471,8 @@ impl CayenneTableProvider {
     /// reaches [`INPUT_RANGE_SAMPLE_BYTES`] — the batch that crosses the mark
     /// included, since a batch is in memory once pulled — with each batch charged
     /// to the query memory pool until the writer takes it (a refused charge ends
-    /// the buffering, and the refused batch is written as it arrived). Each
+    /// the buffering, and the refused batch is written as it arrived); the keys
+    /// sampled from it are charged too while the split points are cut. Each
     /// routing candidate ([`Self::range_routing_candidates`]) is then tried on the
     /// head in turn, as [`Self::overwrite_range_plan`] tries them on a loaded
     /// table, and the first to yield split points for every shard routes the
@@ -17569,6 +17571,7 @@ impl CayenneTableProvider {
                 shards,
                 exhausted,
                 MAX_SAMPLE_ROWS,
+                &reservation,
             )
             .map(|bounds| OverwriteRangePlan {
                 column: column.clone(),
@@ -17604,6 +17607,11 @@ impl CayenneTableProvider {
     /// Equal-count split points for `shards` from the key column of an input's
     /// buffered head, or `None` when the head is not a fair sample of the key.
     /// See [`Self::input_range_plan`].
+    ///
+    /// The keys it copies out of the head are charged to `reservation` until it
+    /// returns, and a refused charge gives `None`: the head is already charged, so
+    /// only the sample could take the load past the query memory pool. The sort
+    /// scratch is a few bytes per sampled key, at most `max_sample_rows` of them.
     fn sampled_input_bounds(
         head: &[RecordBatch],
         key_index: usize,
@@ -17611,6 +17619,7 @@ impl CayenneTableProvider {
         shards: usize,
         exhausted: bool,
         max_sample_rows: usize,
+        reservation: &MemoryReservation,
     ) -> Option<Vec<ScalarValue>> {
         use arrow::array::UInt32Array;
 
@@ -17618,6 +17627,8 @@ impl CayenneTableProvider {
         if total_rows == 0 {
             return None;
         }
+        // Freed when this returns, with every copy it covers.
+        let sample_charge = reservation.new_empty();
         let stride = total_rows.div_ceil(max_sample_rows.max(1)).max(1);
         let mut parts: Vec<ArrayRef> = Vec::with_capacity(head.len());
         // The input window each sampled key came from, in sample order.
@@ -17634,22 +17645,32 @@ impl CayenneTableProvider {
                 }
             }
             if !indices.is_empty() {
-                let picked = arrow::compute::take(
-                    batch.column(key_index).as_ref(),
-                    &UInt32Array::from(indices),
-                    None,
-                )
-                .ok()?;
-                parts.push(compact_sampled_views(picked));
+                let picked = compact_sampled_views(
+                    arrow::compute::take(
+                        batch.column(key_index).as_ref(),
+                        &UInt32Array::from(indices),
+                        None,
+                    )
+                    .ok()?,
+                );
+                sample_charge
+                    .try_grow(picked.get_array_memory_size())
+                    .ok()?;
+                parts.push(picked);
             }
             position = position.saturating_add(rows);
         }
         let refs: Vec<&dyn Array> = parts.iter().map(AsRef::as_ref).collect();
         let sample = arrow::compute::concat(&refs).ok()?;
+        sample_charge
+            .try_grow(sample.get_array_memory_size())
+            .ok()?;
         let sample = if sample.data_type() == key_type {
             sample
         } else {
-            arrow::compute::cast(&sample, key_type).ok()?
+            let cast = arrow::compute::cast(&sample, key_type).ok()?;
+            sample_charge.try_grow(cast.get_array_memory_size()).ok()?;
+            cast
         };
         // NULL keys all route to the first shard; past one shard's share of the
         // rows they would pile the write onto one encoder.
@@ -46703,6 +46724,14 @@ mod tests {
         i64::try_from((i * 7919) % n).expect("fits i64")
     }
 
+    /// A reservation on a pool that never refuses, for the input sampling tests.
+    fn unbounded_reservation() -> MemoryReservation {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new("input_range_sample_test").register(&pool)
+    }
+
     /// Asserts that `provider`'s current snapshot holds `rows` rows in `files`
     /// files, each in order of the Int64 key in the schema's first column and
     /// covering a key range no other file overlaps.
@@ -46790,6 +46819,7 @@ mod tests {
                 SHARDS,
                 exhausted,
                 65_536,
+                &unbounded_reservation(),
             )
         };
 
@@ -46832,6 +46862,46 @@ mod tests {
         );
     }
 
+    /// The keys sampled out of a first load's head are charged to the query
+    /// memory pool while the split points are cut and released afterwards. A
+    /// pool that cannot hold them leaves the load hashed, rather than let the
+    /// sample run outside it.
+    #[test]
+    fn sampled_input_bounds_charge_the_sample_to_the_pool() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
+
+        const BATCHES: usize = 40;
+        const ROWS: usize = 8192;
+        const N: usize = BATCHES * ROWS;
+        let head = int64_key_batches(BATCHES, ROWS, |b, r| scrambled(b * ROWS + r, N));
+        let bounds = |pool_bytes: usize| {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_bytes));
+            let reservation = MemoryConsumer::new("input_range_sample_test").register(&pool);
+            let cuts = CayenneTableProvider::sampled_input_bounds(
+                &head,
+                0,
+                &DataType::Int64,
+                4,
+                false,
+                65_536,
+                &reservation,
+            );
+            assert_eq!(
+                pool.reserved(),
+                0,
+                "the sample is released once the split points are cut"
+            );
+            cuts
+        };
+        // 65,536 sampled Int64 keys, held twice at the peak: about 1 MiB.
+        assert_eq!(
+            bounds(64 * 1024),
+            None,
+            "a pool that cannot hold the sample refuses it"
+        );
+        assert!(bounds(16 * 1024 * 1024).is_some_and(|cuts| cuts.len() == 3));
+    }
+
     /// A head whose windows each span a wide key range but drift through the
     /// key domain as the input goes on — early windows low, late windows high —
     /// is not a fair sample of the load, so the first load hashes.
@@ -46855,7 +46925,8 @@ mod tests {
                 &DataType::Int64,
                 4,
                 false,
-                65_536
+                65_536,
+                &unbounded_reservation(),
             ),
             None
         );
@@ -46885,7 +46956,15 @@ mod tests {
                 .collect()
         };
         let bounds = |head: &[RecordBatch]| {
-            CayenneTableProvider::sampled_input_bounds(head, 0, &DataType::Utf8, 4, false, 65_536)
+            CayenneTableProvider::sampled_input_bounds(
+                head,
+                0,
+                &DataType::Utf8,
+                4,
+                false,
+                65_536,
+                &unbounded_reservation(),
+            )
         };
         assert!(bounds(&head(&|i| (i * 7919) % N)).is_some_and(|cuts| cuts.len() == 3));
         assert_eq!(bounds(&head(&|i| i)), None);
