@@ -15083,7 +15083,8 @@ impl CayenneTableProvider {
 
     /// After `checkpoint_inlined_data` flushes inline rows to a Vortex file at
     /// `flush_sequence`, walk the supplied PKs and upgrade any pre-existing
-    /// delete-only tombstone (`insert_seq=None`) to record `insert_seq=flush_sequence`.
+    /// tombstone that still hides them (`insert_seq` absent or older than
+    /// `delete_seq`) to record `insert_seq=flush_sequence`.
     ///
     /// Without this upgrade, listing-time pruning via
     /// `vortex_key_delete_pushdown_filter` and the runtime
@@ -15106,14 +15107,17 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // Scan the LIVE in-memory index for flushed PKs that still carry a
-        // delete-only tombstone (its `insert_sequence` must be stamped so scans
-        // see the re-insert). Grouped by `delete_sequence` for a single rcu fold.
+        // Scan the LIVE in-memory index for flushed PKs whose tombstone still
+        // hides them: delete-only, or carrying an insert older than its delete
+        // (a key re-inserted, deleted, then re-inserted again). Its
+        // `insert_sequence` must be stamped so scans see the re-insert. Grouped
+        // by `delete_sequence` for a single rcu fold.
         let current = deletion_snapshot.load_full();
         let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
         for &pk in flushed_pks {
             if let Some(t) = current.tombstones.get(pk)
-                && t.insert_sequence.is_none()
+                && t.insert_sequence
+                    .is_none_or(|insert| insert < t.delete_sequence)
             {
                 by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
             }
@@ -42780,6 +42784,82 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// A key re-inserted after its delete was checkpointed must stay visible even
+    /// when its tombstone still carries an older insert: the upgrade must stamp
+    /// every delete-dominated tombstone, not only delete-only ones.
+    #[tokio::test]
+    async fn mem_tier_reinsert_over_stale_insert_tombstone_stays_visible() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("reinsert_stale_insert", Arc::clone(&runtime_env))
+                .await;
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+        let append = |ids: &'static [i64]| {
+            let batch = int64_id_batch(ids);
+            let bytes = batch.get_array_memory_size() as u64;
+            (batch, bytes)
+        };
+
+        let (batch, bytes) = append(&[1, 2]);
+        provider
+            .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+            .await
+            .expect("seed append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
+
+        // Delete key 2 and re-insert it twice, checkpointing each step so every
+        // delete is absorbed before the next insert. The first re-insert leaves
+        // the tombstone with an insert sequence that the second delete outdates.
+        for round in 0..2 {
+            provider
+                .write_cdc_delete_keys_in_memory(&int64_id_batch(&[2]))
+                .await
+                .expect("absorb delete")
+                .expect("the delete is absorbed, not routed durable");
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("delete checkpoint");
+            assert_eq!(
+                scan_sorted_ids(&provider).await,
+                vec![1],
+                "round {round}: deleted"
+            );
+
+            let (batch, bytes) = append(&[2]);
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("re-insert");
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("re-insert checkpoint");
+            assert_eq!(
+                scan_sorted_ids(&provider).await,
+                vec![1, 2],
+                "round {round}: the re-inserted key must be visible after its checkpoint"
+            );
+        }
+
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("reinsert_stale_insert")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2],
+            "the re-insert is durable across restart"
+        );
     }
 
     /// Fix B (i) — a delete-only burst absorbed into the mem tier: the
