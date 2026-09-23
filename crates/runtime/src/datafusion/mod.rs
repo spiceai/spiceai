@@ -5671,6 +5671,24 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
+    // Only `CayenneSnapshotEngine` writes the per-dataset metastore slice a
+    // Cayenne bootstrap reads; the default engine archives the raw `cayenne.db`
+    // instead, which the reader cannot apply because its own metastore already
+    // exists at extract time. `snapshot_engine_for_source` answers `None` when
+    // the catalog or the data directory cannot be resolved, and creating a
+    // snapshot makes whatever it uploads the store's `current-snapshot-id` — so
+    // publishing on that path would replace a restorable current snapshot with
+    // one nothing can load. `snapshot_before_recreate` declines on exactly this
+    // condition; this is the same gate on the periodic publish path.
+    if acceleration_settings.engine == Engine::Cayenne && snapshot_engine_override.is_none() {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Dataset '{}' will not publish snapshots: its Cayenne metastore catalog is unavailable, so an archive of it would carry no metastore slice and could not be restored. Check that this dataset's `cayenne_metadata_dir` and data directory are readable.",
+            dataset.name
+        );
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -6492,6 +6510,60 @@ mod tests {
             .await;
 
             assert!(result.expect("config should exist").is_none());
+        }
+
+        /// A Cayenne dataset must not publish a snapshot the default engine
+        /// wrote: that archive carries the raw `cayenne.db` and no per-dataset
+        /// metastore slice, and publishing it makes an unrestorable archive the
+        /// store's `current-snapshot-id`. `snapshot_engine_for_source` returns
+        /// `None` on a catalog or data-directory failure, so the absent
+        /// override is the observable form of that failure here.
+        ///
+        /// Partitioned and unpartitioned alike: `snapshot_before_recreate`
+        /// draws no such distinction, and the slice is what makes either one
+        /// restorable.
+        #[tokio::test]
+        async fn cayenne_does_not_publish_without_its_snapshot_engine() {
+            for partition_by in [
+                vec![],
+                vec![spicepod::partitioning::PartitionedBy {
+                    name: "part_col".to_string(),
+                    expression: "part_col".to_string(),
+                }],
+            ] {
+                let dataset = create_test_dataset(None).await;
+                let acceleration = Acceleration {
+                    partition_by,
+                    ..create_acceleration_with_trigger(
+                        Some("file:///tmp".to_string()),
+                        Engine::Cayenne,
+                        Some(SnapshotsTrigger::RefreshComplete),
+                        None,
+                        &dataset.runtime().secrets(),
+                    )
+                };
+                let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+                let result = build_snapshot_creation_config(
+                    &dataset,
+                    &acceleration,
+                    RefreshMode::Full,
+                    AccelerationLayout::cayenne(
+                        temp_dir.path().join("metadata"),
+                        temp_dir.path().join("data"),
+                    ),
+                    None,
+                )
+                .await;
+
+                assert!(
+                    result
+                        .expect("an absent snapshot engine is not an error")
+                        .is_none(),
+                    "Cayenne must not publish through the default engine (partition_by={:?})",
+                    acceleration.partition_by
+                );
+            }
         }
 
         #[tokio::test]
