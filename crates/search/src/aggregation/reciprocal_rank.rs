@@ -34,7 +34,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::logical_expr::{JoinType, Operator, binary_expr, col, lit};
 use datafusion::prelude::{SessionContext, coalesce};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::ResultExt;
 
 /// Reciprocal Rank Fusion (RRF) is a method for combining multiple ranked sets of search results.

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use fundu::ParseError;
 use key::CacheKey;
 use key::RawCacheKey;

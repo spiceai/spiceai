@@ -29,7 +29,7 @@ use datafusion::catalog::CatalogProviderList;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::CreateTableStatementExtension;
 

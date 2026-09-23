@@ -45,7 +45,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;

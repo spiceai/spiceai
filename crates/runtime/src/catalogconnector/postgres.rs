@@ -34,7 +34,7 @@ use data_components::postgres::provider::PostgresCatalogProvider;
 use data_components::{Read, RefreshableCatalogProvider};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;

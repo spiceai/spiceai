@@ -57,7 +57,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::TableProviderFilterPushDown;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl};
@@ -1232,7 +1232,7 @@ mod tests {
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{Volatility, create_udf};
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use runtime_query_engine::query_engine::QueryEngine;
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;

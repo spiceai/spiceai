@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::ResultExt;
 use spice_table::{Index, IndexLayer, SpiceTable};
 use spicepod::semantic::{Column, IndexStore};
@@ -213,7 +213,7 @@ pub(crate) fn add_full_text_search_to_table(
 pub(crate) async fn add_elasticsearch_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
-    tbl: &datafusion::sql::TableReference,
+    tbl: &datafusion::common::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
 ) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     let index =
@@ -247,7 +247,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
 pub(crate) async fn add_compound_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
-    tbl: &datafusion::sql::TableReference,
+    tbl: &datafusion::common::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
     on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
     stream_attached: bool,
@@ -337,7 +337,7 @@ pub(crate) async fn add_compound_fts_to_table(
 pub(crate) async fn build_elasticsearch_text_index(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
-    tbl: &datafusion::sql::TableReference,
+    tbl: &datafusion::common::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
 ) -> Result<
     Arc<search::index::elasticsearch::ElasticsearchTextIndex>,
@@ -534,7 +534,7 @@ mod tests {
             params,
             es_index: "docs".to_string(),
         };
-        let table_ref = datafusion::sql::TableReference::parse_str("docs");
+        let table_ref = datafusion::common::TableReference::parse_str("docs");
 
         let err = add_elasticsearch_fts_to_table(table, &columns, &table_ref, &fts_params)
             .await
@@ -566,7 +566,7 @@ mod tests {
             Column::new("body")
                 .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
         ];
-        let table_ref = datafusion::sql::TableReference::parse_str("docs");
+        let table_ref = datafusion::common::TableReference::parse_str("docs");
 
         let index = build_full_text_database_index(
             table,

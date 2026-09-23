@@ -19,7 +19,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::Expr;
 use spicepod::partitioning::PartitionedBy;
 

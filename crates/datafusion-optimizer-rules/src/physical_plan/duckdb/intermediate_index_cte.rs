@@ -439,7 +439,7 @@ mod tests {
     use datafusion::catalog::TableProvider;
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionContext, col, lit};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_table_providers::duckdb::sql_table::DuckDBTable;
     use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
     use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;

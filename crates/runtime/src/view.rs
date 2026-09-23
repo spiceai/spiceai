@@ -17,7 +17,8 @@ use crate::{
     component::view::View, embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table,
 };
-use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
+use ::datafusion::common::{TableReference};
+use ::datafusion::sql::{parser, sqlparser::ast};
 use datafusion::{
     catalog::TableProvider,
     datasource::ViewTable,

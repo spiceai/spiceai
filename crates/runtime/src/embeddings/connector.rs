@@ -718,7 +718,7 @@ pub(crate) fn duckdb_embedding_columns_from_view(
 #[cfg(feature = "duckdb")]
 pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     view: &View,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     builder: &mut crate::accelerated::Builder,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(vector_engine) = duckdb_vector_store_for_view(view) else {

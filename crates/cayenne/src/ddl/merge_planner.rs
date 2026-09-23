@@ -26,7 +26,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Column, Expr, JoinType, col};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_common::ResolvedTableReference;
 use datafusion_dml::{CatalogDmlHandler, MergeParams};
 

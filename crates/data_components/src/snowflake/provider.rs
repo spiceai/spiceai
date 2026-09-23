@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::stream::{self, StreamExt};
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
@@ -490,7 +490,7 @@ mod tests {
     use crate::{Read, ReadWrite};
     use async_trait::async_trait;
     use datafusion::datasource::{MemTable, TableProvider};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},

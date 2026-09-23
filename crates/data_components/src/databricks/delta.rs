@@ -20,7 +20,7 @@ use crate::unity_catalog::{UCTable, UnityCatalog};
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};

@@ -48,7 +48,7 @@ pub(crate) mod search {
 
     use anyhow::anyhow;
     use app::AppBuilder;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use serde_json::json;
     use spicepod::{
         component::{dataset::Dataset, embeddings::EmbeddingChunkConfig},

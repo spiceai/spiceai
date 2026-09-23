@@ -29,7 +29,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
@@ -1078,7 +1078,7 @@ mod tests {
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::Expr;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use globset::{Glob, GlobSetBuilder};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};

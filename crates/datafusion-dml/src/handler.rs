@@ -28,7 +28,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, dml::InsertOp};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 /// Parameters for [`CatalogDmlHandler::delete_exec`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -153,7 +153,7 @@ pub trait CatalogDmlHandler: fmt::Debug + Send + Sync {
 
 async fn resolve_table_provider(
     session_state: &SessionState,
-    table_name: &datafusion::sql::TableReference,
+    table_name: &datafusion::common::TableReference,
 ) -> DFResult<Arc<dyn datafusion::datasource::TableProvider>> {
     session_state
         .schema_for_ref(table_name.clone())?

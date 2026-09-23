@@ -23,7 +23,7 @@ use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use snafu::prelude::*;

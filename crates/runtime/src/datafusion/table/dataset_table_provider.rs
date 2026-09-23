@@ -48,7 +48,7 @@ use datafusion::common::DataFusionError;
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use snafu::Snafu;

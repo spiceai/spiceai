@@ -31,7 +31,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{Expr, SessionContext};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion_table_providers::UnsupportedTypeAction;

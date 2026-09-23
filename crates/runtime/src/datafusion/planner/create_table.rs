@@ -25,7 +25,7 @@ limitations under the License.
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     ColumnOption, CreateTable, CreateTableOptions, SqlOption, Statement as SQLStatement,

@@ -2356,7 +2356,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 mod tests {
     use arrow::array::{Array, RecordBatch};
     use chrono::{TimeZone, Utc};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
     use futures::StreamExt;
     use futures::stream::{self, BoxStream};

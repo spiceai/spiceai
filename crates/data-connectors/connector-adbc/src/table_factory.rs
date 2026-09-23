@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
 use datafusion::optimizer::OptimizerRule;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;

@@ -28,7 +28,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::RecordBatchStream;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::Stream;
 use futures::StreamExt;
 use futures::task::{Context, Poll};

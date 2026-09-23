@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::ops::{Deref, DerefMut};

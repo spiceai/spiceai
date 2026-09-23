@@ -29,7 +29,7 @@ use axum::{
     http::status,
     response::{IntoResponse, Response},
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use iceberg::{
     arrow::arrow_schema_to_schema,
     spec::{PartitionSpec, Schema, SortOrder},

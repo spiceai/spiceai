@@ -1164,7 +1164,7 @@ mod tests {
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_expr::TableProviderFilterPushDown;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};

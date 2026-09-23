@@ -33,7 +33,7 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ident};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::unparser::Unparser;
 use tracing::Level;
 

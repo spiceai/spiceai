@@ -17,7 +17,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_query_engine::query_engine::QueryEngine;
 use search::generation::{CandidateGeneration, text_search::index::FullTextDatabaseIndex};
 

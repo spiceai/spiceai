@@ -57,7 +57,7 @@ dependencies = [
  "search",
  "secrecy",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "spicepod",
  "tempfile",
@@ -101,7 +101,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-table",
  "runtime-table-partition",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "spicepod",
  "tempfile",
@@ -127,7 +127,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-parameters",
  "runtime-table-partition",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -152,7 +152,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-table-partition",
  "rusqlite",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tokio",
  "tracing",
@@ -180,7 +180,7 @@ dependencies = [
  "runtime-table-partition",
  "runtime-udfs-api",
  "rusqlite",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tokio",
  "tracing",
@@ -197,14 +197,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "adbc_core"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "365059b13a01bbf6f324b5bfe328232a819679731431f78105e2883256236858"
+dependencies = [
+ "arrow-array 59.2.0",
+ "arrow-schema 59.2.0",
+]
+
+[[package]]
 name = "adbc_driver_manager"
 version = "0.23.0"
 source = "git+https://github.com/spiceai/arrow-adbc.git?rev=34a465e97fb529075f953adf40bc2e02de755bec#34a465e97fb529075f953adf40bc2e02de755bec"
 dependencies = [
- "adbc_core",
- "adbc_ffi",
+ "adbc_core 0.23.0",
+ "adbc_ffi 0.23.0",
  "arrow-array 58.4.0",
  "arrow-schema 58.4.0",
+ "libloading 0.8.9",
+ "path-slash",
+ "regex",
+ "toml 1.1.6+spec-1.1.0",
+ "windows-registry 0.100.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "adbc_driver_manager"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aac8bb789ff1f493bcb5d423c65b7a1b21ba5516f5e60797b4e1c64b34a2b61"
+dependencies = [
+ "adbc_core 0.24.0",
+ "adbc_ffi 0.24.0",
+ "arrow-array 59.2.0",
+ "arrow-schema 59.2.0",
  "libloading 0.8.9",
  "path-slash",
  "regex",
@@ -218,9 +246,20 @@ name = "adbc_ffi"
 version = "0.23.0"
 source = "git+https://github.com/spiceai/arrow-adbc.git?rev=34a465e97fb529075f953adf40bc2e02de755bec#34a465e97fb529075f953adf40bc2e02de755bec"
 dependencies = [
- "adbc_core",
+ "adbc_core 0.23.0",
  "arrow-array 58.4.0",
  "arrow-schema 58.4.0",
+]
+
+[[package]]
+name = "adbc_ffi"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdef84c12e9e8858b300440c36ca94ba24fb2e188175251dc39bb44ba3584e"
+dependencies = [
+ "adbc_core 0.24.0",
+ "arrow-array 59.2.0",
+ "arrow-schema 59.2.0",
 ]
 
 [[package]]
@@ -569,7 +608,7 @@ name = "app"
 version = "2.4.0-unstable"
 dependencies = [
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tracing",
  "util",
@@ -1186,7 +1225,7 @@ dependencies = [
  "datafusion 55.1.0",
  "insta",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -1985,7 +2024,7 @@ dependencies = [
  "reqsign-core",
  "reqwest 0.13.5",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -3427,6 +3466,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "btoi"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5ab9db53bcda568284df0fd39f6eac24ad6f7ba7ff1168b9e76eba6576b976"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "bufstream"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3556,7 +3604,7 @@ dependencies = [
  "rand 0.10.3",
  "rstest 0.25.0",
  "sharded-cache",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tokio",
  "tracing",
@@ -3876,7 +3924,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "telemetry",
  "tempfile",
  "test-framework",
@@ -3911,7 +3959,7 @@ dependencies = [
  "datafusion-ddl",
  "datafusion-flightsql",
  "runtime-datafusion",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tonic",
  "tracing",
@@ -4046,7 +4094,7 @@ dependencies = [
  "futures",
  "rand 0.10.3",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tokio",
  "tracing",
@@ -4064,11 +4112,11 @@ dependencies = [
  "datafusion-table-providers",
  "futures",
  "governor",
- "mysql_async",
+ "mysql_async 0.36.2",
  "rand 0.10.3",
  "rust_decimal",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "tokio",
  "tokio-postgres",
@@ -4162,7 +4210,7 @@ name = "chunking"
 version = "2.4.0-unstable"
 dependencies = [
  "criterion 0.7.0",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "text-splitter",
  "tiktoken-rs 0.9.1",
@@ -4339,7 +4387,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "x509-parser 0.18.1",
  "zeroize",
 ]
@@ -4499,7 +4547,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "url",
@@ -4509,9 +4557,9 @@ dependencies = [
 name = "connector-adbc"
 version = "2.4.0-unstable"
 dependencies = [
- "adbc_core",
- "adbc_driver_manager",
- "adbc_ffi",
+ "adbc_core 0.23.0",
+ "adbc_driver_manager 0.23.0",
+ "adbc_ffi 0.23.0",
  "app",
  "arrow 59.2.0",
  "async-trait",
@@ -4533,7 +4581,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -4562,7 +4610,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "url",
  "uuid 1.26.1",
 ]
@@ -4587,7 +4635,7 @@ dependencies = [
  "runtime-metrics",
  "runtime-parameters",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -4615,7 +4663,7 @@ dependencies = [
  "runtime-rate-control",
  "runtime-secrets",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "token_provider",
  "tokio",
@@ -4639,7 +4687,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "url",
@@ -4663,7 +4711,7 @@ dependencies = [
  "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -4683,7 +4731,7 @@ dependencies = [
  "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -4701,7 +4749,7 @@ dependencies = [
  "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -4738,7 +4786,7 @@ dependencies = [
  "runtime-metrics",
  "runtime-parameters",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tokio",
  "tracing",
@@ -4760,7 +4808,7 @@ dependencies = [
  "runtime-component",
  "runtime-parameters",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -4781,7 +4829,7 @@ dependencies = [
  "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -4794,7 +4842,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "url",
 ]
@@ -4812,7 +4860,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "url",
 ]
@@ -4839,7 +4887,7 @@ dependencies = [
  "runtime-metrics",
  "runtime-parameters",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -4876,7 +4924,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "token_provider",
  "tokio",
@@ -4922,7 +4970,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "token_provider",
  "tokio",
  "tracing",
@@ -4951,7 +4999,7 @@ dependencies = [
  "runtime-component",
  "runtime-parameters",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -4980,7 +5028,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tonic",
  "tracing",
@@ -5011,7 +5059,7 @@ dependencies = [
  "runtime-parameters",
  "secrecy",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -5030,7 +5078,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tiberius",
 ]
 
@@ -5049,7 +5097,7 @@ dependencies = [
  "fundu",
  "futures",
  "linkme",
- "mysql_async",
+ "mysql_async 0.36.2",
  "opentelemetry",
  "paste",
  "runtime",
@@ -5060,7 +5108,7 @@ dependencies = [
  "runtime-metrics",
  "runtime-parameters",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -5074,7 +5122,7 @@ dependencies = [
  "paste",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "url",
 ]
@@ -5102,7 +5150,7 @@ dependencies = [
  "runtime-udfs-api",
  "secrecy",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-util",
  "tracing",
@@ -5123,7 +5171,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -5154,7 +5202,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-postgres",
  "tracing",
@@ -5166,7 +5214,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "datafusion-common 55.1.0",
  "datafusion-table-providers",
- "snafu",
+ "snafu 0.8.9",
  "tokio-postgres",
 ]
 
@@ -5189,7 +5237,7 @@ dependencies = [
  "runtime-component",
  "runtime-parameters",
  "scylla",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -5204,7 +5252,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "url",
 ]
@@ -5240,7 +5288,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "url",
@@ -5256,7 +5304,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "url",
 ]
@@ -5278,7 +5326,7 @@ dependencies = [
  "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
- "snafu",
+ "snafu 0.8.9",
  "snowflake-api",
 ]
 
@@ -5295,7 +5343,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -5476,7 +5524,7 @@ name = "cpu-budget"
 version = "2.4.0-unstable"
 dependencies = [
  "insta",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -6387,7 +6435,7 @@ dependencies = [
  "runtime-secrets",
  "runtime-table-partition",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "sysinfo 0.38.4",
  "tokio",
@@ -6431,7 +6479,7 @@ dependencies = [
  "runtime-object-store",
  "runtime-parameters",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "token_provider",
  "tokio",
@@ -6448,7 +6496,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "globset",
  "runtime-component",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -6487,8 +6535,8 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 name = "data_components"
 version = "2.4.0-unstable"
 dependencies = [
- "adbc_core",
- "adbc_driver_manager",
+ "adbc_core 0.23.0",
+ "adbc_driver_manager 0.23.0",
  "ahash",
  "apache-avro",
  "arrow 59.2.0",
@@ -6541,8 +6589,8 @@ dependencies = [
  "insta",
  "logos",
  "moka",
- "mysql_async",
- "mysql_common",
+ "mysql_async 0.36.2",
+ "mysql_common 0.35.5",
  "native-tls",
  "num_cpus",
  "object_store 0.13.2",
@@ -6568,7 +6616,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "snowflake-api",
  "spark-connect-rs",
  "spice-table",
@@ -6607,7 +6655,7 @@ dependencies = [
  "futures",
  "object_store 0.13.2",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -7327,15 +7375,15 @@ dependencies = [
 
 [[package]]
 name = "datafusion-federation"
-version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=3af703dba0accdff5fdb0ae92ef12588e1dfe88a#3af703dba0accdff5fdb0ae92ef12588e1dfe88a"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e91e3cf0e3a0b2840964f9df678874e5836971307578ed96ab4c359a5315ca2"
 dependencies = [
- "arrow-json 58.4.0",
+ "arrow-json 59.2.0",
  "async-stream",
  "async-trait",
- "datafusion 54.1.0",
+ "datafusion 55.1.0",
  "futures",
- "tracing",
 ]
 
 [[package]]
@@ -7356,7 +7404,7 @@ dependencies = [
  "postcard",
  "prost 0.14.4",
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -7713,7 +7761,7 @@ dependencies = [
  "object_store 0.13.2",
  "r2d2",
  "reqwest 0.13.5",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tonic",
  "tracing",
@@ -8159,61 +8207,211 @@ dependencies = [
 
 [[package]]
 name = "datafusion-table-providers"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=14fdd18233daab646859eb9ea115873a445b3df3#14fdd18233daab646859eb9ea115873a445b3df3"
+version = "0.13.1"
 dependencies = [
- "adbc_core",
- "adbc_driver_manager",
- "arrow 58.4.0",
- "arrow-json 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow 59.2.0",
+ "datafusion 55.1.0",
+ "datafusion-table-providers-adbc",
+ "datafusion-table-providers-common",
+ "datafusion-table-providers-duckdb",
+ "datafusion-table-providers-mongodb",
+ "datafusion-table-providers-mysql",
+ "datafusion-table-providers-postgres",
+ "datafusion-table-providers-sqlite",
+ "tokio",
+]
+
+[[package]]
+name = "datafusion-table-providers-adbc"
+version = "0.13.1"
+dependencies = [
+ "adbc_core 0.24.0",
+ "adbc_driver_manager 0.24.0",
+ "arrow 59.2.0",
+ "arrow-schema 59.2.0",
  "async-stream",
  "async-trait",
- "bb8",
- "bb8-postgres",
+ "datafusion 55.1.0",
+ "datafusion-federation 0.5.7",
+ "datafusion-table-providers-common",
+ "futures",
+ "r2d2",
+ "r2d2_adbc",
+ "secrecy",
+ "sha2 0.11.0",
+ "snafu 0.9.2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "datafusion-table-providers-common"
+version = "0.13.1"
+dependencies = [
+ "arrow 59.2.0",
+ "arrow-json 59.2.0",
+ "async-trait",
  "bigdecimal",
- "byte-unit",
  "byteorder",
  "chrono",
  "dashmap",
- "datafusion 54.1.0",
- "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3af703dba0accdff5fdb0ae92ef12588e1dfe88a)",
- "datafusion-physical-expr 54.1.0",
- "duckdb 1.4.4 (git+https://github.com/spiceai/duckdb-rs.git?rev=76655d2ffc1b1e4dfc886de561759b70ead48b96)",
- "dyn-clone",
+ "datafusion 55.1.0",
+ "datafusion-federation 0.5.7",
  "fallible-iterator 0.3.0",
  "fundu",
  "futures",
  "geo-types",
  "hickory-resolver",
- "itertools 0.14.0",
- "logos",
- "mongodb",
- "mysql_async",
- "native-tls",
+ "itertools 0.15.0",
  "num-bigint 0.4.8",
- "num-traits",
- "once_cell",
- "pem 3.0.6",
- "postgres-native-tls",
- "r2d2",
- "r2d2_adbc",
- "rand 0.9.5",
+ "rand 0.10.3",
  "regex",
- "rusqlite",
- "rust_decimal",
  "sea-query",
  "secrecy",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "snafu",
+ "sha2 0.11.0",
+ "snafu 0.9.2",
  "time",
  "tokio",
- "tokio-postgres",
- "tokio-rusqlite",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "datafusion-table-providers-duckdb"
+version = "0.13.1"
+dependencies = [
+ "arrow 59.2.0",
+ "arrow-schema 59.2.0",
+ "async-stream",
+ "async-trait",
+ "byte-unit",
+ "datafusion 55.1.0",
+ "datafusion-federation 0.5.7",
+ "datafusion-physical-expr 55.1.0",
+ "datafusion-table-providers-common",
+ "duckdb 1.4.4 (git+https://github.com/spiceai/duckdb-rs.git?rev=76655d2ffc1b1e4dfc886de561759b70ead48b96)",
+ "dyn-clone",
+ "futures",
+ "itertools 0.15.0",
+ "once_cell",
+ "r2d2",
+ "rand 0.9.5",
+ "sea-query",
+ "secrecy",
+ "snafu 0.9.2",
+ "tokio",
+ "tracing",
+ "uuid 1.26.1",
+]
+
+[[package]]
+name = "datafusion-table-providers-mongodb"
+version = "0.13.1"
+dependencies = [
+ "arrow 59.2.0",
+ "arrow-schema 59.2.0",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "datafusion 55.1.0",
+ "datafusion-table-providers-common",
+ "futures",
+ "mongodb",
+ "num-traits",
+ "rust_decimal",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu 0.9.2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "datafusion-table-providers-mysql"
+version = "0.13.1"
+dependencies = [
+ "arrow 59.2.0",
+ "async-stream",
+ "async-trait",
+ "bigdecimal",
+ "chrono",
+ "datafusion 55.1.0",
+ "datafusion-federation 0.5.7",
+ "datafusion-table-providers-common",
+ "futures",
+ "mysql_async 0.37.1",
+ "num-bigint 0.4.8",
+ "sea-query",
+ "secrecy",
+ "snafu 0.9.2",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "datafusion-table-providers-postgres"
+version = "0.13.1"
+dependencies = [
+ "arrow 59.2.0",
+ "arrow-json 59.2.0",
+ "arrow-schema 59.2.0",
+ "async-stream",
+ "async-trait",
+ "bb8",
+ "bb8-postgres",
+ "bigdecimal",
+ "byteorder",
+ "chrono",
+ "datafusion 55.1.0",
+ "datafusion-federation 0.5.7",
+ "datafusion-table-providers-common",
+ "fallible-iterator 0.3.0",
+ "futures",
+ "geo-types",
+ "logos",
+ "native-tls",
+ "pem 4.0.0",
+ "postgres-native-tls",
+ "rust_decimal",
+ "sea-query",
+ "secrecy",
+ "serde_json",
+ "snafu 0.9.2",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "url",
+ "uuid 1.26.1",
+]
+
+[[package]]
+name = "datafusion-table-providers-sqlite"
+version = "0.13.1"
+dependencies = [
+ "arrow 59.2.0",
+ "arrow-schema 59.2.0",
+ "async-trait",
+ "bigdecimal",
+ "chrono",
+ "datafusion 55.1.0",
+ "datafusion-federation 0.5.7",
+ "datafusion-table-providers-common",
+ "fundu",
+ "futures",
+ "rusqlite",
+ "sea-query",
+ "secrecy",
+ "serde_json",
+ "snafu 0.9.2",
+ "time",
+ "tokio",
+ "tokio-rusqlite",
+ "tracing",
  "uuid 1.26.1",
 ]
 
@@ -8236,7 +8434,7 @@ dependencies = [
  "pkcs8",
  "secrecy",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "snowflake-api",
  "tokio",
  "tokio-util",
@@ -8709,7 +8907,7 @@ dependencies = [
  "liteparse-pdfium-sys",
  "quick-xml 0.38.4",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "tar",
  "tokio",
  "ureq 2.12.1",
@@ -8822,7 +9020,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "duration-parse"
 version = "2.4.0-unstable"
 dependencies = [
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -8858,7 +9056,7 @@ dependencies = [
  "humantime",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "util",
@@ -8944,7 +9142,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "url",
@@ -8981,7 +9179,7 @@ dependencies = [
  "chunking",
  "hf-hub",
  "runtime-rate-control",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -9209,7 +9407,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "utoipa",
 ]
@@ -9245,7 +9443,7 @@ name = "event_stream"
 version = "2.4.0-unstable"
 dependencies = [
  "futures",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -9568,7 +9766,7 @@ dependencies = [
  "parking_lot",
  "rustls-native-certs",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -10382,7 +10580,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "token_provider",
  "tokio",
  "tokio-stream",
@@ -10647,7 +10845,7 @@ dependencies = [
  "criterion 0.6.0",
  "parking_lot",
  "rand 0.10.3",
- "snafu",
+ "snafu 0.8.9",
  "telemetry",
  "tokio",
  "tracing",
@@ -11847,17 +12045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inherent"
-version = "1.0.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee2c455ca60511a054699102d40ce7153621cb2429558f9eaa600e4499b5984"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "inotify"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12649,7 +12836,7 @@ version = "0.1.0"
 dependencies = [
  "bindgen 0.71.1",
  "nix 0.30.1",
- "snafu",
+ "snafu 0.8.9",
  "static_assertions",
 ]
 
@@ -12878,7 +13065,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tempfile",
  "text-embeddings-backend",
@@ -14136,7 +14323,7 @@ dependencies = [
  "futures-util",
  "keyed_priority_queue",
  "lru 0.16.4",
- "mysql_common",
+ "mysql_common 0.35.5",
  "native-tls",
  "pem 3.0.6",
  "percent-encoding",
@@ -14153,16 +14340,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "mysql_async"
+version = "0.37.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40d11da0e2d9fad4640c9f9198ee431c6d68444568f83ef1f10f3367270071e4"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "flate2",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "keyed_priority_queue",
+ "lru 0.18.5",
+ "mysql_common 0.37.3",
+ "native-tls",
+ "pem 3.0.6",
+ "percent-encoding",
+ "rand 0.10.3",
+ "serde",
+ "socket2 0.6.5",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-util",
+ "twox-hash",
+ "url",
+]
+
+[[package]]
 name = "mysql_common"
 version = "0.35.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbb9f371618ce723f095c61fbcdc36e8936956d2b62832f9c7648689b338e052"
 dependencies = [
  "base64 0.22.1",
- "bigdecimal",
  "bitflags 2.13.2",
  "bitvec",
- "btoi",
+ "btoi 0.4.3",
  "byteorder",
  "bytes",
  "chrono",
@@ -14180,9 +14397,38 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "thiserror 2.0.20",
- "time",
  "uuid 1.26.1",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "mysql_common"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f27695f286b461da077b8c2f72f47feaa04ce3c3f9c0976257410e90e21208a"
+dependencies = [
+ "base64 0.22.1",
+ "bigdecimal",
+ "bitflags 2.13.2",
+ "btoi 0.5.0",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "flate2",
+ "getrandom 0.3.4",
+ "mysql-common-derive",
+ "num-bigint 0.4.8",
+ "num-traits",
+ "regex",
+ "saturating",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "uuid 1.26.1",
 ]
 
 [[package]]
@@ -14435,7 +14681,7 @@ name = "ns_lookup"
 version = "2.4.0-unstable"
 dependencies = [
  "hickory-resolver",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "url",
@@ -15022,7 +15268,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "tokio",
 ]
@@ -15060,7 +15306,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tower 0.5.3",
  "tower-http 0.6.11",
@@ -15597,7 +15843,7 @@ dependencies = [
  "lzokay-native",
  "num",
  "prost 0.13.5",
- "snafu",
+ "snafu 0.8.9",
  "snap",
  "tokio",
  "zstd 0.13.3",
@@ -15748,7 +15994,7 @@ dependencies = [
  "futures",
  "object_store 0.13.2",
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tracing",
  "yaml",
@@ -16045,7 +16291,7 @@ dependencies = [
  "document_parse",
  "pdf-inspector",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
 ]
 
@@ -16056,7 +16302,7 @@ dependencies = [
  "blake3",
  "clap",
  "lopdf 0.43.0",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -17252,7 +17498,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c927bf1acbcc9c5c99674a55e320c15effe73fd05f069469d4af360428ac368a"
 dependencies = [
- "adbc_core",
+ "adbc_core 0.23.0",
  "r2d2",
 ]
 
@@ -18105,7 +18351,7 @@ name = "rerank-api"
 version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -18342,8 +18588,8 @@ dependencies = [
  "accelerator-postgres",
  "accelerator-sqlite",
  "accelerator-turso",
- "adbc_core",
- "adbc_driver_manager",
+ "adbc_core 0.23.0",
+ "adbc_driver_manager 0.23.0",
  "anyhow",
  "app",
  "arc-swap",
@@ -18472,7 +18718,7 @@ dependencies = [
  "mediatype",
  "moka",
  "mongodb",
- "mysql_async",
+ "mysql_async 0.36.2",
  "notify",
  "ns_lookup",
  "object_store 0.13.2",
@@ -18546,7 +18792,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "snowflake-api",
  "spice-cloud",
  "spice-cloud-client",
@@ -18625,7 +18871,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tar",
  "telemetry",
@@ -18655,7 +18901,7 @@ dependencies = [
  "cpu-budget",
  "futures",
  "libc",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-util",
  "tracing",
@@ -18684,7 +18930,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
  "util",
 ]
@@ -18781,7 +19027,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "spice-cloud-client",
  "tempfile",
  "tokio",
@@ -18830,7 +19076,7 @@ dependencies = [
  "runtime-table-partition",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "telemetry",
  "tokio",
@@ -18858,7 +19104,7 @@ dependencies = [
  "opentelemetry",
  "runtime-acceleration",
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tracing",
  "util",
@@ -18903,7 +19149,7 @@ dependencies = [
  "runtime-udfs-api",
  "search",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "tokio",
  "tokio-stream",
@@ -18924,7 +19170,7 @@ dependencies = [
  "datafusion 55.1.0",
  "futures",
  "itertools 0.14.0",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "tokio",
  "tracing",
@@ -18964,7 +19210,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simsimd",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tempfile",
  "tokio",
@@ -18990,7 +19236,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "url",
@@ -19017,7 +19263,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "opentelemetry",
  "runtime-api-types",
- "snafu",
+ "snafu 0.8.9",
  "telemetry",
 ]
 
@@ -19046,7 +19292,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smb",
- "snafu",
+ "snafu 0.8.9",
  "ssh2",
  "suppaftp",
  "tokio",
@@ -19070,7 +19316,7 @@ dependencies = [
  "runtime-parameters-typed",
  "runtime-secrets",
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "util",
@@ -19090,7 +19336,7 @@ name = "runtime-parameters-typed"
 version = "2.4.0-unstable"
 dependencies = [
  "secrecy",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "util",
@@ -19120,7 +19366,7 @@ dependencies = [
  "async-trait",
  "datafusion 55.1.0",
  "globset",
- "snafu",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -19133,7 +19379,7 @@ dependencies = [
  "object_store_occ",
  "rand 0.10.3",
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -19217,7 +19463,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "spicepod",
  "telemetry",
@@ -19255,7 +19501,7 @@ dependencies = [
  "runtime-parameters-typed",
  "secrecy",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tempfile",
  "tokio",
@@ -19322,7 +19568,7 @@ dependencies = [
  "runtime-udfs-api",
  "search",
  "serde",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "spicepod",
  "telemetry",
@@ -19351,7 +19597,7 @@ dependencies = [
  "insta",
  "parking_lot",
  "runtime-datafusion-udfs",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tempfile",
  "tokio",
@@ -19370,7 +19616,7 @@ dependencies = [
  "opentelemetry",
  "rustls",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -19409,7 +19655,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spicepod",
  "tokio",
  "tools",
@@ -19788,7 +20034,7 @@ dependencies = [
  "datafusion 55.1.0",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -19894,7 +20140,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "croner",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-util",
  "tracing",
@@ -20078,12 +20324,13 @@ dependencies = [
 
 [[package]]
 name = "sea-query"
-version = "0.32.0-rc.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=ae75baef819513fb8d19af014972dcfa324e201a#ae75baef819513fb8d19af014972dcfa324e201a"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "546040c653a705e60ec65ecd3191a809603734bebbc225775916dea9ae409b31"
 dependencies = [
  "bigdecimal",
  "chrono",
- "inherent",
+ "itoa",
  "rust_decimal",
  "sea-query-derive",
  "time",
@@ -20091,14 +20338,16 @@ dependencies = [
 
 [[package]]
 name = "sea-query-derive"
-version = "0.4.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=ae75baef819513fb8d19af014972dcfa324e201a#ae75baef819513fb8d19af014972dcfa324e201a"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0b0f466921cdd3cf4b89d5c3ac2173dba89a873ab395b123a645de181ec7537"
 dependencies = [
+ "darling 0.20.11",
  "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -20131,7 +20380,7 @@ dependencies = [
  "s3_vectors",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "spice-table",
  "tantivy",
  "tantivy_datafusion_filter",
@@ -20867,7 +21116,16 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
 dependencies = [
- "snafu-derive",
+ "snafu-derive 0.8.9",
+]
+
+[[package]]
+name = "snafu"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e45cb604038abb7b926b679887b3226d8d0f23874b66623625a0454be425a4b7"
+dependencies = [
+ "snafu-derive 0.9.2",
 ]
 
 [[package]]
@@ -20875,6 +21133,18 @@ name = "snafu-derive"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "287f59010008f0d7cf5e3b03196d666c1acc46c8d3e9cf34c28a1a7157601e72"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -21067,7 +21337,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "spice-cloud-client",
  "spiceai",
  "spicepod",
@@ -21100,7 +21370,7 @@ dependencies = [
  "runtime-secrets",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
 ]
@@ -21113,7 +21383,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "url",
 ]
@@ -21132,7 +21402,7 @@ dependencies = [
  "prost 0.14.4",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "yaml",
 ]
@@ -21171,7 +21441,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tonic",
  "tracing",
@@ -21259,7 +21529,7 @@ dependencies = [
  "runtime-tls",
  "rustls",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "snmalloc-rs",
  "spice-cloud",
  "telemetry",
@@ -21293,7 +21563,7 @@ dependencies = [
  "serde",
  "serde-value",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "subtle",
  "tempfile",
  "tokio",
@@ -21308,7 +21578,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "app",
  "clap",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
 ]
 
@@ -22271,7 +22541,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "arrow 59.2.0",
  "datafusion 55.1.0",
- "snafu",
+ "snafu 0.8.9",
  "tantivy",
 ]
 
@@ -22315,7 +22585,7 @@ dependencies = [
  "pin-project",
  "prost 0.14.4",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "sysinfo 0.38.4",
  "tempfile",
  "tokio",
@@ -22902,7 +23172,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tracing",
  "util",
@@ -23434,7 +23704,7 @@ dependencies = [
  "async-trait",
  "duckdb 1.4.4",
  "runtime",
- "snafu",
+ "snafu 0.8.9",
  "tracing",
 ]
 
@@ -24420,7 +24690,7 @@ dependencies = [
  "pin-project",
  "rand 0.10.3",
  "serde_json",
- "snafu",
+ "snafu 0.8.9",
  "tokio",
  "tokio-util",
  "tracing",

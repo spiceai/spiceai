@@ -166,7 +166,7 @@ pub fn get_partition_filter_exprs(
 /// [`Statistics`]: datafusion::common::Statistics
 pub(crate) async fn local_executor_table_statistics(
     df: &crate::datafusion::DataFusion,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
 ) -> Option<(datafusion::common::Statistics, Vec<String>)> {
     let provider = df.get_table(table).await?;
     let schema = provider.schema();

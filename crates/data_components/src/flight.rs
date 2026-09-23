@@ -625,7 +625,7 @@ mod tests {
     use datafusion::catalog::TableProvider;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion::sql::unparser::dialect::DefaultDialect;
     use flight_client::{Credentials, FlightClient};
     use std::net::SocketAddr;

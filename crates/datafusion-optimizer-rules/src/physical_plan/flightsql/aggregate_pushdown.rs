@@ -318,7 +318,7 @@ mod tests {
         SendableRecordBatchStream, collect,
     };
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_datasource::memory::MemorySourceConfig;
     use flight_client::cookie::CookieStore;
     use std::fmt;

@@ -64,7 +64,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
-use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;

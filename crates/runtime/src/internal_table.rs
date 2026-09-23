@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 

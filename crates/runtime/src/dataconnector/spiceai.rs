@@ -27,7 +27,7 @@ use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;

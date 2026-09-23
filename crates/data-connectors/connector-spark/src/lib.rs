@@ -32,7 +32,7 @@ use data_connector_api::{
     DataConnectorResult,
 };
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;

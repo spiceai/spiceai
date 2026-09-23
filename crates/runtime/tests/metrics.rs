@@ -1156,7 +1156,7 @@ async fn a_query_counts_one_results_cache_lookup() {
     rt.datafusion()
         .results_cache_provider()
         .expect("the results cache is configured")
-        .invalidate_for_table(datafusion::sql::TableReference::bare("scores"))
+        .invalidate_for_table(datafusion::common::TableReference::bare("scores"))
         .await
         .expect("the cached result to be invalidated");
     for (status, recorded) in miss_then_hit {

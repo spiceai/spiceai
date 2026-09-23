@@ -217,7 +217,7 @@ fn write_csv_source(path: &Path, rows: u64) -> Result<(), anyhow::Error> {
 async fn dataset_error_message(rt: &Arc<Runtime>, dataset: &str) -> Result<String, anyhow::Error> {
     let loading = tokio::spawn(Arc::clone(rt).load_components());
 
-    let table_ref = datafusion::sql::TableReference::bare(dataset.to_string());
+    let table_ref = datafusion::common::TableReference::bare(dataset.to_string());
     let status = rt.datafusion().runtime_status();
 
     let became_error = wait_until_true(LOAD_TIMEOUT, || {

@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn as_search_index_recognizes_a_known_concrete_type() {
         let idx: Arc<dyn Index + Send + Sync> = Arc::new(NativeVectorIndex::new(
-            datafusion::sql::TableReference::bare("t"),
+            datafusion::common::TableReference::bare("t"),
             "embedding".to_string(),
             vec![Field::new("id", arrow_schema::DataType::Int64, false)],
             4,

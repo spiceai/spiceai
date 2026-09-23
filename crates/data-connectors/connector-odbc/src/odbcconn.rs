@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::{
     DbConnectionPool,
     dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},

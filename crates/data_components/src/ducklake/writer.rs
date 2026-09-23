@@ -44,7 +44,7 @@ use datafusion::logical_expr::{Expr, LogicalPlan, TableType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion_table_providers::duckdb::DuckDB;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;

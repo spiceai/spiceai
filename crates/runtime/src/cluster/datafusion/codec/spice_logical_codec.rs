@@ -25,7 +25,7 @@ use ballista_core::serde::BallistaLogicalExtensionCodec;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference, exec_err};
 use datafusion::execution::TaskContext;
-use datafusion::sql::TableReference as SqlTableReference;
+use datafusion::common::TableReference as SqlTableReference;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;

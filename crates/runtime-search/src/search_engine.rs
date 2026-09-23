@@ -43,7 +43,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::Expr;
 use futures::StreamExt;
 use itertools::Itertools;

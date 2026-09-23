@@ -92,7 +92,7 @@ pub(crate) async fn trigger_refresh(
     table: &str,
 ) -> Result<(), anyhow::Error> {
     rt.datafusion()
-        .refresh_table(&datafusion::sql::TableReference::from(table), None)
+        .refresh_table(&datafusion::common::TableReference::from(table), None)
         .await
         .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;

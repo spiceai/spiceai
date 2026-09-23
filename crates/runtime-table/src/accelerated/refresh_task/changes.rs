@@ -49,7 +49,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
@@ -5099,7 +5099,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -5124,7 +5124,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare("test".to_string()),
             federated,
             None,
             accelerator,
@@ -5176,7 +5176,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&stored), vec![vec![]])
                     .expect("mem table should be created"),
             );
-            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            let dataset = datafusion::common::TableReference::bare(name.to_string());
             install_cdc_schema_evolution(
                 &dataset,
                 CdcSchemaEvolution {
@@ -5259,7 +5259,7 @@ mod tests {
 
         let dataset = "cdc_map_entries_accepted";
         install_cdc_schema_evolution(
-            &datafusion::sql::TableReference::bare(dataset.to_string()),
+            &datafusion::common::TableReference::bare(dataset.to_string()),
             CdcSchemaEvolution {
                 policy: OnSchemaChange::Fail,
                 constraint_columns: vec![],

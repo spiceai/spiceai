@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use app::AppBuilder;
 use axum::{Router, routing::get};
 use datafusion::prelude::*;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, IndexType, Mode, OnConflictBehavior, RefreshMode},

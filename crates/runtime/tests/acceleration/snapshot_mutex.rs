@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime::Runtime;
 use runtime::accelerated::refresh::{AccelerationRefreshMode, Refresh, Refresher};
 use runtime::accelerated::{SnapshotCreateTrigger, SnapshotCreationConfig};

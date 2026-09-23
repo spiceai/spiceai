@@ -964,7 +964,7 @@ async fn initialize_partition_metadata(
     if let Some(expr_sql) = partition_expr_sql
         && let Some(registry) = executor_registry
     {
-        let table_ref = datafusion::sql::TableReference::full(
+        let table_ref = datafusion::common::TableReference::full(
             catalog_name.to_string(),
             schema_name.to_string(),
             table_name.to_string(),

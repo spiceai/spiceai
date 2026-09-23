@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::future::join_all;
 use runtime::Runtime;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;

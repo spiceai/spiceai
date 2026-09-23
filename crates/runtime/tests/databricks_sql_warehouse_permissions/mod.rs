@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime::{Runtime, status::ComponentStatus};
 use spicepod::{component::dataset::Dataset, param::Params};
 

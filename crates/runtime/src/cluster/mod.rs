@@ -1611,7 +1611,7 @@ pub async fn initialize_cluster_executor(
     > = Some(Arc::new(move |dataset_name, overrides_json| {
         let rt = Arc::clone(&refresh_dataset_handler_rt);
         Box::pin(async move {
-            let dataset_ref = ::datafusion::sql::TableReference::parse_str(&dataset_name);
+            let dataset_ref = ::datafusion::common::TableReference::parse_str(&dataset_name);
             let overrides = overrides_json.and_then(|json| {
                 serde_json::from_str(&json)
                     .map_err(|e| {
@@ -2410,7 +2410,7 @@ async fn executor_bind_app(
     // Fail closed if init fails and the table is still absent — otherwise the
     // executor can report Ready while scheduler federated queries break.
     if rt.df.task_history_enabled {
-        let task_history_ref = ::datafusion::sql::TableReference::partial(
+        let task_history_ref = ::datafusion::common::TableReference::partial(
             crate::datafusion::SPICE_RUNTIME_SCHEMA,
             crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
         );

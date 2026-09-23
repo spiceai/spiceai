@@ -38,7 +38,7 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::scheduler_server::job_state_event::JobState as BallistaJobState;
 use cache::key::RawCacheKey;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;

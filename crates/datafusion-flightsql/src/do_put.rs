@@ -109,20 +109,20 @@ fn ingest_command_path_override(
     }
 }
 
-fn resolve_table_path(path: &[String]) -> datafusion::sql::TableReference {
+fn resolve_table_path(path: &[String]) -> datafusion::common::TableReference {
     match path.len() {
-        3 => datafusion::sql::TableReference::full(
+        3 => datafusion::common::TableReference::full(
             path[0].as_str(),
             path[1].as_str(),
             path[2].as_str(),
         ),
-        2 => datafusion::sql::TableReference::partial(path[0].as_str(), path[1].as_str()),
-        _ => datafusion::sql::TableReference::parse_str(&path.join(".")),
+        2 => datafusion::common::TableReference::partial(path[0].as_str(), path[1].as_str()),
+        _ => datafusion::common::TableReference::parse_str(&path.join(".")),
     }
 }
 
 async fn decode_flight_batches(
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     streaming: Peekable<Streaming<FlightData>>,
 ) -> Result<
     (
@@ -179,7 +179,7 @@ async fn decode_flight_batches(
 /// schema, so what its batches need is resolved once, and the corrected schema is returned with
 /// them — it is the one they now carry.
 fn normalize_map_entries(
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
@@ -300,8 +300,8 @@ mod tests {
     use super::normalize_map_entries;
 
     /// The table a `DoPut` resolved to, as `do_put_raw` would have resolved it.
-    fn test_table() -> datafusion::sql::TableReference {
-        datafusion::sql::TableReference::partial("sales", "orders")
+    fn test_table() -> datafusion::common::TableReference {
+        datafusion::common::TableReference::partial("sales", "orders")
     }
     use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Schema};

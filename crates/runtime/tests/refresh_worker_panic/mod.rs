@@ -28,7 +28,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemTable;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime::accelerated::refresh::{Refresh, RefreshSQL};
 use runtime::accelerated::{Error as AcceleratedError, RefreshTaskRunner};
 use runtime::component::dataset::acceleration::RefreshMode;

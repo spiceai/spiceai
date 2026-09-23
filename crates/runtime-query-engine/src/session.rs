@@ -30,7 +30,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::query_engine::{Error, QueryEngine, QueryRequest, Result, UpdateType};
 

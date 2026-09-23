@@ -33,7 +33,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::utils::{register_test_connectors, wait_until_true};
 

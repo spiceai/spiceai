@@ -43,7 +43,7 @@ use datafusion::logical_expr::{Expr, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::handler::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 use crate::{

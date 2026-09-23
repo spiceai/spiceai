@@ -173,7 +173,7 @@ impl ResolvedTableAwareAllowlist {
 #[cfg(test)]
 mod tests {
 
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::ResolvedTableAwareAllowlist;
 

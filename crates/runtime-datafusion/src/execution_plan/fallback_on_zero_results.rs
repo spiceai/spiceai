@@ -25,7 +25,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use std::fmt;

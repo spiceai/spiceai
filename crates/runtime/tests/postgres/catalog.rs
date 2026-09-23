@@ -686,7 +686,7 @@ impl RecordingRead {
 impl Read for RecordingRead {
     async fn table_provider(
         &self,
-        table_reference: datafusion::sql::TableReference,
+        table_reference: datafusion::common::TableReference,
     ) -> Result<
         Arc<dyn datafusion::datasource::TableProvider + 'static>,
         Box<dyn std::error::Error + Send + Sync>,
@@ -702,7 +702,7 @@ impl Read for RecordingRead {
 
     async fn table_provider_with_schema(
         &self,
-        table_reference: datafusion::sql::TableReference,
+        table_reference: datafusion::common::TableReference,
         schema: arrow::datatypes::SchemaRef,
     ) -> Result<
         Arc<dyn datafusion::datasource::TableProvider + 'static>,
@@ -1306,7 +1306,7 @@ struct UnloadableTables;
 impl Read for UnloadableTables {
     async fn table_provider(
         &self,
-        table_reference: datafusion::sql::TableReference,
+        table_reference: datafusion::common::TableReference,
     ) -> Result<
         Arc<dyn datafusion::datasource::TableProvider + 'static>,
         Box<dyn std::error::Error + Send + Sync>,

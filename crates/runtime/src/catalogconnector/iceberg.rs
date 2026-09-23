@@ -34,7 +34,7 @@ use data_components::{
     },
 };
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 

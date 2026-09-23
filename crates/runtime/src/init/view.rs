@@ -25,7 +25,8 @@ use crate::{
     status, view,
 };
 use app::App;
-use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+use datafusion::common::{TableReference};
+use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 #[cfg(feature = "duckdb")]
 use futures::stream::StreamExt;
 use itertools::Itertools;

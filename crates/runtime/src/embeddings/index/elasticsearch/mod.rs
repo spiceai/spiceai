@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use elasticsearch::Elasticsearch;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};

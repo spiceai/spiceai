@@ -27,7 +27,7 @@ use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::StreamExt;
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};

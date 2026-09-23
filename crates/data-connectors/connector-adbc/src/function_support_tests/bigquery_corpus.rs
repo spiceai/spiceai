@@ -35,7 +35,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::windows::WindowAggExec;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_federation::schema_cast::SchemaCastScanExec;
 use datafusion_federation::sql::{SQLFederationPlanner, VirtualExecutionPlan};
 use datafusion_federation::{FederatedPlanNode, FederatedQueryType, FederationPlanner};

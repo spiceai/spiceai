@@ -20,7 +20,7 @@ use std::{collections::BTreeMap, collections::HashMap, fmt::Display};
 
 use arrow::error::ArrowError;
 use arrow_tools::format::to_markdown_documents;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;
 use search::aggregation::AggregationResult;

@@ -29,7 +29,7 @@ use data_connector_api::{
     parameters::{ConnectorContext, aws::initiate_config_with_auth_method},
 };
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;

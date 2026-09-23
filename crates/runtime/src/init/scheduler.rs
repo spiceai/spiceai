@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use scheduler::{
     channel::cron::CronRequestChannel,
     schedule::Schedule,

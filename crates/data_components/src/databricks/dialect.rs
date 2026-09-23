@@ -143,7 +143,7 @@ mod tests {
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::prelude::lit;
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion::sql::unparser::Unparser;
 
     fn create_dialect() -> DatabricksDialect {

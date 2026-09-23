@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs};
 use datafusion::catalog::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_query_engine::query_engine::QueryEngine;
 use search::generation::CandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;

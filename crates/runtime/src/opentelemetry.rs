@@ -40,7 +40,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use indexmap::IndexMap;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSuccess;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;

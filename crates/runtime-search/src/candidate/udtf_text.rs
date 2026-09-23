@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use search::generation::CandidateGeneration;
 use tonic::async_trait;
 

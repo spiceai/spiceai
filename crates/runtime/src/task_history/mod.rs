@@ -25,7 +25,7 @@ use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBui
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;

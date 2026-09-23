@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use tokio::sync::RwLock;
 
 use crate::accelerated::AcceleratedTable;

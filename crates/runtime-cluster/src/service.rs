@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::future::join_all;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;

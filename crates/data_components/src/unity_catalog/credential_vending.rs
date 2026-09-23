@@ -398,7 +398,7 @@ mod delta {
 
     use datafusion::config::TableParquetOptions;
     use datafusion::datasource::TableProvider;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use secrecy::{ExposeSecret, SecretString};
     use snafu::prelude::*;
     use tokio::runtime::Handle;

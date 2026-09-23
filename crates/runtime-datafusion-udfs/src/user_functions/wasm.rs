@@ -58,7 +58,7 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use serde_json::Value;

@@ -21,7 +21,7 @@ use aws_config::timeout::TimeoutConfigBuilder;
 use data_components::s3_vectors::{
     MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::Expr;
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
@@ -368,7 +368,7 @@ fn s3_vector_metadata_columns(columns: &[Column], schema: &SchemaRef) -> Metadat
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use spicepod::{semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
     use std::collections::HashMap;
 

@@ -49,7 +49,7 @@ use datafusion::catalog::{TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use flight_client::{
     configure_endpoint_for_high_throughput,
     cookie::{CookieService, CookieStore},

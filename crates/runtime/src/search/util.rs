@@ -78,7 +78,7 @@ mod tests {
     use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use runtime_search::embeddings::table::EmbeddingTable;
     use search::generation::text_search::index::FullTextDatabaseIndex;
     use spice_table::{IndexLayer, SpiceTable};

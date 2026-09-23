@@ -53,7 +53,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::util::test::MockExec;
 use test_framework::queries::Query;
 use test_framework::queries::validation::{

@@ -41,7 +41,7 @@ use data_components::postgres_replication::XidRegistry;
 use data_components::postgres_replication::slot::parse_lsn;
 use data_connector_api::write_back::{DeliveryError, DeliveryResult, WriteBackDeliverer};
 use datafusion::common::Constraints;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{self, InsertBuilder};
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::constraints::{
@@ -393,7 +393,7 @@ mod tests {
     use arrow::array::{Int32Array, LargeStringArray, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::on_conflict::OnConflict;
     use std::sync::Arc;

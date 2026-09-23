@@ -17,7 +17,7 @@ use crate::utils::parameters;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::QueryEngine;
 use serde_json::Value;

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -2478,7 +2478,7 @@ mod function_support_tests {
     use datafusion::optimizer::AnalyzerRule;
     use datafusion::physical_plan::{collect, displayable};
     use datafusion::prelude::{SessionContext, col, lit};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_federation::sql::federation_analyzer_rule;
     use datafusion_federation::{
         FederatedPlanNode, FederatedPlanner, FederatedTableProviderAdaptor,

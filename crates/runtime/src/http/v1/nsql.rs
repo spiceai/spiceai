@@ -800,7 +800,7 @@ mod tests {
     };
     use app::AppBuilder;
     use axum_extra::extract::Query as ExtraQuery;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use http::Uri;
     use http_body_util::BodyExt;
     use serde_json::json;

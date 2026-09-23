@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::StreamExt;
 use snafu::prelude::*;
 use std::collections::HashMap;

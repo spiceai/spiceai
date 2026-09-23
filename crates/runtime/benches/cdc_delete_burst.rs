@@ -53,7 +53,7 @@ use data_components::cdc::{
 };
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::StreamExt;
 use futures::stream as fstream;
 use runtime::accelerated::refresh::Refresh;

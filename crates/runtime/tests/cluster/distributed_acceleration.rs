@@ -845,7 +845,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .expect("scheduler should have partition store");
 
             for table_name in ["test_data", "categories"] {
-                let table_ref = datafusion::sql::TableReference::parse_str(table_name);
+                let table_ref = datafusion::common::TableReference::parse_str(table_name);
                 let assigned = crate::utils::wait_until_true(Duration::from_mins(1), || async {
                     partition_store.refresh().await.ok();
                     partition_store
@@ -952,7 +952,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
             // Trigger refresh from the scheduler. Previously this would fail with
             // "the refresh worker is no longer running. channel closed" because the
             // scheduler doesn't run local refresh workers. Now it forwards to executors.
-            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+            let table_ref = datafusion::common::TableReference::parse_str("test_data");
             harness
                 .scheduler
                 .datafusion()
@@ -1046,7 +1046,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                 .scheduler
                 .partition_store()
                 .expect("scheduler should have partition store");
-            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+            let table_ref = datafusion::common::TableReference::parse_str("test_data");
 
             let partitions_assigned =
                 crate::utils::wait_until_true(Duration::from_secs(30), || async {

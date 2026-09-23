@@ -38,7 +38,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use data_components::flightsql::{
     FlightSqlClient, FlightSqlExec, query_to_stream, trace_parent_from_task_context,

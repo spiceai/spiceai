@@ -33,7 +33,7 @@ use axum::{
     http::status,
     response::{IntoResponse, Response},
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -390,7 +390,7 @@ impl DataConnectorFactory for MySQLFactory {
 
 async fn mysql_comment_metadata(
     pool: &Arc<MySQLConnectionPool>,
-    table_reference: &datafusion::sql::TableReference,
+    table_reference: &datafusion::common::TableReference,
 ) -> std::result::Result<
     (HashMap<String, String>, data_components::FieldMetadata),
     Box<dyn std::error::Error + Send + Sync>,
@@ -434,7 +434,7 @@ async fn mysql_comment_metadata(
 /// the row-count/byte estimates the adaptive tuner warm-starts from.
 async fn mysql_inferred_schema_metadata(
     pool: &Arc<MySQLConnectionPool>,
-    table_reference: &datafusion::sql::TableReference,
+    table_reference: &datafusion::common::TableReference,
 ) -> std::result::Result<InferredSchema, Box<dyn std::error::Error + Send + Sync>> {
     let connection = pool.connect_direct().await?;
     let mut conn = connection.conn.lock().await;
@@ -504,7 +504,7 @@ async fn mysql_inferred_schema_metadata(
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
     dataset: &DatasetSpec,
-    table_reference: &datafusion::sql::TableReference,
+    table_reference: &datafusion::common::TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     let (mut table_metadata, field_metadata) =

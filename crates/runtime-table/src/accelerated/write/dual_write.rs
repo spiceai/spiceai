@@ -929,7 +929,7 @@ mod tests {
         use datafusion::logical_expr::col;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use datafusion::scalar::ScalarValue;
-        use datafusion::sql::TableReference;
+        use datafusion::common::TableReference;
         use datafusion_table_providers::UnsupportedTypeAction;
         use runtime_component::dataset::acceleration::RefreshMode;
         use runtime_table_partition::expression::PartitionedBy;

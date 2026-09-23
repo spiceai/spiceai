@@ -37,7 +37,7 @@ use datafusion::physical_plan::{
     metrics::MetricsSet,
     stream::RecordBatchStreamAdapter,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::sql::unparser::{Unparser, dialect::Dialect};
 use futures::{StreamExt, stream};
 use snafu::prelude::*;

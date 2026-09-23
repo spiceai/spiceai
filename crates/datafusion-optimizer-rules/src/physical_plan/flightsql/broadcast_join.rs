@@ -688,7 +688,7 @@ mod tests {
     use datafusion::physical_expr::expressions::IsNotNullExpr;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::PartitionMode;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use tonic::transport::Channel;
 
     fn dummy_client() -> FlightSqlClient {

@@ -29,7 +29,7 @@ use futures::TryStreamExt;
 pub use runtime_query_engine::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 const DATA_UPDATE_BROADCAST_CAPACITY: usize = 100;
 
@@ -373,7 +373,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     fn one_column_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int32Array::from(values))])
