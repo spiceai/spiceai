@@ -67,6 +67,7 @@ use super::pk_index::{
     pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::pk_validation::null_primary_key_message;
+use super::protected_merge_claims::{ProtectedMergeClaimGuard, ProtectedMergeClaims};
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
@@ -2453,29 +2454,16 @@ pub struct CayenneTableProvider {
     /// wall-clock time escalates the (otherwise TRACE-level) skip to a
     /// one-shot WARN.
     position_compaction_skip_streak: Arc<ParkingMutex<ResourceStarvationTracker>>,
-    /// Coordinates compaction passes on this table so a write-driven inline
-    /// trigger and the background scheduler can't both rewrite the same state.
-    ///
-    /// Every pass that repoints or re-reads the WHOLE protected set or the
-    /// current snapshot takes it exclusively (`write`/`try_write`): the
-    /// current-snapshot rewrite, the seq-prefix bake, the post-write manifest
-    /// rebuild, cold promotion, and the reopen drain barrier. Competing
-    /// exclusive triggers no-op via `try_write` rather than chaining onto a
-    /// backlog.
-    ///
-    /// The protected-snapshot subset merge on a key-delete table takes it
-    /// SHARED (`try_read`): it rewrites only the runs it selected and commits
-    /// them with a catalog CAS, so several can run at once as long as their
-    /// inputs are disjoint — which [`Self::protected_merge_claims`] enforces.
-    /// That is what keeps small runs leveling while one large-tier merge runs
-    /// for minutes (#14291). The per-table write lock continues to serialize
-    /// ordinary inserts independently.
+    /// Coordinates compaction passes on this table. Passes that repoint or
+    /// re-read the whole protected set or the current snapshot take it
+    /// exclusively and skip via `try_write` when it is held: the current-snapshot
+    /// rewrite, the seq-prefix bake, the manifest rebuild, cold promotion, and
+    /// the reopen drain. Key-delete subset merges take it shared, so small
+    /// merges can run during a long large-tier merge (#14291). The write lock
+    /// still serializes inserts independently.
     compaction_lock: Arc<tokio::sync::RwLock<()>>,
-    /// Protected-snapshot runs currently being rewritten by an in-flight subset
-    /// merge. A merge excludes claimed runs from selection and registers its own
-    /// under this mutex in one check-and-insert, so concurrent merges (allowed by
-    /// the shared [`Self::compaction_lock`]) never select the same run. Released
-    /// by [`ProtectedMergeClaimGuard`]'s `Drop`, on every exit.
+    /// Runs claimed by in-flight subset merges, which keeps concurrent merges
+    /// on disjoint inputs. See [`ProtectedMergeClaims`].
     protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
     /// Coalesces write-driven compaction notifications so a high-ingest table
     /// does not spawn one background compaction task per append while a prior
@@ -3698,6 +3686,9 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
 /// only while they fit, so a tier of large runs merges a few at a time. `None`
 /// leaves selection bounded only by `max_width`.
 ///
+/// `below_tier` restricts selection to tiers strictly below it; concurrent
+/// merges pass the lowest running merge's tier.
+///
 /// `inputs` is `(snapshot_id, deletion_threshold, bytes)`, oldest-first (i.e.
 /// `UUIDv7` lexical order). See [`ProtectedMergeSelection`] for the outcomes.
 fn select_protected_snapshot_merge_tier(
@@ -3707,6 +3698,7 @@ fn select_protected_snapshot_merge_tier(
     base_bytes: u64,
     growth: u64,
     max_pass_bytes: Option<u64>,
+    below_tier: Option<u32>,
 ) -> ProtectedMergeSelection {
     if inputs.len() < 2 || min_runs < 2 {
         // A merge needs at least two runs, and a floor below 2 is meaningless.
@@ -3722,6 +3714,9 @@ fn select_protected_snapshot_merge_tier(
 
     // BTreeMap iterates tiers in ascending order, so the first qualifying tier
     // is the lowest one.
+    let tiers = tiers
+        .into_iter()
+        .take_while(|(tier, _)| below_tier.is_none_or(|below| *tier < below));
     for (_tier, indices) in tiers {
         if indices.len() < min_runs {
             continue;
@@ -3798,167 +3793,6 @@ impl ProtectedMergeSelection {
             Self::Merge(inputs) => inputs,
             Self::NoQualifyingTier | Self::OverPassBudget { .. } => Vec::new(),
         }
-    }
-}
-
-/// The protected-snapshot runs in-flight subset merges are rewriting.
-///
-/// Key-delete subset merges share the compaction lock, so this is what keeps
-/// them apart: a merge may start only on runs no other merge holds, and only at
-/// a strictly lower size tier than every running merge. The tier rule is what
-/// makes the concurrent lane a small-tier lane — a large merge never waits
-/// behind another large merge's rewrite of the same bytes, and small checkpoint
-/// runs keep leveling while a large merge runs (#14291). The catalog CAS in
-/// `swap_protected_snapshots` remains the correctness backstop; claims only
-/// ensure the CAS never has to reject a whole rewrite.
-#[derive(Debug, Default)]
-struct ProtectedMergeClaims {
-    next_claim_id: u64,
-    claims: Vec<ProtectedMergeClaim>,
-}
-
-#[derive(Debug)]
-struct ProtectedMergeClaim {
-    claim_id: u64,
-    snapshot_ids: Vec<String>,
-    tier: u32,
-    bytes: u64,
-}
-
-impl ProtectedMergeClaims {
-    /// Copy of the claimed state for a pass to plan against without holding the
-    /// mutex across its I/O.
-    fn view(&self) -> ProtectedMergeClaimsView {
-        ProtectedMergeClaimsView {
-            snapshot_ids: self
-                .claims
-                .iter()
-                .flat_map(|claim| claim.snapshot_ids.iter().cloned())
-                .collect(),
-            bytes: self
-                .claims
-                .iter()
-                .fold(0u64, |total, claim| total.saturating_add(claim.bytes)),
-            min_tier: self.claims.iter().map(|claim| claim.tier).min(),
-            merges: self.claims.len(),
-        }
-    }
-
-    /// Register a merge of `snapshot_ids` at `tier`, unless a run is already
-    /// claimed, is no longer live, or `tier` is not strictly below every running
-    /// merge's tier. Returns the new claim's id on success.
-    fn try_insert(
-        &mut self,
-        snapshot_ids: Vec<String>,
-        tier: u32,
-        bytes: u64,
-        is_live: impl Fn(&str) -> bool,
-    ) -> Option<u64> {
-        if snapshot_ids.len() < 2 {
-            return None;
-        }
-        if self.claims.iter().any(|claim| claim.tier <= tier) {
-            return None;
-        }
-        let overlaps = snapshot_ids.iter().any(|id| {
-            !is_live(id)
-                || self
-                    .claims
-                    .iter()
-                    .any(|claim| claim.snapshot_ids.contains(id))
-        });
-        if overlaps {
-            return None;
-        }
-        let claim_id = self.next_claim_id;
-        self.next_claim_id = self.next_claim_id.wrapping_add(1);
-        self.claims.push(ProtectedMergeClaim {
-            claim_id,
-            snapshot_ids,
-            tier,
-            bytes,
-        });
-        Some(claim_id)
-    }
-
-    fn remove(&mut self, claim_id: u64) {
-        self.claims.retain(|claim| claim.claim_id != claim_id);
-    }
-}
-
-/// Snapshot of [`ProtectedMergeClaims`] taken under the Phase 1 fence.
-#[derive(Debug)]
-struct ProtectedMergeClaimsView {
-    snapshot_ids: HashSet<String>,
-    bytes: u64,
-    min_tier: Option<u32>,
-    merges: usize,
-}
-
-impl ProtectedMergeClaimsView {
-    fn is_empty(&self) -> bool {
-        self.merges == 0
-    }
-
-    fn len(&self) -> usize {
-        self.merges
-    }
-
-    fn is_claimed(&self, snapshot_id: &str) -> bool {
-        self.snapshot_ids.contains(snapshot_id)
-    }
-
-    /// Whether a run of `tier` may be merged alongside the running merges.
-    fn admits_tier(&self, tier: u32) -> bool {
-        self.min_tier.is_none_or(|running| tier < running)
-    }
-
-    /// The pass budget left after the running merges' inputs. `None` (no
-    /// finite pool) stays unbounded.
-    fn remaining_budget(&self, max_pass_bytes: Option<u64>) -> Option<u64> {
-        max_pass_bytes.map(|budget| budget.saturating_sub(self.bytes))
-    }
-
-    /// A decline while another merge runs is reported as `declined_lock_busy`:
-    /// before merges could run concurrently the pass stopped at the lock with
-    /// that outcome, so the series keeps meaning "another pass is in the way".
-    fn decline_outcome(&self, otherwise: CompactionOutcome) -> CompactionOutcome {
-        if self.is_empty() {
-            otherwise
-        } else {
-            CompactionOutcome::DeclinedLockBusy
-        }
-    }
-}
-
-/// Releases a [`ProtectedMergeClaims`] entry when the merge that holds it ends,
-/// on every exit: commit, decline, error, CAS abort, or task cancellation.
-struct ProtectedMergeClaimGuard {
-    claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
-    claim_id: u64,
-}
-
-impl ProtectedMergeClaimGuard {
-    fn try_claim(
-        claims: &Arc<ParkingMutex<ProtectedMergeClaims>>,
-        snapshot_ids: Vec<String>,
-        tier: u32,
-        bytes: u64,
-        is_live: impl Fn(&str) -> bool,
-    ) -> Option<Self> {
-        let claim_id = claims
-            .lock()
-            .try_insert(snapshot_ids, tier, bytes, is_live)?;
-        Some(Self {
-            claims: Arc::clone(claims),
-            claim_id,
-        })
-    }
-}
-
-impl Drop for ProtectedMergeClaimGuard {
-    fn drop(&mut self) {
-        self.claims.lock().remove(self.claim_id);
     }
 }
 
@@ -23136,13 +22970,13 @@ impl CayenneTableProvider {
             None
         };
 
-        // Key-delete merges share the compaction lock, so a small-tier merge can
-        // level fresh checkpoints while a large-tier merge runs for minutes
-        // (#14291); `protected_merge_claims` keeps their inputs disjoint.
-        // Position-delete merges already serialize with writers above and take
-        // it exclusively, as does every pass that repoints the whole protected
-        // set (current-snapshot rewrite, bake, promotion, manifest rebuild).
-        let compaction_guards = if serialize_position_deletes {
+        // Key-delete merges share the lock so small merges can run during a
+        // long large-tier merge (#14291); claims keep their inputs disjoint.
+        // Position-scoped tables take it exclusively, like every pass that
+        // repoints the whole protected set.
+        let keeps_positions_serial =
+            serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
+        let compaction_guards = if keeps_positions_serial {
             self.compaction_lock
                 .try_write()
                 .map(|guard| (Some(guard), None))
@@ -23178,9 +23012,8 @@ impl CayenneTableProvider {
         // would resurrect the whole pre-overwrite warm row set next to its
         // cold/new copies.
         //
-        // Runs another in-flight merge has claimed are invisible to this pass.
-        // The view is only a pre-filter: admission re-checks it atomically once
-        // the inputs are chosen.
+        // Runs claimed by an in-flight merge are skipped. Admission re-checks
+        // the claims atomically once the inputs are chosen.
         let (candidates, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture, in_flight) = {
             let _fence = self.listing_fence.read().await;
             let snapshot_at_capture = self.get_current_snapshot_id();
@@ -23190,15 +23023,15 @@ impl CayenneTableProvider {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::ProtectedSubset,
-                    in_flight.decline_outcome(CompactionOutcome::DeclinedNoCandidates),
+                    CompactionOutcome::DeclinedNoCandidates,
                 );
                 return Ok(false);
             }
-            let unclaimed = protected
-                .keys()
-                .filter(|id| !in_flight.is_claimed(id))
-                .count();
-            if unclaimed < 2 {
+            let unclaimed: Vec<(&String, &i64)> = protected
+                .iter()
+                .filter(|(id, _)| !in_flight.is_claimed(id))
+                .collect();
+            if unclaimed.len() < 2 {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::ProtectedSubset,
@@ -23207,7 +23040,7 @@ impl CayenneTableProvider {
                 tracing::trace!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    claimed = protected.len() - unclaimed,
+                    claimed = protected.len() - unclaimed.len(),
                     "Skipping protected-snapshot subset compaction: the remaining runs are being merged by another pass",
                 );
                 return Ok(false);
@@ -23244,25 +23077,24 @@ impl CayenneTableProvider {
             // Protected snapshot ids are UUIDv7, so lexical order == creation
             // order. Consider the oldest `max_inputs` (at least 2) eligible
             // snapshots.
-            let mut ids: Vec<String> = protected
+            let mut ids: Vec<String> = unclaimed
                 .iter()
-                .filter(|&(id, _)| !in_flight.is_claimed(id))
-                .filter(|&(_, &threshold)| {
+                .filter(|&&(_, &threshold)| {
                     pending_floor.is_none() || threshold <= fence_max_delete_seq
                 })
-                .map(|(id, _)| id.clone())
+                .map(|&(id, _)| id.clone())
                 .collect();
             if ids.len() < 2 {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::ProtectedSubset,
-                    in_flight.decline_outcome(CompactionOutcome::DeclinedAboveDeleteFence),
+                    CompactionOutcome::DeclinedAboveDeleteFence,
                 );
                 tracing::trace!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     fence_max_delete_seq,
-                    above_fence = unclaimed - ids.len(),
+                    above_fence = unclaimed.len() - ids.len(),
                     "Skipping protected-snapshot subset compaction: fewer than two inputs at or below the delete fence",
                 );
                 return Ok(false);
@@ -23288,14 +23120,42 @@ impl CayenneTableProvider {
         };
         let phase1_fence_ms = compaction_start.elapsed().as_millis();
 
+        // Resolved before sizing: under a finite budget an unsizeable candidate must be
+        // DROPPED, not counted as free (see the per-candidate arm below).
+        let max_pass_bytes = self.protected_merge_input_budget_bytes();
+        let selection_budget_bytes = in_flight.remaining_budget(max_pass_bytes);
+        let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
+
+        // Skip the sizing I/O when no merge could be admitted: a tier-0 merge is
+        // running, the running merges hold the whole budget, or too few runs
+        // remain to fill a tier.
+        if in_flight.min_tier() == Some(0) || selection_budget_bytes == Some(0) {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::ProtectedSubset,
+                CompactionOutcome::DeclinedLockBusy,
+            );
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping protected-snapshot subset compaction: the running merges hold the lowest tier or the whole budget",
+            );
+            return Ok(false);
+        }
+        if candidates.len() < min_runs {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::ProtectedSubset,
+                CompactionOutcome::DeclinedNoQualifyingTier,
+            );
+            return Ok(false);
+        }
+
         // Per-input sizing: list each candidate snapshot's on-disk Vortex bytes
         // + file count. Sizes drive the size-tier selection and reveal the size
         // distribution (e.g. one carried-forward merged snapshot dwarfing the
         // small new deltas). This is diagnostic I/O outside the fence.
         let sizing_start = std::time::Instant::now();
-        // Resolved before sizing: under a finite budget an unsizeable candidate must be
-        // DROPPED, not counted as free (see the per-candidate arm below).
-        let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut sized_candidates: Vec<(String, i64, u64)> = Vec::with_capacity(candidates.len());
         for (snapshot_id, threshold) in &candidates {
             let bytes = match self.list_snapshot_files_with_sizes(snapshot_id).await {
@@ -23325,23 +23185,6 @@ impl CayenneTableProvider {
         }
         let sizing_ms = sizing_start.elapsed().as_millis();
 
-        // While another merge is in flight, this pass may only level runs in a
-        // strictly lower tier than every running merge, and only with the budget
-        // those merges have not already taken. The first keeps the concurrent
-        // lane a short small-tier lane (never two large merges at once, never a
-        // merge into the tier a running merge is producing); the second keeps
-        // the merges together inside the single-pass memory bound.
-        if !in_flight.is_empty() {
-            sized_candidates.retain(|(_, _, bytes)| {
-                in_flight.admits_tier(protected_snapshot_size_tier(
-                    *bytes,
-                    PROTECTED_TIER_BASE_BYTES,
-                    PROTECTED_TIER_GROWTH,
-                ))
-            });
-        }
-        let selection_budget_bytes = in_flight.remaining_budget(max_pass_bytes);
-
         // --- Size-tier selection (replaces the single-threshold PoC skip). ---
         // Consolidate only the lowest size tier that has accumulated at least
         // `min_runs` same-size runs, capped at `PROTECTED_MERGE_MAX_WIDTH`. This
@@ -23351,8 +23194,8 @@ impl CayenneTableProvider {
         // the large carried-forward blob back in on every pass.
         // `max_pass_bytes` (resolved above) is the absolute per-pass input ceiling above
         // the relative size tiers, so a tier of very large runs consolidates a few at a
-        // time (issue #12013).
-        let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
+        // time (issue #12013). Alongside running merges, only tiers below theirs
+        // qualify, within the budget they leave.
         let selection = select_protected_snapshot_merge_tier(
             &sized_candidates,
             min_runs,
@@ -23360,6 +23203,7 @@ impl CayenneTableProvider {
             PROTECTED_TIER_BASE_BYTES,
             PROTECTED_TIER_GROWTH,
             selection_budget_bytes,
+            in_flight.min_tier(),
         );
 
         if let ProtectedMergeSelection::OverPassBudget {
@@ -23381,7 +23225,7 @@ impl CayenneTableProvider {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::ProtectedSubset,
-                in_flight.decline_outcome(CompactionOutcome::DeclinedOverPassBudget),
+                CompactionOutcome::DeclinedOverPassBudget,
             );
             tracing::debug!(
                 target: "cayenne::compaction",
@@ -23400,7 +23244,7 @@ impl CayenneTableProvider {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::ProtectedSubset,
-                in_flight.decline_outcome(CompactionOutcome::DeclinedNoQualifyingTier),
+                CompactionOutcome::DeclinedNoQualifyingTier,
             );
             tracing::debug!(
                 target: "cayenne::compaction",
@@ -23439,11 +23283,8 @@ impl CayenneTableProvider {
             PROTECTED_TIER_GROWTH,
         );
 
-        // Admission: claim the inputs in one check-and-insert, so a merge that
-        // chose the same runs (or a larger tier) since the Phase 1 view loses
-        // here instead of rewriting them for a CAS that would reject it. Held to
-        // the end of the pass — past the in-memory publish — so no other merge
-        // can select these runs while they are still in the protected map.
+        // Claim the inputs atomically. Held until the pass returns, past the
+        // in-memory publish, so no other merge can select these runs.
         let input_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
         let live = self.protected_snapshots.load();
         let Some(_claim) = ProtectedMergeClaimGuard::try_claim(
@@ -23451,6 +23292,7 @@ impl CayenneTableProvider {
             input_ids,
             selected_tier,
             total_input_bytes,
+            max_pass_bytes,
             |id| live.contains_key(id),
         ) else {
             maintenance_metrics::track_compaction(
@@ -23462,7 +23304,7 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 selected_tier,
-                "Skipping protected-snapshot subset compaction: another pass claimed these runs or a larger tier first",
+                "Skipping protected-snapshot subset compaction: another merge claimed these runs or the remaining budget first",
             );
             return Ok(false);
         };
@@ -23532,8 +23374,6 @@ impl CayenneTableProvider {
         // default is `DEFAULT_WRITE_CONCURRENCY`, and a table may configure its
         // own — so on any host with more cores than that default they disagree.
         let target_size_bytes = self.context.target_file_size_bytes();
-        let keeps_positions_serial =
-            serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             keeps_positions_serial,
             target_partitions_hint,
@@ -39125,9 +38965,33 @@ mod tests {
             sized("d", base * 5), // tier 1
         ];
         let selected =
-            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None).into_inputs();
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None)
+                .into_inputs();
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn select_merge_tier_stays_below_the_running_merge_tier() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let inputs = vec![
+            sized("a", base * 4), // tier 1
+            sized("b", base * 5), // tier 1
+            sized("c", 1024),     // tier 0
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, Some(2))
+                .into_inputs()
+                .len(),
+            2,
+            "tier 1 qualifies below a running tier-2 merge"
+        );
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, Some(1)),
+            ProtectedMergeSelection::NoQualifyingTier,
+            "tier 1 must not merge alongside a running tier-1 merge"
+        );
     }
 
     #[test]
@@ -39137,7 +39001,7 @@ mod tests {
         // One run per tier — no tier reaches min_runs = 2.
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
         assert_eq!(
-            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None),
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None),
             ProtectedMergeSelection::NoQualifyingTier
         );
     }
@@ -39154,7 +39018,8 @@ mod tests {
             sized("d", 400),
         ];
         let selected =
-            select_protected_snapshot_merge_tier(&inputs, 2, 2, base, growth, None).into_inputs();
+            select_protected_snapshot_merge_tier(&inputs, 2, 2, base, growth, None, None)
+                .into_inputs();
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -39165,7 +39030,7 @@ mod tests {
         let growth = 8;
         // Fewer than two inputs, or a sub-2 floor, can never merge.
         assert_eq!(
-            select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None),
+            select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth, None, None),
             ProtectedMergeSelection::NoQualifyingTier
         );
         assert_eq!(
@@ -39175,6 +39040,7 @@ mod tests {
                 32,
                 base,
                 growth,
+                None,
                 None
             ),
             ProtectedMergeSelection::NoQualifyingTier
@@ -39194,15 +39060,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         let selected =
-            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib))
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib), None)
                 .into_inputs();
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["s0", "s1", "s2"], "oldest-first, budget-bounded");
 
         // An unbounded pool keeps the prior behavior: the whole tier, up to max_width.
-        let unbounded = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None)
-            .into_inputs()
-            .len();
+        let unbounded =
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, None, None)
+                .into_inputs()
+                .len();
         assert_eq!(unbounded, 8);
     }
 
@@ -39220,7 +39087,7 @@ mod tests {
         // Reported as a budget stall rather than "nothing accumulated", so the caller
         // can escalate the read amplification it implies.
         assert_eq!(
-            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(6 * gib)),
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(6 * gib), None),
             ProtectedMergeSelection::OverPassBudget {
                 tier_runs: 4,
                 oldest_pair_bytes: 8 * gib,
@@ -39228,7 +39095,7 @@ mod tests {
         );
         // Exactly two fitting is enough to make progress.
         let pair =
-            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(8 * gib))
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(8 * gib), None)
                 .into_inputs();
         let ids: Vec<&str> = pair.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["s0", "s1"]);
@@ -39251,7 +39118,7 @@ mod tests {
             sized("new_b", gib),
         ];
         assert_eq!(
-            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib)),
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib), None),
             ProtectedMergeSelection::OverPassBudget {
                 tier_runs: 4,
                 oldest_pair_bytes: 8 * gib,
@@ -40077,27 +39944,23 @@ mod tests {
         );
     }
 
-    /// Regression test for #14291: while a large-tier protected-snapshot merge
-    /// is in flight, fresh small runs must still level. The large merge is
-    /// parked between its catalog CAS and its in-memory publish — the lock and
-    /// its claim are held there, as they are throughout its rewrite — and the
-    /// small runs written meanwhile (an upsert of a key the large merge is
-    /// rewriting, plus a new key) must merge before it publishes, without either
-    /// merge losing or resurrecting a row.
+    /// Regression test for #14291: small runs must merge while a large-tier
+    /// merge is in flight. The large merge is parked after its catalog CAS,
+    /// still holding the lock and its claim. Runs written meanwhile (an upsert
+    /// of a key it is rewriting, plus a new key) must merge before it publishes,
+    /// with no row lost, duplicated, or resurrected.
     #[tokio::test]
     async fn small_tier_merge_runs_while_large_tier_merge_is_in_flight() {
-        use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
 
-        // ~4 KiB rows over a 64-symbol alphabet (~3 KiB each on disk); 3,600 per
-        // run puts each large run above the 8 MiB tier-0 ceiling ON DISK
-        // (asserted below, not assumed).
+        // ~3 KiB per row on disk, so each large run exceeds the 8 MiB tier-0
+        // ceiling (asserted below).
         const LARGE_RUN_ROWS: i64 = 3_600;
         const PAYLOAD_BYTES: usize = 4096;
         const NEW_KEY: i64 = 1_000_000;
 
         let ctx = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("payload", DataType::Utf8, false),
         ]));
@@ -40110,7 +39973,7 @@ mod tests {
                 inline_max_rows: 0,
                 compaction_trigger_protected_snapshots: 2,
                 compaction_background_interval_ms: 3_600_000,
-                // Key mode: the mode whose merges share the compaction lock.
+                // Key-delete merges are the ones that share the lock.
                 deletion_mode: crate::metadata::DeletionMode::Key,
                 ..VortexConfig::default()
             },
@@ -40121,40 +39984,23 @@ mod tests {
             ),
         )
         .await;
-        let payload_batch = |ids: Vec<i64>, payload: &dyn Fn(i64) -> String| {
-            let payloads: Vec<String> = ids.iter().map(|id| payload(*id)).collect();
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(ids)),
-                    Arc::new(StringArray::from(payloads)),
-                ],
-            )
-            .expect("payload batch")
-        };
-        let original = |id: i64| format!("{id:08}_{}", entropy_payload(id, PAYLOAD_BYTES));
 
-        // Hold the lock across setup so write-driven maintenance cannot merge the
-        // two large runs before the test does.
+        // Keep write-driven maintenance from merging the large runs early.
         let setup_guard = provider.compaction_lock.write().await;
         for run in 0..2 {
-            let start = run * LARGE_RUN_ROWS;
-            insert_batch(
-                &provider,
-                payload_batch((start..start + LARGE_RUN_ROWS).collect(), &original),
-            )
-            .await;
+            let ids: Vec<i64> = (run * LARGE_RUN_ROWS..(run + 1) * LARGE_RUN_ROWS).collect();
+            let payloads: Vec<String> = ids
+                .iter()
+                .map(|id| format!("{id:08}_{}", entropy_payload(*id, PAYLOAD_BYTES)))
+                .collect();
+            let payloads: Vec<&str> = payloads.iter().map(String::as_str).collect();
+            insert_batch(&provider, id_name_batch(&schema, &ids, &payloads)).await;
         }
         provider
             .flush_pending_maintenance()
             .await
             .expect("drain pending post-write maintenance");
-        let large_runs: Vec<String> = provider
-            .protected_snapshots
-            .load_full()
-            .keys()
-            .cloned()
-            .collect();
+        let large_runs = provider.protected_snapshot_ids();
         assert_eq!(large_runs.len(), 2, "fixture must produce two large runs");
         for run in &large_runs {
             let bytes: u64 = provider
@@ -40176,8 +40022,7 @@ mod tests {
         }
         drop(setup_guard);
 
-        // Runs while the large merge is parked after its CAS, holding the
-        // compaction lock and its claim.
+        // Runs while the large merge is parked after its CAS.
         let small_runs = Arc::new(ParkingMutex::new(Vec::<String>::new()));
         let small_merged = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -40188,28 +40033,23 @@ mod tests {
             let schema = Arc::clone(&schema);
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
-                    let batch = |id: i64, payload: &str| {
-                        RecordBatch::try_new(
-                            Arc::clone(&schema),
-                            vec![
-                                Arc::new(Int64Array::from(vec![id])),
-                                Arc::new(StringArray::from(vec![payload.to_string()])),
-                            ],
-                        )
-                        .expect("small batch")
-                    };
                     // Upsert a key the large merge is rewriting, then add a key.
-                    insert_batch(&provider_in_hook, batch(0, "updated")).await;
-                    insert_batch(&provider_in_hook, batch(NEW_KEY, "new")).await;
+                    insert_batch(
+                        &provider_in_hook,
+                        id_name_batch(&schema, &[0], &["updated"]),
+                    )
+                    .await;
+                    insert_batch(
+                        &provider_in_hook,
+                        id_name_batch(&schema, &[NEW_KEY], &["new"]),
+                    )
+                    .await;
                     let fresh: Vec<String> = provider_in_hook
-                        .protected_snapshots
-                        .load_full()
-                        .keys()
-                        .filter(|id| !large_runs.contains(id))
+                        .protected_snapshot_ids()
+                        .difference(&large_runs)
                         .cloned()
                         .collect();
-                    // A write-driven pass may already have merged them; either
-                    // way they must not wait for the large merge.
+                    // A write-driven pass may already have merged them.
                     if fresh.len() >= 2 {
                         let merged = provider_in_hook
                             .compact_protected_snapshots_subset(usize::MAX)
@@ -40221,9 +40061,10 @@ mod tests {
                              flight (#14291), not decline on the compaction lock"
                         );
                     }
-                    let protected = provider_in_hook.protected_snapshots.load_full();
                     assert!(
-                        large_runs.iter().all(|run| protected.contains_key(run)),
+                        provider_in_hook
+                            .protected_snapshot_ids()
+                            .is_superset(&large_runs),
                         "the large merge's inputs stay published until it publishes"
                     );
                     *small_runs.lock() = fresh;
@@ -40242,7 +40083,7 @@ mod tests {
         );
         assert!(merged_large, "the two large runs must merge");
 
-        let protected = provider.protected_snapshots.load_full();
+        let protected = provider.protected_snapshot_ids();
         let small_runs = small_runs.lock().clone();
         assert!(
             !small_runs.is_empty(),
@@ -40252,7 +40093,7 @@ mod tests {
             small_runs
                 .iter()
                 .chain(large_runs.iter())
-                .all(|run| !protected.contains_key(run)),
+                .all(|run| !protected.contains(run)),
             "both merges' inputs must be gone from the protected set: {protected:?}"
         );
         assert_eq!(
@@ -40261,12 +40102,11 @@ mod tests {
             "one output per merge must remain: {protected:?}"
         );
         assert!(
-            provider.protected_merge_claims.lock().claims.is_empty(),
+            provider.protected_merge_claims.lock().is_empty(),
             "both merges must release their claims"
         );
 
-        // Correctness: every key once, the upsert's value wins, the new key is
-        // present.
+        // Every key once, the upsert wins, and the new key is visible.
         ctx.register_table(
             "small_tier_under_large_merge",
             Arc::new(provider.clone_for_write()),
@@ -40284,94 +40124,16 @@ mod tests {
             .collect()
             .await
             .expect("query ran");
-        let row = &batches[0];
-        let count = |col: usize| {
-            row.column(col)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("count is Int64")
-                .value(0)
-        };
-        let text = |col: usize| {
-            ScalarValue::try_from_array(row.column(col).as_ref(), 0)
-                .expect("payload scalar")
+        let value = |col: usize| {
+            ScalarValue::try_from_array(batches[0].column(col).as_ref(), 0)
+                .expect("scalar")
                 .to_string()
         };
-        assert_eq!(count(0), 2 * LARGE_RUN_ROWS + 1, "row count");
-        assert_eq!(count(1), 2 * LARGE_RUN_ROWS + 1, "no key may appear twice");
-        assert_eq!(text(2), "updated", "the concurrent upsert must win");
-        assert_eq!(text(3), "new", "the key written mid-merge must be visible");
-    }
-
-    #[test]
-    fn protected_merge_claims_keep_concurrent_merges_disjoint() {
-        let ids = |names: &[&str]| names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>();
-        let live = |_: &str| true;
-        let mut claims = ProtectedMergeClaims::default();
-
-        let large = claims
-            .try_insert(ids(&["a", "b"]), 2, 400, live)
-            .expect("first merge claims its runs");
-        assert!(
-            claims.try_insert(ids(&["b", "c"]), 0, 1, live).is_none(),
-            "a run another merge holds cannot be claimed"
-        );
-        assert!(
-            claims.try_insert(ids(&["c", "d"]), 2, 1, live).is_none(),
-            "a second merge at the running merge's tier is refused"
-        );
-        assert!(
-            claims.try_insert(ids(&["c", "d"]), 3, 1, live).is_none(),
-            "a larger-tier merge is refused while a merge runs"
-        );
-        assert!(
-            claims
-                .try_insert(ids(&["c", "d"]), 0, 1, |id| id != "d")
-                .is_none(),
-            "a run already merged away (no longer live) cannot be claimed"
-        );
-        let small = claims
-            .try_insert(ids(&["c", "d"]), 0, 8, live)
-            .expect("disjoint lower-tier merge is admitted");
-
-        let view = claims.view();
-        assert_eq!(view.len(), 2);
-        assert!(view.is_claimed("a") && view.is_claimed("d") && !view.is_claimed("e"));
-        assert!(!view.admits_tier(0), "below the lowest running tier only");
-        assert_eq!(view.remaining_budget(Some(1_000)), Some(592));
-        assert_eq!(view.remaining_budget(Some(100)), Some(0));
-        assert_eq!(view.remaining_budget(None), None);
-        assert_eq!(
-            view.decline_outcome(CompactionOutcome::DeclinedNoQualifyingTier),
-            CompactionOutcome::DeclinedLockBusy
-        );
-
-        claims.remove(large);
-        claims.remove(small);
-        let view = claims.view();
-        assert!(view.is_empty() && view.admits_tier(u32::MAX));
-        assert_eq!(
-            view.decline_outcome(CompactionOutcome::DeclinedNoQualifyingTier),
-            CompactionOutcome::DeclinedNoQualifyingTier
-        );
-    }
-
-    #[test]
-    fn protected_merge_claim_guard_releases_on_drop() {
-        let claims = Arc::new(ParkingMutex::new(ProtectedMergeClaims::default()));
-        let runs = vec!["a".to_string(), "b".to_string()];
-        let guard = ProtectedMergeClaimGuard::try_claim(&claims, runs.clone(), 1, 10, |_| true)
-            .expect("claim");
-        assert!(
-            ProtectedMergeClaimGuard::try_claim(&claims, runs.clone(), 0, 10, |_| true).is_none(),
-            "held runs cannot be claimed again"
-        );
-        drop(guard);
-        assert!(claims.lock().claims.is_empty(), "drop releases the claim");
-        assert!(
-            ProtectedMergeClaimGuard::try_claim(&claims, runs, 1, 10, |_| true).is_some(),
-            "released runs can be claimed by a later merge"
-        );
+        let expected_rows = (2 * LARGE_RUN_ROWS + 1).to_string();
+        assert_eq!(value(0), expected_rows, "row count");
+        assert_eq!(value(1), expected_rows, "no key may appear twice");
+        assert_eq!(value(2), "updated", "the concurrent upsert must win");
+        assert_eq!(value(3), "new", "the key written mid-merge must be visible");
     }
 
     /// Engagement test for the size-aware PARALLEL merge encode: a subset
