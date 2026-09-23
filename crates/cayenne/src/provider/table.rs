@@ -2459,7 +2459,7 @@ pub struct CayenneTableProvider {
     /// exclusively and skip via `try_write` when it is held: the current-snapshot
     /// rewrite, the seq-prefix bake, the manifest rebuild, cold promotion, and
     /// the reopen drain. Key-delete subset merges take it shared, so small
-    /// merges can run during a long large-tier merge (#14291). The write lock
+    /// merges can run during a long large-tier merge. The write lock
     /// still serializes inserts independently.
     compaction_lock: Arc<tokio::sync::RwLock<()>>,
     /// Runs claimed by in-flight subset merges, which keeps concurrent merges
@@ -22970,10 +22970,14 @@ impl CayenneTableProvider {
             None
         };
 
-        // Key-delete merges share the lock so small merges can run during a
-        // long large-tier merge (#14291); claims keep their inputs disjoint.
-        // Position-scoped tables take it exclusively, like every pass that
-        // repoints the whole protected set.
+        // Key-delete merges share the lock, so a small merge can run while a long
+        // large-tier merge is in flight; claims keep their inputs disjoint. This
+        // is safe because a key delete applies to any run by key and sequence, so
+        // a delete that lands mid-merge still reaches the merged output.
+        // Position-scoped tables take the lock exclusively: their deletes name a
+        // row position in a specific file, and a merge that swaps that file for a
+        // rewritten one would lose a delete aimed at it mid-merge. Every pass that
+        // repoints the whole protected set also takes it exclusively.
         let keeps_positions_serial =
             serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
         let compaction_guards = if keeps_positions_serial {
@@ -40069,7 +40073,7 @@ mod tests {
                         assert!(
                             merged,
                             "the small-tier merge must run while the large merge is in \
-                             flight (#14291), not decline on the compaction lock"
+                             flight, not decline on the compaction lock"
                         );
                     }
                     let protected = provider_in_hook.protected_snapshot_ids();

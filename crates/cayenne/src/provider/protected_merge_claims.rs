@@ -19,7 +19,7 @@ limitations under the License.
 //! Key-delete subset merges share the table's compaction lock, so claims keep
 //! them apart: a merge may claim only unclaimed, still-published runs, at a tier
 //! strictly below every running merge, and within the pass budget left by the
-//! running merges (#14291). The catalog CAS remains the correctness backstop.
+//! running merges. The catalog CAS remains the correctness backstop.
 
 use std::collections::HashSet;
 use std::sync::Arc;
