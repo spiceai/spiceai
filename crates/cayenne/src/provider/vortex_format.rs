@@ -59,18 +59,7 @@ impl std::fmt::Debug for PositionDeletionAccessPlanProvider {
     }
 }
 
-#[async_trait::async_trait]
 impl VortexAccessPlanProvider for PositionDeletionAccessPlanProvider {
-    /// Deletion vectors are known when the plan is built, so there is nothing to
-    /// add once a file opens.
-    async fn runtime_access_plan_for_file(
-        &self,
-        _file: &PartitionedFile,
-        _predicate: Option<&datafusion_physical_expr::PhysicalExprRef>,
-    ) -> Option<Arc<VortexAccessPlan>> {
-        None
-    }
-
     fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
         let file_path = file.object_meta.location.to_string();
         let deletion_vector = self.deletion_vector_for_path(&file_path)?;

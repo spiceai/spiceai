@@ -162,6 +162,7 @@ use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use vortex_datafusion::VortexAccessPlanProvider;
+use vortex_datafusion::VortexRuntimeAccessPlanProvider;
 use vortex_datafusion::VortexWriteObserver;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -33238,7 +33239,7 @@ impl CayenneTableProvider {
         // can inspect a completed hash-join dynamic filter and batch-probe the
         // same snapshot index. Unsupported or oversized filters simply return no
         // runtime plan and keep the ordinary scan path.
-        let runtime_lookup_provider: Option<Arc<dyn VortexAccessPlanProvider>> = self
+        let runtime_lookup_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>> = self
             .lookup_index
             .as_ref()
             .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
@@ -33260,23 +33261,33 @@ impl CayenneTableProvider {
                         .flat_map(FileGroup::iter)
                         .map(|file| file.object_meta.clone())
                         .collect(),
-                    Self::position_deletion_plans(&self.pk_deletion_strategy),
                     request_build,
-                )) as Arc<dyn VortexAccessPlanProvider>
+                )) as Arc<dyn VortexRuntimeAccessPlanProvider>
             });
         // Runtime lookup filters are populated only while a hash join executes.
         // Preserve the base scan's exact statistics here so an indexed table can
         // still use metadata-only aggregates when no runtime filter is present.
         // Static lookup selections above already make their restricted scan
         // statistics inexact.
-        let plan_provider = lookup_plan_provider.or(runtime_lookup_provider);
-        let plan_format: Arc<dyn FileFormat> = match plan_provider {
-            Some(provider) => Arc::new(
+        //
+        // Only such a scan registers a runtime provider; every other scan opens
+        // its files exactly as it is planned.
+        let plan_format: Arc<dyn FileFormat> = match (lookup_plan_provider, runtime_lookup_provider)
+        {
+            (Some(provider), _) => Arc::new(
                 self.context
                     .file_format()
                     .with_access_plan_provider(provider),
             ),
-            None => Arc::clone(&options.format),
+            (None, Some(runtime)) => Arc::new(
+                self.context
+                    .file_format()
+                    .with_access_plan_provider(Self::position_deletion_plans(
+                        &self.pk_deletion_strategy,
+                    ))
+                    .with_runtime_access_plan_provider(runtime),
+            ),
+            (None, None) => Arc::clone(&options.format),
         };
 
         plan_format

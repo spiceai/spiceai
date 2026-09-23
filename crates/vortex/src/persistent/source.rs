@@ -36,7 +36,7 @@ use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
-use super::VortexAccessPlanProvider;
+use super::VortexRuntimeAccessPlanProvider;
 use super::opener::VortexOpener;
 use super::segment_cache::SharedSegmentCache;
 use crate::ProjectionPushdown;
@@ -85,7 +85,7 @@ pub struct VortexSource {
     allow_repartitioning: bool,
     /// Optional provider retained until file-open time so runtime predicates can
     /// contribute row selections after dynamic filters have been populated.
-    runtime_access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
 }
 
 impl VortexSource {
@@ -208,7 +208,7 @@ impl VortexSource {
     #[must_use]
     pub fn with_runtime_access_plan_provider(
         mut self,
-        provider: Arc<dyn VortexAccessPlanProvider>,
+        provider: Arc<dyn VortexRuntimeAccessPlanProvider>,
     ) -> Self {
         self.runtime_access_plan_provider = Some(provider);
         self

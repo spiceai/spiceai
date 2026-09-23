@@ -54,7 +54,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
 use crate::VortexAccessPlan;
-use crate::VortexAccessPlanProvider;
+use crate::VortexRuntimeAccessPlanProvider;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::make_vortex_predicate;
@@ -114,7 +114,7 @@ pub(crate) struct VortexOpener {
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
     /// Provider consulted after runtime dynamic filters have been populated.
-    pub runtime_access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    pub runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
 }
 
 impl FileOpener for VortexOpener {
@@ -1536,11 +1536,7 @@ mod tests {
     struct EmptyRuntimeAccessPlanProvider;
 
     #[async_trait::async_trait]
-    impl VortexAccessPlanProvider for EmptyRuntimeAccessPlanProvider {
-        fn access_plan_for_file(&self, _file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
-            None
-        }
-
+    impl VortexRuntimeAccessPlanProvider for EmptyRuntimeAccessPlanProvider {
         async fn runtime_access_plan_for_file(
             &self,
             _file: &PartitionedFile,

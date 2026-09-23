@@ -29,25 +29,9 @@ pub struct VortexAccessPlan {
 /// can attach a [`VortexAccessPlan`] to each [`PartitionedFile`] before the scan
 /// is built and can adjust the footer-derived [`Statistics`] so `DataFusion` does
 /// not apply optimizations using stale metadata.
-#[async_trait]
 pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
     /// Returns the access plan to attach to a file, if any.
     fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>>;
-
-    /// Returns an access plan derived from the scan's runtime predicate.
-    ///
-    /// Unlike [`Self::access_plan_for_file`], this hook is invoked when a file is
-    /// opened, after dynamic expressions such as hash-join filters may have been
-    /// populated. The opener intersects a returned plan with the plan attached
-    /// during physical planning, so a runtime plan can only narrow the rows read.
-    ///
-    /// There is deliberately no default: a provider that wraps another must
-    /// forward this call, or the inner provider's runtime plan is silently lost.
-    async fn runtime_access_plan_for_file(
-        &self,
-        file: &PartitionedFile,
-        predicate: Option<&PhysicalExprRef>,
-    ) -> Option<Arc<VortexAccessPlan>>;
 
     /// Adjusts the statistics inferred from a file footer.
     ///
@@ -57,6 +41,26 @@ pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
     fn adjust_statistics(&self, _object: &ObjectMeta, statistics: Statistics) -> Statistics {
         statistics
     }
+}
+
+/// Provides access plans that depend on the scan's runtime predicate.
+///
+/// Unlike a [`VortexAccessPlanProvider`], which plans every file before the scan
+/// starts, this is consulted as each file opens, after dynamic expressions such
+/// as hash-join filters may have been populated. A scan registers one only when
+/// it has something to plan from such a predicate; every other scan opens its
+/// files exactly as before. The opener intersects a returned plan with the plan
+/// attached during physical planning, so a runtime plan can only narrow the rows
+/// read.
+#[async_trait]
+pub trait VortexRuntimeAccessPlanProvider: Debug + Send + Sync + 'static {
+    /// Returns an access plan for `file` derived from the scan's `predicate`, or
+    /// `None` to read the file as planned.
+    async fn runtime_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        predicate: Option<&PhysicalExprRef>,
+    ) -> Option<Arc<VortexAccessPlan>>;
 }
 
 impl VortexAccessPlan {

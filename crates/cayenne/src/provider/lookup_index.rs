@@ -106,7 +106,9 @@ use vortex::compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder};
 use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
-use vortex_datafusion::{VortexAccessPlan, VortexAccessPlanProvider};
+use vortex_datafusion::{
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
+};
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
@@ -967,7 +969,6 @@ pub(crate) struct DynamicLookupAccessPlanProvider {
     /// Every file the scan reads. A selection is used only when the index covers
     /// all of them, so the probe's outcome is decided once, before any file opens.
     scan_files: Arc<[ObjectMeta]>,
-    table: Arc<dyn VortexAccessPlanProvider>,
     request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     selection: Mutex<Option<(RuntimeLookupFilterIdentity, RuntimeLookupCell)>>,
 }
@@ -979,7 +980,6 @@ impl DynamicLookupAccessPlanProvider {
         visible_snapshot: String,
         visible_file_set: FileSetVersion,
         scan_files: Arc<[ObjectMeta]>,
-        table: Arc<dyn VortexAccessPlanProvider>,
         request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
@@ -988,7 +988,6 @@ impl DynamicLookupAccessPlanProvider {
             visible_snapshot,
             visible_file_set,
             scan_files,
-            table,
             request_build,
             selection: Mutex::default(),
         }
@@ -1205,7 +1204,6 @@ fn in_list_matches_columns(in_list: &InListExpr, columns: &[String]) -> bool {
     }
 }
 
-#[async_trait]
 impl VortexAccessPlanProvider for LookupAccessPlanProvider {
     fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
         let path: &str = file.object_meta.location.as_ref();
@@ -1228,61 +1226,34 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
         }))
     }
 
-    async fn runtime_access_plan_for_file(
-        &self,
-        file: &PartitionedFile,
-        predicate: Option<&Arc<dyn PhysicalExpr>>,
-    ) -> Option<Arc<VortexAccessPlan>> {
-        self.table
-            .runtime_access_plan_for_file(file, predicate)
-            .await
-    }
-
     fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
         self.table.adjust_statistics(object, statistics)
     }
 }
 
 #[async_trait]
-impl VortexAccessPlanProvider for DynamicLookupAccessPlanProvider {
-    fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
-        self.table.access_plan_for_file(file)
-    }
-
-    /// The opener intersects this with the table's planning-time plan, which
+impl VortexRuntimeAccessPlanProvider for DynamicLookupAccessPlanProvider {
+    /// The opener intersects this with the file's planning-time plan, which
     /// carries its position-delete vectors, so a deleted row is never selected.
     async fn runtime_access_plan_for_file(
         &self,
         file: &PartitionedFile,
         predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Option<Arc<VortexAccessPlan>> {
-        let table_plan = self
-            .table
-            .runtime_access_plan_for_file(file, predicate)
-            .await;
-        let plan = self.resolve(predicate).await.and_then(|selection| {
-            // `resolve` validated every scan file; a file outside that list is
-            // read as the table would read it.
-            if !selection.index.indexes_file(&file.object_meta) {
-                return None;
-            }
-            self.state
-                .counters
-                .access_plans_attached
-                .fetch_add(1, Ordering::Relaxed);
-            let path: &str = file.object_meta.location.as_ref();
-            Some(Arc::clone(
-                selection.plans.get(path).unwrap_or(&selection.empty),
-            ))
-        });
-        match (plan, table_plan) {
-            (Some(plan), Some(table_plan)) => Some(Arc::new(plan.intersect(&table_plan))),
-            (plan, table_plan) => plan.or(table_plan),
+        let selection = self.resolve(predicate).await?;
+        // `resolve` validated every scan file; a file outside that list is read
+        // as planned.
+        if !selection.index.indexes_file(&file.object_meta) {
+            return None;
         }
-    }
-
-    fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
-        self.table.adjust_statistics(object, statistics)
+        self.state
+            .counters
+            .access_plans_attached
+            .fetch_add(1, Ordering::Relaxed);
+        let path: &str = file.object_meta.location.as_ref();
+        Some(Arc::clone(
+            selection.plans.get(path).unwrap_or(&selection.empty),
+        ))
     }
 }
 
@@ -2996,9 +2967,6 @@ mod tests {
         KeySpec::new(columns.iter().map(|c| (*c).to_string()).collect()).expect("columns")
     }
 
-    #[derive(Debug)]
-    struct NoAccessPlans;
-
     /// Counts the build requests a runtime lookup makes.
     #[derive(Default)]
     struct BuildRequests(Arc<AtomicU64>);
@@ -3013,21 +2981,6 @@ mod tests {
 
         fn count(&self) -> u64 {
             self.0.load(Ordering::Relaxed)
-        }
-    }
-
-    #[async_trait]
-    impl VortexAccessPlanProvider for NoAccessPlans {
-        fn access_plan_for_file(&self, _file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
-            None
-        }
-
-        async fn runtime_access_plan_for_file(
-            &self,
-            _file: &PartitionedFile,
-            _predicate: Option<&Arc<dyn PhysicalExpr>>,
-        ) -> Option<Arc<VortexAccessPlan>> {
-            None
         }
     }
 
@@ -3108,7 +3061,6 @@ mod tests {
             "snapshot".to_string(),
             FileSetVersion::default(),
             Arc::new([]),
-            Arc::new(NoAccessPlans),
             Some(builds.callback()),
         );
         let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
@@ -3660,7 +3612,6 @@ mod tests {
                 "snapshot".to_string(),
                 visible_file_set,
                 scan_files.into(),
-                Arc::new(NoAccessPlans),
                 Some(builds.callback()),
             ))
         };
@@ -3742,7 +3693,6 @@ mod tests {
                 snapshot.to_string(),
                 FileSetVersion::default(),
                 vec![scan_file(&format!("{snapshot}/file.vortex"))].into(),
-                Arc::new(NoAccessPlans),
                 None,
             )
         };
