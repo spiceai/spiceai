@@ -314,23 +314,49 @@ async fn absent_on_disk(files: &[PathBuf]) -> (Vec<String>, usize) {
     (named, total)
 }
 
-/// Whether `anchor` holds any directory entry.
+/// Whether `anchor` holds a file, a symlink, or an unreadable entry at any depth.
 ///
-/// Matches [`runtime_acceleration::AccelerationLayout::has_existing_acceleration`] for a
-/// directory layout: an empty restored tree is the only safe companion to a slice that
-/// points at a current snapshot with no manifest rows.
+/// Empty directories are not content. `create_table` always creates
+/// `<table_id>/<snapshot_id>/` before the table has a data file, and the scan's
+/// directory-listing fallback returns only `.vortex` files in that snapshot
+/// directory, so the empty tree cannot be served as rows. A file nested under
+/// those directories still counts: that is the orphan a listing would return.
+/// An unreadable entry counts too, so verification refuses rather than assuming
+/// the tree is empty.
 async fn data_dir_has_entries(anchor: &std::path::Path) -> bool {
     let anchor = anchor.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        match std::fs::read_dir(&anchor) {
-            Ok(mut entries) => entries.next().is_some(),
-            // Unreadable → treat as non-empty so verification refuses rather than
-            // importing a slice that would fall back to directory listing.
-            Err(_) => true,
+    tokio::task::spawn_blocking(move || directory_contains_content(&anchor))
+        .await
+        .unwrap_or(true)
+}
+
+/// True when `dir` holds a file, a symlink, or an unreadable entry at any depth.
+///
+/// Directories that contain only other directories are not content. Symlinks are
+/// not followed: a symlink is itself an entry the archiver and the listing treat
+/// differently from an empty directory, and following one could cycle.
+fn directory_contains_content(dir: &std::path::Path) -> bool {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                return true;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else {
+                return true;
+            }
         }
-    })
-    .await
-    .unwrap_or(true)
+    }
+    false
 }
 
 /// `current_snapshot_id` from the slice's `cayenne_table` row, when set.
@@ -366,12 +392,13 @@ fn manifest_rows_for_current_snapshot(slice: &DatasetMetastoreSlice) -> Result<u
 }
 
 /// Refuse a slice whose `current_snapshot_id` is set but that snapshot has no manifest
-/// rows, unless `anchor` is also empty.
+/// rows, unless `anchor` contains no files.
 ///
 /// An empty `referenced_data_files` list makes both archive-member and restore-side
 /// checks succeed vacuously; Cayenne then falls back to directory listing and can serve
-/// unrelated or orphaned files. A genuinely empty published snapshot is fine only when
-/// the restored tree is empty too.
+/// unrelated or orphaned files. A genuinely empty published snapshot is fine when the
+/// only entries are directories (`create_table`'s `<table_id>/<snapshot_id>/`). A file
+/// at any depth is not.
 async fn reject_empty_manifest_with_orphans(
     slice: &DatasetMetastoreSlice,
     anchor: &std::path::Path,
@@ -1027,6 +1054,38 @@ mod tests {
         verify_slice_against_disk(&slice, tmp.path())
             .await
             .expect("empty manifest is ok when the restored tree is empty");
+    }
+
+    /// `create_table` leaves `<table_id>/<snapshot_id>/` even when the snapshot has
+    /// no data files. Those directories are not orphans the scan can serve.
+    #[tokio::test]
+    async fn verification_allows_empty_manifest_when_only_empty_directories() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        std::fs::create_dir_all(anchor.join("tbl-1").join("snap-1")).expect("mkdir snapshot");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect("empty snapshot directories are not orphaned files");
+    }
+
+    /// A file nested where `create_table` puts the snapshot directory is still an
+    /// orphan: directory listing would return it while the manifest names nothing.
+    #[tokio::test]
+    async fn verification_rejects_empty_manifest_when_nested_orphan_present() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let anchor = tmp.path();
+        let snapshot_dir = anchor.join("tbl-1").join("snap-1");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+        std::fs::write(snapshot_dir.join("orphan.vortex"), b"orphan").expect("write orphan");
+
+        let slice = slice_with_manifest("tbl-1", Some("snap-1"), &[]);
+        let reason = verify_slice_against_disk(&slice, anchor)
+            .await
+            .expect_err("a nested orphan file must be refused");
+        assert!(reason.contains("no manifest rows"), "{reason}");
+        assert!(reason.contains("snap-1"), "{reason}");
     }
 
     #[tokio::test]
