@@ -35,14 +35,12 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [features]
 duckdb = [
   "datafusion-table-providers/duckdb",
-  "datafusion-table-providers/duckdb-federation",
 ]
 mysql = ["datafusion-table-providers/mysql"]
 postgres = [
   "dep:tokio",
   "dep:async-stream",
   "datafusion-table-providers/postgres",
-  "datafusion-table-providers/postgres-federation",
 ]
 snowflake = [
   "dep:snowflake-api",
@@ -51,7 +49,6 @@ snowflake = [
 ]
 sqlite = [
   "datafusion-table-providers/sqlite",
-  "datafusion-table-providers/sqlite-federation",
 ]
 
 [lints]

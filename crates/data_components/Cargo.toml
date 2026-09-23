@@ -136,15 +136,16 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc-federation"]
-# Shared Spice federation deny-list wrapper (crate::federation). Requires the
-# upstream `impl SQLExecutor for SqlTable`, which is gated behind
-# `datafusion-table-providers/federation`.
-federation = ["datafusion-table-providers/federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc"]
+# Shared Spice federation deny-list wrapper (crate::federation). The upstream
+# `impl SQLExecutor for SqlTable` is now bundled unconditionally into each
+# `datafusion-table-providers/<provider>` feature's own default features
+# (datafusion-table-providers no longer exposes a separate top-level
+# `federation`/`<provider>-federation` feature to forward to).
+federation = []
 databricks = [
     "delta_lake",
     "spark_connect",
-    "datafusion-table-providers/federation",
 ]
 debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
@@ -154,7 +155,6 @@ duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
     "datafusion-table-providers/duckdb",
-    "datafusion-table-providers/duckdb-federation",
 ]
 flightsql = []
 kafka = ["dep:rdkafka"]
@@ -168,7 +168,6 @@ mysql = [
     "dep:mysql_common",
     "dep:bitvec",
     "datafusion-table-providers/mysql",
-    "datafusion-table-providers/mysql-federation",
 ]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
@@ -180,22 +179,19 @@ postgres = [
     "dep:connector-postgres-common",
     "federation",
     "datafusion-table-providers/postgres",
-    "datafusion-table-providers/postgres-federation",
 ]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 snowflake = [
     "dep:snowflake-api",
     "federation",
-    "datafusion-table-providers/federation",
     "db_connection_pool/snowflake",
 ]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",
     "datafusion-table-providers/sqlite",
-    "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
+turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite"]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
