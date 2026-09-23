@@ -4483,7 +4483,7 @@ mod tests {
             .write(true)
             .open(&valid_path)
             .expect("open new.parquet")
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(300))
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_mins(5))
             .expect("set new mtime");
 
         // Corrupt, stale object (mtime 100s, below the watermark). A `.parquet`
