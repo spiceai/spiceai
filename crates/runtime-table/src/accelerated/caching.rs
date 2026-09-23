@@ -6310,7 +6310,7 @@ mod tests {
                 scans: Arc::clone(&scans),
             });
             let in_flight: InFlightRevalidations =
-                Arc::new(parking_lot::Mutex::new(HashSet::new()));
+                Arc::new(parking_lot::Mutex::new(HashMap::new()));
             let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
             let exec = CachingAccelerationScanExec::new(
                 input,
