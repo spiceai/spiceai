@@ -24,7 +24,10 @@ limitations under the License.
 //! a process restart, once accelerated full/append datasets finish their first
 //! refresh, those shapes are replayed with `SELECT DISTINCT` of the bound
 //! columns until the cache is full. Datasets stay not ready until that warmup
-//! completes, so `/v1/ready` does not succeed on a cold cache.
+//! completes, so `/v1/ready` does not succeed on a cold cache. Each replay
+//! (and its stream drain) is bounded by `runtime.query.timeout` or a default,
+//! and cancelled on runtime shutdown, so a stalled Internal-protocol query
+//! cannot hold readiness forever.
 //!
 //! Only [`CacheNamespace::Public`] plans are recorded and replayed. Authenticated
 //! (principal-scoped) and system traffic is skipped: results-cache keys include the
@@ -32,9 +35,11 @@ limitations under the License.
 //! request, and persisting principal ids into the warmup catalog is undesirable.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use app::App;
 use datafusion::common::{ParamValues, ScalarValue};
@@ -52,6 +57,7 @@ use runtime_secrets::Secrets;
 use spicepod::component::runtime::RuntimeState;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::accelerated::AcceleratedTable;
 use crate::accelerated::RefreshCompletion;
@@ -73,6 +79,11 @@ const WARMUP_STORE_RELATIVE: &str = ".spice/data/results_cache_warmup.json";
 const WARMUP_STATE_KEY: &str = "results_cache_warmup";
 
 const MAX_REMOTE_PERSIST_ATTEMPTS: usize = 8;
+
+/// Per-replay wall-clock bound. Warmup uses [`Protocol::Internal`], which does
+/// not inherit `runtime.query.timeout`; without an explicit bound a stalled
+/// DISTINCT or drain can hold `/v1/ready` forever.
+const DEFAULT_WARMUP_REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct WarmupCatalog {
     templates: Vec<WarmupTemplate>,
@@ -445,14 +456,26 @@ impl DataFusion {
         let refresh_runtime = self.refresh_runtime().cloned();
         tokio::spawn(async move {
             if !df.wait_for_first_full_append_refresh(&status).await {
+                status.release_dataset_ready();
                 return;
             }
+            let replay_timeout = warmup_replay_timeout(app.as_ref());
             let run = {
                 let df = Arc::clone(&df);
                 let status = Arc::clone(&status);
                 async move {
-                    df.run_warmup_templates(&templates, app.as_ref()).await;
-                    status.release_dataset_ready();
+                    let shutdown = status.shutdown_token();
+                    run_warmup_releasing_ready(
+                        Arc::clone(&status),
+                        shutdown.clone(),
+                        df.run_warmup_templates_bounded(
+                            &templates,
+                            app.as_ref(),
+                            shutdown,
+                            replay_timeout,
+                        ),
+                    )
+                    .await;
                 }
             };
             if let Some(runtime) = refresh_runtime {
@@ -464,6 +487,7 @@ impl DataFusion {
     }
 
     async fn wait_for_first_full_append_refresh(&self, status: &status::RuntimeStatus) -> bool {
+        let shutdown = status.shutdown_token();
         loop {
             if status.is_shutdown() {
                 return false;
@@ -471,7 +495,10 @@ impl DataFusion {
             if self.accelerated_initial_loads_done(status).await {
                 return true;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::select! {
+                () = shutdown.cancelled() => return false,
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
         }
     }
 
@@ -499,6 +526,22 @@ impl DataFusion {
         templates: &[WarmupTemplate],
         app: Option<&Arc<App>>,
     ) {
+        self.run_warmup_templates_bounded(
+            templates,
+            app,
+            CancellationToken::new(),
+            warmup_replay_timeout(app),
+        )
+        .await;
+    }
+
+    async fn run_warmup_templates_bounded(
+        self: &Arc<Self>,
+        templates: &[WarmupTemplate],
+        app: Option<&Arc<App>>,
+        shutdown: CancellationToken,
+        replay_timeout: Duration,
+    ) {
         let Some(cache_provider) = self.results_cache_provider() else {
             return;
         };
@@ -514,18 +557,32 @@ impl DataFusion {
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(CacheControl::Cache(cache_key_type))
                 .with_cache_namespace(CacheNamespace::Public)
+                .with_query_timeout(Some(replay_timeout))
+                .with_cancellation_token(shutdown.clone())
                 .build(),
         );
 
         let mut stored = 0_u64;
         for template in templates {
+            if shutdown.is_cancelled() {
+                break;
+            }
             cache_provider.run_pending_tasks().await;
             if cache_provider.size().await >= cache_provider.max_size() {
                 break;
             }
-            stored += self
+            match self
                 .warm_one_template(template, &request_context, cache_provider.as_ref())
-                .await;
+                .await
+            {
+                Ok(count) => stored += count,
+                Err(WarmupBound::TimedOut) => {
+                    tracing::warn!(
+                        "SQL results cache warmup skipped a stored query plan that exceeded {replay_timeout:?}, so `/v1/ready` will not wait for that plan. Increase `runtime.query.timeout` if warmup queries need more time. See: https://spiceai.org/docs/reference/spicepod"
+                    );
+                }
+                Err(WarmupBound::Cancelled) => break,
+            }
         }
 
         cache_provider.run_pending_tasks().await;
@@ -541,12 +598,14 @@ impl DataFusion {
         template: &WarmupTemplate,
         request_context: &Arc<RequestContext>,
         cache_provider: &cache::QueryResultsCacheProvider,
-    ) -> u64 {
+    ) -> Result<u64, WarmupBound> {
         if template.bindings.is_empty() {
-            return u64::from(execute_warmup_sql(self, &template.sql, None, request_context).await);
+            return execute_warmup_sql(self, &template.sql, None, request_context)
+                .await
+                .map(u64::from);
         }
         let Some(distinct_sql) = distinct_keys_sql(template) else {
-            return 0;
+            return Ok(0);
         };
 
         warm_distinct_key_rows(
@@ -647,6 +706,66 @@ fn dataset_is_disabled(status: &status::RuntimeStatus, name: &TableReference) ->
     })
 }
 
+fn warmup_replay_timeout(app: Option<&Arc<App>>) -> Duration {
+    app.and_then(|app| app.runtime.query.as_ref())
+        .and_then(|query| query.timeout().ok().flatten())
+        .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT)
+}
+
+/// Releases the dataset ready-hold when dropped so `/v1/ready` recovers after
+/// warmup finishes, times out, is cancelled, or errors.
+#[must_use]
+struct DatasetReadyHold {
+    status: Arc<status::RuntimeStatus>,
+}
+
+impl Drop for DatasetReadyHold {
+    fn drop(&mut self) {
+        self.status.release_dataset_ready();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmupBound {
+    TimedOut,
+    Cancelled,
+}
+
+async fn bound_warmup_op<T>(
+    shutdown: &CancellationToken,
+    timeout: Duration,
+    fut: impl Future<Output = T>,
+) -> Result<T, WarmupBound> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(WarmupBound::Cancelled),
+        result = tokio::time::timeout(timeout, fut) => {
+            result.map_err(|_elapsed| WarmupBound::TimedOut)
+        }
+    }
+}
+
+/// Run warmup, then always release the ready-hold. A stalled replay is
+/// interrupted when `shutdown` is cancelled (runtime shutdown).
+async fn run_warmup_releasing_ready<F>(
+    status: Arc<status::RuntimeStatus>,
+    shutdown: CancellationToken,
+    warmup: F,
+) where
+    F: Future<Output = ()>,
+{
+    let _release = DatasetReadyHold { status };
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            tracing::debug!(
+                "SQL results cache warmup stopped because the runtime is shutting down"
+            );
+        }
+        () = warmup => {}
+    }
+}
+
 /// Replay one parameterized template from streamed DISTINCT rows.
 ///
 /// Rows are applied batch-by-batch so a high-cardinality binding cannot
@@ -659,28 +778,43 @@ async fn warm_distinct_key_rows(
     distinct_sql: &str,
     request_context: &Arc<RequestContext>,
     cache_provider: &cache::QueryResultsCacheProvider,
-) -> u64 {
+) -> Result<u64, WarmupBound> {
+    let timeout = request_context
+        .query_timeout()
+        .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
+    let cancel = request_context.child_cancellation_token();
     let query = QueryBuilder::new(distinct_sql, Arc::clone(df))
         .for_results_cache_warming()
         .results_cache_mode(ResultsCacheMode::Bypass)
         .build();
-    let Ok(result) = Arc::clone(request_context)
-        .scope(async move { query.run().await })
-        .await
-    else {
-        return 0;
+    let result = match bound_warmup_op(
+        &cancel,
+        timeout,
+        Arc::clone(request_context).scope(async move { query.run().await }),
+    )
+    .await?
+    {
+        Ok(result) => result,
+        Err(_) => return Ok(0),
     };
 
     let mut stream = result.data;
     let mut stored = 0_u64;
     let max_size = cache_provider.max_size();
 
-    while let Ok(Some(batch)) = stream.try_next().await {
+    loop {
+        let batch = match bound_warmup_op(&cancel, timeout, stream.try_next()).await? {
+            Ok(Some(batch)) => batch,
+            Ok(None) | Err(_) => break,
+        };
         for row_idx in 0..batch.num_rows() {
+            if cancel.is_cancelled() {
+                return Err(WarmupBound::Cancelled);
+            }
             cache_provider.run_pending_tasks().await;
             let size_before = cache_provider.size().await;
             if size_before >= max_size {
-                return stored;
+                return Ok(stored);
             }
 
             let Ok(values) = (0..batch.num_columns())
@@ -690,16 +824,20 @@ async fn warm_distinct_key_rows(
                 continue;
             };
 
-            if execute_warmup_sql(df, template_sql, Some(values), request_context).await {
-                stored += 1;
-                cache_provider.run_pending_tasks().await;
-                if cache_provider.size().await <= size_before {
-                    return stored;
+            match execute_warmup_sql(df, template_sql, Some(values), request_context).await {
+                Ok(true) => {
+                    stored += 1;
+                    cache_provider.run_pending_tasks().await;
+                    if cache_provider.size().await <= size_before {
+                        return Ok(stored);
+                    }
                 }
+                Ok(false) => {}
+                Err(bound) => return Err(bound),
             }
         }
     }
-    stored
+    Ok(stored)
 }
 
 async fn execute_warmup_sql(
@@ -707,24 +845,37 @@ async fn execute_warmup_sql(
     sql: &str,
     parameters: Option<Vec<ScalarValue>>,
     request_context: &Arc<RequestContext>,
-) -> bool {
+) -> Result<bool, WarmupBound> {
     let mut builder = QueryBuilder::new(sql, Arc::clone(df)).for_results_cache_warming();
     if let Some(values) = parameters {
         builder = builder.parameters(Some(ParamValues::from(values)));
     }
     let query = builder.build();
-    let result = Arc::clone(request_context)
-        .scope(async move { query.run().await })
-        .await;
+    let timeout = request_context
+        .query_timeout()
+        .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
+    let cancel = request_context.child_cancellation_token();
+    let result = bound_warmup_op(
+        &cancel,
+        timeout,
+        Arc::clone(request_context).scope(async move { query.run().await }),
+    )
+    .await?;
     match result {
         // Drain without retaining batches. The results-cache wrapper stores as
         // the stream is consumed; warmup does not need the rows itself, and
         // holding them here would scale RAM with the full result while
         // datasets stay not ready.
-        Ok(query_result) => query_result.drain().await.is_ok(),
+        Ok(query_result) => match bound_warmup_op(&cancel, timeout, query_result.drain()).await? {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::debug!("SQL results cache warmup query failed: {e}");
+                Ok(false)
+            }
+        },
         Err(e) => {
             tracing::debug!("SQL results cache warmup query failed: {e}");
-            false
+            Ok(false)
         }
     }
 }
@@ -1325,7 +1476,8 @@ mod tests {
             None,
             &request_context(),
         )
-        .await;
+        .await
+        .expect("warmup DML is rejected, not timed out");
         assert!(
             !ok,
             "warmup must reject DML from a persisted template via read-only validation"
@@ -1573,6 +1725,125 @@ mod tests {
 
         let _ = std::fs::remove_file(&store);
         let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn warmup_replay_timeout_uses_query_timeout_or_default() {
+        assert_eq!(warmup_replay_timeout(None), DEFAULT_WARMUP_REPLAY_TIMEOUT);
+
+        let mut app = app::AppBuilder::new("test").build();
+        app.runtime.query = Some(spicepod::component::runtime::Query {
+            timeout: Some("5s".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            warmup_replay_timeout(Some(&Arc::new(app))),
+            Duration::from_secs(5)
+        );
+    }
+
+    /// Copilot on #14178: a non-completing Internal-protocol replay held
+    /// readiness forever (`warmup_hung=true ready_released=false task_done=false`)
+    /// because release ran only after the replay await returned.
+    #[tokio::test]
+    async fn stalled_warmup_replay_releases_ready_hold() {
+        let status = status::RuntimeStatus::new();
+        status.set_ready_state(status::RuntimeReadyState::OnRegistration);
+        status.update_dataset(
+            &TableReference::bare("orders"),
+            status::ComponentStatus::Initializing,
+        );
+        assert!(status.is_ready());
+        status.hold_dataset_ready();
+        assert!(
+            !status.is_ready(),
+            "an active ready-hold must keep is_ready false"
+        );
+
+        let shutdown = CancellationToken::new();
+        let start = std::time::Instant::now();
+        run_warmup_releasing_ready(Arc::clone(&status), shutdown, async {
+            let bound = bound_warmup_op(
+                &CancellationToken::new(),
+                Duration::from_millis(50),
+                std::future::pending::<()>(),
+            )
+            .await;
+            assert_eq!(
+                bound,
+                Err(WarmupBound::TimedOut),
+                "a non-completing replay must be bounded"
+            );
+        })
+        .await;
+
+        let task_done = true;
+        let warmup_hung = !task_done;
+        let ready_released = status.is_ready();
+        eprintln!(
+            "warmup_hung={warmup_hung} ready_released={ready_released} task_done={task_done} elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
+        assert!(
+            ready_released,
+            "a stalled replay must release the ready-hold so /v1/ready can recover"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the stalled replay must not block readiness, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_warmup_replay_releases_ready_hold_on_shutdown() {
+        let status = status::RuntimeStatus::new();
+        status.set_ready_state(status::RuntimeReadyState::OnRegistration);
+        status.update_dataset(
+            &TableReference::bare("orders"),
+            status::ComponentStatus::Initializing,
+        );
+        status.hold_dataset_ready();
+        assert!(!status.is_ready());
+
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn({
+            let status = Arc::clone(&status);
+            let shutdown = shutdown.clone();
+            async move {
+                run_warmup_releasing_ready(status, shutdown, std::future::pending()).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !status.is_ready(),
+            "the ready-hold must stay until shutdown cancels warmup"
+        );
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("warmup task must finish after shutdown cancel")
+            .expect("join");
+
+        assert!(
+            status.is_ready(),
+            "shutdown cancel must release the ready-hold so /v1/ready recovers"
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_warmup_op_prefers_shutdown_over_pending() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let result = bound_warmup_op(
+            &shutdown,
+            Duration::from_secs(60),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_eq!(result, Err(WarmupBound::Cancelled));
     }
 
     #[tokio::test]
