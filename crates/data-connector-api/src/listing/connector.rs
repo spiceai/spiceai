@@ -4559,14 +4559,23 @@ mod tests {
             rows, 1,
             "only the newest object's row is above the watermark"
         );
-        let value = batches[0]
-            .column_by_name("value")
-            .expect("value column")
+        let value_col = batches[0].column_by_name("value").expect("value column");
+        let value = if let Some(arr) = value_col
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .expect("value is Utf8")
-            .value(0)
-            .to_string();
+        {
+            arr.value(0).to_string()
+        } else if let Some(arr) = value_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+        {
+            arr.value(0).to_string()
+        } else {
+            panic!(
+                "value decoded as {}, expected Utf8 or Utf8View",
+                value_col.data_type()
+            );
+        };
         assert_eq!(value, "new");
     }
 
