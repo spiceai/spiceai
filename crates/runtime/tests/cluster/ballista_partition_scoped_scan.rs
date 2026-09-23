@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,12 +28,15 @@ limitations under the License.
 //!
 //! This distributes a plain (non-accelerated) three-file dataset across two
 //! executors, running `target_partitions = 3` (`configure_test_datafusion`)
-//! so the scan is split into three file groups — more file groups than any
-//! one executor can serve alone, which is what forces a real cross-process
-//! task split rather than a single in-process scan that would read the same
-//! files correctly either way. `COUNT(*)` and `SUM(id)` are exact sums over
-//! disjoint files, so an over-read by any task shows up as a multiple of the
-//! correct total rather than a rounding difference.
+//! so the scan plans as three file groups — asserted below via `EXPLAIN`,
+//! since that is what the loss needs: Ballista hands every task its own
+//! freshly-deserialized plan instance regardless of which executor runs it,
+//! so a single task is already unguarded without the patch. Two executors
+//! exercise the scan the way a real cluster runs it, but task placement
+//! across them is neither asserted nor required for the loss to show.
+//! `COUNT(*)` and `SUM(id)` are exact sums over disjoint files, so an
+//! over-read by any task shows up as a multiple of the correct total rather
+//! than a rounding difference.
 
 use app::AppBuilder;
 use arrow::array::{AsArray, RecordBatch};
@@ -156,9 +159,10 @@ async fn distributed_scan_reads_each_task_its_own_file_group() -> Result<(), any
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            // Give the scheduler a moment to observe both executors' task
-            // slots before planning, so the leaf scan's tasks land on both
-            // rather than racing capacity propagation onto only one.
+            // Give the scheduler a moment to observe executor capacity
+            // before planning. Without this, the first query can race with
+            // cluster-capacity propagation and fail with a transient
+            // non-successful completed job status.
             sleep(Duration::from_secs(2)).await;
 
             let plan_rows = harness
@@ -171,7 +175,8 @@ async fn distributed_scan_reads_each_task_its_own_file_group() -> Result<(), any
             assert!(
                 !plan_fmt.contains("file_groups={1 group"),
                 "expected the scan to plan with more than one file group, so the leaf \
-                 stage has more than one task to distribute across executors, got:\n{plan_fmt}"
+                 stage has more than one task — each on its own plan instance, which is \
+                 what the loss needs — got:\n{plan_fmt}"
             );
 
             let count_rows = run_distributed(
