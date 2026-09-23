@@ -58,38 +58,53 @@ use crate::catalog::{CatalogError, CatalogResult};
 /// predates partition children still restores every slice it could before.
 pub const SLICE_FORMAT_VERSION: u32 = 1;
 
-/// The version a slice carrying a partitioned dataset's per-partition child
-/// tables is written at, and the highest this build reads.
+/// The version a slice is written at when it carries rows a
+/// [`SLICE_FORMAT_VERSION`] import does **not** clear before inserting, and the
+/// highest this build reads.
 ///
-/// The bump exists to stop a reader that predates those rows from *accepting*
-/// one. Such a reader restores the payload correctly the first time — it
-/// inserts every row the slice carries — but its delete step is scoped to the
-/// parent alone, so the child `cayenne_table` rows survive and every later
-/// restore fails on `idx_cayenne_table_name_unique`. A `refresh_mode: snapshot`
-/// replica restores repeatedly into its live catalog, so that is not a one-off:
-/// it is stranded on whichever snapshot it happened to load first. Measured by
-/// running `trunk`'s own `import_dataset` twice against one `SqliteMetastore`
-/// with a slice this build's exporter produced:
+/// That import clears the parent `cayenne_table` row — whose `ON DELETE
+/// CASCADE` reaches every dependent table that keys `table_id` as text — plus
+/// `cayenne_insert_record` by hand. Everything else the slice may now carry
+/// falls outside both: a partitioned dataset's child `cayenne_table` rows, and
+/// the [`blob_keyed_tables`][super::blob_keyed_tables] other than
+/// `cayenne_insert_record`, which have no foreign key back to the parent.
+///
+/// Such a reader restores the payload correctly the *first* time — it inserts
+/// every row the slice carries — and then cannot restore it again, because its
+/// own cleanup never reaches those rows and the next insert collides with them.
+/// `CayenneSnapshotEngine` imports into the node's live catalog, and a
+/// `refresh_mode: snapshot` replica restores repeatedly, so that is not a
+/// one-off: the replica is stranded on whichever snapshot it loaded first.
+/// Measured by running `trunk`'s own `import_dataset` twice against one
+/// `SqliteMetastore` with slices this build's exporter produced:
 ///
 /// ```text
-/// import #1 -> Ok, tables: ["events", "events_p…6B31", "events_p…6B32"]
-/// import #2 -> Err("UNIQUE constraint failed: cayenne_table.table_name")
+/// partitioned:  #1 -> Ok   #2 -> Err(UNIQUE constraint failed: cayenne_table.table_name)
+/// write-backs:  #1 -> Ok   #2 -> Err(UNIQUE constraint failed: cayenne_pending_write_back.table_id, …pk_bytes)
 /// ```
 ///
-/// Refusing the payload outright is the legible form of that: the reader says
-/// the archive needs a newer build instead of half-working for one cycle.
-///
-/// A slice is written at the *lowest* version that expresses it, so an
-/// unpartitioned dataset still produces [`SLICE_FORMAT_VERSION`] and an older
-/// reader keeps restoring it.
-pub const SLICE_FORMAT_VERSION_CHILDREN: u32 = 2;
+/// Refusing the payload outright is the legible form of the same outcome: the
+/// reader says the archive needs a newer build instead of half-working for one
+/// cycle. A slice is written at the *lowest* version that expresses it, so a
+/// dataset carrying none of those rows still produces [`SLICE_FORMAT_VERSION`]
+/// and an older reader keeps restoring it.
+pub const SLICE_FORMAT_VERSION_FULL_CLEANUP: u32 = 2;
+
+/// The one table outside `cayenne_table`'s cascade that a
+/// [`SLICE_FORMAT_VERSION`] import clears by hand. Naming it here is what lets
+/// [`DatasetMetastoreSlice::rows_an_older_import_cannot_clear`] derive the rest
+/// of the set from the registry rather than from a second hand-kept list — so a
+/// table added to [`blob_keyed_tables`][super::blob_keyed_tables] later starts
+/// requiring [`SLICE_FORMAT_VERSION_FULL_CLEANUP`] without anyone remembering
+/// to say so.
+const OLDER_IMPORT_CLEARS: &str = "cayenne_insert_record";
 
 /// Engine identifier embedded in slices to detect cross-engine misuse.
 pub const SLICE_ENGINE: &str = "cayenne";
 
 /// Whether this build reads a slice written at `version`.
 fn supported_format_version(version: u32) -> bool {
-    (SLICE_FORMAT_VERSION..=SLICE_FORMAT_VERSION_CHILDREN).contains(&version)
+    (SLICE_FORMAT_VERSION..=SLICE_FORMAT_VERSION_FULL_CLEANUP).contains(&version)
 }
 
 /// JSON-friendly mirror of [`MetastoreValue`]. Blobs are base64-encoded so the
@@ -158,7 +173,7 @@ pub type SliceRow = Vec<SliceValue>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetMetastoreSlice {
     /// Slice format version: [`SLICE_FORMAT_VERSION`], or
-    /// [`SLICE_FORMAT_VERSION_CHILDREN`] when the slice carries partition
+    /// [`SLICE_FORMAT_VERSION_FULL_CLEANUP`] when the slice carries partition
     /// child tables. A build reads both and writes the lower of the two
     /// whenever the payload allows it.
     pub format_version: u32,
@@ -197,7 +212,7 @@ impl DatasetMetastoreSlice {
         if !supported_format_version(slice.format_version) {
             return Err(CatalogError::Database {
                 message: format!(
-                    "unsupported metastore slice format_version {} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_CHILDREN}); upgrade the runtime that reads this snapshot",
+                    "unsupported metastore slice format_version {} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}); upgrade the runtime that reads this snapshot",
                     slice.format_version
                 ),
             });
@@ -402,21 +417,20 @@ pub async fn export_dataset(
         tables.insert(expected.name.to_string(), rows);
     }
 
-    // The lowest version that expresses this payload, so an unpartitioned
-    // dataset still produces a slice an older reader restores.
-    let format_version = if child_ids.is_empty() {
-        SLICE_FORMAT_VERSION
-    } else {
-        SLICE_FORMAT_VERSION_CHILDREN
-    };
-
-    let slice = DatasetMetastoreSlice {
-        format_version,
+    let mut slice = DatasetMetastoreSlice {
+        format_version: SLICE_FORMAT_VERSION,
         engine: SLICE_ENGINE.to_string(),
         dataset_name: dataset_name.to_string(),
         exported_at_ms: chrono::Utc::now().timestamp_millis(),
         tables,
     };
+
+    // The lowest version that expresses this payload, read off the payload
+    // rather than off `child_ids`: partition children are only one of the two
+    // things a slice can now carry that an older import cannot clear.
+    if slice.rows_an_older_import_cannot_clear().is_some() {
+        slice.format_version = SLICE_FORMAT_VERSION_FULL_CLEANUP;
+    }
 
     // Refuse to *write* a slice the reader would refuse. A partition whose
     // child table could not be matched would otherwise be published as the
@@ -448,6 +462,36 @@ impl DatasetMetastoreSlice {
         names
     }
 
+    /// The first table this slice carries rows in that a
+    /// [`SLICE_FORMAT_VERSION`] import would not clear before inserting.
+    ///
+    /// Those rows are what makes a restore unrepeatable on such a reader: it
+    /// inserts them, its own cleanup never reaches them, and the next restore
+    /// collides with them. Two sources exist, and both are new in the slice
+    /// rather than new in the metastore:
+    ///
+    /// * a partition child `cayenne_table` row — the cleanup deletes the parent
+    ///   by name, and `ON DELETE CASCADE` does not reach a sibling row;
+    /// * a row in a [`blob_keyed_tables`][super::blob_keyed_tables] table other
+    ///   than [`OLDER_IMPORT_CLEARS`] — those have no foreign key back to the
+    ///   parent at all, which is why the cleanup names one of them by hand.
+    ///
+    /// Derived from the registry rather than from a list, so a blob-keyed table
+    /// added later is covered without anyone remembering to add it here.
+    fn rows_an_older_import_cannot_clear(&self) -> Option<&'static str> {
+        if slice_rows(self, "cayenne_table")
+            .iter()
+            .any(|row| text_at(row, CAYENNE_TABLE_NAME_INDEX) != Some(self.dataset_name.as_str()))
+        {
+            return Some("cayenne_table");
+        }
+        super::blob_keyed_tables()
+            .find(|table| {
+                table.name != OLDER_IMPORT_CLEARS && !slice_rows(self, table.name).is_empty()
+            })
+            .map(|table| table.name)
+    }
+
     /// Refuse a slice that is not this dataset and its own partition children,
     /// or whose partitions have no child table to be restored with.
     ///
@@ -469,10 +513,10 @@ impl DatasetMetastoreSlice {
     /// partition but not the child restores to a dataset that cannot open —
     /// `infer_existing_partitions` propagates `TableNotFound`.
     ///
-    /// *A version that matches the payload.* A slice carrying partition
-    /// children declares [`SLICE_FORMAT_VERSION_CHILDREN`], which is what stops
-    /// a reader that predates those rows from accepting one it can restore only
-    /// once.
+    /// *A version that matches the payload.* A slice carrying anything
+    /// [`Self::rows_an_older_import_cannot_clear`] names declares
+    /// [`SLICE_FORMAT_VERSION_FULL_CLEANUP`], which is what stops a reader that
+    /// predates those rows from accepting one it can restore only once.
     ///
     /// *A parent to restore.* A slice that names a dataset but carries no
     /// `cayenne_table` row for it satisfies both halves above vacuously, while
@@ -583,16 +627,6 @@ impl DatasetMetastoreSlice {
                     child_path.unwrap_or("no readable path")
                 ));
             }
-            // The payload and the version it declares must agree: a reader that
-            // predates child rows is protected only by refusing the version, so
-            // a slice that carries them under the older one would slip past the
-            // very build the bump exists for.
-            if self.format_version < SLICE_FORMAT_VERSION_CHILDREN {
-                return refuse(format!(
-                    "it carries the partition child table '{name}' but declares format_version {}, and a slice carrying partition children is written at {SLICE_FORMAT_VERSION_CHILDREN}",
-                    self.format_version
-                ));
-            }
             partitions_with_a_child.insert(partition_path);
         }
 
@@ -602,6 +636,19 @@ impl DatasetMetastoreSlice {
         {
             return refuse(format!(
                 "its partition at '{orphan}' has no child table row, so the restored dataset could not be opened"
+            ));
+        }
+
+        // The payload and the version it declares must agree. A reader that
+        // predates these rows is protected only by refusing the version, so a
+        // slice carrying them under the older one would reach the very build
+        // the bump exists for.
+        if let Some(table) = self.rows_an_older_import_cannot_clear()
+            && self.format_version < SLICE_FORMAT_VERSION_FULL_CLEANUP
+        {
+            return refuse(format!(
+                "it carries rows in '{table}' that a format_version {SLICE_FORMAT_VERSION} import does not clear, but declares format_version {}; such a slice is written at {SLICE_FORMAT_VERSION_FULL_CLEANUP}",
+                self.format_version
             ));
         }
 
@@ -629,7 +676,7 @@ pub async fn import_dataset(
     if !supported_format_version(slice.format_version) {
         return Err(CatalogError::Database {
             message: format!(
-                "refusing to import metastore slice: unsupported format_version {} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_CHILDREN}); upgrade the runtime that reads this snapshot",
+                "refusing to import metastore slice: unsupported format_version {} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}); upgrade the runtime that reads this snapshot",
                 slice.format_version
             ),
         });
@@ -919,7 +966,7 @@ mod tests {
         let slice = export_dataset(ms_a.as_ref(), "trips", anchor_a)
             .await
             .expect("export");
-        assert_eq!(slice.format_version, SLICE_FORMAT_VERSION_CHILDREN);
+        assert_eq!(slice.format_version, SLICE_FORMAT_VERSION_FULL_CLEANUP);
         assert_eq!(slice.engine, SLICE_ENGINE);
         assert_eq!(
             slice.tables["cayenne_table"].len(),
@@ -1003,7 +1050,7 @@ mod tests {
             ],
         );
         let slice = DatasetMetastoreSlice {
-            format_version: SLICE_FORMAT_VERSION_CHILDREN,
+            format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "trips".to_string(),
             exported_at_ms: 0,
@@ -1861,15 +1908,18 @@ mod tests {
         );
     }
 
-    /// A slice is written at the lowest version that expresses it.
+    /// A slice is written at the lowest version that expresses it, and the
+    /// bump is driven by the rows an older import cannot clear — *not* by
+    /// whether the dataset is partitioned.
     ///
-    /// The distinction is the whole point of the bump: an unpartitioned dataset
-    /// must keep producing a slice a reader that predates partition children
-    /// restores, while a partitioned one must be refused by that reader rather
-    /// than restored once and then stuck. Measured against `trunk`'s own
-    /// `import_dataset`, two consecutive imports of a child-carrying slice into
-    /// one metastore gave `#1 -> Ok` then
-    /// `#2 -> UNIQUE constraint failed: cayenne_table.table_name`.
+    /// Both sources are covered, because each was found separately and the
+    /// second only after the first was fixed. Measured against `trunk`'s own
+    /// `import_dataset`, two consecutive imports into one metastore gave:
+    ///
+    /// ```text
+    /// partition children: #1 -> Ok  #2 -> UNIQUE constraint failed: cayenne_table.table_name
+    /// write-back markers: #1 -> Ok  #2 -> UNIQUE constraint failed: cayenne_pending_write_back.table_id, …pk_bytes
+    /// ```
     #[tokio::test]
     async fn a_slice_declares_the_lowest_version_that_expresses_it() {
         let (ms, tmp) = fresh_metastore().await;
@@ -1879,7 +1929,7 @@ mod tests {
             .expect("export the unpartitioned dataset");
         assert_eq!(
             flat.format_version, SLICE_FORMAT_VERSION,
-            "an unpartitioned slice must stay readable by a build that predates partition children"
+            "a slice carrying nothing an older import leaves behind must stay readable by that import"
         );
 
         insert_dataset(&ms, "events", tmp.path(), &[("p1", "k1", "events.dir/k1")]).await;
@@ -1887,12 +1937,32 @@ mod tests {
             .await
             .expect("export the partitioned dataset");
         assert_eq!(
-            partitioned.format_version, SLICE_FORMAT_VERSION_CHILDREN,
+            partitioned.format_version, SLICE_FORMAT_VERSION_FULL_CLEANUP,
             "a slice carrying partition children must declare the version that refuses an older reader"
         );
 
-        // Both versions round-trip through this build.
-        for slice in [&flat, &partitioned] {
+        // Unpartitioned, but carrying a write-back marker: the same bump, from
+        // the other source. `flat` above is the control — the only difference
+        // between the two exports is the marker row.
+        insert_write_back_marker(&ms, "tid-flat", 11).await;
+        let with_markers = export_dataset(ms.as_ref(), "flat", tmp.path())
+            .await
+            .expect("re-export the unpartitioned dataset");
+        assert_eq!(
+            with_markers
+                .tables
+                .get("cayenne_pending_write_back")
+                .map_or(0, Vec::len),
+            1,
+            "the marker must be in the slice for this case to mean anything"
+        );
+        assert_eq!(
+            with_markers.format_version, SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            "an older import clears only cayenne_insert_record by hand, so a slice carrying any other blob-keyed row must declare the newer version"
+        );
+
+        // Every version this build writes, it also reads.
+        for slice in [&flat, &partitioned, &with_markers] {
             let bytes = slice.to_json_bytes().expect("serialize");
             let parsed = DatasetMetastoreSlice::from_json_bytes(&bytes)
                 .expect("this build reads every version it writes");
@@ -1900,31 +1970,43 @@ mod tests {
         }
     }
 
-    /// A slice may not carry partition children under the older version.
+    /// A slice may not carry rows an older import cannot clear while declaring
+    /// the older version.
     ///
-    /// The bump protects a reader that predates those rows, and that reader
-    /// decides purely on the declared version — so a payload that disagrees
-    /// with its own version would reach exactly the build the bump exists for.
+    /// The bump protects that reader, and that reader decides purely on the
+    /// declared version — so a payload disagreeing with its own version would
+    /// reach exactly the build the bump exists for. Both sources are checked,
+    /// since each is a separate way to build the disagreement.
     #[tokio::test]
-    async fn refuses_partition_children_declared_under_the_older_version() {
+    async fn refuses_rows_an_older_import_cannot_clear_under_the_older_version() {
         let (ms, tmp) = fresh_metastore().await;
         insert_dataset(&ms, "events", tmp.path(), &[("p1", "k1", "events.dir/k1")]).await;
-        let mut slice = export_dataset(ms.as_ref(), "events", tmp.path())
-            .await
-            .expect("export");
-        slice.format_version = SLICE_FORMAT_VERSION;
+        insert_dataset(&ms, "flat", tmp.path(), &[]).await;
+        insert_write_back_marker(&ms, "tid-flat", 11).await;
 
-        let (reader, reader_tmp) = fresh_metastore().await;
-        let err = import_dataset(reader.as_ref(), &slice, reader_tmp.path())
-            .await
-            .expect_err("a child-carrying slice declaring the older version must be refused");
-        assert!(
-            err.to_string().contains("declares format_version"),
-            "err={err}"
-        );
-        assert!(
-            table_names(reader.as_ref()).await.is_empty(),
-            "a refused import must leave the reader's metastore untouched"
-        );
+        for dataset in ["events", "flat"] {
+            let mut slice = export_dataset(ms.as_ref(), dataset, tmp.path())
+                .await
+                .expect("export");
+            assert_eq!(
+                slice.format_version, SLICE_FORMAT_VERSION_FULL_CLEANUP,
+                "'{dataset}' must export at the newer version for this case to mean anything"
+            );
+            slice.format_version = SLICE_FORMAT_VERSION;
+
+            let (reader, reader_tmp) = fresh_metastore().await;
+            let err = import_dataset(reader.as_ref(), &slice, reader_tmp.path())
+                .await
+                .expect_err("a slice declaring the older version must be refused");
+            assert!(
+                err.to_string()
+                    .contains("import does not clear, but declares format_version"),
+                "dataset={dataset} err={err}"
+            );
+            assert!(
+                table_names(reader.as_ref()).await.is_empty(),
+                "a refused import must leave the reader's metastore untouched"
+            );
+        }
     }
 }
