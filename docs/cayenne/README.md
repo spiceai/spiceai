@@ -107,4 +107,4 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
 Cayenne moves quickly. PRs that change `crates/cayenne` behavior, config
 parameters, the metastore schema, or the CDC/compaction flows should update
 `cayenne.md` in the same PR where practical. See the note in the repository's
-agent instructions (`CLAUDE.md` / `.github/copilot-instructions.md`).
+agent instructions (`AGENTS.md`).
