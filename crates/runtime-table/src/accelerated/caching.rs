@@ -333,7 +333,7 @@ impl UncoalescedFetch<'_> {
                 // instead when `caching_stale_if_error` allows it.
                 if !cache::batches_cacheable(&batches)
                     && let Some(stale) = match expired_batches {
-                        Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                        Some(fallback) => fallback.read().await,
                         None => None,
                     }
                 {
@@ -364,7 +364,7 @@ impl UncoalescedFetch<'_> {
             )),
             Err(e) => {
                 if let Some(batches) = match expired_batches {
-                    Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                    Some(fallback) => fallback.read().await,
                     None => None,
                 } {
                     let staleness = staleness_past_max_age(&batches, max_age);
@@ -1225,8 +1225,8 @@ enum CacheFallback {
 
 impl CacheFallback {
     async fn read(self) -> Option<Vec<RecordBatch>> {
-        match self {
-            Self::Loaded(batches) => Some(batches),
+        let batches = match self {
+            Self::Loaded(batches) => batches,
             Self::Deferred {
                 input,
                 partition,
@@ -1236,8 +1236,13 @@ impl CacheFallback {
                 .ok()?
                 .try_collect()
                 .await
-                .ok(),
-        }
+                .ok()?,
+        };
+        let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect();
+        (!batches.is_empty()).then_some(batches)
     }
 }
 
@@ -2280,7 +2285,7 @@ impl CacheRefreshHelper {
                 // to.
                 if !batches_cacheable
                     && let Some(stale) = match expired_batches {
-                        Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                        Some(fallback) => fallback.read().await,
                         None => None,
                     }
                 {
@@ -2392,7 +2397,7 @@ impl CacheRefreshHelper {
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
                 if let Some(batches) = match expired_batches {
-                    Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                    Some(fallback) => fallback.read().await,
                     None => None,
                 } {
                     let staleness = staleness_past_max_age(&batches, max_age);
@@ -6415,7 +6420,72 @@ mod tests {
         );
     }
 
-    /// Regression guard for the shared `SessionState`. Every query plans its own
+    #[tokio::test]
+    async fn follower_does_not_serve_zero_row_deferred_fallback() {
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "origin error"));
+        let schema = origin.schema();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![empty]], Arc::clone(&schema), None)
+                .expect("empty cache input"),
+        )));
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+            inner,
+            scans: Arc::clone(&scans),
+        });
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let leader = leader_claim(&in_flight, "request");
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "request".to_string(), None)
+        else {
+            panic!("second caller must be a follower");
+        };
+        drop(leader);
+
+        let session_state = test_session_state();
+        let filters = [col("request_path").eq(lit("/api/test"))];
+        let stream = CacheRefreshHelper::follow_cache_miss(
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
+                dataset_name: "http_data",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: StaleIfError::Enabled,
+                max_age: Duration::ZERO,
+                expired_batches: Some(CacheFallback::Deferred {
+                    input,
+                    partition: 0,
+                    context: Arc::new(TaskContext::default()),
+                }),
+            },
+        )
+        .await;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect origin failure");
+
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "an empty cache batch cannot suppress the origin's transient response"
+        );
+        let status = batches[0]
+            .column_by_name(RESPONSE_STATUS_COLUMN)
+            .expect("response_status")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("UInt16 response_status");
+        assert_eq!(status.value(0), 503);
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the deferred accelerator scan runs once after origin failure"
+        );
+    }
+
+    /// Regression guard for the shared `SessionState`.  Every query plans its own
     /// `CachingAccelerationScanExec` (through `scan_plan`, and again through
     /// `with_new_children` on a plan rewrite), and each source fetch that exec issues — a cache
     /// miss, an expired entry re-fetched inline, and a stale-while-revalidate refresh in the
