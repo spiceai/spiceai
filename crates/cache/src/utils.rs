@@ -40,8 +40,15 @@ pub const RESPONSE_STATUS_COLUMN: &str = "response_status";
 /// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
 /// from record batches before caching.
 ///
-/// If a batch has neither a `response_status` column nor the schema-metadata status marker
-/// (i.e., not from an HTTP connector), it is returned unchanged.
+/// A batch is only ever filtered on the HTTP connector's own provenance
+/// marker ([`HTTP_RESPONSE_STATUS_METADATA_KEY`], read via
+/// [`http_fetch_status`]) — never merely because it happens to have a
+/// same-named, same-typed `response_status` column. A non-HTTP dataset's own
+/// business column named `response_status` (e.g. an order's status code)
+/// would otherwise have rows carrying a value like `503` silently dropped,
+/// exactly the class of data loss `batches_cacheable`'s own provenance check
+/// (`has_transient_http_error_responses`) guards against. Returned unchanged
+/// whenever that marker is absent, regardless of what the column holds.
 #[must_use]
 pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBatch> {
     if batches.is_empty() {
@@ -52,13 +59,20 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
 
     for batch in batches {
         let schema = batch.schema();
+        let Some(fetch_status) = http_fetch_status(&schema) else {
+            // No HTTP-connector provenance marker: not an HTTP-connector
+            // result (or its schema lost the marker upstream) — pass
+            // through unchanged, whatever a same-named column might hold.
+            result.push(batch.clone());
+            continue;
+        };
+
         let Some((col_idx, _)) = schema.column_with_name(RESPONSE_STATUS_COLUMN) else {
-            // No materialized column: either a decomposed HTTP dataset (fall back to
-            // the schema-metadata status, which applies to every row in this batch)
-            // or not an HTTP-connector result at all (pass through unchanged).
-            match http_fetch_status(&schema) {
-                Some(status) if is_retryable_status(status) => {}
-                _ => result.push(batch.clone()),
+            // Decomposed HTTP dataset with no materialized column: fall back
+            // to the schema-metadata status, which applies to every row in
+            // this batch (a single HTTP response never mixes statuses).
+            if !is_retryable_status(fetch_status) {
+                result.push(batch.clone());
             }
             continue;
         };
@@ -1013,10 +1027,13 @@ pub(crate) mod tests {
     use arrow::array::{StringArray, UInt16Array};
 
     fn create_http_response_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
-            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
-        ]))
+        Arc::new(
+            Schema::new(vec![
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            ])
+            .with_metadata(http_provenance_metadata()),
+        )
     }
 
     /// The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker the real HTTP
@@ -1030,11 +1047,11 @@ pub(crate) mod tests {
         )])
     }
 
-    /// Like [`create_http_response_schema`], plus a tagged schema and
-    /// `_fetched_at` — what [`http_fetch_status`] actually checks.
-    /// Tests exercising `batches_cacheable`/`has_transient_http_error_responses`
-    /// need this one; `filter_transient_error_responses` tests don't check
-    /// provenance at all, so they stay on the untagged schema above.
+    /// Like [`create_http_response_schema`] (both now carry the provenance
+    /// marker), plus `_fetched_at` for tests exercising
+    /// `batches_cacheable`/`has_transient_http_error_responses`, which read
+    /// it via `time_column`/TTL logic that the plain schema above doesn't
+    /// need.
     fn create_http_response_schema_with_fetched_at() -> Arc<Schema> {
         Arc::new(
             Schema::new(vec![
@@ -1482,6 +1499,41 @@ pub(crate) mod tests {
             result[0].num_rows(),
             2,
             "Non-HTTP batches pass through unchanged"
+        );
+    }
+
+    /// A non-HTTP source (e.g. `localpod`) can have its own business column
+    /// literally named `response_status` — an order's status code, say —
+    /// with no connection to an HTTP fetch. Filtering on the column's mere
+    /// name/type, without checking the HTTP connector's own provenance
+    /// marker first, would silently drop a legitimate row whose business
+    /// value happens to be `503`. Regression test for the finding on
+    /// `filter_transient_error_responses`: this function must gate on
+    /// `http_fetch_status` the same way `has_transient_http_error_responses`
+    /// already does.
+    #[test]
+    fn test_filter_preserves_non_http_business_row_with_503_value() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(UInt16Array::from(vec![503, 200])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1, "the batch must pass through, not vanish");
+        assert_eq!(
+            result[0].num_rows(),
+            2,
+            "a non-HTTP batch's own business `response_status` value of 503 is real data, \
+            not an origin failure, and must not be filtered out absent the HTTP \
+            connector's own provenance marker"
         );
     }
 

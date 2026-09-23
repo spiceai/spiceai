@@ -5148,12 +5148,22 @@ mod tests {
         );
     }
 
-    /// Helper to create a schema with `response_status` column for `filter_5xx` tests
+    /// Helper to create a schema with `response_status` column for `filter_5xx` tests.
+    /// Carries the HTTP-connector provenance marker so
+    /// `filter_transient_error_responses` treats it as a real HTTP-connector
+    /// batch rather than passing it through unfiltered (see
+    /// `cache::utils::http_fetch_status`).
     fn create_http_response_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
-            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
-        ]))
+        Arc::new(
+            Schema::new(vec![
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            ])
+            .with_metadata(std::collections::HashMap::from([(
+                HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        )
     }
 
     #[test]

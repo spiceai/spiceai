@@ -8627,6 +8627,7 @@ mod tests {
             column_order.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -8770,6 +8771,7 @@ mod tests {
                 "details".to_string(),
             ],
             "details".to_string(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -9009,6 +9011,7 @@ mod tests {
             vec!["id".to_string(), "name".to_string(), "details".to_string()],
             "details".to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -9051,6 +9054,7 @@ mod tests {
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -9084,6 +9088,7 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         let provider = Arc::new(
@@ -9131,6 +9136,12 @@ mod tests {
                 "details".to_string(),
             ],
             "details".to_string(),
+            ["request_path".to_string(), "response_status".to_string()]
+                .into_iter()
+                .collect(),
+            // Both are user-declared in `column_order` above, so both
+            // legitimately take a same-named body key away from the
+            // catch-all — this test is exercising exactly that case.
             ["request_path".to_string(), "response_status".to_string()]
                 .into_iter()
                 .collect(),

@@ -1616,6 +1616,11 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
         .cloned()
         .collect();
+    // The user-declared subset, captured before `_fetched_at` and
+    // `response_status` are force-added below regardless of declaration —
+    // see `HttpJsonNesting::catch_all_exclusions` for why only this subset
+    // may take a same-named JSON body key away from the catch-all.
+    let catch_all_exclusions = metadata_fields.clone();
 
     // Ensure `fetched_at` is always present so caching TTL eviction and
     // append-mode `time_column` work even when the user omits the column.
@@ -1659,6 +1664,7 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         column_order,
         json_column.name.clone(),
         metadata_fields,
+        catch_all_exclusions,
     )))
 }
 
