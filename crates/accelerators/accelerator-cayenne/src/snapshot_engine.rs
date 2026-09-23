@@ -338,9 +338,8 @@ async fn data_dir_has_entries(anchor: &std::path::Path) -> bool {
 fn directory_contains_content(dir: &std::path::Path) -> bool {
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
-        let entries = match std::fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(_) => return true,
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            return true;
         };
         for entry in entries {
             let Ok(entry) = entry else {
