@@ -99,6 +99,7 @@ _CONTROL_KEYS = (
     "timeout_hang_ms",
     "headers",
     "seed",
+    "fault_paths",
 )
 
 _lock = threading.Lock()
@@ -117,6 +118,13 @@ _state: dict[str, Any] = {
     "timeout_hang_ms": 0,
     "headers": {},
     "seed": 0,
+    # Paths this fault applies to. Empty = every path on this origin (the
+    # prior, path-agnostic behavior) -- set this to scope a fault to one
+    # dataset's URL while a sibling dataset on the SAME origin (different
+    # path, same host:port) stays healthy, to test whether the client-side
+    # rate controller's per-origin state (keyed on host:port, not path --
+    # see rate_control_key in data-http-rate-control) couples the two.
+    "fault_paths": [],
     # Counters.
     "data_requests": 0,
     "total_requests": 0,
@@ -298,7 +306,11 @@ async def _serve_data(request: Request, path: str) -> Any:
         hang_ms = float(_state["timeout_hang_ms"])
         profile_id = _state.get("id")
 
-        faulted = mode in ("status", "refuse", "hang") and _rng.random() < error_rate
+        fault_paths = _state.get("fault_paths") or []
+        path_faultable = not fault_paths or path in fault_paths
+        faulted = (
+            path_faultable and mode in ("status", "refuse", "hang") and _rng.random() < error_rate
+        )
         if faulted:
             _state["faulted_requests"] += 1
         latency_delay_ms = base + (_rng.random() * jitter if jitter > 0 else 0.0)

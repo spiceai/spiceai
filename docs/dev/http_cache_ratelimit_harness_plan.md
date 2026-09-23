@@ -8,7 +8,7 @@ Repo: `spiceai/spiceai`. Investigated against trunk `ff430a4b66`, worktree `/pri
 This harness proves two Spice.ai runtime features by observed behavior, not by code reading:
 
 1. RFC 5861 cache semantics for the `refresh_mode: caching` accelerator: stale-while-revalidate (SWR) and stale-if-error (SIE). HTTP connector timeouts must propagate as errors that trigger SIE.
-2. Client-side adaptive rate control on the per-origin HTTP rate limiter: Google SRE-style client-side throttling (the one strategy #14143 ships).
+2. Client-side adaptive rate control on the per-origin HTTP rate limiter: admission-coefficient client-side throttling (the one strategy #14143 ships).
 
 Every claim the harness makes must rest on a reproduction: an origin request log, a scraped metric, a query result, or a response header. A plausible-looking pass is not a pass.
 
@@ -167,7 +167,7 @@ Runtime section (rate control is a runtime.params concern; the keys are the `htt
 runtime:
   params:
     # http_adaptive_rate_control: disabled | enabled — one admission-coefficient
-    # strategy (Google SRE client-side throttling), not a selectable AIMD/SRE
+    # strategy (client-side throttling), not a selectable AIMD/admission-coefficient
     # pair. K is set via http_adaptive_rate_control_failure_threshold
     # (K = 1/(1-threshold), default threshold 50% => K = 2.0), decay half-life
     # via http_adaptive_rate_control_window (default 10s).
@@ -224,7 +224,7 @@ datasets:
 ```
 `caching_stale_if_error` accepts `disabled`, `enabled` (unbounded), or a duration such as `60s` (parsed in `acceleration.rs:1245`, `parse_caching_stale_if_error`). `enabled` with no retention triggers a startup warning (`crates/runtime/src/datafusion/caching_retention.rs:168`), so pair it with retention.
 
-Provide a small matrix of spicepods (one per top-level scenario group) rather than one giant file: `spicepod.caching.yaml` (rate control disabled, tiny windows), `spicepod.ratecontrol.sre.yaml` (`http_adaptive_rate_control: enabled`, `http_adaptive_rate_control_failure_threshold: "50%"` => K=2.0 — shared by all adaptive-rate-control scenarios, since #14143 ships one strategy), `spicepod.composition.yaml` (both features on), and `spicepod.slow.yaml` (real-duration windows). Duration scaling lives here (Section 8).
+Provide a small matrix of spicepods (one per top-level scenario group) rather than one giant file: `spicepod.caching.yaml` (rate control disabled, tiny windows), `spicepod.ratecontrol.admission.yaml` (`http_adaptive_rate_control: enabled`, `http_adaptive_rate_control_failure_threshold: "50%"` => K=2.0 — shared by all adaptive-rate-control scenarios, since #14143 ships one strategy), `spicepod.composition.yaml` (both features on), and `spicepod.slow.yaml` (real-duration windows). Duration scaling lives here (Section 8).
 
 ### 4.4 Origin fault modes (each separately dialable)
 
@@ -308,7 +308,7 @@ Caching (per scenario window):
 
 Rate control (per origin, diffed over the fault window):
 - Backoff-on-failure: during the p2 error window, `adaptive_rate_control_admission_coefficient_permille{origin=p2}` drops well below 1000; the p2 origin arrival rate (from its request log) falls below the offered rate. (No separate throttled-request counter exists — see 2.3.)
-- SRE shape: with `http_adaptive_rate_control: enabled` and `http_adaptive_rate_control_failure_threshold: "50%"` (K=2.0), admission ≈ `min(1, (K*accepts+1)/(requests+1))` within tolerance, using accept/request counts reconstructed from the origin log over the 10s decaying window (`SRE_WINDOW_HALF_LIFE`, `adaptive.rs:52`).
+- Admission-coefficient shape: with `http_adaptive_rate_control: enabled` and `http_adaptive_rate_control_failure_threshold: "50%"` (K=2.0), admission ≈ `min(1, (K*accepts+1)/(requests+1))` within tolerance, using accept/request counts reconstructed from the origin log over the 10s decaying window (the window half-life constant, `adaptive.rs:52`).
 - Recovery: after the origin heals, `admission_coefficient_permille` returns to 1000 and `effective_limit` climbs back to the ceiling within a bounded time.
 - Cooldown headers: when the origin sends `Retry-After`/`RateLimit`, `rate_limit_retry_after_updates_total` and `rate_limit_retry_after_remaining_ms` move; the origin arrival log shows a gap of about the advertised duration.
 - IETF advertised-quota headers (today): with only `RateLimit`/`RateLimit-Policy` set (no `Retry-After`, no 429 body), assert admission does NOT change — encodes the current not-yet-honored behavior (Section 2.3). Flip to the opposite assertion when #14136 lands that support.
@@ -323,9 +323,9 @@ Topology:
 2. `caching-sie-503` (spicepod.caching). t=30 p2 -> 50% 503 + 20ms latency; t=90 recover. Expect SIE serves stale within `E`; SWR refreshes fail silently; d1 unaffected.
 3. `caching-sie-timeout` (spicepod.caching, MANDATORY). t=30 p2 -> `hang 5000ms` with `client_timeout=2s`; t=120 recover. Expect timeout classified as error, SIE serves stale within `E`, connector timed out (evidence: origin hang log + ~2s refresh latency).
 4. `caching-sie-expiry` (spicepod.caching, `caching_stale_if_error: "10s"`). Long error window > `E`. Expect stale served until `E`, then errors propagate (fail closed).
-5. `ratecontrol-sre` (spicepod.ratecontrol.sre, K=2.0). Offered QPS above ceiling; t=30 p2 90% 503; t=120 recover. Expect admission ≈ SRE formula over the decaying window and drops well below 1000, p2 upstream arrivals capped, p1 clean.
-6. `ratecontrol-cooldown` (spicepod.ratecontrol.sre). p2 returns 429 + `Retry-After: 2`. Expect retry-after metrics move and a ~2s arrival gap.
-7. `ratecontrol-ietf-headers` (spicepod.ratecontrol.sre). p2 sends only `RateLimit`/`RateLimit-Policy`. Expect NO admission change today (assertion flips when #14136 lands).
+5. `ratecontrol-admission` (spicepod.ratecontrol.admission, K=2.0). Offered QPS above ceiling; t=30 p2 90% 503; t=120 recover. Expect admission ≈ the admission-coefficient formula over the decaying window and drops well below 1000, p2 upstream arrivals capped, p1 clean.
+6. `ratecontrol-cooldown` (spicepod.ratecontrol.admission). p2 returns 429 + `Retry-After: 2`. Expect retry-after metrics move and a ~2s arrival gap.
+7. `ratecontrol-ietf-headers` (spicepod.ratecontrol.admission). p2 sends only `RateLimit`/`RateLimit-Policy`. Expect NO admission change today (assertion flips when #14136 lands).
 8. `topology-isolation` (spicepod.composition). Fault p2 only. Expect both p2 datasets throttled/stale, p1 untouched; one shared p2 limiter series.
 9. `composition-sie-absorbs-while-backoff` (spicepod.composition). p2 timeout window. Expect: SIE keeps responses `ok=true` STALE while the controller backs off and upstream arrivals collapse — the two features cooperate (cache absorbs user-facing hits while the controller protects the origin).
 10. `slow-confirmation` (spicepod.slow, real durations e.g. max-age=60s, swr=120s, sie=1h). One long run mirroring scenario 2/3 to confirm the tiny-window results hold at realistic timescales.
@@ -353,7 +353,7 @@ Each run creates `runs/<UTC-timestamp>-<scenario>/` containing: the resolved spi
 
 1. Phase 0 — skeleton and oracle spike. One origin (FastAPI) with `/data` + `/control` + request log; one caching dataset; a trivial load generator that reads `version`. Confirm the version oracle end-to-end AND empirically test whether `SELECT _fetched_at` works (Section 2.2). Deliverable: a passing `caching-swr-basic`.
 2. Phase 1 — fault modes + driver + clock. Add 503/429/refuse/hang/latency, the control API, and the shared-clock driver. Deliverable: `caching-sie-503` and `caching-sie-timeout` pass.
-3. Phase 2 — metrics scraper + rate-control assertions. Add the scraper and the per-origin adaptive/cooldown checks. Deliverable: `ratecontrol-sre`, `ratecontrol-cooldown`, `ratecontrol-ietf-headers`.
+3. Phase 2 — metrics scraper + rate-control assertions. Add the scraper and the per-origin adaptive/cooldown checks. Deliverable: `ratecontrol-admission`, `ratecontrol-cooldown`, `ratecontrol-ietf-headers`.
 4. Phase 3 — topology + composition. Second origin, two p2 datasets, isolation/sharing checks, and the composition scenario.
 5. Phase 4 — hygiene, compose, slow run, correlation plot. One-command bring-up, run directories, the guardrail warning, and scenario 12.
 
@@ -363,8 +363,8 @@ Each phase is independently useful: Phase 0 already validates the single most lo
 
 1. `_fetched_at` visibility — UNCONFIRMED whether `SELECT *` or `SELECT _fetched_at` surfaces it to a client query. Phase 0 must settle this. If it is not selectable, the harness relies solely on the origin `version` oracle (acceptable, but it removes the independent cross-check). Decision needed only if Phase 0 shows the version oracle alone is insufficient.
 2. File format for `/data` — the plan assumes `file_format: json`. Confirm the HTTP connector schema-infers the origin JSON as intended, and that a caching accelerator over it round-trips the `version` column. Fallback: serve CSV or a single-column payload.
-3. Rate control config location — RESOLVED: the adaptive knob is a `runtime.params` key (`http_adaptive_rate_control`, `enabled`/`disabled`), applied per origin, not a per-dataset param; no dataset-level override exists on the merged `14136`/#14143 surface. Also RESOLVED: #14143 ships a single admission-coefficient (SRE-style) strategy, not an AIMD/SRE pair this plan originally assumed — the `ratecontrol-aimd` scenario, its spicepod, and the AIMD-specific harness assertions were removed; `ratecontrol-sre`, `ratecontrol-cooldown`, and `ratecontrol-ietf-headers` all now share `spicepod.ratecontrol.sre.yaml`.
-4. Ceiling semantics — the SRE ceiling derives from the max of configured rps/rpm/concurrency, else 100. The harness must set an explicit `http_requests_per_second_limit` so the ceiling is known; otherwise assertions must target the default 100.
+3. Rate control config location — RESOLVED: the adaptive knob is a `runtime.params` key (`http_adaptive_rate_control`, `enabled`/`disabled`), applied per origin, not a per-dataset param; no dataset-level override exists on the merged `14136`/#14143 surface. Also RESOLVED: #14143 ships a single admission-coefficient strategy, not an AIMD/admission-coefficient pair this plan originally assumed — the `ratecontrol-aimd` scenario, its spicepod, and the AIMD-specific harness assertions were removed; `ratecontrol-admission`, `ratecontrol-cooldown`, and `ratecontrol-ietf-headers` all now share `spicepod.ratecontrol.admission.yaml`.
+4. Ceiling semantics — the admission-coefficient ceiling derives from the max of configured rps/rpm/concurrency, else 100. The harness must set an explicit `http_requests_per_second_limit` so the ceiling is known; otherwise assertions must target the default 100.
 5. IETF header behavior may flip mid-project — #14136 may land `RateLimit`/`RateLimit-Policy` handling during harness development. Scenario 8's expected outcome must be a config flag, not a hardcoded assumption.
 6. Metric label stability — assertions key on the `origin` label value (`rate_control_key(base_url)`). Confirm the exact string (host:port vs host) so oracle filters match; pin it from a first live scrape rather than assuming.
 7. Branch volatility — both features live on branches (SIE at `14126-stale-if-error`, rate control uncommitted on `14136-adaptive-rate-control`). Metric names and params can change before merge. Treat Section 2.3 and 4.3 names as "verify at build time"; the harness should read metric names from a small config file, not hardcode them, so a rename is a one-line change.

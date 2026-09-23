@@ -32,9 +32,10 @@ The oracle correlates the scraped metrics, the origin request logs, and the
 per-response samples on ``t_rel = now - T0`` and writes ``assertions.json``.
 
 Scenarios (harness plan Section 7):
-  ratecontrol-sre      SRE throttle, K=2. p2 -> 90% 503 (accepts/requests < 1/K
-                       so it actually throttles). Expect admission near the SRE
-                       steady state (2*accepts/requests) within tolerance.
+  ratecontrol-admission  Admission-coefficient throttle, K=2. p2 -> 90% 503
+                       (accepts/requests < 1/K so it actually throttles).
+                       Expect admission near the steady state
+                       (2*accepts/requests) within tolerance.
   ratecontrol-cooldown p2 -> 429 + Retry-After: 2. Expect the retry-after
                        cooldown metrics to move and a ~2s gap in p2 arrivals.
   ratecontrol-ietf-headers  p2 serves 200 + RateLimit / RateLimit-Policy only
@@ -42,9 +43,10 @@ Scenarios (harness plan Section 7):
                        change today (server-advertised quota not yet honored,
                        TODO(#14136)); the assertion flips when that lands.
 
-#14143 ships one admission-coefficient strategy (Google SRE client-side
-throttling); there is no separate AIMD control law, so the scenarios above all
-exercise the same mechanism under different fault shapes.
+#14143 ships one admission-coefficient strategy (an exponentially-decayed
+accept/request ratio); there is no separate AIMD control law, so the
+scenarios above all exercise the same mechanism under different fault
+shapes.
 
 Verdict / exit code:
   PASS     0   every assertion holds.
@@ -78,8 +80,8 @@ from harness.timeline import Step, Timeline  # noqa: E402
 # Scenario fault profiles POSTed to the p2 origin during the fault window.
 # --------------------------------------------------------------------------
 SCENARIOS: dict[str, dict[str, Any]] = {
-    "ratecontrol-sre": {
-        # SRE with K=2 only throttles when accepts/requests < 1/K = 0.5, so the
+    "ratecontrol-admission": {
+        # K=2 only throttles when accepts/requests < 1/K = 0.5, so the
         # failure fraction must exceed 0.5. 0.9 -> steady-state admission
         # ~ 2*0.1 = 0.2.
         "id": "p2-503-heavy",
@@ -159,13 +161,21 @@ class OpenLoopLoad:
         t0: float,
         sql_url: str,
         request_timeout_s: float,
-        pool: ThreadPoolExecutor,
+        max_workers: int,
         pick_key: "Callable[[], str]",
     ):
         self.t0 = t0
         self.sql_url = sql_url
         self.request_timeout_s = request_timeout_s
-        self.pool = pool
+        # One pool PER ORIGIN, not shared: a shared pool lets one origin's
+        # backpressure (e.g. p2 blocked for up to request_timeout_s waiting on
+        # a rate-limit permit under heavy throttling) starve the other
+        # origin's independent, unthrottled requests of workers -- which also
+        # corrupts phase attribution, since t_send is stamped at actual
+        # execution time, so a delayed request gets misclassified into
+        # whatever phase it finally runs in.
+        self._max_workers = max_workers
+        self._pools: dict[str, ThreadPoolExecutor] = {}
         # Single seeded key picker shared by both driver threads; called under
         # `_lock` so the one RNG stream stays consistent (no second stream).
         self._pick_key = pick_key
@@ -219,18 +229,23 @@ class OpenLoopLoad:
             if tl.burst_qps and origin_name == "p2" and t_rel >= tl.burst_start:
                 step = 1.0 / tl.burst_qps
             if now >= next_send:
-                self.pool.submit(self._fire, dataset, origin_name, base_query, tl)
+                self._pools[origin_name].submit(self._fire, dataset, origin_name, base_query, tl)
                 next_send = max(now, next_send) + step
             else:
                 time.sleep(min(0.01, next_send - now))
 
     def run(self, plan: list[tuple[str, str, str, float]], tl: "Phases") -> None:
         for dataset, origin_name, base_query, qps in plan:
+            self._pools[origin_name] = ThreadPoolExecutor(max_workers=self._max_workers)
             th = threading.Thread(
                 target=self._driver, args=(dataset, origin_name, base_query, qps, tl)
             )
             th.start()
             self._threads.append(th)
+
+    def shutdown_pools(self) -> None:
+        for pool in self._pools.values():
+            pool.shutdown(wait=False)
 
     def join(self) -> None:
         for th in self._threads:
@@ -239,12 +254,12 @@ class OpenLoopLoad:
 
 
 # --------------------------------------------------------------------------
-# SRE admission reconstruction
+# Admission-coefficient reconstruction
 # --------------------------------------------------------------------------
-def sre_predicted_admission(
+def predicted_admission_coefficient(
     arrivals: list[dict[str, Any]], at_t: float, k: float, half_life_s: float = 10.0
 ) -> Optional[float]:
-    """Reconstruct the SRE admission coefficient the controller would report at
+    """Reconstruct the admission coefficient the controller would report at
     ``at_t`` from the origin arrival log: an exponentially time-decayed count of
     requests and accepts (200s), then min(1, (k*accepts+1)/(requests+1))."""
     requests = 0.0
@@ -328,12 +343,11 @@ def run(args: argparse.Namespace) -> int:
         (args.p2_dataset, "p2", q2, args.p2_qps),
     ]
 
-    pool = ThreadPoolExecutor(max_workers=args.max_workers)
     load = OpenLoopLoad(
         t0,
         args.spiced_sql_url,
         args.request_timeout_s,
-        pool,
+        args.max_workers,
         multi_key.make_key_picker(args.seed),
     )
 
@@ -345,7 +359,7 @@ def run(args: argparse.Namespace) -> int:
     # One trailing scrape so the final gauge state is captured, then stop.
     scraper.scrape_once()
     scraper.stop()
-    pool.shutdown(wait=False)
+    load.shutdown_pools()
 
     p1_stats1 = http.get_json(args.p1_stats_url)
     p2_stats1 = http.get_json(args.p2_stats_url)
@@ -431,23 +445,25 @@ def run(args: argparse.Namespace) -> int:
         f"{warm_ok}/{len(warm)} warmup queries returned rows",
     )
 
-    if scenario == "ratecontrol-sre":
-        k = args.sre_k  # must match `http_adaptive_rate_control` in the SRE pod
+    if scenario == "ratecontrol-admission":
+        k = args.admission_k  # must match `http_adaptive_rate_control` in the pod
         add(
             "p2_admission_drops_during_fault",
             p2_adm_min_fault is not None and p2_adm_min_fault < args.admission_drop_permille,
             f"min admission_coefficient_permille[p2] during fault = {p2_adm_min_fault} "
             f"(need < {args.admission_drop_permille})",
         )
-        # Reconstruct the SRE admission from the p2 arrival log at each scrape
-        # time in the second half of the fault window (after the decaying
-        # window has filled), and compare to the observed coefficient.
+        # Reconstruct the predicted admission from the p2 arrival log at each
+        # scrape time in the second half of the fault window (after the
+        # decaying window has filled), and compare to the observed coefficient.
         errs: list[float] = []
         pred_obs: list[tuple[float, float, float]] = []
         for s in (p2_adm_series or []):
             if not (fs + 5.0 <= s.t_rel_s <= fe):
                 continue
-            pred = sre_predicted_admission(p2_arrivals, s.t_rel_s, k)
+            pred = predicted_admission_coefficient(
+                p2_arrivals, s.t_rel_s, k, half_life_s=args.admission_window_s
+            )
             if pred is None:
                 continue
             obs = s.value / 1000.0
@@ -455,10 +471,10 @@ def run(args: argparse.Namespace) -> int:
             pred_obs.append((round(s.t_rel_s, 1), round(pred, 3), round(obs, 3)))
         mae = sum(errs) / len(errs) if errs else None
         add(
-            "sre_admission_matches_formula",
-            mae is not None and mae <= args.sre_tolerance,
+            "admission_matches_formula",
+            mae is not None and mae <= args.admission_tolerance,
             f"mean|predicted-observed| admission over fault (2nd half) = "
-            f"{None if mae is None else round(mae, 3)} (need <= {args.sre_tolerance}); "
+            f"{None if mae is None else round(mae, 3)} (need <= {args.admission_tolerance}); "
             f"samples (t, pred, obs) = {pred_obs[:12]}",
         )
         add(
@@ -640,8 +656,14 @@ def main() -> int:
     p.add_argument("--admission-drop-permille", type=float, default=800.0)
     p.add_argument("--recovery-permille", type=float, default=950.0)
     p.add_argument("--p1-full-permille", type=float, default=1000.0)
-    p.add_argument("--sre-tolerance", type=float, default=0.2)
-    p.add_argument("--sre-k", type=float, default=cli.env_float("SRE_K", 2.0))
+    p.add_argument("--admission-tolerance", type=float, default=0.2)
+    p.add_argument("--admission-k", type=float, default=cli.env_float("ADMISSION_K", 2.0))
+    p.add_argument(
+        "--admission-window-s",
+        type=float,
+        default=cli.env_float("ADMISSION_WINDOW_S", 10.0),
+        help="must match http_adaptive_rate_control_window in the spicepod",
+    )
     p.add_argument("--cooldown-gap-min-s", type=float, default=1.5)
     p.add_argument("--out-dir", default=cli.env_str("OUT_DIR", "/tmp/http_cache_phase2_run"))
     p.add_argument(

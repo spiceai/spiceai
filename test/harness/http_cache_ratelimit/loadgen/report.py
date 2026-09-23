@@ -21,7 +21,7 @@ hand-drawn inline SVG, so the output opens in a browser with no server and no
 network access.
 
 Usage:
-  python loadgen/report.py --run-dir /tmp/http_cache_phase2_run/ratecontrol-sre
+  python loadgen/report.py --run-dir /tmp/http_cache_phase2_run/ratecontrol-admission
   # writes <run-dir>/report.html by default; --out to change the path.
 
 The phase is auto-detected from which files/columns are present:
@@ -194,6 +194,15 @@ def describe_fault(config: dict[str, Any], phase: int) -> Optional[str]:
                 "slowdown, just to keep it realistic."
             )
 
+    fault_paths = profile.get("fault_paths")
+    if fault_paths:
+        bullets.append(
+            f"<code>fault_paths: {escape(str(fault_paths))}</code> — scoped to this "
+            "origin's listed path(s) only; a sibling dataset on the same host:port but "
+            "a different path stays content-healthy, so any effect on it comes purely "
+            "from sharing the origin's rate limiter/controller, not from its own errors."
+        )
+
     headers = profile.get("headers")
     if headers:
         pairs = ", ".join(f"{k}: {v}" for k, v in headers.items())
@@ -222,7 +231,15 @@ def describe_fault(config: dict[str, Any], phase: int) -> Optional[str]:
             f"({end - start:g}s){seed_note}."
         )
 
-    if phase == 2:
+    if fault_paths:
+        bullets.append(
+            "Injected at origin <code>p2</code> only, scoped to the path(s) above — "
+            "<code>p1</code> (a different origin) stays healthy the entire run, and any "
+            "OTHER dataset on p2's host:port but a different path also gets its own "
+            "content served healthy throughout. Whether that other dataset's admission "
+            "still degrades is exactly what this run tests."
+        )
+    elif phase == 2:
         bullets.append(
             "Injected at origin <code>p2</code> only — <code>p1</code> stays healthy the "
             "entire run, which is how per-origin isolation is proven."
@@ -558,7 +575,16 @@ def render(run_dir: str) -> str:
         )
 
     origin_rows = _read_origin_logs(run_dir)
-    qps_group_key = "origin_name" if samples and "origin_name" in samples[0] else None
+    # Prefer "dataset" -- it's always present and never coarser than
+    # "origin_name" (two datasets can share one physical origin, e.g. the
+    # same-origin coupling probe's d2/d3 both on :9002; grouping by origin
+    # would silently merge their otherwise-distinct QPS/status series).
+    if samples and "dataset" in samples[0]:
+        qps_group_key = "dataset"
+    elif samples and "origin_name" in samples[0]:
+        qps_group_key = "origin_name"
+    else:
+        qps_group_key = None
 
     # 1. QPS at the HTTP origin(s) -- true upstream arrival rate, grouped by
     # origin label (one series per origin; a single series if there is only
@@ -622,9 +648,11 @@ def render(run_dir: str) -> str:
     # caching behavior off this chart (see the scatter chart below for the
     # per-response view of that split).
     lat_group_key = qps_group_key
-    lat_series = bucketed_percentiles(samples, "t_send_rel_s", "latency_ms", [50, 99, 100], group_key=lat_group_key)
+    lat_series = bucketed_percentiles(
+        samples, "t_send_rel_s", "latency_ms", [50, 99, 100], group_key=lat_group_key, bucket_s=0.1
+    )
     sections.append(
-        '<div class="card"><h2>Latency at spiced: p50 / p99 / max per 1s bucket</h2>'
+        '<div class="card"><h2>Latency at spiced: p50 / p99 / max per 0.1s bucket</h2>'
         + line_chart(lat_series, "latency_ms", "ms", shaded_windows=windows)
         + "</div>"
     )
@@ -638,9 +666,9 @@ def render(run_dir: str) -> str:
             + "</div>"
         )
         # Freshness band counts per bucket (FRESH/STALE/EMPTY/ERROR).
-        band_series = bucketed_counts(samples, "t_send_rel_s", "freshness")
+        band_series = bucketed_counts(samples, "t_send_rel_s", "freshness", bucket_s=0.1)
         sections.append(
-            '<div class="card"><h2>Response freshness band (count/s)</h2>'
+            '<div class="card"><h2>Response freshness band (count/s, 0.1s buckets)</h2>'
             + line_chart(band_series, "freshness", "count/s", shaded_windows=windows)
             + "</div>"
         )
@@ -659,7 +687,10 @@ def render(run_dir: str) -> str:
             + "</div>"
         )
 
-    # Rate-control metrics (Phase 2 only): admission + effective limit per origin.
+    # Rate-control metrics (Phase 2 only): admission coefficient + effective
+    # limit per origin (the admission series is the direct evidence of
+    # same-origin coupling -- one shared series per host:port regardless of
+    # how many datasets target it).
     if metrics:
         for metric_suffix, y_label in (
             ("adaptive_rate_control_admission_coefficient_permille", "admission permille"),
