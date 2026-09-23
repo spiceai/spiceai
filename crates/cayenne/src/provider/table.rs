@@ -4794,6 +4794,73 @@ const INPUT_RANGE_MIN_WINDOW_RANK_SPAN_PERCENT: usize = 50;
 /// shows it inside the head too.
 const INPUT_RANGE_MAX_DRIFT_PERCENT: usize = 25;
 
+/// Replays a first-load input head that is charged to the query memory pool,
+/// then the rest of the input, releasing each head batch's charge on the poll
+/// *after* the consumer has taken that batch.
+///
+/// [`StreamExt::inspect`] would shrink during the poll that yields the batch —
+/// before the Vortex demux receives it and before `send` to a depth-1 shard
+/// channel can complete — so those bytes would sit outside the pool while the
+/// batch waited behind a shard writer. The following poll is, on that path,
+/// after `send` has accepted the previous batch.
+struct ChargedInputHead {
+    head: std::vec::IntoIter<RecordBatch>,
+    head_sizes: std::vec::IntoIter<usize>,
+    refused: Option<RecordBatch>,
+    rest: SendableRecordBatchStream,
+    reservation: MemoryReservation,
+    /// Bytes of the last yielded head batch. Released at the start of the next
+    /// poll, once the consumer has taken that batch.
+    pending_release: Option<usize>,
+}
+
+impl ChargedInputHead {
+    fn new(
+        head: Vec<RecordBatch>,
+        head_sizes: Vec<usize>,
+        refused: Option<RecordBatch>,
+        rest: SendableRecordBatchStream,
+        reservation: MemoryReservation,
+    ) -> Self {
+        Self {
+            head: head.into_iter(),
+            head_sizes: head_sizes.into_iter(),
+            refused,
+            rest,
+            reservation,
+            pending_release: None,
+        }
+    }
+
+    fn release_taken_batch(&mut self) {
+        if let Some(bytes) = self.pending_release.take() {
+            self.reservation.shrink(bytes);
+        }
+    }
+}
+
+impl Stream for ChargedInputHead {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // The consumer already holds the previous batch (and, on the Vortex
+        // write path, has finished sending it to a shard channel).
+        this.release_taken_batch();
+        if let Some(batch) = this.head.next() {
+            this.pending_release = this.head_sizes.next();
+            return std::task::Poll::Ready(Some(Ok(batch)));
+        }
+        if let Some(batch) = this.refused.take() {
+            return std::task::Poll::Ready(Some(Ok(batch)));
+        }
+        this.rest.as_mut().poll_next(cx)
+    }
+}
+
 /// Where a range-routed replace takes its key from, for the debug log.
 #[derive(Debug, Clone, Copy)]
 enum RangeKeySource {
@@ -17590,15 +17657,9 @@ impl CayenneTableProvider {
             elapsed_ms = started.elapsed().as_millis(),
             "Sampled the routing key of a first load from its input"
         );
-        // Each head batch stays charged until the writer takes it.
-        let mut head_sizes = head_sizes.into_iter();
-        let rest = stream::iter(head.into_iter().chain(refused).map(Ok))
-            .chain(data)
-            .inspect(move |_| {
-                if let Some(bytes) = head_sizes.next() {
-                    reservation.shrink(bytes);
-                }
-            });
+        // Each head batch stays charged until the writer takes it: the
+        // following poll, not the yielding one (see [`ChargedInputHead`]).
+        let rest = ChargedInputHead::new(head, head_sizes, refused, data, reservation);
         let data: SendableRecordBatchStream =
             Box::pin(RecordBatchStreamAdapter::new(input_schema, rest));
         Ok((data, plan))
@@ -46900,6 +46961,193 @@ mod tests {
             "a pool that cannot hold the sample refuses it"
         );
         assert!(bounds(16 * 1024 * 1024).is_some_and(|cuts| cuts.len() == 3));
+    }
+
+    /// The first-load head stays charged until the poll *after* the consumer
+    /// has taken the batch. `StreamExt::inspect` shrinks during the yielding
+    /// poll — before the sink receives the batch and before a shard-channel
+    /// `send` can complete — so those bytes would sit outside the query pool
+    /// while the demux still held them.
+    #[tokio::test]
+    async fn charged_input_head_releases_after_the_consumer_receives() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |n: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![n; 1024]))],
+            )
+            .expect("int64 batch")
+        };
+        let first = batch(1);
+        let second = batch(2);
+        let first_bytes = first.get_array_memory_size();
+        let second_bytes = second.get_array_memory_size();
+
+        // Control: inspect shrinks during poll, before next() returns.
+        {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+            let mut reservation = MemoryConsumer::new("inspect_control").register(&pool);
+            reservation
+                .try_grow(first_bytes)
+                .expect("charge the inspect-control batch");
+            let mut inspect_stream = stream::iter([Ok::<_, DataFusionError>(first.clone())])
+                .inspect(move |_| {
+                    reservation.shrink(first_bytes);
+                });
+            let _item = inspect_stream.next().await.expect("inspect yields");
+            assert_eq!(
+                pool.reserved(),
+                0,
+                "inspect already released before the consumer can act"
+            );
+        }
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let mut reservation = MemoryConsumer::new("charged_input_head").register(&pool);
+        reservation
+            .try_grow(first_bytes.saturating_add(second_bytes))
+            .expect("charge both head batches");
+        let mut replay = ChargedInputHead::new(
+            vec![first, second],
+            vec![first_bytes, second_bytes],
+            None,
+            empty_stream(&schema),
+            reservation,
+        );
+        let mut events = Vec::new();
+        assert_eq!(
+            pool.reserved(),
+            first_bytes.saturating_add(second_bytes),
+            "both batches stay charged until they are taken"
+        );
+
+        let got = replay
+            .next()
+            .await
+            .expect("first batch present")
+            .expect("first batch ok");
+        events.push("consumer_received");
+        assert_eq!(got.num_rows(), 1024);
+        assert_eq!(
+            pool.reserved(),
+            first_bytes.saturating_add(second_bytes),
+            "still charged after consumer_received — inspect would already be 0"
+        );
+        // The demux holds the batch here and may wait on a shard writer before
+        // polling again. Dropping our local copy must not release the charge:
+        // the stream still accounts for the queued batch.
+        drop(got);
+        assert_eq!(
+            pool.reserved(),
+            first_bytes.saturating_add(second_bytes),
+            "still charged while the consumer / channel holds the batch"
+        );
+
+        let got = replay
+            .next()
+            .await
+            .expect("second batch present")
+            .expect("second batch ok");
+        events.push("reservation_shrunk");
+        assert_eq!(got.num_rows(), 1024);
+        assert_eq!(
+            pool.reserved(),
+            second_bytes,
+            "the first batch is released only on the following poll"
+        );
+        assert_eq!(events, ["consumer_received", "reservation_shrunk"]);
+
+        assert!(replay.next().await.is_none(), "head then empty rest");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "the last head batch is released on the poll that ends the stream"
+        );
+    }
+
+    /// `input_range_plan` wires the head through [`ChargedInputHead`], so a
+    /// first-load refresh cannot drop the pool charge at inspect-on-poll time.
+    #[tokio::test]
+    async fn input_range_plan_keeps_the_head_charged_until_after_the_writer_takes_it() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env);
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "first_load_head_charge",
+            Arc::clone(&schema),
+            VortexConfig {
+                inline_max_rows: 0,
+                write_concurrency: Some(2),
+                ..VortexConfig::default()
+            },
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = |start: i64| {
+            let keys: Vec<i64> = (start..start + 1024).collect();
+            let values: Vec<i64> = keys.iter().map(|k| k * 10).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .expect("load batch")
+        };
+        let first = batch(0);
+        let second = batch(1024);
+        let first_bytes = first.get_array_memory_size();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter([Ok(first), Ok(second)]),
+        ));
+
+        let reserved_before = pool.reserved();
+        let (mut replayed, _plan) = provider
+            .input_range_plan(input, 2)
+            .await
+            .expect("sample the first-load head");
+        let reserved_after_plan = pool.reserved();
+        assert!(
+            reserved_after_plan.saturating_sub(reserved_before) >= first_bytes,
+            "the head is charged after sampling: before={reserved_before} after={reserved_after_plan}"
+        );
+
+        let _got = replayed
+            .next()
+            .await
+            .expect("first batch present")
+            .expect("first batch ok");
+        assert_eq!(
+            pool.reserved(),
+            reserved_after_plan,
+            "inspect-on-poll would have released the first batch before the writer took it"
+        );
+
+        let _got = replayed
+            .next()
+            .await
+            .expect("second batch present")
+            .expect("second batch ok");
+        assert!(
+            pool.reserved() < reserved_after_plan,
+            "the first batch is released only once the writer asks for the next"
+        );
     }
 
     /// A head whose windows each span a wide key range but drift through the
