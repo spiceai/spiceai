@@ -170,6 +170,33 @@ impl AdaptiveController {
         self.sre.admission_coefficient(now).clamp(0.0, 1.0)
     }
 
+    /// How many cells/permits one request should charge right now: `round(1 /
+    /// coefficient)`, at least 1. `1` when the origin is healthy.
+    ///
+    /// Charging `weight` cells against a fixed bucket scales the effective rate by
+    /// the admission coefficient without mutating the bucket. This is the *desired*
+    /// weight; each caller clamps it to the individual limiter's capacity, so one
+    /// small limit never bounds how deeply a larger one throttles, and reaching a
+    /// limiter's capacity is its deepest throttle — roughly one request per window.
+    #[must_use]
+    pub fn acquire_weight(&self) -> u32 {
+        let coefficient = self.admission_coefficient();
+        if coefficient >= 1.0 {
+            return 1;
+        }
+        // coefficient is in [0, 1); 1/coefficient is >= 1 (or +inf at 0). Clamp to
+        // the u32 range so a near-zero coefficient can't overflow the cast; each
+        // limiter clamps further to its own (much smaller) capacity.
+        let weight = (1.0 / coefficient).round().clamp(1.0, f64::from(u32::MAX));
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to [1.0, u32::MAX] before the cast"
+        )]
+        let weight = weight as u32;
+        weight
+    }
+
     /// The effective request-rate limit the controller currently allows: the
     /// admission coefficient scaled by the ceiling. Reported as a gauge.
     #[must_use]

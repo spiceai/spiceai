@@ -289,31 +289,28 @@ impl RateControllerBuilder {
         let jitter = self.jitter;
         let metrics = self.metrics.unwrap_or_default();
 
-        let semaphore = self
-            .max_concurrent_requests
-            .map(|max_concurrent_requests| Arc::new(Semaphore::new(max_concurrent_requests)));
+        // Each limiter carries its own capacity so the adaptive weight is clamped
+        // per limiter: a weighted acquire never asks a limiter for more than it can
+        // hold, and one small limit never bounds how deeply a larger one throttles.
+        let semaphore = self.max_concurrent_requests.map(|max_concurrent_requests| {
+            (
+                Arc::new(Semaphore::new(max_concurrent_requests)),
+                u32::try_from(max_concurrent_requests).unwrap_or(u32::MAX),
+            )
+        });
 
         let weighted_rate_limiter = self
             .weighted_quota
             .as_ref()
             .map(|q| Arc::new(GovernorRateLimiter::direct(q.quota)));
 
-        // Capacities that bound how many cells/permits one request may charge when
-        // the adaptive controller weights it: each quota's burst and the semaphore
-        // permit count. The adaptive weight is clamped to their minimum so a
-        // weighted acquire never asks for more than any single limiter can hold.
-        let mut capacities: Vec<u32> = Vec::new();
-        if let Some(max_concurrent_requests) = self.max_concurrent_requests {
-            capacities.push(u32::try_from(max_concurrent_requests).unwrap_or(u32::MAX));
-        }
-
         // Persistence path: each named quota becomes a LeasedBucket. We do NOT
         // also build a local governor limiter for that quota — the lease
         // strictly bounds the per-replica budget per window already.
         //
         // No-persistence path: each quota becomes a local governor limiter.
-        let mut local_limiters: Vec<Arc<GovernorRateLimiter>> = Vec::new();
-        let mut leased_buckets: Vec<Arc<LeasedBucket>> = Vec::new();
+        let mut local_limiters: Vec<(Arc<GovernorRateLimiter>, u32)> = Vec::new();
+        let mut leased_buckets: Vec<(Arc<LeasedBucket>, u32)> = Vec::new();
 
         for (index, quota_def) in self.quotas.into_iter().enumerate() {
             let fallback_name = format!("quota-{index}");
@@ -321,28 +318,31 @@ impl RateControllerBuilder {
 
             if let Some(persistence) = &self.persistence {
                 let burst_per_window = quota_def.burst_per_window(persistence.window_duration);
-                capacities.push(u32::try_from(burst_per_window).unwrap_or(u32::MAX));
-                leased_buckets.push(LeasedBucket::new(LeasedBucketConfig {
-                    store: Arc::clone(&persistence.store),
-                    prefix: persistence.prefix.clone(),
-                    object_key: persistence.object_key.clone(),
-                    origin: persistence.origin.clone(),
-                    instance_id: persistence.instance_id.clone(),
-                    window_duration: persistence.window_duration,
-                    limiter_key,
-                    burst_per_window,
-                }));
+                let capacity = u32::try_from(burst_per_window).unwrap_or(u32::MAX);
+                leased_buckets.push((
+                    LeasedBucket::new(LeasedBucketConfig {
+                        store: Arc::clone(&persistence.store),
+                        prefix: persistence.prefix.clone(),
+                        object_key: persistence.object_key.clone(),
+                        origin: persistence.origin.clone(),
+                        instance_id: persistence.instance_id.clone(),
+                        window_duration: persistence.window_duration,
+                        limiter_key,
+                        burst_per_window,
+                    }),
+                    capacity,
+                ));
             } else {
-                capacities.push(quota_def.quota.burst_size().get());
-                local_limiters.push(Arc::new(GovernorRateLimiter::direct(quota_def.quota)));
+                let capacity = quota_def.quota.burst_size().get();
+                local_limiters.push((
+                    Arc::new(GovernorRateLimiter::direct(quota_def.quota)),
+                    capacity,
+                ));
             }
         }
 
         let persistence_origin = self.persistence.as_ref().map(|p| p.origin.clone());
 
-        // The deepest a weighted acquire can throttle is 1 request per window,
-        // reached at weight == the smallest limiter capacity.
-        let adaptive_max_weight = capacities.into_iter().min().unwrap_or(1).max(1);
         let adaptive = self
             .adaptive
             .map(|(control, ceiling)| Arc::new(AdaptiveController::new(control, ceiling)));
@@ -356,7 +356,6 @@ impl RateControllerBuilder {
             metrics,
             persistence_origin,
             adaptive,
-            adaptive_max_weight,
         )
     }
 }
@@ -411,24 +410,29 @@ impl RateControllerMetrics {
     }
 }
 
+/// A rate controller with its known maximum capacity limit.
+/// Useful for adapative rate controls on static data structures by using inverse
+/// weight acquisition.
+pub type MaxCapacityLimits<T, L = u32> = (Arc<T>, L);
+
 pub struct RateController {
     jitter_config: JitterConfig,
     /// Local-only governor limiters (in-memory mode).
-    local_limiters: Vec<Arc<GovernorRateLimiter>>,
+    local_limiters: Vec<MaxCapacityLimits<GovernorRateLimiter>>,
     /// Cluster-wide leased token buckets (cluster mode).
-    leased_buckets: Vec<Arc<LeasedBucket>>,
+    leased_buckets: Vec<MaxCapacityLimits<LeasedBucket>>,
     weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
-    semaphore: Option<Arc<Semaphore>>,
+    semaphore: Option<MaxCapacityLimits<Semaphore>>,
     metrics: Arc<RateControllerMetrics>,
     /// Origin string used for log/error context when in cluster mode.
     persistence_origin: Option<String>,
-    /// Adaptive controller, when enabled: scales every configured limit by its
-    /// admission coefficient via per-request weighting.
+    /// When present, scales each limit down by an admission coefficient in
+    /// `[0, 1.0]` based on recent [`RequestOutcome`]. See [`Self::record_outcome`].
+    /// Buckets, semaphores and limits stay static; each request charges an
+    /// inversely-scaled weight ([`AdaptiveController::acquire_weight`]) that every
+    /// limiter clamps to its own capacity — so a small concurrency cap never bounds
+    /// how deeply the per-second/per-minute quotas can throttle.
     adaptive: Option<Arc<AdaptiveController>>,
-    /// Largest weight a single acquire may charge — the smallest limiter capacity
-    /// (min quota burst / semaphore permits). Bounds how deep adaptive throttling
-    /// can go (floor of ~1 request per window).
-    adaptive_max_weight: u32,
 }
 
 impl std::fmt::Debug for RateController {
@@ -446,7 +450,6 @@ impl std::fmt::Debug for RateController {
             .field("metrics", &self.metrics)
             .field("persistence_origin", &self.persistence_origin)
             .field("adaptive", &self.adaptive.is_some())
-            .field("adaptive_max_weight", &self.adaptive_max_weight)
             .finish()
     }
 }
@@ -516,7 +519,7 @@ impl RateController {
     pub fn leased_bucket_metrics(&self) -> Vec<(String, Arc<LeasedBucketMetrics>)> {
         self.leased_buckets
             .iter()
-            .map(|b| (b.limiter_key().to_string(), b.metrics()))
+            .map(|(bucket, _)| (bucket.limiter_key().to_string(), bucket.metrics()))
             .collect()
     }
 
@@ -524,7 +527,7 @@ impl RateController {
     pub fn available_permits(&self) -> Option<usize> {
         self.semaphore
             .as_ref()
-            .map(|semaphore| semaphore.available_permits())
+            .map(|(semaphore, _)| semaphore.available_permits())
     }
 
     /// Refresh leases for all leased buckets (no-op if persistence is
@@ -536,7 +539,7 @@ impl RateController {
     /// Returns the first error encountered. Other buckets are still attempted.
     pub async fn refresh_and_persist_state_snapshot(&self) -> Result<()> {
         let mut first_error: Option<Error> = None;
-        for bucket in &self.leased_buckets {
+        for (bucket, _) in &self.leased_buckets {
             if let Err(e) = bucket.refresh_lease().await {
                 let origin = bucket.origin().to_string();
                 tracing::warn!(
@@ -544,37 +547,30 @@ impl RateController {
                     limiter = bucket.limiter_key(),
                     "Failed to refresh cluster rate-control lease: {e}"
                 );
-                if first_error.is_none() {
-                    first_error = Some(Error::LeaseRefresh {
+                first_error = first_error.or_else(|| {
+                    Some(Error::LeaseRefresh {
                         origin,
                         source: Box::new(e),
-                    });
-                }
+                    })
+                });
             }
         }
-        if let Some(e) = first_error {
-            return Err(e);
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        Ok(())
-    }
-
-    /// Read-only snapshot refresh — no-op for the leased model (every refresh
-    /// is read+write). Kept for API compatibility with the previous design.
-    ///
-    /// # Errors
-    ///
-    /// Currently never returns an error.
-    pub fn refresh_persisted_state(&self) -> Result<()> {
-        Ok(())
     }
 
     async fn until_ready(self: Arc<Self>) -> Result<()> {
         // Adaptive control scales every configured limit by charging `weight`
-        // cells/tokens per request (weight == 1 when disabled or healthy).
-        let weight = self.adaptive_weight();
+        // cells/tokens per request (weight == 1 when disabled or healthy). Each
+        // limiter clamps the weight to its own capacity, so one small limit never
+        // caps how deeply another can throttle.
+        let desired = self.adaptive_desired_weight();
 
         // Local in-memory limiters: pace per replica.
-        for limiter in &self.local_limiters {
+        for (limiter, capacity) in &self.local_limiters {
+            let weight = desired.min(*capacity).max(1);
             if weight <= 1 {
                 limiter.until_ready().await;
             } else if let Some(nonzero_weight) = NonZeroU32::new(weight) {
@@ -586,7 +582,8 @@ impl RateController {
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
         // A weighted request consumes `weight` tokens from the cluster budget.
-        for bucket in &self.leased_buckets {
+        for (bucket, capacity) in &self.leased_buckets {
+            let weight = desired.min(*capacity).max(1);
             for _ in 0..weight {
                 bucket.acquire().await.map_err(|e| match e {
                     leased::Error::FailClosed { origin } => {
@@ -626,14 +623,13 @@ impl RateController {
     )]
     fn new(
         jitter: Option<JitterConfig>,
-        local_limiters: Vec<Arc<GovernorRateLimiter>>,
-        leased_buckets: Vec<Arc<LeasedBucket>>,
+        local_limiters: Vec<(Arc<GovernorRateLimiter>, u32)>,
+        leased_buckets: Vec<(Arc<LeasedBucket>, u32)>,
         weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
-        semaphore: Option<Arc<Semaphore>>,
+        semaphore: Option<(Arc<Semaphore>, u32)>,
         metrics: Arc<RateControllerMetrics>,
         persistence_origin: Option<String>,
         adaptive: Option<Arc<AdaptiveController>>,
-        adaptive_max_weight: u32,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
             min: Duration::ZERO,
@@ -649,7 +645,6 @@ impl RateController {
             metrics,
             persistence_origin,
             adaptive,
-            adaptive_max_weight,
         })
     }
 
@@ -679,28 +674,14 @@ impl RateController {
             .map(|adaptive| adaptive.effective_limit())
     }
 
-    /// How many cells/permits one request charges right now: `round(1 /
-    /// coefficient)`, clamped to `[1, adaptive_max_weight]`. `1` when adaptive
-    /// control is disabled or the origin is healthy.
-    fn adaptive_weight(&self) -> u32 {
-        let Some(adaptive) = &self.adaptive else {
-            return 1;
-        };
-        let coefficient = adaptive.admission_coefficient();
-        if coefficient >= 1.0 {
-            return 1;
-        }
-        // coefficient is in [0, 1); 1/coefficient is >= 1 (or +inf at 0), and the
-        // clamp keeps it within the limiter capacities before the cast.
-        let weight = (1.0 / coefficient).round();
-        let clamped = weight.clamp(1.0, f64::from(self.adaptive_max_weight));
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "clamped to [1.0, adaptive_max_weight] (a u32) before the cast"
-        )]
-        let clamped = clamped as u32;
-        clamped
+    /// The weight one request wants to charge right now, before any per-limiter
+    /// capacity clamp. `1` when adaptive control is disabled; otherwise the
+    /// controller's [`AdaptiveController::acquire_weight`]. Each limiter clamps
+    /// this to its own capacity at the point of acquisition.
+    fn adaptive_desired_weight(&self) -> u32 {
+        self.adaptive
+            .as_ref()
+            .map_or(1, |adaptive| adaptive.acquire_weight())
     }
 
     async fn wait_for_rate_limiters(self: &Arc<Self>, weight: Option<u32>) -> Result<()> {
@@ -741,11 +722,11 @@ impl RateController {
         let wait_start = tokio::time::Instant::now();
 
         // Concurrency cap first — we may end up waiting long enough that
-        // rate-limiter slots open up. Adaptive control holds `weight` permits per
-        // request (weight == 1 when disabled or healthy), scaling concurrency by
-        // the same coefficient as the rate quotas.
-        let semaphore = if let Some(semaphore) = &self.semaphore {
-            let permits = self.adaptive_weight();
+        // rate-limiter slots open up. Adaptive control holds `permits` permits per
+        // request (1 when disabled or healthy), scaling concurrency by the same
+        // coefficient as the rate quotas, clamped to this semaphore's capacity.
+        let semaphore = if let Some((semaphore, capacity)) = &self.semaphore {
+            let permits = self.adaptive_desired_weight().min(*capacity).max(1);
             match Arc::clone(semaphore).acquire_many_owned(permits).await {
                 Ok(permit) => Some(permit),
                 Err(source) => {

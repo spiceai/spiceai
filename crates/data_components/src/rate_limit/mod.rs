@@ -137,9 +137,8 @@ impl RateLimiter for HttpRateLimiter {
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
-            let retry_after = *self.retry_after.read().await;
-            let Some(retry_after) = retry_after else {
-                break;
+            let Some(retry_after) = *self.retry_after.read().await else {
+                return Ok(());
             };
 
             let now = Instant::now();
@@ -157,8 +156,6 @@ impl RateLimiter for HttpRateLimiter {
             tokio::time::sleep(wait_duration).await;
             self.clear_elapsed_retry_after(Instant::now()).await;
         }
-
-        Ok(())
     }
 }
 
