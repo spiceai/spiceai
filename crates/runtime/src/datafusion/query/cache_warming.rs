@@ -816,7 +816,10 @@ async fn warm_distinct_key_rows(
     .await?
     {
         Ok(result) => result,
-        Err(_) => return Ok(0),
+        Err(e) => {
+            query_error_to_warmup_bound(shutdown, &e)?;
+            return Ok(0);
+        }
     };
 
     let mut stream = result.data;
@@ -2293,6 +2296,19 @@ mod tests {
                 }
             ),
             Ok(())
+        );
+
+        // DISTINCT query.run() used to collapse QueryTimedOut into Ok(0).
+        let distinct_run = classify_query_result::<()>(
+            &shutdown,
+            Ok(Err(super::super::Error::QueryTimedOut {
+                query_id: "warmup-test".to_string(),
+                timeout: "50ms".to_string(),
+            })),
+        );
+        assert_eq!(
+            distinct_run, "TimedOut",
+            "a timed-out DISTINCT query.run() must skip the plan, not look like an empty success"
         );
 
         let shutdown_cancelled = CancellationToken::new();
