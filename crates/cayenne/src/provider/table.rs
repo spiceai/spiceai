@@ -40023,11 +40023,11 @@ mod tests {
         drop(setup_guard);
 
         // Runs while the large merge is parked after its CAS.
-        let small_runs = Arc::new(ParkingMutex::new(Vec::<String>::new()));
+        let small_output = Arc::new(ParkingMutex::new(None::<String>));
         let small_merged = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let provider_in_hook = provider.clone_for_write();
-            let small_runs = Arc::clone(&small_runs);
+            let small_output = Arc::clone(&small_output);
             let small_merged = Arc::clone(&small_merged);
             let large_runs = large_runs.clone();
             let schema = Arc::clone(&schema);
@@ -40061,13 +40061,19 @@ mod tests {
                              flight (#14291), not decline on the compaction lock"
                         );
                     }
+                    let protected = provider_in_hook.protected_snapshot_ids();
                     assert!(
-                        provider_in_hook
-                            .protected_snapshot_ids()
-                            .is_superset(&large_runs),
+                        protected.is_superset(&large_runs),
                         "the large merge's inputs stay published until it publishes"
                     );
-                    *small_runs.lock() = fresh;
+                    // Whoever merged them, the fresh runs are now one output.
+                    let outputs: Vec<String> = protected.difference(&large_runs).cloned().collect();
+                    assert_eq!(
+                        outputs.len(),
+                        1,
+                        "the fresh runs must merge while the large merge is in flight: {outputs:?}"
+                    );
+                    *small_output.lock() = outputs.into_iter().next();
                     small_merged.store(true, Ordering::SeqCst);
                 })
             }));
@@ -40084,17 +40090,10 @@ mod tests {
         assert!(merged_large, "the two large runs must merge");
 
         let protected = provider.protected_snapshot_ids();
-        let small_runs = small_runs.lock().clone();
+        let small_output = small_output.lock().clone().expect("small merge output");
         assert!(
-            !small_runs.is_empty(),
-            "the hook must have written small runs"
-        );
-        assert!(
-            small_runs
-                .iter()
-                .chain(large_runs.iter())
-                .all(|run| !protected.contains(run)),
-            "both merges' inputs must be gone from the protected set: {protected:?}"
+            protected.contains(&small_output) && protected.is_disjoint(&large_runs),
+            "the small merge's output survives and the large inputs are gone: {protected:?}"
         );
         assert_eq!(
             protected.len(),
