@@ -423,7 +423,10 @@ cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 # TODO(datafusion-55): pending spiceai/snowflake-rs spiceai-59 rev (agent: arrow-only-forks-bundle)
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "e1542cc4320cd08b0e50b3d2270f38ba3f0ccd68" } # branch: spiceai-58 (merged PR #11)
+# LOCAL ONLY: branch spiceai-59 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/snowflake-rs.git", rev = "ed4b017"` # branch: spiceai-59
+# once pushed.
+snowflake-api = { path = "/Users/viktor/workspace/df55-prep/snowflake-rs/snowflake-api" }
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
@@ -500,7 +503,11 @@ vortex-utils = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vor
 
 x509-certificate = "0.25.0"
 # TODO(datafusion-55): pending spiceai/spice-rs arrow-59 rev (agent: arrow-only-forks-bundle)
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "3267ff355f1bc2e0f382aa0b1e0113e5b98f1d76" } # spiceai/spice-rs#85: same-origin redirect policy on the credentialed client
+# LOCAL ONLY: branch arrow-59 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/spice-rs.git", rev = "3e3b1a1"` # branch: arrow-59
+# once pushed. Confirmed spiceai/spice-rs#85 (rev 3267ff3, same-origin
+# redirect policy) is an ancestor of this branch, so it's still carried.
+spiceai = { path = "/Users/viktor/workspace/df55-prep/spice-rs" }
 
 [profile.release-lto]
 inherits = "release"
