@@ -111,6 +111,7 @@ enum RequestAttemptError {
     Response {
         response: reqwest::Response,
         attempt_started: Instant,
+        permit: Option<Permit>,
     },
     Failure(Error),
 }
@@ -1542,6 +1543,7 @@ impl HttpTableProvider {
             Err(RequestAttemptError::Response {
                 response,
                 attempt_started,
+                permit: _rate_control_permit,
             }) => {
                 let status_code = response.status().as_u16();
                 Self::extract_response(
@@ -1579,7 +1581,7 @@ impl HttpTableProvider {
         request_headers: Option<&HeaderMap>,
         path_label: &str,
     ) -> std::result::Result<HttpFetchResult, RetryError<RequestAttemptError>> {
-        let _rate_control_permit = self
+        let rate_control_permit = self
             .acquire_rate_control_permit()
             .await
             .map_err(|err| RetryError::transient(RequestAttemptError::Failure(err)))?;
@@ -1636,6 +1638,7 @@ impl HttpTableProvider {
             return Err(RetryError::transient(RequestAttemptError::Response {
                 response,
                 attempt_started,
+                permit: rate_control_permit,
             }));
         }
 
@@ -5229,6 +5232,100 @@ mod tests {
                 server.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_holds_permit_until_final_body_is_read() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let (release_body, mut body_ready) = tokio::sync::oneshot::channel();
+        let (second_accepted, second_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).await.expect("read request");
+            let body = "{\"error\":\"final-response\"}";
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            headers_sent.send(()).expect("signal response headers");
+            tokio::select! {
+                second = listener.accept() => {
+                    second.expect("accept second request");
+                    second_accepted.send(()).expect("signal second request");
+                    body_ready.await.expect("body release signal");
+                }
+                result = &mut body_ready => {
+                    result.expect("body release signal");
+                }
+            }
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("write response body");
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0);
+        let second_provider = provider.clone();
+        let second_url = url.clone();
+        let request = tokio::spawn(async move {
+            provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), headers_received)
+            .await
+            .expect("response headers arrived in time")
+            .expect("headers signal sent");
+        let second_request = tokio::spawn(async move {
+            second_provider
+                .perform_request_with_retry(second_url, None, None, "/lookup")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), second_received)
+                .await
+                .is_err(),
+            "the next origin request must wait for the first response body"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(
+            metrics.inflight_permits(),
+            1,
+            "response body still in flight"
+        );
+        second_request.abort();
+        release_body.send(()).expect("release response body");
+        let result = request
+            .await
+            .expect("request task completed")
+            .expect("final HTTP response retained");
+        assert_eq!(result.response_status, 503);
+        assert_eq!(result.content, "{\"error\":\"final-response\"}");
+        assert_eq!(metrics.inflight_permits(), 0);
+        server.await.expect("streaming origin finished");
     }
 
     #[tokio::test]
