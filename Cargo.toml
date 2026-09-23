@@ -488,15 +488,15 @@ flatbuffers = "25.2.10"
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
 # TODO(datafusion-55): pending spiceai/vortex spiceai-55 rev (agent: vortex)
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
+vortex = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex" }
+vortex-array = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-array" }
+vortex-btrblocks = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-btrblocks" }
 vortex-datafusion = { path = "crates/vortex" }
 # TODO(datafusion-55): pending spiceai/vortex spiceai-55 rev (agent: vortex)
-vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f", features = ["tokio"] } # branch: spiceai-54 (vortex 0.79.0)
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-io = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-io", features = ["tokio"] }
+vortex-scan = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-scan" }
+vortex-session = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-session" }
+vortex-utils = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-utils" }
 
 x509-certificate = "0.25.0"
 # TODO(datafusion-55): pending spiceai/spice-rs arrow-59 rev (agent: arrow-only-forks-bundle)
@@ -666,10 +666,10 @@ arrow-string = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/arrow-string
 parquet = { path = "/Users/viktor/workspace/df55-prep/arrow-rs/parquet" }
 
 # TODO(datafusion-55): pending spiceai/vortex spiceai-55 rev (agent: vortex)
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
+vortex = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex" }
+vortex-array = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-array" }
 vortex-datafusion = { path = "crates/vortex" }
 # TODO(datafusion-55): pending spiceai/vortex spiceai-55 rev (agent: vortex)
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "5e477a52254a670bd51a24d8e6fad5b464f4b41f" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-scan = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-scan" }
+vortex-session = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-session" }
+vortex-utils = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-utils" }
