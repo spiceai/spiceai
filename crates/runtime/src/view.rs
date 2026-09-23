@@ -230,6 +230,9 @@ impl ViewRefreshReadAttestation {
         }
     }
 
+    // Refresh scans call `record_with_dependencies`. This wrapper is what the
+    // tests use, so a lib-only build sees it as unused.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn record(&self, shape: ViewReadShape) {
         self.record_with_dependencies(shape, Vec::new());
     }
@@ -289,6 +292,7 @@ impl std::fmt::Debug for AttestingViewProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttestingViewProvider")
             .field("attestation", &self.attestation)
+            .field("dependency_refreshes", &self.dependency_refreshes)
             .finish()
     }
 }
@@ -660,6 +664,9 @@ fn is_non_read_leaf(name: &str) -> bool {
 /// Dependencies are emitted in sorted order so the string does not depend on traversal
 /// order, and each view is visited once so a cycle (which view loading tolerates and warns
 /// about) terminates rather than recursing forever.
+// Publish hashes [`view_definition_closure_with_live_refresh_sql`]. Tests use
+// this static wrapper, so a lib-only build sees it as unused.
+#[cfg_attr(not(test), expect(dead_code))]
 #[must_use]
 pub(crate) fn view_definition_closure(
     name: &TableReference,
@@ -778,7 +785,7 @@ enum ViewClosureMember<'a> {
 /// `app.catalogs`; rebinding catalog `sales` keeps the view SQL and schema
 /// identical. Folding only datasets would restore an archive of the old
 /// catalog's rows.
-
+///
 /// Declared dataset names in a view's definition closure, in visit order.
 #[must_use]
 pub(crate) fn dataset_names_in_view_closure(
@@ -1279,7 +1286,7 @@ fn apply_live_refresh_sql_to_identity_fields(
     }
 }
 
-/// Peel federation / SpiceTable layers to the accelerated table underneath.
+/// Peel federation / `SpiceTable` layers to the accelerated table underneath.
 fn find_accelerated_table(provider: &dyn TableProvider) -> Option<&AcceleratedTable> {
     if let Some(accelerated) =
         spice_table::find_layer::<AcceleratedTable>(provider, spice_table::LayerWalk::Read)
@@ -1320,7 +1327,10 @@ pub(crate) fn live_dataset_refresh_sql_sync(
         let Some(accelerated) = find_accelerated_table(provider.as_ref()) else {
             continue;
         };
-        let Ok(refresh) = accelerated.refresh_params().try_read() else {
+        // `refresh_params` returns an `Arc` by value. `try_read` borrows that lock,
+        // so the `Arc` has to outlive the guard.
+        let params = accelerated.refresh_params();
+        let Ok(refresh) = params.try_read() else {
             continue;
         };
         let sql = refresh
@@ -1350,7 +1360,8 @@ pub(crate) fn view_snapshot_bootstrap_refusal(
         let Some(accelerated) = find_accelerated_table(provider.as_ref()) else {
             continue;
         };
-        let Ok(refresh) = accelerated.refresh_params().try_read() else {
+        let params = accelerated.refresh_params();
+        let Ok(refresh) = params.try_read() else {
             return Some(format!(
                 "view '{view_name}' depends on '{dep_name}' whose refresh state could not be inspected, so snapshot bootstrap is withheld"
             ));

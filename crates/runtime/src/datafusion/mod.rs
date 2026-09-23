@@ -5058,9 +5058,7 @@ impl DataFusion {
         view: &View,
         refresh_attestation: Option<crate::view::ViewRefreshReadAttestation>,
     ) -> Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>> {
-        let Some(attestation) = refresh_attestation else {
-            return None;
-        };
+        let attestation = refresh_attestation?;
         let dependency_refreshes = self.accelerated_dependency_refreshes(view).await;
         Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
             table.clone(),
@@ -6298,10 +6296,10 @@ async fn build_snapshot_creation_config(
         } else {
             sm
         };
-        return Ok(Some(SnapshotCreationConfig::new(
+        Ok(Some(SnapshotCreationConfig::new(
             Arc::new(sm),
             snapshot_creation_trigger,
-        )));
+        )))
     }
 }
 
