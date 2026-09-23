@@ -821,7 +821,11 @@ async fn warm_distinct_key_rows(
         let batch =
             match bound_warmup_op(shutdown, &query_cancel, timeout, stream.try_next()).await? {
                 Ok(Some(batch)) => batch,
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(e) => {
+                    stream_error_to_warmup_bound(shutdown, &e)?;
+                    break;
+                }
             };
         for row_idx in 0..batch.num_rows() {
             if shutdown.is_cancelled() {
@@ -890,16 +894,52 @@ async fn execute_warmup_sql(
             match bound_warmup_op(shutdown, &query_cancel, timeout, query_result.drain()).await? {
                 Ok(()) => Ok(true),
                 Err(e) => {
+                    stream_error_to_warmup_bound(shutdown, &e)?;
                     tracing::debug!("SQL results cache warmup query failed: {e}");
                     Ok(false)
                 }
             }
         }
         Err(e) => {
+            query_error_to_warmup_bound(shutdown, &e)?;
             tracing::debug!("SQL results cache warmup query failed: {e}");
             Ok(false)
         }
     }
+}
+
+fn warmup_bound_from_shutdown(shutdown: &CancellationToken) -> WarmupBound {
+    if shutdown.is_cancelled() {
+        WarmupBound::Cancelled
+    } else {
+        WarmupBound::TimedOut
+    }
+}
+
+/// Map a DISTINCT/`drain` stream error. Timeout and cancel become
+/// [`WarmupBound`] so the caller warns and skips the plan instead of
+/// treating a partial result as a successful store.
+fn stream_error_to_warmup_bound(
+    shutdown: &CancellationToken,
+    err: &datafusion::error::DataFusionError,
+) -> Result<(), WarmupBound> {
+    if super::is_timeout_error(err) || super::is_cancellation_error(err) {
+        return Err(warmup_bound_from_shutdown(shutdown));
+    }
+    Ok(())
+}
+
+fn query_error_to_warmup_bound(
+    shutdown: &CancellationToken,
+    err: &super::Error,
+) -> Result<(), WarmupBound> {
+    if matches!(
+        err,
+        super::Error::QueryTimedOut { .. } | super::Error::QueryCancelled { .. }
+    ) {
+        return Err(warmup_bound_from_shutdown(shutdown));
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -2109,6 +2149,180 @@ mod tests {
             start.elapsed() >= Duration::from_millis(180),
             "must wait for the per-op bound, not return at the child-token fire, took {:?}",
             start.elapsed()
+        );
+    }
+
+    fn timeout_stream_error() -> datafusion::error::DataFusionError {
+        datafusion::error::DataFusionError::External(Box::new(super::super::Error::QueryTimedOut {
+            query_id: "warmup-test".to_string(),
+            timeout: "50ms".to_string(),
+        }))
+    }
+
+    fn cancelled_stream_error() -> datafusion::error::DataFusionError {
+        datafusion::error::DataFusionError::External(Box::new(
+            super::super::Error::QueryCancelled {
+                query_id: "warmup-test".to_string(),
+            },
+        ))
+    }
+
+    fn classify_stream_result<T>(
+        shutdown: &CancellationToken,
+        result: Result<Result<T, datafusion::error::DataFusionError>, WarmupBound>,
+    ) -> &'static str {
+        match result {
+            Err(WarmupBound::TimedOut) => "TimedOut",
+            Err(WarmupBound::Cancelled) => "Cancelled",
+            Ok(Ok(_)) => "success",
+            Ok(Err(e)) => match stream_error_to_warmup_bound(shutdown, &e) {
+                Err(WarmupBound::TimedOut) => "TimedOut",
+                Err(WarmupBound::Cancelled) => "Cancelled",
+                Ok(()) => "ordinary_query_error",
+            },
+        }
+    }
+
+    fn classify_query_result<T>(
+        shutdown: &CancellationToken,
+        result: Result<Result<T, super::super::Error>, WarmupBound>,
+    ) -> &'static str {
+        match result {
+            Err(WarmupBound::TimedOut) => "TimedOut",
+            Err(WarmupBound::Cancelled) => "Cancelled",
+            Ok(Ok(_)) => "success",
+            Ok(Err(e)) => match query_error_to_warmup_bound(shutdown, &e) {
+                Err(WarmupBound::TimedOut) => "TimedOut",
+                Err(WarmupBound::Cancelled) => "Cancelled",
+                Ok(()) => "ordinary_query_error",
+            },
+        }
+    }
+
+    #[test]
+    fn query_timeout_stream_error_is_warmup_timeout() {
+        let shutdown = CancellationToken::new();
+        assert_eq!(
+            stream_error_to_warmup_bound(&shutdown, &timeout_stream_error()),
+            Err(WarmupBound::TimedOut)
+        );
+        assert_eq!(
+            stream_error_to_warmup_bound(
+                &shutdown,
+                &datafusion::error::DataFusionError::Internal("not a timeout".to_string())
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            query_error_to_warmup_bound(
+                &shutdown,
+                &super::super::Error::QueryTimedOut {
+                    query_id: "warmup-test".to_string(),
+                    timeout: "50ms".to_string(),
+                }
+            ),
+            Err(WarmupBound::TimedOut)
+        );
+        assert_eq!(
+            query_error_to_warmup_bound(
+                &shutdown,
+                &super::super::Error::UnableToExecuteQuery {
+                    source: datafusion::error::DataFusionError::Internal("plan".to_string()),
+                }
+            ),
+            Ok(())
+        );
+
+        let shutdown_cancelled = CancellationToken::new();
+        shutdown_cancelled.cancel();
+        assert_eq!(
+            stream_error_to_warmup_bound(&shutdown_cancelled, &cancelled_stream_error()),
+            Err(WarmupBound::Cancelled)
+        );
+        assert_eq!(
+            stream_error_to_warmup_bound(&shutdown, &cancelled_stream_error()),
+            Err(WarmupBound::TimedOut),
+            "QueryCancelled without runtime shutdown must skip one plan, not abort warmup"
+        );
+    }
+
+    /// Copilot: a Query lifetime timer that fires during DISTINCT/`drain`
+    /// yields `Ok(Err(QueryTimedOut))` from `bound_warmup_op`. That must be
+    /// `TimedOut` (warn and skip the plan), not `ordinary_query_error`.
+    #[tokio::test]
+    async fn query_timeout_during_distinct_drain_is_not_ordinary_error() {
+        let shutdown = CancellationToken::new();
+        let query_cancel = CancellationToken::new();
+        let start = std::time::Instant::now();
+        let result = bound_warmup_op(
+            &shutdown,
+            &query_cancel,
+            Duration::from_millis(200),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err::<(), _>(timeout_stream_error())
+            },
+        )
+        .await;
+        let classification = classify_stream_result(&shutdown, result);
+        let elapsed_ms = start.elapsed().as_millis();
+        eprintln!("classification={classification} elapsed_ms={elapsed_ms}");
+        assert_eq!(
+            classification, "TimedOut",
+            "QueryTimedOut from DISTINCT drain must skip the plan, not look like success"
+        );
+        assert!(
+            elapsed_ms < 180,
+            "must return when the stream yields QueryTimedOut, not wait for the outer bound, took {elapsed_ms}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_timeout_from_query_run_is_not_ordinary_error() {
+        let shutdown = CancellationToken::new();
+        let query_cancel = CancellationToken::new();
+        let start = std::time::Instant::now();
+        let result = bound_warmup_op(
+            &shutdown,
+            &query_cancel,
+            Duration::from_millis(200),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err::<(), _>(super::super::Error::QueryTimedOut {
+                    query_id: "warmup-test".to_string(),
+                    timeout: "50ms".to_string(),
+                })
+            },
+        )
+        .await;
+        let classification = classify_query_result(&shutdown, result);
+        let elapsed_ms = start.elapsed().as_millis();
+        eprintln!("classification={classification} elapsed_ms={elapsed_ms}");
+        assert_eq!(
+            classification, "TimedOut",
+            "QueryTimedOut from query.run() must skip the plan, not look like an ordinary failure"
+        );
+        assert!(
+            elapsed_ms < 180,
+            "must return when query.run() yields QueryTimedOut, took {elapsed_ms}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_cancel_during_drain_is_shutdown_cancelled() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let result = bound_warmup_op(
+            &shutdown,
+            &CancellationToken::new(),
+            Duration::from_millis(200),
+            async { Err::<(), _>(cancelled_stream_error()) },
+        )
+        .await;
+        assert_eq!(
+            classify_stream_result(&shutdown, result),
+            "Cancelled",
+            "a QueryCancelled observed after shutdown must abort remaining warmup"
         );
     }
 
