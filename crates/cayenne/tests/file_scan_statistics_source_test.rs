@@ -82,6 +82,25 @@ async fn scan_statistics(
     Ok((stats.total_byte_size, per_column))
 }
 
+/// The key a per-file statistics row is stored under: the object-store location,
+/// which is the store-relative path. The manifest carries only the bare filename.
+fn statistics_row_key(
+    data_path: &std::path::Path,
+    table_id: &str,
+    file: &cayenne::metadata::SnapshotFile,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        data_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .trim_end_matches('/'),
+        table_id,
+        file.snapshot_id,
+        file.file_path
+    )
+}
+
 async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -237,20 +256,8 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
          `get_all_snapshot_files` still returns no manifest row for table {table_id}"
     );
     let scan_snapshot_id = files[0].snapshot_id.clone();
-    // Per-file statistics rows are keyed by the object-store location, which is the
-    // store-relative path; the manifest carries only the bare filename.
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        format!(
-            "{}/{}/{}/{}",
-            fixture
-                .data_path
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .trim_end_matches('/'),
-            table_id,
-            file.snapshot_id,
-            file.file_path
-        )
+        statistics_row_key(&fixture.data_path, &table_id, file)
     };
     for file in &files {
         fixture
@@ -334,6 +341,10 @@ test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_bl
 
 const EVOLVED_TABLE: &str = "file_stats_source_evolved";
 
+/// A per-column size no Vortex footer would produce, so a scan reporting it was
+/// served from the persisted blob rather than from the file.
+const POISON_BYTES: usize = 1_234_567;
+
 fn evolved_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -406,19 +417,8 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
         "the settle must have produced a data file"
     );
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        format!(
-            "{}/{}/{}/{}",
-            fixture
-                .data_path
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .trim_end_matches('/'),
-            table_id,
-            file.snapshot_id,
-            file.file_path
-        )
+        statistics_row_key(&fixture.data_path, &table_id, file)
     };
-    const POISON_BYTES: usize = 1_234_567;
     let mut poisoned = 0;
     for file in &files {
         let Some(row) = fixture
