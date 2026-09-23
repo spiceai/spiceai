@@ -200,43 +200,47 @@ fn escape_duckdb_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{DuckDBSnapshotEngine, SnapshotEngine};
+    use duckdb::Connection;
     use std::path::{Path, PathBuf};
-
-    fn wal_path(live: &Path) -> PathBuf {
-        PathBuf::from(format!("{}.wal", live.display()))
-    }
+    use tempfile::TempDir;
 
     fn wal_bytes(live: &Path) -> u64 {
-        std::fs::metadata(wal_path(live)).map_or(0, |m| m.len())
+        std::fs::metadata(live.with_added_extension("wal")).map_or(0, |m| m.len())
     }
 
-    fn row_count(path: &Path) -> i64 {
-        let conn = duckdb::Connection::open(path).expect("open for verification");
+    fn count_rows(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("open for verification");
         conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .expect("count rows")
     }
 
-    /// Regression guard for #13912. `DuckDB` keeps a committed write in its
-    /// write-ahead log until a checkpoint folds it into the database file, and
-    /// `create_file_snapshot` copies that file on its own — so without this hook the
-    /// snapshot ships without the write. The connection stays open throughout, as the
-    /// accelerator's pool holds it.
-    #[tokio::test]
-    async fn checkpoint_live_then_copy_captures_an_uncheckpointed_write() {
-        let tmp = tempfile::tempdir().expect("temp dir");
+    /// A live database holding one checkpointed row and a second row still in the
+    /// write-ahead log. The returned connection is kept open for the rest of the test,
+    /// as the accelerator's pool keeps its own open across a snapshot.
+    fn live_db_with_an_uncheckpointed_write(tmp: &TempDir) -> (PathBuf, Connection) {
         let live = tmp.path().join("live.db");
-        let conn = duckdb::Connection::open(&live).expect("open live database");
+        let conn = Connection::open(&live).expect("open live database");
         conn.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
             .expect("seed a checkpointed baseline");
         conn.execute_batch("INSERT INTO t VALUES (2);")
             .expect("write without checkpointing");
-
-        // Assert the shape this test exists for, so it cannot pass vacuously if a
+        // Assert the shape these tests exist for, so they cannot pass vacuously if a
         // future DuckDB checkpoints eagerly and leaves nothing in the log.
         assert!(
             wal_bytes(&live) > 0,
             "the second write must still be in the write-ahead log for this test to mean anything"
         );
+        (live, conn)
+    }
+
+    /// Regression guard for #13912. `DuckDB` keeps a committed write in its
+    /// write-ahead log until a checkpoint folds it into the database file, and
+    /// `create_file_snapshot` copies that file on its own — so without this hook the
+    /// snapshot ships without the write.
+    #[tokio::test]
+    async fn checkpoint_live_then_copy_captures_an_uncheckpointed_write() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (live, _conn) = live_db_with_an_uncheckpointed_write(&tmp);
 
         DuckDBSnapshotEngine::new(false)
             .checkpoint_live(&live, "ds")
@@ -249,7 +253,7 @@ mod tests {
         let copy = tmp.path().join("copy.db");
         std::fs::copy(&live, &copy).expect("copy the database file");
         assert_eq!(
-            row_count(&copy),
+            count_rows(&copy),
             2,
             "the copy must carry the write that was still in the log"
         );
@@ -259,16 +263,10 @@ mod tests {
     /// reads. The checkpoint must still drain the log rather than fail the snapshot.
     #[tokio::test]
     async fn checkpoint_live_drains_the_log_with_a_reader_transaction_open() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let live = tmp.path().join("live.db");
-        let conn = duckdb::Connection::open(&live).expect("open live database");
-        conn.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
-            .expect("seed a checkpointed baseline");
-        conn.execute_batch("INSERT INTO t VALUES (2);")
-            .expect("write without checkpointing");
-        assert!(wal_bytes(&live) > 0, "the write must still be in the log");
+        let tmp = TempDir::new().expect("temp dir");
+        let (live, _conn) = live_db_with_an_uncheckpointed_write(&tmp);
 
-        let reader = duckdb::Connection::open(&live).expect("open a reader");
+        let reader = Connection::open(&live).expect("open a reader");
         reader.execute_batch("BEGIN TRANSACTION").expect("begin");
         reader
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
@@ -286,10 +284,9 @@ mod tests {
     /// A dataset that has never been written has an empty database and no log.
     #[tokio::test]
     async fn checkpoint_live_is_ok_on_an_empty_database() {
-        let tmp = tempfile::tempdir().expect("temp dir");
+        let tmp = TempDir::new().expect("temp dir");
         let live = tmp.path().join("empty.db");
-        let conn = duckdb::Connection::open(&live).expect("create an empty database");
-        drop(conn);
+        drop(Connection::open(&live).expect("create an empty database"));
 
         DuckDBSnapshotEngine::new(false)
             .checkpoint_live(&live, "ds_empty")
@@ -302,7 +299,7 @@ mod tests {
     /// on it without reading the source.
     #[tokio::test]
     async fn a_file_that_is_not_a_database_fails_with_a_message_naming_the_dataset() {
-        let tmp = tempfile::tempdir().expect("temp dir");
+        let tmp = TempDir::new().expect("temp dir");
         let live = tmp.path().join("not_a_database.db");
         std::fs::write(&live, b"this is not a DuckDB database").expect("write a decoy file");
 

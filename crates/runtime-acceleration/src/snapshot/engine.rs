@@ -84,13 +84,14 @@ pub trait SnapshotEngine: Send + Sync {
     /// must checkpoint here so that the subsequent `fs::copy` produces a
     /// self-contained file. An engine with nothing to flush returns `Ok(())`.
     ///
-    /// **Deliberately has no default.** A no-op default is invisible to an engine
-    /// that needed to override it: `DuckDB` inherited one for as long as it existed
-    /// and shipped snapshots missing every write still in its log (#13912).
-    /// Requiring the method makes the compiler name each engine.
+    /// **Deliberately has no default.** A no-op default is invisible to an engine that
+    /// needed to override it: `DuckDB` inherited one for as long as it existed and
+    /// shipped snapshots missing every write still in its log (#13912).
     ///
     /// The caller holds the accelerator's write lock for the duration of this
-    /// call, so no concurrent writes are in flight.
+    /// call, so no concurrent writes are in flight. Only the file-layout snapshot
+    /// path invokes it; a directory-layout engine captures its own state through
+    /// [`SnapshotEngine::prepare_directory_snapshot`] instead.
     async fn checkpoint_live(
         &self,
         live_path: &Path,

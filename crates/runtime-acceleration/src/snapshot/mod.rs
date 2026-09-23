@@ -1287,9 +1287,9 @@ impl SnapshotManager {
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For SQLite/Turso this drains the WAL into the main file so that
-        // the subsequent `fs::copy` produces a self-contained snapshot.
-        // Default (no-op) for engines without WAL.
+        // For DuckDB/SQLite/Turso this drains the write-ahead log into the main
+        // file so that the subsequent `fs::copy` produces a self-contained
+        // snapshot. Engines with nothing to flush return `Ok(())`.
         self.snapshot_engine
             .checkpoint_live(source_local_path, &self.dataset_name)
             .await
@@ -3169,7 +3169,7 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
-    use crate::snapshot::engine::create_snapshot_engine;
+    use crate::snapshot::engine::{DefaultSnapshotEngine, create_snapshot_engine};
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
@@ -3298,12 +3298,13 @@ mod tests {
         }
     }
 
-    /// A manager over an engine with nothing to flush before the copy, for the tests
-    /// about the manager's own file path — metadata, schema versioning, snapshot
-    /// policies, streaming upload. Those tests hand it a local file of arbitrary bytes
-    /// and assert the uploaded object matches, which an engine that opens that file as a
-    /// database cannot do. Tests that are about a particular engine name it through
-    /// [`build_manager_for_engine`] instead.
+    /// A `DuckDB` manager whose engine hook does nothing, for the tests about the
+    /// manager's own file path. Those hand it a local file of arbitrary bytes and assert
+    /// the uploaded object matches, which `DuckDBSnapshotEngine` cannot do because it
+    /// opens that file as a database. Only the hook is swapped: the manager keeps the
+    /// `DuckDB` identity that names the snapshot file, is published in the metadata, and
+    /// is matched at restore. Tests about engine *behaviour* use
+    /// [`build_manager_for_engine`].
     #[cfg(feature = "duckdb")]
     fn build_manager(
         store: Arc<InMemory>,
@@ -3312,14 +3313,16 @@ mod tests {
         schema: &SchemaRef,
         compaction_enabled: bool,
     ) -> SnapshotManager {
-        build_manager_for_engine(
+        let mut manager = build_manager_for_engine(
             store,
             local_path,
             behavior,
             schema,
-            &AccelerationEngine::Cayenne,
+            &AccelerationEngine::DuckDB,
             compaction_enabled,
-        )
+        );
+        manager.snapshot_engine = Arc::new(DefaultSnapshotEngine);
+        manager
     }
 
     async fn write_metadata(store: &InMemory, metadata_path: &Path, metadata: &SnapshotMetadata) {
@@ -4400,12 +4403,11 @@ mod tests {
         let local_path = temp_dir.path().join("snapshot.db");
 
         // Build manager with DuckDB engine (mismatches SQLite snapshot)
-        let manager = build_manager_for_engine(
+        let manager = build_manager(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
-            &AccelerationEngine::DuckDB,
             false,
         );
         let factory = Arc::clone(
@@ -4509,12 +4511,11 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        let manager = build_manager_for_engine(
+        let manager = build_manager(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            &AccelerationEngine::DuckDB,
             false,
         );
 
@@ -4583,12 +4584,11 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        let manager = build_manager_for_engine(
+        let manager = build_manager(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            &AccelerationEngine::DuckDB,
             false,
         );
 
@@ -4690,12 +4690,11 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.db");
 
-        let manager = build_manager_for_engine(
+        let manager = build_manager(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
-            &AccelerationEngine::DuckDB,
             false,
         );
 
@@ -5107,6 +5106,69 @@ mod tests {
     #[tokio::test]
     async fn duckdb_create_snapshot_updates_metadata() {
         generic_create_snapshot_updates_metadata(&AccelerationEngine::DuckDB).await;
+    }
+
+    /// The whole upload path, not just the engine hook: a `DuckDB` write that is still
+    /// in the write-ahead log when the snapshot is taken must reach the uploaded object.
+    /// Before the `checkpoint_live` override, `create_file_snapshot` copied the database
+    /// file while the write sat in `<db>.wal`, and the snapshot was published without it
+    /// (#13912). The accelerator's connection stays open throughout, as it does in
+    /// production.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_snapshot_carries_a_write_still_in_the_write_ahead_log() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let live = duckdb::Connection::open(&local_path).expect("open live database");
+        live.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
+            .expect("seed a checkpointed baseline");
+        live.execute_batch("INSERT INTO t VALUES (2);")
+            .expect("write without checkpointing");
+
+        let wal = PathBuf::from(format!("{}.wal", local_path.display()));
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0),
+            "the second write must still be in the write-ahead log for this test to mean anything"
+        );
+
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let uploaded_path = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot should be created");
+
+        let uploaded = store
+            .get(&uploaded_path)
+            .await
+            .expect("snapshot stored")
+            .bytes()
+            .await
+            .expect("read stored snapshot");
+
+        let restored = temp_dir.path().join("restored.db");
+        std::fs::write(&restored, &uploaded).expect("materialize the uploaded snapshot");
+        let verify = duckdb::Connection::open(&restored).expect("open the uploaded snapshot");
+        let rows: i64 = verify
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("count rows in the uploaded snapshot");
+        assert_eq!(
+            rows, 2,
+            "the uploaded snapshot must carry the write that was still in the log"
+        );
     }
 
     #[cfg(feature = "duckdb")]
