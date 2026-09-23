@@ -603,13 +603,19 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-# TODO(datafusion-55): pending spiceai/iceberg-rust spiceai-<ver>-df-55 rev (agent: iceberg-rust)
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "351d1bc7b6ac9a835397e248e9c687f305e947d1" } # branch: spiceai-0.10.1-df-54
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "351d1bc7b6ac9a835397e248e9c687f305e947d1" } # branch: spiceai-0.10.1-df-54
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "351d1bc7b6ac9a835397e248e9c687f305e947d1" } # branch: spiceai-0.10.1-df-54
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "351d1bc7b6ac9a835397e248e9c687f305e947d1" } # branch: spiceai-0.10.1-df-54
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "351d1bc7b6ac9a835397e248e9c687f305e947d1" } # branch: spiceai-0.10.1-df-54
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "351d1bc7b6ac9a835397e248e9c687f305e947d1" } # branch: spiceai-0.10.1-df-54
+# iceberg-rust 0.10.1 manually upgraded to DataFusion 55 (no upstream release
+# tracks DF55 - apache/iceberg-rust removed iceberg-datafusion entirely on
+# 2026-09-17, moving it to a new, untagged apache/datafusion-iceberg repo;
+# revisit whether to rebase onto that repo instead, separately from this bump).
+# LOCAL ONLY: branch spiceai-0.10.1-df-55 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/iceberg-rust.git", rev = "4f7235b2a124027c69f486a75a9e142514e0a807"` # branch: spiceai-0.10.1-df-55
+# once pushed.
+iceberg = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/iceberg" }
+iceberg-catalog-glue = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/catalog/glue" }
+iceberg-catalog-rest = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/catalog/rest" }
+iceberg-datafusion = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/integrations/datafusion" }
+iceberg-storage-opendal = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/storage/opendal" }
+iceberg_test_utils = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/test_utils" }
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
