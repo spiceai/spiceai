@@ -28,7 +28,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_flight::{FlightData, FlightDescriptor, PutResult, utils::flight_data_to_arrow_batch};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
-use arrow_tools::map_entries::MapEntriesNormalizer;
+use arrow_tools::{ipc, map_entries::MapEntriesNormalizer};
 use datafusion::{
     common::DFSchema,
     scalar::ScalarValue,
@@ -88,6 +88,32 @@ pub enum Error {
 
     #[snafu(display("Failed to decode FlightData into RecordBatch: {source}"))]
     DecodeBatch { source: arrow_schema::ArrowError },
+
+    #[snafu(display(
+        "Failed to write to dataset '{table}': an Arrow message partway through the stream \
+        could not be read ({message}), so the rest of the stream was not applied and any batch \
+        already accepted may have been. \
+        Check that the writing client emits valid Arrow IPC. \
+        See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))]
+    UnreadableMessageHeader { table: String, message: String },
+
+    #[snafu(display(
+        "Failed to write to dataset '{table}': an Arrow message partway through the stream \
+        carries no record batch, so the rest of the stream was not applied and any batch \
+        already accepted may have been. \
+        Send every message after the schema as a record batch. \
+        See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))]
+    NonBatchMessage { table: String },
+
+    #[snafu(display(
+        "Failed to write to dataset '{table}': the first Arrow message of the stream carries \
+        data that no record batch describes, so nothing was written. \
+        Send the schema on its own, then the rows as record batch messages. \
+        See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))]
+    FirstMessageBodyWithoutBatch { table: String },
 
     #[snafu(display("Stream error while reading FlightData: {source}"))]
     StreamRead { source: tonic::Status },
@@ -176,7 +202,12 @@ impl From<Error> for tonic::Status {
             // not a server fault, and the local DoPut path already reports it as such — routing
             // it through `internal` here would tell the caller to retry a write that can never
             // succeed.
-            Error::MapEntriesNotNormalizable { .. } => {
+            // Same reasoning for a stream that does not carry what Flight says it does: the
+            // client sent it, and no retry of the same stream can succeed.
+            Error::MapEntriesNotNormalizable { .. }
+            | Error::UnreadableMessageHeader { .. }
+            | Error::NonBatchMessage { .. }
+            | Error::FirstMessageBodyWithoutBatch { .. } => {
                 tonic::Status::invalid_argument(err.to_string())
             }
             _ => tonic::Status::internal(err.to_string()),
@@ -207,7 +238,7 @@ pub async fn forward_federated_partitioned_write(
     io_runtime: tokio::runtime::Handle,
     path: &TableReference,
     first_message: FlightData,
-    mut streaming_flight: Peekable<Streaming<FlightData>>,
+    streaming_flight: Peekable<Streaming<FlightData>>,
     raw_partition_by: &[String],
 ) -> Result<Response<DoPutStream>> {
     let declared: SchemaRef = Arc::new(
@@ -224,35 +255,15 @@ pub async fn forward_federated_partitioned_write(
     let normalizer = MapEntriesNormalizer::for_schema(&declared);
     let schema = Arc::clone(normalizer.schema());
 
-    let dictionaries_by_id = Arc::new(HashMap::new());
-
     // Decode the first message and build a streaming iterator that yields
     // each subsequent FlightData message as a RecordBatch without buffering.
-    let first_batch =
-        maybe_read_first_batch(&first_message, Arc::clone(&declared), &dictionaries_by_id)?;
-
-    let decode_schema = declared;
-    let table_name = path.to_string();
-    let batch_stream = async_stream::try_stream! {
-        if let Some(batch) = first_batch {
-            yield normalizer
-                .normalize(batch)
-                .context(MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
-        }
-        while let Some(result) = streaming_flight.next().await {
-            let batch = flight_data_to_arrow_batch(
-                &result.context(StreamReadSnafu)?,
-                Arc::clone(&decode_schema),
-                &dictionaries_by_id,
-            )
-            .context(DecodeBatchSnafu)?;
-            if batch.num_rows() > 0 {
-                yield normalizer
-                    .normalize(batch)
-                    .context(MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
-            }
-        }
-    };
+    let batch_stream = decode_client_batches(
+        &first_message,
+        streaming_flight,
+        declared,
+        normalizer,
+        path.to_string(),
+    )?;
 
     forward_partitioned_batches(
         executor_registry,
@@ -270,22 +281,155 @@ pub async fn forward_federated_partitioned_write(
     )]))))
 }
 
-/// If the first `FlightData` message contains a non-empty body, decode it as
-/// the first `RecordBatch` to be forwarded.
-/// The first `FlightData` message could be schema-only with an empty body, or
-/// it could contain both schema and data; we support both cases.
+/// Decodes a client's `DoPut` stream into the `RecordBatch`es the partition router forwards.
+///
+/// Generic over the inbound stream so the decode can be driven from a test with a stream of
+/// hand-assembled messages; production passes the tonic `Streaming` the request arrived on.
+///
+/// Three kinds of message reach here that are not record batches, and each is answered the way
+/// the runtime's own `DoPut` handler answers it, since the scheduler speaks the same protocol:
+///
+/// - a **keepalive** heartbeat is skipped. The scheduler emits these itself when it forwards to
+///   an executor, so refusing one from a writer that follows the same convention would be the
+///   scheduler rejecting its own protocol;
+/// - a message that **declares no record batch** — a metadata-only trailer, or a schema
+///   re-declared partway through — fails the write, because the stream has gone out of step
+///   with what it declared and the rows already accepted may have been applied;
+/// - a **header that will not parse** fails the write as a malformed stream.
+///
+/// Asking the batch decoder instead of the header is not the same question: it rejects all
+/// three with the Arrow decoder's own wording, which names a flatbuffer range rather than
+/// anything the writer can act on.
+fn decode_client_batches<S>(
+    first_message: &FlightData,
+    mut messages: S,
+    declared: SchemaRef,
+    normalizer: MapEntriesNormalizer,
+    table_name: String,
+) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static>
+where
+    S: Stream<Item = std::result::Result<FlightData, tonic::Status>> + Unpin + Send + 'static,
+{
+    let dictionaries_by_id = HashMap::new();
+    let first_batch = maybe_read_first_batch(
+        first_message,
+        Arc::clone(&declared),
+        &dictionaries_by_id,
+        &table_name,
+    )?;
+
+    Ok(async_stream::try_stream! {
+        if let Some(batch) = first_batch {
+            yield normalizer
+                .normalize(batch)
+                .with_context(|_| MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
+        }
+        while let Some(result) = messages.next().await {
+            let message = result.context(StreamReadSnafu)?;
+
+            // The sentinel alone cannot decide this. On this path `app_metadata` is the
+            // client's to set, so a message carrying data can wear it, and skipping on the
+            // metadata alone discards that data while the write still reports success. A
+            // heartbeat declares no IPC data at all, so requiring that too keeps the skip to
+            // real heartbeats and sends anything data-bearing on to the check below, which
+            // decodes it or fails loudly. The predicate is `declares_ipc_data` rather than
+            // `declares_record_batch` because a dictionary is client data too: the batches
+            // referring to it carry nothing without it, so a tagged dictionary must be refused
+            // rather than dropped. The empty body is a floor under that: the header can only
+            // ever add to what the body already establishes, never narrow it. `declares_ipc_data`
+            // answers `false` for a schema message, a trailer, a `Tensor` and any IPC header a
+            // later Arrow adds, so without the floor a sentinel-tagged message of those kinds
+            // would take its body with it and the write would still report success. A real
+            // heartbeat carries neither header nor body. `do_put.rs`'s discarded-message count
+            // keeps the same header-vs-body floor, for the same reason -- though it applies the
+            // floor only *after* its own sentinel check, which still skips unconditionally.
+            if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
+                && message.data_body.is_empty()
+                && !declares_ipc_data(&message.data_header, &table_name)?
+            {
+                continue;
+            }
+
+            if !declares_record_batch(&message.data_header, &table_name)? {
+                // `ensure!` cannot be used inside the generator: it expands to a `return`,
+                // which ends the stream rather than failing it.
+                Err::<(), Error>(Error::NonBatchMessage {
+                    table: table_name.clone(),
+                })?;
+            }
+
+            let batch = flight_data_to_arrow_batch(
+                &message,
+                Arc::clone(&declared),
+                &dictionaries_by_id,
+            )
+            .context(DecodeBatchSnafu)?;
+            if batch.num_rows() > 0 {
+                yield normalizer
+                    .normalize(batch)
+                    .with_context(|_| MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
+            }
+        }
+    })
+}
+
+/// Whether a message's IPC header declares data the client sent — a record batch, or a
+/// dictionary the batches referencing it cannot be decoded without — reporting an unreadable
+/// header the same way [`declares_record_batch`] does.
+fn declares_ipc_data(data_header: &[u8], table: &str) -> Result<bool> {
+    ipc::declares_ipc_data(data_header).map_err(|message| Error::UnreadableMessageHeader {
+        table: table.to_string(),
+        message,
+    })
+}
+
+/// Whether a message's IPC header declares a record batch, reporting an unreadable header as
+/// this module's own failure so that what the writer sees names the dataset.
+fn declares_record_batch(data_header: &[u8], table: &str) -> Result<bool> {
+    ipc::declares_record_batch(data_header).map_err(|message| Error::UnreadableMessageHeader {
+        table: table.to_string(),
+        message,
+    })
+}
+
+/// Decodes the first `FlightData` message as a `RecordBatch` when its header says it is one.
+///
+/// The header is the discriminator, not the body length. Arrow encodes a batch whose columns
+/// need no buffers — an all-`Null` batch is the clear case — as a `RecordBatch` message with an
+/// empty body, and such a batch can carry rows, so reading an empty body as "no batch" drops
+/// rows the writer sent.
+///
+/// The caller's own precondition is what keeps that from being reachable here today: it derives
+/// the stream's schema from this same header with `try_schema_from_flatbuffer_bytes`, which
+/// fails on anything but a `Schema` message, so a first message that carries rows never reaches
+/// this function — the write is refused earlier with a decode-schema error. Reading the header
+/// rather than the body is what stops that from being load-bearing, since nothing in either
+/// signature ties the two together.
+///
+/// A header that will not parse is a malformed stream rather than the absence of a batch, and
+/// is reported as such.
 fn maybe_read_first_batch(
     first_message: &FlightData,
     schema: SchemaRef,
-    dictionaries_by_id: &Arc<HashMap<i64, Arc<dyn Array>>>,
+    dictionaries_by_id: &HashMap<i64, Arc<dyn Array>>,
+    table: &str,
 ) -> Result<Option<RecordBatch>> {
-    if first_message.data_body.is_empty() {
-        Ok(None)
-    } else {
-        let batch = flight_data_to_arrow_batch(first_message, schema, dictionaries_by_id)
-            .context(DecodeBatchSnafu)?;
-        Ok(Some(batch))
+    if !declares_record_batch(&first_message.data_header, table)? {
+        // The same floor the subsequent-message loop keeps: a body the client streamed is data
+        // whatever the header above it declares, so reading the header alone must not narrow
+        // what the body already establishes. Without this, a schema-headed first message with a
+        // body answers `None` and those bytes are dropped while the write reports success --
+        // which counting by body length, the test this replaced, got right.
+        ensure!(
+            first_message.data_body.is_empty(),
+            FirstMessageBodyWithoutBatchSnafu { table }
+        );
+        return Ok(None);
     }
+
+    let batch = flight_data_to_arrow_batch(first_message, schema, dictionaries_by_id)
+        .context(DecodeBatchSnafu)?;
+    Ok(Some(batch))
 }
 
 /// Core partition-aware batch routing logic shared by the Flight `DoPut` path
@@ -1073,9 +1217,12 @@ async fn forward_batches_to_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StructArray};
+    use arrow::array::{
+        ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StringDictionaryBuilder,
+        StructArray,
+    };
     use arrow::buffer::{Buffer, NullBuffer};
-    use arrow::datatypes::{Field, Fields, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
     use arrow_flight::utils::batches_to_flight_data;
 
     fn test_schema() -> SchemaRef {
@@ -1146,7 +1293,7 @@ mod tests {
     #[test]
     fn test_maybe_read_first_batch_empty_body_returns_none() {
         let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         // Build a FlightData with schema header but empty body (schema-only message).
         let batch = RecordBatch::try_new(
@@ -1162,16 +1309,20 @@ mod tests {
             "schema message should have empty body"
         );
 
-        let result =
-            maybe_read_first_batch(&flight_data[0], Arc::clone(&schema), &dictionaries_by_id)
-                .expect("should succeed");
+        let result = maybe_read_first_batch(
+            &flight_data[0],
+            Arc::clone(&schema),
+            &dictionaries_by_id,
+            "test.table",
+        )
+        .expect("should succeed");
         assert!(result.is_none(), "empty body should return None");
     }
 
     #[test]
     fn test_maybe_read_first_batch_with_data_returns_some() {
         let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1194,8 +1345,13 @@ mod tests {
             "data message should have non-empty body"
         );
 
-        let result = maybe_read_first_batch(&data_fd, Arc::clone(&schema), &dictionaries_by_id)
-            .expect("should succeed");
+        let result = maybe_read_first_batch(
+            &data_fd,
+            Arc::clone(&schema),
+            &dictionaries_by_id,
+            "test.table",
+        )
+        .expect("should succeed");
 
         let decoded = result.expect("non-empty body should return Some");
         assert_eq!(decoded.num_rows(), 3);
@@ -1212,7 +1368,7 @@ mod tests {
     #[test]
     fn test_maybe_read_first_batch_single_row() {
         let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1226,8 +1382,13 @@ mod tests {
             .nth(1)
             .expect("should have data message");
 
-        let result = maybe_read_first_batch(&data_fd, Arc::clone(&schema), &dictionaries_by_id)
-            .expect("should succeed");
+        let result = maybe_read_first_batch(
+            &data_fd,
+            Arc::clone(&schema),
+            &dictionaries_by_id,
+            "test.table",
+        )
+        .expect("should succeed");
 
         let decoded = result.expect("should return Some for single row");
         assert_eq!(decoded.num_rows(), 1);
@@ -1239,7 +1400,7 @@ mod tests {
     #[test]
     fn scheduler_seam_conforms_a_nullable_entries_declaration() {
         let declared = map_schema(true);
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = map_batch(true, None);
         let flight_data = encode_batch_to_flight_data(&declared, &batch);
@@ -1248,9 +1409,14 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded = maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
-            .expect("decode should succeed")
-            .expect("data message should carry a batch");
+        let decoded = maybe_read_first_batch(
+            &data_fd,
+            Arc::clone(&declared),
+            &dictionaries_by_id,
+            "test.table",
+        )
+        .expect("decode should succeed")
+        .expect("data message should carry a batch");
 
         let normalizer = MapEntriesNormalizer::for_schema(&declared);
 
@@ -1284,7 +1450,7 @@ mod tests {
     #[test]
     fn scheduler_seam_refuses_entry_nulls_as_invalid_argument() {
         let declared = map_schema(true);
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = map_batch(true, Some(NullBuffer::from(vec![true, false])));
         let flight_data = encode_batch_to_flight_data(&declared, &batch);
@@ -1293,9 +1459,14 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded = maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
-            .expect("decode should succeed")
-            .expect("data message should carry a batch");
+        let decoded = maybe_read_first_batch(
+            &data_fd,
+            Arc::clone(&declared),
+            &dictionaries_by_id,
+            "test.table",
+        )
+        .expect("decode should succeed")
+        .expect("data message should carry a batch");
 
         let err = MapEntriesNormalizer::for_schema(&declared)
             .normalize(decoded)
@@ -1319,6 +1490,400 @@ mod tests {
             status.message().contains("'sales.orders'"),
             "message must name the table, quoted so a dotted identifier stays unambiguous: {}",
             status.message()
+        );
+    }
+
+    /// The three-message shape a client actually sends: the schema, then batches. `region` is
+    /// the partition column in the cluster tests, but nothing here routes, so any schema does.
+    fn client_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]))
+    }
+
+    fn client_batch(regions: Vec<&str>, ids: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            client_schema(),
+            vec![
+                Arc::new(StringArray::from(regions)) as ArrayRef,
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+            ],
+        )
+        .expect("client batch")
+    }
+
+    fn keepalive() -> FlightData {
+        FlightData {
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            ..Default::default()
+        }
+    }
+
+    /// Drives the production decode over `messages`, with `first` as the message the caller
+    /// already took off the stream.
+    async fn decode(
+        first: FlightData,
+        messages: Vec<FlightData>,
+        schema: &SchemaRef,
+    ) -> Result<Vec<RecordBatch>> {
+        let stream = decode_client_batches(
+            &first,
+            futures::stream::iter(messages.into_iter().map(Ok::<_, tonic::Status>)),
+            Arc::clone(schema),
+            MapEntriesNormalizer::for_schema(schema),
+            "test.s.events".to_string(),
+        )?;
+        Box::pin(stream).try_collect().await
+    }
+
+    /// A keepalive is a heartbeat, not data. The scheduler emits these itself when it forwards
+    /// to an executor, and the executor's `DoPut` handler skips them; feeding one to the batch
+    /// decoder instead fails the whole write with a flatbuffer range error.
+    #[tokio::test]
+    async fn a_keepalive_partway_through_the_stream_is_skipped() {
+        let schema = client_schema();
+        let mut messages = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = messages.remove(0);
+        let second = encode_batch_to_flight_data(&schema, &client_batch(vec!["EU"], vec![2]))
+            .pop()
+            .expect("a batch message");
+
+        // What the decoder this replaces would have been handed. Asserted so the case cannot
+        // quietly stop exercising the failure: it is the whole reason it exists.
+        let dictionaries = Arc::new(HashMap::new());
+        assert!(
+            flight_data_to_arrow_batch(&keepalive(), Arc::clone(&schema), &dictionaries).is_err(),
+            "a keepalive is expected to be undecodable as a batch"
+        );
+
+        let batches = decode(
+            first,
+            vec![messages.remove(0), keepalive(), second],
+            &schema,
+        )
+        .await
+        .expect("the keepalive should be skipped, not decoded");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
+
+    /// On this path `app_metadata` is set by the Flight client — the function's own comment
+    /// calls this "the scheduler's own decode of the client stream" — so the sentinel is not a
+    /// private channel between our scheduler and our executor, and a writer is free to put it on
+    /// a message that also carries a batch. Skipping on the metadata alone drops those rows and
+    /// still reports the write a success: the same silent row loss the header discriminator
+    /// exists to close, reopened by a different door.
+    #[tokio::test]
+    async fn a_data_bearing_message_wearing_the_keepalive_sentinel_is_not_skipped() {
+        let schema = client_schema();
+        let mut messages = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = messages.remove(0);
+        let mut second = encode_batch_to_flight_data(&schema, &client_batch(vec!["EU"], vec![2]))
+            .pop()
+            .expect("a batch message");
+        second.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // The fixture really does declare a batch: the sentinel is the only thing separating it
+        // from the message the keepalive case sends. Asserted so the test cannot pass by
+        // accidentally carrying nothing.
+        assert!(
+            declares_record_batch(&second.data_header, "test.s.events").expect("a readable header"),
+            "the fixture must declare a record batch for this case to mean anything"
+        );
+
+        let batches = decode(first, vec![messages.remove(0), second], &schema)
+            .await
+            .expect("a data-bearing message should decode, not be skipped");
+
+        // Asserted by value, not by count: a count alone passes on code that drops the tagged
+        // row and duplicates the untagged one, which is the wrong behaviour wearing the right
+        // total.
+        let regions: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the region column is a string")
+                    .iter()
+                    .map(|region| region.expect("no nulls in the fixture").to_string())
+            })
+            .collect();
+        assert_eq!(
+            regions,
+            vec!["US".to_string(), "EU".to_string()],
+            "the row carried by the sentinel-tagged message was dropped"
+        );
+    }
+
+    /// A dictionary is client data too — the batches referring to it carry nothing without it —
+    /// so a dictionary message wearing the sentinel must not be skipped either. This decoder
+    /// does not ingest dictionaries, so what matters is that one is refused loudly rather than
+    /// discarded while the write reports success.
+    #[tokio::test]
+    async fn a_dictionary_message_wearing_the_keepalive_sentinel_is_refused_not_skipped() {
+        use arrow::ipc::writer::{
+            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+        };
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let mut values = StringDictionaryBuilder::<Int32Type>::new();
+        values.append_value("US");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(values.finish()) as ArrayRef],
+        )
+        .expect("a dictionary batch");
+
+        // Encoded the way a writer does, so the dictionary message is a real one rather than a
+        // header this test built to agree with itself.
+        let generator = IpcDataGenerator::default();
+        let options = IpcWriteOptions::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let schema_message =
+            generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut tracker, &options);
+        let (dictionaries, _encoded) = generator
+            .encode(
+                &batch,
+                &mut tracker,
+                &options,
+                &mut CompressionContext::default(),
+            )
+            .expect("encoding a dictionary batch");
+        let encoded_dictionary = dictionaries
+            .into_iter()
+            .next()
+            .expect("a dictionary message");
+
+        let first = FlightData {
+            data_header: schema_message.ipc_message.into(),
+            ..Default::default()
+        };
+        let dictionary = FlightData {
+            data_header: encoded_dictionary.ipc_message.into(),
+            data_body: encoded_dictionary.arrow_data.into(),
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            ..Default::default()
+        };
+        assert!(
+            ipc::declares_ipc_data(&dictionary.data_header).expect("a readable header")
+                && !ipc::declares_record_batch(&dictionary.data_header).expect("a readable header"),
+            "the fixture must be a dictionary message for this case to mean anything"
+        );
+
+        let err = decode(first, vec![dictionary], &schema)
+            .await
+            .expect_err("a tagged dictionary should be refused, not silently skipped");
+
+        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
+    }
+
+    /// A message that declares no record batch means the stream has gone out of step with what
+    /// it declared. It fails the write, and the message has to say which dataset and what to do
+    /// — the Arrow decoder's own wording names a flatbuffer range instead.
+    #[tokio::test]
+    async fn a_message_declaring_no_batch_fails_the_write_with_an_actionable_message() {
+        let schema = client_schema();
+        let mut messages = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = messages.remove(0);
+
+        let err = decode(
+            first,
+            vec![messages.remove(0), FlightData::default()],
+            &schema,
+        )
+        .await
+        .expect_err("a trailer declaring no batch should fail the write");
+
+        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("'test.s.events'"), "{message}");
+        assert!(message.contains("carries no record batch"), "{message}");
+        assert!(
+            message.contains("Send every message after the schema as a record batch"),
+            "{message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+            "{message}"
+        );
+        assert_eq!(
+            tonic::Status::from(err).code(),
+            tonic::Code::InvalidArgument,
+            "the client sent it, so no retry of the same stream can succeed"
+        );
+    }
+
+    /// A header with bytes that will not parse is a malformed stream, not the absence of a
+    /// batch, and is reported as its own problem.
+    #[tokio::test]
+    async fn an_unparseable_header_fails_the_write_as_malformed() {
+        let schema = client_schema();
+        let mut messages = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = messages.remove(0);
+        let garbage = FlightData {
+            data_header: bytes::Bytes::from_static(&[0xff; 8]),
+            ..Default::default()
+        };
+
+        let err = decode(first, vec![messages.remove(0), garbage], &schema)
+            .await
+            .expect_err("an unreadable header should fail the write");
+
+        assert!(
+            matches!(err, Error::UnreadableMessageHeader { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("'test.s.events'"), "{message}");
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(
+            message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+            "{message}"
+        );
+    }
+
+    /// The header, not the body length, decides whether the first message carries a batch.
+    ///
+    /// Arrow encodes a batch whose columns need no buffers with an empty body, so a body-length
+    /// discriminator reads this three-row batch as no batch at all and drops its rows. The
+    /// caller's schema parse keeps that unreachable in production today — a first message that
+    /// declares a record batch fails `try_schema_from_flatbuffer_bytes` before this runs — but
+    /// nothing in either signature ties the two together, so the discriminator is guarded here.
+    #[tokio::test]
+    async fn a_buffer_free_first_message_is_decoded_by_its_header() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("n", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::NullArray::new(3)) as ArrayRef],
+        )
+        .expect("null batch");
+        let mut messages = encode_batch_to_flight_data(&schema, &batch);
+        let first = messages.pop().expect("the batch message");
+
+        assert!(
+            first.data_body.is_empty(),
+            "a batch whose columns need no buffers is expected to encode with an empty body; without that this case does not exercise the confusion"
+        );
+
+        let batches = decode(first, vec![], &schema)
+            .await
+            .expect("the first message declares a record batch");
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            3,
+            "the rows the empty body would have dropped"
+        );
+    }
+
+    /// The ordinary shape: a schema-only first message declares no batch and yields nothing.
+    #[tokio::test]
+    async fn a_schema_only_first_message_yields_no_batch_of_its_own() {
+        let schema = client_schema();
+        let mut messages = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = messages.remove(0);
+        assert!(first.data_body.is_empty());
+
+        let batches = decode(first, vec![], &schema).await.expect("no batches");
+        assert!(batches.is_empty());
+    }
+
+    /// A message wearing the keepalive sentinel whose header declares something other than IPC
+    /// data — a schema re-declaration, a trailer, a `Tensor`, any header a later Arrow adds —
+    /// but which carries a body, is client data, not a heartbeat.
+    ///
+    /// `declares_ipc_data` answers `false` for all of those, so the sentinel check alone would
+    /// skip the message and take its body with it while the write still reported success: the
+    /// exact silent-row-loss shape this PR exists to remove, reintroduced one layer up. The
+    /// empty-body floor is what refuses it. `do_put.rs` keeps the same header-vs-body floor in
+    /// its discarded-message count, but reaches it only past a sentinel check that still skips
+    /// unconditionally, so on that one point the two receivers do not yet agree.
+    ///
+    /// A schema message is used because it is the shape a real client is likeliest to send; the
+    /// arm it exercises is shared by every non-data header.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_carrying_a_body_is_not_skipped_as_a_heartbeat() {
+        let schema = client_schema();
+        let mut msgs = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = msgs.remove(0);
+
+        let mut tagged = batches_to_flight_data(
+            &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
+            vec![],
+        )
+        .expect("encoding a schema as flight data")
+        .remove(0);
+        tagged.data_body = bytes::Bytes::from_static(b"rows the client sent");
+        tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // Asserted so the case cannot quietly stop exercising the confusion: it needs a header
+        // that parses into a non-data kind, and a body under it.
+        assert_eq!(
+            ipc::declares_ipc_data(&tagged.data_header),
+            Ok(false),
+            "the case needs a header that declares something other than IPC data"
+        );
+        assert!(
+            !tagged.data_body.is_empty(),
+            "the case needs a body; without one this is a real heartbeat"
+        );
+
+        let err = decode(first, vec![msgs.remove(0), tagged], &schema)
+            .await
+            .expect_err("a sentinel-tagged message carrying a body must not be skipped");
+
+        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
+        assert!(err.to_string().contains("'test.s.events'"), "{err}");
+    }
+    /// A first message whose header declares a schema but which carries a body is lost client
+    /// data, not an absent batch.
+    ///
+    /// This is the half of the body/header swap that could *regress* rather than repair: reading
+    /// the header alone answers `None` here, so those bytes would be dropped and an otherwise
+    /// empty stream acknowledged as a complete write. Counting by body length -- the test this
+    /// branch replaced -- got this case right, because a non-empty body reached
+    /// `flight_data_to_arrow_batch`, which refuses a schema header. So the floor is a property
+    /// to preserve, not a new one to add, and it matches what the subsequent-message loop does.
+    #[tokio::test]
+    async fn a_first_message_carrying_a_body_under_a_schema_header_is_refused() {
+        let schema = client_schema();
+        let mut first =
+            encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1])).remove(0);
+        first.data_body = bytes::Bytes::from_static(b"rows the client sent");
+
+        // Asserted so the case cannot quietly stop exercising the confusion.
+        assert_eq!(
+            ipc::declares_record_batch(&first.data_header),
+            Ok(false),
+            "the case needs the leading schema message, whose header declares no batch"
+        );
+        assert!(!first.data_body.is_empty(), "the case needs a body");
+
+        let err = maybe_read_first_batch(&first, schema, &HashMap::new(), "test.s.events")
+            .expect_err("a body no batch describes must not be silently dropped");
+
+        assert!(
+            matches!(err, Error::FirstMessageBodyWithoutBatch { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("'test.s.events'"), "{message}");
+        assert!(message.contains("no record batch describes"), "{message}");
+        assert!(
+            message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+            "{message}"
+        );
+        assert_eq!(
+            tonic::Status::from(err).code(),
+            tonic::Code::InvalidArgument,
+            "the client sent it, so no retry of the same stream can succeed"
         );
     }
 }

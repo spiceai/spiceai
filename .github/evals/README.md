@@ -1,7 +1,6 @@
 # Agent-instruction evals
 
-Evals for the rules in `.github/copilot-instructions.md` (symlinked as
-`CLAUDE.md`) — the instructions every agent working in this repo runs under.
+Evals for the rules in `AGENTS.md` — the instructions every agent working in this repo runs under.
 
 A rule in that file is a prompt shipped to every session, and like any other
 prompt it can be wrong, ignored, or actively harmful without anyone noticing.
