@@ -952,8 +952,16 @@ type RuntimeLookupCell = Arc<tokio::sync::OnceCell<Option<Arc<RuntimeLookupSelec
 /// join may have populated its `DynamicFilterPhysicalExpr` with an exact `IN`
 /// list. The expression generation prevents an early, unresolved filter from
 /// becoming a permanent decision for later file openers.
+///
+/// The index is the one the scan's view pinned, captured in the same fenced
+/// instant as its snapshot and files. A join can run long after it was planned,
+/// and a refresh may publish a newer index meanwhile; the scan still probes the
+/// index that matches what it reads, and never judges the newer one.
 pub(crate) struct DynamicLookupAccessPlanProvider {
     state: Arc<LookupIndexState>,
+    /// The index published when the scan's view was captured, if any.
+    index: Option<Arc<SnapshotLookupIndex>>,
+    /// The snapshot and file set the scan's view captured.
     visible_snapshot: String,
     visible_file_set: FileSetVersion,
     /// Every file the scan reads. A selection is used only when the index covers
@@ -967,6 +975,7 @@ pub(crate) struct DynamicLookupAccessPlanProvider {
 impl DynamicLookupAccessPlanProvider {
     pub(crate) fn new(
         state: Arc<LookupIndexState>,
+        index: Option<Arc<SnapshotLookupIndex>>,
         visible_snapshot: String,
         visible_file_set: FileSetVersion,
         scan_files: Arc<[ObjectMeta]>,
@@ -975,6 +984,7 @@ impl DynamicLookupAccessPlanProvider {
     ) -> Self {
         Self {
             state,
+            index,
             visible_snapshot,
             visible_file_set,
             scan_files,
@@ -1037,6 +1047,7 @@ impl DynamicLookupAccessPlanProvider {
             return None;
         }
         let state = Arc::clone(&self.state);
+        let index = self.index.clone();
         let visible_snapshot = self.visible_snapshot.clone();
         let visible_file_set = self.visible_file_set;
         let scan_files = Arc::clone(&self.scan_files);
@@ -1050,6 +1061,7 @@ impl DynamicLookupAccessPlanProvider {
             };
             state.probe_runtime_filter(
                 spec,
+                index.as_ref(),
                 &visible_snapshot,
                 visible_file_set,
                 &scan_files,
@@ -1429,6 +1441,10 @@ pub(crate) struct LookupIndexState {
     /// `info`.
     published_once: AtomicBool,
     counters: Counters,
+    /// The table's scan-input version. Scan views pin the published index, so
+    /// every change to it must invalidate the cached views, or scans keep
+    /// serving a view that pinned the previous index (or none).
+    scan_input_version: Arc<AtomicU64>,
 }
 
 impl LookupIndexState {
@@ -1438,6 +1454,7 @@ impl LookupIndexState {
         specs: Vec<KeySpec>,
         pool: Arc<dyn MemoryPool>,
         account: Arc<CayenneMemoryAccount>,
+        scan_input_version: Arc<AtomicU64>,
     ) -> Option<Arc<Self>> {
         if specs.is_empty() {
             return None;
@@ -1461,6 +1478,7 @@ impl LookupIndexState {
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
             counters: Counters::default(),
+            scan_input_version,
         }))
     }
 
@@ -1512,6 +1530,7 @@ impl LookupIndexState {
     fn store_index(&self, index: Option<Arc<SnapshotLookupIndex>>) {
         self.index.store(index);
         self.generation.fetch_add(1, Ordering::Release);
+        self.scan_input_version.fetch_add(1, Ordering::Release);
     }
 
     /// Makes `index` the published index if `expected` still is. Returns whether
@@ -1749,13 +1768,14 @@ impl LookupIndexState {
     /// with a value: see the module's note on column-side casts.
     pub(crate) fn probe(
         self: &Arc<Self>,
+        index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
     ) -> LookupProbe {
         let Some(shape) = self.matched_shape(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
         };
-        let index = match self.current_index(shape, visible_snapshot) {
+        let index = match self.index_for_scan(shape, index, visible_snapshot) {
             Ok(index) => index,
             Err(outcome) => {
                 return LookupProbe::Fallback(LookupIndexExplain::fallback(
@@ -1778,24 +1798,27 @@ impl LookupIndexState {
         })
     }
 
-    /// The published index for `visible_snapshot`. Otherwise records why there
-    /// is none as `shape`'s probe outcome, dropping an index built for another
-    /// snapshot so a rebuild can replace it.
-    fn current_index(
+    /// `index`, the index the scan's view pinned, when it was built for the
+    /// scan's `visible_snapshot`. Otherwise records why there is none as
+    /// `shape`'s probe outcome. A pinned index for another snapshot is older than
+    /// the view that captured it, so it is dropped, unless something newer
+    /// already replaced it, so a rebuild can take its place.
+    fn index_for_scan(
         &self,
         shape: &str,
+        index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
     ) -> Result<Arc<SnapshotLookupIndex>, LookupIndexExplainOutcome> {
-        let Some(index) = self.published() else {
+        let Some(index) = index else {
             self.record_probe(shape, ProbeOutcome::Unbuilt);
             return Err(LookupIndexExplainOutcome::Unbuilt);
         };
         if index.snapshot_id != visible_snapshot {
             self.record_probe(shape, ProbeOutcome::SnapshotMismatch);
-            self.discard_stale(&index);
+            self.discard_stale(index);
             return Err(LookupIndexExplainOutcome::SnapshotMismatch);
         }
-        Ok(index)
+        Ok(Arc::clone(index))
     }
 
     /// Probes a completed hash-join dynamic filter's `keys` for `spec` as one
@@ -1803,19 +1826,21 @@ impl LookupIndexState {
     ///
     /// Single-column membership arrives as `column IN (...)`; composite
     /// membership arrives as `struct(columns...) IN (struct literals...)`, so
-    /// tuple correlation is preserved without a Cartesian product. The selection
-    /// is used only when the index covers every one of `scan_files`, checked
-    /// before any key is probed. As in [`LookupSelection::restrict`], a file the
-    /// index lacks after the file set moved on proves the index stale.
+    /// tuple correlation is preserved without a Cartesian product. `index` is
+    /// the one the scan's view pinned; it answers only when it covers every one
+    /// of `scan_files`, checked before any key is probed. As in
+    /// [`LookupSelection::restrict`], a file it lacks while the view's file set
+    /// has moved on since the index was listed proves the index stale.
     fn probe_runtime_filter(
         &self,
         spec: &KeySpec,
+        index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
         visible_file_set: FileSetVersion,
         scan_files: &[ObjectMeta],
         keys: &[Vec<ScalarValue>],
     ) -> RuntimeProbe {
-        let Ok(index) = self.current_index(&spec.label, visible_snapshot) else {
+        let Ok(index) = self.index_for_scan(&spec.label, index, visible_snapshot) else {
             return RuntimeProbe::IndexUnusable;
         };
         if !scan_files.iter().all(|file| index.indexes_file(file)) {
@@ -2974,6 +2999,23 @@ mod tests {
     #[derive(Debug)]
     struct NoAccessPlans;
 
+    /// Counts the build requests a runtime lookup makes.
+    #[derive(Default)]
+    struct BuildRequests(Arc<AtomicU64>);
+
+    impl BuildRequests {
+        fn callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+            let count = Arc::clone(&self.0);
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        }
+
+        fn count(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
     #[async_trait]
     impl VortexAccessPlanProvider for NoAccessPlans {
         fn access_plan_for_file(&self, _file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
@@ -3056,19 +3098,18 @@ mod tests {
             vec![spec(&["tenant"])],
             Arc::clone(&pool),
             account(&pool),
+            Arc::default(),
         )
         .expect("state");
-        let build_requests = Arc::new(AtomicU64::new(0));
-        let request_counter = Arc::clone(&build_requests);
+        let builds = BuildRequests::default();
         let provider = DynamicLookupAccessPlanProvider::new(
             Arc::clone(&state),
+            state.published(),
             "snapshot".to_string(),
             FileSetVersion::default(),
             Arc::new([]),
             Arc::new(NoAccessPlans),
-            Some(Arc::new(move || {
-                request_counter.fetch_add(1, Ordering::Relaxed);
-            })),
+            Some(builds.callback()),
         );
         let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
         let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
@@ -3083,7 +3124,7 @@ mod tests {
             0,
             "an unresolved filter is not probed"
         );
-        assert_eq!(build_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(builds.count(), 0);
 
         dynamic
             .update(tenant_in_list(&column, &[1, 2]))
@@ -3091,14 +3132,14 @@ mod tests {
         dynamic.mark_complete();
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(state.counters().unbuilt, 1);
-        assert_eq!(build_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(builds.count(), 1);
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
             state.counters().unbuilt,
             1,
             "one generation is probed only once"
         );
-        assert_eq!(build_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(builds.count(), 1);
 
         dynamic
             .update(tenant_in_list(&column, &[3]))
@@ -3109,7 +3150,7 @@ mod tests {
             2,
             "a later generation is resolved independently"
         );
-        assert_eq!(build_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(builds.count(), 2);
     }
 
     #[test]
@@ -3592,6 +3633,7 @@ mod tests {
             vec![spec(&["tenant"])],
             Arc::clone(&pool),
             Arc::clone(&table),
+            Arc::default(),
         )
         .expect("state");
         state.store_index(Some(index));
@@ -3599,6 +3641,7 @@ mod tests {
         assert!(matches!(
             state.probe_runtime_filter(
                 &spec(&["tenant"]),
+                state.published().as_ref(),
                 "snapshot",
                 FileSetVersion::default(),
                 std::slice::from_ref(&indexed),
@@ -3609,18 +3652,16 @@ mod tests {
         assert_eq!(state.counters().runtime_fallback, 1);
 
         let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
-        let build_requests = Arc::new(AtomicU64::new(0));
+        let builds = BuildRequests::default();
         let provider = |scan_files: Vec<ObjectMeta>, visible_file_set| {
-            let request_counter = Arc::clone(&build_requests);
             Arc::new(DynamicLookupAccessPlanProvider::new(
                 Arc::clone(&state),
+                state.published(),
                 "snapshot".to_string(),
                 visible_file_set,
                 scan_files.into(),
                 Arc::new(NoAccessPlans),
-                Some(Arc::new(move || {
-                    request_counter.fetch_add(1, Ordering::Relaxed);
-                })),
+                Some(builds.callback()),
             ))
         };
 
@@ -3635,7 +3676,7 @@ mod tests {
             assert!(scan.resolve(Some(&oversized)).await.is_none());
         }
         assert_eq!(state.counters().runtime_fallback, 2);
-        assert_eq!(build_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(builds.count(), 0);
 
         // A scan file the index lacks, while the file set has not moved, means
         // the scan predates the index: every concurrent opener sees one
@@ -3658,8 +3699,9 @@ mod tests {
         );
         assert!(state.published().is_some());
 
-        // The same missing file after the file set moved proves the index stale:
-        // it is discarded and one replacement build is requested.
+        // The same missing file in a view whose file set moved on since the index
+        // was listed proves the index stale: it is discarded and one replacement
+        // build is requested.
         let scan = provider(
             vec![indexed, appended],
             FileSetVersion {
@@ -3671,10 +3713,83 @@ mod tests {
         assert_eq!(state.counters().snapshot_mismatch, 2);
         assert!(state.published().is_none(), "the stale index is discarded");
         assert_eq!(
-            build_requests.load(Ordering::Relaxed),
+            builds.count(),
             2,
             "each refused scan requests a build; the schedule decides whether one runs"
         );
+    }
+
+    /// A full refresh can publish the next snapshot's index while a join that
+    /// was planned against the previous snapshot is still building its hash
+    /// table. The join probes the index its view pinned, which matches what it
+    /// reads, and leaves the newer index alone.
+    #[tokio::test]
+    async fn a_runtime_probe_planned_before_a_refresh_keeps_the_newer_index() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let state = LookupIndexState::new(
+            "refreshed_during_join",
+            vec![spec(&["tenant"])],
+            Arc::clone(&pool),
+            Arc::clone(&table),
+            Arc::default(),
+        )
+        .expect("state");
+        let scan = |pinned: &Arc<SnapshotLookupIndex>, snapshot: &str| {
+            DynamicLookupAccessPlanProvider::new(
+                Arc::clone(&state),
+                Some(Arc::clone(pinned)),
+                snapshot.to_string(),
+                FileSetVersion::default(),
+                vec![scan_file(&format!("{snapshot}/file.vortex"))].into(),
+                Arc::new(NoAccessPlans),
+                None,
+            )
+        };
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = completed_dynamic_filter(&column, &[1]);
+
+        let planned = tiny_index(&pool, &table, "s1");
+        state.store_index(Some(Arc::clone(&planned)));
+        let join = scan(&planned, "s1");
+        let refreshed = tiny_index(&pool, &table, "s2");
+        state.store_index(Some(Arc::clone(&refreshed)));
+
+        assert!(
+            join.resolve(Some(&predicate)).await.is_some(),
+            "the join still answers from the index its view pinned"
+        );
+        assert_eq!(state.counters().snapshot_mismatch, 0);
+        assert!(
+            state
+                .published()
+                .is_some_and(|index| Arc::ptr_eq(&index, &refreshed)),
+            "the refreshed snapshot's index stays published"
+        );
+
+        // A view that pinned an index older than its own snapshot refuses it,
+        // and discards it only while it is still the published one.
+        assert!(
+            scan(&planned, "s2")
+                .resolve(Some(&predicate))
+                .await
+                .is_none()
+        );
+        assert!(
+            state
+                .published()
+                .is_some_and(|index| Arc::ptr_eq(&index, &refreshed)),
+            "a newer index is never discarded in place of a stale one"
+        );
+        state.store_index(Some(Arc::clone(&planned)));
+        assert!(
+            scan(&planned, "s2")
+                .resolve(Some(&predicate))
+                .await
+                .is_none()
+        );
+        assert!(state.published().is_none(), "the stale index is discarded");
+        assert_eq!(state.counters().snapshot_mismatch, 2);
     }
 
     /// A single shifted address is reported, so the read-back verification can
@@ -3896,6 +4011,7 @@ mod tests {
             vec![spec(&["tenant"])],
             Arc::clone(&pool),
             Arc::clone(&table),
+            Arc::default(),
         )
         .expect("state");
         let old = tiny_index(&pool, &table, "s1");
@@ -3939,6 +4055,7 @@ mod tests {
             vec![spec(&["tenant"])],
             Arc::clone(&pool),
             account(&pool),
+            Arc::default(),
         )
         .expect("state");
         let claim = state.claim_build("snapshot").expect("first claim");
