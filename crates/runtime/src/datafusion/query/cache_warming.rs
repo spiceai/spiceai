@@ -104,7 +104,7 @@ impl ResultsCacheWarmer {
         } else {
             Vec::new()
         };
-        Self::from_loaded(loaded, enabled, WarmupPersist::Local(store_path))
+        Self::from_loaded(&loaded, enabled, WarmupPersist::Local(store_path))
     }
 
     async fn from_object_store(
@@ -126,10 +126,10 @@ impl ResultsCacheWarmer {
         } else {
             Vec::new()
         };
-        Self::from_loaded(loaded, enabled, WarmupPersist::Remote(state))
+        Self::from_loaded(&loaded, enabled, WarmupPersist::Remote(state))
     }
 
-    fn from_loaded(loaded: Vec<WarmupTemplate>, enabled: bool, persist: WarmupPersist) -> Self {
+    fn from_loaded(loaded: &[WarmupTemplate], enabled: bool, persist: WarmupPersist) -> Self {
         if enabled {
             tracing::info!(
                 "SQL results cache warmup is enabled: the first {MAX_WARMUP_PLANS} distinct query plans will be recorded and replayed after the first full or append refresh until the cache is full"
@@ -138,7 +138,7 @@ impl ResultsCacheWarmer {
         // Persisted catalogs are not trusted: a stale or edited file can
         // exceed the advertised cap or repeat the same shape. Dedup and
         // cap here so replay (which holds readiness) cannot run unbounded.
-        let loaded = merge_templates(&[], &loaded);
+        let loaded = merge_templates(&[], loaded);
         let ids = loaded.iter().map(template_id).collect::<HashSet<_>>();
         let count = loaded.len();
         Self {
@@ -1106,7 +1106,7 @@ mod tests {
         });
 
         let warmer = ResultsCacheWarmer::from_loaded(
-            persisted,
+            &persisted,
             true,
             WarmupPersist::Local(std::env::temp_dir().join("spice-warmup-from-loaded.json")),
         );
