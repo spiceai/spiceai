@@ -4768,6 +4768,8 @@ pub(crate) enum OverwriteRouting {
 
 /// Bytes of a first load's leading rows [`CayenneTableProvider::input_range_plan`]
 /// buffers to sample its routing key from, charged to the query memory pool.
+/// Buffering stops once the head reaches it, so the head can exceed it by the
+/// batch that crossed it — a batch already in memory once it has been pulled.
 const INPUT_RANGE_SAMPLE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Consecutive input rows [`CayenneTableProvider::input_range_plan`] treats as
@@ -17385,8 +17387,9 @@ impl CayenneTableProvider {
     /// The key comes from [`Self::range_routing_candidates`], taking the first
     /// whose values spread across every shard. Tables with an explicit order
     /// (`cayenne_sort_columns`, `cayenne_cluster_by`) keep their single sorted
-    /// writer. The first load has nothing to sample and hashes, as does a table
-    /// too small to cut.
+    /// writer. A table too small to cut hashes. The first load has nothing to
+    /// sample ([`OverwriteRouting::NothingToSample`]) and takes its split points
+    /// from its own input instead ([`Self::input_range_plan`]).
     pub(crate) async fn overwrite_range_plan(&self, target_partitions: usize) -> OverwriteRouting {
         // Places equal-count cuts within a fraction of a percent of their target
         // for any shard count a write uses.
@@ -17463,11 +17466,15 @@ impl CayenneTableProvider {
     /// opens every file until the next refresh routes on ranges. The input's
     /// leading rows can stand in for the table when they are a fair sample of the
     /// key — which a source emitting rows in random key order gives, and one
-    /// ordered or clustered by the key does not. So up to
-    /// [`INPUT_RANGE_SAMPLE_BYTES`] of the head are buffered (charged to the query
-    /// memory pool batch by batch until the writer takes them; a refused charge
-    /// ends the buffering, and the refused batch is written as it arrived) and a
-    /// plan is taken only when either
+    /// ordered or clustered by the key does not. So the head is buffered until it
+    /// reaches [`INPUT_RANGE_SAMPLE_BYTES`] — the batch that crosses the mark
+    /// included, since a batch is in memory once pulled — with each batch charged
+    /// to the query memory pool until the writer takes it (a refused charge ends
+    /// the buffering, and the refused batch is written as it arrived). Each
+    /// routing candidate ([`Self::range_routing_candidates`]) is then tried on the
+    /// head in turn, as [`Self::overwrite_range_plan`] tries them on a loaded
+    /// table, and the first to yield split points for every shard routes the
+    /// load. A candidate's split points are taken only when either
     ///
     /// * the input ended inside the buffer, so the sample is the whole table; or
     /// * the head is a fair sample of the key (`head_is_fair_key_sample`):
@@ -17511,10 +17518,11 @@ impl CayenneTableProvider {
         }
         let input_schema = data.schema();
         let table_schema = self.table_schema();
-        let Some((column, key_index, key_type)) = self
+        // Every routing candidate the input carries, most preferred first.
+        let candidates: Vec<(String, usize, DataType)> = self
             .range_routing_candidates(&table_schema)
             .into_iter()
-            .find_map(|(column, _)| {
+            .filter_map(|(column, _)| {
                 let key_index = input_schema.index_of(&column).ok()?;
                 let key_type = table_schema
                     .field_with_name(&column)
@@ -17523,9 +17531,10 @@ impl CayenneTableProvider {
                     .clone();
                 Some((column, key_index, key_type))
             })
-        else {
+            .collect();
+        if candidates.is_empty() {
             return Ok((data, None));
-        };
+        }
 
         let started = Instant::now();
         let reservation =
@@ -17552,22 +17561,25 @@ impl CayenneTableProvider {
             head.push(batch);
         }
 
-        let plan = Self::sampled_input_bounds(
-            &head,
-            key_index,
-            &key_type,
-            shards,
-            exhausted,
-            MAX_SAMPLE_ROWS,
-        )
-        .map(|bounds| OverwriteRangePlan {
-            column: column.clone(),
-            bounds,
-            from_input_head: true,
+        let plan = candidates.iter().find_map(|(column, key_index, key_type)| {
+            Self::sampled_input_bounds(
+                &head,
+                *key_index,
+                key_type,
+                shards,
+                exhausted,
+                MAX_SAMPLE_ROWS,
+            )
+            .map(|bounds| OverwriteRangePlan {
+                column: column.clone(),
+                bounds,
+                from_input_head: true,
+            })
         });
         tracing::debug!(
             table = self.table_name(),
-            column = column.as_str(),
+            column = plan.as_ref().map(|plan| plan.column.as_str()),
+            candidates = candidates.len(),
             head_rows = head.iter().map(RecordBatch::num_rows).sum::<usize>(),
             head_bytes,
             input_exhausted = exhausted,
@@ -46691,6 +46703,74 @@ mod tests {
         i64::try_from((i * 7919) % n).expect("fits i64")
     }
 
+    /// Asserts that `provider`'s current snapshot holds `rows` rows in `files`
+    /// files, each in order of the Int64 key in the schema's first column and
+    /// covering a key range no other file overlaps.
+    async fn assert_disjoint_sorted_key_range_files(
+        provider: &CayenneTableProvider,
+        schema: &SchemaRef,
+        files: usize,
+        rows: usize,
+    ) {
+        let snapshot_id = provider.current_snapshot_id();
+        let names: Vec<String> = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("list snapshot files")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.len(), files, "one file per key range: {names:?}");
+        let file_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut ranges = Vec::with_capacity(names.len());
+        let mut total = 0_usize;
+        for name in &names {
+            let path = provider.snapshot_dir_path_for(&snapshot_id).join(name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing table");
+            let keys: Vec<i64> = file_ctx
+                .read_table(table)
+                .expect("read file")
+                .collect()
+                .await
+                .expect("scan file")
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("the key is Int64")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert!(
+                keys.is_sorted(),
+                "{name}: a range file's rows are in key order"
+            );
+            let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
+                panic!("{name}: every range of a scrambled key domain receives rows");
+            };
+            total += keys.len();
+            ranges.push((first, last));
+        }
+        assert_eq!(total, rows, "every row is written exactly once");
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "key ranges of a first load's files must not overlap: {ranges:?}"
+            );
+        }
+    }
+
     /// A head in random key order is a fair sample of the key even though the
     /// input continues past it, so a first load cuts equal-count split points
     /// from it; a head in key order, or in narrow key clusters, says nothing
@@ -46873,61 +46953,7 @@ mod tests {
             .expect("begin_overwrite");
         prepared.apply_owned_txn().await.expect("apply_owned_txn");
         prepared.finish().await.expect("finish");
-
-        let snapshot_id = provider.current_snapshot_id();
-        let files = provider
-            .list_snapshot_files_with_sizes(&snapshot_id)
-            .await
-            .expect("list snapshot files");
-        assert_eq!(files.len(), SHARDS, "one file per key range: {files:?}");
-        let file_ctx =
-            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-        let mut ranges = Vec::with_capacity(files.len());
-        let mut total = 0_usize;
-        for (name, _) in &files {
-            let path = provider.snapshot_dir_path_for(&snapshot_id).join(name);
-            let table = CayenneTableProvider::create_listing_table(
-                &path.to_string_lossy(),
-                Arc::clone(&schema),
-                provider.context.file_format(),
-                &provider.pk_deletion_strategy,
-            )
-            .expect("single-file listing table");
-            let keys: Vec<i64> = file_ctx
-                .read_table(table)
-                .expect("read file")
-                .collect()
-                .await
-                .expect("scan file")
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("id is Int64")
-                        .values()
-                        .to_vec()
-                })
-                .collect();
-            assert!(
-                keys.is_sorted(),
-                "{name}: a range file's rows are in key order"
-            );
-            let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
-                panic!("{name}: every range of a scrambled key domain receives rows");
-            };
-            total += keys.len();
-            ranges.push((first, last));
-        }
-        assert_eq!(total, ROWS, "every row is written exactly once");
-        ranges.sort_unstable();
-        for pair in ranges.windows(2) {
-            assert!(
-                pair[0].1 < pair[1].0,
-                "key ranges of a first load's files must not overlap: {ranges:?}"
-            );
-        }
+        assert_disjoint_sorted_key_range_files(&provider, &schema, SHARDS, ROWS).await;
 
         let provider = Arc::new(provider);
         ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
@@ -46952,6 +46978,81 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec![313_370]);
+    }
+
+    /// A first load tries each routing candidate on its input's head in turn,
+    /// as a replace of a loaded table does: a hot filter column too coarse to
+    /// cut into every shard gives way to the primary key behind it, instead of
+    /// the load falling back to hashing.
+    #[tokio::test]
+    async fn test_first_load_routes_on_the_next_candidate_when_the_first_cannot_cut() {
+        use datafusion_expr::{col, lit};
+
+        const ROWS: usize = 40_000;
+        const SHARDS: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "first_load_candidate_fallback",
+            Arc::clone(&schema),
+            VortexConfig {
+                // Keep the load out of the metastore so it writes files.
+                inline_max_rows: 0,
+                write_concurrency: Some(SHARDS),
+                ..VortexConfig::default()
+            },
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        // Scans filter on `status` far more often than on the key, so it leads
+        // the candidates, but its two values can fill only two of four shards.
+        for _ in 0..10 {
+            provider
+                .filter_column_observations
+                .record_filters(&[col("status").eq(lit(1_i64))]);
+        }
+        let candidates: Vec<String> = provider
+            .range_routing_candidates(&provider.table_schema())
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(candidates, vec!["status", "id"]);
+
+        let batches: Vec<DataFusionResult<RecordBatch>> = (0..ROWS)
+            .step_by(1024)
+            .map(|start| {
+                let keys: Vec<i64> = (start..ROWS.min(start + 1024))
+                    .map(|i| scrambled(i, ROWS))
+                    .collect();
+                let statuses: Vec<i64> = keys.iter().map(|key| key % 2).collect();
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(Int64Array::from(statuses)),
+                    ],
+                )
+                .expect("load batch"))
+            })
+            .collect();
+        let prepared = provider
+            .begin_overwrite(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    stream::iter(batches),
+                )),
+                SHARDS,
+            )
+            .await
+            .expect("begin_overwrite");
+        prepared.apply_owned_txn().await.expect("apply_owned_txn");
+        prepared.finish().await.expect("finish");
+        assert_disjoint_sorted_key_range_files(&provider, &schema, SHARDS, ROWS).await;
     }
 
     /// A whole-table replace of a keyed table routes its rows into key-range
