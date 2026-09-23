@@ -287,6 +287,6 @@ Testing focus DRIs are responsible for:
 - [ ] Reddit: [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
 - [ ] Discord: [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] Telegram: [spiceai](https://t.me/spiceai)
-- [ ] Blog: [spiceai.org/blog](https://spiceai.org/blog)
+- [ ] Release Notes: [spiceai.org/releases](https://spiceai.org/releases)
   - [ ] Update docs banner version in [docusaurus.config.ts](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
   - [ ] Ensure version numbers and references match the release.
