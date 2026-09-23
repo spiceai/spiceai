@@ -280,9 +280,9 @@ datafusion-spark = "55.1.0"
 datafusion-substrait = "55.1.0"
 # TODO(datafusion-55): pending spiceai/datafusion-table-providers spiceai-55 rev (agent: datafusion-table-providers)
 datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "14fdd18233daab646859eb9ea115873a445b3df3" } # branch: spiceai-54
-delta_kernel = { version = "0.23.0", features = [
+delta_kernel = { version = "0.28.0", features = [
     "default-engine-rustls",
-    "arrow-58",
+    "arrow-59",
     "internal-api",
 ] }
 derive_builder = "0.20.2"
@@ -593,8 +593,10 @@ candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "ef
 # point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
 
-# TODO(datafusion-55): pending spiceai/delta-kernel-rs rev (agent: arrow-only-forks-bundle)
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
+# LOCAL ONLY: branch spiceai-0.28.0 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "1e7a083df926951b4200b3cde13153f2ceb53032"` # branch: spiceai-0.28.0
+# once pushed. No Spice patches needed porting (both historical patches are upstreamed).
+delta_kernel = { path = "/Users/viktor/workspace/df55-prep/delta-kernel-rs/kernel" }
 
 # TODO(datafusion-55): pending spiceai/duckdb-rs rev (agent: arrow-only-forks-bundle)
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b1e4dfc886de561759b70ead48b96" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
