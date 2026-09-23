@@ -40,6 +40,9 @@ datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
+# delta-kernel-rs 0.28.0 split `DefaultEngine` and friends out of
+# `delta_kernel::engine::default` into their own crate.
+delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -145,7 +148,7 @@ databricks = [
 ]
 debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
-delta_lake = ["dep:delta_kernel"]
+delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",

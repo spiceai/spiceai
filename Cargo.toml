@@ -283,10 +283,11 @@ datafusion-substrait = "55.1.0"
 # TODO(datafusion-55): pending spiceai/datafusion-table-providers spiceai-55 rev (agent: datafusion-table-providers)
 datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "14fdd18233daab646859eb9ea115873a445b3df3" } # branch: spiceai-54
 delta_kernel = { version = "0.28.0", features = [
-    "default-engine-rustls",
+    "default-engine-base",
     "arrow-59",
     "internal-api",
 ] }
+delta_kernel_default_engine = "0.28.0"
 derive_builder = "0.20.2"
 dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
@@ -602,6 +603,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 # `git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "1e7a083df926951b4200b3cde13153f2ceb53032"` # branch: spiceai-0.28.0
 # once pushed. No Spice patches needed porting (both historical patches are upstreamed).
 delta_kernel = { path = "/Users/viktor/workspace/df55-prep/delta-kernel-rs/kernel" }
+delta_kernel_default_engine = { path = "/Users/viktor/workspace/df55-prep/delta-kernel-rs/default-engine" }
 
 # LOCAL ONLY: branch spiceai-1.4.4-arrow59 not pushed yet. Replace with
 # `git = "https://github.com/spiceai/duckdb-rs.git", rev = "875974763e847eb4dc4e071f875f5bbecdd63b47"` # branch: spiceai-1.4.4-arrow59
