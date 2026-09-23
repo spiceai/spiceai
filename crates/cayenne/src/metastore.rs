@@ -26,6 +26,7 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
+use std::collections::HashSet;
 use std::fmt::Display;
 
 use super::catalog::{CatalogError, CatalogResult};
@@ -446,6 +447,9 @@ pub(crate) async fn partition_child_table_ids(
         .await?;
 
     let mut child_ids: Vec<String> = Vec::new();
+    // `child_ids` keeps export order; membership is answered by the set, so a
+    // snapshot with many partitions does not spend quadratic time here.
+    let mut seen_child_ids: HashSet<String> = HashSet::new();
     for (values_json, path) in partitions {
         let values: Vec<String> =
             serde_json::from_str(&values_json).map_err(|e| CatalogError::Database {
@@ -474,7 +478,7 @@ pub(crate) async fn partition_child_table_ids(
         // one twice would export its rows twice and fail the import's INSERT on
         // that same uniqueness, so do not depend on it holding.
         for id in matched {
-            if !child_ids.contains(&id) {
+            if seen_child_ids.insert(id.clone()) {
                 child_ids.push(id);
             }
         }
