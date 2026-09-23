@@ -59,6 +59,7 @@ ALLOWED: dict[str, str] = {
     "CountingInsertProvider": "test double",
     "CountingDeleteProvider": "test double",
     "FailFirstWriteProvider": "test double",
+    "FailAfterNWrites": "test double",
     "SlowProvider": "test double",
     "WriteOrderRecordingProvider": "test double",
     "DelayedNativeTableProvider": "test double",
