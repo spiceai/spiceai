@@ -319,7 +319,15 @@ where
     /// the scan and then rewritten by a concurrent `insert` is removed on the strength of
     /// the value the scan saw, so a fresh entry can be dropped — a cache miss, never a
     /// stale hit.
+    #[cfg(test)]
     pub(crate) fn invalidate_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&V) -> bool,
+    {
+        self.remove_matching(predicate)
+    }
+
+    fn remove_matching<F>(&self, predicate: F) -> usize
     where
         F: Fn(&V) -> bool,
     {
@@ -448,7 +456,7 @@ where
         self.evict_to_weight_limit();
     }
 
-    async fn get(&self, key: &u64) -> Option<V> {
+    async fn get(&self, key: &u64) -> Option<Arc<V>> {
         // First, check metadata for expiration without touching pingora-lru
         // This avoids the race condition for expired items
         match self.is_expired_by_metadata(*key) {
@@ -512,7 +520,7 @@ where
         let cloned_value = entry.value.clone();
         self.cache.admit(*key, entry, weight);
 
-        Some(cloned_value)
+        Some(Arc::new(cloned_value))
     }
 
     async fn remove(&self, key: &u64) -> Option<V> {
@@ -578,6 +586,13 @@ where
         // size, and because a cache that stopped being written to should not hold weight
         // it has been asked to give up.
         self.evict_to_weight_limit();
+    }
+
+    async fn invalidate_matching(
+        &self,
+        predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> usize {
+        self.remove_matching(predicate)
     }
 }
 
@@ -700,7 +715,7 @@ mod tests {
         backend.insert(key, value.clone()).await;
 
         let retrieved = backend.get(&key).await;
-        assert_eq!(retrieved, Some(value));
+        assert_eq!(retrieved, Some(std::sync::Arc::new(value)));
     }
 
     #[tokio::test]
@@ -717,7 +732,10 @@ mod tests {
 
         for i in 0..10 {
             let retrieved = backend.get(&i).await;
-            assert_eq!(retrieved, Some(TestValue::new(&format!("value_{i}"))));
+            assert_eq!(
+                retrieved,
+                Some(std::sync::Arc::new(TestValue::new(&format!("value_{i}"))))
+            );
         }
     }
 
@@ -727,10 +745,16 @@ mod tests {
         let key = 42u64;
 
         backend.insert(key, TestValue::new("original")).await;
-        assert_eq!(backend.get(&key).await, Some(TestValue::new("original")));
+        assert_eq!(
+            backend.get(&key).await,
+            Some(std::sync::Arc::new(TestValue::new("original")))
+        );
 
         backend.insert(key, TestValue::new("updated")).await;
-        assert_eq!(backend.get(&key).await, Some(TestValue::new("updated")));
+        assert_eq!(
+            backend.get(&key).await,
+            Some(std::sync::Arc::new(TestValue::new("updated")))
+        );
 
         // Should still be only one entry
         assert_eq!(backend.len().await, 1);
@@ -773,7 +797,7 @@ mod tests {
         assert!(replaced, "predicate matched, so the value must be replaced");
         assert_eq!(
             backend.get(&key).await,
-            Some(TestValue::with_size("large", 500))
+            Some(std::sync::Arc::new(TestValue::with_size("large", 500)))
         );
         assert_eq!(
             backend.weighted_size().await,
@@ -793,7 +817,10 @@ mod tests {
             .await;
 
         assert!(!replaced);
-        assert_eq!(backend.get(&key).await, Some(TestValue::new("original")));
+        assert_eq!(
+            backend.get(&key).await,
+            Some(std::sync::Arc::new(TestValue::new("original")))
+        );
     }
 
     #[tokio::test]
@@ -825,7 +852,7 @@ mod tests {
         );
         assert_eq!(
             backend.get(&key).await,
-            Some(TestValue::new("raw").keeping_ttl())
+            Some(std::sync::Arc::new(TestValue::new("raw").keeping_ttl()))
         );
     }
 
@@ -846,7 +873,10 @@ mod tests {
         // Verify all values are retrievable
         for i in 0..16 {
             let retrieved = backend.get(&i).await;
-            assert_eq!(retrieved, Some(TestValue::new(&format!("shard_{i}"))));
+            assert_eq!(
+                retrieved,
+                Some(std::sync::Arc::new(TestValue::new(&format!("shard_{i}"))))
+            );
         }
     }
 
@@ -863,7 +893,7 @@ mod tests {
         backend.insert(key, value.clone()).await;
 
         let retrieved = backend.get(&key).await;
-        assert_eq!(retrieved, Some(value));
+        assert_eq!(retrieved, Some(std::sync::Arc::new(value)));
     }
 
     #[tokio::test]
@@ -920,7 +950,7 @@ mod tests {
         // Get multiple times
         for _ in 0..5 {
             let retrieved = backend.get(&key).await;
-            assert_eq!(retrieved, Some(value.clone()));
+            assert_eq!(retrieved, Some(std::sync::Arc::new(value.clone())));
         }
     }
 
@@ -1061,7 +1091,10 @@ mod tests {
 
         backend.insert(key, TestValue::new("new_value")).await;
 
-        assert_eq!(backend.get(&key).await, Some(TestValue::new("new_value")));
+        assert_eq!(
+            backend.get(&key).await,
+            Some(std::sync::Arc::new(TestValue::new("new_value")))
+        );
         assert_eq!(backend.len().await, 1);
     }
 
@@ -1344,7 +1377,10 @@ mod tests {
         );
 
         assert_eq!(backend.len().await, 1);
-        assert_eq!(backend.get(&key).await, Some(TestValue::new("fresh")));
+        assert_eq!(
+            backend.get(&key).await,
+            Some(std::sync::Arc::new(TestValue::new("fresh")))
+        );
     }
 
     #[tokio::test]
@@ -1357,7 +1393,10 @@ mod tests {
         // Live key — left in place.
         backend.insert(2, TestValue::new("live")).await;
         assert!(!backend.remove_if_expired(2));
-        assert_eq!(backend.get(&2).await, Some(TestValue::new("live")));
+        assert_eq!(
+            backend.get(&2).await,
+            Some(std::sync::Arc::new(TestValue::new("live")))
+        );
 
         // Lapsed key — removed.
         backend.insert(3, TestValue::new("stale")).await;
@@ -1457,7 +1496,7 @@ mod tests {
     /// aim a second operation at exactly the gap the bug lives in.
     struct ParkedRead {
         backend: Arc<PingoraBackend<GatedValue>>,
-        reader: tokio::task::JoinHandle<Option<GatedValue>>,
+        reader: tokio::task::JoinHandle<Option<std::sync::Arc<GatedValue>>>,
         release: std::sync::mpsc::Sender<()>,
         /// Handed back rather than dropped: the value the reader re-admits is the gated copy,
         /// so the *next* read of this key parks too and signals on this channel. Dropping the
@@ -1624,7 +1663,7 @@ mod tests {
 
         assert_eq!(
             backend.get(&large_key).await,
-            Some(TestValue::new("max_key"))
+            Some(std::sync::Arc::new(TestValue::new("max_key")))
         );
     }
 
@@ -1634,7 +1673,10 @@ mod tests {
 
         backend.insert(0, TestValue::new("zero_key")).await;
 
-        assert_eq!(backend.get(&0).await, Some(TestValue::new("zero_key")));
+        assert_eq!(
+            backend.get(&0).await,
+            Some(std::sync::Arc::new(TestValue::new("zero_key")))
+        );
     }
 
     #[tokio::test]
@@ -1768,7 +1810,10 @@ mod tests {
 
         backend.insert(1, TestValue::new("value")).await;
 
-        assert_eq!(backend.get(&1).await, Some(TestValue::new("value")));
+        assert_eq!(
+            backend.get(&1).await,
+            Some(std::sync::Arc::new(TestValue::new("value")))
+        );
     }
 
     // ==========================
@@ -1897,7 +1942,7 @@ mod tests {
         for key in SHARD_ZERO_KEYS.into_iter().filter(|key| *key != 48) {
             assert_eq!(
                 backend.get(&key).await,
-                Some(TestValue::new(&format!("v{key}"))),
+                Some(std::sync::Arc::new(TestValue::new(&format!("v{key}")))),
                 "key {key} should have survived an invalidation that did not match it"
             );
         }
@@ -1927,7 +1972,10 @@ mod tests {
 
         // Read the oldest key so recency no longer matches insertion order —
         // otherwise a scan that rebuilt the order could coincidentally match.
-        assert_eq!(backend.get(&16).await, Some(TestValue::new("v16")));
+        assert_eq!(
+            backend.get(&16).await,
+            Some(std::sync::Arc::new(TestValue::new("v16")))
+        );
         assert_eq!(
             backend.keys_in_lru_order(),
             vec![16, 80, 64, 48, 32],
@@ -2040,7 +2088,7 @@ mod tests {
         assert_eq!(removed, 32);
         assert_eq!(backend.len().await, 32);
         for key in 0..64u64 {
-            let expected = (key % 2 == 1).then(|| TestValue::new("odd"));
+            let expected = (key % 2 == 1).then(|| std::sync::Arc::new(TestValue::new("odd")));
             assert_eq!(backend.get(&key).await, expected, "key {key}");
         }
     }
