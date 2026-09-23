@@ -270,6 +270,57 @@ mod tests {
         assert!((enabled(0.9).k - 10.0).abs() < 1e-9);
     }
 
+    /// Control-logic evidence: at a fixed 10% failure threshold, a higher backend
+    /// error rate settles the admission coefficient lower, matching
+    /// `min(1, k * success_rate)` with `k = 1 / (1 - threshold)`. The coefficient
+    /// is the fraction of the configured rate admitted, so this is the load
+    /// reduction. (Deterministic — it exercises the control law, not governor
+    /// throughput; the end-to-end test covers the wired request path.)
+    #[test]
+    fn admission_coefficient_tracks_backend_error_rate() {
+        // Settle the coefficient at a 10% failure threshold for a backend that
+        // fails every `fail_every`-th request (0 = never fail). A large sample
+        // makes the `+1` smoothing negligible; the tight loop makes window decay
+        // over the elapsed microseconds immaterial.
+        fn settled(fail_every: u32) -> f64 {
+            let control = AdaptiveRateControl::new(0.10, DEFAULT_ADAPTIVE_WINDOW)
+                .expect("a 10% failure threshold is valid");
+            let controller = AdaptiveController::new(control);
+            for request in 1..=8000u32 {
+                let failed = fail_every != 0 && request % fail_every == 0;
+                controller.record(if failed {
+                    RequestOutcome::Failure
+                } else {
+                    RequestOutcome::Success
+                });
+            }
+            controller.admission_coefficient()
+        }
+
+        // k = 1 / (1 - 0.10) = 1.111.
+        let healthy = settled(0); // 0% errors  -> min(1, 1.111 * 1.00) = 1.000
+        let err_25 = settled(4); // 25% errors -> min(1, 1.111 * 0.75) = 0.833
+        let err_50 = settled(2); // 50% errors -> min(1, 1.111 * 0.50) = 0.556
+
+        assert!(
+            (healthy - 1.0).abs() < 1e-6,
+            "a healthy backend must not be throttled, got {healthy}"
+        );
+        assert!(
+            (err_25 - 0.8333).abs() < 0.02,
+            "25% errors at a 10% threshold should settle near 0.833 (~17% load reduction), got {err_25}"
+        );
+        assert!(
+            (err_50 - 0.5556).abs() < 0.02,
+            "50% errors at a 10% threshold should settle near 0.556 (~44% load reduction), got {err_50}"
+        );
+        // A worse backend must reduce load further.
+        assert!(
+            healthy > err_25 && err_25 > err_50,
+            "load reduction must grow with the error rate: {healthy} > {err_25} > {err_50}"
+        );
+    }
+
     #[test]
     fn new_validates_failure_threshold() {
         AdaptiveRateControl::new(0.5, DEFAULT_ADAPTIVE_WINDOW)
