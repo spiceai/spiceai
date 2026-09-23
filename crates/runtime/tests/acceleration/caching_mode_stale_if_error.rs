@@ -599,8 +599,8 @@ async fn enabled_serves_stale_with_no_bound() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// The zero-TTL fallback fetches the origin on every keyed read, but reads the
-/// accelerator only if that fetch fails and its stored row fits the window.
+/// A zero-TTL cache query fetches the origin first, reading the accelerator only
+/// if that fetch fails and its stored row fits the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn zero_ttl_fallback_handles_success_failures_timeout_and_recovery()
 -> Result<(), anyhow::Error> {
@@ -678,14 +678,30 @@ async fn zero_ttl_fallback_handles_success_failures_timeout_and_recovery()
         vec![503],
         "a row past the configured window is not served"
     );
+    let stored_before_recovery = cached_fetch_timestamp(&rt).await;
+    let before_recovery = origin.fetches();
     origin.set_status(200);
     let recovered = fetch_statuses(&rt, "key=a").await?;
     assert_eq!(recovered, first);
+    assert!(
+        origin.fetches() > before_recovery,
+        "recovery keeps the backend-first path"
+    );
+    let refresh_deadline = Instant::now() + Duration::from_secs(10);
+    while cached_fetch_timestamp(&rt).await <= stored_before_recovery
+        && Instant::now() < refresh_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cached_fetch_timestamp(&rt).await > stored_before_recovery,
+        "successful recovery must update the stored response"
+    );
     let observed = origin.fetches();
     assert_eq!(fetch_statuses(&rt, "key=a").await?, first);
     assert!(
         origin.fetches() > observed,
-        "recovery keeps the backend-first path"
+        "a subsequent backend-first read contacts the origin after its write finishes"
     );
     Ok(())
 }

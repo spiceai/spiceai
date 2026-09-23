@@ -6354,6 +6354,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn follower_reads_deferred_cache_fallback_after_origin_failure() {
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "origin error"));
+        let schema = origin.schema();
+        let stale = http_row(&schema, 0, "cached");
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![stale]], Arc::clone(&schema), None)
+                .expect("cache input"),
+        )));
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+            inner,
+            scans: Arc::clone(&scans),
+        });
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let leader = leader_claim(&in_flight, "request");
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "request".to_string(), None)
+        else {
+            panic!("second caller must be a follower");
+        };
+        drop(leader);
+
+        let session_state = test_session_state();
+        let filters = [col("request_path").eq(lit("/api/test"))];
+        let stream = CacheRefreshHelper::follow_cache_miss(
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
+                dataset_name: "http_data",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: StaleIfError::Enabled,
+                max_age: Duration::ZERO,
+                expired_batches: Some(CacheFallback::Deferred {
+                    input,
+                    partition: 0,
+                    context: Arc::new(TaskContext::default()),
+                }),
+            },
+        )
+        .await;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect fallback");
+
+        assert_eq!(batches.len(), 1);
+        let content = batches[0]
+            .column_by_name("content")
+            .expect("content")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string content");
+        assert_eq!(content.value(0), "cached");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the deferred accelerator scan runs when the origin fails"
+        );
+    }
+
     /// Regression guard for the shared `SessionState`. Every query plans its own
     /// `CachingAccelerationScanExec` (through `scan_plan`, and again through
     /// `with_new_children` on a plan rewrite), and each source fetch that exec issues — a cache
