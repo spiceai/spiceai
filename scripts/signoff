@@ -2469,7 +2469,7 @@ cmd_clear_pending() {
   # treats its own missing tooling that way; this is the same rule for the same
   # reason. Run by hand, the command still refuses: a person asking for the status
   # to be restated needs to be told it was not.
-  if ! command -v gh >/dev/null 2>&1 && is_remote_run; then
+  if is_remote_run && ! command -v gh >/dev/null 2>&1; then
     info "gh unavailable on this runner — leaving the ${STATUS_CONTEXT} status alone."
     return 0
   fi

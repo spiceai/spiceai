@@ -159,15 +159,21 @@ assert_clear_pending() {
   echo "  ok: $name"
 }
 
-# Runs `clear-pending` on a PATH from which every `gh` has been removed, and
-# checks the exit code ($2) and a substring of the output ($3). Remaining
-# arguments are environment assignments for the invocation.
+# The interpreter, resolved while PATH is still intact. `path_without_gh` below
+# drops whole directories, and on the ubuntu-24.04 runner this suite uses, `gh`
+# lives in `/usr/bin` — which, under the merged-/usr layout, is also where `bash`
+# is and what `/bin` points at. Looking the interpreter up on the filtered PATH
+# therefore fails with `env: bash: No such file or directory` and exit 127, so
+# both assertions below would report a failure without ever reaching the guard.
+bash_bin="$(command -v bash)"
+
+# Every PATH directory that holds an executable `gh`, removed — the state a runner
+# is in when the CLI is not reachable (#14234).
 #
-# The directories are filtered rather than replaced with a curated bin dir: the
-# script reaches for ordinary tools before and after the guard under test, and a
-# handmade PATH would make this a test of that list instead of a test of the guard.
-# The stub `gh` dir is deliberately not on this PATH either — the point is that no
-# `gh` is reachable at all.
+# Directories, because that is the only way to hide a command from `command -v`:
+# it walks PATH in order and takes the first executable named `gh`, so a shim
+# cannot shadow one. The subject needs nothing external before the guard returns,
+# which is what makes removing whole directories safe here.
 path_without_gh() {
   local dir out=""
   local IFS=:
@@ -179,6 +185,8 @@ path_without_gh() {
   printf '%s' "$out"
 }
 
+# Runs `clear-pending` with no `gh` reachable, and checks the exit code ($2) and a
+# substring of the output ($3). Remaining arguments are environment assignments.
 assert_clear_pending_without_gh() {
   local name="$1" want_rc="$2" want_output="$3"
   shift 3
@@ -186,8 +194,9 @@ assert_clear_pending_without_gh() {
 
   local output rc
   # `env` rather than an assignment prefix: the extra settings arrive in "$@".
+  # `$bash_bin`, not `bash`: `env` resolves its command on the PATH it is handed.
   output="$(env "PATH=$(path_without_gh)" "$@" \
-    bash "$subject" clear-pending "a canned reason" 2>&1)"
+    "$bash_bin" "$subject" clear-pending "a canned reason" 2>&1)"
   rc=$?
 
   if [[ "$rc" -ne "$want_rc" ]]; then
