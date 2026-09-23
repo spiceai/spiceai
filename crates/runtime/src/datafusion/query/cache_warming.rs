@@ -1072,7 +1072,7 @@ mod tests {
 
         // An already-oversized base (stale or edited persist) must also
         // drop duplicates and stop at the advertised cap.
-        let mut oversized = full.clone();
+        let mut oversized = full;
         oversized.push(WarmupTemplate {
             sql: "SELECT 0".to_string(),
             bindings: vec![],
