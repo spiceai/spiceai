@@ -1590,7 +1590,11 @@ impl GraphQLClient {
             }
         }
 
-        let limit_reached = query.limit_reached(limit, res.len());
+        // A `LIMIT` is a row count, so this page is measured in rows. One JSON object
+        // currently yields one single-row batch, which is why `res.len()` agreed; nothing
+        // holds that, and the paginated scan debits its remaining limit in rows.
+        let page_rows: usize = res.iter().map(RecordBatch::num_rows).sum();
+        let limit_reached = query.limit_reached(limit, page_rows);
 
         Ok(GraphQLQueryResult {
             records: res,
@@ -1633,18 +1637,9 @@ impl GraphQLClient {
             )
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let mut limit = limit;
 
             let first_page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
             total_rows += first_page_rows;
-            // What the remaining `limit` is debited by before the next page is
-            // requested. It is the rows that arrived, never the page size the
-            // query declares: a gateway-error retry shrinks the page below that
-            // size, and a connection-style API may return a short page for
-            // reasons of its own. Debiting the declared size retires rows that
-            // were never fetched, so a `LIMIT n` scan ends early and answers
-            // with fewer than `n` rows and no error (#14308).
-            let mut last_page_rows = first_page_rows;
             tracing::debug!(
                 page = 0,
                 page_rows = first_page_rows,
@@ -1693,14 +1688,24 @@ impl GraphQLClient {
                     break;
                 }
 
-                if let Some(value) = limit {
-                    limit = Some(value.saturating_sub(last_page_rows));
+                // What the next page may still ask for: the rows the caller wanted, less
+                // the rows already emitted. Never less the page size the query declares —
+                // a gateway-error retry shrinks the page below that size, and a
+                // connection-style API may return a short page of its own accord, so the
+                // declared size retires rows the scan never fetched (#14308).
+                let remaining_limit = match limit {
+                    Some(requested) => {
+                        let remaining = requested.saturating_sub(total_rows);
 
-                    // Stop if limit is exhausted
-                    if limit == Some(0) {
-                        break;
+                        // Stop if limit is exhausted
+                        if remaining == 0 {
+                            break;
+                        }
+
+                        Some(remaining)
                     }
-                }
+                    None => None,
+                };
 
                 previous_cursor = Some(next_cursor_val.clone());
 
@@ -1709,7 +1714,7 @@ impl GraphQLClient {
                     &self,
                     &query,
                     Some(Arc::clone(&gql_schema)),
-                    limit,
+                    remaining_limit,
                     Some(next_cursor_val),
                     error_checker.clone(),
                     query_cost,
@@ -1719,7 +1724,6 @@ impl GraphQLClient {
 
                 let page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
                 total_rows += page_rows;
-                last_page_rows = page_rows;
                 tracing::debug!(
                     page = pagination_count,
                     page_rows,
@@ -3520,18 +3524,18 @@ mod tests {
         assert!(result.contains('^'), "should show the caret marker");
     }
 
-    /// A gateway error shrinks the per-page size for the retry, so a page can
-    /// come back with fewer rows than the query's declared page size. The
-    /// remaining-`LIMIT` counter has to follow the rows that actually arrived:
-    /// debiting the declared size instead exhausts the limit early and ends the
-    /// scan with a short result that reports success (regression test for
-    /// #14308).
+    /// A page can carry fewer rows than the query's declared page size — a
+    /// gateway-error retry shrinks it, and a connection-style API may short one
+    /// of its own accord. The remaining-`LIMIT` counter has to follow the rows
+    /// that actually arrived: debiting the declared size retires rows the scan
+    /// never fetched, so it ends early and answers short while reporting success
+    /// (regression tests for #14308).
     mod limit_accounting {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         use arrow::array::RecordBatch;
-        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        use arrow::datatypes::{DataType, Field, Schema};
         use datafusion::catalog::TableProvider;
         use datafusion::physical_plan::collect;
         use datafusion::prelude::SessionContext;
@@ -3541,7 +3545,7 @@ mod tests {
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         use crate::graphql::builder::GraphQLClientBuilder;
-        use crate::graphql::client::UnnestBehavior;
+        use crate::graphql::client::{GraphQLQuery, UnnestBehavior};
         use crate::graphql::provider::GraphQLTableProviderBuilder;
 
         /// The page size the query declares, and the one the shrink ladder is
@@ -3553,10 +3557,16 @@ mod tests {
         /// The `LIMIT` from the failing CI query.
         const REQUESTED_LIMIT: usize = 125;
 
-        const QUERY: &str = "query { commits(first: 100) {
-            pageInfo { hasNextPage endCursor }
-            nodes { id }
-        } }";
+        /// Built from `DECLARED_PAGE_SIZE` so the size the query declares and the
+        /// size the assertions talk about cannot drift apart.
+        fn query() -> String {
+            format!(
+                "query {{ commits(first: {DECLARED_PAGE_SIZE}) {{
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{ id }}
+        }} }}"
+            )
+        }
 
         /// A connection-style endpoint: it serves the `first:` each request
         /// asks for — capped by `page_cap`, the way an API free to short a page
@@ -3578,8 +3588,8 @@ mod tests {
                 }
             }
 
-            fn with_one_gateway_error(mut self) -> Self {
-                self.gateway_error_pending = AtomicBool::new(true);
+            fn with_one_gateway_error(self) -> Self {
+                self.gateway_error_pending.store(true, Ordering::SeqCst);
                 self
             }
 
@@ -3588,24 +3598,23 @@ mod tests {
                 self
             }
 
-            /// `first: N` / `after: "cN"` out of the GraphQL document the client
-            /// sent, which is what decides the page this request gets.
+            /// The page this request asks for: the `first:` the client rendered, read
+            /// back with the same parser the client builds the query from, and the
+            /// offset its `after:` cursor names.
             fn page_request(query: &str) -> (usize, usize) {
-                let leading_number = |text: &str| {
-                    text.split(|c: char| !c.is_ascii_digit())
-                        .next()
-                        .and_then(|digits| digits.parse::<usize>().ok())
-                };
+                let first = GraphQLQuery::try_from(Arc::<str>::from(query))
+                    .expect("the client always sends a parseable query")
+                    .pagination_parameters
+                    .expect("the client always names a page size")
+                    .pagination_argument
+                    .size();
 
-                let first = query
-                    .split_once("first: ")
-                    .and_then(|(_, rest)| leading_number(rest))
-                    .expect("the client always names a page size");
-
+                // Cursors are this endpoint's own, minted below as `c{offset}`; the
+                // query parser drops `after:`, so read it off the rendered document.
                 let offset = query
-                    .split_once("after: ")
-                    .and_then(|(_, rest)| rest.split_once('c'))
-                    .and_then(|(_, rest)| leading_number(rest))
+                    .split_once("after: \"c")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .and_then(|(digits, _)| digits.parse::<usize>().ok())
                     .unwrap_or(0);
 
                 (first, offset)
@@ -3652,20 +3661,21 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let schema: SchemaRef =
-                Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
-
             let client = GraphQLClientBuilder::new(
                 Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
                 UnnestBehavior::Depth(0),
             )
             .with_json_pointer(Some("/data/commits/nodes"))
-            .with_schema(Some(Arc::clone(&schema)))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
             .build(reqwest::Client::new())
             .expect("client to build");
 
             let provider = GraphQLTableProviderBuilder::new(client)
-                .build_without_validation(QUERY)
+                .build_without_validation(&query())
                 .expect("provider to build without validation");
 
             let ctx = SessionContext::new();
@@ -3686,8 +3696,8 @@ mod tests {
             (batches.iter().map(RecordBatch::num_rows).sum(), requests)
         }
 
-        /// The reported failure: one 502 shrinks the page to 55 rows, and the
-        /// scan stops 45 rows short of the `LIMIT` with a successful result.
+        /// The reported failure: one 502 shrinks the page 100 -> 55, and the scan
+        /// stops 45 rows short of the `LIMIT` with a successful result.
         #[tokio::test]
         async fn a_limit_spanning_a_shrunk_page_returns_every_requested_row() {
             let (rows, _) = scan_rows(
@@ -3704,9 +3714,8 @@ mod tests {
             );
         }
 
-        /// The shrink makes it systematic, but the defect is the accounting: any
-        /// page shorter than the declared size over-debits the remaining limit,
-        /// with no error in sight.
+        /// The shrink makes it systematic, but the defect is the accounting, so a
+        /// short page over-debits with no error anywhere in sight.
         #[tokio::test]
         async fn a_short_page_with_no_gateway_error_still_answers_the_limit() {
             let (rows, _) = scan_rows(
