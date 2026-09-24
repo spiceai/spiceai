@@ -4570,9 +4570,14 @@ mod tests {
             .downcast_ref::<arrow::array::StringViewArray>()
         {
             arr.value(0).to_string()
+        } else if let Some(arr) = value_col
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+        {
+            arr.value(0).to_string()
         } else {
             panic!(
-                "value decoded as {}, expected Utf8 or Utf8View",
+                "value decoded as {}, expected Utf8, Utf8View, or LargeUtf8",
                 value_col.data_type()
             );
         };
