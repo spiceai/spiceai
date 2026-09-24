@@ -445,10 +445,6 @@ impl PaginationParameters {
 }
 
 impl PaginationParameters {
-    fn reduce_limit(&self, l: usize) -> usize {
-        l.saturating_sub(self.pagination_argument.size())
-    }
-
     /// Parses the GraphQL query and returns the appropriate [`PaginationParameters`] if the query
     /// contains a `pageInfo` field (and therefore involved pagination). Alongside the parameters,
     /// it also infers the standard JSON pointer to the paginated data as expected when
@@ -1641,6 +1637,14 @@ impl GraphQLClient {
 
             let first_page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
             total_rows += first_page_rows;
+            // What the remaining `limit` is debited by before the next page is
+            // requested. It is the rows that arrived, never the page size the
+            // query declares: a gateway-error retry shrinks the page below that
+            // size, and a connection-style API may return a short page for
+            // reasons of its own. Debiting the declared size retires rows that
+            // were never fetched, so a `LIMIT n` scan ends early and answers
+            // with fewer than `n` rows and no error (#14308).
+            let mut last_page_rows = first_page_rows;
             tracing::debug!(
                 page = 0,
                 page_rows = first_page_rows,
@@ -1689,10 +1693,8 @@ impl GraphQLClient {
                     break;
                 }
 
-                if let Some(p) = query.pagination_parameters.as_ref()
-                    && let Some(value) = limit
-                {
-                    limit = Some(p.reduce_limit(value));
+                if let Some(value) = limit {
+                    limit = Some(value.saturating_sub(last_page_rows));
 
                     // Stop if limit is exhausted
                     if limit == Some(0) {
@@ -1717,6 +1719,7 @@ impl GraphQLClient {
 
                 let page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
                 total_rows += page_rows;
+                last_page_rows = page_rows;
                 tracing::debug!(
                     page = pagination_count,
                     page_rows,
@@ -3515,5 +3518,233 @@ mod tests {
         let result = super::format_query_with_context(query, 2, 3);
         assert!(result.contains("  users {"), "should show the error line");
         assert!(result.contains('^'), "should show the caret marker");
+    }
+
+    /// A gateway error shrinks the per-page size for the retry, so a page can
+    /// come back with fewer rows than the query's declared page size. The
+    /// remaining-`LIMIT` counter has to follow the rows that actually arrived:
+    /// debiting the declared size instead exhausts the limit early and ends the
+    /// scan with a short result that reports success (regression test for
+    /// #14308).
+    mod limit_accounting {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        use datafusion::catalog::TableProvider;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use serde_json::{Value, json};
+        use url::Url;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::UnnestBehavior;
+        use crate::graphql::provider::GraphQLTableProviderBuilder;
+
+        /// The page size the query declares, and the one the shrink ladder is
+        /// seeded from: `100 -> 55` on the first gateway error.
+        const DECLARED_PAGE_SIZE: usize = 100;
+        /// Rows the endpoint can serve — far more than the requested limit, so
+        /// a short answer is never end-of-data.
+        const SOURCE_ROWS: usize = 500;
+        /// The `LIMIT` from the failing CI query.
+        const REQUESTED_LIMIT: usize = 125;
+
+        const QUERY: &str = "query { commits(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { id }
+        } }";
+
+        /// A connection-style endpoint: it serves the `first:` each request
+        /// asks for — capped by `page_cap`, the way an API free to short a page
+        /// does — hands back a cursor while rows remain, and can fail its very
+        /// first request with a 502 so the client shrinks its page size once,
+        /// the sequence logged in the run this issue was filed from.
+        struct Connection {
+            gateway_error_pending: AtomicBool,
+            source_rows: usize,
+            page_cap: Option<usize>,
+        }
+
+        impl Connection {
+            fn new(source_rows: usize) -> Self {
+                Self {
+                    gateway_error_pending: AtomicBool::new(false),
+                    source_rows,
+                    page_cap: None,
+                }
+            }
+
+            fn with_one_gateway_error(mut self) -> Self {
+                self.gateway_error_pending = AtomicBool::new(true);
+                self
+            }
+
+            fn with_page_cap(mut self, cap: usize) -> Self {
+                self.page_cap = Some(cap);
+                self
+            }
+
+            /// `first: N` / `after: "cN"` out of the GraphQL document the client
+            /// sent, which is what decides the page this request gets.
+            fn page_request(query: &str) -> (usize, usize) {
+                let leading_number = |text: &str| {
+                    text.split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .and_then(|digits| digits.parse::<usize>().ok())
+                };
+
+                let first = query
+                    .split_once("first: ")
+                    .and_then(|(_, rest)| leading_number(rest))
+                    .expect("the client always names a page size");
+
+                let offset = query
+                    .split_once("after: ")
+                    .and_then(|(_, rest)| rest.split_once('c'))
+                    .and_then(|(_, rest)| leading_number(rest))
+                    .unwrap_or(0);
+
+                (first, offset)
+            }
+        }
+
+        impl Respond for Connection {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                if self.gateway_error_pending.swap(false, Ordering::SeqCst) {
+                    return ResponseTemplate::new(502).set_body_string("<html>Bad gateway</html>");
+                }
+
+                let body: Value =
+                    serde_json::from_slice(&request.body).expect("a JSON request body");
+                let query = body
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .expect("the request carries its query");
+
+                let (first, offset) = Self::page_request(query);
+                let wanted = self.page_cap.map_or(first, |cap| std::cmp::min(first, cap));
+                let served = std::cmp::min(wanted, self.source_rows.saturating_sub(offset));
+                let next = offset + served;
+                let nodes: Vec<Value> = (offset..next)
+                    .map(|i| json!({"id": format!("r{i}")}))
+                    .collect();
+
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"commits": {
+                    "pageInfo": {
+                        "hasNextPage": next < self.source_rows,
+                        "endCursor": format!("c{next}"),
+                    },
+                    "nodes": nodes,
+                }}}))
+            }
+        }
+
+        /// Runs `QUERY` against `endpoint` through the table provider, the way a
+        /// `SELECT … LIMIT n` reaches it, and returns the rows it answered with.
+        async fn scan_rows(endpoint: Connection, limit: Option<usize>) -> (usize, usize) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(endpoint)
+                .mount(&server)
+                .await;
+
+            let schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/commits/nodes"))
+            .with_schema(Some(Arc::clone(&schema)))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let provider = GraphQLTableProviderBuilder::new(client)
+                .build_without_validation(QUERY)
+                .expect("provider to build without validation");
+
+            let ctx = SessionContext::new();
+            let plan = provider
+                .scan(&ctx.state(), None, &[], limit)
+                .await
+                .expect("scan to plan");
+            let batches: Vec<RecordBatch> = collect(plan, ctx.task_ctx())
+                .await
+                .expect("the scan to succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+
+            (batches.iter().map(RecordBatch::num_rows).sum(), requests)
+        }
+
+        /// The reported failure: one 502 shrinks the page to 55 rows, and the
+        /// scan stops 45 rows short of the `LIMIT` with a successful result.
+        #[tokio::test]
+        async fn a_limit_spanning_a_shrunk_page_returns_every_requested_row() {
+            let (rows, _) = scan_rows(
+                Connection::new(SOURCE_ROWS).with_one_gateway_error(),
+                Some(REQUESTED_LIMIT),
+            )
+            .await;
+
+            assert_eq!(
+                rows, REQUESTED_LIMIT,
+                "a source holding {SOURCE_ROWS} rows must answer LIMIT {REQUESTED_LIMIT} in full; \
+                 a page shrunk below the declared size of {DECLARED_PAGE_SIZE} must not retire \
+                 rows the scan never fetched"
+            );
+        }
+
+        /// The shrink makes it systematic, but the defect is the accounting: any
+        /// page shorter than the declared size over-debits the remaining limit,
+        /// with no error in sight.
+        #[tokio::test]
+        async fn a_short_page_with_no_gateway_error_still_answers_the_limit() {
+            let (rows, _) = scan_rows(
+                Connection::new(SOURCE_ROWS).with_page_cap(40),
+                Some(REQUESTED_LIMIT),
+            )
+            .await;
+
+            assert_eq!(
+                rows, REQUESTED_LIMIT,
+                "an endpoint that serves 40 rows per page still owes every one of the \
+                 {REQUESTED_LIMIT} requested rows"
+            );
+        }
+
+        /// The counter must not run the other way either: a limit inside a
+        /// single page still costs exactly one request.
+        #[tokio::test]
+        async fn a_limit_inside_one_page_stops_after_one_request() {
+            let (rows, requests) = scan_rows(Connection::new(SOURCE_ROWS), Some(10)).await;
+
+            assert_eq!(rows, 10, "LIMIT 10 is answered by the first page");
+            assert_eq!(
+                requests, 1,
+                "a limit the first page already satisfies must not fetch another page"
+            );
+        }
+
+        /// A source with fewer rows than the limit is end-of-data, not a short
+        /// page: the scan ends when the cursor does, with what exists.
+        #[tokio::test]
+        async fn a_source_smaller_than_the_limit_ends_the_scan() {
+            let (rows, _) = scan_rows(Connection::new(30), Some(REQUESTED_LIMIT)).await;
+
+            assert_eq!(
+                rows, 30,
+                "a scan that runs out of rows answers with the rows there are"
+            );
+        }
     }
 }
