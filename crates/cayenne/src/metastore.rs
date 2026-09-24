@@ -587,6 +587,21 @@ pub trait MetastoreTransaction: Send + Sync {
     /// Returns an error if the statement cannot be executed.
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()>;
 
+    /// Execute one parameterized statement once per entry of `params`, in order,
+    /// within the transaction.
+    ///
+    /// Equivalent to calling [`Self::execute`] once per entry, but the statement
+    /// is prepared once and every entry runs in one round trip to the
+    /// connection, so a bulk rewrite does not pay that round trip per row while
+    /// it holds the metastore write lock. The first entry that fails stops the
+    /// batch and returns its error; entries before it stay applied until the
+    /// caller rolls the transaction back.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the first entry that fails to execute.
+    async fn execute_many(&self, sql: &str, params: Vec<Vec<MetastoreValue>>) -> CatalogResult<()>;
+
     /// Query a single row within the transaction and return its values.
     ///
     /// # Errors

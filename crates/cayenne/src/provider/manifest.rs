@@ -66,8 +66,8 @@ pub(crate) struct SeqPrefixPlan {
 ///   manifest with its merged `[min, max]` over the inputs (full-rewrite,
 ///   subset merge).
 /// - [`Self::PreserveOrUniform`] — keep any range already recorded for a file
-///   (so a re-list never clobbers a compaction-authored merged range — the
-///   catalog upsert is `INSERT OR REPLACE`), and tag a brand-new (untagged)
+///   (so a re-list never clobbers a compaction-authored merged range — a
+///   manifest write replaces every column of a stored row), and tag a brand-new (untagged)
 ///   file `[min, max]`. Used by `rebuild_live_snapshot_manifests`:
 ///   - the CURRENT snapshot uses `[0, current_seq]` — a brand-new file there
 ///     has an unknown true min, so `0` keeps it always bake-eligible (never

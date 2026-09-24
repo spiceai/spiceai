@@ -1907,6 +1907,36 @@ impl MetastoreTransaction for SqliteTransaction {
         Ok(())
     }
 
+    async fn execute_many(&self, sql: &str, params: Vec<Vec<MetastoreValue>>) -> CatalogResult<()> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        if params.is_empty() {
+            return Ok(());
+        }
+        let sql = sql.to_string();
+        let rows: Vec<Vec<rusqlite::types::Value>> = params
+            .into_iter()
+            .map(|row| row.into_iter().map(to_sqlite_value).collect())
+            .collect();
+
+        // One `call` for every row: the statement is prepared once and each row
+        // is a step on the connection thread, not a channel round trip.
+        conn.call(move |conn| {
+            let mut stmt = conn.prepare_cached(&sql)?;
+            for row in &rows {
+                stmt.execute(rusqlite::params_from_iter(row))?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| {
+            convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
+        })?;
+
+        Ok(())
+    }
+
     async fn query_row_values(
         &self,
         params: QueryRowParams<'_>,
@@ -2073,6 +2103,100 @@ mod tests {
     /// across the whole process, so a shared name would leak state between tests.
     fn in_memory_metastore(name: &str) -> SqliteMetastore {
         SqliteMetastore::new(format!("sqlite://file:/{name}?vfs=memdb"))
+    }
+
+    async fn count_rows(tx: &dyn MetastoreTransaction, sql: &str) -> i64 {
+        let value = tx
+            .query_row_values(QueryRowParams {
+                sql,
+                params: vec![],
+            })
+            .await
+            .expect("count query")
+            .into_iter()
+            .next()
+            .expect("one column");
+        let MetastoreValue::Integer(count) = value else {
+            panic!("COUNT(*) returned {value:?}");
+        };
+        count
+    }
+
+    /// `execute_many` runs its statement once per entry, in order, and the first
+    /// entry that fails stops the batch with that entry's error — what a loop of
+    /// `execute` calls does, so the caller's rollback leaves nothing behind.
+    #[tokio::test]
+    async fn test_execute_many_runs_every_entry_and_stops_at_the_first_failure() {
+        const INSERT: &str = "INSERT INTO t (id, label) VALUES (?1, ?2)";
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+            .await
+            .expect("create table");
+
+        let tx = metastore.begin_transaction().await.expect("begin");
+        tx.execute_many(INSERT, Vec::new())
+            .await
+            .expect("an empty batch is a no-op");
+        let rows = (0..1_000)
+            .map(|i| {
+                vec![
+                    MetastoreValue::Integer(i),
+                    MetastoreValue::Text(format!("row-{i}")),
+                ]
+            })
+            .collect();
+        tx.execute_many(INSERT, rows).await.expect("insert batch");
+        tx.commit().await.expect("commit");
+
+        let tx = metastore.begin_transaction().await.expect("begin");
+        assert_eq!(
+            count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t").await,
+            1_000,
+            "every entry of the batch must run"
+        );
+        let result = tx
+            .execute_many(
+                INSERT,
+                vec![
+                    vec![
+                        MetastoreValue::Integer(5_000),
+                        MetastoreValue::Text("first".to_string()),
+                    ],
+                    vec![
+                        MetastoreValue::Integer(0),
+                        MetastoreValue::Text("duplicate key".to_string()),
+                    ],
+                    vec![
+                        MetastoreValue::Integer(5_001),
+                        MetastoreValue::Text("after the failure".to_string()),
+                    ],
+                ],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CatalogError::ConstraintViolation { .. })),
+            "the failing entry's constraint violation must surface: {result:?}"
+        );
+        assert_eq!(
+            count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t WHERE id = 5000").await,
+            1,
+            "entries before the failure stay applied until the caller rolls back"
+        );
+        assert_eq!(
+            count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t WHERE id = 5001").await,
+            0,
+            "entries after the failure never run"
+        );
+        tx.rollback().await.expect("rollback");
+
+        let tx = metastore.begin_transaction().await.expect("begin");
+        assert_eq!(
+            count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t").await,
+            1_000,
+            "rolling back drops the partially applied batch"
+        );
+        tx.rollback().await.expect("rollback");
     }
 
     /// Cayenne memory mode: an in-memory (memdb) metastore must be usable and,

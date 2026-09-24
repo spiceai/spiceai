@@ -557,7 +557,7 @@ impl CayenneCatalog {
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
         txn.execute(ExecuteParams {
-            sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+            sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
             params: vec![
                 MetastoreValue::Text(table_id.to_string()),
                 MetastoreValue::Text(target_snapshot_id.to_string()),
@@ -629,23 +629,11 @@ impl CayenneCatalog {
             ],
         })
         .await?;
-        for file in files {
-            txn.execute(ExecuteParams {
-                sql: "INSERT INTO cayenne_snapshot_file (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
-                    MetastoreValue::Text(file.table_id.clone()),
-                    MetastoreValue::Text(file.snapshot_id.clone()),
-                    MetastoreValue::Text(file.file_path.clone()),
-                    MetastoreValue::Integer(file.row_count),
-                    MetastoreValue::Integer(file.file_size_bytes),
-                    MetastoreValue::Integer(file.min_sequence),
-                    MetastoreValue::Integer(file.max_sequence),
-                    file.digest.clone().map_or(MetastoreValue::Null, MetastoreValue::Text),
-                ],
-            })
-            .await?;
-        }
-        Ok(())
+        txn.execute_many(
+            SNAPSHOT_FILE_INSERT_SQL,
+            files.iter().map(snapshot_file_params).collect(),
+        )
+        .await
     }
 
     async fn existing_delete_file_record(
@@ -961,9 +949,10 @@ impl CayenneCatalog {
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
              DELETE FROM cayenne_snapshot_file_statistics \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
-             INSERT OR REPLACE INTO cayenne_snapshot_sequence \
+             INSERT INTO cayenne_snapshot_sequence \
                 (table_id, snapshot_id, sequence_number) \
-                VALUES ({table_id_literal}, {new_snapshot_id_literal}, {new_sequence_number});"
+                VALUES ({table_id_literal}, {new_snapshot_id_literal}, {new_sequence_number}) \
+                ON CONFLICT(table_id, snapshot_id) DO UPDATE SET sequence_number = excluded.sequence_number;"
         );
         txn.execute_batch(&batch_sql).await?;
         Ok(true)
@@ -1031,12 +1020,10 @@ impl CayenneCatalog {
         // tier's inline corpus along with everything else keyed on the old snapshot.
         self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
             .await?;
-        for f in cold_files {
-            txn.execute(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_cold_tier_file \
-                      (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob, pk_bloom_blob) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
+        let rows = cold_files
+            .iter()
+            .map(|f| {
+                vec![
                     MetastoreValue::Text(f.table_id.clone()),
                     MetastoreValue::Text(f.file_url.clone()),
                     MetastoreValue::Integer(f.row_count),
@@ -1047,11 +1034,10 @@ impl CayenneCatalog {
                     f.pk_bloom
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Blob),
-                ],
+                ]
             })
-            .await?;
-        }
-        Ok(())
+            .collect();
+        txn.execute_many(COLD_TIER_FILE_UPSERT_SQL, rows).await
     }
 
     /// # Errors
@@ -1850,7 +1836,7 @@ impl CayenneCatalog {
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
                     .execute(ExecuteParams {
-                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
                         params: vec![
                             MetastoreValue::Text(table_id.to_string()),
                             MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
@@ -3148,7 +3134,7 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
@@ -3686,9 +3672,7 @@ impl MetadataCatalog for CayenneCatalog {
     async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
-                      VALUES (?1, ?2, ?3, ?4, ?5)",
+                sql: TABLE_STATISTICS_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
@@ -3747,9 +3731,7 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file_statistics \
-                      (table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                sql: SNAPSHOT_FILE_STATISTICS_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Text(stats.snapshot_id.clone()),
@@ -3854,21 +3836,8 @@ impl MetadataCatalog for CayenneCatalog {
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
-                    MetastoreValue::Text(file.table_id.clone()),
-                    MetastoreValue::Text(file.snapshot_id.clone()),
-                    MetastoreValue::Text(file.file_path.clone()),
-                    MetastoreValue::Integer(file.row_count),
-                    MetastoreValue::Integer(file.file_size_bytes),
-                    MetastoreValue::Integer(file.min_sequence),
-                    MetastoreValue::Integer(file.max_sequence),
-                    file.digest
-                        .clone()
-                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
-                ],
+                sql: SNAPSHOT_FILE_UPSERT_SQL,
+                params: snapshot_file_params(file),
             })
             .await
     }
@@ -3879,6 +3848,19 @@ impl MetadataCatalog for CayenneCatalog {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
+        // Validate before taking the write lock: a rejected replacement then
+        // never touches the stored manifest.
+        if let Some(file) = files
+            .iter()
+            .find(|file| file.table_id != table_id || file.snapshot_id != snapshot_id)
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Snapshot manifest replacement row does not match target table/snapshot: expected {table_id}/{snapshot_id}, found {}/{}",
+                    file.table_id, file.snapshot_id
+                ),
+            });
+        }
         let txn = self.begin_transaction().await?;
         txn.execute(ExecuteParams {
             sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
@@ -3888,34 +3870,11 @@ impl MetadataCatalog for CayenneCatalog {
             ],
         })
         .await?;
-        for file in files {
-            if file.table_id != table_id || file.snapshot_id != snapshot_id {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Snapshot manifest replacement row does not match target table/snapshot: expected {table_id}/{snapshot_id}, found {}/{}",
-                        file.table_id, file.snapshot_id
-                    ),
-                });
-            }
-            txn.execute(ExecuteParams {
-                sql: "INSERT INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
-                    MetastoreValue::Text(file.table_id.clone()),
-                    MetastoreValue::Text(file.snapshot_id.clone()),
-                    MetastoreValue::Text(file.file_path.clone()),
-                    MetastoreValue::Integer(file.row_count),
-                    MetastoreValue::Integer(file.file_size_bytes),
-                    MetastoreValue::Integer(file.min_sequence),
-                    MetastoreValue::Integer(file.max_sequence),
-                    file.digest
-                        .clone()
-                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
-                ],
-            })
-            .await?;
-        }
+        txn.execute_many(
+            SNAPSHOT_FILE_INSERT_SQL,
+            files.iter().map(snapshot_file_params).collect(),
+        )
+        .await?;
         txn.commit().await
     }
 
@@ -4103,9 +4062,7 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_pk_index \
-                      (table_id, snapshot_id, index_blob) \
-                      VALUES (?1, ?2, ?3)",
+                sql: PK_INDEX_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
@@ -4953,7 +4910,7 @@ impl MetadataCatalog for CayenneCatalog {
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
                     .execute(ExecuteParams {
-                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
                         params: vec![
                             MetastoreValue::Text(table_id.to_string()),
                             MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
@@ -5452,6 +5409,83 @@ fn insert_record_table_id_blob_literal(table_id: &str) -> String {
     hex
 }
 
+/// The one statement that inserts a `cayenne_snapshot_file` manifest row, bound by
+/// [`snapshot_file_params`]. Every manifest write path shares it so the column list
+/// and parameter order cannot drift between them.
+const SNAPSHOT_FILE_INSERT_SQL: &str = "INSERT INTO cayenne_snapshot_file \
+     (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+
+/// Bind one manifest row in [`SNAPSHOT_FILE_INSERT_SQL`] /
+/// [`SNAPSHOT_FILE_UPSERT_SQL`] column order.
+fn snapshot_file_params(file: &SnapshotFile) -> Vec<MetastoreValue> {
+    vec![
+        MetastoreValue::Text(file.table_id.clone()),
+        MetastoreValue::Text(file.snapshot_id.clone()),
+        MetastoreValue::Text(file.file_path.clone()),
+        MetastoreValue::Integer(file.row_count),
+        MetastoreValue::Integer(file.file_size_bytes),
+        MetastoreValue::Integer(file.min_sequence),
+        MetastoreValue::Integer(file.max_sequence),
+        file.digest
+            .clone()
+            .map_or(MetastoreValue::Null, MetastoreValue::Text),
+    ]
+}
+
+// Every upsert into a child of `cayenne_table` is `INSERT … ON CONFLICT … DO
+// UPDATE`, not `INSERT OR REPLACE`. REPLACE resolves the conflict by deleting the
+// stored row and inserting a new one, and on a table with a foreign key that
+// delete runs SQLite's delete-side foreign-key processing. DO UPDATE rewrites the
+// row in place and never changes `table_id`, so it does no foreign-key work. Each
+// DO UPDATE sets every non-key column from the new row, so the stored row is the
+// one REPLACE would have written (`test_upserts_set_every_non_key_column`).
+
+/// Upsert of one `cayenne_snapshot_sequence` row.
+const SNAPSHOT_SEQUENCE_UPSERT_SQL: &str = "INSERT INTO cayenne_snapshot_sequence \
+     (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(table_id, snapshot_id) DO UPDATE SET sequence_number = excluded.sequence_number";
+
+/// Upsert of a table's `cayenne_table_statistics` row.
+const TABLE_STATISTICS_UPSERT_SQL: &str = "INSERT INTO cayenne_table_statistics \
+     (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
+     VALUES (?1, ?2, ?3, ?4, ?5) \
+     ON CONFLICT(table_id) DO UPDATE SET statistics_blob = excluded.statistics_blob, \
+     num_rows = excluded.num_rows, ndv_sketches = excluded.ndv_sketches, \
+     num_rows_exact = excluded.num_rows_exact";
+
+/// Upsert of one file's `cayenne_snapshot_file_statistics` row.
+const SNAPSHOT_FILE_STATISTICS_UPSERT_SQL: &str = "INSERT INTO cayenne_snapshot_file_statistics \
+     (table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     ON CONFLICT(table_id, snapshot_id, file_path) DO UPDATE SET \
+     file_size_bytes = excluded.file_size_bytes, num_rows = excluded.num_rows, \
+     statistics_blob = excluded.statistics_blob";
+
+/// Upsert form of [`SNAPSHOT_FILE_INSERT_SQL`], bound by [`snapshot_file_params`].
+const SNAPSHOT_FILE_UPSERT_SQL: &str = "INSERT INTO cayenne_snapshot_file \
+     (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+     ON CONFLICT(table_id, snapshot_id, file_path) DO UPDATE SET \
+     row_count = excluded.row_count, file_size_bytes = excluded.file_size_bytes, \
+     min_sequence = excluded.min_sequence, max_sequence = excluded.max_sequence, \
+     digest = excluded.digest";
+
+/// Upsert of a table's `cayenne_pk_index` row.
+const PK_INDEX_UPSERT_SQL: &str = "INSERT INTO cayenne_pk_index \
+     (table_id, snapshot_id, index_blob) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(table_id) DO UPDATE SET snapshot_id = excluded.snapshot_id, \
+     index_blob = excluded.index_blob";
+
+/// Upsert of one `cayenne_cold_tier_file` row.
+const COLD_TIER_FILE_UPSERT_SQL: &str = "INSERT INTO cayenne_cold_tier_file \
+     (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob, pk_bloom_blob) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+     ON CONFLICT(table_id, file_url) DO UPDATE SET row_count = excluded.row_count, \
+     file_size_bytes = excluded.file_size_bytes, min_sequence = excluded.min_sequence, \
+     max_sequence = excluded.max_sequence, statistics_blob = excluded.statistics_blob, \
+     pk_bloom_blob = excluded.pk_bloom_blob";
+
 /// The one statement that appends a row to `cayenne_inlined_data`. Shared by
 /// every inline write path so the column list and parameter order cannot drift
 /// between them; see [`inlined_data_insert`].
@@ -5805,6 +5839,295 @@ mod tests {
     async fn test_catalog_creation() {
         let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
         // Tests will be added once implementation is complete
+    }
+
+    /// The upserts replaced `INSERT OR REPLACE`, which rewrote the whole row.
+    /// `DO UPDATE` writes only the columns it names, so each upsert must insert
+    /// every column of its table and set every non-key column from the new row —
+    /// otherwise a column the table gains later keeps its stale value.
+    #[test]
+    fn test_upserts_set_every_non_key_column() {
+        use std::collections::BTreeSet;
+
+        fn between<'a>(sql: &'a str, open: &str, close: &str) -> &'a str {
+            let start = sql.find(open).expect("opening token") + open.len();
+            let end = start + sql[start..].find(close).expect("closing token");
+            &sql[start..end]
+        }
+        fn column_set(list: &str) -> BTreeSet<String> {
+            list.split(',').map(|c| c.trim().to_string()).collect()
+        }
+
+        for sql in [
+            SNAPSHOT_SEQUENCE_UPSERT_SQL,
+            TABLE_STATISTICS_UPSERT_SQL,
+            SNAPSHOT_FILE_STATISTICS_UPSERT_SQL,
+            SNAPSHOT_FILE_UPSERT_SQL,
+            PK_INDEX_UPSERT_SQL,
+            COLD_TIER_FILE_UPSERT_SQL,
+        ] {
+            let table = between(sql, "INSERT INTO ", " ");
+            let expected = crate::metastore::EXPECTED_TABLES
+                .iter()
+                .find(|t| t.name == table)
+                .expect("the upsert targets a metastore table");
+            let all: BTreeSet<String> = expected.columns.iter().map(|c| (*c).to_string()).collect();
+            assert_eq!(
+                column_set(between(sql, "(", ")")),
+                all,
+                "{table}: the upsert must insert every column"
+            );
+
+            let key = column_set(between(sql, "ON CONFLICT(", ")"));
+            let (_, assignments) = sql
+                .split_once("DO UPDATE SET ")
+                .expect("an ON CONFLICT DO UPDATE upsert");
+            let mut set = BTreeSet::new();
+            for assignment in assignments.split(',') {
+                let (column, value) = assignment.split_once('=').expect("column = value");
+                let column = column.trim();
+                assert_eq!(
+                    value.trim(),
+                    format!("excluded.{column}"),
+                    "{table}: {column} must be set from the new row"
+                );
+                set.insert(column.to_string());
+            }
+            let non_key: BTreeSet<String> = all.difference(&key).cloned().collect();
+            assert_eq!(
+                set, non_key,
+                "{table}: DO UPDATE must set exactly the non-key columns"
+            );
+        }
+    }
+
+    type ManifestRow = (String, String, String, i64, i64, i64, i64, Option<String>);
+
+    fn manifest_row(f: &SnapshotFile) -> ManifestRow {
+        (
+            f.table_id.clone(),
+            f.snapshot_id.clone(),
+            f.file_path.clone(),
+            f.row_count,
+            f.file_size_bytes,
+            f.min_sequence,
+            f.max_sequence,
+            f.digest.clone(),
+        )
+    }
+
+    async fn stored_manifest(
+        catalog: &CayenneCatalog,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> Vec<ManifestRow> {
+        let mut rows: Vec<ManifestRow> = catalog
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
+            .expect("read manifest")
+            .iter()
+            .map(manifest_row)
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A catalog in its own temporary directory with one table; returns the
+    /// catalog, the table's id and current snapshot id, and the guards that keep
+    /// the database and table root alive.
+    async fn catalog_with_table(
+        table_name: &str,
+    ) -> (
+        CayenneCatalog,
+        String,
+        String,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let (table_root, base_path) = test_table_root();
+        let db_dir = tempfile::tempdir().expect("database directory");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            db_dir.path().join("cayenne.db").display()
+        ))
+        .expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path,
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+        let snapshot_id = catalog
+            .get_table(table_name)
+            .await
+            .expect("get table")
+            .current_snapshot_id;
+        (catalog, table_id, snapshot_id, db_dir, table_root)
+    }
+
+    /// A second upsert of a stored key leaves exactly the second row's values —
+    /// `NULL`s included — which is what `INSERT OR REPLACE` stored.
+    #[tokio::test]
+    async fn test_upserts_overwrite_every_column_of_a_stored_row() {
+        let (catalog, table_id, snapshot_id, _db, _root) =
+            catalog_with_table("upsert_overwrite").await;
+
+        let first = SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "a.vortex".to_string(),
+            row_count: 1,
+            file_size_bytes: 2,
+            min_sequence: 3,
+            max_sequence: 4,
+            digest: Some("xxh3-128:01".to_string()),
+        };
+        let second = SnapshotFile {
+            row_count: 10,
+            file_size_bytes: 20,
+            min_sequence: 30,
+            max_sequence: 40,
+            digest: None,
+            ..first.clone()
+        };
+        catalog
+            .upsert_snapshot_file(&first)
+            .await
+            .expect("first upsert");
+        catalog
+            .upsert_snapshot_file(&second)
+            .await
+            .expect("second upsert");
+        assert_eq!(
+            stored_manifest(&catalog, &table_id, &snapshot_id).await,
+            vec![manifest_row(&second)]
+        );
+
+        let stats = |file_size_bytes, num_rows, blob: &[u8]| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "a.vortex".to_string(),
+            file_size_bytes,
+            num_rows,
+            statistics_blob: blob.to_vec(),
+        };
+        catalog
+            .upsert_snapshot_file_statistics(&stats(1, 2, &[1, 2, 3]))
+            .await
+            .expect("first file stats upsert");
+        catalog
+            .upsert_snapshot_file_statistics(&stats(10, 20, &[9]))
+            .await
+            .expect("second file stats upsert");
+        let stored = catalog
+            .get_snapshot_file_statistics(&table_id, &snapshot_id, "a.vortex")
+            .await
+            .expect("read file stats")
+            .expect("file stats row");
+        assert_eq!(
+            (
+                stored.file_size_bytes,
+                stored.num_rows,
+                stored.statistics_blob
+            ),
+            (10, 20, vec![9])
+        );
+
+        catalog
+            .upsert_pk_index(&table_id, "snapshot-a", &[1, 2, 3])
+            .await
+            .expect("first pk index upsert");
+        catalog
+            .upsert_pk_index(&table_id, "snapshot-b", &[4])
+            .await
+            .expect("second pk index upsert");
+        assert_eq!(
+            catalog
+                .get_pk_index(&table_id)
+                .await
+                .expect("read pk index"),
+            Some(("snapshot-b".to_string(), vec![4]))
+        );
+
+        catalog
+            .set_snapshot_sequence(&table_id, &snapshot_id, 5)
+            .await
+            .expect("first sequence upsert");
+        catalog
+            .set_snapshot_sequence(&table_id, &snapshot_id, 9)
+            .await
+            .expect("second sequence upsert");
+        assert_eq!(
+            catalog
+                .get_snapshot_sequence(&table_id, &snapshot_id)
+                .await
+                .expect("read sequence"),
+            Some(9)
+        );
+    }
+
+    /// Both manifest rewrites write the whole manifest in one batch; every row
+    /// must land, with its values.
+    #[tokio::test]
+    async fn test_replace_snapshot_files_writes_every_row() {
+        let (catalog, table_id, snapshot_id, _db, _root) =
+            catalog_with_table("manifest_batch").await;
+        let files: Vec<SnapshotFile> = (0..2_500_i64)
+            .map(|i| SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: format!("{i:05}.vortex"),
+                row_count: i,
+                file_size_bytes: i * 2,
+                min_sequence: i,
+                max_sequence: i + 1,
+                digest: (i % 2 == 0).then(|| format!("xxh3-128:{i:032x}")),
+            })
+            .collect();
+
+        catalog
+            .replace_snapshot_files(&table_id, &snapshot_id, &files)
+            .await
+            .expect("replace manifest");
+        let mut expected: Vec<ManifestRow> = files.iter().map(manifest_row).collect();
+        expected.sort();
+        assert_eq!(
+            stored_manifest(&catalog, &table_id, &snapshot_id).await,
+            expected
+        );
+
+        // The caller-owned-transaction form, replacing it with a smaller set.
+        let replacement: Vec<SnapshotFile> = files
+            .iter()
+            .take(1_200)
+            .map(|f| SnapshotFile {
+                row_count: 7,
+                ..f.clone()
+            })
+            .collect();
+        let mut txn = catalog.begin_transaction().await.expect("begin");
+        catalog
+            .replace_snapshot_files_in_txn(txn.as_mut(), &table_id, &snapshot_id, &replacement)
+            .await
+            .expect("replace manifest in transaction");
+        txn.commit().await.expect("commit");
+        let mut expected: Vec<ManifestRow> = replacement.iter().map(manifest_row).collect();
+        expected.sort();
+        assert_eq!(
+            stored_manifest(&catalog, &table_id, &snapshot_id).await,
+            expected
+        );
     }
 
     /// The per-cold-file `pk_bloom` blob must survive the manifest write/read
