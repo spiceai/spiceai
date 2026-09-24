@@ -17,8 +17,6 @@ limitations under the License.
 //! Runtime integration regression for SQL results-cache warmup:
 //! record a plan → persist → restart → first refresh → ready → cache hit.
 
-#![allow(clippy::expect_used)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +32,7 @@ use spicepod::component::caching::{ResultsCacheWarmup, SQLResultsCacheConfig};
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, RuntimeState, TaskHistory};
 
+#[expect(clippy::expect_used)]
 fn lookup_dataset(dir: &std::path::Path) -> Dataset {
     let csv = dir.join("lookup.csv");
     std::fs::write(&csv, "id,payload\n1,a\n2,b\n3,c\n").expect("write fixture");
@@ -48,6 +47,7 @@ fn lookup_dataset(dir: &std::path::Path) -> Dataset {
     dataset
 }
 
+#[expect(clippy::expect_used)]
 async fn run_query(rt: &Arc<Runtime>, query: &str) -> CacheStatus {
     let result = rt
         .datafusion()
@@ -64,6 +64,7 @@ async fn run_query(rt: &Arc<Runtime>, query: &str) -> CacheStatus {
     status
 }
 
+#[expect(clippy::expect_used)]
 async fn wait_ready(rt: &Arc<Runtime>) {
     tokio::time::timeout(Duration::from_mins(2), async {
         while !rt.status().is_ready() {
@@ -75,6 +76,7 @@ async fn wait_ready(rt: &Arc<Runtime>) {
 }
 
 #[tokio::test]
+#[expect(clippy::expect_used)]
 async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
     let request_context = Arc::new(
         RequestContext::builder(Protocol::Internal)
