@@ -210,27 +210,43 @@ impl Https {
         params_indicate_dynamic_api(&self.params)
     }
 
-    /// Reject `on_error_response` on a dataset bound for the listing connector.
+    /// Validate `on_error_response` on a dataset bound for the listing connector.
     ///
-    /// The listing connector never reaches [`resolve_http_provider_params`], so the
-    /// parameter would be read by nothing — including an invalid value, which would be
-    /// accepted here and rejected on a dynamic dataset. Refusing it is what makes the
-    /// setting mean the same thing wherever it is written.
+    /// The listing connector never reaches [`resolve_http_provider_params`], so it cannot
+    /// honour an action that records a row. It does already refuse a response the origin
+    /// did not mark successful, which is exactly what `error` asks for — so `error` is
+    /// accepted as the statement of that behaviour rather than refused, and one `params`
+    /// block stays shareable between a structured and a dynamic dataset. An unparseable
+    /// value is rejected in the same words the dynamic path uses, so the setting means the
+    /// same thing wherever it is written.
     ///
     /// [`resolve_http_provider_params`]: Https::resolve_http_provider_params
     fn ensure_error_response_action_supported_for_structured_dataset(
         &self,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
-        if self.params.get("on_error_response").expose().ok().is_some() {
-            return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "https".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: "`on_error_response` is not supported for structured HTTP file datasets that use the listing connector. Those datasets already fail a request the origin did not answer successfully, so remove the parameter; set it on a dynamic JSON HTTP API dataset if you need to choose that behaviour. See: https://spiceai.org/docs/components/data-connectors/https".to_string(),
-            });
-        }
+        use data_components::http::provider::ErrorResponseAction;
 
-        Ok(())
+        let Some(value) = self.params.get("on_error_response").expose().ok() else {
+            return Ok(());
+        };
+
+        let message = match value.parse::<ErrorResponseAction>() {
+            Ok(ErrorResponseAction::Error) => return Ok(()),
+            Ok(action) => format!(
+                "`on_error_response: {action}` is not supported for structured HTTP file datasets that use the listing connector, which cannot record a response body as a row. Those datasets always fail a request the origin did not answer successfully: remove the parameter, or set `on_error_response: error` to state that. Set `{action}` on a dynamic JSON HTTP API dataset instead. See: https://spiceai.org/docs/components/data-connectors/https"
+            ),
+            Err(()) => format!(
+                "'{value}' is not a valid `on_error_response`. Expected one of: {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                ErrorResponseAction::accepted_values()
+            ),
+        };
+
+        Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message,
+        })
     }
 
     fn ensure_rate_control_supported_for_structured_dataset(
@@ -1900,7 +1916,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("http_headers")
             .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers."),
         ParameterSpec::runtime("on_error_response")
-            .description("What a response the origin did not mark successful becomes: 'error' fails the request (a refresh then keeps the accelerated table's previous contents), 'warn' records it as a row and warns, 'store' records it as a row silently. Defaults to 'error'."),
+            .description("What a response the origin did not mark successful becomes: 'error' fails the request (a refresh then keeps the accelerated table's previous contents), 'warn' records it as a row and warns, 'store' records it as a row silently. 'warn' and 'store' apply to client errors only — a 5xx or 429 that outlives the retries always fails the request, because a server error is a statement about the origin rather than about the resource. Applies to a response the origin answered; a connection failure or timeout is unaffected. Defaults to 'error'."),
         ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("retry_backoff_method")
@@ -2742,12 +2758,39 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert_invalid_url_error(error);
     }
 
-    /// A structured dataset never reaches `resolve_http_provider_params`, so an
-    /// `on_error_response` written there would be read by nothing — including a value
-    /// the dynamic route would reject outright.
+    /// `error` names what the listing route already does, so writing it is a statement
+    /// rather than a request the route cannot meet — and one `params` block stays
+    /// shareable between a structured dataset and a dynamic one.
     #[tokio::test]
-    async fn test_http_structured_format_rejects_on_error_response() {
-        for value in ["error", "store", "not-an-action"] {
+    async fn test_http_structured_format_accepts_on_error_response_error() {
+        let connector =
+            test_connector_with(&[("file_format", "csv"), ("on_error_response", "error")]).await;
+        let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+        // The listing route may still fail for unrelated reasons (it resolves a real URL),
+        // so what is asserted is that it does not fail *on this parameter*.
+        if let Err(error) = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+        {
+            assert!(
+                !error.to_string().contains("on_error_response"),
+                "`error` must not be refused on a structured dataset, got: {error}"
+            );
+        }
+    }
+
+    /// The two actions that record a row cannot be honoured by the listing route, which
+    /// never builds an `HttpTableProvider` — and a value that parses as nothing at all is
+    /// refused in the same words the dynamic route uses, so the setting means one thing
+    /// wherever it is written.
+    #[tokio::test]
+    async fn test_http_structured_format_rejects_recording_on_error_response() {
+        for (value, expected) in [
+            ("store", "`on_error_response: store` is not supported"),
+            ("warn", "`on_error_response: warn` is not supported"),
+            ("not-an-action", "is not a valid `on_error_response`"),
+        ] {
             let connector =
                 test_connector_with(&[("file_format", "csv"), ("on_error_response", value)]).await;
             let dataset =
@@ -2763,16 +2806,12 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             match error {
                 DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                     assert!(
-                        message.contains("`on_error_response` is not supported"),
-                        "expected the unsupported-parameter error for '{value}', got: {message}"
+                        message.contains(expected),
+                        "expected '{expected}' for '{value}', got: {message}"
                     );
                     assert!(
-                        message.contains("dynamic JSON HTTP API dataset"),
-                        "expected dynamic JSON guidance for '{value}', got: {message}"
-                    );
-                    assert!(
-                        message.contains("already fail a request"),
-                        "the refusal must say what this route already does, got: {message}"
+                        message.contains("data-connectors/https"),
+                        "every refusal must link the docs, got: {message}"
                     );
                 }
                 other => {

@@ -100,12 +100,10 @@ pub enum Error {
     JsonNesting { source: super::json_nest::Error },
 
     #[snafu(display(
-        "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, which \
-        `on_error_response` treats as a failed request rather than as data. \
-        Fix the origin, or set `on_error_response: warn` on this dataset to record the body as a \
-        row and log that a full refresh would replace the dataset's previous contents. \
-        `store` records it without the log line and is not recommended. \
-        See: https://spiceai.org/docs/components/data-connectors/https"
+        "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, so the request \
+        failed rather than becoming data. {} \
+        See: https://spiceai.org/docs/components/data-connectors/https",
+        error_response_remedy(*status)
     ))]
     ErrorResponse {
         status: u16,
@@ -140,20 +138,54 @@ fn endpoint_label(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
+/// The half of an [`Error::ErrorResponse`] message that tells the operator what to do,
+/// which differs by status class because only one of the two classes is selectable.
+///
+/// A 5xx or 429 is a statement about the origin's health rather than about the resource
+/// (RFC 9110 S15.6), so no `on_error_response` setting records one as a row and offering
+/// `warn` here would name a remedy that does not work. A 4xx is a statement about the
+/// request, which a dataset may legitimately read as a business fact.
+fn error_response_remedy(status: u16) -> &'static str {
+    if HttpTableProvider::is_retryable_status(status) {
+        "The origin did not recover after the configured retries, and a server error is never \
+         recorded as a row, so the dataset keeps its previous contents. Fix the origin, or raise \
+         `max_retries` if it recovers on its own."
+    } else {
+        "`on_error_response` treats it as a failed request. Fix the origin, or set \
+         `on_error_response: warn` on this dataset to record the body as a row and log that a \
+         full refresh would replace the dataset's previous contents. `store` records it without \
+         the log line and is not recommended."
+    }
+}
+
 /// What the connector does with a response the origin did not mark as successful.
 ///
 /// A non-2xx body is otherwise recorded as an ordinary row, and on a dataset with
 /// `refresh_mode: full` that row *replaces* the previously good contents — a transient
 /// origin failure substitutes error pages for data without the query result marking it
 /// (spiceai/spiceai#13515).
+///
+/// [`Warn`] and [`Store`] reach only the statuses this connector does *not* retry. A 5xx
+/// or 429 that outlives the retry ladder fails the request whatever the action says,
+/// because it is a statement about the origin's health rather than about the resource
+/// (RFC 9110 S15.6) — and the rest of the connector already reads it that way:
+/// `filter_transient_error_responses` keeps such a row out of the results cache and
+/// `HttpExec` counts it through [`crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME`]. Without
+/// that scoping, the setting a dataset picks to keep a meaningful 404 working would also
+/// let an outage overwrite its contents (spiceai/spiceai#13578).
+///
+/// [`Warn`]: ErrorResponseAction::Warn
+/// [`Store`]: ErrorResponseAction::Store
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorResponseAction {
     /// Fail the request, so a refresh fails and the accelerated table keeps what it had.
     #[default]
     Error,
-    /// Record the response as a row, and warn that it happened.
+    /// Record the response as a row, and warn that it happened. A retryable status
+    /// (5xx/429) still fails — see the type's documentation.
     Warn,
-    /// Record the response as a row, silently.
+    /// Record the response as a row, silently. A retryable status (5xx/429) still
+    /// fails — see the type's documentation.
     Store,
 }
 
@@ -1674,24 +1706,21 @@ impl HttpTableProvider {
         })
         .await;
 
-        // If retries exhausted due to transient errors (5xx/429), make one final attempt
-        // and return whatever response we get - the response is still valid data.
+        // A ladder exhausted by something other than a status gets one final attempt that
+        // accepts whatever comes back; a status is decided below without spending it.
         match result {
             Ok(fetch_result) => Ok(fetch_result),
-            // That final attempt exists only to turn an exhausted retry into a row. Under
-            // `error` there is no row to make, so it would spend one more request on an
-            // origin that has already failed and arrive at this same error regardless.
+            // That final attempt exists only to turn an exhausted retry into a row. A
+            // ladder that ended on a *status* has no row left to make under any action —
+            // the status is either retryable, which is refused whatever the action says,
+            // or it is one `error` already refused — so the attempt would spend one more
+            // request on an origin that has already failed and arrive at this same error.
             //
-            // Only when the ladder ended on a *status*, though. A ladder exhausted by a
-            // network error, a rate-control acquisition failure or a body read that broke
-            // mid-stream is a different case: the extra attempt is a real recovery chance
-            // that has nothing to do with this action, and if it does answer non-2xx the
-            // check in `perform_single_request` refuses it there.
-            Err(err @ Error::ErrorResponse { .. })
-                if self.error_response_action == ErrorResponseAction::Error =>
-            {
-                Err(err)
-            }
+            // A ladder exhausted by a network error, a rate-control acquisition failure or
+            // a body read that broke mid-stream is a different case: the extra attempt is
+            // a real recovery chance that has nothing to do with this action, and if it
+            // does answer non-2xx the check in `perform_single_request` refuses it there.
+            Err(err @ Error::ErrorResponse { .. }) => Err(err),
             Err(_) => {
                 tracing::debug!(
                     "Retries exhausted for {}, making final attempt accepting any status",
@@ -1792,11 +1821,19 @@ impl HttpTableProvider {
         // Everything the origin did not mark successful reaches here: 4xx always (a 404
         // "not found" can be a business fact for an API-shaped dataset), and 5xx/429 once
         // retries are exhausted. `error_response_action` decides whether such a body is
-        // data. Anything but `Store` has to answer here rather than downstream of the row:
-        // the row is what a full refresh writes over good data with.
+        // data. Anything that is not recorded has to answer here rather than downstream of
+        // the row: the row is what a full refresh writes over good data with.
         let is_error_response = !(200..300).contains(&status_code);
 
-        if is_error_response && self.error_response_action == ErrorResponseAction::Error {
+        // A retryable status is refused whatever the action is. It reached this line only
+        // by outliving the ladder, which makes it an origin that is down rather than an
+        // answer about the resource, and recording one would let the setting a dataset
+        // picked to keep a 404 working overwrite its contents during an outage. See
+        // [`ErrorResponseAction`].
+        let refuse = self.error_response_action == ErrorResponseAction::Error
+            || Self::is_retryable_status(status_code);
+
+        if is_error_response && refuse {
             // Permanent: the retry ladder above already spent its attempts on the statuses
             // worth retrying, so retrying here would only repeat them.
             return Err(RetryError::Permanent(Error::ErrorResponse {
@@ -4935,21 +4972,33 @@ mod response_cache_tests {
 
     /// An error body is not served back from the cache afterwards.
     ///
-    /// A 5xx that outlives its retries is accepted as content rather than
-    /// raised — a choice of the fetch path, not of this cache — so what keeps it
-    /// out is that the origin never marked it retainable. Worth pinning because
-    /// retaining an outage response would serve it for the whole of its window,
-    /// long after the origin recovered.
+    /// What keeps an error body out of the cache is that the origin never marked it
+    /// retainable — not that the fetch refused it. Worth pinning because retaining one
+    /// would serve it for the whole of its window, long after the origin recovered.
+    ///
+    /// A 404 under `store` is the status that still reaches admission: it is content by
+    /// the dataset's own choice, so the assertion below is about this cache rather than
+    /// about the fetch path. A 500 would not do — it is refused before a body exists
+    /// (see [`crate::http::provider::ErrorResponseAction`]), which would leave the cache
+    /// empty however broken admission was.
     #[tokio::test]
     async fn an_unmarked_error_body_is_not_retained() {
         let origin = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream unavailable"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such report"))
             .mount(&origin)
             .await;
 
-        let provider = provider_for(&origin);
-        let _ = provider.get_response("/report", None, None, None).await;
+        let provider = provider_for(&origin)
+            .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
+        let fetched = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("`store` must answer a 404 with its body, or this asserts nothing");
+        assert_eq!(
+            fetched.response_status, 404,
+            "the body under test has to be the error response itself"
+        );
 
         settle(&provider.cache).await;
         assert_eq!(
@@ -7075,56 +7124,39 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "hits a live external API (httpbin.org); not deterministic in CI — run with --ignored"]
-    async fn test_integration_httpbin_500_server_error() {
+    async fn test_integration_httpbin_500_server_error_is_refused_under_every_action() {
         use datafusion::prelude::SessionContext;
 
-        // httpbin.org provides endpoints that return specific HTTP status codes
-        let url = Url::parse("https://httpbin.org").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            // As above: recording the error response as a row is what `store` selects.
-            .with_error_response_action(ErrorResponseAction::Store)
-            .with_allowed_paths(vec!["/status/500".to_string()])
-            .expect("allowed paths");
+        // The live counterpart of the unit coverage: a server error is refused by its
+        // status class, so even `store` — the action a dataset picks to keep a 404
+        // working — does not record one. See [`ErrorResponseAction`].
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            // httpbin.org provides endpoints that return specific HTTP status codes
+            let url = Url::parse("https://httpbin.org").expect("valid URL");
+            let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+                // The ladder is not what this asserts, and every retry is a real sleep.
+                .with_max_retries(0)
+                .with_error_response_action(action)
+                .with_allowed_paths(vec!["/status/500".to_string()])
+                .expect("allowed paths");
 
-        let ctx = SessionContext::new();
-        ctx.register_table("httpbin", Arc::new(provider))
-            .expect("register table");
+            let ctx = SessionContext::new();
+            ctx.register_table("httpbin", Arc::new(provider))
+                .expect("register table");
 
-        // Query for a 500 status endpoint - should return a row with 500 status
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
-            .await
-            .expect("query should succeed");
+            let error = ctx
+                .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
+                .await
+                .expect("query should plan")
+                .collect()
+                .await
+                .expect_err("a server error must not be answered with rows");
 
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results even for 5xx");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
-
-        // Validate response_status is 500
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
-        assert_eq!(
-            status_col.value(0),
-            500,
-            "Server error should have response_status 500"
-        );
-
-        // Validate content is empty (httpbin /status/500 returns empty body)
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-        let content = content_col.value(0);
-        assert!(
-            content.is_empty(),
-            "httpbin 500 response should have empty content body"
-        );
+            assert!(
+                error.to_string().contains("500"),
+                "{action}: the failure must name the status the origin gave: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8141,23 +8173,20 @@ mod tests {
             "the failure must name the status the origin gave: {message}"
         );
         assert!(
-            message.contains("on_error_response"),
-            "the failure must name the parameter that decides this: {message}"
-        );
-        assert!(
             message.contains("spiceai.org/docs/components/data-connectors/https"),
             "the failure must link the connector's docs: {message}"
         );
-        // The remedy has to point at `warn`, which records the body *and* says so. Pointing
-        // at `store` hands the operator the silent form as the golden path, which is the
-        // behaviour this parameter exists to stop being the accident.
+        // A 503 is refused by its status class, not by the action, so the remedy must not
+        // name a setting that would not change it. Offering `warn` here would send the
+        // operator to a value that leaves the refusal exactly where it was.
         assert!(
-            message.contains("`on_error_response: warn`"),
-            "the failure must offer `warn` as the remedy: {message}"
+            !message.contains("`on_error_response: warn`")
+                && !message.contains("`on_error_response: store`"),
+            "no action records a server error, so neither may be offered as the remedy: {message}"
         );
         assert!(
-            !message.contains("`on_error_response: store`"),
-            "the failure must not offer the silent form as the remedy: {message}"
+            message.contains("max_retries"),
+            "the remedy for an origin that stayed down is the retry budget: {message}"
         );
         // Several datasets can share one endpoint with different request filters, so the
         // endpoint alone does not say which one failed.
@@ -8379,9 +8408,21 @@ mod tests {
             .await
             .expect_err("a 404 must not be answered with rows");
 
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("404"),
-            "the failure must name the status the origin gave: {error}"
+            message.contains("404"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        // A client error *is* selectable, so this is the message that must carry the
+        // remedy — and it has to be `warn`, which records the body and says so, not the
+        // silent `store` this parameter exists to stop being the accident.
+        assert!(
+            message.contains("`on_error_response: warn`"),
+            "a selectable status must offer `warn` as the remedy: {message}"
+        );
+        assert!(
+            !message.contains("`on_error_response: store`"),
+            "the failure must not offer the silent form as the remedy: {message}"
         );
     }
 
@@ -8410,6 +8451,40 @@ mod tests {
                 404,
                 "{action} must record the status the origin gave"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_transient_status_is_never_recorded_as_a_row() {
+        use std::sync::atomic::Ordering;
+
+        // `store`/`warn` exist for the dataset that reads a 404 body as a business fact.
+        // A 5xx or 429 is never that: RFC 9110 S15.6 makes it a statement about the
+        // origin's health rather than about the resource, and this connector already
+        // treats one as a failure everywhere else — `filter_transient_error_responses`
+        // keeps such a row out of the results cache, and `HttpExec` counts it through
+        // `HTTP_TRANSIENT_FAILURE_METRIC_NAME`. Admitting one here would let an outage
+        // replace an accelerated table's contents under the very setting chosen to keep
+        // a 404 working, which is the gap spiceai/spiceai#13578 reports.
+        for status in [500, 502, 503, 504, 429] {
+            for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+                let (base_url, requests) =
+                    start_status_server(status, r#"{"error":"upstream is down"}"#).await;
+
+                let error = scan_status_dataset(base_url, action)
+                    .await
+                    .expect_err("a transient status must not be answered with rows");
+
+                assert!(
+                    error.to_string().contains(&status.to_string()),
+                    "the failure must name the status the origin gave: {error}"
+                );
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "no row to make means no post-ladder attempt for {action}/{status}"
+                );
+            }
         }
     }
 

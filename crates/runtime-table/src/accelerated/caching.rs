@@ -1863,14 +1863,16 @@ impl CacheRefreshHelper {
                 // errors.
                 let batches_cacheable = cache::batches_cacheable(&batches);
 
-                // A failing origin does not arrive as an error. Once the HTTP
-                // connector has exhausted its own retries it reports the
-                // failure as a successful fetch whose rows carry a 429 or 5xx
-                // status, so serving stale data only from the `Err` arm below
-                // would miss the dominant failure mode — an operator who asked
-                // for `caching_stale_if_error` would get the origin's error
-                // body instead of the cached response they asked to fall back
-                // to.
+                // A failing origin usually arrives as an `Err`, which the arm
+                // below serves stale from: the HTTP connector refuses a 429 or
+                // 5xx that outlives its retries whatever `on_error_response`
+                // says. This arm covers what still reaches here as a
+                // *successful* fetch carrying such a status — another source of
+                // HTTP-provenance batches, or a path that assembles them
+                // without going through that refusal. Without it an operator who
+                // asked for `caching_stale_if_error` would get the origin's
+                // error body instead of the cached response they asked to fall
+                // back to.
                 if !batches_cacheable
                     && stale_if_error
                     && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
