@@ -1,0 +1,9 @@
+order_id,tenant_id,customer_id,ordered_at,status,total_cents
+1001,north,1,2026-08-01T09:00:00Z,paid,12500
+1002,north,2,2026-08-01T10:00:00Z,paid,7200
+1003,north,1,2026-08-02T11:00:00Z,pending,5000
+1004,south,3,2026-08-02T12:00:00Z,paid,9900
+1005,north,2,2026-08-03T13:00:00Z,paid,2500
+1006,south,4,2026-08-03T14:00:00Z,cancelled,8000
+1007,north,,2026-08-03T15:00:00Z,paid,0
+1008,south,3,2026-08-04T16:00:00Z,paid,15000

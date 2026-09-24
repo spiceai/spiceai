@@ -1,0 +1,86 @@
+[
+  {
+    "name": "unauthenticated",
+    "status": 401,
+    "body": {
+      "error": "unauthorized"
+    }
+  },
+  {
+    "name": "north-sales",
+    "status": 200,
+    "body": {
+      "tenant_id": "north",
+      "paid_orders": 4,
+      "gross_cents": 22200,
+      "currency": "USD",
+      "definition": "paid-gross-v1"
+    }
+  },
+  {
+    "name": "south-sales",
+    "status": 200,
+    "body": {
+      "tenant_id": "south",
+      "paid_orders": 2,
+      "gross_cents": 24900,
+      "currency": "USD",
+      "definition": "paid-gross-v1"
+    }
+  },
+  {
+    "name": "tenant-query-rejected",
+    "status": 404,
+    "body": {
+      "error": "not_found"
+    }
+  },
+  {
+    "name": "north-search",
+    "status": 200,
+    "body": {
+      "tenant_id": "north",
+      "question": "shipping",
+      "evidence": [
+        {
+          "citation_id": "policy-3",
+          "article_id": 3,
+          "title": "Shipping delays",
+          "source_version": "fixture-2026-08",
+          "text": "Check the tracking number before opening a shipping delay ticket. Contact support after five business days."
+        }
+      ]
+    }
+  },
+  {
+    "name": "south-search",
+    "status": 200,
+    "body": {
+      "tenant_id": "south",
+      "question": "shipping",
+      "evidence": [
+        {
+          "citation_id": "policy-6",
+          "article_id": 6,
+          "title": "Shipping delays",
+          "source_version": "fixture-2026-08",
+          "text": "Contact the account manager after three business days without a tracking update."
+        }
+      ]
+    }
+  },
+  {
+    "name": "tenant-body-rejected",
+    "status": 400,
+    "body": {
+      "error": "invalid_request"
+    }
+  },
+  {
+    "name": "empty-question",
+    "status": 400,
+    "body": {
+      "error": "invalid_request"
+    }
+  }
+]
