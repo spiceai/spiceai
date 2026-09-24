@@ -860,8 +860,6 @@ impl HttpTableProvider {
         self
     }
 
-    /// How a message refers to the dataset: by name when there is one, and by a phrase
-    /// that still reads as a sentence when there is not.
     /// The error a response the origin did not mark successful becomes.
     ///
     /// One constructor so every refusal — the retry ladder, the accepting attempt, and
@@ -874,6 +872,8 @@ impl HttpTableProvider {
         }
     }
 
+    /// How a message refers to the dataset: by name when there is one, and by a phrase
+    /// that still reads as a sentence when there is not.
     fn dataset_subject(&self) -> String {
         self.dataset_name.as_ref().map_or_else(
             || "this dataset".to_string(),
