@@ -208,6 +208,82 @@ pub struct DatasetMetastoreSlice {
     pub tables: BTreeMap<String, Vec<SliceRow>>,
 }
 
+/// One child on the search's trail, and the partition it has reserved.
+struct Placement {
+    child: usize,
+    cursor: usize,
+    /// The partition this child takes if the walk reaches a free one. `None`
+    /// until it has entered one, which is why a trail entry that reserved
+    /// nothing claims nothing.
+    trying: Option<usize>,
+}
+
+/// Assign `child` to one of the partitions it may belong to, displacing the
+/// children already placed wherever that leaves them somewhere else to go.
+///
+/// This is Kuhn's augmenting-path step over the bipartite graph of a slice's
+/// child table rows and the partitions each may belong to. `visited` marks the
+/// partitions this one search has already entered, so it enters each at most
+/// once and the search terminates.
+///
+/// Iterative rather than recursive because the slice is untrusted and the path
+/// it walks can be as long as the slice has partitions. Nothing bounds that
+/// shorter: a child's name is the partition values joined by `_`, which does
+/// not say where one value ended and the next began, so the `m` underscores in
+/// one string give `2^m` distinct partitions that all answer to a single legacy
+/// name and can all sit at one path. A recursive walk of that graph would let
+/// a crafted slice choose the stack depth.
+fn assign_child_to_a_partition(
+    child: usize,
+    child_options: &[Vec<usize>],
+    child_of_partition: &mut [Option<usize>],
+    visited: &mut [bool],
+) -> bool {
+    // The children displaced to get here: each with how far through its own
+    // options the search has looked, and the partition it is currently trying.
+    // The partition is carried rather than re-derived from the cursor so that
+    // what an entry claims on success cannot drift from what it reserved.
+    let mut trail: Vec<Placement> = vec![Placement {
+        child,
+        cursor: 0,
+        trying: None,
+    }];
+    while let Some(step) = trail.last_mut() {
+        let current = step.child;
+        let Some(&partition) = child_options[current].get(step.cursor) else {
+            // Out of options: give this child up and resume whichever child
+            // displaced it, at its next option.
+            trail.pop();
+            continue;
+        };
+        step.cursor += 1;
+        if visited[partition] {
+            continue;
+        }
+        visited[partition] = true;
+        step.trying = Some(partition);
+        if let Some(occupant) = child_of_partition[partition] {
+            trail.push(Placement {
+                child: occupant,
+                cursor: 0,
+                trying: None,
+            });
+            continue;
+        }
+        // Free. Every entry on the trail now takes the partition it reserved:
+        // the last one this newly free partition, and each earlier one the
+        // partition the entry after it has just vacated. `visited` kept those
+        // partitions distinct, so the writes cannot collide.
+        for step in &trail {
+            if let Some(target) = step.trying {
+                child_of_partition[target] = Some(step.child);
+            }
+        }
+        return true;
+    }
+    false
+}
+
 impl DatasetMetastoreSlice {
     /// Marshal to a JSON byte vector suitable for embedding in a snapshot
     /// archive.
@@ -675,7 +751,14 @@ impl DatasetMetastoreSlice {
 
         // Both sides were rewritten relative to the exporter's anchor, so a
         // child's path is comparable to its partition's without re-anchoring.
-        let mut partitions_with_a_child: HashSet<usize> = HashSet::new();
+        // The partitions each child could belong to: those of its name that are
+        // also rooted where it is. Resolved for every child before any of them
+        // is assigned, because which partition a child belongs to is not always
+        // decidable from that child alone — one partition's current-scheme name
+        // can equal another's legacy-scheme name, and when both name one
+        // directory the child called that fits either of them.
+        let mut child_names: Vec<&str> = Vec::new();
+        let mut child_options: Vec<Vec<usize>> = Vec::new();
         for row in table_rows {
             let Some(name) = text_at(row, CAYENNE_TABLE_NAME_INDEX) else {
                 return refuse("one of its table rows has no readable name".to_string());
@@ -689,37 +772,55 @@ impl DatasetMetastoreSlice {
                 ));
             };
             let child_path = text_at(row, CAYENNE_TABLE_PATH_INDEX);
-            // The candidate this child actually belongs to: one rooted at the
-            // same directory that no earlier child has already covered.
-            // Requiring it to be unclaimed is what still keeps a single child
-            // row from standing in for two partitions naming one directory.
-            let Some(partition_index) = candidates.iter().copied().find(|index| {
-                Some(partition_paths[*index]) == child_path
-                    && !partitions_with_a_child.contains(index)
-            }) else {
-                // Two different faults reach here and they are not the same:
-                // no partition of this name is rooted where the child is, or
-                // every one that is has already been covered by another child.
-                // Reporting the second as a path mismatch would print the
-                // child's own directory as the one it should have been at.
-                return if candidates
-                    .iter()
-                    .any(|index| Some(partition_paths[*index]) == child_path)
-                {
-                    refuse(format!(
-                        "its child table '{name}' could only belong to the partition at '{}', which another of its child tables already covers, so one of this dataset's partitions would be restored without its own data",
-                        child_path.unwrap_or("no readable path")
-                    ))
-                } else {
-                    refuse(format!(
-                        "its child table '{name}' is rooted at '{}' but the partition it belongs to is at '{}', so the restored dataset would read that partition's rows from another partition's directory",
-                        child_path.unwrap_or("no readable path"),
-                        partition_paths[candidates[0]]
-                    ))
-                };
-            };
-            partitions_with_a_child.insert(partition_index);
+            let options: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|index| Some(partition_paths[*index]) == child_path)
+                .collect();
+            // No partition of this name is rooted where the child is. Reported
+            // separately from "every one that is already has a child" below,
+            // which is a different fault: printing that one as a path mismatch
+            // would name the child's own directory as the one it should be at.
+            if options.is_empty() {
+                return refuse(format!(
+                    "its child table '{name}' is rooted at '{}' but the partition it belongs to is at '{}', so the restored dataset would read that partition's rows from another partition's directory",
+                    child_path.unwrap_or("no readable path"),
+                    partition_paths[candidates[0]]
+                ));
+            }
+            child_names.push(name);
+            child_options.push(options);
         }
+
+        // Giving each child the first partition of its own that no earlier
+        // child took is order-dependent: it can spend the only partition a
+        // later child fits and refuse a slice in which every partition does
+        // have a child of its own. Displacing an earlier child that has
+        // somewhere else to go makes the outcome independent of the row order,
+        // so a slice is refused only when no complete assignment exists at all.
+        // Requiring each child to hold a partition of its own is still what
+        // keeps one child row from standing in for two partitions that name a
+        // single directory.
+        let mut child_of_partition: Vec<Option<usize>> = vec![None; partition_paths.len()];
+        for (child, options) in child_options.iter().enumerate() {
+            let mut visited = vec![false; partition_paths.len()];
+            if !assign_child_to_a_partition(
+                child,
+                &child_options,
+                &mut child_of_partition,
+                &mut visited,
+            ) {
+                return refuse(format!(
+                    "its child table '{}' could only belong to the partition at '{}', which another of its child tables already covers, so one of this dataset's partitions would be restored without its own data",
+                    child_names[child], partition_paths[options[0]]
+                ));
+            }
+        }
+        let partitions_with_a_child: HashSet<usize> = child_of_partition
+            .iter()
+            .enumerate()
+            .filter_map(|(partition, child)| child.map(|_| partition))
+            .collect();
 
         if let Some((_, orphan)) = partition_paths
             .iter()
@@ -977,6 +1078,31 @@ mod tests {
             MetastoreValue::Text(partition_id.to_string()),
             MetastoreValue::Text(table_id.to_string()),
             MetastoreValue::Text(r#"["part_col"]"#.to_string()),
+            MetastoreValue::Text(serde_json::to_string(&values).expect("a string list serializes")),
+            MetastoreValue::Text(crate::metadata::composite_partition_key(&values)),
+            MetastoreValue::Text(abs_path.to_string()),
+            MetastoreValue::Bool(false),
+            MetastoreValue::Integer(100),
+            MetastoreValue::Integer(1024),
+        ]
+    }
+
+    /// A partition row over several partition columns, for the cases where one
+    /// value's worth of ambiguity is not enough to build the slice under test.
+    fn sample_partition_row_over(
+        partition_id: &str,
+        table_id: &str,
+        abs_path: &str,
+        partition_values: &[&str],
+    ) -> Vec<MetastoreValue> {
+        let values: Vec<String> = partition_values.iter().map(|v| (*v).to_string()).collect();
+        let columns: Vec<String> = (0..values.len()).map(|i| format!("part_col_{i}")).collect();
+        vec![
+            MetastoreValue::Text(partition_id.to_string()),
+            MetastoreValue::Text(table_id.to_string()),
+            MetastoreValue::Text(
+                serde_json::to_string(&columns).expect("a string list serializes"),
+            ),
             MetastoreValue::Text(serde_json::to_string(&values).expect("a string list serializes")),
             MetastoreValue::Text(crate::metadata::composite_partition_key(&values)),
             MetastoreValue::Text(abs_path.to_string()),
@@ -2370,7 +2496,13 @@ mod tests {
             ],
         );
         let slice = DatasetMetastoreSlice {
-            format_version: SLICE_FORMAT_VERSION,
+            // Child `cayenne_table` rows are exactly what
+            // `rows_an_older_import_cannot_clear` names, so the slice has to
+            // declare the version that carries them or the payload/version
+            // guard refuses it before any of this is reached — and a test that
+            // tolerated that error would pass without ever reaching the
+            // matching it is about.
+            format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2378,13 +2510,145 @@ mod tests {
         };
 
         let (ms, tmp) = fresh_metastore().await;
-        if let Err(err) = import_dataset(ms.as_ref(), &slice, tmp.path()).await {
-            assert!(
-                !err.to_string()
-                    .contains("but the partition it belongs to is at"),
-                "a child whose name collides with another partition's legacy name must still be matched to its own partition: {err}"
-            );
-        }
+        import_dataset(ms.as_ref(), &slice, tmp.path())
+            .await
+            .expect("a child whose name collides with another partition's legacy name must still be matched to its own partition");
+    }
+
+    /// Two partitions may share one directory, and one partition's
+    /// current-scheme name may equal another's legacy-scheme name. When both
+    /// hold at once, which partition each child belongs to is not decidable
+    /// child-by-child: the child named for the clash fits either partition,
+    /// and only the *other* child's single option settles it.
+    ///
+    /// Assigning each child to the first unclaimed partition that fits it is
+    /// therefore order-dependent — it can consume the one partition the second
+    /// child could have used and refuse a slice that a complete assignment
+    /// exists for. The slice is built here directly, in the order that exposes
+    /// it, for the same reason the sibling test above does.
+    ///
+    /// Reported by Copilot on #14238 and reproduced before the fix: `validate`
+    /// refused this slice with "which another of its child tables already
+    /// covers" while the assignment `p76313A313A78`-named child -> second
+    /// partition, `events_x` -> first partition covers both.
+    #[tokio::test]
+    async fn accepts_a_slice_whose_colliding_children_need_an_order_independent_assignment() {
+        // `["x"]` under the current scheme and `["p76313A313A78"]` under the
+        // legacy one are the same name, so this child fits either partition.
+        let ambiguous = child_table_name("events", "x");
+        let mut tables: BTreeMap<String, Vec<SliceRow>> = BTreeMap::new();
+        tables.insert(
+            "cayenne_table".to_string(),
+            vec![
+                sample_table_row("tid-events", "events", "events.dir")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+                // Ambiguous child first: taking the first partition that fits
+                // it strands the unambiguous child that follows.
+                sample_table_row("tid-a", &ambiguous, "events.dir/shared")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+                // Only the first partition answers to this legacy name.
+                sample_table_row("tid-b", "events_x", "events.dir/shared")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+            ],
+        );
+        tables.insert(
+            "cayenne_partition".to_string(),
+            vec![
+                sample_partition_row("p1", "tid-events", "events.dir/shared", "x")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+                sample_partition_row("p2", "tid-events", "events.dir/shared", "p76313A313A78")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+            ],
+        );
+        let slice = DatasetMetastoreSlice {
+            // Child `cayenne_table` rows are exactly what
+            // `rows_an_older_import_cannot_clear` names, so the slice has to
+            // declare the version that carries them or the payload/version
+            // guard refuses it before any of this is reached.
+            format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            engine: SLICE_ENGINE.to_string(),
+            dataset_name: "events".to_string(),
+            exported_at_ms: 0,
+            tables,
+        };
+
+        let (ms, tmp) = fresh_metastore().await;
+        import_dataset(ms.as_ref(), &slice, tmp.path())
+            .await
+            .expect("a slice both of whose partitions have a child of their own must import");
+    }
+
+    /// A child's legacy name is its partition's values joined by `_`, and that
+    /// join does not record where one value ended and the next began: `["a_b"]`
+    /// and `["a", "b"]` are different partitions with the same legacy name. So
+    /// the ambiguity is not confined to the hex-encoded case the tests above
+    /// cover — it needs no crafted value at all, and one string of `m`
+    /// underscores yields `2^m` partitions that all answer to a single name.
+    ///
+    /// That is also why the assignment walks its trail iteratively: this is the
+    /// shape that lets a slice make the search arbitrarily deep, so a recursive
+    /// walk would let the slice choose the stack depth.
+    #[tokio::test]
+    async fn accepts_a_slice_whose_partitions_split_one_legacy_name_differently() {
+        let mut tables: BTreeMap<String, Vec<SliceRow>> = BTreeMap::new();
+        tables.insert(
+            "cayenne_table".to_string(),
+            vec![
+                sample_table_row("tid-events", "events", "events.dir")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+                // Answers to the legacy name of both partitions below.
+                sample_table_row("tid-a", "events_a_b", "events.dir/shared")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+                // Only the single-value partition answers to this one.
+                sample_table_row(
+                    "tid-b",
+                    &child_table_name("events", "a_b"),
+                    "events.dir/shared",
+                )
+                .iter()
+                .map(SliceValue::from)
+                .collect(),
+            ],
+        );
+        tables.insert(
+            "cayenne_partition".to_string(),
+            vec![
+                sample_partition_row("p1", "tid-events", "events.dir/shared", "a_b")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+                sample_partition_row_over("p2", "tid-events", "events.dir/shared", &["a", "b"])
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+            ],
+        );
+        let slice = DatasetMetastoreSlice {
+            format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            engine: SLICE_ENGINE.to_string(),
+            dataset_name: "events".to_string(),
+            exported_at_ms: 0,
+            tables,
+        };
+
+        let (ms, tmp) = fresh_metastore().await;
+        import_dataset(ms.as_ref(), &slice, tmp.path())
+            .await
+            .expect("both ways of splitting one legacy name must each keep their own partition");
     }
 
     /// Two partitions may name one directory — `cayenne_partition` puts no
