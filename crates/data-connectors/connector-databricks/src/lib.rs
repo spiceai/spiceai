@@ -51,6 +51,7 @@ use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_rate_control::RateController;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -387,7 +388,11 @@ impl Databricks {
                         permissions,
                         rate_controller,
                     )
-                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?,
+                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?
+                    // Databricks has none of the Spice-only functions, so they
+                    // are evaluated locally instead of being unparsed into the
+                    // statement sent to the warehouse (#10703, #13664).
+                    .with_function_support(deny_spice_functions_for_table_providers()),
                 );
                 let metrics = Some(Arc::clone(read_provider.metrics()));
 
@@ -570,7 +575,8 @@ impl Databricks {
                     rate_controller.clone(),
                 )
                 .await
-                .context(UnableToConstructDatabricksSparkSnafu)?,
+                .context(UnableToConstructDatabricksSparkSnafu)?
+                .with_function_support(deny_spice_functions_for_table_providers()),
             ),
 
             AuthCredentials::ServicePrincipal(client_id, client_secret) => {
@@ -591,7 +597,8 @@ impl Databricks {
                         rate_controller.clone(),
                     )
                     .await
-                    .context(UnableToConstructDatabricksSparkSnafu)?,
+                    .context(UnableToConstructDatabricksSparkSnafu)?
+                    .with_function_support(deny_spice_functions_for_table_providers()),
                 )
             }
 
@@ -609,7 +616,8 @@ impl Databricks {
                         rate_controller.clone(),
                     )
                     .await
-                    .context(UnableToConstructDatabricksSparkSnafu)?,
+                    .context(UnableToConstructDatabricksSparkSnafu)?
+                    .with_function_support(deny_spice_functions_for_table_providers()),
                 )
             }
         };

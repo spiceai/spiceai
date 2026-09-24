@@ -4471,6 +4471,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
+ "runtime-udfs-api",
  "secrecy",
  "snafu",
  "spicepod",
@@ -5152,6 +5153,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-parameters",
+ "runtime-udfs-api",
  "snafu",
 ]
 

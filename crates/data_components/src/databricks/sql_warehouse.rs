@@ -58,6 +58,7 @@ use util::{
     format_datafusion_error,
 };
 
+use crate::function_support::FunctionSupport;
 #[cfg(test)]
 use crate::resilient_http::configure_client_builder;
 use crate::resilient_http::{
@@ -389,6 +390,9 @@ pub struct DatabricksSqlWarehouse {
     pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
     metrics: Arc<DatabricksMetrics>,
     api: Arc<SqlWarehouseApi>,
+    /// Which functions may be pushed into the SQL sent to the warehouse.
+    /// `None` federates every function -- see [`Self::with_function_support`].
+    function_support: Option<FunctionSupport>,
 }
 
 impl DatabricksSqlWarehouse {
@@ -513,7 +517,25 @@ impl DatabricksSqlWarehouse {
             metrics: Arc::clone(&metrics),
             permissions,
         });
-        Ok(Self { pool, metrics, api })
+        Ok(Self {
+            pool,
+            metrics,
+            api,
+            function_support: None,
+        })
+    }
+
+    /// Restricts which functions may be unparsed into the SQL sent to the
+    /// warehouse.
+    ///
+    /// Databricks evaluates no Spice-only function -- the `json_get_str` set,
+    /// the embedding and distance UDFs, every user-registered one -- so
+    /// without a deny-list a query naming one federates verbatim and the
+    /// warehouse answers `UNRESOLVED_ROUTINE`. See issues #10703 and #13664.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 
     /// Returns the shared metrics for this SQL Warehouse instance.
@@ -2102,7 +2124,8 @@ impl crate::Read for DatabricksSqlWarehouse {
             SqlTable::new("databricks", &self.pool, table_reference, None)
                 .await
                 .context(SqlTableInitializationFailedSnafu)?
-                .with_dialect(dialect),
+                .with_dialect(dialect)
+                .with_function_support(self.function_support.clone()),
         );
 
         Ok(Arc::new(

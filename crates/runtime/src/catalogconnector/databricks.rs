@@ -44,6 +44,7 @@ use data_components::unity_catalog::provider::{
 use datafusion::sql::TableReference;
 use runtime_rate_control::RateController;
 use runtime_secrets::get_params_with_secrets;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use std::any::Any;
@@ -421,7 +422,11 @@ impl CatalogConnector for Databricks {
                     connector: "databricks".to_string(),
                     source: source.into(),
                     connector_component: ConnectorComponent::from(catalog),
-                })?;
+                })?
+                // Same deny-list the dataset connector installs: a catalog's
+                // tables must not push a Spice-only function into the SQL sent
+                // to the warehouse (#10703, #13664).
+                .with_function_support(deny_spice_functions_for_table_providers());
 
             Arc::new(ReadTableProviderFactory::new(
                 Arc::new(read_provider) as Arc<dyn Read>,
@@ -459,7 +464,8 @@ impl CatalogConnector for Databricks {
                 connector: "databricks".to_string(),
                 source,
                 connector_component: ConnectorComponent::from(catalog),
-            })?;
+            })?
+            .with_function_support(deny_spice_functions_for_table_providers());
 
             Arc::new(ReadTableProviderFactory::new(
                 Arc::new(read_provider) as Arc<dyn Read>,

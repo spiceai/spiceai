@@ -19,6 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::Read;
+use crate::function_support::FunctionSupport;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
@@ -161,6 +162,10 @@ impl SparkSessionFactory {
 #[derive(Clone)]
 pub struct SparkConnect {
     inner: Arc<SparkConnectInner>,
+    /// Which functions may be pushed into the SQL sent to Spark. `None`
+    /// federates every function, which is only safe for a caller that
+    /// registers no function Spark lacks -- see [`Self::with_function_support`].
+    function_support: Option<FunctionSupport>,
 }
 
 struct SparkConnectInner {
@@ -213,7 +218,21 @@ impl SparkConnect {
                 join_push_down_context,
                 rate_controller,
             }),
+            function_support: None,
         })
+    }
+
+    /// Restricts which functions may be unparsed into the SQL sent to Spark.
+    ///
+    /// Spark evaluates no Spice-only function -- the `json_get_str` set, the
+    /// embedding and distance UDFs, every user-registered one -- so without a
+    /// deny-list a query naming one federates verbatim and Spark answers
+    /// `[UNRESOLVED_ROUTINE]`. Every caller that registers Spice functions
+    /// installs the list; see issues #10703 and #13664.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 
     /// The join push-down context used for federation compute-context matching.
@@ -411,9 +430,11 @@ async fn get_table_provider(
         .await?;
 
     let join_push_down_context = spark_connect.join_push_down_context().to_string();
+    let function_support = spark_connect.function_support.clone();
 
     Ok(Arc::new(SparkConnectTableProvider {
         spark_connect,
+        function_support,
         table_reference: spark_table_reference.as_ref().into(),
         spark_table_reference,
         join_push_down_context,
@@ -424,6 +445,9 @@ async fn get_table_provider(
 #[derive(Debug)]
 struct SparkConnectTableProvider {
     spark_connect: SparkConnect,
+    /// Copied off the [`SparkConnect`] so the federation executor can read it
+    /// without reaching back through the provider's connection.
+    function_support: Option<FunctionSupport>,
     table_reference: TableReference,
     /// Backtick-quoted Spark table name, used to (re)build dataframes against the
     /// current session each time the table is scanned.
@@ -671,6 +695,142 @@ mod tests {
     use super::*;
 
     const TEST_CONNECTION: &str = "sc://dbc-abcd.cloud.databricks.com:443/;use_ssl=true;user_id=spice.ai;session_id=00000000-0000-0000-0000-000000000001;token=secret-token;x-databricks-cluster-id=cluster-123;user_agent=SpiceAI_OSS/1.0;";
+
+    /// A Spice-only UDF over a Spark Connect table must be evaluated locally,
+    /// not unparsed into the SQL sent to Spark.
+    ///
+    /// `SparkConnectTableProvider`'s `SQLExecutor` overrode no
+    /// `can_execute_plan`, so the default `true` federated every plan and
+    /// Spark answered
+    /// `[UNRESOLVED_ROUTINE] Cannot resolve routine \`spice_only_udf\``. The
+    /// same executor is what the Databricks `spark_connect` mode federates
+    /// through, on both the dataset and the `catalogs:` path. Regression test
+    /// for #13664.
+    ///
+    /// Needs a Spark Connect server holding `docs(id INT, body STRING)`:
+    ///
+    /// ```text
+    /// SPARK_REMOTE=sc://127.0.0.1:15002/ cargo test --release -p data_components \
+    ///   --no-default-features --features spark_connect -- --ignored spice_only_udf
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires a live Spark Connect server; set SPARK_REMOTE"]
+    async fn a_spice_only_udf_is_not_pushed_into_the_spark_statement() {
+        let Ok(remote) = std::env::var("SPARK_REMOTE") else {
+            panic!("SPARK_REMOTE must name a Spark Connect server holding `docs`");
+        };
+
+        // The negative control, first: with no deny-list the same plan
+        // federates, which is what gives the assertion below teeth -- and is
+        // the behaviour this test exists to keep from coming back.
+        let unguarded = SparkConnect::from_connection(&remote)
+            .await
+            .expect("connect to the Spark Connect server");
+        let unguarded_sql = federated_sql_for_spice_only_udf(&unguarded).await;
+        assert!(
+            unguarded_sql
+                .as_deref()
+                .is_some_and(|sql| sql.contains(SPICE_ONLY_UDF)),
+            "the control: with no deny-list the UDF is unparsed into the remote statement, \
+             so an assertion that it is absent once the deny-list is installed means \
+             something. Got: {unguarded_sql:?}"
+        );
+
+        let guarded = SparkConnect::from_connection(&remote)
+            .await
+            .expect("connect to the Spark Connect server")
+            .with_function_support(deny_only(SPICE_ONLY_UDF));
+        let guarded_sql = federated_sql_for_spice_only_udf(&guarded).await;
+        assert!(
+            guarded_sql
+                .as_deref()
+                .is_none_or(|sql| !sql.contains(SPICE_ONLY_UDF)),
+            "a denied function must not reach the statement sent to Spark, which cannot \
+             resolve it. Got: {guarded_sql:?}"
+        );
+
+        // A function Spark does have must still be pushed down, so the
+        // deny-list has not simply turned federation off.
+        let control_sql = federated_sql(&guarded, "SELECT id, upper(body) AS c FROM docs").await;
+        assert!(
+            control_sql
+                .as_deref()
+                .is_some_and(|sql| sql.contains("upper(")),
+            "upper() is a Spark function and must keep federating. Got: {control_sql:?}"
+        );
+    }
+
+    const SPICE_ONLY_UDF: &str = "spice_only_udf";
+
+    /// A deny-list naming exactly one function, standing in for the Spice set
+    /// the connectors install (`runtime_udfs_api::deny_spice_functions_for_table_providers`,
+    /// which `data_components` is below and cannot call).
+    fn deny_only(name: &str) -> crate::function_support::FunctionSupport {
+        crate::function_support::FunctionSupport::new(
+            Some(crate::function_support::FunctionRestriction::Deny(vec![
+                name.to_string(),
+            ])),
+            None,
+            None,
+        )
+    }
+
+    async fn federated_sql_for_spice_only_udf(spark: &SparkConnect) -> Option<String> {
+        federated_sql(spark, "SELECT id, spice_only_udf(body) AS c FROM docs").await
+    }
+
+    /// The statement the federated plan for `sql` would send to Spark, or
+    /// `None` when nothing federated.
+    async fn federated_sql(spark: &SparkConnect, sql: &str) -> Option<String> {
+        use arrow::datatypes::DataType;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::SessionContext;
+        use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+
+        let provider = spark
+            .table_provider(TableReference::bare("docs"))
+            .await
+            .expect("build the docs table provider");
+
+        // Stands in for any Spice-only UDF: Spark has no function of this
+        // name, exactly as it has none called `json_get_str`.
+        let spice_only = create_udf(
+            SPICE_ONLY_UDF,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        );
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(spice_only);
+        ctx.register_table(TableReference::bare("docs"), provider)
+            .expect("register the docs table");
+
+        let physical = ctx
+            .sql(sql)
+            .await
+            .expect("plan the query")
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+
+        displayable(physical.as_ref())
+            .indent(false)
+            .to_string()
+            .lines()
+            .find_map(|line| {
+                line.split_once("base_sql=")
+                    .map(|(_, sql)| sql.trim().to_string())
+            })
+    }
 
     #[test]
     fn recoverable_session_errors_are_detected() {
