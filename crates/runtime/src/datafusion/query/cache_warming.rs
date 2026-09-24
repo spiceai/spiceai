@@ -105,6 +105,12 @@ pub(crate) struct ResultsCacheWarmer {
     /// one cached version, so a stale task can overwrite a newer catalog without
     /// a conflict; one writer at a time keeps recorded shapes.
     remote_persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Template ids dropped locally but not yet confirmed removed from the remote
+    /// catalog. Every remote persist unions this set into its exclude filter so an
+    /// ordinary persist that wins the lock first cannot reintroduce pruned shapes
+    /// via a remote-first merge (and wipe a newly observed shape when the catalog
+    /// is at capacity).
+    pending_excludes: Arc<parking_lot::Mutex<HashSet<u64>>>,
     count: Arc<AtomicUsize>,
     started: AtomicBool,
     persist: WarmupPersist,
@@ -169,6 +175,7 @@ impl ResultsCacheWarmer {
             })),
             persist_lock: Arc::new(parking_lot::Mutex::new(())),
             remote_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_excludes: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             count: Arc::new(AtomicUsize::new(count)),
             started: AtomicBool::new(false),
             persist,
@@ -250,6 +257,9 @@ impl ResultsCacheWarmer {
             catalog.ids = catalog.templates.iter().map(template_id).collect();
             self.count.store(catalog.templates.len(), Ordering::Relaxed);
         }
+        // Tombstone before scheduling so a concurrent ordinary persist that
+        // acquires `remote_persist_lock` first still filters these ids.
+        self.pending_excludes.lock().extend(exclude.iter().copied());
         self.schedule_persist_excluding(exclude);
     }
 
@@ -290,14 +300,20 @@ impl ResultsCacheWarmer {
                 let count = Arc::clone(&self.count);
                 let state = Arc::clone(state);
                 let remote_persist_lock = Arc::clone(&self.remote_persist_lock);
+                let pending_excludes = Arc::clone(&self.pending_excludes);
                 tokio::spawn(async move {
                     let _persist = remote_persist_lock.lock().await;
-                    // Re-snapshot under the lock so this write includes any
-                    // templates observed while we waited for earlier persists.
-                    if exclude.is_empty() {
-                        persist_remote(state, catalog, count).await;
-                    } else {
-                        persist_remote_excluding(state, catalog, count, exclude).await;
+                    // Union call-local excludes with pending tombstones under
+                    // the lock so an ordinary persist cannot restore pruned
+                    // shapes from a stale remote catalog.
+                    let exclude = {
+                        let pending = pending_excludes.lock();
+                        exclude.union(&pending).copied().collect::<HashSet<_>>()
+                    };
+                    let wrote =
+                        persist_remote_excluding(state, catalog, count, exclude.clone()).await;
+                    if wrote {
+                        pending_excludes.lock().retain(|id| !exclude.contains(id));
                     }
                 });
             }
@@ -375,16 +391,19 @@ async fn persist_remote(
     state: Arc<ObjectState<Vec<WarmupTemplate>>>,
     catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
     count: Arc<AtomicUsize>,
-) {
-    persist_remote_excluding(state, catalog, count, HashSet::new()).await;
+) -> bool {
+    persist_remote_excluding(state, catalog, count, HashSet::new()).await
 }
 
+/// Returns `true` when the remote catalog was left consistent with `exclude`
+/// (written or already matching). `false` on I/O failure so pending tombstones
+/// are retained for a later attempt.
 async fn persist_remote_excluding(
     state: Arc<ObjectState<Vec<WarmupTemplate>>>,
     catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
     count: Arc<AtomicUsize>,
     exclude: HashSet<u64>,
-) {
+) -> bool {
     let mut local = without_ids(&catalog.lock().templates, &exclude);
     for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
         // Compare `merged` to the stored catalog, not the already-filtered
@@ -395,14 +414,14 @@ async fn persist_remote_excluding(
             Ok(None) => (Vec::new(), None),
             Err(e) => {
                 tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                return;
+                return false;
             }
         };
         let remote = without_ids(&stored, &exclude);
         let merged = merge_templates(&remote, &local);
         if merged == stored {
             apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-            return;
+            return true;
         }
         if let Some(version) = version {
             match state
@@ -411,7 +430,7 @@ async fn persist_remote_excluding(
             {
                 Ok(UpdateResult::Ok) => {
                     apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-                    return;
+                    return true;
                 }
                 Ok(UpdateResult::NotFound) => {
                     local = merged;
@@ -421,26 +440,27 @@ async fn persist_remote_excluding(
                 }
                 Err(e) => {
                     tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                    return;
+                    return false;
                 }
             }
         } else {
             match state.insert(WARMUP_STATE_KEY, &merged).await {
                 Ok(InsertResult::Ok) => {
                     apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-                    return;
+                    return true;
                 }
                 Ok(InsertResult::AlreadyExists) => {
                     local = merged;
                 }
                 Err(e) => {
                     tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                    return;
+                    return false;
                 }
             }
         }
     }
     tracing::debug!("Failed to persist SQL results cache warmup catalog after retries");
+    false
 }
 
 /// Build the warmer, loading from `runtime.state` when that is set.
@@ -1855,6 +1875,63 @@ mod tests {
             .expect("final get")
             .expect("catalog exists");
         assert_eq!(template_sqls(&persisted), ["SELECT keep"]);
+    }
+
+    /// Regression for Copilot on #14178: an ordinary remote persist that runs
+    /// while a prune is only scheduled must not restore excluded ids from the
+    /// stale remote catalog (and crowd out a newly observed shape at capacity).
+    #[tokio::test]
+    async fn pending_excludes_keep_ordinary_persist_from_restoring_pruned_shapes() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let state = Arc::new(ObjectState::new(store));
+
+        // Remote catalog is full of stale shapes.
+        let stale: Vec<WarmupTemplate> = (0..MAX_WARMUP_PLANS)
+            .map(|i| warmup_tpl(&format!("SELECT stale_{i}")))
+            .collect();
+        let drop_id = template_id(&stale[0]);
+        state
+            .insert(WARMUP_STATE_KEY, &stale)
+            .await
+            .expect("seed catalog");
+
+        // Local catalog already dropped the unusable shape and recorded a new one.
+        let keep: Vec<WarmupTemplate> = stale[1..].to_vec();
+        let fresh = warmup_tpl("SELECT fresh");
+        let mut local = keep;
+        local.push(fresh.clone());
+        // Cap: fresh replaces dropped slot.
+        assert_eq!(local.len(), MAX_WARMUP_PLANS);
+
+        // Ordinary persist (empty call-local exclude) with the pending tombstone
+        // must filter the stale remote entry and keep `fresh`.
+        let catalog = catalog_mutex(local);
+        let count = Arc::new(AtomicUsize::new(MAX_WARMUP_PLANS));
+        let wrote = persist_remote_excluding(
+            Arc::clone(&state),
+            Arc::clone(&catalog),
+            Arc::clone(&count),
+            HashSet::from([drop_id]),
+        )
+        .await;
+        assert!(wrote, "persist should succeed");
+
+        let persisted = state
+            .get(WARMUP_STATE_KEY)
+            .await
+            .expect("final get")
+            .expect("catalog exists");
+        let sqls = template_sqls(&persisted);
+        assert!(
+            sqls.contains(&"SELECT fresh"),
+            "fresh shape must survive; got {sqls:?}"
+        );
+        assert!(
+            !sqls.iter().any(|s| *s == "SELECT stale_0"),
+            "pruned shape must not be restored; got {sqls:?}"
+        );
+        assert_eq!(sqls.len(), MAX_WARMUP_PLANS);
     }
 
     #[tokio::test]
