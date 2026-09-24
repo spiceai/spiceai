@@ -57,7 +57,7 @@ use super::on_conflict::{
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
-    apply_mem_tier_delete, pk_deletion_snapshot_for_strategy,
+    pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -25374,14 +25374,24 @@ impl CayenneTableProvider {
         // The sink above addresses durable Vortex files and catalog-inlined rows, so a
         // row resident in the RAM mem-tier is in neither — and under `mode: memory`
         // that tier IS the table, which is why a retention predicate reached nothing
-        // there (#14045). This is the same arm a client `DELETE` runs, so the two agree
-        // on what a predicate removes by construction rather than by convention.
+        // there (#14045).
         //
-        // What is NOT adopted from the `DELETE` path is `checkpoint_mem_tier_for_delete`:
-        // it would materialize a `cdc_durability: memory` table's tier, which retention
-        // deliberately leaves to that table's own checkpoint. The filtered arm self-gates
-        // on memory residency, so it stays inert there.
-        let mem_tier_deleted = match apply_mem_tier_delete(self, &filters).await {
+        // `delete_mem_tier_rows_matching` DIRECTLY rather than `apply_mem_tier_delete`,
+        // which is what a client `DELETE` composes. That wrapper routes an all-true
+        // predicate to `purge_mem_tier_all`, and unlike the filtered arm, purge has no
+        // memory-residency gate: it discards the tier in EVERY mode and releases the
+        // discarded bytes against the process-global mem-tier budget. A `retention_sql`
+        // of `DELETE FROM t WHERE TRUE` would then reach into a `cdc_durability: memory`
+        // or file-mode table's tier, and — because a memory-resident write never
+        // RESERVES those bytes — would credit another table's reservation with bytes
+        // this one never took. The filtered arm is gated on `is_memory_resident_mode()`
+        // and handles an all-true predicate by rebuilding the tier empty, which is the
+        // same outcome with none of that reach.
+        //
+        // `checkpoint_mem_tier_for_delete` is likewise not adopted: it would materialize
+        // a `cdc_durability: memory` table's tier, which retention deliberately leaves to
+        // that table's own checkpoint.
+        let mem_tier_deleted = match self.delete_mem_tier_rows_matching(&filters).await {
             Ok(deleted) => deleted,
             Err(err) => {
                 maintenance_metrics::track_maintenance(
@@ -25398,6 +25408,15 @@ impl CayenneTableProvider {
                 });
             }
         };
+
+        // Cleared INSIDE the hold, unlike the durable clear below. A key this pass just
+        // removed from the tier stays in the existence cache until something clears it,
+        // and on a `DoNothing` table a concurrent insert that takes `write_lock` in that
+        // window is dropped as a duplicate of a row that no longer exists. Clearing after
+        // the fact cannot undo a conflict decision already taken.
+        if mem_tier_deleted > 0 {
+            self.clear_cached_pk_keyset();
+        }
         drop(write_guard);
 
         let deleted_count = file_deleted.saturating_add(mem_tier_deleted);
