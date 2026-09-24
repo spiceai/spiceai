@@ -697,11 +697,26 @@ impl DatasetMetastoreSlice {
                 Some(partition_paths[*index]) == child_path
                     && !partitions_with_a_child.contains(index)
             }) else {
-                return refuse(format!(
-                    "its child table '{name}' is rooted at '{}' but the partition it belongs to is at '{}', so the restored dataset would read that partition's rows from another partition's directory",
-                    child_path.unwrap_or("no readable path"),
-                    partition_paths[candidates[0]]
-                ));
+                // Two different faults reach here and they are not the same:
+                // no partition of this name is rooted where the child is, or
+                // every one that is has already been covered by another child.
+                // Reporting the second as a path mismatch would print the
+                // child's own directory as the one it should have been at.
+                return if candidates
+                    .iter()
+                    .any(|index| Some(partition_paths[*index]) == child_path)
+                {
+                    refuse(format!(
+                        "its child table '{name}' could only belong to the partition at '{}', which another of its child tables already covers, so one of this dataset's partitions would be restored without its own data",
+                        child_path.unwrap_or("no readable path")
+                    ))
+                } else {
+                    refuse(format!(
+                        "its child table '{name}' is rooted at '{}' but the partition it belongs to is at '{}', so the restored dataset would read that partition's rows from another partition's directory",
+                        child_path.unwrap_or("no readable path"),
+                        partition_paths[candidates[0]]
+                    ))
+                };
             };
             partitions_with_a_child.insert(partition_index);
         }
