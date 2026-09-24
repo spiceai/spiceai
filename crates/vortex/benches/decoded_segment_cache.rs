@@ -47,7 +47,10 @@ use vortex::session::VortexSession;
 const ROW_COUNT: usize = 320_000;
 const LOOKUP_ORDER_KEY: i64 = 80_000;
 const MEBIBYTE: u64 = 1024 * 1024;
-const CACHE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
+/// Matches Cayenne's configured segment-cache budget: encoded and fully
+/// decoded segments each receive half.
+const TOTAL_CACHE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
+const CACHE_CAPACITY_BYTES: u64 = TOTAL_CACHE_CAPACITY_BYTES / 2;
 
 /// A one-file encoded cache for the low-level benchmark. Production Cayenne
 /// qualifies this key with object-store and path identity; the benchmark owns
