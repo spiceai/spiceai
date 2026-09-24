@@ -29,6 +29,10 @@ limitations under the License.
 //!   2. **`prepare_for_upload`** — defensively switches the *copied* file
 //!      to `journal_mode=DELETE` so the uploaded snapshot has no `-wal`
 //!      sidecar at all and is fully self-contained.
+//!   3. **`finalize_file_snapshot`** — after a download is renamed over the
+//!      live file, removes the `-wal`/`-shm`/`-journal` the replaced database
+//!      left beside it, so the next connection cannot apply them to the
+//!      restored file.
 
 use async_trait::async_trait;
 use snafu::prelude::*;
@@ -71,6 +75,14 @@ pub enum SqliteSnapshotError {
         dataset: String,
         path: PathBuf,
         source: rusqlite::Error,
+    },
+    #[snafu(display(
+        "Failed to remove the stale SQLite sidecar {path:?} after restoring the snapshot of dataset '{dataset}': {source}"
+    ))]
+    RemoveSidecar {
+        dataset: String,
+        path: PathBuf,
+        source: std::io::Error,
     },
     #[snafu(display(
         "SQLite snapshot preparation task failed unexpectedly for dataset '{dataset}'"
@@ -189,6 +201,43 @@ impl SnapshotEngine for SqliteSnapshotEngine {
     fn supports_compaction(&self) -> bool {
         false
     }
+
+    async fn finalize_file_snapshot(
+        &self,
+        restored_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), super::SnapshotEngineError> {
+        // The rename replaced the database file but not the sidecars the
+        // replaced database kept beside it. A connection opening the restored
+        // file in WAL mode would take that stale `-wal` as this database's and
+        // apply it, and a checkpoint would then write the old pages into the
+        // restored file. Connections still open on the replaced file hold their
+        // own handles to the removed sidecars, so reads in flight are unaffected.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = sidecar_path(restored_path, suffix);
+            match tokio::fs::remove_file(&sidecar).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(super::SnapshotEngineError::Sqlite {
+                        source: SqliteSnapshotError::RemoveSidecar {
+                            dataset: dataset_name.to_string(),
+                            path: sidecar,
+                            source,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `SQLite` names a database's sidecars by appending to the database path.
+fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
@@ -219,6 +268,78 @@ mod tests {
         let conn = Connection::open(path).expect("open verify");
         conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .expect("count")
+    }
+
+    /// Restores a three-row snapshot over a live WAL-mode database whose
+    /// connection is still open with an unflushed WAL, the state an
+    /// accelerator's first reload replaces. Returns the restored path and the
+    /// open connection to the replaced database.
+    fn restore_over_live_wal_database(tmp: &TempDir) -> (PathBuf, Connection) {
+        let live_path = tmp.path().join("orders.sqlite");
+        let live = Connection::open(&live_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch(
+            "PRAGMA wal_autocheckpoint=0; CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .expect("create");
+        assert!(sidecar_path(&live_path, "-wal").exists());
+
+        let download = tmp.path().join("download.sqlite");
+        let snapshot = Connection::open(&download).expect("open download");
+        snapshot
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO t(id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            )
+            .expect("write snapshot");
+        drop(snapshot);
+
+        std::fs::rename(&download, &live_path).expect("restore");
+        (live_path, live)
+    }
+
+    fn count_rows_in_wal_mode(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("open fresh");
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("count")
+    }
+
+    #[tokio::test]
+    async fn a_restore_over_a_live_wal_database_keeps_its_rows() {
+        // Control: without the hook, the restored rows are lost to the stale
+        // WAL, so this scenario reproduces what the hook exists to prevent.
+        let unfixed = TempDir::new().expect("tmp");
+        let (path, _live) = restore_over_live_wal_database(&unfixed);
+        assert_eq!(count_rows_in_wal_mode(&path), 0);
+
+        let tmp = TempDir::new().expect("tmp");
+        let (path, live) = restore_over_live_wal_database(&tmp);
+        SqliteSnapshotEngine::new()
+            .finalize_file_snapshot(&path, "orders")
+            .await
+            .expect("finalize");
+        assert!(!sidecar_path(&path, "-wal").exists());
+        assert!(!sidecar_path(&path, "-shm").exists());
+        assert_eq!(count_rows_in_wal_mode(&path), 3);
+
+        // Closing the replaced database's connection afterwards changes nothing.
+        drop(live);
+        assert_eq!(count_rows_in_wal_mode(&path), 3);
+    }
+
+    #[tokio::test]
+    async fn finalize_without_sidecars_is_a_no_op() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("fresh.sqlite");
+        std::fs::write(&path, b"").expect("write");
+        SqliteSnapshotEngine::new()
+            .finalize_file_snapshot(&path, "orders")
+            .await
+            .expect("finalize with no sidecars");
+        assert!(path.exists());
     }
 
     #[tokio::test]

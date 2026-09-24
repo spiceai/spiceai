@@ -369,6 +369,11 @@ pub enum SnapshotDownloadError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[snafu(display("Failed to prepare the snapshot restored to {}: {source}", path.display()))]
+    FinalizeFile {
+        path: PathBuf,
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Failed to write snapshot to {}: {source}", path.display()))]
     WriteLocal {
         path: PathBuf,
@@ -2193,6 +2198,16 @@ impl SnapshotManager {
             }
         }
 
+        // Remove what the replaced file left beside it before anything opens
+        // the restored one; see `SnapshotEngine::finalize_file_snapshot`.
+        self.snapshot_engine
+            .finalize_file_snapshot(local_path, &self.dataset_name)
+            .await
+            .map_err(|source| SnapshotDownloadError::FinalizeFile {
+                path: local_path.clone(),
+                source: Box::new(source),
+            })?;
+
         // Best-effort fsync of the parent directory so the rename's directory
         // entry update is durable across a crash. POSIX requires this in
         // addition to fsync of the file itself; on platforms where directory
@@ -3472,6 +3487,97 @@ mod tests {
             .await
             .expect("read downloaded snapshot");
         assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    /// Regression test for the first reload of a `refresh_mode: snapshot`
+    /// `SQLite` reader: the restore replaces a live WAL-mode database whose
+    /// connection is still open, and the replaced database's `-wal` must not be
+    /// applied to the restored rows.
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn a_sqlite_restore_over_a_live_wal_database_serves_the_snapshot_rows() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("orders.sqlite");
+        let live = rusqlite::Connection::open(&local_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE t(id INTEGER PRIMARY KEY);")
+            .expect("create live table");
+
+        let snapshot_file = temp_dir.path().join("published.sqlite");
+        let published = rusqlite::Connection::open(&snapshot_file).expect("open published");
+        published
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1), (2), (3);",
+            )
+            .expect("write published snapshot");
+        drop(published);
+        let contents = Bytes::from(std::fs::read(&snapshot_file).expect("read published"));
+
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Sqlite);
+        let instant = Utc
+            .with_ymd_and_hms(2026, 9, 24, 5, 37, 3)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(
+                    &schema,
+                    vec![SnapshotEntry {
+                        snapshot_id: 0,
+                        timestamp_ms: instant.timestamp_millis(),
+                        snapshot: snapshot_uri(&location),
+                        snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+                        snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                        snapshot_size: contents.len() as u64,
+                        snapshot_engine: None,
+                        snapshot_row_count: None,
+                        snapshot_last_updated_at_ms: None,
+                    }],
+                    Some(0),
+                ),
+            )]),
+        };
+        write_metadata(&store, &base.join(METADATA_FILE_NAME), &metadata).await;
+
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Sqlite,
+            false,
+        );
+        manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("expected snapshot");
+
+        let fresh = rusqlite::Connection::open(&local_path).expect("open restored");
+        fresh
+            .query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        let rows: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            rows, 3,
+            "the restored snapshot's rows must survive the replaced WAL"
+        );
+        drop(live);
     }
 
     #[tokio::test]

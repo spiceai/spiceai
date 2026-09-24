@@ -133,6 +133,26 @@ pub trait SnapshotEngine: Send + Sync {
         Ok(DirectorySnapshotPlan::default())
     }
 
+    /// Hook invoked by `SnapshotManager` right after a downloaded single-file
+    /// snapshot has been renamed over the accelerator's file, before anything
+    /// opens the restored file.
+    ///
+    /// Engines that keep state beside the primary file must remove what the
+    /// *replaced* file left there. `SQLite` in WAL mode is the case: the old
+    /// database's `-wal` and `-shm` stay behind after the rename, and the next
+    /// connection applies that stale write-ahead log to the restored file,
+    /// losing its rows.
+    ///
+    /// Default implementation is a no-op.
+    async fn finalize_file_snapshot(
+        &self,
+        restored_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (restored_path, dataset_name);
+        Ok(())
+    }
+
     /// Hook invoked by `SnapshotManager` *after* extracting a directory-layout
     /// snapshot. Allows engines to perform engine-specific post-processing
     /// (e.g. import a metastore slice that was written into one of the
