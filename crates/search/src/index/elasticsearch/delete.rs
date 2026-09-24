@@ -62,7 +62,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which no exact-match filter can address — a `text` mapping indexes analyzed tokens rather than the value, and an unsearchable mapping indexes nothing — and it has no exact-match sub-field either, so the delete was not issued. Map '{column}' as a searchable `keyword` and re-create the index; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which no exact-match filter can address — a `text` mapping indexes analyzed tokens rather than the value, and an unsearchable mapping indexes nothing — and it has no exact-match sub-field either, so the delete was not issued. Re-create the index and let the runtime map '{column}': it maps a string key as a searchable `keyword`, and every other key type to that type's own exact mapping. Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
     ))]
     KeyColumnNotExactlyMatchable {
         index: String,
@@ -71,7 +71,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped with the normalizer '{normalizer}', so an exact-match filter on it also matches every other value that normalizes the same way — deleting one row's documents would reach another row's — and it has no unnormalized exact-match sub-field either; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword` with no `normalizer`; Elasticsearch cannot change an existing field's normalizer. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped with the normalizer '{normalizer}', so an exact-match filter on it also matches every other value that normalizes the same way — deleting one row's documents would reach another row's — and it has no unnormalized exact-match sub-field either; the delete was not issued. Re-create the index and let the runtime map its key columns: it maps a string key `keyword` with no `normalizer`, and every other key type to that type's own exact mapping. Elasticsearch cannot change an existing field's normalizer. See: https://spiceai.org/docs/features/search"
     ))]
     KeyColumnNormalized {
         index: String,
@@ -80,7 +80,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' holds {source_type} values but is mapped `{mapped_as}`, which {why}, so an exact-match filter on it also reaches every other value indexed under that same term — deleting one row's documents would reach another row's — and it has no exactly-addressable sub-field either; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword`; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' holds {source_type} values but is mapped `{mapped_as}`, which {why}, so an exact-match filter on it also reaches every other value indexed under that same term — deleting one row's documents would reach another row's — and it has no exactly-addressable sub-field either; the delete was not issued. Re-create the index and let the runtime map its key columns: it maps a string key `keyword`, and every other key type to that type's own exact mapping (an `Int64` key becomes `long`, not `keyword`). Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
     ))]
     KeyColumnOverMatches {
         index: String,
@@ -896,7 +896,8 @@ const TERM_ROUNDING_FIELD_TYPES: &[(&str, &str)] = &[
 ///   query's string with the same lenient parser, and that parse is not injective: measured
 ///   against Elasticsearch 8.15.0, `"1"` and `"01"` under `long` both index as the term `1` and
 ///   a `term` for either returns both rows' documents, as do `"1.0"`/`"1.00"` under `double` and
-///   `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date`. [`STRING_FIELD_TYPES`] is the measured
+///   `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date`, `"false"`/`""` under `boolean` and
+///   `"2001:db8::1"`/`"2001:0db8:0:0:0:0:0:1"` under `ip`. [`STRING_FIELD_TYPES`] is the measured
 ///   set a string *does* reach as itself, and carries the rest of the measurements.
 ///
 /// Only asked of a column whose values [`scalar_to_term_value`] can render, because a column it
@@ -944,18 +945,22 @@ fn term_over_matches(mapping: &FieldMapping, source_type: &DataType) -> Option<T
 /// matches the stored string and no other. Everything [`TERM_EXACT_FIELD_TYPES`] holds that is
 /// *not* here is what [`term_over_matches`] refuses for a string column.
 ///
-/// Measured against Elasticsearch 8.15.0 rather than reasoned from the type's name. Collapsing
-/// (so refused): `"1"`/`"01"` index as the same term under `byte`, `short`, `integer`, `long` and
-/// `unsigned_long`; `"1.0"`/`"1.00"` under `double`; `"2020-01-01"`/`"2020-01-01T00:00:00Z"`
-/// under `date` and `date_nanos`. Distinct (so kept): `"1"`/`"01"` and `"ORDER-1"`/`"order-1"`
-/// under `keyword`, `wildcard` and `version`, and `version`'s ordering normalization — the one
-/// here that is not simply the bytes — also keeps `"1.0.0"`/`"1.00.0"`, `"1.0.0"`/`"01.0.0"` and
-/// `"1.0"`/`"1.0.0-"` apart. `boolean` and `ip` are kept because they *reject* the second value of
-/// each such pair at index time (`"True"`, `"1.2.3.04"`), so the write fails where the prune would
-/// have had to, and refusing them as well would cost a delete an index can serve exactly.
-/// `constant_keyword` is absent because [`TERM_ROUNDING_FIELD_TYPES`] already refuses it for every
-/// source type.
-const STRING_FIELD_TYPES: &[&str] = &["boolean", "ip", "keyword", "version", "wildcard"];
+/// Measured against Elasticsearch 8.15.0 rather than reasoned from the type's name, and the pair
+/// has to come from the type's *own* parser — a pair it rejects proves nothing, because rejecting
+/// is not collapsing. Collapsing (so refused): `"1"`/`"01"` index as the same term under `byte`,
+/// `short`, `integer`, `long` and `unsigned_long`; `"1.0"`/`"1.00"` under `double`;
+/// `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` and `date_nanos`; `"false"`/`""` under
+/// `boolean`, which reads an empty string as false; and `"2001:db8::1"`/`"2001:0db8:0:0:0:0:0:1"`
+/// under `ip`, which canonicalizes the address. Each of those types *also* rejects some pairs
+/// (`"True"` under `boolean`, `"1.2.3.04"` under `ip`) — which is why a single rejected pair is
+/// not evidence the type is safe.
+///
+/// Distinct (so kept): `"1"`/`"01"`, `"A"`/`"a"` and `"ORDER-1"`/`"order-1"` under `keyword`,
+/// `wildcard` and `version`; `version` stores the original string in its doc values, so
+/// `"1.0.0"`/`"1.00.0"`, `"1.0.0"`/`"01.0.0"`, `"1.0"`/`"1.0.0"` and `"1.0.0"`/`"1.0.0+build"`
+/// each index as themselves. `constant_keyword` is absent because [`TERM_ROUNDING_FIELD_TYPES`]
+/// already refuses it for every source type.
+const STRING_FIELD_TYPES: &[&str] = &["keyword", "version", "wildcard"];
 
 /// Whether `source_type` holds strings, so a non-string mapping reaches it only through a parse.
 fn is_string_type(source_type: &DataType) -> bool {
@@ -2091,7 +2096,13 @@ mod tests {
     /// `{"bool": {"filter": [{"term": {"row_key": "1"}}], "must_not": [{"ids": …}]}}` — reported
     /// `"deleted": 3`, removing row `"01"`'s two chunks along with row `"1"`'s superseded one.
     /// The same two keys under `keyword` leave `"deleted": 1`. `"1.0"`/`"1.00"` under `double`
-    /// and `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` collide the same way.
+    /// and `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` collide the same way, as do
+    /// `"false"`/`""` under `boolean` (an empty string reads as false) and
+    /// `"2001:db8::1"`/`"2001:0db8:0:0:0:0:0:1"` under `ip` (the address is canonicalized).
+    ///
+    /// `boolean` and `ip` are in this list because of those pairs, not despite rejecting others:
+    /// `"True"` and `"1.2.3.04"` are refused at index time, and taking a rejected pair as proof
+    /// the type is injective is what left both of them wrongly in [`STRING_FIELD_TYPES`] once.
     #[tokio::test]
     async fn a_string_key_column_mapped_to_a_parsed_type_refuses_before_issuing() {
         for mapped_as in [
@@ -2103,6 +2114,8 @@ mod tests {
             "double",
             "date",
             "date_nanos",
+            "boolean",
+            "ip",
         ] {
             let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
 
