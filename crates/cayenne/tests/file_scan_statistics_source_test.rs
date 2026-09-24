@@ -82,6 +82,34 @@ async fn scan_statistics(
     Ok((stats.total_byte_size, per_column))
 }
 
+/// The manifest rows a settle produces, waited for rather than read once.
+///
+/// `flush_pending_maintenance` does not guarantee the checkpoint/maintenance passes
+/// have committed their manifest rows by the time it returns, so on a loaded runner
+/// the first read comes back empty — a readiness race in the test, not a missing
+/// file. #13904 observed exactly that here (`TRY 1 FAIL` / `TRY 2 PASS` at the
+/// `!files.is_empty()` premise), and spiceai/spiceai#13906 is the same shape in a
+/// neighbouring suite. Poll the condition with a bound rather than sleeping a fixed
+/// amount, and name the last observed state on failure.
+async fn await_manifest_rows(
+    fixture: &common::TestFixture,
+    table_id: &str,
+) -> TestResult<Vec<cayenne::metadata::SnapshotFile>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let files = fixture.catalog.get_all_snapshot_files(table_id).await?;
+        if !files.is_empty() {
+            return Ok(files);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the settle must have produced a data file within 30s; \
+             `get_all_snapshot_files` still returns no manifest row for table {table_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// The key a per-file statistics row is stored under: the object-store location,
 /// which is the store-relative path. The manifest carries only the bare filename.
 fn statistics_row_key(
@@ -236,25 +264,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     // Overwrite every per-file row with a pre-change blob, which is the state an
     // installation that upgrades into this change is already in.
     let table_id = table.table_id().to_string();
-    // The manifest rows are published by the checkpoint/maintenance passes above, and
-    // `flush_pending_maintenance` does not guarantee they are committed by the time it
-    // returns. Poll for them rather than asserting once: on a loaded runner the first
-    // read comes back empty, which is a readiness race in this test and not a missing
-    // file (spiceai/spiceai#13906 is the same shape in a neighbouring suite).
-    let mut files = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline {
-        files = fixture.catalog.get_all_snapshot_files(&table_id).await?;
-        if !files.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(
-        !files.is_empty(),
-        "the settle must have produced a data file within 30s; \
-         `get_all_snapshot_files` still returns no manifest row for table {table_id}"
-    );
+    let files = await_manifest_rows(&fixture, &table_id).await?;
     let scan_snapshot_id = files[0].snapshot_id.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
         statistics_row_key(&fixture.data_path, &table_id, file)
@@ -411,11 +421,7 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     // rejected the blob and re-read the file.
     let table_id = table.table_id().to_string();
     let stored_schema = table.schema();
-    let files = fixture.catalog.get_all_snapshot_files(&table_id).await?;
-    assert!(
-        !files.is_empty(),
-        "the settle must have produced a data file"
-    );
+    let files = await_manifest_rows(&fixture, &table_id).await?;
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
         statistics_row_key(&fixture.data_path, &table_id, file)
     };
