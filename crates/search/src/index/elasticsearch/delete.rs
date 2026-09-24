@@ -2094,7 +2094,16 @@ mod tests {
     /// and `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` collide the same way.
     #[tokio::test]
     async fn a_string_key_column_mapped_to_a_parsed_type_refuses_before_issuing() {
-        for mapped_as in ["byte", "short", "integer", "long", "unsigned_long", "double", "date", "date_nanos"] {
+        for mapped_as in [
+            "byte",
+            "short",
+            "integer",
+            "long",
+            "unsigned_long",
+            "double",
+            "date",
+            "date_nanos",
+        ] {
             let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
 
             let Err(err) = delete_group_remainder(
