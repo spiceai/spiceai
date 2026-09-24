@@ -47,6 +47,9 @@ LOAD_DATA_RE = re.compile(r"LOAD\s+DATA\s+(LOCAL\s+)?INFILE\s+'([^']+)'", re.IGN
 #   $(MYSQL_LOAD_PREP) "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
 STAGE_RE = re.compile(r"^\s*(?P<prep>.*?)\s*\"[^\"]+\"\s*>\s*(?P<dest>\S+?);?\s*\\?\s*$")
 
+# The start of a recipe: a target name, then a colon that is not `:=`.
+TARGET_RE = re.compile(r"^([A-Za-z0-9_.\-/]+)\s*:(?!=)")
+
 
 def read(path: Path) -> str:
     try:
@@ -59,39 +62,33 @@ def read(path: Path) -> str:
 def recipe_blocks(text: str) -> list[tuple[str, list[str]]]:
     """Split a Makefile into (target, recipe-lines) pairs."""
     blocks: list[tuple[str, list[str]]] = []
-    target: str | None = None
-    lines: list[str] = []
+    current: list[str] | None = None
     for line in text.splitlines():
         if line.startswith("\t"):
-            if target is not None:
-                lines.append(line)
-            continue
-        if target is not None:
-            blocks.append((target, lines))
-            target, lines = None, []
-        match = re.match(r"^([A-Za-z0-9_.\-/]+)\s*:(?!=)", line)
-        if match:
-            target, lines = match.group(1), []
-    if target is not None:
-        blocks.append((target, lines))
+            if current is not None:
+                current.append(line)
+        elif match := TARGET_RE.match(line):
+            current = []
+            blocks.append((match.group(1), current))
+        else:
+            current = None
     return blocks
 
 
-def main() -> int:
-    text = read(BENCH_MAKEFILE)
-    rel = BENCH_MAKEFILE.relative_to(REPO)
+def loader_errors(text: str, rel: str) -> tuple[list[str], int]:
+    """Every problem in a bench Makefile's MySQL loaders, and how many it inspected.
 
-    errors: list[str] = []
-
+    Split out of `main` so the self-test can drive it in-process: asserting on the
+    returned strings is what distinguishes the three failure modes from each other,
+    which a subprocess exit code cannot.
+    """
     if not re.search(rf"^{re.escape(PREP_VAR)}\s*[:+?]?=", text, re.MULTILINE):
-        errors.append(
+        return [
             f"{rel}: `{PREP_VAR}` is not defined, so no MySQL loader can render an "
             f"empty field as NULL."
-        )
-        for error in errors:
-            print(f"error: {error}", file=sys.stderr)
-        return 1
+        ], 0
 
+    errors: list[str] = []
     checked = 0
     for target, lines in recipe_blocks(text):
         # Map each staged destination to the command that produced it, so a LOAD
@@ -100,7 +97,7 @@ def main() -> int:
         for line in lines:
             stage = STAGE_RE.match(line)
             if stage and stage.group("prep"):
-                staged[stage.group("dest").strip()] = stage.group("prep")
+                staged[stage.group("dest")] = stage.group("prep")
 
         for line in lines:
             load = LOAD_DATA_RE.search(line)
@@ -128,6 +125,12 @@ def main() -> int:
             f"{rel}: found no `LOAD DATA … INFILE` recipe at all. This guard is "
             f"matching nothing, so it would pass however the loaders are written."
         )
+    return errors, checked
+
+
+def main() -> int:
+    rel = str(BENCH_MAKEFILE.relative_to(REPO))
+    errors, checked = loader_errors(read(BENCH_MAKEFILE), rel)
 
     if errors:
         for error in errors:

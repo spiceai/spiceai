@@ -8,9 +8,9 @@
 #
 #   * The guard's parser only ever scans today's Makefile. With both its regexes
 #     matching nothing it would report agreement, so a parser regression would
-#     pass unnoticed on a clean tree — the shapes below pin it against a loader
-#     that skips the prep, one that stages with a bare `sed`, and a file with no
-#     loader at all.
+#     pass unnoticed on a clean tree — the fixtures below pin it against a loader
+#     that skips the prep, one staged with a bare `sed`, one whose input is never
+#     staged, and a file with no loader at all.
 #   * The transform is the thing that actually has to be right, and it is a sed
 #     program in a Makefile that nothing else executes in CI. It is read out of
 #     the shipped Makefile — not restated here — and run, so this cannot drift
@@ -21,100 +21,112 @@
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-GUARD = REPO / "scripts" / "check_bench_mysql_load_nulls.py"
+sys.path.insert(0, str(REPO / "scripts"))
+
+# Imported rather than driven through a subprocess: asserting on the returned
+# strings is what tells the three failure modes apart, which an exit code cannot.
+from check_bench_mysql_load_nulls import loader_errors  # noqa: E402
+
 BENCH_MAKEFILE = REPO / "test" / "tpc-bench" / "Makefile"
 
+REL = "test/tpc-bench/Makefile"
+
+PREP_DEF = (
+    "MYSQL_LOAD_PREP = sed -e 's/|$$//' -e ':a' -e 's/||/|\\\\N|/g' -e 'ta' "
+    "-e 's/^|/\\\\N|/' -e 's/|$$/|\\\\N/'\n"
+)
+TARGET = "\nmysql-tpcds-load:\n"
+PREP_STAGE = "\t$(MYSQL_LOAD_PREP) \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
+BARE_STAGE = "\tsed 's/|$$//' \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
 LOAD_LINE = (
     "\tmysql -h$(DB_HOST) --local-infile=1 $(DB_NAME) -e \"LOAD DATA LOCAL INFILE "
     "'./tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES "
     "TERMINATED BY '\\n';\"; \\\n"
 )
 
-PREP_DEF = (
-    "MYSQL_LOAD_PREP = sed -e 's/|$$//' -e ':a' -e 's/||/|\\\\N|/g' -e 'ta' "
-    "-e 's/^|/\\\\N|/' -e 's/|$$/|\\\\N/'\n"
-)
-
-GOOD = PREP_DEF + "\nmysql-tpcds-load:\n" + (
-    "\t$(MYSQL_LOAD_PREP) \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
-) + LOAD_LINE
-
-BARE_SED = PREP_DEF + "\nmysql-tpcds-load:\n" + (
-    "\tsed 's/|$$//' \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
-) + LOAD_LINE
-
-UNSTAGED = PREP_DEF + "\nmysql-tpcds-load:\n" + LOAD_LINE
-
-NO_PREP_VAR = "mysql-tpcds-load:\n" + (
-    "\tsed 's/|$$//' \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
-) + LOAD_LINE
-
+GOOD = PREP_DEF + TARGET + PREP_STAGE + LOAD_LINE
+BARE_SED = PREP_DEF + TARGET + BARE_STAGE + LOAD_LINE
+UNSTAGED = PREP_DEF + TARGET + LOAD_LINE
+NO_PREP_VAR = TARGET.lstrip("\n") + BARE_STAGE + LOAD_LINE
 NO_LOADER = PREP_DEF + "\nsomething-else:\n\techo hi\n"
 
 FAILURES: list[str] = []
+CHECKS = 0
 
 
-def check(name: str, condition: bool, detail: str = "") -> None:
-    if condition:
+def check(name: str, got: object, want: object) -> None:
+    global CHECKS
+    CHECKS += 1
+    if got == want:
         print(f"  ok   {name}")
     else:
-        FAILURES.append(f"{name}{': ' + detail if detail else ''}")
-        print(f"  FAIL {name}{': ' + detail if detail else ''}")
+        FAILURES.append(name)
+        print(f"  FAIL {name}\n         got:  {got!r}\n         want: {want!r}")
 
 
-def run_guard_against(makefile_text: str) -> subprocess.CompletedProcess[str]:
-    """Run the shipped guard against a synthetic bench Makefile."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        (root / "scripts").mkdir()
-        (root / "test" / "tpc-bench").mkdir(parents=True)
-        (root / "test" / "tpc-bench" / "Makefile").write_text(
-            makefile_text, encoding="utf-8"
-        )
-        guard = root / "scripts" / GUARD.name
-        guard.write_text(GUARD.read_text(encoding="utf-8"), encoding="utf-8")
-        return subprocess.run(
-            [sys.executable, str(guard)], capture_output=True, text=True, check=False
-        )
+def check_contains(name: str, haystack: str, needle: str) -> None:
+    global CHECKS
+    CHECKS += 1
+    if needle in haystack:
+        print(f"  ok   {name}")
+    else:
+        FAILURES.append(name)
+        print(f"  FAIL {name}\n         {needle!r} not in {haystack!r}")
 
 
 def test_guard_parser() -> None:
     print("guard parser")
-    good = run_guard_against(GOOD)
-    check("accepts a loader staged through $(MYSQL_LOAD_PREP)", good.returncode == 0,
-          good.stderr.strip())
 
-    bare = run_guard_against(BARE_SED)
-    check("rejects a loader staged with a bare sed", bare.returncode == 1)
-    check("  names the offending target", "mysql-tpcds-load" in bare.stderr)
+    errors, checked = loader_errors(GOOD, REL)
+    check("a loader staged through $(MYSQL_LOAD_PREP) is accepted", errors, [])
+    check("  and its LOAD DATA was actually inspected", checked, 1)
 
-    unstaged = run_guard_against(UNSTAGED)
-    check("rejects a loader whose input is never staged", unstaged.returncode == 1)
+    errors, _ = loader_errors(BARE_SED, REL)
+    check("a loader staged with a bare sed yields one error", len(errors), 1)
+    check_contains("  the error names the target", errors[0], "mysql-tpcds-load")
+    check_contains("  and says what the bad staging was", errors[0], "instead")
 
-    missing = run_guard_against(NO_PREP_VAR)
-    check("rejects a Makefile with no MYSQL_LOAD_PREP at all", missing.returncode == 1)
+    errors, _ = loader_errors(UNSTAGED, REL)
+    check("a loader whose input is never staged yields one error", len(errors), 1)
+    check_contains("  the error says nothing stages it", errors[0], "no ")
+    check(
+        "  the unstaged error is distinct from the bare-sed error",
+        errors[0] == loader_errors(BARE_SED, REL)[0][0],
+        False,
+    )
 
-    empty = run_guard_against(NO_LOADER)
-    check("rejects a Makefile it matched no loader in", empty.returncode == 1,
-          "a guard that matches nothing must not report success")
+    errors, _ = loader_errors(NO_PREP_VAR, REL)
+    check("a Makefile with no MYSQL_LOAD_PREP yields one error", len(errors), 1)
+    check_contains("  the error names the missing variable", errors[0], "MYSQL_LOAD_PREP")
+
+    # A guard that matches nothing must not report success — that is how a parser
+    # regression would otherwise pass on a clean tree.
+    errors, checked = loader_errors(NO_LOADER, REL)
+    check("a Makefile with no loader at all is rejected", len(errors), 1)
+    check("  and nothing was inspected", checked, 0)
 
 
 def shipped_prep_command() -> str:
-    """The `MYSQL_LOAD_PREP` recipe as `make` expands it, read from the real Makefile."""
+    """The `MYSQL_LOAD_PREP` recipe as `make` expands it, read from the real Makefile.
+
+    Via `make -n` rather than by re-parsing the assignment, so make's own escaping
+    (`$$` -> `$`) is applied by make and this cannot disagree with what the loaders run.
+    """
     expanded = subprocess.run(
         ["make", "-C", str(BENCH_MAKEFILE.parent), "-n", "mysql-tpcds-load"],
         capture_output=True, text=True, check=False,
     ).stdout
     for line in expanded.splitlines():
         stripped = line.strip()
-        if stripped.startswith("sed ") and " > ./tmp/" in stripped:
+        if stripped.startswith("sed "):
+            # The staged source is the first quoted argument; everything before it
+            # is the transform.
             return stripped.split(' "', 1)[0]
     raise AssertionError(
         "could not read the expanded MYSQL_LOAD_PREP out of `make -n mysql-tpcds-load`"
@@ -126,13 +138,13 @@ def test_transform_semantics() -> None:
     try:
         prep = shipped_prep_command()
     except AssertionError as exc:
-        check("reads the shipped transform", False, str(exc))
+        check("reads the shipped transform", str(exc), "")
         return
-    check("reads the shipped transform", True)
+    print("  ok   reads the shipped transform")
 
     # dsdgen/dbgen format: pipe-separated, one trailing '|', NULL written as an
     # empty field. Covers a leading, middle, trailing, and consecutive NULL, plus
-    # a row with none, and a value that merely contains 'N'.
+    # a row with none, and values that merely contain 'N' or are a literal 0.
     rows = [
         "1|101|11|19.99|",
         "2|102||29.99|",
@@ -156,23 +168,16 @@ def test_transform_semantics() -> None:
         out = subprocess.run(
             f"{prep} {src}", shell=True, capture_output=True, text=True, check=False
         )
-    check("transform runs", out.returncode == 0, out.stderr.strip())
+    check("transform exits cleanly", (out.returncode, out.stderr.strip()), (0, ""))
+
     got = [line.split("|") for line in out.stdout.splitlines()]
+    check("every row parses to the PostgreSQL CSV NULL reading", got, expected)
 
-    check("row count preserved", len(got) == len(expected),
-          f"{len(got)} != {len(expected)}")
-    for i, (g, e) in enumerate(zip(got, expected)):
-        check(f"row {i + 1} field parity with PostgreSQL CSV NULL semantics", g == e,
-              f"{g!r} != {e!r}")
-
-    # The point of the whole transform: an empty field becomes NULL, and exactly
-    # the fields that were empty. `0` must never become NULL, and NULL never 0.
-    empties = sum(1 for row in rows for f in row[:-1].split("|") if f == "")
-    nulls = sum(1 for row in expected for f in row if f == r"\N")
-    check("one \\N per empty field, and no others", empties == nulls,
-          f"{empties} empty field(s) in, {nulls} \\N out")
-    check("a literal 0 is never turned into NULL",
-          expected[5][3] == "0" and got and got[5][3] == "0")
+    # The point of the whole transform: exactly the empty fields become NULL. A
+    # literal 0 must never become NULL, and a NULL never 0.
+    empties = sum(1 for row in rows for field in row[:-1].split("|") if field == "")
+    nulls = sum(1 for row in got for field in row if field == r"\N")
+    check("one \\N out per empty field in, and no others", nulls, empties)
 
 
 def main() -> int:
@@ -180,11 +185,11 @@ def main() -> int:
     test_transform_semantics()
     print()
     if FAILURES:
-        print(f"{len(FAILURES)} failure(s):", file=sys.stderr)
+        print(f"{len(FAILURES)} of {CHECKS} checks failed:", file=sys.stderr)
         for failure in FAILURES:
             print(f"  - {failure}", file=sys.stderr)
         return 1
-    print("check_bench_mysql_load_nulls self-test OK")
+    print(f"check_bench_mysql_load_nulls self-test OK ({CHECKS} checks)")
     return 0
 
 

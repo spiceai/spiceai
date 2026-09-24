@@ -73,6 +73,12 @@ RUST_SOURCE_PATHS = (
     # ledger-only edit skips the very check that would have rejected it, and the
     # mismatch surfaces on someone else's unrelated Rust PR.
     "docs/dev/fork_patches.md",
+    # `check_bench_mysql_load_nulls.py` reads this file and nothing else, for the
+    # same reason and with the same consequence: left ungated, a revert of
+    # `$(MYSQL_LOAD_PREP)` back to a bare `sed` skips the very guard written to
+    # reject it. It is here rather than derived because the `lint-rust` recipe
+    # names the guard, not the file the guard reads.
+    "test/tpc-bench/Makefile",
 )
 
 # Paths that must NOT drag in the Rust gate — otherwise the fast-track is dead
@@ -86,8 +92,6 @@ MUST_SKIP_RUST_CHECKS = (
     "scripts/tpcds_explain.sh",
     # A non-Rust guard must not inherit the Rust gate by naming convention.
     "scripts/check_helm_chart.py",
-    # Only the root Makefile carries the lint flags.
-    "test/tpc-bench/Makefile",
 )
 
 
