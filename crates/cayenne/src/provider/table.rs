@@ -34695,6 +34695,18 @@ impl CayenneTableProvider {
         }
     }
 
+    /// How many per-snapshot secondary indexes this table holds — one per
+    /// protected snapshot written since the process started, plus any rewrite
+    /// not yet promoted — and their resident bytes. `None` when the table
+    /// declares no index. Exposed for index-lifecycle tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn lookup_index_snapshot_footprint(&self) -> Option<(usize, usize)> {
+        self.lookup_index
+            .as_ref()
+            .map(|state| state.snapshot_index_footprint())
+    }
+
     /// A guard for the index [`Self::write_to_indexed_snapshot`] will register
     /// under `snapshot_id`: dropped before the snapshot is published — an error
     /// returned with `?`, a cancelled write — it discards that index, so an
@@ -34718,7 +34730,7 @@ impl CayenneTableProvider {
     /// Records that `snapshot_id` was published as a protected snapshot, and
     /// drops the indexes of protected snapshots no longer in the set. Called
     /// right after each change to `protected_snapshots`.
-    fn sync_protected_snapshot_lookup_indexes(&self, published: Option<&str>) {
+    pub(crate) fn sync_protected_snapshot_lookup_indexes(&self, published: Option<&str>) {
         let Some(state) = &self.lookup_index else {
             return;
         };

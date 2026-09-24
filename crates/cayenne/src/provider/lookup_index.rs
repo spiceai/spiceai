@@ -1544,6 +1544,16 @@ impl LookupIndexState {
         self.index.load_full()
     }
 
+    /// How many per-snapshot indexes are held, and their resident bytes.
+    pub(crate) fn snapshot_index_footprint(&self) -> (usize, usize) {
+        let snapshots = self.snapshots.load();
+        let bytes = snapshots
+            .values()
+            .map(|entry| entry.index.reservation.bytes())
+            .fold(0usize, usize::saturating_add);
+        (snapshots.len(), bytes)
+    }
+
     pub(crate) fn counters(&self) -> LookupIndexCounters {
         let index_bytes = self
             .index

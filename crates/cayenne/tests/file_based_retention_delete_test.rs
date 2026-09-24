@@ -61,6 +61,7 @@ test_with_backends!(test_pk_file_based_retention_main_table_only_impl);
 test_with_backends!(test_orphaned_key_dv_cleaned_after_retention_impl);
 test_with_backends!(test_needed_key_dv_retained_after_retention_impl);
 test_with_backends!(test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl);
+test_with_backends!(test_retention_releases_indexes_of_emptied_snapshots_impl);
 test_with_backends!(test_orphaned_dv_cleanup_below_threshold_retained_impl);
 test_with_backends!(test_loader_self_heals_orphaned_missing_dv_impl);
 test_with_backends!(test_loader_errors_on_missing_needed_dv_impl);
@@ -1310,5 +1311,77 @@ async fn test_loader_errors_on_missing_needed_dv_impl(fixture: TestFixture) -> T
         "Reopen must fail when a still-needed deletion-vector file is missing (data loss)"
     );
 
+    Ok(())
+}
+
+/// Test: retention that empties protected snapshots also drops their secondary
+/// indexes and releases the memory those indexes reserved.
+///
+/// Each upsert of an expired row writes its own protected snapshot, and the
+/// table declares an index on `id`, so each snapshot carries a write-time index.
+/// Retention removes the emptied snapshots from the protected set; their indexes
+/// must go with them.
+async fn test_retention_releases_indexes_of_emptied_snapshots_impl(
+    fixture: TestFixture,
+) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "emptied_snapshot_indexes";
+    let ctx = SessionContext::new();
+    let table_dir = fixture.data_path.join(table_name);
+    std::fs::create_dir_all(&table_dir)?;
+    let schema = retention_schema();
+    let table_options = CreateTableOptions {
+        table_name: table_name.to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: table_dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig {
+            inline_max_rows: 0,
+            ..cayenne::metadata::VortexConfig::default()
+        },
+    };
+    let retention_builder =
+        TimeRetentionFilterBuilder::try_new("event_time", retention_seconds, &schema)
+            .expect("to create retention builder");
+    let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention_builder)
+            .with_secondary_indexes(vec![vec!["id".to_string()]])
+            .create(table_options)
+            .await?,
+    );
+    let table_id = table.metadata().table_id.clone();
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us - 200_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+    insert_row(&table, 2, now_us - 100_000_000).await?;
+    common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
+
+    let (indexes_before, bytes_before) = table
+        .lookup_index_snapshot_footprint()
+        .expect("the table declares an index");
+    assert!(
+        indexes_before >= 2 && bytes_before > 0,
+        "each expired upsert should have written an indexed protected snapshot, got {indexes_before} index(es), {bytes_before} bytes"
+    );
+
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 2, "Retention should delete both expired rows");
+    assert_table_contents(&ctx, &table, table_name, &[], "after retention").await?;
+
+    let (indexes_after, bytes_after) = table
+        .lookup_index_snapshot_footprint()
+        .expect("the table declares an index");
+    assert_eq!(
+        (indexes_after, bytes_after),
+        (0, 0),
+        "retention emptied every protected snapshot, so none of their indexes should remain (had {indexes_before} holding {bytes_before} bytes)"
+    );
     Ok(())
 }

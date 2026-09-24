@@ -529,12 +529,14 @@ impl FileBasedDeletionSink {
                 );
             }
 
-            // 3. Remove from in-memory map (copy-on-write atomic publish)
+            // 3. Remove from in-memory map (copy-on-write atomic publish), and
+            //    drop the removed snapshot's secondary index with it.
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
                 new_map.remove(snapshot_id);
                 Arc::new(new_map)
             });
+            self.provider.sync_protected_snapshot_lookup_indexes(None);
 
             // 4. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
