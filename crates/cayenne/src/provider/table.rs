@@ -57877,8 +57877,8 @@ mod tests {
     /// The append takes the `!stage_on_conflict` arm — purely-new keys into a
     /// table holding no tombstones, which is `do_nothing`'s steady state
     /// (`may_have_on_conflict_deletions` is set only for `Upsert`) — so it
-    /// publishes into the current snapshot, and nothing on that path draws a
-    /// sequence for it except the draw this test pins.
+    /// publishes into the current snapshot; the only sequence it draws is the one
+    /// this test pins.
     ///
     /// Neither writer sees the other: the transaction staged its row before the
     /// append existed, and the append validated before the transaction published.
@@ -58016,50 +58016,22 @@ mod tests {
     /// transaction that read one of its keys (#13685). An append that wrote
     /// nothing publishes no row for any transaction to race, so drawing one for it
     /// buys no ordering and costs a false abort: `transaction_has_conflict` falls
-    /// back to `current_high_water != stage_seq` whenever the keyset is degraded
-    /// or cleared, and that reads any movement of the high water as a conflict.
+    /// back to `current_high_water != stage_seq` whenever the keyset is degraded,
+    /// cleared, or absent, and that reads any movement of the high water as a
+    /// conflict. The mem-tier checkpoint gates its own draw on `any_nonempty` for
+    /// the same reason.
     ///
-    /// A retention table is the shape that reaches this: retention filters bar the
-    /// inline buffer (`InlineMutationPolicy::from_blocking_conditions`), which is
-    /// what absorbs an empty batch on an ordinary table, so the batch goes to the
-    /// plain-append arm and writes zero rows. Partitioned tables take the same
-    /// route. An empty refresh tick is the steady state for both.
+    /// [`create_retention_table`] is the shape that reaches this: retention
+    /// filters bar the inline buffer (`InlineMutationPolicy::from_blocking_conditions`),
+    /// and that buffer is what absorbs an empty batch on an ordinary table — so the
+    /// batch goes to the plain-append arm and writes zero rows. Partitioned tables
+    /// take the same route. An empty refresh tick is the steady state for both.
     #[tokio::test]
     async fn an_append_that_writes_no_rows_leaves_the_sequence_high_water_alone() {
         let ctx = SessionContext::new();
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
-        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
-        let catalog = Arc::new(
-            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
-        ) as Arc<dyn MetadataCatalog>;
-        catalog.init().await.expect("catalog init");
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let provider = CayenneTableProvider::create_table_with_retention(
-            Arc::clone(&catalog),
-            CreateTableOptions {
-                table_name: "retention_empty_append".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::DoNothingAll),
-                base_path: data_dir,
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    deletion_mode: crate::metadata::DeletionMode::Key,
-                    ..VortexConfig::default()
-                },
-            },
-            vec![datafusion::prelude::col("value").gt(datafusion::prelude::lit(0_i64))],
-            ctx.runtime_env(),
-        )
-        .await
-        .expect("retention table");
+        let (provider, _catalog, _tmp) =
+            create_retention_table("retention_empty_append", ctx.runtime_env(), 0).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
 
         let before = provider.sequence_high_water().await;
         insert_batch_with_context(
@@ -58076,16 +58048,68 @@ mod tests {
         );
 
         // The same table still orders an append that DOES write rows, so the
-        // assertion above cannot be satisfied by never drawing a sequence at all.
+        // assertion above cannot be satisfied by never drawing at all. The value
+        // clears `RETENTION_FLOOR` so retention does not delete the row back out.
         insert_batch_with_context(
             &ctx,
             &provider,
-            id_value_batch(Arc::clone(&schema), &[1], &[1]),
+            id_value_batch(Arc::clone(&schema), &[1], &[RETENTION_FLOOR]),
         )
         .await;
         assert!(
             provider.sequence_high_water().await > before,
             "an append that wrote rows must still move the high water (#13685)"
+        );
+    }
+
+    /// A pipelined append that publishes rows must move the high water even when
+    /// it validated no primary keys.
+    ///
+    /// The draw is gated on the ROW count, and this pins why it cannot be gated on
+    /// the validated key set instead. A table with no primary key returns
+    /// `PreparedInsertStream::immediate`, whose `PostValidationState` is empty on
+    /// every append however many rows it writes — and a table like this has no
+    /// per-key stamp at all, so `transaction_has_conflict` can only take the
+    /// per-table `current_high_water != stage_seq` fallback. Gating on the key set
+    /// would leave every one of its appends invisible to that fallback, which is
+    /// #13685 again on the tables least able to detect it.
+    #[tokio::test]
+    async fn a_keyless_pipelined_append_still_moves_the_sequence_high_water() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "keyless_pipelined_append",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec![],
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+
+        let before = provider.sequence_high_water().await;
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[1])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("the CDC append should stage")
+            .finish()
+            .await
+            .expect("finalize the staged append");
+
+        assert!(
+            provider.sequence_high_water().await > before,
+            "an append that published rows must move the high water even with no validated keys, \
+             or a transaction on a key-less table commits over it unseen (#13685)"
         );
     }
 

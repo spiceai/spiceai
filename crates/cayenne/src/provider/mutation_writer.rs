@@ -708,13 +708,17 @@ impl<'a> AppendMutationWriter<'a> {
                 // moves, and so does the per-table high water the degraded fallback
                 // compares.
                 //
-                // Only when this append actually has keys to record. An append that
-                // validated away to nothing publishes no row for a transaction to
-                // race, so moving the high water for it would abort a concurrent
-                // transaction on the degraded fallback for a write nobody can
-                // observe. Drawn before `finish()` publishes, so a failure to draw
-                // one rolls back a write that is still private.
-                let record_seq = if stage_on_conflict || validated_keys.is_empty() {
+                // Only when the append actually publishes rows: one that wrote none
+                // gives a transaction nothing to race, so moving the high water for
+                // it would abort concurrent transactions over a write nobody can
+                // observe. The gate is the ROW count, not `validated_keys` — a
+                // PK-less table and one at `pk_conflict_detection: none` both
+                // validate to an empty key set on every append (`immediate`), and
+                // those are precisely the tables with no per-key stamp to fall back
+                // on. `sequence_high_water`'s own mem-tier checkpoint gates on
+                // `any_nonempty` for the same reason. Drawn before `finish()`
+                // publishes, so a failure to draw one rolls back a private write.
+                let record_seq = if stage_on_conflict || rows == 0 {
                     self.table.sequence_high_water().await
                 } else {
                     match self.table.reserve_sequences_local(1).await {
@@ -1184,15 +1188,6 @@ impl<'a> AppendMutationWriter<'a> {
 
         let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
 
-        // The plain-append arm's own sequence, for the same ordering rule as the
-        // pipelined staged append above (#13685). `write_staged_append` draws it
-        // between writing the rows and publishing them — the only seam where the
-        // row count is known and nothing is visible yet — and returns it here to
-        // stamp with. `None` on the `needs_new_snapshot` arm, which draws this
-        // batch's sequences while writing its snapshot, and on an append that
-        // wrote no rows, which has nothing for a transaction to race.
-        let mut append_sequence: Option<i64> = None;
-
         // Taken before either publish below: both make rows visible well before
         // the `num_rows` delta describing them reaches the maintenance queue, and
         // a reader landing in between would be served the pre-write count as a
@@ -1204,6 +1199,13 @@ impl<'a> AppendMutationWriter<'a> {
         // of the conflict resolution). The live-row delta is `inserted -
         // superseded`, which keeps the metastore `num_rows` tracking COUNT(*)
         // under CDC upsert instead of summing every insert.
+        // This write's own sequence for the primary-key OCC stamp below, `None`
+        // when it drew none: `write_staged_append` draws it for the plain-append
+        // arm and returns it, the `needs_new_snapshot` arm draws its own while
+        // writing its snapshot (and nothing at all when it writes no rows, for the
+        // same reason `write_staged_append` does not), and the stamp falls back to
+        // the high water in both of those cases.
+        let mut append_sequence: Option<i64> = None;
         let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
             let new_snapshot_start = Instant::now();
             let (rows, stats_acc, validated_keys, superseded) = self
@@ -1574,7 +1576,7 @@ impl<'a> AppendMutationWriter<'a> {
             .store(true, Ordering::Release);
 
         let write_start = Instant::now();
-        let result = match self
+        let (rows, writer_ops, stats_acc) = match self
             .table
             .write_to_snapshot(
                 stream,
@@ -1606,11 +1608,9 @@ impl<'a> AppendMutationWriter<'a> {
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
 
-        // Drawn before the publish below and only for an append that wrote rows:
-        // an append that wrote none publishes nothing for a transaction to race,
-        // so moving the high water for it would abort a concurrent transaction on
-        // the per-table degraded fallback over a write nobody can observe.
-        let append_sequence = if result.0 > 0 {
+        // Zero rows publishes nothing, so there is nothing for a transaction to
+        // race and no sequence to draw (see the fn doc).
+        let append_sequence = if rows > 0 {
             Some(self.table.reserve_sequences_local(1).await?)
         } else {
             None
@@ -1620,7 +1620,7 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.clone_for_write_operations(),
             None,
             staging_snapshot_id,
-            result.0,
+            rows,
         );
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
@@ -1629,7 +1629,7 @@ impl<'a> AppendMutationWriter<'a> {
         // publish-bound signal (the single-writer finalization on the CDC-apply path).
         self.context.record_publish_latency(publish_start.elapsed());
 
-        Ok((result.0, result.1, result.2, append_sequence))
+        Ok((rows, writer_ops, stats_acc, append_sequence))
     }
 
     async fn write_staged_append_prepared(
