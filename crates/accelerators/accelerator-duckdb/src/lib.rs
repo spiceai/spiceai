@@ -1443,25 +1443,36 @@ fn drop_indexes_named(
             .into_iter()
             .map(|(name, _)| name),
     );
-    let writer_names: HashSet<String> = tables
+    // Keyed by the owning table as well as the name: the writer joins table and column
+    // names with `_`, so `orders (customer_id)` and `orders_customer (id)` share the name
+    // `i_orders_customer_id`, and a name alone would reach another dataset's index.
+    let writer_indexes: HashSet<(String, String)> = tables
         .iter()
         .cartesian_product(superseded)
-        .map(|(table, columns)| IndexBuilder::new(table, columns.iter().collect()).index_name())
+        .map(|(table, columns)| {
+            (
+                table.clone(),
+                IndexBuilder::new(table, columns.iter().collect()).index_name(),
+            )
+        })
         .collect();
 
     let mut stmt = tx
         .prepare(
-            "SELECT index_name FROM duckdb_indexes() \
+            "SELECT table_name, index_name FROM duckdb_indexes() \
              WHERE database_name = current_database() AND schema_name = current_schema()",
         )
         .boxed()?;
     let dropped: Vec<String> = stmt
-        .query_map([], |row| row.get::<usize, String>(0))
+        .query_map([], |row| {
+            Ok((row.get::<usize, String>(0)?, row.get::<usize, String>(1)?))
+        })
         .boxed()?
-        .filter(|name| match name {
-            Ok(name) => writer_names.contains(name),
+        .filter(|index| match index {
+            Ok(index) => writer_indexes.contains(index),
             Err(_) => true,
         })
+        .map(|index| index.map(|(_, name)| name))
         .collect::<Result<_, _>>()
         .boxed()?;
     for name in &dropped {
@@ -4262,6 +4273,48 @@ mod tests {
             remaining,
             vec!["i_t_email".to_string(), "i_tt_first_last".to_string()],
             "a declared index and another table's index must survive"
+        );
+    }
+
+    // The writer joins table and column names with `_`, so `orders (customer_id)` and
+    // `orders_customer (id)` generate the same index name; only the owning table's may go.
+    #[test]
+    fn drop_indexes_named_keeps_another_tables_index_with_the_same_name() {
+        let mut conn =
+            duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
+        conn.execute_batch(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_id BIGINT);
+             CREATE TABLE orders_customer (id BIGINT);
+             CREATE UNIQUE INDEX i_orders_customer_id ON orders_customer (id);",
+        )
+        .expect("fixture tables and index are created");
+
+        let tx = conn.transaction().expect("transaction begins");
+        let superseded = std::collections::HashSet::from([
+            datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                "customer_id".to_string(),
+            ]),
+        ]);
+        let dropped = super::drop_indexes_named(&tx, "orders", &superseded).expect("drop succeeds");
+        tx.commit().expect("transaction commits");
+
+        assert!(
+            dropped.is_empty(),
+            "dropped another table's index: {dropped:?}"
+        );
+        let remaining: Vec<(String, String)> = conn
+            .prepare("SELECT table_name, index_name FROM duckdb_indexes()")
+            .expect("index listing prepares")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("index listing runs")
+            .collect::<Result<_, _>>()
+            .expect("index names read");
+        assert_eq!(
+            remaining,
+            vec![(
+                "orders_customer".to_string(),
+                "i_orders_customer_id".to_string()
+            )]
         );
     }
 }
