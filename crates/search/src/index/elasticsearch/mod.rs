@@ -627,8 +627,17 @@ impl Index for ElasticsearchIndex {
     /// The same field-value addressing [`Index::deletes_by_partial_key`] reports, applied to the
     /// rest of a key group: a `_delete_by_query` reaches every document sharing the group's key,
     /// and `must_not` on the surviving `_id`s keeps the members.
+    ///
+    /// That addressing needs every key column to have a `term` form. A key this index cannot
+    /// render one for — a float, date or timestamp column — prunes nothing at all, because
+    /// `collect_groups` drops the whole group rather than filter on part of its key, so it is
+    /// reported as unsupported and the caller warns that superseded chunks stay in place.
     fn group_pruning(&self) -> GroupPruning {
-        GroupPruning::Complete
+        if delete::key_renders_terms(&self.primary_key) {
+            GroupPruning::Complete
+        } else {
+            GroupPruning::Unsupported
+        }
     }
 }
 
@@ -905,9 +914,14 @@ impl Index for ElasticsearchTextIndex {
         .await
     }
 
-    /// Same group addressing as [`ElasticsearchIndex`].
+    /// Same group addressing as [`ElasticsearchIndex`], including the key types it cannot
+    /// address.
     fn group_pruning(&self) -> GroupPruning {
-        GroupPruning::Complete
+        if delete::key_renders_terms(&self.primary_key) {
+            GroupPruning::Complete
+        } else {
+            GroupPruning::Unsupported
+        }
     }
 }
 

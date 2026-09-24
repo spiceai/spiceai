@@ -839,7 +839,12 @@ const TERM_EXACT_FIELD_TYPES: &[&str] = &[
 /// Stands in for a key column the delete batch does not carry, until `key_column_arrays` fails
 /// on it: the renderable type that the most mappings are refused for, so an absent column can
 /// never resolve to a mapping a present one would have been refused for.
-const ASSUMED_KEY_TYPE: DataType = DataType::Int64;
+///
+/// `Utf8` holds that position, and `assumed_key_type_is_refused_for_every_mapping_any_type_is`
+/// keeps it there: a string is refused for every rounding type *and* for every exact type that
+/// reaches it through a parse, which is a superset of what any other renderable type is refused
+/// for.
+const ASSUMED_KEY_TYPE: DataType = DataType::Utf8;
 
 /// Field types whose indexed form is a *rounded* form of the value, whatever it holds, so one
 /// term stands for a range of values and a `term` on one reaches documents the key never named.
@@ -875,8 +880,8 @@ const TERM_ROUNDING_FIELD_TYPES: &[(&str, &str)] = &[
 
 /// Why a `term` on this field would reach more than the key names, or `None` when it would not.
 ///
-/// Two ways one term can stand for several keys, and the caller needs to tell them apart only to
-/// say so in the message:
+/// Three ways one term can stand for several keys, and the caller needs to tell them apart only
+/// to say so in the message:
 ///
 /// - the type rounds every value it holds ([`TERM_ROUNDING_FIELD_TYPES`]);
 /// - the type is exact but too narrow for this column. `double` is the only such pairing that
@@ -886,12 +891,21 @@ const TERM_ROUNDING_FIELD_TYPES: &[(&str, &str)] = &[
 ///   first returns both rows' documents, while the same two keys under `long` return one each.
 ///   `long` holds every Arrow integer, and `byte`/`short`/`integer` reject an out-of-range value
 ///   at index time rather than rounding it, so the write fails where this would have had to.
+/// - the type is exact in its own values but reached through a parse, because the column's own
+///   values are strings and the field is not. Elasticsearch parses the stored string and the
+///   query's string with the same lenient parser, and that parse is not injective: measured
+///   against Elasticsearch 8.15.0, `"1"` and `"01"` under `long` both index as the term `1` and
+///   a `term` for either returns both rows' documents, as do `"1.0"`/`"1.00"` under `double` and
+///   `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date`. [`STRING_FIELD_TYPES`] is the measured
+///   set a string *does* reach as itself, and carries the rest of the measurements.
 ///
 /// Only asked of a column whose values [`scalar_to_term_value`] can render, because a column it
-/// cannot render issues no `term` at all: its group is dropped by [`collect_groups`] instead.
-/// That is what keeps this rule pointed at over-matching rather than at mappings the runtime
-/// itself writes — `primary_key_mapping` maps a `Float32` key column `float` and a timestamp key
-/// column `date`, and neither renders a term.
+/// cannot render issues no `term` at all: its group is dropped by [`collect_groups`] instead, and
+/// [`key_renders_terms`] is what stops that drop being reported as a complete prune. That is what
+/// keeps this rule pointed at over-matching rather than at mappings the runtime itself writes —
+/// `primary_key_mapping` maps a `Float32` key column `float` and a timestamp key column `date`,
+/// and neither renders a term; it maps a string key column bare `keyword`, so the parse rule
+/// above only ever fires on an index the runtime did not create.
 fn term_over_matches(mapping: &FieldMapping, source_type: &DataType) -> Option<TermOverMatch> {
     let field_type = mapping.field_type.as_deref()?;
     if !renders_a_term(source_type) {
@@ -903,12 +917,52 @@ fn term_over_matches(mapping: &FieldMapping, source_type: &DataType) -> Option<T
     {
         return Some(TermOverMatch { mapped_as, why });
     }
-    let too_narrow =
-        field_type == "double" && matches!(source_type, DataType::Int64 | DataType::UInt64);
-    too_narrow.then_some(TermOverMatch {
-        mapped_as: "double",
-        why: "indexes integers past 2^53 rounded, being an IEEE-754 binary64",
-    })
+    if field_type == "double" && matches!(source_type, DataType::Int64 | DataType::UInt64) {
+        return Some(TermOverMatch {
+            mapped_as: "double",
+            why: "indexes integers past 2^53 rounded, being an IEEE-754 binary64",
+        });
+    }
+    if !is_string_type(source_type) || STRING_FIELD_TYPES.contains(&field_type) {
+        return None;
+    }
+    // Only an *exact* type can over-match, and looking the name up here is what enforces that: a
+    // type that is not exact at all is refused by `is_term_exact` with
+    // [`Error::KeyColumnNotExactlyMatchable`], whose message is the right one for it — saying
+    // `text` "parses this column's strings" would describe analysis as coercion. The lookup also
+    // supplies the `&'static str` the message needs, so no mapping-supplied name is carried.
+    TERM_EXACT_FIELD_TYPES
+        .iter()
+        .find(|t| **t == field_type)
+        .map(|mapped_as| TermOverMatch {
+            mapped_as,
+            why: "parses this column's strings to index them, and that parse maps several strings onto one value",
+        })
+}
+
+/// The exact field types that a string column reaches without a lossy parse, so a `term` on one
+/// matches the stored string and no other. Everything [`TERM_EXACT_FIELD_TYPES`] holds that is
+/// *not* here is what [`term_over_matches`] refuses for a string column.
+///
+/// Measured against Elasticsearch 8.15.0 rather than reasoned from the type's name. Collapsing
+/// (so refused): `"1"`/`"01"` index as the same term under `byte`, `short`, `integer`, `long` and
+/// `unsigned_long`; `"1.0"`/`"1.00"` under `double`; `"2020-01-01"`/`"2020-01-01T00:00:00Z"`
+/// under `date` and `date_nanos`. Distinct (so kept): `"1"`/`"01"` and `"ORDER-1"`/`"order-1"`
+/// under `keyword`, `wildcard` and `version`, and `version`'s ordering normalization — the one
+/// here that is not simply the bytes — also keeps `"1.0.0"`/`"1.00.0"`, `"1.0.0"`/`"01.0.0"` and
+/// `"1.0"`/`"1.0.0-"` apart. `boolean` and `ip` are kept because they *reject* the second value of
+/// each such pair at index time (`"True"`, `"1.2.3.04"`), so the write fails where the prune would
+/// have had to, and refusing them as well would cost a delete an index can serve exactly.
+/// `constant_keyword` is absent because [`TERM_ROUNDING_FIELD_TYPES`] already refuses it for every
+/// source type.
+const STRING_FIELD_TYPES: &[&str] = &["boolean", "ip", "keyword", "version", "wildcard"];
+
+/// Whether `source_type` holds strings, so a non-string mapping reaches it only through a parse.
+fn is_string_type(source_type: &DataType) -> bool {
+    matches!(
+        source_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
 }
 
 /// A mapping that would make a `term` reach more than the key it names: the type, and the clause
@@ -916,6 +970,21 @@ fn term_over_matches(mapping: &FieldMapping, source_type: &DataType) -> Option<T
 struct TermOverMatch {
     mapped_as: &'static str,
     why: &'static str,
+}
+
+/// Whether every column of `primary_key` has a `term` form, so a group keyed on it can be
+/// addressed at all.
+///
+/// A key column whose values [`scalar_to_term_value`] cannot render drops its whole group in
+/// [`collect_groups`], which leaves that group's superseded documents in place. That is a
+/// defensible thing to do — a partial filter would reach documents the row does not identify —
+/// but it is not a complete prune, so an index over such a key reports
+/// `GroupPruning::Unsupported` rather than `GroupPruning::Complete` and the caller warns.
+/// The runtime maps a `Float32` key column `float` and a timestamp key column `date`
+/// (`primary_key_mapping`), and neither renders a term, so these are key types a user can
+/// actually declare rather than a theoretical gap.
+pub(crate) fn key_renders_terms(primary_key: &[Field]) -> bool {
+    primary_key.iter().all(|f| renders_a_term(f.data_type()))
 }
 
 /// Whether a value of `source_type` has a `term` form at all, mirroring [`scalar_to_term_value`].
@@ -1976,6 +2045,137 @@ mod tests {
         );
     }
 
+    /// [`ASSUMED_KEY_TYPE`] stands in for a column the batch does not carry, and the whole point
+    /// of the choice is that it cannot let such a column through a mapping a real one would have
+    /// been refused for. Pin that: every mapping refused for any renderable source type must be
+    /// refused for the assumed one too.
+    #[test]
+    fn assumed_key_type_is_refused_for_every_mapping_any_type_is() {
+        let renderable = [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        for field_type in TERM_EXACT_FIELD_TYPES {
+            let mapping = field_mapping(field_type);
+            let refused_for_some = renderable
+                .iter()
+                .any(|t| term_over_matches(&mapping, t).is_some());
+            if refused_for_some {
+                assert!(
+                    term_over_matches(&mapping, &ASSUMED_KEY_TYPE).is_some(),
+                    "`{field_type}` is refused for some source type, so it must be refused for \
+                     the assumed one — otherwise an absent key column resolves to a mapping a \
+                     present one would have been refused for"
+                );
+            }
+        }
+    }
+
+    /// A string key column mapped to a non-string type is reached only through Elasticsearch's
+    /// parse of the stored string, and that parse is not injective — so a `term` for one key
+    /// returns another key's documents and the prune deletes the sibling row's chunks.
+    ///
+    /// Measured against Elasticsearch 8.15.0, not reasoned from the mapping. Under
+    /// `{"type": "long"}`, documents keyed `"1"` and `"01"` both index as the term `1`, and the
+    /// prune this code builds for row `"1"` shortened to one chunk —
+    /// `{"bool": {"filter": [{"term": {"row_key": "1"}}], "must_not": [{"ids": …}]}}` — reported
+    /// `"deleted": 3`, removing row `"01"`'s two chunks along with row `"1"`'s superseded one.
+    /// The same two keys under `keyword` leave `"deleted": 1`. `"1.0"`/`"1.00"` under `double`
+    /// and `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` collide the same way.
+    #[tokio::test]
+    async fn a_string_key_column_mapped_to_a_parsed_type_refuses_before_issuing() {
+        for mapped_as in ["byte", "short", "integer", "long", "unsigned_long", "double", "date", "date_nanos"] {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+
+            let Err(err) = delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(DataType::Utf8),
+                &["id".to_string()],
+                &member_batch_keyed(Arc::new(StringArray::from(vec!["1"])), &[0]),
+            )
+            .await
+            else {
+                panic!("a Utf8 key column mapped `{mapped_as}` must fail the prune")
+            };
+
+            let message = err.to_string();
+            assert!(
+                message.contains("'id'") && message.contains(mapped_as) && message.contains("Utf8"),
+                "the error must name the column, its mapping and the source type, got: {message}"
+            );
+            assert!(
+                client.queries().is_empty(),
+                "no _delete_by_query may be issued against `{mapped_as}`, which collapses distinct string keys"
+            );
+        }
+    }
+
+    /// The parse rule is about the *pairing*, not about string columns: a string key mapped to a
+    /// type it reaches as itself is stored and matched as itself, and `keyword` is the mapping
+    /// the runtime writes for every string key (`primary_key_mapping`). A blanket refusal of
+    /// string keys would cost the common case its prune entirely.
+    #[tokio::test]
+    async fn a_string_key_column_mapped_to_a_type_it_reaches_as_itself_still_resolves() {
+        for mapped_as in STRING_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(DataType::Utf8),
+                &["id".to_string()],
+                &member_batch_keyed(Arc::new(StringArray::from(vec!["1"])), &[0]),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("a Utf8 key column mapped `{mapped_as}` should address its group: {e}")
+            });
+
+            assert_eq!(
+                client.queries().len(),
+                1,
+                "`{mapped_as}` addresses the group exactly, so the prune is issued"
+            );
+        }
+    }
+
+    /// A key column no `term` can render drops its whole group in [`collect_groups`], so an
+    /// index over such a key prunes nothing — and [`key_renders_terms`] is what stops that being
+    /// reported as a complete prune. `primary_key_mapping` maps a `Float32` key `float` and a
+    /// timestamp key `date`, so these are keys a user can declare today.
+    #[test]
+    fn a_key_type_that_renders_no_term_is_not_addressable() {
+        for unaddressable in [
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            assert!(
+                !key_renders_terms(&chunked_key_of(unaddressable.clone())),
+                "{unaddressable} renders no term, so a group keyed on it cannot be addressed"
+            );
+        }
+        for addressable in [DataType::Utf8, DataType::Int64, DataType::UInt32] {
+            assert!(
+                key_renders_terms(&chunked_key_of(addressable.clone())),
+                "{addressable} renders a term, so its groups are addressable"
+            );
+        }
+    }
+
     /// The width rule is about the pairing, not about `double`: a `UInt32` column mapped
     /// `double` still addresses its group, because binary64 holds every `u32` apart, and the
     /// same `Int64` column mapped `long` does too. A blanket refusal of `double` would fail the
@@ -2174,12 +2374,18 @@ mod tests {
     }
 
     /// The counterpart of the refusal: a type whose indexed form *is* the value still resolves to
-    /// the column itself, so tightening the list did not cost an index its delete. `double` and
-    /// `date_nanos` are the two that were re-examined and kept.
+    /// the column itself, so tightening the list did not cost an index its delete.
+    ///
+    /// The key here is `Utf8`, so the set is [`STRING_FIELD_TYPES`] rather than every non-rounding
+    /// exact type: Elasticsearch reaches a string through a parse for the numeric and date types,
+    /// and that parse collapses distinct keys onto one term (see [`STRING_FIELD_TYPES`] for the
+    /// measurements). `a_string_key_column_mapped_to_a_parsed_type_refuses_before_issuing` is the
+    /// other half, and `a_mapping_wide_enough_for_the_source_type_still_resolves` keeps the
+    /// numeric types addressable for the numeric key columns they are exact for.
     #[tokio::test]
     async fn an_exactly_indexed_group_column_still_resolves_to_the_column() {
         let rounding: Vec<&str> = TERM_ROUNDING_FIELD_TYPES.iter().map(|(t, _)| *t).collect();
-        for field_type in TERM_EXACT_FIELD_TYPES {
+        for field_type in STRING_FIELD_TYPES {
             if rounding.contains(field_type) {
                 continue;
             }
