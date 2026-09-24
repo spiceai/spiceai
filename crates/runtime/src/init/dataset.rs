@@ -89,6 +89,38 @@ use util::{error_spaced, warn_spaced};
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// What a caller of [`Runtime::invalidate_cached_results_because`] is doing to the
+/// dataset, which decides what the operator is told they will observe when the
+/// invalidation itself fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheInvalidation {
+    /// The dataset stays registered and its contents may change.
+    Reload,
+    /// The dataset is being unloaded and stops being queryable.
+    Unload,
+}
+
+/// The warning for a cached-results invalidation that failed — a degrade-and-continue
+/// path, so this line is the only account an operator gets of why a removed or reloaded
+/// dataset keeps answering.
+///
+/// A pure function so the wording is asserted rather than assumed: see
+/// `a_failed_unload_invalidation_says_the_dataset_keeps_answering`.
+fn cache_invalidation_warning(
+    dataset: &TableReference,
+    cause: CacheInvalidation,
+    source: &dyn std::fmt::Display,
+) -> String {
+    match cause {
+        CacheInvalidation::Reload => format!(
+            "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {source}"
+        ),
+        CacheInvalidation::Unload => format!(
+            "Dataset '{dataset}' was unloaded, but the results cached from it could not be invalidated, so queries may keep being answered from the dataset that is no longer there until they expire. Cause: {source}"
+        ),
+    }
+}
+
 /// Warn an operator about what their dataset's or view's acceleration block asks for and
 /// the runtime will not do as written: settings that `enabled: false` discards (#13514), and
 /// the deprecated `acceleration.ready_state`, honoured but superseded by the component's own
@@ -1191,6 +1223,17 @@ impl Runtime {
         // them at registration before the changes stream starts.
         crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
 
+        // Deregistering the table is not enough to stop it being read: a cached
+        // logical plan holds the `TableSource` it was planned against, so a query
+        // executed before the removal keeps executing against the retired provider
+        // — answering rows from a dataset the catalog no longer lists, and holding
+        // that provider's memory reservations against the query pool. A cached
+        // result reads the same way. `update_dataset` and `remove_view` discard
+        // both for the same reason; removal is the arm that did not.
+        self.df.clear_cached_plans().await;
+        self.invalidate_cached_results_because(&ds_name, CacheInvalidation::Unload)
+            .await;
+
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
             || "None".to_string(),
@@ -1324,15 +1367,27 @@ impl Runtime {
     /// an operator learns that queries may keep being answered from the previous
     /// contents until `item_ttl` expires.
     async fn invalidate_cached_results_for(&self, dataset: &TableReference) {
+        self.invalidate_cached_results_because(dataset, CacheInvalidation::Reload)
+            .await;
+    }
+
+    /// [`Self::invalidate_cached_results_for`], for a caller that is unloading the
+    /// dataset rather than reloading it — which is what the warning on the degrade
+    /// path has to say, because the two leave the operator observing different
+    /// things: a reload keeps answering from the previous contents, an unload keeps
+    /// answering at all.
+    async fn invalidate_cached_results_because(
+        &self,
+        dataset: &TableReference,
+        cause: CacheInvalidation,
+    ) {
         if let Err(e) = self
             .df
             .caching()
             .invalidate_for_table(dataset.clone())
             .await
         {
-            tracing::warn!(
-                "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}"
-            );
+            tracing::warn!("{}", cache_invalidation_warning(dataset, cause, &e));
         }
     }
 
@@ -4493,5 +4548,137 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             2,
             "both datasets of the cycle are selected"
         );
+    }
+
+    /// #14251: deregistering the table is not what stops it being read. A cached logical
+    /// plan holds the `TableSource` it was planned against, so a query executed before the
+    /// removal keeps answering from the retired provider — and keeps that provider's memory
+    /// reservations charged to the query pool — while a *new* query correctly fails to plan
+    /// and `information_schema.tables` no longer lists the dataset.
+    ///
+    /// Before the fix this read `Some(1)`: `update_dataset` and `remove_view` both discard
+    /// cached plans, and the removal arm was the one that did not.
+    #[tokio::test]
+    async fn removing_a_dataset_discards_cached_plans() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let name = TableReference::bare("removed_ds");
+        runtime
+            .df
+            .ctx
+            .register_table(name.clone(), empty_table())
+            .expect("the table registers");
+
+        runtime
+            .df
+            .cache_one_plan("SELECT id FROM removed_ds")
+            .await
+            .expect("the query plans while the dataset is registered");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&app_with_datasets(&["removed_ds"]), &app_with_datasets(&[]))
+            .await;
+
+        assert!(
+            !runtime.df.table_exists(&name),
+            "the premise: the dataset really was unloaded"
+        );
+        assert_eq!(
+            runtime.df.cached_plan_count().await,
+            Some(0),
+            "a plan cached over the removed dataset still resolves through its retired provider, so an already-executed query keeps answering from a dataset the catalog no longer lists"
+        );
+
+        // What the operator actually observes. Going back through the same cache key is the
+        // whole defect: on `trunk` this returns the stale plan and the query answers rows,
+        // which is why asserting only on the count above would be a weaker claim than the
+        // issue makes.
+        let replanned = runtime.df.cache_one_plan("SELECT id FROM removed_ds").await;
+        let err = replanned.expect_err(
+            "the previously executed SQL must be replanned against the catalog, which no longer has the dataset",
+        );
+        assert!(
+            err.to_string().contains("removed_ds"),
+            "and it must fail for the reason a new query fails — table not found: {err}"
+        );
+    }
+
+    /// The other half: an apply that removes nothing must not throw the plan cache away.
+    #[tokio::test]
+    async fn an_apply_that_removes_no_dataset_keeps_cached_plans() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&app_with_datasets(&[]), &app_with_datasets(&[]))
+            .await;
+
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+    }
+
+    /// The warning is the only account an operator gets of why a dataset that is gone keeps
+    /// answering, so it has to say *that*, not that the dataset "is updating" — which is what
+    /// the one shared message said before the unload path had its own.
+    #[test]
+    fn a_failed_unload_invalidation_says_the_dataset_keeps_answering() {
+        let dataset = TableReference::partial("public", "orders");
+        let unload = cache_invalidation_warning(
+            &dataset,
+            CacheInvalidation::Unload,
+            &"cache backend unavailable",
+        );
+        assert!(
+            unload.contains("'public.orders'"),
+            "the dataset is named, and quoted so an empty or word-like name survives: {unload}"
+        );
+        assert!(
+            unload.contains("unloaded"),
+            "an operator reading this must not be told the dataset is updating: {unload}"
+        );
+        assert!(
+            unload.contains("cache backend unavailable"),
+            "the cause is carried: {unload}"
+        );
+        assert!(!unload.contains('\n'), "one log line: {unload}");
+
+        let reload = cache_invalidation_warning(
+            &dataset,
+            CacheInvalidation::Reload,
+            &"cache backend unavailable",
+        );
+        assert!(
+            reload.contains("is updating") && reload.contains("previous contents"),
+            "the reload wording is unchanged, so an operator's existing alert keeps matching: {reload}"
+        );
+    }
+
+    /// An empty single-column table to register under a dataset name, so the removal path
+    /// has a real registration to deregister rather than passing over a name that was never
+    /// there.
+    fn empty_table() -> Arc<dyn datafusion::catalog::TableProvider> {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
+        ]));
+        Arc::new(
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("an empty MemTable is valid"),
+        )
+    }
+
+    /// An app declaring `names` as `file:` datasets. The `from` never has to resolve: the
+    /// removal arm reads only which names left the app.
+    fn app_with_datasets(names: &[&str]) -> Arc<App> {
+        let mut builder = app::AppBuilder::new("dataset_removal");
+        for name in names {
+            builder = builder.with_dataset(spicepod::component::dataset::Dataset::new(
+                "file:data.csv",
+                (*name).to_string(),
+            ));
+        }
+        Arc::new(builder.build())
     }
 }
