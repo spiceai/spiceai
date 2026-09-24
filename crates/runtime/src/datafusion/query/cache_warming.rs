@@ -387,16 +387,20 @@ async fn persist_remote_excluding(
 ) {
     let mut local = without_ids(&catalog.lock().templates, &exclude);
     for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
-        let (remote, version) = match state.get_with_version(WARMUP_STATE_KEY).await {
-            Ok(Some((templates, version))) => (without_ids(&templates, &exclude), Some(version)),
+        // Compare `merged` to the stored catalog, not the already-filtered
+        // remote. Filtering stale ids in memory and then returning because
+        // `merged == remote` would leave those ids on the object store.
+        let (stored, version) = match state.get_with_version(WARMUP_STATE_KEY).await {
+            Ok(Some((templates, version))) => (templates, Some(version)),
             Ok(None) => (Vec::new(), None),
             Err(e) => {
                 tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
                 return;
             }
         };
+        let remote = without_ids(&stored, &exclude);
         let merged = merge_templates(&remote, &local);
-        if merged == remote {
+        if merged == stored {
             apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
             return;
         }
