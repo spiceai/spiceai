@@ -566,6 +566,27 @@ impl Caching {
                 .invalidate_for_table(table_ref.clone())
                 .await?;
         }
+        self.invalidate_derived_for_table(table_ref).await
+    }
+
+    /// [`Self::invalidate_for_table`], for a table that is going away rather than
+    /// changing: the results cache drops its entries instead of deferring to
+    /// `stale_while_revalidate_ttl`, which has no revalidation to wait for once the
+    /// table is unloaded. See [`QueryResultsCacheProvider::evict_for_table`].
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails for any of the caches.
+    pub async fn evict_for_table(&self, table_ref: TableReference) -> Result<()> {
+        if let Some(results_cache) = &self.results {
+            results_cache.evict_for_table(table_ref.clone()).await?;
+        }
+        self.invalidate_derived_for_table(table_ref).await
+    }
+
+    /// The plan and search caches, which both paths above invalidate identically —
+    /// neither has a stale-serving mode to choose between.
+    async fn invalidate_derived_for_table(&self, table_ref: TableReference) -> Result<()> {
         if let Some(plans_cache) = &self.plans {
             plans_cache.invalidate_for_table(table_ref.clone()).await?;
         }
@@ -1117,16 +1138,18 @@ impl QueryResultsCacheProvider {
             .await;
     }
 
+    /// Invalidates the cached results that read `table_name`, because the table's
+    /// *contents* changed — an accelerated refresh, a DML write.
+    ///
+    /// Use [`Self::evict_for_table`] instead when the table itself is going away:
+    /// the stale-serving window below rests on a revalidation that can replace the
+    /// entry, and a table that no longer exists has none.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        // Record the change before removing entries, never after. A
-        // writer that started before this point must be rejected by
-        // `tables_changed_since`, and stamping afterwards leaves exactly
-        // the same gap one step earlier.
-        self.table_changes
-            .record_change(&table_name, std::time::Instant::now());
+        self.mark_table_changed(&table_name);
 
         // With `stale_while_revalidate_ttl` configured, the mark *is* the
         // invalidation: dependent entries stay resident so that a hit inside
@@ -1148,6 +1171,40 @@ impl QueryResultsCacheProvider {
             return Ok(());
         }
 
+        self.evict_marked(table_name).await
+    }
+
+    /// Drops the cached results that read `table_name`, because the table is gone —
+    /// unloaded from the running app, or dropped.
+    ///
+    /// Unlike [`Self::invalidate_for_table`] this never defers to
+    /// `stale_while_revalidate_ttl`. That window is an agreement to serve one more
+    /// previous result *while a background revalidation replaces the entry*, and the
+    /// revalidation of a query over a table that no longer exists cannot land — so
+    /// deferring would serve rows from an unloaded dataset for the whole window, with
+    /// nothing able to end it early. spiceai/spiceai#14251: a `cache_key_type: sql`
+    /// hit is answered before planning, so discarding the logical plan does not reach
+    /// it and this is the only thing that does.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to invalidate cache for the table provided
+    pub async fn evict_for_table(&self, table_name: TableReference) -> Result<()> {
+        self.mark_table_changed(&table_name);
+        self.evict_marked(table_name).await
+    }
+
+    /// Stamps the table-change clock. Recorded before entries are removed, never
+    /// after: a writer that started before this point must be rejected by
+    /// `tables_changed_since`, and stamping afterwards leaves exactly the same gap
+    /// one step earlier.
+    fn mark_table_changed(&self, table_name: &TableReference) {
+        self.table_changes
+            .record_change(table_name, std::time::Instant::now());
+    }
+
+    /// The eviction both paths above share, once the clock is already stamped.
+    async fn evict_marked(&self, table_name: TableReference) -> Result<()> {
         CachedQueryResult::record_table_invalidation(InvalidationMode::Evict);
         // The entries each invalidation drops are counted by the underlying
         // cache, so that every cache type is counted the same way rather than
@@ -1937,6 +1994,101 @@ mod tests {
                 .expect("cache access should succeed")
                 .is_none(),
             "a caller that only serves fresh results must still miss on a stale entry"
+        );
+    }
+
+    /// spiceai/spiceai#14251: the same window must NOT absorb an unload. The
+    /// stale-serving agreement is to serve one more previous result while a
+    /// background revalidation replaces the entry, and a query over a dataset that
+    /// has been unloaded has no revalidation that can land — so the entry would be
+    /// served for the whole window with nothing able to end it early. A
+    /// `cache_key_type: sql` hit is answered before planning, so discarding the
+    /// logical plan does not reach this entry and only the eviction does.
+    ///
+    /// Measured against `invalidate_for_table` on the identical provider and key, so
+    /// this pins the asymmetry rather than just the eviction.
+    #[tokio::test]
+    async fn evict_for_table_drops_entries_the_stale_window_would_have_kept() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid cache provider");
+
+        // The control: the contents-changed path keeps the entry resident.
+        let refreshed = RawCacheKey::new(40);
+        provider
+            .put_raw_key(
+                &refreshed,
+                cached_result_for("customer", std::time::Instant::now()).await,
+            )
+            .await
+            .expect("cache access should succeed");
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        provider.run_pending_tasks().await;
+        assert!(
+            provider
+                .get_raw_key_with_validity(&refreshed)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "the premise: with a window configured, a contents change leaves the entry resident"
+        );
+
+        // The unload path, same provider, same window, same table.
+        let unloaded = RawCacheKey::new(41);
+        provider
+            .put_raw_key(
+                &unloaded,
+                cached_result_for("customer", std::time::Instant::now()).await,
+            )
+            .await
+            .expect("cache access should succeed");
+        provider
+            .evict_for_table(TableReference::bare("customer"))
+            .await
+            .expect("eviction should succeed");
+        provider.run_pending_tasks().await;
+
+        assert!(
+            provider
+                .get_raw_key_with_validity(&unloaded)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "an unloaded dataset's cached result must be gone, not servable as stale"
+        );
+        assert!(
+            provider
+                .get_raw_key_with_validity(&refreshed)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "and the eviction takes every entry that read the table, not only the newest"
+        );
+    }
+
+    /// The eviction stamps the same clock the mark-stale path does, so a write that
+    /// began before the unload still cannot store its result afterwards.
+    #[tokio::test]
+    async fn evict_for_table_records_the_invalidation() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid cache provider");
+
+        let read_started_at = std::time::Instant::now();
+        let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        assert!(!provider.tables_changed_since(&tables, read_started_at));
+
+        provider
+            .evict_for_table(TableReference::bare("customer"))
+            .await
+            .expect("eviction should succeed");
+
+        assert!(
+            provider.tables_changed_since(&tables, read_started_at),
+            "a result whose read began before the unload must not be stored after it"
         );
     }
 

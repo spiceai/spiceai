@@ -1381,12 +1381,20 @@ impl Runtime {
         dataset: &TableReference,
         cause: CacheInvalidation,
     ) {
-        if let Err(e) = self
-            .df
-            .caching()
-            .invalidate_for_table(dataset.clone())
-            .await
-        {
+        let caching = self.df.caching();
+        // An unload takes the evicting path. `invalidate_for_table` defers to
+        // `stale_while_revalidate_ttl` where it is configured, and that window is an
+        // agreement to serve one more previous result *while a revalidation replaces
+        // the entry* — which a query over an unloaded dataset can never do, so the
+        // result would be served for the whole window with nothing able to end it
+        // early. A `cache_key_type: sql` hit is answered before planning, so the plan
+        // cache above does not reach it either (#14251).
+        let outcome = match cause {
+            CacheInvalidation::Reload => caching.invalidate_for_table(dataset.clone()).await,
+            CacheInvalidation::Unload => caching.evict_for_table(dataset.clone()).await,
+        };
+
+        if let Err(e) = outcome {
             tracing::warn!("{}", cache_invalidation_warning(dataset, cause, &e));
         }
     }
