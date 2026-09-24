@@ -317,7 +317,7 @@ async fn cayenne_memory_mode_applies_retention_sql() -> Result<(), anyhow::Error
                  test asserts nothing"
             );
 
-            let retention_applied = wait_until_true(std::time::Duration::from_secs(60), || {
+            let retention_applied = wait_until_true(std::time::Duration::from_mins(1), || {
                 let rt = Arc::clone(&rt);
                 async move {
                     row_count(&rt, MEM_TABLE)
@@ -414,7 +414,7 @@ async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_eva
                     .filter(|(_, score)| score.is_none_or(|score| score >= SCORE_FLOOR))
                     .count(),
             )?;
-            let settled = wait_until_true(std::time::Duration::from_secs(60), || {
+            let settled = wait_until_true(std::time::Duration::from_mins(1), || {
                 let rt = Arc::clone(&rt);
                 async move {
                     row_count(&rt, MEM_NULL_TABLE)
@@ -501,7 +501,7 @@ async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
             runtime_ready_check(&rt).await;
             trigger_refresh(&rt, MEM_ALL_TABLE).await?;
 
-            let emptied = wait_until_true(std::time::Duration::from_secs(60), || {
+            let emptied = wait_until_true(std::time::Duration::from_mins(1), || {
                 let rt = Arc::clone(&rt);
                 async move { row_count(&rt, MEM_ALL_TABLE).await.is_ok_and(|n| n == 0) }
             })
