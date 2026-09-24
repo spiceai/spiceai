@@ -280,8 +280,6 @@ Testing focus DRIs are responsible for:
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
 - [ ] Confirm docs/install refs for Skills point at the matching release (or trunk if intentional).
-- [ ] QA DRI: Add metrics to [QA analytics](https://github.com/spiceai/spiceai/blob/trunk/docs/release_notes/qa_analytics.csv).
-  - Use number of recipes total from [spiceai.org/docs/cookbook](https://spiceai.org/docs/cookbook).
 
 ## Announcement Checklist
 
@@ -289,6 +287,6 @@ Testing focus DRIs are responsible for:
 - [ ] Reddit: [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
 - [ ] Discord: [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] Telegram: [spiceai](https://t.me/spiceai)
-- [ ] Blog: [spiceai.org/blog](https://spiceai.org/blog)
+- [ ] Release Notes: [spiceai.org/releases](https://spiceai.org/releases)
   - [ ] Update docs banner version in [docusaurus.config.ts](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
   - [ ] Ensure version numbers and references match the release.
