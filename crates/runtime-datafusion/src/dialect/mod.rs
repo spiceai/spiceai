@@ -319,7 +319,7 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bigquery, bigquery_native_function_names, duckdb_builtin_scalar_overrides,
+        bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
         duckdb_can_translate, duckdb_native_function_names, new_duckdb_dialect,
     };
     use arrow_schema::{DataType, Field, Schema};
@@ -327,7 +327,7 @@ mod tests {
     use datafusion::functions::expr_fn::{concat, upper};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace};
     use datafusion::logical_expr::expr::ScalarFunction;
-    use datafusion::prelude::{Expr, col, lit};
+    use datafusion::prelude::{Expr, cast, col, lit, try_cast};
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
 
@@ -377,41 +377,71 @@ mod tests {
         }
     }
 
-    /// A nested `concat` is refused through the same check, and it has to be:
-    /// `SparkConcat` always reports `Utf8`, so the *outer* call's argument
-    /// types say nothing about the inner one — `concat(concat(a, b), 'z')`
-    /// over binary `a`/`b` looks like a string concat from the top.
+    /// A nested `concat` over binary columns is refused at the *outer* call,
+    /// because the check searches the whole operand tree rather than reading
+    /// the argument's final type.
     ///
-    /// `contains_unsupported_functions` walks every expression node with
-    /// `Expr::apply`, so the inner call is visited in its own right against
-    /// the same scope. This pins that, because the guard reading only the
-    /// outer arguments would pass the outer call and still render `a || b`.
+    /// That distinction is the whole point: `SparkConcat` reports `Utf8` for
+    /// the inner call whatever it was handed, so a check reading only the outer
+    /// arguments sees two strings and admits it. `contains_unsupported_functions`
+    /// would still have refused the plan — it walks every expression node with
+    /// `Expr::apply`, so the inner call is visited in its own right — but that
+    /// is the caller's property, not this check's, and this pins both.
     #[test]
     fn duckdb_declines_a_nested_concat_over_a_binary_column() {
         let scope = scope_of(&[("a", DataType::Binary), ("b", DataType::Binary)]);
         let nested = concat(vec![concat(vec![col("a"), col("b")]), lit("z")]);
 
-        // The outer call alone reads as a string concat — `SparkConcat` reports
-        // `Utf8` for the inner one — so the outer check must not be what saves
-        // this.
         assert!(
-            duckdb_can_translate(&call_of(nested.clone()), Some(&scope)),
-            "the outer call's own arguments are both Utf8, so it is admitted"
+            !duckdb_can_translate(&call_of(nested.clone()), Some(&scope)),
+            "the outer call reaches binary columns through its operand tree"
         );
 
-        // The inner call is a node of the same expression tree, and the walk
-        // visits it, so the plan is still refused.
+        // And the inner call on its own, which is what the caller's own walk
+        // reaches independently.
         let Expr::ScalarFunction(outer) = &nested else {
             panic!("expected a scalar function call");
         };
-        let inner = outer.args.first().expect("the nested concat");
-        let Expr::ScalarFunction(inner) = inner else {
+        let Some(Expr::ScalarFunction(inner)) = outer.args.first() else {
             panic!("expected the inner call to be a scalar function");
         };
         assert!(
             !duckdb_can_translate(inner, Some(&scope)),
             "the inner concat over binary columns must be refused"
         );
+    }
+
+    /// Regression test for the explicit-cast bypass @copilot found on #14333:
+    /// `ExprSchemable::get_type` reports a cast's *target*, so
+    /// `concat(CAST(bin AS Utf8), 'z')` reads as a string concat. Measured on a
+    /// DuckDB-accelerated dataset, that rendering answers
+    /// `CAST("a" AS VARCHAR) || 'z'`, which for bytes that are not valid UTF-8
+    /// returns the 12-character escaped literal as a row while the same query
+    /// evaluated locally raises `Encountered non UTF-8 data`.
+    #[test]
+    fn duckdb_declines_a_concat_over_a_cast_away_binary_column() {
+        let scope = scope_of(&[("a", DataType::Binary), ("s", DataType::Utf8)]);
+        for laundered in [
+            cast(col("a"), DataType::Utf8),
+            cast(col("a"), DataType::Utf8View),
+            try_cast(col("a"), DataType::Utf8),
+            // A cast of a cast still originates in the binary column.
+            cast(cast(col("a"), DataType::Utf8), DataType::LargeUtf8),
+        ] {
+            assert!(
+                !duckdb_can_translate(
+                    &call_of(concat(vec![laundered.clone(), lit("z")])),
+                    Some(&scope)
+                ),
+                "a cast does not make {laundered:?} renderable"
+            );
+        }
+
+        // A cast that has nothing binary under it is untouched.
+        assert!(duckdb_can_translate(
+            &call_of(concat(vec![cast(col("s"), DataType::LargeUtf8), lit("z")])),
+            Some(&scope)
+        ));
     }
 
     /// The refusal is scoped to binary operands: an ordinary string `concat` is
@@ -455,12 +485,18 @@ mod tests {
     /// A literal carries its own type, so an all-literal call still federates
     /// with no scope: the refusal must cost only the calls it is about.
     ///
-    /// A binary *literal* never reached this check — the unparser refuses it
-    /// with `NotImplemented("Unsupported scalar: Binary")`, so
-    /// `duckdb_can_translate` already answered `false` for it. It is a binary
-    /// *column* that renders cleanly (`"a" || 'z'`) and so needs the type
-    /// check, which is why the scope is what closes #13915 and an argument
-    /// inspection on its own would not have.
+    /// A binary *literal* is refused on two independent paths, and each is
+    /// asserted separately because only one of them is this check's.
+    /// `duckdb_can_translate` consults the type guard *before* the unparser,
+    /// and a `ScalarValue::Binary` reports `Binary` with or without a scope, so
+    /// the guard is what answers `false` here. The `expr_to_sql` assertion
+    /// establishes the other path — the renderer would have refused it too,
+    /// with `NotImplemented("Unsupported scalar: Binary")` — so neither can be
+    /// removed on the assumption that the other still covers a binary literal.
+    ///
+    /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
+    /// its type is readable only against a scope. That is why the scope is what
+    /// closes #13915 and an inspection of the arguments alone would not have.
     #[test]
     fn duckdb_reads_a_literal_argument_without_a_scope() {
         assert!(duckdb_can_translate(
@@ -473,11 +509,16 @@ mod tests {
             &call_of(binary_literal.clone()),
             None
         ));
+        // The guard, which runs first, is the path that refuses it.
+        assert!(
+            !duckdb::concat_arguments_are_renderable(&call_of(binary_literal.clone()).args, None),
+            "a binary literal reads as binary with no scope, so the type guard refuses it"
+        );
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         assert!(
             unparser.expr_to_sql(&binary_literal).is_err(),
-            "a binary literal is refused by the renderer, not by the type check"
+            "and the renderer behind the guard refuses it as well"
         );
     }
 

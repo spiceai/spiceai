@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::prelude::Expr;
@@ -359,17 +360,59 @@ pub(crate) fn concat_to_string_concat(
 /// than assumed to be a string: assuming wrong is a wrong answer, and refusing
 /// costs only the pushdown. A literal carries its own type and needs no scope,
 /// so an all-literal call still federates.
+///
+/// The operand's *final* type is not enough, because a cast launders it while
+/// leaving the rendering just as wrong. `CAST(blob AS VARCHAR)` reports `Utf8`
+/// here, and `DuckDB` renders the bytes as their **escaped literal** rather
+/// than validating them, where `DataFusion`'s own cast raises
+/// `Encountered non UTF-8 data`. Measured on `DuckDB` v1.4.4 through a real
+/// `spiced`: the bytes `FF FE 20 62 61 64` come back from
+/// `concat(CAST(a AS VARCHAR), 'z')` as the 13-character `\xFF\xFE badz`,
+/// with no error anywhere — the remote call already returned `VARCHAR`, so
+/// there is not even a failed scan cast to notice it, while the same query on
+/// an unaccelerated copy of the same rows refuses to answer. The operand tree is
+/// therefore searched, not just its root, which also covers the shapes a
+/// cast-only rule would miss (`coalesce`, `CASE`, a nested `concat`, or
+/// `sha256`, whose `unhex` rewrite is itself a `BLOB`).
+///
+/// This is deliberately conservative: an operand that merely *contains* a
+/// binary value is refused even where the enclosing function would have
+/// normalised it to text (`md5(blob)` agrees on both engines). That costs a
+/// pushdown on a rare shape and cannot return a wrong row, which is the
+/// direction this check is required to err in.
 pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSchema>) -> bool {
     let empty = DFSchema::empty();
     let scope = scope.unwrap_or(&empty);
-    args.iter().all(|arg| {
+    !args.iter().any(|arg| operand_reaches_binary(arg, scope))
+}
+
+/// Whether any node of this operand's expression tree is, or carries, a binary
+/// value — including one a cast has since retyped as text.
+fn operand_reaches_binary(expr: &Expr, scope: &DFSchema) -> bool {
+    let mut reaches = false;
+    // `Expr::apply` is infallible for a closure that never errors, so the
+    // result carries no information and the flag is the answer.
+    let _ = expr.apply(|node| {
         // `DataType::is_binary` is Arrow's own set — `Binary`, `LargeBinary`,
         // `FixedSizeBinary` and `BinaryView` — so a byte-array variant added
         // upstream arrives with the dependency rather than having to be found
         // by grep.
-        arg.get_type(scope)
-            .is_ok_and(|data_type| !data_type.is_binary())
-    })
+        let carries_binary = match node.get_type(scope) {
+            Ok(data_type) => data_type.is_binary(),
+            // The error is deliberately not propagated: a node whose type will
+            // not resolve is treated as binary, because unprovable and unsafe
+            // are the same answer for a check that must not admit a call it
+            // cannot vouch for.
+            Err(_) => true,
+        };
+        if carries_binary {
+            reaches = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    reaches
 }
 
 /// Decodes `DuckDB`'s `sha256`, which returns the digest's hex *text*, back
