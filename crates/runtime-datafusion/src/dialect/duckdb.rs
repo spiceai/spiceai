@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::common::DFSchema;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser;
@@ -330,6 +332,44 @@ pub(crate) fn concat_to_string_concat(
     // Parenthesised so the operator keeps the precedence the function call it
     // replaces had, wherever the expression is spliced in.
     Ok(Some(ast::Expr::Nested(Box::new(concatenated))))
+}
+
+/// Whether [`concat_to_string_concat`]'s rendering answers what the registered
+/// `concat` answers, for a call with these arguments.
+///
+/// The rendering is `||`, which `DuckDB` types by its operands: `VARCHAR ||
+/// VARCHAR` is a `VARCHAR`, and `BLOB || BLOB` is a **`BLOB`**. The `concat` a
+/// Spice query resolves is `datafusion-spark`'s `SparkConcat`, whose
+/// `return_field_from_args` seeds `Utf8` and only ever widens to `LargeUtf8` or
+/// `Utf8View`, so it returns a string whatever its arguments are — reading a
+/// binary argument's bytes into the string builder, which validates them. So on
+/// a binary operand the two disagree on the result's *type*, and on bytes that
+/// are not valid UTF-8 they disagree on whether the query succeeds at all: the
+/// kernel raises `Invalid UTF8 sequence`, and `DuckDB` returns a row
+/// (issue #13915).
+///
+/// No rendering closes that. `concat(a, b)` has `DuckDB`'s NULL semantics,
+/// which is the divergence `concat_to_string_concat` exists to remove
+/// (issue #13849), and `CAST(a AS VARCHAR)` renders a non-UTF-8 `BLOB` as its
+/// 12-character escaped literal rather than its bytes. What is left is to keep
+/// the call local, which is what this refusal does.
+///
+/// `scope` is the schema the arguments resolve against and is `None` where the
+/// type cannot be proven. A column whose type cannot be read is refused rather
+/// than assumed to be a string: assuming wrong is a wrong answer, and refusing
+/// costs only the pushdown. A literal carries its own type and needs no scope,
+/// so an all-literal call still federates.
+pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSchema>) -> bool {
+    let empty = DFSchema::empty();
+    let scope = scope.unwrap_or(&empty);
+    args.iter().all(|arg| {
+        // `DataType::is_binary` is Arrow's own set — `Binary`, `LargeBinary`,
+        // `FixedSizeBinary` and `BinaryView` — so a byte-array variant added
+        // upstream arrives with the dependency rather than having to be found
+        // by grep.
+        arg.get_type(scope)
+            .is_ok_and(|data_type| !data_type.is_binary())
+    })
 }
 
 /// Decodes `DuckDB`'s `sha256`, which returns the digest's hex *text*, back
