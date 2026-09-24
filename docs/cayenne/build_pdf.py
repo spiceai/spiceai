@@ -241,7 +241,7 @@ for i, svg in enumerate(svgs):
 CSS = """
 @page {
   size: A4; margin: 18mm 16mm 20mm 16mm;
-  @bottom-center { content: "Cayenne — Spice.ai's CDC acceleration engine"; font-size: 8pt; color: #94a3b8; }
+  @bottom-center { content: "Cayenne — the engine that powers Spice.ai"; font-size: 8pt; color: #94a3b8; }
   @bottom-right  { content: counter(page) " / " counter(pages); font-size: 8pt; color: #94a3b8; }
 }
 @page :first { @bottom-center { content: ""; } @bottom-right { content: ""; } }
@@ -269,7 +269,8 @@ pre code { background: none; color: #e2e8f0; padding: 0; font-size: 8.2pt; }
 table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 8.6pt;
   page-break-inside: avoid; }
 th { background: #4338ca; color: #fff; text-align: left; padding: 6px 9px; font-weight: 600; }
-td { border: 1px solid #e2e8f0; padding: 5px 9px; vertical-align: top; }
+td { border: 1px solid #e2e8f0; padding: 5px 9px; vertical-align: top;
+  overflow-wrap: anywhere; }
 tr:nth-child(even) td { background: #f8fafc; }
 blockquote { border-left: 4px solid #818cf8; background: #eef2ff; margin: 12px 0;
   padding: 8px 14px; color: #3730a3; border-radius: 0 6px 6px 0; }
@@ -279,7 +280,7 @@ figure.diagram { margin: 16px auto; text-align: center; page-break-inside: avoid
 figure.diagram svg { max-width: 100%; height: auto; }
 @page landscapefig {
   size: A4 landscape; margin: 12mm 14mm 14mm 14mm;
-  @bottom-center { content: "Cayenne — Spice.ai's CDC acceleration engine"; font-size: 8pt; color: #94a3b8; }
+  @bottom-center { content: "Cayenne — the engine that powers Spice.ai"; font-size: 8pt; color: #94a3b8; }
   @bottom-right  { content: counter(page) " / " counter(pages); font-size: 8pt; color: #94a3b8; }
 }
 .landscape-fig { page: landscapefig; page-break-before: always; page-break-after: always;
@@ -298,10 +299,10 @@ COVER = """
 <div class="cover">
   <div class="cover-kicker">SPICE.AI · crates/cayenne</div>
   <div class="cover-title">Cayenne</div>
-  <div class="cover-sub">Spice.ai's acceleration engine for high-rate CDC — a lakehouse table format built on Vortex</div>
+  <div class="cover-sub">The engine that powers Spice.ai — high-rate CDC ingestion and low-latency queries on the same table, built on Vortex</div>
   <div class="cover-desc">A breadth-first technical walkthrough — from the three-tier overview down to
-  the locks, the fused deletion index, and the CDC write pipeline — with comparisons to
-  Apache Iceberg, Delta Lake, and Apache Hudi.</div>
+  the locks, the fused deletion index, and the CDC write pipeline — and the design ideas it
+  borrows from Apache Iceberg, Delta Lake, and Apache Hudi.</div>
 </div>
 """
 COVER_CSS = """
