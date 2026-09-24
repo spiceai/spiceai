@@ -25173,6 +25173,20 @@ impl CayenneTableProvider {
         }
     }
 
+    /// The error a failed retention pass reports, whatever step of the pass failed.
+    ///
+    /// One function rather than a `format!` per arm so a reword cannot land on some of
+    /// them: the pass can fail at the inline materialization, the predicate coercion, the
+    /// sink build, or the mem-tier arm, and a user reading any of the four is owed the
+    /// same three things — which dataset, what is still queryable because of it, and
+    /// where to look next.
+    fn retention_failed_message(&self) -> String {
+        format!(
+            "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+            self.table_metadata.table_name
+        )
+    }
+
     /// Apply retention filters by running the configured delete sink against
     /// the current table state.
     ///
@@ -25202,12 +25216,7 @@ impl CayenneTableProvider {
         // whatever is there, the same way `delete_from` does for a user DELETE. The row
         // count is a relaxed atomic, so the common case of nothing inlined costs a load
         // and never queues for the exclusive lock the sink is about to take.
-        // Skipped under `mode: memory`, where `inlined_row_count` mirrors the RAM tier
-        // rather than a catalog inline corpus: there is nothing to materialize, and
-        // `checkpoint_inlined_data` would re-sync that counter from the (empty) corpus
-        // and report the tier as holding no rows. The mem-tier arm below is what reaches
-        // those rows.
-        if !self.is_memory_resident_mode() && self.cached_inlined_row_count() > 0 {
+        if self.cached_inlined_row_count() > 0 {
             let guard = self.write_lock.lock().await;
             let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
             // Defer while a staged inline-conflict tombstone is unpublished (Option D)
@@ -25276,10 +25285,7 @@ impl CayenneTableProvider {
                     MaintenanceOutcome::Failed,
                 );
                 CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                        self.table_metadata.table_name
-                    ),
+                    message: self.retention_failed_message(),
                     source: Box::new(err),
                 }
             })?;
@@ -25299,10 +25305,7 @@ impl CayenneTableProvider {
             &self.table_schema(),
         )
         .map_err(|err| CatalogError::InvalidOperation {
-            message: format!(
-                "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                self.table_metadata.table_name
-            ),
+            message: self.retention_failed_message(),
             source: Box::new(err),
         })?;
         // Composed through the shared builder rather than hand-rolled, so retention gets
@@ -25336,10 +25339,7 @@ impl CayenneTableProvider {
                     MaintenanceOutcome::Failed,
                 );
                 CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                        self.table_metadata.table_name
-                    ),
+                    message: self.retention_failed_message(),
                     source: Box::new(err),
                 }
             })?;
@@ -25400,10 +25400,7 @@ impl CayenneTableProvider {
                     MaintenanceOutcome::Failed,
                 );
                 return Err(CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                        self.table_metadata.table_name
-                    ),
+                    message: self.retention_failed_message(),
                     source: Box::new(err),
                 });
             }
@@ -25447,7 +25444,12 @@ impl CayenneTableProvider {
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
-            self.clear_cached_pk_keyset();
+            // `file_deleted`, not `deleted_count`: the mem-tier arm cleared its own keys
+            // inside the hold above, and clearing again here would only discard a rebuild
+            // a writer may have paid for in between.
+            if file_deleted > 0 {
+                self.clear_cached_pk_keyset();
+            }
             if self.pk_deletion_strategy.is_position_based() {
                 self.clear_scan_file_statistics_cache();
             }
@@ -30771,19 +30773,9 @@ impl CayenneTableProvider {
     /// maintenance. Nothing else queues the request, so its `retention_sql` predicate was
     /// accepted at registration and then never evaluated (#14045).
     ///
-    /// The delta is `0` and its claim released rather than queued, for the same reason
-    /// the checkpoint's arming carries none: this queues a retention request, not a
-    /// row-count change — the append that preceded it already did that bookkeeping
-    /// against the tier.
     pub(crate) fn arm_retention_after_memory_resident_write(&self) {
-        if self.is_memory_resident_mode() && self.has_retention_delete_filters() {
-            self.schedule_post_write_maintenance(
-                None,
-                false,
-                true,
-                0,
-                self.reserve_live_rows_delta().published(),
-            );
+        if self.is_memory_resident_mode() {
+            self.arm_retention_after_checkpoint();
         }
     }
 
@@ -32200,7 +32192,17 @@ impl CayenneTableProvider {
     /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
     /// `InlineMutationPolicy`, so its table can hold one. That caller checks
     /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
+    ///
+    /// A no-op under `mode: memory`, where `inlined_row_count` nets in the RAM tier
+    /// rather than tracking a catalog inline corpus this mode never writes (the
+    /// accelerator zeroes `inline_max_rows`/`inline_max_bytes` for it). Without the gate
+    /// `checkpoint_inlined_data`'s no-batches arm re-syncs that counter from the empty
+    /// corpus and stores `0` over a populated tier — the clobber
+    /// `delete_mem_tier_rows_matching` separately documents having to defend against.
     async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
+        if self.is_memory_resident_mode() {
+            return Ok(());
+        }
         let inlined_count = self.cached_inlined_row_count();
 
         if inlined_count > 0 {

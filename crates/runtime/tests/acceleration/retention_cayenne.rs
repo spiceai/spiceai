@@ -51,6 +51,8 @@ const MEM_TABLE: &str = "cayenne_retention_sql_memory_it";
 /// A second `mode: memory` table, over a fixture whose `score` has NULLs. Its own
 /// acceleration so it never shares a tier with [`MEM_TABLE`].
 const MEM_NULL_TABLE: &str = "cayenne_retention_sql_memory_null_it";
+/// A third `mode: memory` table, whose `retention_sql` predicate matches every row.
+const MEM_ALL_TABLE: &str = "cayenne_retention_sql_memory_all_it";
 
 /// Rows scoring below this are deleted by the retention predicate.
 const SCORE_FLOOR: i64 = 90;
@@ -76,14 +78,40 @@ const ADDED_ROW: (i64, i64) = (11, 95);
 
 /// Write `rows` to `path` as CSV, replacing whatever is there.
 fn write_source(path: &std::path::Path, rows: &[(i64, i64)]) -> Result<(), anyhow::Error> {
+    let rows: Vec<(i64, Option<i64>)> = rows.iter().map(|&(id, score)| (id, Some(score))).collect();
+    write_nullable_source(path, &rows)
+}
+
+/// Write `rows` to `path` as CSV, an absent `score` written as an empty field.
+fn write_nullable_source(
+    path: &std::path::Path,
+    rows: &[(i64, Option<i64>)],
+) -> Result<(), anyhow::Error> {
     use std::fmt::Write as _;
 
     let mut csv = String::from("id,score\n");
     for (id, score) in rows {
-        writeln!(csv, "{id},{score}")?;
+        match score {
+            Some(score) => writeln!(csv, "{id},{score}")?,
+            None => writeln!(csv, "{id},")?,
+        }
     }
     std::fs::write(path, csv)?;
     Ok(())
+}
+
+/// The pretty-printed table `rows` should render as, for `assert_batches_eq!`.
+fn expected_table(rows: &[(i64, i64)]) -> Vec<String> {
+    let mut lines = vec![
+        "+----+-------+".to_string(),
+        "| id | score |".to_string(),
+        "+----+-------+".to_string(),
+    ];
+    for (id, score) in rows {
+        lines.push(format!("| {id: <2} | {score: <5} |"));
+    }
+    lines.push("+----+-------+".to_string());
+    lines
 }
 
 async fn run_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -115,30 +143,32 @@ async fn assert_retention_left(
     }
 
     let retained = run_sql(rt, &format!("SELECT id, score FROM {TABLE} ORDER BY id")).await?;
-    let mut lines = vec![
-        "+----+-------+".to_string(),
-        "| id | score |".to_string(),
-        "+----+-------+".to_string(),
-    ];
-    for (id, score) in expected {
-        lines.push(format!("| {id: <2} | {score: <5} |"));
-    }
-    lines.push("+----+-------+".to_string());
-    let expected_table: Vec<&str> = lines.iter().map(String::as_str).collect();
-    assert_batches_eq!(&expected_table, &retained);
+    let lines = expected_table(expected);
+    let rendered: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_batches_eq!(&rendered, &retained);
     Ok(())
 }
 
 /// The `mode: memory` twin of [`make_dataset`]. A memory acceleration builds its
 /// data and metastore in RAM, so it takes no `cayenne_file_path`.
 fn make_memory_dataset(source: &std::path::Path, table: &str) -> Dataset {
+    make_memory_dataset_with_predicate(source, table, &format!("score < {SCORE_FLOOR}"))
+}
+
+/// [`make_memory_dataset`] with the `retention_sql` WHERE clause spelled out, for the
+/// predicate shapes the score floor cannot express.
+fn make_memory_dataset_with_predicate(
+    source: &std::path::Path,
+    table: &str,
+    predicate: &str,
+) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", source.display()), table);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
-        retention_sql: Some(format!("DELETE FROM {table} WHERE score < {SCORE_FLOOR}")),
+        retention_sql: Some(format!("DELETE FROM {table} WHERE {predicate}")),
         retention_check_enabled: false,
         retention_check_interval: None,
         ..Acceleration::default()
@@ -323,17 +353,9 @@ async fn cayenne_memory_mode_applies_retention_sql() -> Result<(), anyhow::Error
 
             // By value, not only by count: this is what fails a repair that deletes the
             // wrong rows as loudly as one that deletes none.
-            let mut lines = vec![
-                "+----+-------+".to_string(),
-                "| id | score |".to_string(),
-                "+----+-------+".to_string(),
-            ];
-            for (id, score) in &expected {
-                lines.push(format!("| {id: <2} | {score: <5} |"));
-            }
-            lines.push("+----+-------+".to_string());
-            let expected_table: Vec<&str> = lines.iter().map(String::as_str).collect();
-            assert_batches_eq!(&expected_table, &rows);
+            let lines = expected_table(&expected);
+            let rendered: Vec<&str> = lines.iter().map(String::as_str).collect();
+            assert_batches_eq!(&rendered, &rows);
 
             Ok(())
         })
@@ -350,24 +372,6 @@ const NULL_ROWS: [(i64, Option<i64>); 6] = [
     (5, None),
     (6, Some(95)),
 ];
-
-/// Write `rows` to `path` as CSV, an absent `score` written as an empty field.
-fn write_nullable_source(
-    path: &std::path::Path,
-    rows: &[(i64, Option<i64>)],
-) -> Result<(), anyhow::Error> {
-    use std::fmt::Write as _;
-
-    let mut csv = String::from("id,score\n");
-    for (id, score) in rows {
-        match score {
-            Some(score) => writeln!(csv, "{id},{score}")?,
-            None => writeln!(csv, "{id},")?,
-        }
-    }
-    std::fs::write(path, csv)?;
-    Ok(())
-}
 
 /// A row the predicate cannot evaluate is KEPT, and a row it evaluates FALSE is kept too.
 ///
@@ -450,6 +454,73 @@ async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_eva
                     "+----+-------+",
                 ],
                 &rows
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// An all-true `retention_sql` empties a `mode: memory` acceleration.
+///
+/// This shape is why retention calls `delete_mem_tier_rows_matching` directly instead of
+/// the wrapper a client `DELETE` composes: that wrapper routes an all-true predicate to a
+/// whole-tier purge with no memory-residency gate, which would reach the tier of a table
+/// that is not memory-resident and return bytes to a budget a memory-mode write never
+/// took from. The bypass is only correct if the filtered arm empties the tier on its own,
+/// and that is a claim about `is_delete_all`-shaped input that no other test makes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(not(target_os = "windows"))]
+async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
+-> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            crate::configure_test_datafusion();
+
+            let temp_dir = tempfile::tempdir()?;
+            let source = temp_dir.path().join("all_scores.csv");
+            write_source(&source, INITIAL_ROWS.as_ref())?;
+
+            let app = AppBuilder::new("test_cayenne_retention_sql_memory_all")
+                .with_dataset(make_memory_dataset_with_predicate(
+                    &source,
+                    MEM_ALL_TABLE,
+                    "true",
+                ))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            trigger_refresh(&rt, MEM_ALL_TABLE).await?;
+
+            let emptied = wait_until_true(std::time::Duration::from_secs(60), || {
+                let rt = Arc::clone(&rt);
+                async move { row_count(&rt, MEM_ALL_TABLE).await.is_ok_and(|n| n == 0) }
+            })
+            .await;
+
+            let rows = run_query(
+                &rt,
+                &format!("SELECT id, score FROM {MEM_ALL_TABLE} ORDER BY id"),
+            )
+            .await?;
+            eprintln!(
+                "[mode: memory, all-true] retention_sql `true`; rows served:\n{}",
+                arrow::util::pretty::pretty_format_batches(&rows)?
+            );
+            assert!(
+                emptied,
+                "an all-true retention_sql must empty a `mode: memory` acceleration; it \
+                 still holds {} row(s)",
+                row_count(&rt, MEM_ALL_TABLE).await?
             );
 
             Ok(())

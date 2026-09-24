@@ -189,7 +189,7 @@ impl DataSink for CayenneDataSink {
             // memory-mode writers are serialized on exactly this lock, so taking it
             // first is what makes that snapshot current rather than one write stale.
             // Nothing under `prepare_stream_for_insert` takes `write_lock`.
-            let _write_guard = self.table.write_lock().lock().await;
+            let write_guard = self.table.write_lock().lock().await;
 
             // An APPEND must run primary-key conflict detection, so `on_conflict`
             // is honoured: the validation records which resident rows the incoming
@@ -252,11 +252,9 @@ impl DataSink for CayenneDataSink {
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_inlined_pk_keys(&keys, record_seq);
             }
-            drop(_write_guard);
-            // A memory-mode write returns here with no durable publish behind it and no
-            // checkpoint ahead of it, so this is the only place its `retention_sql` can be
-            // queued — every other write path arms retention from a durable commit that
-            // memory mode never performs (#14045).
+            drop(write_guard);
+            // Memory mode arms retention here — see the method's own doc for why nowhere
+            // else can (#14045).
             self.table.arm_retention_after_memory_resident_write();
             return Ok(rows);
         }
