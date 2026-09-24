@@ -544,8 +544,22 @@ impl TableProvider for LocationPruningListingTable {
 /// predicates when they appear in a purely conjunctive context. If a location
 /// predicate appears under `NOT` or `OR`, return `None` to force the caller to
 /// fall back to full listing (to avoid incorrect pruning).
+///
+/// The caller's fast path applies no filter other than the extracted locations
+/// (`scan` heads each location directly and skips listing), so this also returns
+/// `None` whenever any filter references a column other than `_location` — such a
+/// filter must fall through to the standard listing/scan path, which applies it
+/// (as a residual `FilterExec`, or by metadata pruning), rather than being silently
+/// dropped by the fast path.
 fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<String>> {
     use datafusion_expr::{Expr, Operator};
+
+    if filters
+        .iter()
+        .any(|f| f.column_refs().iter().any(|c| c.name != "_location"))
+    {
+        return None;
+    }
 
     // Recursively walks filter expressions to collect string literals from:
     // - location = 'literal' and 'literal' = location
@@ -4533,7 +4547,14 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_location_predicates_ignores_non_location() {
+    fn test_extract_location_predicates_disabled_by_other_column() {
+        // A filter on any other column (data or metadata) must disable the fast
+        // path, which applies no filter besides the extracted locations: silently
+        // keeping only the location values here would drop `id = 5` when the
+        // caller uses the fast path instead of falling back to full listing.
+        // Regression test for spiceai#14264 (mixed `_location` + metadata-column
+        // predicates returning wrong rows once the other column is reported
+        // `Exact` and no residual `FilterExec` is added).
         use datafusion_expr::{col, lit};
 
         let filters = vec![
@@ -4542,9 +4563,28 @@ mod tests {
                 .and(col("_location").eq(lit("s3://bucket/only_location.parquet"))),
         ];
         let values = extract_location_predicates(&filters);
-        assert_eq!(
-            values,
-            Some(vec!["s3://bucket/only_location.parquet".to_string()])
+        assert!(
+            values.is_none(),
+            "a non-location filter must disable the location fast path"
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_disabled_by_other_metadata_column() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![
+            col("_location").eq(lit("s3://bucket/only_location.parquet")),
+            col("_last_modified").gt(lit(ScalarValue::TimestampMicrosecond(
+                Some(0),
+                Some("UTC".into()),
+            ))),
+        ];
+        let values = extract_location_predicates(&filters);
+        assert!(
+            values.is_none(),
+            "a _last_modified filter must disable the location fast path so it isn't \
+             silently dropped once metadata predicates are reported Exact"
         );
     }
 
