@@ -14,20 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Construction of resident sorted keys and shared Arrow payload pages.
+//! Construction and fenced publication of resident covering artifacts.
+//!
+//! # Writer-path inventory
+//!
+//! | Writer path | Existing data-publication boundary | Covering action in this step |
+//! | --- | --- | --- |
+//! | Full refresh (`overwrite.rs`) | `publish_overwrite_snapshot_fenced` | Capture the Vortex observer's final file order, prepare before the flip, then swap the immutable catalog in that flip. |
+//! | CDC append / staged upsert (`mutation_writer.rs`, `staged_upsert.rs`) | Their fenced durable publication | No artifact is advertised yet; step 05 attaches complete source manifests and explicit uncovered sources before the optional scan path can select them. |
+//! | Mem-tier checkpoint (`sink.rs`) | Checkpoint publish after file finalization | No artifact is advertised yet for the same reason. |
+//! | Compaction / rewrite (`compaction_writer.rs`) | Snapshot/file-set replacement | No artifact is advertised yet; its new file identities must never inherit old row references. |
+//!
+//! The observer fires after Vortex has established its file-local physical row
+//! positions. Incoming record-batch order is therefore never used as a source
+//! ordinal: batches are reassembled by the reported `(file, first_row_position)`
+//! and rejected when they leave a gap or overlap.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwapOption;
 use arrow::alloc::Allocation;
 use arrow::array::{Array, ArrayData, ArrayRef, RecordBatch, RecordBatchOptions, make_array};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
+use parking_lot::Mutex;
+use vortex_datafusion::VortexWriteObserver;
 
+use super::super::lookup_index::{IndexedFile, KeySpec};
 use super::super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use super::{
-    AllocationOwner, CoveredRowRef, EncodedKey, Error, IndexDefinition, IndexRun, IndexedSource,
-    KeyDirectory, KeyDirectoryEntry, KeyPage, KeyPageId, KeyPageLease, MemoryPageStore, PageLease,
-    PayloadPage, PayloadPageId, PayloadPageLease, ReservationToken, Result, RunId, SourceId,
+    AllocationOwner, CoveredRowRef, CoveringIndexCatalog, EncodedKey, Error, IndexCatalog,
+    IndexDefinition, IndexRun, IndexedSource, KeyDirectory, KeyDirectoryEntry, KeyPage, KeyPageId,
+    KeyPageLease, MemoryPageStore, PageLease, PayloadPage, PayloadPageId, PayloadPageLease,
+    ReservationToken, Result, RunId, SourceId,
 };
 
 /// Target retained Arrow bytes in one payload page.
@@ -51,6 +71,7 @@ pub(crate) struct BuiltCoveredSource {
     source: IndexedSource,
     runs: Arc<[IndexRun]>,
     page_store: Arc<MemoryPageStore>,
+    non_null_key_count: usize,
 }
 
 impl BuiltCoveredSource {
@@ -72,11 +93,464 @@ impl BuiltCoveredSource {
         &self.page_store
     }
 
+    /// Exact number of physical rows with a non-NULL full key for this
+    /// definition. Finalization compares it to the run pages before staging.
+    #[must_use]
+    pub(crate) const fn non_null_key_count(&self) -> usize {
+        self.non_null_key_count
+    }
+
     /// Split this unpublished source into the atomically publishable pieces.
     #[must_use]
     pub(crate) fn into_parts(self) -> (IndexedSource, Arc<[IndexRun]>, Arc<MemoryPageStore>) {
         (self.source, self.runs, self.page_store)
     }
+}
+
+/// Immutable covering catalogs staged by a full-refresh write.
+///
+/// `None` is intentional: an optional build refusal must replace an older
+/// catalog with explicit uncovered state rather than leave old physical row
+/// references live for replacement data.
+#[derive(Debug)]
+struct StagedCatalog {
+    snapshot_id: String,
+    catalog: Option<Arc<CoveringIndexCatalog>>,
+}
+
+/// Table-local state for optional file-backed covering artifacts.
+///
+/// Page construction and all executor awaits happen after the pending builder
+/// is removed from its mutex. The publication lock protects only immutable
+/// pointer swaps, inside the table's existing data-visibility fence.
+pub(crate) struct CoveringIndexState {
+    table_id: Arc<str>,
+    definitions: Arc<[IndexDefinition]>,
+    account: Arc<CayenneMemoryAccount>,
+    catalog: ArcSwapOption<CoveringIndexCatalog>,
+    generation: AtomicU64,
+    publish_lock: Mutex<()>,
+    pending: Mutex<Option<Arc<IncrementalCoveringIndexBuilder>>>,
+    staged: Mutex<Option<StagedCatalog>>,
+    rejection: Mutex<Option<Error>>,
+    scan_input_version: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for CoveringIndexState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoveringIndexState")
+            .field("table_id", &self.table_id)
+            .field("definitions", &self.definitions.len())
+            .field("generation", &self.generation.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl CoveringIndexState {
+    /// Resolve existing address-index declarations into covering definitions.
+    /// An optional-resolution failure does not alter the smaller address index.
+    pub(crate) fn new(
+        table_id: impl Into<Arc<str>>,
+        schema: arrow_schema::SchemaRef,
+        specs: &[KeySpec],
+        account: Arc<CayenneMemoryAccount>,
+        scan_input_version: Arc<AtomicU64>,
+    ) -> Option<Arc<Self>> {
+        if specs.is_empty() {
+            return None;
+        }
+        let definitions = specs
+            .iter()
+            .map(|spec| IndexDefinition::resolve(Arc::clone(&schema), spec))
+            .collect::<Result<Vec<_>>>()
+            .ok()?;
+        Some(Arc::new(Self {
+            table_id: table_id.into(),
+            definitions: definitions.into(),
+            account,
+            catalog: ArcSwapOption::empty(),
+            generation: AtomicU64::new(0),
+            publish_lock: Mutex::new(()),
+            pending: Mutex::new(None),
+            staged: Mutex::new(None),
+            rejection: Mutex::new(None),
+            scan_input_version,
+        }))
+    }
+
+    /// The immutable catalog captured under the table listing fence.
+    #[must_use]
+    pub(crate) fn published(&self) -> Option<Arc<CoveringIndexCatalog>> {
+        self.catalog.load_full()
+    }
+
+    /// Start a full-refresh artifact that captures final Vortex row positions.
+    pub(crate) fn begin_incremental_build(
+        self: &Arc<Self>,
+        snapshot_id: &str,
+    ) -> Arc<IncrementalCoveringIndexBuilder> {
+        let builder = Arc::new(IncrementalCoveringIndexBuilder::new(
+            Arc::clone(&self.table_id),
+            snapshot_id.to_string(),
+            Arc::clone(&self.account),
+        ));
+        *self.pending.lock() = Some(Arc::clone(&builder));
+        builder
+    }
+
+    /// Build off publication locks and stage a whole replacement catalog, or an
+    /// explicit uncovered replacement when optional construction is refused.
+    pub(crate) async fn stage_pending(&self, snapshot_id: &str, files: &[IndexedFile]) {
+        let pending = {
+            let mut pending = self.pending.lock();
+            if pending
+                .as_ref()
+                .is_some_and(|builder| builder.snapshot_id() == snapshot_id)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        let Some(builder) = pending else {
+            // A later refresh owns the pending slot. Its staged replacement is
+            // newer than this completion and must remain untouched.
+            return;
+        };
+        let catalog = match builder
+            .finish(
+                Arc::clone(&self.definitions),
+                Arc::clone(&self.account),
+                files,
+            )
+            .await
+        {
+            Ok(catalog) => {
+                *self.rejection.lock() = None;
+                Some(Arc::new(catalog))
+            }
+            Err(error) => {
+                *self.rejection.lock() = Some(error);
+                Some(Arc::new(CoveringIndexCatalog::uncovered(
+                    snapshot_id,
+                    self.source_manifest(snapshot_id, files),
+                )))
+            }
+        };
+        *self.staged.lock() = Some(StagedCatalog {
+            snapshot_id: snapshot_id.to_string(),
+            catalog,
+        });
+    }
+
+    /// Stage explicit uncovered state when the final manifest cannot be read.
+    /// The data writer still commits; the optional catalog simply cannot make a
+    /// completeness claim for an unknown source set.
+    pub(crate) fn stage_uncovered(&self, snapshot_id: &str) {
+        *self.pending.lock() = None;
+        *self.rejection.lock() = Some(Error::Unavailable {
+            operation: "final covering source manifest could not be listed".to_string(),
+        });
+        *self.staged.lock() = Some(StagedCatalog {
+            snapshot_id: snapshot_id.to_string(),
+            catalog: Some(Arc::new(CoveringIndexCatalog::uncovered(snapshot_id, []))),
+        });
+    }
+
+    /// Swap the prepared immutable catalog inside the existing data flip.
+    /// Stale or missing staged work publishes uncovered state and therefore
+    /// cannot resurrect a catalog after a newer refresh.
+    pub(crate) fn promote_staged(&self, snapshot_id: &str) {
+        let staged = self.staged.lock().take();
+        let catalog = staged.and_then(|staged| {
+            (staged.snapshot_id == snapshot_id)
+                .then_some(staged.catalog)
+                .flatten()
+        });
+        let _publishing = self.publish_lock.lock();
+        self.catalog.store(catalog);
+        self.generation.fetch_add(1, Ordering::Release);
+        self.scan_input_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Drop all unpublished capture/pages after an aborted writer.
+    pub(crate) fn discard_pending(&self) {
+        *self.pending.lock() = None;
+        *self.staged.lock() = None;
+        *self.rejection.lock() = None;
+    }
+
+    fn source_manifest(&self, snapshot_id: &str, files: &[IndexedFile]) -> Vec<SourceId> {
+        files
+            .iter()
+            .map(|file| {
+                SourceId::file(
+                    Arc::clone(&self.table_id),
+                    snapshot_id.to_string(),
+                    file.path.clone(),
+                    file.size,
+                    file.last_modified_ms,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rejection(&self) -> Option<String> {
+        self.rejection.lock().as_ref().map(ToString::to_string)
+    }
+}
+
+/// Captures Vortex write callbacks by final file-local positions.
+pub(crate) struct IncrementalCoveringIndexBuilder {
+    table_id: Arc<str>,
+    snapshot_id: String,
+    account: Arc<CayenneMemoryAccount>,
+    files: Mutex<BTreeMap<String, BTreeMap<u64, PendingCapturedBatch>>>,
+    failure: Mutex<Option<String>>,
+}
+
+impl std::fmt::Debug for IncrementalCoveringIndexBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncrementalCoveringIndexBuilder")
+            .field("table_id", &self.table_id)
+            .field("snapshot_id", &self.snapshot_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A writer batch retained until page construction transfers its values into
+/// independently owned, accounted payload buffers.
+#[derive(Debug)]
+struct PendingCapturedBatch {
+    batch: RecordBatch,
+    _reservation: LookupIndexReservation,
+}
+
+impl IncrementalCoveringIndexBuilder {
+    fn new(table_id: Arc<str>, snapshot_id: String, account: Arc<CayenneMemoryAccount>) -> Self {
+        Self {
+            table_id,
+            snapshot_id,
+            account,
+            files: Mutex::new(BTreeMap::new()),
+            failure: Mutex::new(None),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    fn record_failure(&self, message: String) {
+        let mut failure = self.failure.lock();
+        if failure.is_none() {
+            *failure = Some(message);
+        }
+    }
+
+    async fn finish(
+        &self,
+        definitions: Arc<[IndexDefinition]>,
+        account: Arc<CayenneMemoryAccount>,
+        files: &[IndexedFile],
+    ) -> Result<CoveringIndexCatalog> {
+        if let Some(failure) = self.failure.lock().clone() {
+            return Err(Error::InvalidContract { message: failure });
+        }
+        let mut captured = std::mem::take(&mut *self.files.lock());
+        let listed = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<HashSet<_>>();
+        let observed = captured.keys().map(String::as_str).collect::<HashSet<_>>();
+        if listed != observed {
+            return Err(Error::InvalidContract {
+                message: format!(
+                    "covering write capture and final file manifest differ ({} observed, {} listed)",
+                    observed.len(),
+                    listed.len()
+                ),
+            });
+        }
+
+        let mut by_definition = (0..definitions.len())
+            .map(|_| Vec::with_capacity(files.len()))
+            .collect::<Vec<_>>();
+        for file in files {
+            let batches = captured
+                .remove(&file.path)
+                .ok_or_else(|| Error::InvalidContract {
+                    message: format!(
+                        "final file {} was not captured by the write observer",
+                        file.path
+                    ),
+                })?;
+            let (batches, physical_rows) = ordered_physical_batches(&file.path, batches)?;
+            // Keep the capture reservations alive through this await. The source
+            // builder first admits independently owned page buffers, then these
+            // temporary input pins can drop without an accounting gap.
+            let source_batches = batches
+                .iter()
+                .map(|captured| captured.batch.clone())
+                .collect::<Vec<_>>();
+            let source = SourceId::file(
+                Arc::clone(&self.table_id),
+                self.snapshot_id.clone(),
+                file.path.clone(),
+                file.size,
+                file.last_modified_ms,
+            );
+            let built = build_sources(
+                source,
+                definitions.to_vec(),
+                source_batches,
+                Arc::clone(&account),
+            )
+            .await?;
+            drop(batches);
+            if built.len() != definitions.len() {
+                return Err(Error::InvalidContract {
+                    message: "covering source builder returned a different definition count"
+                        .to_string(),
+                });
+            }
+            for (definition_index, source) in built.into_iter().enumerate() {
+                validate_finalized_source(&source, physical_rows)?;
+                by_definition[definition_index].push(source);
+            }
+        }
+        let catalogs = definitions
+            .iter()
+            .cloned()
+            .zip(by_definition)
+            .map(|(definition, sources)| {
+                IndexCatalog::from_built_sources(definition, sources).map(Arc::new)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        CoveringIndexCatalog::new(self.snapshot_id.clone(), catalogs)
+    }
+}
+
+impl VortexWriteObserver for IncrementalCoveringIndexBuilder {
+    fn batch_written(
+        &self,
+        file_path: &object_store::path::Path,
+        first_row_position: u64,
+        batch: &RecordBatch,
+    ) {
+        if batch.num_rows() == 0 {
+            return;
+        }
+        if self.failure.lock().is_some() {
+            return;
+        }
+        let bytes = match retained_buffer_bytes(batch) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.record_failure(format!("unable to account write capture: {error}"));
+                return;
+            }
+        };
+        let Some(reservation) = self.account.try_reserve_lookup_index(bytes) else {
+            self.record_failure(format!(
+                "unable to admit {bytes} bytes for covering write capture"
+            ));
+            return;
+        };
+        let path: &str = file_path.as_ref();
+        let mut files = self.files.lock();
+        let batches = files.entry(path.to_string()).or_default();
+        if batches
+            .insert(
+                first_row_position,
+                PendingCapturedBatch {
+                    batch: batch.clone(),
+                    _reservation: reservation,
+                },
+            )
+            .is_some()
+        {
+            drop(files);
+            self.record_failure(format!(
+                "file {path} reported more than one covering batch at physical row {first_row_position}"
+            ));
+        }
+    }
+}
+
+/// Reassemble source batches in their final Vortex physical order.
+fn ordered_physical_batches(
+    path: &str,
+    batches: BTreeMap<u64, PendingCapturedBatch>,
+) -> Result<(Vec<PendingCapturedBatch>, usize)> {
+    let mut expected_position = 0u64;
+    let mut total_rows = 0usize;
+    let mut ordered = Vec::with_capacity(batches.len());
+    for (first_position, batch) in batches {
+        if first_position != expected_position {
+            return Err(Error::InvalidContract {
+                message: format!(
+                    "file {path} has non-contiguous covering capture: expected row {expected_position}, got {first_position}"
+                ),
+            });
+        }
+        let rows = u64::try_from(batch.batch.num_rows()).map_err(|_| Error::Overflow {
+            operation: "covering capture batch row count",
+        })?;
+        expected_position = expected_position.checked_add(rows).ok_or(Error::Overflow {
+            operation: "covering capture physical row position",
+        })?;
+        total_rows = total_rows
+            .checked_add(batch.batch.num_rows())
+            .ok_or(Error::Overflow {
+                operation: "covering capture source row count",
+            })?;
+        ordered.push(batch);
+    }
+    Ok((ordered, total_rows))
+}
+
+/// Compare the observer's physical count with the pages and exact per-key run
+/// entry count before an artifact crosses the staging boundary.
+fn validate_finalized_source(source: &BuiltCoveredSource, physical_rows: usize) -> Result<()> {
+    if source.source().row_count() != physical_rows {
+        return Err(Error::InvalidContract {
+            message: format!(
+                "source payload row count {} differs from observed physical rows {physical_rows}",
+                source.source().row_count()
+            ),
+        });
+    }
+    let run_entries = source.runs().iter().try_fold(0usize, |count, run| {
+        run.directory()
+            .entries()
+            .iter()
+            .try_fold(count, |count, page| {
+                count
+                    .checked_add(page.entry_count())
+                    .ok_or(Error::Overflow {
+                        operation: "finalized per-key non-NULL count",
+                    })
+            })
+    })?;
+    if run_entries != source.non_null_key_count() {
+        return Err(Error::InvalidContract {
+            message: format!(
+                "source key-run entries {run_entries} differ from encoded non-NULL keys {}",
+                source.non_null_key_count()
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -215,14 +689,16 @@ fn build_source_sync(
         }
     }
 
+    let non_null_key_count = entries.len();
     let (key_leases, runs) = build_key_runs(&source, entries, account)?;
     let indexed_source = IndexedSource::new(source, schema, row_count, payload_pages)?;
     let store = Arc::new(MemoryPageStore::new(key_leases, payload_leases)?);
-    validate_complete_source(&indexed_source, &runs, &store)?;
+    validate_complete_source(&indexed_source, &runs, &store, non_null_key_count)?;
     Ok(BuiltCoveredSource {
         source: indexed_source,
         runs: runs.into(),
         page_store: store,
+        non_null_key_count,
     })
 }
 
@@ -272,13 +748,15 @@ fn build_index_over_shared_payload(
             message: "shared payload row count differs from its source metadata".to_string(),
         });
     }
+    let non_null_key_count = entries.len();
     let (key_leases, runs) = build_key_runs(source.source(), entries, account)?;
     let store = Arc::new(MemoryPageStore::new(key_leases, payload_leases)?);
-    validate_complete_source(&source, &runs, &store)?;
+    validate_complete_source(&source, &runs, &store, non_null_key_count)?;
     Ok(BuiltCoveredSource {
         source,
         runs: runs.into(),
         page_store: store,
+        non_null_key_count,
     })
 }
 
@@ -462,7 +940,30 @@ fn validate_complete_source(
     source: &IndexedSource,
     runs: &[IndexRun],
     store: &MemoryPageStore,
+    expected_non_null_key_count: usize,
 ) -> Result<()> {
+    let mut payload_rows = 0usize;
+    let payload_leases = store.payload_page_leases();
+    for page_id in source.payload_pages() {
+        let page = payload_leases
+            .get(page_id)
+            .ok_or_else(|| Error::InvalidContract {
+                message: format!("constructed source is missing payload page {page_id:?}"),
+            })?;
+        payload_rows = payload_rows
+            .checked_add(page.page().batch().num_rows())
+            .ok_or(Error::Overflow {
+                operation: "constructed payload row count",
+            })?;
+    }
+    if payload_rows != source.row_count() {
+        return Err(Error::InvalidContract {
+            message: format!(
+                "constructed payload rows {payload_rows} differ from source rows {}",
+                source.row_count()
+            ),
+        });
+    }
     let mut total_entries = 0usize;
     for run in runs {
         if run.source() != source.source() {
@@ -487,9 +988,11 @@ fn validate_complete_source(
                     })?;
         }
     }
-    if total_entries > source.row_count() {
+    if total_entries != expected_non_null_key_count {
         return Err(Error::InvalidContract {
-            message: "constructed key entries exceed source row count".to_string(),
+            message: format!(
+                "constructed key entries {total_entries} differ from expected non-NULL keys {expected_non_null_key_count}"
+            ),
         });
     }
     if source.row_count() > 0 && runs.is_empty() {
@@ -686,4 +1189,136 @@ fn account_buffer_bytes(
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+    use super::*;
+
+    fn schema() -> arrow_schema::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, false),
+        ]))
+    }
+
+    fn batch(keys: Vec<Option<i64>>, values: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )
+        .expect("publication fixture batch")
+    }
+
+    fn state(bytes: usize) -> Arc<CoveringIndexState> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let account = Arc::new(CayenneMemoryAccount::new("covering-publication", &pool));
+        let specs = vec![KeySpec::new(vec!["key".to_string()]).expect("nonempty key")];
+        CoveringIndexState::new(
+            "table",
+            schema(),
+            &specs,
+            account,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .expect("covering state")
+    }
+
+    fn file(path: &str) -> IndexedFile {
+        IndexedFile {
+            path: path.to_string(),
+            size: 42,
+            last_modified_ms: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_reassembles_final_physical_order_and_rekeys_catalog() {
+        let state = state(8 * 1024 * 1024);
+        let builder = state.begin_incremental_build("snapshot-a");
+        let path = object_store::path::Path::from("snapshot-a/data.vortex");
+        // Arrival is intentionally reverse physical order. The observer's
+        // position, not stream arrival, must determine every source ordinal.
+        builder.batch_written(&path, 2, &batch(vec![Some(3), None], vec!["c", "null"]));
+        builder.batch_written(&path, 0, &batch(vec![Some(1), Some(2)], vec!["a", "b"]));
+        state
+            .stage_pending("snapshot-a", &[file(path.as_ref())])
+            .await;
+        state.promote_staged("snapshot-a");
+
+        let catalog = state.published().expect("complete catalog published");
+        assert_eq!(catalog.snapshot_id(), "snapshot-a");
+        assert_eq!(catalog.source_manifest().len(), 1);
+        let index = &catalog.catalogs()[0];
+        assert_eq!(index.sources().len(), 1);
+        assert_eq!(index.runs().len(), 1);
+        assert_eq!(
+            index.runs()[0]
+                .directory()
+                .entries()
+                .iter()
+                .map(KeyDirectoryEntry::entry_count)
+                .sum::<usize>(),
+            3,
+            "only the one NULL key is omitted from an otherwise complete physical source"
+        );
+        assert_eq!(state.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_staging_cannot_replace_a_newer_refresh_catalog() {
+        let state = state(8 * 1024 * 1024);
+        let old = state.begin_incremental_build("snapshot-old");
+        let old_path = object_store::path::Path::from("snapshot-old/data.vortex");
+        old.batch_written(&old_path, 0, &batch(vec![Some(1)], vec!["old"]));
+
+        let new = state.begin_incremental_build("snapshot-new");
+        let new_path = object_store::path::Path::from("snapshot-new/data.vortex");
+        new.batch_written(&new_path, 0, &batch(vec![Some(2)], vec!["new"]));
+        state
+            .stage_pending("snapshot-old", &[file(old_path.as_ref())])
+            .await;
+        state
+            .stage_pending("snapshot-new", &[file(new_path.as_ref())])
+            .await;
+        state.promote_staged("snapshot-new");
+
+        let catalog = state.published().expect("new catalog stays published");
+        assert_eq!(catalog.snapshot_id(), "snapshot-new");
+        assert_eq!(state.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_capture_publishes_explicit_uncovered_state() {
+        let state = state(1);
+        let builder = state.begin_incremental_build("snapshot");
+        let path = object_store::path::Path::from("snapshot/data.vortex");
+        builder.batch_written(&path, 0, &batch(vec![Some(1)], vec!["value"]));
+        state
+            .stage_pending("snapshot", &[file(path.as_ref())])
+            .await;
+        state.promote_staged("snapshot");
+
+        let catalog = state
+            .published()
+            .expect("an uncovered source manifest is published");
+        assert!(
+            !catalog.is_complete(),
+            "optional admission refusal leaves data publishable but uncovered"
+        );
+        assert!(
+            state.rejection().is_some(),
+            "the optional refusal remains a structured internal rejection"
+        );
+    }
 }

@@ -762,6 +762,36 @@ struct CapturedSnapshotFiles {
     files: Arc<Vec<PartitionedFile>>,
 }
 
+/// Fans one finalized Vortex write callback to independent optional indexes.
+/// Each observer records its own failure, so an admission or construction
+/// refusal in the larger covering payload cannot interrupt the address index or
+/// the durable data writer.
+struct CompositeVortexWriteObserver {
+    observers: Vec<Arc<dyn VortexWriteObserver>>,
+}
+
+impl std::fmt::Debug for CompositeVortexWriteObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompositeVortexWriteObserver")
+            .field("observers", &self.observers.len())
+            .finish()
+    }
+}
+
+impl VortexWriteObserver for CompositeVortexWriteObserver {
+    fn batch_written(
+        &self,
+        file_path: &object_store::path::Path,
+        first_row_position: u64,
+        batch: &RecordBatch,
+    ) {
+        for observer in &self.observers {
+            observer.batch_written(file_path, first_row_position, batch);
+        }
+    }
+}
+
 /// The live state one sweep reads, owned so it can cross into `spawn_blocking`.
 struct SnapshotSweepPins {
     /// The live snapshot pointer, read at sweep time.
@@ -1239,6 +1269,10 @@ struct RawScanInput {
     /// probed by a join long after planning, uses this index, so an index a
     /// refresh publishes mid-query is never mistaken for a stale one.
     lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
+    /// Covering catalog captured beside the file snapshot and address index.
+    /// It is an immutable `Arc`, so a plan retains its original pages even if a
+    /// later publication adds coverage to unchanged data.
+    covering_catalog: Option<Arc<super::covering_index::CoveringIndexCatalog>>,
     /// Warm files captured under the same fence as the inline and deletion views.
     /// A checkpoint may add files to the same directory after capture; those files
     /// must not be unioned with this view's pre-checkpoint inline rows.
@@ -1305,6 +1339,10 @@ impl RawScanInput {
                 .lookup_index
                 .as_ref()
                 .map(|index| Arc::as_ptr(index).addr()),
+            covering_catalog_ptr: self
+                .covering_catalog
+                .as_ref()
+                .map(|catalog| Arc::as_ptr(catalog).addr()),
         }
     }
 }
@@ -1371,6 +1409,10 @@ struct ScanViewKey {
     /// A background build publishing for the same snapshot must mint a new
     /// view, or cached views would keep scanning without it.
     lookup_index_ptr: Option<usize>,
+    /// Covering publication can advance without changing the file manifest.
+    /// This pointer prevents a cached scan view from silently acquiring (or
+    /// missing) newly published payload pages halfway through its lifetime.
+    covering_catalog_ptr: Option<usize>,
 }
 
 /// A scan-ready, internally-consistent view of the table: a [`RawScanInput`]
@@ -2004,6 +2046,10 @@ pub struct CayenneTableProvider {
     /// `indexes`. `None` when it declares none. Owned by the provider and its
     /// clones, so dropping the table drops the index and its reservation.
     lookup_index: Option<Arc<super::lookup_index::LookupIndexState>>,
+    /// Optional covering artifacts derived from the same declarations as the
+    /// address-only index. They are captured and published independently, so a
+    /// denied covering build never removes a working address index.
+    covering_index: Option<Arc<super::covering_index::CoveringIndexState>>,
     /// Secondary indexes over a memory-mode table's rows, kept with each
     /// memory-tier segment. `None` in file mode and without `indexes`.
     mem_tier_index: Option<Arc<super::mem_tier_index::MemTierIndexer>>,
@@ -5474,6 +5520,13 @@ impl CayenneTableProvider {
         if let Some(lookup_index) = &self.lookup_index {
             lookup_index.promote_staged(new_snapshot_id);
         }
+        // Covering pages are staged from the same final file manifest and swapped
+        // in this exact visibility boundary. A refused build publishes explicit
+        // uncovered state, never a catalog whose row references name the retired
+        // snapshot.
+        if let Some(covering_index) = &self.covering_index {
+            covering_index.promote_staged(new_snapshot_id);
+        }
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
@@ -8534,7 +8587,7 @@ impl CayenneTableProvider {
             (
                 super::lookup_index::LookupIndexState::new(
                     table_name,
-                    index_keys,
+                    index_keys.clone(),
                     Arc::clone(&context.runtime_env().memory_pool),
                     Arc::clone(&table_memory),
                     Arc::clone(&scan_input_version),
@@ -8542,6 +8595,21 @@ impl CayenneTableProvider {
                 None,
             )
         };
+        // Covering artifacts deliberately remain file-only until step 05 proves
+        // complete visibility across memory, inline, warm, protected, and cold
+        // sources. They reuse existing index declarations but have their own
+        // optional admission and publication state.
+        let covering_index = (!table_metadata.vortex_config.memory_mode)
+            .then(|| {
+                super::covering_index::CoveringIndexState::new(
+                    table_metadata.table_id.clone(),
+                    Arc::clone(&table_metadata.schema),
+                    &index_keys,
+                    Arc::clone(&table_memory),
+                    Arc::clone(&scan_input_version),
+                )
+            })
+            .flatten();
 
         // Per-table in-memory CDC tier caps (`cdc_durability: memory`). The byte
         // cap is read live from the context's actuators (seeded from
@@ -8633,6 +8701,7 @@ impl CayenneTableProvider {
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             lookup_index,
+            covering_index,
             mem_tier_index,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -10658,6 +10727,7 @@ impl CayenneTableProvider {
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             lookup_index: self.lookup_index.as_ref().map(Arc::clone),
+            covering_index: self.covering_index.as_ref().map(Arc::clone),
             mem_tier_index: self.mem_tier_index.as_ref().map(Arc::clone),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -28071,6 +28141,10 @@ impl CayenneTableProvider {
             .lookup_index
             .as_ref()
             .and_then(|state| state.published());
+        let covering_catalog = self
+            .covering_index
+            .as_ref()
+            .and_then(|state| state.published());
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
@@ -28117,6 +28191,7 @@ impl CayenneTableProvider {
             inlined_view,
             current_snapshot_id,
             lookup_index,
+            covering_catalog,
             warm_files,
             cold_files,
             structural_epoch,
@@ -34525,17 +34600,33 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
     ) -> Option<Arc<dyn VortexWriteObserver>> {
-        let state = self.lookup_index.as_ref()?;
-        // Keys are encoded against the STORED schema, so the same value encodes
-        // identically whether it arrives from a write stream or from a scan that
-        // decoded it as a view type.
-        let builder = state.begin_incremental_build(snapshot_id, &self.table_schema())?;
-        Some(builder as Arc<dyn VortexWriteObserver>)
+        let mut observers = Vec::with_capacity(2);
+        if let Some(state) = &self.lookup_index {
+            // Keys are encoded against the STORED schema, so the same value encodes
+            // identically whether it arrives from a write stream or from a scan that
+            // decoded it as a view type.
+            if let Some(builder) = state.begin_incremental_build(snapshot_id, &self.table_schema())
+            {
+                observers.push(builder as Arc<dyn VortexWriteObserver>);
+            }
+        }
+        if let Some(state) = &self.covering_index {
+            observers
+                .push(state.begin_incremental_build(snapshot_id) as Arc<dyn VortexWriteObserver>);
+        }
+        match observers.len() {
+            0 => None,
+            1 => observers.pop(),
+            _ => Some(Arc::new(CompositeVortexWriteObserver { observers })),
+        }
     }
 
     /// Drops a write-time index build whose snapshot is being abandoned.
     pub(crate) fn discard_lookup_index_build(&self) {
         if let Some(state) = &self.lookup_index {
+            state.discard_pending();
+        }
+        if let Some(state) = &self.covering_index {
             state.discard_pending();
         }
     }
@@ -34548,9 +34639,9 @@ impl CayenneTableProvider {
     /// table to a background build, and the snapshot publishes regardless. Data
     /// availability must never depend on this index.
     pub(crate) async fn stage_lookup_index_for_snapshot(&self, snapshot_id: &str) {
-        let Some(state) = &self.lookup_index else {
+        if self.lookup_index.is_none() && self.covering_index.is_none() {
             return;
-        };
+        }
         let file_set = self.file_set_version();
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
@@ -34560,10 +34651,22 @@ impl CayenneTableProvider {
             .await
         {
             Some((_store, files)) => {
-                state.stage_pending(snapshot_id, files, file_set).await;
+                if let Some(state) = &self.lookup_index {
+                    state
+                        .stage_pending(snapshot_id, files.clone(), file_set)
+                        .await;
+                }
+                if let Some(state) = &self.covering_index {
+                    state.stage_pending(snapshot_id, &files).await;
+                }
             }
             None => {
-                state.discard_pending();
+                if let Some(state) = &self.lookup_index {
+                    state.discard_pending();
+                }
+                if let Some(state) = &self.covering_index {
+                    state.stage_uncovered(snapshot_id);
+                }
             }
         }
     }

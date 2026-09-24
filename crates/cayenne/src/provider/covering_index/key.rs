@@ -33,10 +33,29 @@ use crate::row_converter::{RowConverter, SortField};
 pub(crate) const KEY_CODEC_VERSION: u16 = crate::row_converter::RowFormatVersion::CURRENT.id();
 
 /// Immutable identity of one physical source generation in one table.
+///
+/// A file source keeps the final, scan-visible file identity instead of a hash
+/// of it. A covering row reference is only valid for that exact physical file;
+/// retaining the fields makes a rewrite with an equal row count a distinct
+/// source and lets publication compare the identity structurally.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourceId {
     table_id: Arc<str>,
-    generation: u64,
+    identity: SourceIdentity,
+}
+
+/// The immutable thing a [`SourceId`] names.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum SourceIdentity {
+    /// Synthetic identities are retained for unit-level page-store tests.
+    Generation(u64),
+    /// Final metadata of one Vortex file as the scan manifest lists it.
+    File {
+        snapshot_id: Arc<str>,
+        path: Arc<str>,
+        size: u64,
+        last_modified_ms: i64,
+    },
 }
 
 impl SourceId {
@@ -45,7 +64,27 @@ impl SourceId {
     pub(crate) fn new(table_id: impl Into<Arc<str>>, generation: u64) -> Self {
         Self {
             table_id: table_id.into(),
-            generation,
+            identity: SourceIdentity::Generation(generation),
+        }
+    }
+
+    /// Create an identity for one final file in a snapshot's unfiltered manifest.
+    #[must_use]
+    pub(crate) fn file(
+        table_id: impl Into<Arc<str>>,
+        snapshot_id: impl Into<Arc<str>>,
+        path: impl Into<Arc<str>>,
+        size: u64,
+        last_modified_ms: i64,
+    ) -> Self {
+        Self {
+            table_id: table_id.into(),
+            identity: SourceIdentity::File {
+                snapshot_id: snapshot_id.into(),
+                path: path.into(),
+                size,
+                last_modified_ms,
+            },
         }
     }
 
@@ -55,10 +94,17 @@ impl SourceId {
         &self.table_id
     }
 
-    /// The immutable source generation.
+    /// The synthetic generation, when this is a test-only synthetic source.
+    ///
+    /// File identities intentionally do not expose a lossy numeric generation.
+    /// Callers that need to compare a file source must compare the full
+    /// [`SourceId`].
     #[must_use]
-    pub(crate) const fn generation(&self) -> u64 {
-        self.generation
+    pub(crate) const fn generation(&self) -> Option<u64> {
+        match &self.identity {
+            SourceIdentity::Generation(generation) => Some(*generation),
+            SourceIdentity::File { .. } => None,
+        }
     }
 }
 

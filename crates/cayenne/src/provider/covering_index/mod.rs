@@ -72,7 +72,10 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use build::{BuiltCoveredSource, build_source, build_sources};
+pub(crate) use build::{
+    BuiltCoveredSource, CoveringIndexState, IncrementalCoveringIndexBuilder, build_source,
+    build_sources,
+};
 pub(crate) use directory::{
     IndexRun, KeyDirectory, KeyDirectoryEntry, LiteralSeekSpan, PreparedLiteralSeek, RunId,
 };
@@ -86,9 +89,9 @@ pub(crate) use page_store::{
     PayloadPage, PayloadPageLease, ReservationToken,
 };
 pub(crate) use view::{
-    CoverageDecision, CoverageUnavailableReason, CoveringReadView, GatherBatch, IndexCatalog,
-    IndexedSource, ProbeCursor, ProbeMatch, ProbeRequest, ProbeStep, gather, prepare_literal_seek,
-    probe_many, try_cover,
+    CoverageDecision, CoverageUnavailableReason, CoveringIndexCatalog, CoveringReadView,
+    GatherBatch, IndexCatalog, IndexedSource, ProbeCursor, ProbeMatch, ProbeRequest, ProbeStep,
+    gather, prepare_literal_seek, probe_many, try_cover,
 };
 
 use snafu::prelude::*;

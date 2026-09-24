@@ -20,11 +20,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, new_empty_array};
+use async_trait::async_trait;
 
 use super::{
-    CoveredRowRef, CoveringPageStore, EncodedKey, Error, IndexDefinition, IndexRun,
-    KeyDirectoryEntry, KeyPageId, KeyPageLease, LiteralSeekSpan, PayloadPageId,
-    PreparedLiteralSeek, Result, SchemaIdentity, SourceId,
+    BuiltCoveredSource, CoveredRowRef, CoveringPageStore, EncodedKey, Error, IndexDefinition,
+    IndexRun, KeyDirectoryEntry, KeyPageId, KeyPageLease, LiteralSeekSpan, MemoryPageStore,
+    PayloadPageId, PayloadPageLease, PreparedLiteralSeek, Result, SchemaIdentity, SourceId,
 };
 
 /// Immutable source coverage available to a captured view.
@@ -124,6 +125,34 @@ impl IndexCatalog {
         })
     }
 
+    /// Assemble complete source artifacts for one definition into one immutable
+    /// catalog. Each source keeps its own `MemoryPageStore`; the catalog routes
+    /// batched page requests by generation-qualified source ID, so independent
+    /// writer artifacts never overwrite each other's page IDs.
+    pub(crate) fn from_built_sources(
+        definition: IndexDefinition,
+        built_sources: Vec<BuiltCoveredSource>,
+    ) -> Result<Self> {
+        let mut sources = Vec::with_capacity(built_sources.len());
+        let mut runs = Vec::new();
+        let mut stores = BTreeMap::new();
+        for built in built_sources {
+            let (source, source_runs, store) = built.into_parts();
+            let source_id = source.source().clone();
+            if stores.insert(source_id.clone(), store).is_some() {
+                return Err(Error::InvalidContract {
+                    message: format!(
+                        "covering-index catalog contains source {source_id:?} more than once"
+                    ),
+                });
+            }
+            sources.push(source);
+            runs.extend(source_runs.iter().cloned());
+        }
+        let page_store: Arc<dyn CoveringPageStore> = Arc::new(SourcePageStores { stores });
+        Self::new(definition, sources, runs, page_store)
+    }
+
     /// Shared index definition for every run in this catalog.
     #[must_use]
     pub(crate) fn definition(&self) -> &IndexDefinition {
@@ -146,6 +175,173 @@ impl IndexCatalog {
     #[must_use]
     pub(crate) fn page_store(&self) -> &Arc<dyn CoveringPageStore> {
         &self.page_store
+    }
+}
+
+/// Immutable collection of all configured covering definitions for one source
+/// manifest. It is the single object a table publisher swaps, so a captured
+/// scan can retain the old catalog while a refresh installs a wholly new one.
+#[derive(Debug)]
+pub(crate) struct CoveringIndexCatalog {
+    snapshot_id: Arc<str>,
+    catalogs: Arc<[Arc<IndexCatalog>]>,
+    source_manifest: BTreeSet<SourceId>,
+    complete: bool,
+}
+
+impl CoveringIndexCatalog {
+    /// Assemble one catalog per definition and prove every catalog names the
+    /// same complete immutable source manifest before publication.
+    pub(crate) fn new(
+        snapshot_id: impl Into<Arc<str>>,
+        catalogs: Vec<Arc<IndexCatalog>>,
+    ) -> Result<Self> {
+        let source_manifest = catalogs.first().map_or_else(BTreeSet::new, |catalog| {
+            catalog.sources().keys().cloned().collect()
+        });
+        if catalogs.iter().any(|catalog| {
+            catalog.sources().keys().cloned().collect::<BTreeSet<_>>() != source_manifest
+        }) {
+            return Err(Error::InvalidContract {
+                message: "covering-index definitions do not cover the same source manifest"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            snapshot_id: snapshot_id.into(),
+            catalogs: catalogs.into(),
+            source_manifest,
+            complete: true,
+        })
+    }
+
+    /// Publish explicit uncovered sources when optional admission or validation
+    /// refuses an artifact. The table still has an immutable catalog identity to
+    /// capture and rekey on, but `try_cover` must decline it rather than mistake
+    /// a missing catalog for an empty table.
+    #[must_use]
+    pub(crate) fn uncovered(
+        snapshot_id: impl Into<Arc<str>>,
+        source_manifest: impl IntoIterator<Item = SourceId>,
+    ) -> Self {
+        Self {
+            snapshot_id: snapshot_id.into(),
+            catalogs: Arc::new([]),
+            source_manifest: source_manifest.into_iter().collect(),
+            complete: false,
+        }
+    }
+
+    /// Snapshot whose file manifest these artifacts describe.
+    #[must_use]
+    pub(crate) fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    /// Complete source manifest shared by every configured definition.
+    #[must_use]
+    pub(crate) fn source_manifest(&self) -> &BTreeSet<SourceId> {
+        &self.source_manifest
+    }
+
+    /// Whether every source in the manifest has complete runs and payloads.
+    #[must_use]
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Individual definition catalogs, pinned together by this catalog.
+    #[must_use]
+    pub(crate) fn catalogs(&self) -> &[Arc<IndexCatalog>] {
+        &self.catalogs
+    }
+
+    /// Find a structurally compatible definition without relying on a label or
+    /// hash collision.
+    #[must_use]
+    pub(crate) fn catalog_for(&self, definition: &IndexDefinition) -> Option<&Arc<IndexCatalog>> {
+        self.catalogs
+            .iter()
+            .find(|catalog| catalog.definition().matches(definition))
+    }
+}
+
+/// Routes page loads to the immutable store that owns each source generation.
+///
+/// All state is immutable and every awaited page load happens after the routing
+/// maps have been read, so publication never holds a synchronous lock across
+/// I/O or encoding work.
+#[derive(Debug)]
+struct SourcePageStores {
+    stores: BTreeMap<SourceId, Arc<MemoryPageStore>>,
+}
+
+#[async_trait]
+impl CoveringPageStore for SourcePageStores {
+    async fn load_key_pages(&self, ids: &[KeyPageId]) -> Result<Vec<KeyPageLease>> {
+        let mut groups: BTreeMap<&SourceId, Vec<(usize, KeyPageId)>> = BTreeMap::new();
+        for (position, id) in ids.iter().enumerate() {
+            groups
+                .entry(id.source())
+                .or_default()
+                .push((position, id.clone()));
+        }
+        let mut loaded = vec![None; ids.len()];
+        for (source, requested) in groups {
+            let store = self.stores.get(source).ok_or_else(|| Error::MissingPage {
+                page: format!("source {source:?}"),
+            })?;
+            let requested_ids = requested
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            let leases = store.load_key_pages(&requested_ids).await?;
+            for ((position, _), lease) in requested.into_iter().zip(leases) {
+                loaded[position] = Some(lease);
+            }
+        }
+        loaded
+            .into_iter()
+            .enumerate()
+            .map(|(position, lease)| {
+                lease.ok_or_else(|| Error::InvalidContract {
+                    message: format!("key-page routing omitted request {position}"),
+                })
+            })
+            .collect()
+    }
+
+    async fn load_payload_pages(&self, ids: &[PayloadPageId]) -> Result<Vec<PayloadPageLease>> {
+        let mut groups: BTreeMap<&SourceId, Vec<(usize, PayloadPageId)>> = BTreeMap::new();
+        for (position, id) in ids.iter().enumerate() {
+            groups
+                .entry(id.source())
+                .or_default()
+                .push((position, id.clone()));
+        }
+        let mut loaded = vec![None; ids.len()];
+        for (source, requested) in groups {
+            let store = self.stores.get(source).ok_or_else(|| Error::MissingPage {
+                page: format!("source {source:?}"),
+            })?;
+            let requested_ids = requested
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            let leases = store.load_payload_pages(&requested_ids).await?;
+            for ((position, _), lease) in requested.into_iter().zip(leases) {
+                loaded[position] = Some(lease);
+            }
+        }
+        loaded
+            .into_iter()
+            .enumerate()
+            .map(|(position, lease)| {
+                lease.ok_or_else(|| Error::InvalidContract {
+                    message: format!("payload-page routing omitted request {position}"),
+                })
+            })
+            .collect()
     }
 }
 

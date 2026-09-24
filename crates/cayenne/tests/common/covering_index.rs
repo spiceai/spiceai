@@ -372,6 +372,31 @@ impl CoveringIndexFixture {
         }
     }
 
+    /// Replace the indexed `a` source through Cayenne's real full-refresh
+    /// writer. This is deliberately test-only fixture plumbing: publication
+    /// assertions for the private covering catalog remain in the library tests.
+    pub async fn overwrite_indexed_a(&self, batch: RecordBatch) {
+        let context = SessionContext::new();
+        let source = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            a_schema(),
+            None,
+        )
+        .expect("create overwrite source");
+        let plan = self
+            .a
+            .insert_into(
+                &context.state(),
+                source,
+                datafusion_expr::dml::InsertOp::Overwrite,
+            )
+            .await
+            .expect("plan indexed covering fixture overwrite");
+        collect(plan, context.task_ctx())
+            .await
+            .expect("execute indexed covering fixture overwrite");
+    }
+
     async fn wait_for_index_capability(&self) {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
