@@ -722,6 +722,7 @@ impl Runtime {
 
         let runtime = Arc::clone(&self);
         let shutdown_token = runtime.status.shutdown_token();
+        let load = self.dataset_loads.begin(&ds.name);
         let retry_fut = retry(retry_strategy, || async {
             // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
             if runtime.status.is_shutdown() {
@@ -731,6 +732,16 @@ impl Runtime {
                     },
                 ));
             }
+
+            // A Spicepod change replaced or removed this configuration while the
+            // attempt waited to start, so it must not register.
+            let Some(_attempt) = load.start_attempt().await else {
+                return Err(RetryError::permanent(
+                    crate::Error::UnableToInitializeDataConnector {
+                        source: "Dataset configuration was replaced".into(),
+                    },
+                ));
+            };
 
             match runtime
                 .try_load_dataset_once(
@@ -750,10 +761,14 @@ impl Runtime {
         });
 
         // Use tokio::select! so that backoff sleeps inside `retry` are immediately
-        // interrupted when the runtime begins shutting down (e.g. on ctrl-c).
+        // interrupted when the runtime begins shutting down (e.g. on ctrl-c), or
+        // when a Spicepod change supersedes this load. `superseded` resolves only
+        // while no attempt is running, so dropping the load there cannot abandon
+        // a registration part-way through.
         tokio::select! {
             _ = retry_fut => {},
             () = shutdown_token.cancelled() => {},
+            () = load.superseded() => {},
         }
     }
 
@@ -1868,6 +1883,24 @@ impl Runtime {
             .map(Arc::clone)
             .collect();
         let datasets_to_apply = with_localpod_dependents(changed_datasets, &valid_datasets);
+
+        // A load of a configuration this diff replaces or removes may still be
+        // retrying, and its first successful attempt would register that
+        // configuration over the one the Spicepod now declares (#1458). Stop it
+        // before anything below initializes the new configuration's accelerator
+        // or registers it.
+        let removed_datasets = current_app
+            .datasets
+            .iter()
+            .filter(|ds| !new_app.datasets.iter().any(|d| d.name == ds.name))
+            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok());
+        for name in datasets_to_apply
+            .iter()
+            .map(|ds| ds.name.clone())
+            .chain(removed_datasets)
+        {
+            self.dataset_loads.supersede(&name).await;
+        }
 
         let init_results = self
             .initialize_datasets_accelerators(&datasets_to_apply)
@@ -3362,6 +3395,143 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         // The stuck load's task outlives the test holding its own `Arc<Runtime>`;
         // marking shutdown will not unstick a connector already inside `create`,
         // but it stops the runtime the remaining assertions no longer need.
+        runtime.status.mark_shutdown();
+    }
+
+    /// Held shut until a test opens it, so a load of `gated:` stays inside its
+    /// connector's construction, and once open that construction returns a table
+    /// with a `stale` column. Its only user is
+    /// `a_corrected_dataset_is_not_overwritten_by_its_earlier_load`.
+    static GATE: Semaphore = Semaphore::const_new(0);
+
+    struct GatedConnectorFactory;
+
+    impl DataConnectorFactory for GatedConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create<'a>(
+            &'a self,
+            _params: ConnectorParams,
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+            Box::pin(async {
+                let _open = GATE.acquire().await;
+                Ok(Arc::new(StaleConnector) as Arc<dyn DataConnector>)
+            })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "gated"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaleConnector;
+
+    #[async_trait]
+    impl DataConnector for StaleConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "stale",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("empty MemTable with a single column");
+            Ok(Arc::new(table) as Arc<dyn TableProvider>)
+        }
+    }
+
+    /// Regression test for #1458: a dataset whose load had not succeeded yet was
+    /// corrected in the Spicepod, and the load of the earlier configuration kept
+    /// running. When that source answered, its load registered the earlier
+    /// configuration over the corrected one, so queries read the wrong source
+    /// while `/v1/datasets` reported the corrected one.
+    ///
+    /// The last wait is for something that must not happen, so it is bounded by
+    /// wall-clock: on the unfixed code the stale registration lands within
+    /// milliseconds of the gate opening.
+    #[tokio::test]
+    async fn a_corrected_dataset_is_not_overwritten_by_its_earlier_load() {
+        register_connector_factory("gated", Arc::new(GatedConnectorFactory)).await;
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let runtime = Arc::new(
+            crate::Runtime::builder()
+                .with_app(app::AppBuilder::new("corrected").build())
+                .build()
+                .await,
+        );
+        let first = Arc::new(
+            app::AppBuilder::new("corrected")
+                .with_dataset(spicepod_dataset("gated:earlier", "t"))
+                .build(),
+        );
+        assert!(Arc::clone(&runtime).apply_app(first).await);
+
+        let corrected = Arc::new(
+            app::AppBuilder::new("corrected")
+                .with_dataset(spicepod_dataset("schema_only:any", "t"))
+                .build(),
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                Arc::clone(&runtime).apply_app(corrected)
+            )
+            .await
+            .expect("correcting a dataset must not wait for its earlier load's source"),
+            "the corrected spicepod differs from the first one, so it must apply"
+        );
+
+        let t = TableReference::parse_str("t");
+        let columns = || async {
+            runtime.df.get_table(&t).await.map(|table| {
+                table
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(30), || async {
+                columns().await.is_some()
+            })
+            .await,
+            "the corrected dataset must register"
+        );
+        assert_eq!(columns().await, Some(vec!["id".to_string()]));
+
+        // The earlier configuration's source answers now.
+        GATE.add_permits(Semaphore::MAX_PERMITS);
+
+        let overwritten =
+            test_framework::utils::wait_until_true(Duration::from_secs(3), || async {
+                columns().await != Some(vec!["id".to_string()])
+            })
+            .await;
+        assert!(
+            !overwritten,
+            "the earlier configuration's load registered over the corrected dataset: {:?}",
+            columns().await
+        );
+
         runtime.status.mark_shutdown();
     }
 

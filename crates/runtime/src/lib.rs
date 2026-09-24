@@ -704,6 +704,10 @@ pub struct Runtime {
     /// honor `runtime.dataset_load_parallelism`.
     dataset_load_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// The dataset loads still retrying, so a Spicepod change can stop the load
+    /// of a configuration it replaces or removes.
+    dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
     /// fetched from the scheduler; for all other modes it is set before
