@@ -32863,6 +32863,24 @@ impl CayenneTableProvider {
             let lookup_selection = self.lookup_index.as_ref().and_then(|state| {
                 state.probe_snapshot(snapshot_id, &scalar_for, scan.outcome_recorder)
             });
+            // A protected snapshot's files are final once it is indexed, and its
+            // index was built over every one of them, so an index that holds no
+            // row for the key proves the snapshot has none. Skip listing and
+            // stats-pruning its files: at hundreds of protected snapshots that
+            // listing, repeated for every lookup, is most of the lookup's cost.
+            if let Some(selection) = lookup_selection.as_ref()
+                && selection.is_empty()
+            {
+                if let Some(selection) = lookup_selection {
+                    selection.note_empty();
+                }
+                plans.push(self.empty_snapshot_scan_plan(
+                    scan.state,
+                    scan.projection,
+                    &scan.read_schema,
+                )?);
+                continue;
+            }
             let plan = self
                 .create_snapshot_scan_plan_with_config(
                     scan.state,
@@ -32902,6 +32920,27 @@ impl CayenneTableProvider {
         }
 
         Ok(plans)
+    }
+
+    /// The plan of a snapshot branch that reads nothing: an [`EmptyExec`] with the
+    /// schema [`Self::create_snapshot_scan_plan_with_config`] would give the
+    /// branch, so it unions with the others unchanged.
+    fn empty_snapshot_scan_plan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        read_schema: &SchemaRef,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        );
+        let scan_schema = Self::snapshot_scan_schema(read_schema, &options);
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &scan_schema,
+            projection,
+        )?)))
     }
 
     /// Unions [`ExecutionPlan`]s, dropping any [`EmptyExec`], instead of needlessly widening the

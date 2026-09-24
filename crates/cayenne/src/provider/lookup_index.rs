@@ -829,6 +829,20 @@ pub(crate) enum LookupProbe {
 }
 
 impl LookupSelection {
+    /// Whether the index proves that no row of its snapshot holds the key.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.per_file.is_empty()
+    }
+
+    /// Notes this probe's `empty` outcome for a snapshot the scan then skips
+    /// without listing its files. Only valid for a snapshot whose files cannot
+    /// change after it is indexed — a protected snapshot — because the index,
+    /// not the listing, is what proves the key absent.
+    pub(crate) fn note_empty(self) {
+        self.state
+            .note_probe(self.recorder.as_deref(), &self.shape, ProbeOutcome::Empty);
+    }
+
     /// Narrows a scan's file groups to the files that hold a candidate row, and
     /// returns the access-plan provider that carries their positions into the
     /// Vortex scan. Either way the probe's outcome is recorded, so a run that
