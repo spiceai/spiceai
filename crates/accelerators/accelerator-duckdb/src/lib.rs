@@ -51,6 +51,7 @@ use datafusion_table_providers::{
         DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
         write::{DuckDBTableWriter, WriteCompletionHandler},
     },
+    sql::arrow_sql_gen::statement::IndexBuilder,
     sql::db_connection_pool::{
         self as db_connection_pool,
         duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
@@ -186,16 +187,15 @@ impl DuckDBAccelerator {
     }
 
     /// Drops the source indexes an earlier schema inference copied onto this change-stream
-    /// acceleration's stored table before it is opened for writing. The writer rejects every
-    /// write to a table holding an index its definition does not declare, and such an index
-    /// is also what makes an upsert rewrite its row, so under concurrent reads a later change
-    /// to the same key fails to commit (#13929).
+    /// acceleration's stored table, before the table is opened for writing: the writer
+    /// rejects every write to a table holding an index its definition does not declare, and
+    /// the index itself is what `apply_inferred_schema` stopped inferring for `DuckDB` (#13929).
     async fn drop_superseded_inferred_indexes(
         &self,
         cmd: &CreateExternalTable,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let superseded = superseded_inferred_index_columns(cmd);
+        let superseded = superseded_inferred_indexes(cmd);
         if superseded.is_empty() {
             return Ok(());
         }
@@ -1398,14 +1398,9 @@ fn list_internal_data_tables(
 }
 
 /// The source indexes that schema inference reports for `cmd` but that the acceleration
-/// does not declare, each as the column part of the name the `DuckDB` writer gives an
-/// index (`i_{table}_{columns}`, over the sorted column set).
-///
-/// Schema inference no longer copies a source's secondary indexes onto a `DuckDB`
-/// acceleration (see `apply_inferred_schema`), but a file created before that still holds
-/// them, and the writer's drift check fails every write to a table carrying an index its
-/// definition does not declare.
-fn superseded_inferred_index_columns(cmd: &CreateExternalTable) -> HashSet<String> {
+/// does not declare: the ones an earlier inference copied onto a stored table (see
+/// `apply_inferred_schema`).
+fn superseded_inferred_indexes(cmd: &CreateExternalTable) -> HashSet<ColumnReference> {
     let inferred = data_components::inferred_schema::InferredSchema::from_metadata(
         cmd.schema.as_arrow().metadata(),
     );
@@ -1413,8 +1408,7 @@ fn superseded_inferred_index_columns(cmd: &CreateExternalTable) -> HashSet<Strin
         return HashSet::new();
     }
 
-    let name_columns = |columns: &ColumnReference| columns.iter().join("_");
-    let declared: HashSet<String> = cmd
+    let declared: HashSet<ColumnReference> = cmd
         .options
         .get("indexes")
         .map(|indexes| {
@@ -1422,8 +1416,8 @@ fn superseded_inferred_index_columns(cmd: &CreateExternalTable) -> HashSet<Strin
                 indexes,
             )
             .into_keys()
-            .filter_map(|columns| ColumnReference::try_from(columns.as_str()).ok())
-            .map(|columns| name_columns(&columns))
+            .filter_map(|columns| util::column_reference::parse(&columns).ok())
+            .map(ColumnReference::new)
             .collect()
         })
         .unwrap_or_default();
@@ -1431,18 +1425,17 @@ fn superseded_inferred_index_columns(cmd: &CreateExternalTable) -> HashSet<Strin
     inferred
         .indexes
         .iter()
-        .map(|index| name_columns(&ColumnReference::new(index.columns.clone())))
-        .filter(|name| !declared.contains(name))
+        .map(|index| ColumnReference::new(index.columns.clone()))
+        .filter(|columns| !declared.contains(columns))
         .collect()
 }
 
-/// Drops, from `table_name` and its internal `__data_{table_name}_{unix_ms}` tables, every
-/// index the writer named `i_{table}_{columns}` for a `columns` in `superseded`. Returns the
-/// names of the dropped indexes.
+/// Drops every index the `DuckDB` writer created for one of `superseded` on `table_name` or
+/// one of its internal `__data_{table_name}_{unix_ms}` tables. Returns the dropped names.
 fn drop_indexes_named(
     tx: &duckdb::Transaction<'_>,
     table_name: &str,
-    superseded: &HashSet<String>,
+    superseded: &HashSet<ColumnReference>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut tables = vec![table_name.to_string()];
     tables.extend(
@@ -1450,33 +1443,31 @@ fn drop_indexes_named(
             .into_iter()
             .map(|(name, _)| name),
     );
+    let writer_names: HashSet<String> = tables
+        .iter()
+        .cartesian_product(superseded)
+        .map(|(table, columns)| IndexBuilder::new(table, columns.iter().collect()).index_name())
+        .collect();
 
-    let mut dropped = Vec::new();
-    for table in tables {
-        let mut stmt = tx
-            .prepare(
-                "SELECT index_name FROM duckdb_indexes() \
-                 WHERE database_name = current_database() AND schema_name = current_schema() \
-                 AND table_name = ?",
-            )
+    let mut stmt = tx
+        .prepare(
+            "SELECT index_name FROM duckdb_indexes() \
+             WHERE database_name = current_database() AND schema_name = current_schema()",
+        )
+        .boxed()?;
+    let dropped: Vec<String> = stmt
+        .query_map([], |row| row.get::<usize, String>(0))
+        .boxed()?
+        .filter(|name| match name {
+            Ok(name) => writer_names.contains(name),
+            Err(_) => true,
+        })
+        .collect::<Result<_, _>>()
+        .boxed()?;
+    for name in &dropped {
+        let escaped = name.replace('"', "\"\"");
+        tx.execute(&format!("DROP INDEX IF EXISTS \"{escaped}\""), [])
             .boxed()?;
-        let names: Vec<String> = stmt
-            .query_map([table.as_str()], |row| row.get::<usize, String>(0))
-            .boxed()?
-            .collect::<Result<_, _>>()
-            .boxed()?;
-        for name in names {
-            let writer_prefix = format!("i_{table}_");
-            if name
-                .strip_prefix(writer_prefix.as_str())
-                .is_some_and(|columns| superseded.contains(columns))
-            {
-                let escaped = name.replace('"', "\"\"");
-                tx.execute(&format!("DROP INDEX IF EXISTS \"{escaped}\""), [])
-                    .boxed()?;
-                dropped.push(name);
-            }
-        }
     }
     Ok(dropped)
 }
@@ -4198,26 +4189,29 @@ mod tests {
     }
 
     #[test]
-    fn superseded_inferred_index_columns_mirror_the_writer_naming() {
-        // The source declares (last, first); the writer names indexes over the sorted
-        // column set, so the stored index is `i_t_first_last`.
+    fn superseded_inferred_indexes_are_the_undeclared_inferred_ones() {
         let cmd = cmd_with_inferred_indexes(&[(&["last", "first"], false)], None);
         assert_eq!(
-            super::superseded_inferred_index_columns(&cmd),
-            std::collections::HashSet::from(["first_last".to_string()])
+            super::superseded_inferred_indexes(&cmd),
+            std::collections::HashSet::from([
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "first".to_string(),
+                    "last".to_string()
+                ])
+            ])
         );
     }
 
     #[test]
-    fn superseded_inferred_index_columns_exclude_declared_indexes() {
+    fn superseded_inferred_indexes_exclude_declared_indexes() {
         let cmd = cmd_with_inferred_indexes(
             &[(&["last", "first"], false), (&["email"], true)],
             Some("email:unique;(first, last):enabled"),
         );
         assert!(
-            super::superseded_inferred_index_columns(&cmd).is_empty(),
+            super::superseded_inferred_indexes(&cmd).is_empty(),
             "a declared index is configuration, not a superseded inference: {:?}",
-            super::superseded_inferred_index_columns(&cmd)
+            super::superseded_inferred_indexes(&cmd)
         );
     }
 
@@ -4239,7 +4233,12 @@ mod tests {
         .expect("fixture tables and indexes are created");
 
         let tx = conn.transaction().expect("transaction begins");
-        let superseded = std::collections::HashSet::from(["first_last".to_string()]);
+        let superseded = std::collections::HashSet::from([
+            datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                "last".to_string(),
+                "first".to_string(),
+            ]),
+        ]);
         let mut dropped = super::drop_indexes_named(&tx, "t", &superseded).expect("drop succeeds");
         tx.commit().expect("transaction commits");
         dropped.sort();

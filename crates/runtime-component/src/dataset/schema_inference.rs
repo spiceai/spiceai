@@ -163,15 +163,15 @@ pub fn apply_inferred_schema(
     // for a change stream that stops replication of the dataset (#13929). Without a
     // secondary index the upsert updates the row in place and never adds a row id.
     let mut applied_indexes = 0usize;
-    let indexes_applicable = constraints_applicable && engine != Engine::DuckDB;
-    if constraints_applicable && !indexes_applicable && !inferred.indexes.is_empty() {
-        tracing::debug!(
-            dataset = %dataset_name,
-            %engine,
-            "Skipping inferred secondary indexes; a DuckDB upsert that sets an indexed column rewrites the row, which fails to commit while an older query is still reading it"
-        );
-    }
-    if indexes_applicable && acceleration.indexes.is_empty() {
+    let infer_indexes = constraints_applicable && acceleration.indexes.is_empty();
+    if infer_indexes && engine == Engine::DuckDB {
+        if !inferred.indexes.is_empty() {
+            tracing::debug!(
+                dataset = %dataset_name,
+                "Skipping inferred secondary indexes; a DuckDB upsert that sets an indexed column rewrites the row, which fails to commit while an older query is still reading it"
+            );
+        }
+    } else if infer_indexes {
         for index in &inferred.indexes {
             if !index.columns.iter().all(|c| has_column(c)) {
                 continue;
