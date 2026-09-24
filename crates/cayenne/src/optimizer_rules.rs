@@ -5129,24 +5129,21 @@ mod tests {
     /// OR-of-equalities from NDV (`docs/dev/fork_patches.md`).
     ///
     /// Without it neither spelling is analyzable by interval arithmetic, so both
-    /// fall to `FilterExec`'s flat default selectivity of 20%: a key lookup on a
-    /// 150M-row accelerated table advertises 30M rows. The join build side is
-    /// chosen from exactly that number, so the larger table is mistaken for the
-    /// smaller one, and the oversized build then trips the memory gate above and
-    /// rewrites the join into a sort-merge that sorts a whole input to produce a
-    /// handful of rows.
-    /// Guard for the fork patch that estimates an `IN` list or an
-    /// OR-of-equalities from NDV (`docs/dev/fork_patches.md`).
+    /// take `FilterExec`'s flat 20% default: a key lookup on a 150M-row
+    /// accelerated table advertises 30M rows.
     ///
-    /// Without it neither spelling is analyzable by interval arithmetic, so both
-    /// take `FilterExec`'s flat 20% default and a key lookup on a large
-    /// accelerated table advertises a fifth of the table. The harm that does is
-    /// local to this crate: the oversized-join memory gate reads that row count,
-    /// concludes the build side cannot fit, and rewrites the hash join into a
-    /// sort-merge that sorts a whole input to produce a handful of rows. So the
-    /// guard is aimed at the gate, not at the arithmetic — a re-cut that changes
-    /// the estimate's exact value but keeps it useful should not fail, and one
-    /// that drops the patch must.
+    /// The seam that matters to this crate is which input `JoinSelection`
+    /// collects. The estimate exists so a key lookup over a large accelerated
+    /// table reads as smaller than the table opposite it; when it does not, the
+    /// unfiltered side is collected instead, and because that side is a scan
+    /// with an *exact* row count it is what the oversized-join memory gate then
+    /// reads before rewriting the join into a sort-merge.
+    ///
+    /// The gate cannot serve as the guard itself: `build_input_row_estimate`
+    /// accepts only `Precision::Exact`, and a `FilterExec` is always `Inexact`,
+    /// so the gate never reads this estimate directly. Hence the tests below
+    /// run `JoinSelection` and assert which side it collects, with the row-count
+    /// assertions kept only as fast diagnostics.
     mod in_list_row_estimate {
         use super::*;
         use datafusion::logical_expr::Operator;
