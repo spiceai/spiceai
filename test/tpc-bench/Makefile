@@ -311,12 +311,31 @@ mysql-init:
 
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
+# MySQL's LOAD DATA reads an empty field as the column type's zero value - an empty
+# integer field lands as 0, never NULL - while PostgreSQL's `\copy ... CSV` reads that
+# same empty field as NULL. dsdgen writes a NULL as an empty field (and the DuckDB
+# tpcds/tpch extensions export with QUOTE '', so they write one too, which is why an
+# empty field is the only spelling a NULL has in these files). Loading them into MySQL
+# unchanged therefore replaces every NULL with 0 and every empty string with '', so the
+# MySQL arms benchmark different data from every other engine seeded from the same
+# files: tpcds_q76, whose three predicates are all `IS NULL`, answers 0 rows there and
+# 11 everywhere else.
+#
+# Rendering each empty field as \N - the sequence LOAD DATA reads as NULL under its
+# default ESCAPED BY '\' - makes MySQL agree with the rest of the fleet. The `:a`/`ta`
+# loop is what carries consecutive empty fields (`a||b` -> `a|\N|\N|b`), which a single
+# pass would only half-convert because the substitutions overlap; the last two
+# expressions cover a leading and a trailing empty field, which have no `||` to match.
+# The leading `s/|$$//` drops the trailing delimiter dsdgen/dbgen end each row with, and
+# must run first so a trailing empty field is not mistaken for that delimiter.
+MYSQL_LOAD_PREP = sed -e 's/|$$//' -e ':a' -e 's/||/|\\N|/g' -e 'ta' -e 's/^|/\\N|/' -e 's/|$$/|\\N/'
+
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
 mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
+		$(MYSQL_LOAD_PREP) "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
@@ -352,7 +371,7 @@ mysql-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
+		$(MYSQL_LOAD_PREP) "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."

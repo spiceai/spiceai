@@ -359,6 +359,10 @@ lint-rust:
 	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
 	$(PYTHON) scripts/test_check_fork_patches.py
 	$(PYTHON) scripts/check_fork_patches.py
+	## MySQL bench-loader NULL guard (fast, no compile): a pipe-delimited bench file spells NULL as an empty field, which MySQL's LOAD DATA reads as 0 unless it is rendered as `\N` first
+	## Its parser is exercised first, together with the transform itself: nothing else in CI executes that sed program, and a guard matching no loader would report success
+	$(PYTHON) scripts/test_check_bench_mysql_load_nulls.py
+	$(PYTHON) scripts/check_bench_mysql_load_nulls.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
