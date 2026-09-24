@@ -375,3 +375,164 @@ impl CoveringPageStore for MemoryPageStore {
             .collect()
     }
 }
+
+/// Controlled asynchronous page-store implementation used to verify that the
+/// probe and gather code depend only on page leases, rather than on the
+/// resident store's synchronous implementation details.
+///
+/// Each requested page waits on an explicit test-controlled gate. Requests are
+/// polled concurrently and can therefore finish in a different order from the
+/// caller's IDs, while `try_join_all` restores the contract's caller order.
+/// This is test support only: it deliberately does not model persistence or a
+/// cache policy.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use futures::future::try_join_all;
+    use parking_lot::Mutex;
+    use tokio::sync::Notify;
+
+    use super::{
+        CoveringPageStore, Error, KeyPageId, KeyPageLease, MemoryPageStore, PayloadPageId,
+        PayloadPageLease, Result,
+    };
+
+    #[derive(Debug, Default)]
+    struct PageGate {
+        released: AtomicBool,
+        notify: Notify,
+    }
+
+    impl PageGate {
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+
+        async fn wait(&self) {
+            loop {
+                let notified = self.notify.notified();
+                if self.released.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    /// An in-memory store whose individual page operations can be explicitly
+    /// delayed or failed. It wraps the resident store, but implements both
+    /// trait methods itself so the contract suite also exercises asynchronous
+    /// completion and result reordering.
+    #[derive(Debug)]
+    pub(crate) struct DelayedPageStore {
+        resident: MemoryPageStore,
+        key_gates: Mutex<BTreeMap<KeyPageId, Arc<PageGate>>>,
+        payload_gates: Mutex<BTreeMap<PayloadPageId, Arc<PageGate>>>,
+        key_failures: Mutex<BTreeMap<KeyPageId, String>>,
+        payload_failures: Mutex<BTreeMap<PayloadPageId, String>>,
+    }
+
+    impl DelayedPageStore {
+        /// Construct a delayed wrapper with the same immutable resident pages.
+        pub(crate) fn new(
+            key_pages: impl IntoIterator<Item = (KeyPageId, KeyPageLease)>,
+            payload_pages: impl IntoIterator<Item = (PayloadPageId, PayloadPageLease)>,
+        ) -> Result<Self> {
+            Ok(Self {
+                resident: MemoryPageStore::new(key_pages, payload_pages)?,
+                key_gates: Mutex::new(BTreeMap::new()),
+                payload_gates: Mutex::new(BTreeMap::new()),
+                key_failures: Mutex::new(BTreeMap::new()),
+                payload_failures: Mutex::new(BTreeMap::new()),
+            })
+        }
+
+        /// Block a key-page request until [`Self::release_key_page`] is called.
+        pub(crate) fn block_key_page(&self, id: KeyPageId) {
+            self.key_gates
+                .lock()
+                .insert(id, Arc::new(PageGate::default()));
+        }
+
+        /// Permit all waiting requests for one key page to complete.
+        pub(crate) fn release_key_page(&self, id: &KeyPageId) {
+            if let Some(gate) = self.key_gates.lock().get(id) {
+                gate.release();
+            }
+        }
+
+        /// Cause a key-page request to fail after its optional delay.
+        pub(crate) fn fail_key_page(&self, id: KeyPageId, message: impl Into<String>) {
+            self.key_failures.lock().insert(id, message.into());
+        }
+
+        /// Block a payload-page request until [`Self::release_payload_page`] is called.
+        pub(crate) fn block_payload_page(&self, id: PayloadPageId) {
+            self.payload_gates
+                .lock()
+                .insert(id, Arc::new(PageGate::default()));
+        }
+
+        /// Permit all waiting requests for one payload page to complete.
+        pub(crate) fn release_payload_page(&self, id: &PayloadPageId) {
+            if let Some(gate) = self.payload_gates.lock().get(id) {
+                gate.release();
+            }
+        }
+
+        /// Cause a payload-page request to fail after its optional delay.
+        pub(crate) fn fail_payload_page(&self, id: PayloadPageId, message: impl Into<String>) {
+            self.payload_failures.lock().insert(id, message.into());
+        }
+
+        async fn load_one_key_page(&self, id: KeyPageId) -> Result<KeyPageLease> {
+            let gate = self.key_gates.lock().get(&id).cloned();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            if let Some(message) = self.key_failures.lock().get(&id).cloned() {
+                return Err(Error::Unavailable { operation: message });
+            }
+            let mut pages = self
+                .resident
+                .load_key_pages(std::slice::from_ref(&id))
+                .await?;
+            pages.pop().ok_or_else(|| Error::InvalidContract {
+                message: "resident key-page store returned no page for one ID".to_string(),
+            })
+        }
+
+        async fn load_one_payload_page(&self, id: PayloadPageId) -> Result<PayloadPageLease> {
+            let gate = self.payload_gates.lock().get(&id).cloned();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            if let Some(message) = self.payload_failures.lock().get(&id).cloned() {
+                return Err(Error::Unavailable { operation: message });
+            }
+            let mut pages = self
+                .resident
+                .load_payload_pages(std::slice::from_ref(&id))
+                .await?;
+            pages.pop().ok_or_else(|| Error::InvalidContract {
+                message: "resident payload-page store returned no page for one ID".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CoveringPageStore for DelayedPageStore {
+        async fn load_key_pages(&self, ids: &[KeyPageId]) -> Result<Vec<KeyPageLease>> {
+            try_join_all(ids.iter().cloned().map(|id| self.load_one_key_page(id))).await
+        }
+
+        async fn load_payload_pages(&self, ids: &[PayloadPageId]) -> Result<Vec<PayloadPageLease>> {
+            try_join_all(ids.iter().cloned().map(|id| self.load_one_payload_page(id))).await
+        }
+    }
+}

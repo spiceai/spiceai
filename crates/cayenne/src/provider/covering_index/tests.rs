@@ -31,6 +31,7 @@ use datafusion_physical_plan::{ExecutionPlan, common::collect};
 
 use super::super::lookup_index::KeySpec;
 use super::super::memory_account::CayenneMemoryAccount;
+use super::page_store::test_support::DelayedPageStore;
 use super::{
     AllocationOwner, CayenneIndexScanExec, CoveredRowRef, CoveringIndexAccess,
     CoveringIndexCapability, CoveringPageStore, CoveringReadView, EncodedKey, Error, IndexCatalog,
@@ -493,6 +494,247 @@ async fn page_store_preserves_repeated_ids_and_prepared_seek_is_compact() {
     assert!(matches!(
         try_cover(Arc::new(view), &definition, &[0]).expect("coverage decision"),
         super::CoverageDecision::Complete(_)
+    ));
+}
+
+fn page_store_fixture() -> (
+    SourceId,
+    BTreeMap<KeyPageId, KeyPageLease>,
+    BTreeMap<PayloadPageId, PayloadPageLease>,
+) {
+    let source = SourceId::new("page-store-contract", 1);
+    let first_key = KeyPageId::new(source.clone(), 0);
+    let second_key = KeyPageId::new(source.clone(), 1);
+    let first_payload = PayloadPageId::new(source.clone(), 0);
+    let second_payload = PayloadPageId::new(source.clone(), 1);
+    let key_pages = BTreeMap::from([
+        (
+            first_key,
+            PageLease::new(
+                Arc::new(
+                    KeyPage::new(
+                        Arc::from(&b"a"[..]),
+                        vec![0, 1],
+                        vec![row_ref(&source, 0, 0)],
+                    )
+                    .expect("first contract key page"),
+                ),
+                token(128),
+            ),
+        ),
+        (
+            second_key,
+            PageLease::new(
+                Arc::new(
+                    KeyPage::new(
+                        Arc::from(&b"b"[..]),
+                        vec![0, 1],
+                        vec![row_ref(&source, 1, 0)],
+                    )
+                    .expect("second contract key page"),
+                ),
+                token(128),
+            ),
+        ),
+    ]);
+    let payload_schema = schema(vec![Field::new("value", DataType::Utf8, false)]);
+    let payload_pages = [first_payload, second_payload]
+        .into_iter()
+        .zip(["first", "second"])
+        .map(|(id, value)| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&payload_schema),
+                vec![Arc::new(StringArray::from(vec![value])) as ArrayRef],
+            )
+            .expect("contract payload batch");
+            (
+                id,
+                PageLease::new(
+                    Arc::new(
+                        PayloadPage::new(
+                            SchemaIdentity::identity(&payload_schema)
+                                .expect("contract payload schema"),
+                            batch,
+                        )
+                        .expect("contract payload page"),
+                    ),
+                    token(128),
+                ),
+            )
+        })
+        .collect();
+    (source, key_pages, payload_pages)
+}
+
+async fn assert_resident_store_contract(store: Arc<dyn CoveringPageStore>, source: &SourceId) {
+    let first_key = KeyPageId::new(source.clone(), 0);
+    let second_key = KeyPageId::new(source.clone(), 1);
+    let first_payload = PayloadPageId::new(source.clone(), 0);
+    let second_payload = PayloadPageId::new(source.clone(), 1);
+
+    let keys = store
+        .load_key_pages(&[second_key.clone(), first_key.clone(), second_key.clone()])
+        .await
+        .expect("contract key pages load");
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[0].page().key(0).expect("second key"), b"b");
+    assert_eq!(keys[1].page().key(0).expect("first key"), b"a");
+    assert!(Arc::ptr_eq(keys[0].page(), keys[2].page()));
+
+    let payloads = store
+        .load_payload_pages(&[
+            second_payload.clone(),
+            first_payload.clone(),
+            second_payload,
+        ])
+        .await
+        .expect("contract payload pages load");
+    assert_eq!(payloads.len(), 3);
+    assert_eq!(payloads[0].page().batch().num_rows(), 1);
+    assert!(Arc::ptr_eq(payloads[0].page(), payloads[2].page()));
+
+    assert!(
+        store
+            .load_key_pages(&[])
+            .await
+            .expect("zero key IDs")
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_payload_pages(&[])
+            .await
+            .expect("zero payload IDs")
+            .is_empty()
+    );
+    assert!(matches!(
+        store
+            .load_key_pages(&[KeyPageId::new(SourceId::new("wrong-source", 1), 0)])
+            .await,
+        Err(Error::MissingPage { .. })
+    ));
+    assert!(matches!(
+        store
+            .load_payload_pages(&[PayloadPageId::new(SourceId::new("wrong-source", 1), 0)])
+            .await,
+        Err(Error::MissingPage { .. })
+    ));
+}
+
+/// The resident and delayed stores have the identical public contract. The
+/// delayed implementation intentionally completes the second physical request
+/// first; the caller still receives IDs in its original order.
+#[tokio::test]
+async fn page_store_contract_conformance_covers_resident_and_delayed_stores() {
+    let (source, keys, payloads) = page_store_fixture();
+    let resident: Arc<dyn CoveringPageStore> = Arc::new(
+        super::MemoryPageStore::new(keys.clone(), payloads.clone())
+            .expect("resident contract store"),
+    );
+    assert_resident_store_contract(resident, &source).await;
+
+    let delayed = Arc::new(DelayedPageStore::new(keys, payloads).expect("delayed contract store"));
+    assert_resident_store_contract(Arc::clone(&delayed) as Arc<dyn CoveringPageStore>, &source)
+        .await;
+
+    let first = KeyPageId::new(source.clone(), 0);
+    let second = KeyPageId::new(source.clone(), 1);
+    delayed.block_key_page(first.clone());
+    delayed.block_key_page(second.clone());
+    let pending_store = Arc::clone(&delayed);
+    let pending = tokio::spawn(async move {
+        pending_store
+            .load_key_pages(&[first, second])
+            .await
+            .expect("delayed key pages load")
+    });
+    tokio::task::yield_now().await;
+    delayed.release_key_page(&KeyPageId::new(source.clone(), 1));
+    tokio::task::yield_now().await;
+    assert!(
+        !pending.is_finished(),
+        "the first requested page is still blocked even though the second completed"
+    );
+    delayed.release_key_page(&KeyPageId::new(source.clone(), 0));
+    let pages = pending.await.expect("delayed task joins");
+    assert_eq!(pages[0].page().key(0).expect("first key"), b"a");
+    assert_eq!(pages[1].page().key(0).expect("second key"), b"b");
+
+    let first_payload = PayloadPageId::new(source.clone(), 0);
+    let second_payload = PayloadPageId::new(source, 1);
+    delayed.block_payload_page(first_payload.clone());
+    delayed.block_payload_page(second_payload.clone());
+    let pending_store = Arc::clone(&delayed);
+    let pending = tokio::spawn(async move {
+        pending_store
+            .load_payload_pages(&[first_payload, second_payload])
+            .await
+            .expect("delayed payload pages load")
+    });
+    tokio::task::yield_now().await;
+    delayed.release_payload_page(&PayloadPageId::new(
+        SourceId::new("page-store-contract", 1),
+        1,
+    ));
+    tokio::task::yield_now().await;
+    assert!(
+        !pending.is_finished(),
+        "the first requested payload page is still blocked even though the second completed"
+    );
+    delayed.release_payload_page(&PayloadPageId::new(
+        SourceId::new("page-store-contract", 1),
+        0,
+    ));
+    let pages = pending.await.expect("delayed payload task joins");
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].page().batch().num_rows(), 1);
+    assert_eq!(pages[1].page().batch().num_rows(), 1);
+}
+
+/// Dropping a stalled or partly resolved request must release its temporary
+/// leases. The resident store remains the only owner of the first page after
+/// cancellation, so a later query can load it normally.
+#[tokio::test]
+async fn delayed_page_store_cancellation_and_faults_do_not_retain_leases() {
+    let (source, keys, payloads) = page_store_fixture();
+    let first_page = Arc::clone(
+        keys.get(&KeyPageId::new(source.clone(), 0))
+            .expect("first key lease")
+            .page(),
+    );
+    let delayed =
+        Arc::new(DelayedPageStore::new(keys, payloads).expect("delayed cancellation store"));
+    let first = KeyPageId::new(source.clone(), 0);
+    let second = KeyPageId::new(source.clone(), 1);
+    delayed.block_key_page(second.clone());
+    let pending_store = Arc::clone(&delayed);
+    let pending = tokio::spawn(async move { pending_store.load_key_pages(&[first, second]).await });
+    tokio::task::yield_now().await;
+    pending.abort();
+    assert!(
+        pending
+            .await
+            .expect_err("cancelled page load task")
+            .is_cancelled()
+    );
+    assert_eq!(
+        Arc::strong_count(&first_page),
+        2,
+        "the fixture inspection clone and resident store are the only surviving key-page owners"
+    );
+    drop(first_page);
+
+    let failed = KeyPageId::new(source.clone(), 0);
+    delayed.fail_key_page(failed.clone(), "injected key read failure");
+    assert!(matches!(
+        delayed.load_key_pages(&[failed]).await,
+        Err(Error::Unavailable { .. })
+    ));
+    let payload_failure = PayloadPageId::new(source, 0);
+    delayed.fail_payload_page(payload_failure.clone(), "injected payload read failure");
+    assert!(matches!(
+        delayed.load_payload_pages(&[payload_failure]).await,
+        Err(Error::Unavailable { .. })
     ));
 }
 

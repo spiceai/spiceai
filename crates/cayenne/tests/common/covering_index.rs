@@ -37,7 +37,8 @@ use cayenne::optimizer_rules::CayenneIndexJoinRewriter;
 use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
-use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -209,6 +210,7 @@ pub struct CoveringIndexFixture {
     _fixture: TestFixture,
     mode: FixtureMode,
     runtime_env: Arc<RuntimeEnv>,
+    memory_pool: Option<Arc<dyn MemoryPool>>,
     store: Option<Arc<CountingObjectStore>>,
     a: Arc<CayenneTableProvider>,
     b: Arc<CayenneTableProvider>,
@@ -219,10 +221,32 @@ pub struct CoveringIndexFixture {
 impl CoveringIndexFixture {
     /// Create, populate, and wait for the indexed pair's query capability.
     pub async fn new(mode: FixtureMode) -> Self {
+        Self::new_with_runtime(mode, Arc::new(RuntimeEnv::default()), None).await
+    }
+
+    /// Create the real provider fixture under one bounded `DataFusion` pool.
+    ///
+    /// This is test-only plumbing for the covering-index budget matrix. The
+    /// returned fixture still exposes only public provider and SQL operations.
+    pub async fn new_with_memory_limit(mode: FixtureMode, bytes: usize) -> Self {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+        let runtime_env = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()
+                .expect("bounded covering-index runtime environment"),
+        );
+        Self::new_with_runtime(mode, runtime_env, Some(pool)).await
+    }
+
+    async fn new_with_runtime(
+        mode: FixtureMode,
+        runtime_env: Arc<RuntimeEnv>,
+        memory_pool: Option<Arc<dyn MemoryPool>>,
+    ) -> Self {
         let fixture = TestFixture::new(BackendType::Sqlite)
             .await
             .expect("create covering-index fixture");
-        let runtime_env = Arc::new(RuntimeEnv::default());
         let store = (mode == FixtureMode::File).then(|| {
             Arc::new(CountingObjectStore::new(Arc::new(
                 object_store::memory::InMemory::new(),
@@ -296,6 +320,7 @@ impl CoveringIndexFixture {
             _fixture: fixture,
             mode,
             runtime_env,
+            memory_pool,
             store,
             a,
             b,
@@ -304,6 +329,12 @@ impl CoveringIndexFixture {
         };
         fixture.wait_for_index_capability().await;
         fixture
+    }
+
+    /// Current pool reservation for the bounded-runtime variant.
+    #[must_use]
+    pub fn pool_reserved_bytes(&self) -> Option<usize> {
+        self.memory_pool.as_ref().map(|pool| pool.reserved())
     }
 
     /// Return this fixture's storage mode.

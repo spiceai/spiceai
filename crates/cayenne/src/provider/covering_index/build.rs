@@ -29,8 +29,22 @@ limitations under the License.
 //! positions. Incoming record-batch order is therefore never used as a source
 //! ordinal: batches are reassembled by the reported `(file, first_row_position)`
 //! and rejected when they leave a gap or overlap.
+//!
+//! # Covering-index ownership ledger
+//!
+//! | Allocation | Owner until release |
+//! | --- | --- |
+//! | Directories, key pages, and copied payload buffers | Their resident page/catalog lease, including every captured read view and output buffer sharing it |
+//! | Shared payload pages across definitions | The single buffer allocation owner; later definitions clone the page lease rather than its charge |
+//! | Capture batches, page-compaction copies, sorting inputs | Build reservations, dropped on refusal or transferred only after final page ownership exists |
+//! | Probe requests, correlation vectors, masks, and output pairs | The query operator's `DataFusion` reservation for the active bounded chunk |
+//! | Replaced catalog | Its existing `Arc` owners; registry replacement removes only the registry's ownership |
+//!
+//! Every stored Arrow buffer is copied into a dedicated allocation with one
+//! reservation owner. That avoids pointer-based alias guesses and keeps a page
+//! charge alive as long as a retained Arrow view can read the buffer.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1017,7 +1031,7 @@ fn reserve_token(
     Ok(AllocationOwner::new(reservation).token())
 }
 
-/// Allocation owner for one immutable Arrow buffer.
+/// Allocation owner for one independently copied immutable Arrow buffer.
 ///
 /// Field order releases the retained backing buffer before its reservation.
 /// It carries no page reference, so result arrays retaining this allocation
@@ -1034,11 +1048,10 @@ fn own_batch_buffers(
     batch: &RecordBatch,
     account: &Arc<CayenneMemoryAccount>,
 ) -> Result<RecordBatch> {
-    let mut allocations = HashMap::new();
     let columns = batch
         .columns()
         .iter()
-        .map(|array| own_array_buffers(array, account, &mut allocations))
+        .map(|array| own_array_buffers(array, account))
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new_with_options(
         batch.schema(),
@@ -1048,37 +1061,25 @@ fn own_batch_buffers(
     .map_err(|source| Error::Arrow { source })
 }
 
-fn own_array_buffers(
-    array: &ArrayRef,
-    account: &Arc<CayenneMemoryAccount>,
-    allocations: &mut HashMap<(usize, usize), Buffer>,
-) -> Result<ArrayRef> {
-    Ok(make_array(own_array_data(
-        &array.to_data(),
-        account,
-        allocations,
-    )?))
+fn own_array_buffers(array: &ArrayRef, account: &Arc<CayenneMemoryAccount>) -> Result<ArrayRef> {
+    Ok(make_array(own_array_data(&array.to_data(), account)?))
 }
 
-fn own_array_data(
-    data: &ArrayData,
-    account: &Arc<CayenneMemoryAccount>,
-    allocations: &mut HashMap<(usize, usize), Buffer>,
-) -> Result<ArrayData> {
+fn own_array_data(data: &ArrayData, account: &Arc<CayenneMemoryAccount>) -> Result<ArrayData> {
     let buffers = data
         .buffers()
         .iter()
-        .map(|buffer| own_buffer(buffer, account, allocations))
+        .map(|buffer| own_buffer(buffer, account))
         .collect::<Result<Vec<_>>>()?;
     let children = data
         .child_data()
         .iter()
-        .map(|child| own_array_data(child, account, allocations))
+        .map(|child| own_array_data(child, account))
         .collect::<Result<Vec<_>>>()?;
     let nulls = data
         .nulls()
         .map(|nulls| {
-            let buffer = own_buffer(nulls.buffer(), account, allocations)?;
+            let buffer = own_buffer(nulls.buffer(), account)?;
             Ok::<NullBuffer, Error>(NullBuffer::new(BooleanBuffer::new(
                 buffer,
                 nulls.inner().offset(),
@@ -1096,13 +1097,8 @@ fn own_array_data(
         .map_err(|source| Error::Arrow { source })
 }
 
-fn own_buffer(
-    buffer: &Buffer,
-    account: &Arc<CayenneMemoryAccount>,
-    allocations: &mut HashMap<(usize, usize), Buffer>,
-) -> Result<Buffer> {
-    let capacity = buffer.capacity();
-    if capacity == 0 {
+fn own_buffer(buffer: &Buffer, account: &Arc<CayenneMemoryAccount>) -> Result<Buffer> {
+    if buffer.capacity() == 0 {
         if buffer.is_empty() {
             return Ok(buffer.clone());
         }
@@ -1110,84 +1106,65 @@ fn own_buffer(
             operation: "Arrow buffer has no accountable owned capacity".to_string(),
         });
     }
-    let offset = buffer.ptr_offset();
-    let end = offset.checked_add(buffer.len()).ok_or(Error::Overflow {
-        operation: "Arrow buffer slice bounds",
-    })?;
-    if end > capacity {
-        return Err(Error::InvalidContract {
-            message: "Arrow buffer slice exceeds its backing allocation".to_string(),
-        });
-    }
-    let key = (buffer.data_ptr().as_ptr() as usize, capacity);
-    let root = if let Some(existing) = allocations.get(&key) {
-        existing.clone()
-    } else {
-        let reservation =
-            account
-                .try_reserve_lookup_index(capacity)
-                .ok_or_else(|| Error::Unavailable {
-                    operation: format!(
-                        "unable to admit {capacity} bytes for an owned Arrow payload buffer"
-                    ),
-                })?;
-        let allocation: Arc<dyn Allocation> = Arc::new(BufferAllocation {
-            _backing: buffer.clone(),
-            _reservation: reservation,
-        });
-        // SAFETY: `BufferAllocation` owns an immutable clone of the original
-        // backing allocation. `data_ptr` and `capacity` describe that exact
-        // allocation, and all returned slices stay within its checked bounds.
-        let wrapped =
-            unsafe { Buffer::from_custom_allocation(buffer.data_ptr(), capacity, allocation) };
-        allocations.insert(key, wrapped.clone());
-        wrapped
-    };
-    Ok(root.slice_with_length(offset, buffer.len()))
+    // Arrow does not expose an allocation identity for an arbitrary incoming
+    // buffer. Never guess one from a pointer/length pair: copy each logical
+    // buffer into an independent backing allocation, then bind that allocation
+    // to exactly one reservation owner. This is conservative for aliases in
+    // the input batch, but it makes the stored representation's ownership and
+    // accounting unambiguous through nested arrays, null maps, and slices.
+    let copied = Buffer::from_slice_ref(buffer.as_slice());
+    let capacity = copied.capacity();
+    let reservation =
+        account
+            .try_reserve_lookup_index(capacity)
+            .ok_or_else(|| Error::Unavailable {
+                operation: format!(
+                    "unable to admit {capacity} bytes for an owned Arrow payload buffer"
+                ),
+            })?;
+    let allocation: Arc<dyn Allocation> = Arc::new(BufferAllocation {
+        _backing: copied.clone(),
+        _reservation: reservation,
+    });
+    // SAFETY: `allocation` retains `copied`, which owns this exact memory for
+    // the full capacity used by the returned immutable buffer.
+    Ok(
+        unsafe { Buffer::from_custom_allocation(copied.data_ptr(), capacity, allocation) }
+            .slice_with_length(0, copied.len()),
+    )
 }
 
 fn retained_buffer_bytes(batch: &RecordBatch) -> Result<usize> {
-    let mut buffers = HashSet::new();
     let mut total = 0usize;
     for column in batch.columns() {
-        collect_buffer_bytes(&column.to_data(), &mut buffers, &mut total)?;
+        collect_buffer_bytes(&column.to_data(), &mut total)?;
     }
     Ok(total)
 }
 
-fn collect_buffer_bytes(
-    data: &ArrayData,
-    seen: &mut HashSet<(usize, usize)>,
-    total: &mut usize,
-) -> Result<()> {
+fn collect_buffer_bytes(data: &ArrayData, total: &mut usize) -> Result<()> {
     for buffer in data.buffers() {
-        account_buffer_bytes(buffer, seen, total)?;
+        account_buffer_bytes(buffer, total)?;
     }
     if let Some(nulls) = data.nulls() {
-        account_buffer_bytes(nulls.buffer(), seen, total)?;
+        account_buffer_bytes(nulls.buffer(), total)?;
     }
     for child in data.child_data() {
-        collect_buffer_bytes(child, seen, total)?;
+        collect_buffer_bytes(child, total)?;
     }
     Ok(())
 }
 
-fn account_buffer_bytes(
-    buffer: &Buffer,
-    seen: &mut HashSet<(usize, usize)>,
-    total: &mut usize,
-) -> Result<()> {
+fn account_buffer_bytes(buffer: &Buffer, total: &mut usize) -> Result<()> {
     let capacity = buffer.capacity();
     if capacity == 0 && !buffer.is_empty() {
         return Err(Error::Unavailable {
             operation: "Arrow buffer has no accountable owned capacity".to_string(),
         });
     }
-    if seen.insert((buffer.data_ptr().as_ptr() as usize, capacity)) {
-        *total = total.checked_add(capacity).ok_or(Error::Overflow {
-            operation: "retained Arrow buffer bytes",
-        })?;
-    }
+    *total = total.checked_add(capacity).ok_or(Error::Overflow {
+        operation: "retained Arrow buffer bytes",
+    })?;
     Ok(())
 }
 
