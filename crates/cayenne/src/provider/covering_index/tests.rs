@@ -23,15 +23,20 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion_common::DFSchema;
+use datafusion_expr::{col, lit};
+use datafusion_physical_plan::{ExecutionPlan, common::collect};
 
 use super::super::lookup_index::KeySpec;
 use super::super::memory_account::CayenneMemoryAccount;
 use super::{
-    AllocationOwner, CoveredRowRef, CoveringPageStore, CoveringReadView, EncodedKey, Error,
-    IndexCatalog, IndexDefinition, IndexRun, IndexedSource, KeyDirectory, KeyDirectoryEntry,
-    KeyPage, KeyPageId, KeyPageLease, PageLease, PayloadPage, PayloadPageId, PayloadPageLease,
-    PrimaryKeyLayout, ProbeRequest, ProbeStep, Result, RunId, SchemaIdentity, SourceId, SourceRole,
+    AllocationOwner, CayenneIndexScanExec, CoveredRowRef, CoveringIndexAccess,
+    CoveringIndexCapability, CoveringPageStore, CoveringReadView, EncodedKey, Error, IndexCatalog,
+    IndexDefinition, IndexRun, IndexedSource, KeyDirectory, KeyDirectoryEntry, KeyPage, KeyPageId,
+    KeyPageLease, PageLease, PayloadPage, PayloadPageId, PayloadPageLease, PrimaryKeyLayout,
+    ProbeRequest, ProbeStep, Result, RunId, SchemaIdentity, SourceId, SourceRole,
     VisibilityAdapter, build_source, build_sources, gather, prepare_literal_seek, probe_many,
     try_cover,
 };
@@ -489,6 +494,139 @@ async fn page_store_preserves_repeated_ids_and_prepared_seek_is_compact() {
         try_cover(Arc::new(view), &definition, &[0]).expect("coverage decision"),
         super::CoverageDecision::Complete(_)
     ));
+}
+
+#[tokio::test]
+async fn index_scan_filters_before_limit_projects_and_resets() {
+    let schema = schema(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]);
+    let definition = definition(Arc::clone(&schema), &["key"]);
+    let source = SourceId::new("point-scan", 1);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["first", "second", "other"])) as ArrayRef,
+        ],
+    )
+    .expect("point-scan source batch");
+    let built = build_source(
+        source.clone(),
+        definition.clone(),
+        vec![batch],
+        build_account(8 * 1024 * 1024),
+    )
+    .await
+    .expect("point-scan source builds");
+    let view = into_view(definition.clone(), source, built);
+    let probe_array = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
+    let key = definition
+        .encode_probe_row(&[probe_array], 0)
+        .expect("point-scan key encodes")
+        .expect("non-NULL point-scan key");
+    let prepared = prepare_literal_seek(&view, &key)
+        .await
+        .expect("point-scan seek prepares");
+    assert_eq!(prepared.raw_entry_count(), 2);
+
+    let access = CoveringIndexAccess::new(Arc::clone(&view), definition);
+    let capability = CoveringIndexCapability::new(
+        vec![access.clone()],
+        vec![1],
+        Vec::new(),
+        Some(prepared.raw_entry_count()),
+    );
+    let filter_schema = DFSchema::try_from(schema.as_ref().clone()).expect("filter schema");
+    let filter = datafusion_physical_expr::create_physical_expr(
+        &col("value").eq(lit("second")),
+        &filter_schema,
+        &datafusion_physical_expr::execution_props::ExecutionProps::new(),
+    )
+    .expect("residual filter plans");
+    let exec = Arc::new(
+        CayenneIndexScanExec::try_new(capability, access, prepared, vec![filter], vec![1], Some(1))
+            .expect("point-scan exec builds"),
+    );
+    let context = SessionContext::new();
+    let batches = collect(
+        exec.execute(0, context.task_ctx())
+            .expect("point-scan stream starts"),
+    )
+    .await
+    .expect("point-scan stream succeeds");
+    assert_eq!(batches.len(), 1);
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("projected value is Utf8");
+    assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some("second")]);
+
+    let reset = Arc::clone(&exec)
+        .reset_state()
+        .expect("point-scan reset succeeds");
+    let reset_batches = collect(
+        reset
+            .execute(0, context.task_ctx())
+            .expect("reset point-scan stream starts"),
+    )
+    .await
+    .expect("reset point-scan stream succeeds");
+    assert_eq!(
+        reset_batches, batches,
+        "reset must use a fresh probe cursor"
+    );
+}
+
+#[tokio::test]
+async fn index_scan_zero_column_projection_preserves_row_count() {
+    let schema = schema(vec![Field::new("key", DataType::Int64, false)]);
+    let definition = definition(Arc::clone(&schema), &["key"]);
+    let source = SourceId::new("zero-column-point-scan", 1);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![7, 7])) as ArrayRef],
+    )
+    .expect("zero-column point-scan source batch");
+    let built = build_source(
+        source.clone(),
+        definition.clone(),
+        vec![batch],
+        build_account(8 * 1024 * 1024),
+    )
+    .await
+    .expect("zero-column point-scan source builds");
+    let view = into_view(definition.clone(), source, built);
+    let probe_array = Arc::new(Int64Array::from(vec![7])) as ArrayRef;
+    let key = definition
+        .encode_probe_row(&[probe_array], 0)
+        .expect("zero-column point-scan key encodes")
+        .expect("non-NULL zero-column point-scan key");
+    let prepared = prepare_literal_seek(&view, &key)
+        .await
+        .expect("zero-column point-scan seek prepares");
+    let access = CoveringIndexAccess::new(Arc::clone(&view), definition);
+    let capability = CoveringIndexCapability::new(
+        vec![access.clone()],
+        Vec::new(),
+        Vec::new(),
+        Some(prepared.raw_entry_count()),
+    );
+    let exec =
+        CayenneIndexScanExec::try_new(capability, access, prepared, Vec::new(), Vec::new(), None)
+            .expect("zero-column point-scan exec builds");
+    let context = SessionContext::new();
+    let batches = collect(
+        exec.execute(0, context.task_ctx())
+            .expect("zero-column point-scan stream starts"),
+    )
+    .await
+    .expect("zero-column point-scan stream succeeds");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 0);
+    assert_eq!(batches[0].num_rows(), 2, "COUNT callers retain both rows");
 }
 
 #[test]

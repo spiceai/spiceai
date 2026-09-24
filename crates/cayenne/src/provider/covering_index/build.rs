@@ -152,7 +152,7 @@ impl CoveringIndexState {
     /// An optional-resolution failure does not alter the smaller address index.
     pub(crate) fn new(
         table_id: impl Into<Arc<str>>,
-        schema: arrow_schema::SchemaRef,
+        schema: &arrow_schema::SchemaRef,
         specs: &[KeySpec],
         account: Arc<CayenneMemoryAccount>,
         scan_input_version: Arc<AtomicU64>,
@@ -162,7 +162,7 @@ impl CoveringIndexState {
         }
         let definitions = specs
             .iter()
-            .map(|spec| IndexDefinition::resolve(Arc::clone(&schema), spec))
+            .map(|spec| IndexDefinition::resolve(Arc::clone(schema), spec))
             .collect::<Result<Vec<_>>>()
             .ok()?;
         Some(Arc::new(Self {
@@ -1226,7 +1226,7 @@ mod publication_tests {
         let specs = vec![KeySpec::new(vec!["key".to_string()]).expect("nonempty key")];
         CoveringIndexState::new(
             "table",
-            schema(),
+            &schema(),
             &specs,
             account,
             Arc::new(AtomicU64::new(0)),

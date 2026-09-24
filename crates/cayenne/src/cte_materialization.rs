@@ -2000,10 +2000,6 @@ mod tests {
         rules
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "TPC-DS Q64 table schemas are a catalog, not control flow"
-    )]
     fn register_q64_tpcds_tables(ctx: &SessionContext) -> Result<()> {
         use async_trait::async_trait;
         use datafusion::catalog::{Session, TableProvider};

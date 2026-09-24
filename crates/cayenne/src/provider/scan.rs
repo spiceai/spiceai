@@ -21,6 +21,7 @@ use std::{
 };
 
 use crate::maintained_aggregate::MaintainedAggregateRegistry;
+use crate::provider::covering_index::CoveringIndexCapability;
 use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
@@ -140,6 +141,11 @@ pub struct CayenneAccelerationExec {
     /// The point-lookup index decision made while planning this scan. This is
     /// stable plan metadata for `EXPLAIN`; execution does not consult it.
     lookup_index: Option<LookupIndexExplain>,
+    /// Pinned complete covering-index access available to a future inner lookup
+    /// rewrite. This is carried at the Cayenne scan boundary, not rediscovered
+    /// from a mutable table registry, so optimizer rewrites retain the exact
+    /// captured source and visibility view.
+    covering_index: Option<CoveringIndexCapability>,
 }
 
 impl CayenneAccelerationExec {
@@ -156,6 +162,7 @@ impl CayenneAccelerationExec {
             optimizer_column_overlay: None,
             table_name: None,
             lookup_index: None,
+            covering_index: None,
         }
     }
 
@@ -173,6 +180,7 @@ impl CayenneAccelerationExec {
             optimizer_column_overlay: None,
             table_name: None,
             lookup_index: None,
+            covering_index: None,
         }
     }
 
@@ -194,6 +202,7 @@ impl CayenneAccelerationExec {
             optimizer_column_overlay: None,
             table_name: None,
             lookup_index: None,
+            covering_index: None,
         }
     }
 
@@ -218,6 +227,7 @@ impl CayenneAccelerationExec {
             optimizer_column_overlay: None,
             table_name: None,
             lookup_index: None,
+            covering_index: None,
         }
     }
 
@@ -252,6 +262,29 @@ impl CayenneAccelerationExec {
         self
     }
 
+    /// Attach the immutable complete covering-index capability captured while
+    /// planning this scan. It has no execution effect until a later physical
+    /// rule selects a supported operator.
+    #[must_use]
+    pub(crate) fn with_covering_index(
+        mut self,
+        covering_index: Option<CoveringIndexCapability>,
+    ) -> Self {
+        self.covering_index = covering_index;
+        self
+    }
+
+    /// Return the immutable covering-index capability retained by this exact
+    /// Cayenne scan, if its complete-view proof succeeded at planning time.
+    #[must_use]
+    #[expect(
+        dead_code,
+        reason = "the following optimizer-integration step consumes this scan-bound capability"
+    )]
+    pub(crate) fn covering_index(&self) -> Option<&CoveringIndexCapability> {
+        self.covering_index.as_ref()
+    }
+
     /// Returns the maintained aggregate registry and scan epoch captured for
     /// this table scan, if aggregate maintenance is enabled for the table.
     #[must_use]
@@ -278,6 +311,7 @@ impl CayenneAccelerationExec {
             optimizer_column_overlay: self.optimizer_column_overlay.clone(),
             table_name: self.table_name.clone(),
             lookup_index: self.lookup_index.clone(),
+            covering_index: self.covering_index.clone(),
         }
     }
 
@@ -1145,7 +1179,19 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner
             .try_swapping_with_projection(projection)
             .map(|plan| {
-                plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
+                plan.map(|plan| {
+                    let mut rewritten = self.wrap_rewritten_child(plan);
+                    // Ordinal composition is valid only for a bare column
+                    // projection. Any other projection changes values or the
+                    // Arrow field contract, so it clears optional eligibility
+                    // rather than making an invented mapping visible to a
+                    // later covering join rewrite.
+                    rewritten.covering_index = self
+                        .covering_index
+                        .as_ref()
+                        .and_then(|capability| capability.project_through(projection));
+                    Arc::new(rewritten) as Arc<dyn ExecutionPlan>
+                })
             })
     }
 

@@ -119,7 +119,7 @@ use datafusion_execution::cache::cache_manager::{
 use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::utils::conjunction;
+use datafusion_expr::utils::{conjunction, expr_to_columns};
 use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
@@ -8625,7 +8625,7 @@ impl CayenneTableProvider {
             .then(|| {
                 super::covering_index::CoveringIndexState::new(
                     table_metadata.table_id.clone(),
-                    Arc::clone(&table_metadata.schema),
+                    &table_metadata.schema,
                     &index_keys,
                     Arc::clone(&table_memory),
                     Arc::clone(&scan_input_version),
@@ -25107,6 +25107,7 @@ impl CayenneTableProvider {
         scan_guard: Arc<SnapshotScanRef>,
         maintained_aggregate_epoch: Option<u64>,
         lookup_index: Option<super::lookup_index::LookupIndexExplain>,
+        covering_index: Option<super::covering_index::CoveringIndexCapability>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
         let table_name = self.table_metadata.table_name.as_str();
@@ -25120,14 +25121,16 @@ impl CayenneTableProvider {
                 )
                 .with_optimizer_column_overlay(overlay)
                 .with_table_name(table_name)
-                .with_lookup_index(lookup_index),
+                .with_lookup_index(lookup_index)
+                .with_covering_index(covering_index),
             )
         } else {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
                     .with_optimizer_column_overlay(overlay)
                     .with_table_name(table_name)
-                    .with_lookup_index(lookup_index),
+                    .with_lookup_index(lookup_index)
+                    .with_covering_index(covering_index),
             )
         }
     }
@@ -28637,10 +28640,6 @@ impl CayenneTableProvider {
     /// view. The method is intentionally separate from ordinary scan planning:
     /// later operators call it before selecting the optional path, while all
     /// incomplete producer states continue to return the normal scan.
-    #[expect(
-        dead_code,
-        reason = "the covering scan and join operators consume this proof in the following implementation steps"
-    )]
     fn try_cover_scan_view(
         &self,
         state: &dyn Session,
@@ -28682,6 +28681,94 @@ impl CayenneTableProvider {
             self.time_retention_filter_builder.clone(),
         )?;
         super::covering_index::try_cover(Arc::new(view), definition, required_columns)
+    }
+
+    /// Capture every complete declared covering index at this scan boundary.
+    ///
+    /// This runs only after object-store setup, transaction read tracking,
+    /// integrity preflight, the captured scan view, and retention/filter
+    /// rewriting have all been resolved. It does not select the inactive
+    /// covering scan operator: a future physical rule receives only this pinned
+    /// capability and must still prove its own supported rewrite.
+    fn covering_index_capability(
+        &self,
+        state: &dyn Session,
+        scan_view: &Arc<ScanView>,
+        projection: Option<&Vec<usize>>,
+        static_filters: &[Expr],
+    ) -> Option<super::covering_index::CoveringIndexCapability> {
+        let catalogs = scan_view.raw.covering_catalog.as_ref()?;
+        let output_columns = projection
+            .cloned()
+            .unwrap_or_else(|| (0..scan_view.raw.read_schema.fields().len()).collect());
+        let mut accesses = Vec::new();
+
+        for catalog in catalogs.catalogs() {
+            let definition = catalog.definition().clone();
+            let required_columns = self.covering_required_columns(
+                &scan_view.raw.read_schema,
+                &output_columns,
+                static_filters,
+                &definition,
+            )?;
+            match self.try_cover_scan_view(state, scan_view, &definition, &required_columns) {
+                Ok(super::covering_index::CoverageDecision::Complete(view)) => accesses.push(
+                    super::covering_index::CoveringIndexAccess::new(view, definition),
+                ),
+                Ok(super::covering_index::CoverageDecision::Unavailable(_)) | Err(_) => {}
+            }
+        }
+
+        (!accesses.is_empty()).then(|| {
+            super::covering_index::CoveringIndexCapability::new(
+                accesses,
+                output_columns,
+                static_filters.to_vec(),
+                None,
+            )
+        })
+    }
+
+    /// All captured query-schema fields a covered scan would need before it can
+    /// return one output row. The set includes output, every static filter,
+    /// indexed key, and PK visibility fields. Retention is already represented
+    /// in `static_filters` by the time this is called.
+    fn covering_required_columns(
+        &self,
+        schema: &SchemaRef,
+        output_columns: &[usize],
+        static_filters: &[Expr],
+        definition: &super::covering_index::IndexDefinition,
+    ) -> Option<Vec<usize>> {
+        let mut required = HashSet::new();
+        required.extend(output_columns.iter().copied());
+        required.extend(self.pk_column_indices.iter().copied());
+        required.extend(
+            definition
+                .columns()
+                .iter()
+                .map(super::covering_index::IndexColumn::schema_index),
+        );
+        for filter in static_filters {
+            let mut columns = HashSet::new();
+            expr_to_columns(filter, &mut columns).ok()?;
+            for column in columns {
+                let index = schema
+                    .fields()
+                    .iter()
+                    .position(|field| field.name() == &column.name)?;
+                required.insert(index);
+            }
+        }
+        if required
+            .iter()
+            .any(|column| *column >= schema.fields().len())
+        {
+            return None;
+        }
+        let mut required = required.into_iter().collect::<Vec<_>>();
+        required.sort_unstable();
+        Some(required)
     }
 
     /// Cap on concurrent in-flight builds cached for dedup. Read-your-writes scans key
@@ -34945,27 +35032,24 @@ impl CayenneTableProvider {
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
-        match self
+        if let Some((_store, files)) = self
             .lookup_index_snapshot_files(&session, snapshot_id, &read_schema)
             .await
         {
-            Some((_store, files)) => {
-                if let Some(state) = &self.lookup_index {
-                    state
-                        .stage_pending(snapshot_id, files.clone(), file_set)
-                        .await;
-                }
-                if let Some(state) = &self.covering_index {
-                    state.stage_pending(snapshot_id, &files).await;
-                }
+            if let Some(state) = &self.lookup_index {
+                state
+                    .stage_pending(snapshot_id, files.clone(), file_set)
+                    .await;
             }
-            None => {
-                if let Some(state) = &self.lookup_index {
-                    state.discard_pending();
-                }
-                if let Some(state) = &self.covering_index {
-                    state.stage_uncovered(snapshot_id);
-                }
+            if let Some(state) = &self.covering_index {
+                state.stage_pending(snapshot_id, &files).await;
+            }
+        } else {
+            if let Some(state) = &self.lookup_index {
+                state.discard_pending();
+            }
+            if let Some(state) = &self.covering_index {
+                state.stage_uncovered(snapshot_id);
             }
         }
     }
@@ -35695,7 +35779,6 @@ impl TableProvider for CayenneTableProvider {
         // below builds from it (not a live re-read) so they stay mutually consistent
         // across a concurrent schema-evolution.
         let read_schema = Arc::clone(&scan_view.raw.read_schema);
-        drop(scan_view);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // The whole-tier tombstone union hides the global inline corpus (a delete of
@@ -35802,6 +35885,13 @@ impl TableProvider for CayenneTableProvider {
                 "Injected time_retention keep-filter into scan filters"
             );
         }
+
+        // Retain the immutable complete-index proof at the outer Cayenne scan
+        // boundary. The product Enhancement is not signed off, so this records
+        // an inactive capability only; ordinary Vortex/memory scan assembly
+        // below remains the sole live execution path.
+        let covering_index =
+            self.covering_index_capability(state, &scan_view, projection, scan_filters);
 
         let mem_tier_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
             // Live (possibly widened) schema, NOT the construction-time
@@ -36142,6 +36232,7 @@ impl TableProvider for CayenneTableProvider {
                 scan_guard,
                 maintained_aggregate_epoch,
                 lookup_index_explain,
+                covering_index,
             ));
         }
 
@@ -36150,6 +36241,7 @@ impl TableProvider for CayenneTableProvider {
             scan_guard,
             maintained_aggregate_epoch,
             lookup_index_explain,
+            covering_index,
         ))
     }
 

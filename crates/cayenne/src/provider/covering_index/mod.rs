@@ -64,6 +64,7 @@ limitations under the License.
 
 mod build;
 mod directory;
+mod exec;
 mod executor;
 mod key;
 mod page_store;
@@ -80,6 +81,7 @@ pub(crate) use build::{
 pub(crate) use directory::{
     IndexRun, KeyDirectory, KeyDirectoryEntry, LiteralSeekSpan, PreparedLiteralSeek, RunId,
 };
+pub(crate) use exec::{CayenneIndexScanExec, CoveringIndexAccess, CoveringIndexCapability};
 pub(crate) use executor::CayenneIndexExecutor;
 pub(crate) use key::{
     CoveredRowRef, EncodedKey, IndexColumn, IndexDefinition, KEY_CODEC_VERSION, KeyPageId,
@@ -92,7 +94,8 @@ pub(crate) use page_store::{
 pub(crate) use view::{
     CapturedSource, CoverageDecision, CoverageUnavailableReason, CoveringIndexCatalog,
     CoveringReadView, GatherBatch, IndexCatalog, IndexedSource, ProbeCursor, ProbeMatch,
-    ProbeRequest, ProbeStep, SourceRows, gather, prepare_literal_seek, probe_many, try_cover,
+    ProbeRequest, ProbeStep, SourceRows, gather, gather_stored, prepare_literal_seek, probe_many,
+    probe_prepared_literal, try_cover,
 };
 pub(crate) use visibility::{PrimaryKeyLayout, SourceRole, VisibilityAdapter};
 
