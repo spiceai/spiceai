@@ -771,9 +771,9 @@ impl Runtime {
 
         // Use tokio::select! so that backoff sleeps inside `retry` are immediately
         // interrupted when the runtime begins shutting down (e.g. on ctrl-c), or
-        // when a Spicepod change supersedes this load. `superseded` resolves only
-        // while no attempt is running, so dropping the load there cannot abandon
-        // a registration part-way through.
+        // when a Spicepod change supersedes this load. Dropping `retry_fut` there
+        // drops any attempt in progress, which releases the attempt lock that
+        // `DatasetLoads::supersede` waits for before the change applies.
         tokio::select! {
             _ = retry_fut => {},
             () = shutdown_token.cancelled() => {},
