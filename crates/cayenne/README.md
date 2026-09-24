@@ -903,7 +903,9 @@ The `cayenne_unsupported_type_action` parameter controls handling:
 
 #### Indexes
 
-Secondary indexes are not supported. Primary keys drive efficient upserts and deletions.
+Cayenne honors dataset `indexes` as in-memory point-lookup accelerators in both file and memory modes. A planned lookup uses an index when equality predicates on bare columns pin every column in one index entry. File mode can also batch-probe a published index from a completed collect-left hash join's exact scalar or correlated composite key set. Partitioned or oversized runtime key sets scan normally. Every predicate and join still runs on the candidate rows. `unique` builds the same lookup index and emits a warning because it does not constrain writes—use `primary_key` plus `on_conflict` for write-time uniqueness.
+
+Floating-point columns (`Float16`, `Float32`, and `Float64`) are rejected as index columns because equal values such as signed zero do not have a unique byte representation. `EXPLAIN` surfaces planning-time shape, outcome, and candidate counts on `CayenneAccelerationExec`; unsupported predicate shapes and runtime-only lookups report `lookup_index_outcome=not_applicable`. Actual runtime index probes are reported by the lookup-index probe metrics. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
 
 #### Concurrency / MVCC
 

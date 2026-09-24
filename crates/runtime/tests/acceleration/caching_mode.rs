@@ -2438,10 +2438,7 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
 /// 4xx responses (like 404 "Not Found") can be valid business responses (e.g., "user not found",
 /// "resource doesn't exist") and are then returned to the user and cached.
 ///
-/// That is an opt-in: `on_error_response` defaults to `error`, because a refresh that
-/// records an error body replaces the previous contents with it (#13515). This dataset
-/// sets `store` to say it means the 404, which is what the behaviour below is asserted
-/// under: it is unchanged for a dataset that asks for it.
+/// That is an opt-in — `on_error_response` defaults to `error` (#13515).
 ///
 /// This test:
 /// 1. Queries an invalid path that returns 404

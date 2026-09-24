@@ -973,25 +973,25 @@ mod tests {
         }
     }
 
-    /// Build a no-arg scalar-function expression with the given name so we can
-    /// probe a `FunctionSupport` by name regardless of the real UDF impl.
-    fn make_named_expr(name: &str) -> Expr {
+    /// Build a scalar-function expression with the given name and arguments so
+    /// we can probe a `FunctionSupport` by name regardless of the real UDF impl.
+    ///
+    /// A name whose backend answers per-call as well as per-name — a
+    /// `FunctionSupport` carrying a
+    /// [`ScalarCallSupport`](datafusion_table_providers::util::supported_functions::ScalarCallSupport)
+    /// asks its dialect to render the call — needs a call shape the dialect can
+    /// render: the no-arg probe is a call the planner cannot build and the
+    /// dialect refuses on arity alone, so it says nothing about the name.
+    fn make_named_call(name: &str, args: Vec<Expr>) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(stub_scalar_udf(name)),
-            vec![],
+            args,
         ))
     }
 
-    /// The same probe with one argument, for a name whose backend answers
-    /// per-call as well as per-name: a `FunctionSupport` carrying a
-    /// [`ScalarCallSupport`](datafusion_table_providers::util::supported_functions::ScalarCallSupport)
-    /// asks its dialect to render the call, and the no-arg probe is a call the
-    /// planner cannot build and the dialect refuses on arity alone.
-    fn make_named_expr_of_one_arg(name: &str) -> Expr {
-        Expr::ScalarFunction(ScalarFunction::new_udf(
-            Arc::new(stub_scalar_udf(name)),
-            vec![lit("  padded  ")],
-        ))
+    /// The no-arg probe, for a name answered by name alone.
+    fn make_named_expr(name: &str) -> Expr {
+        make_named_call(name, vec![])
     }
 
     #[test]
@@ -1131,7 +1131,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                support.supports(&make_named_expr_of_one_arg("btrim"), None),
+                support.supports(&make_named_call("btrim", vec![lit("  padded  ")]), None),
                 !denied,
                 "btrim pushdown for {backend} is wrong: expected denied={denied}"
             );
@@ -1223,19 +1223,19 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_denies_three_regexp_builtins_and_federates_the_other_two() {
-        // Three of the five DataFusion regexp built-ins have no value-preserving
+    fn duckdb_denies_two_regexp_builtins_and_federates_the_other_three() {
+        // Two of the five DataFusion regexp built-ins have no value-preserving
         // DuckDB rendering: `regexp_extract` returns the whole match rather than
         // the capture groups and the empty string rather than NULL for a
-        // non-match (#13809); DuckDB has no `regexp_instr` at all; and
-        // `len(regexp_extract_all(NULL, p))` is NULL where `regexp_count`
-        // answers 0 (#13870). All three must stay local, while the two DuckDB
-        // does answer identically keep federating.
+        // non-match (#13809), and DuckDB has no `regexp_instr` at all. Both must
+        // stay local, while the three the dialect renders faithfully keep
+        // federating — `regexp_count` among them, whose rendering coalesces the
+        // NULL `len(regexp_extract_all(NULL, p))` to the kernel's 0 (#13870).
         for support in [
             deny_spice_functions_for_duckdb(),
             Arc::new(deny_spice_functions_for_duckdb_table_providers()),
         ] {
-            for name in ["regexp_match", "regexp_instr", "regexp_count"] {
+            for name in ["regexp_match", "regexp_instr"] {
                 assert!(
                     !support.supports(&make_named_expr(name), None),
                     "{name} has no value-preserving DuckDB rendering and must not be pushed down"
@@ -1247,6 +1247,13 @@ mod tests {
                     "{name} is rendered natively by the DuckDB dialect and must be pushed down"
                 );
             }
+            assert!(
+                support.supports(
+                    &make_named_call("regexp_count", vec![lit("ab"), lit("a")]),
+                    None
+                ),
+                "regexp_count with a literal pattern is rendered by the DuckDB dialect and must be pushed down"
+            );
         }
     }
 
