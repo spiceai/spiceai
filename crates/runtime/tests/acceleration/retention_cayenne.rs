@@ -48,6 +48,9 @@ const TABLE: &str = "cayenne_retention_sql_it";
 /// The `mode: memory` twin of [`TABLE`]. Distinct so the two tests never share an
 /// acceleration or a metastore slice.
 const MEM_TABLE: &str = "cayenne_retention_sql_memory_it";
+/// A second `mode: memory` table, over a fixture whose `score` has NULLs. Its own
+/// acceleration so it never shares a tier with [`MEM_TABLE`].
+const MEM_NULL_TABLE: &str = "cayenne_retention_sql_memory_null_it";
 
 /// Rows scoring below this are deleted by the retention predicate.
 const SCORE_FLOOR: i64 = 90;
@@ -224,27 +227,24 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
         .await
 }
 
-/// `retention_sql` does NOT reach a `mode: memory` acceleration's rows.
+/// `retention_sql` removes rows from a `mode: memory` acceleration (regression test
+/// for #14045).
 ///
-/// This test asserts the CURRENT behavior, which is a known gap rather than the
-/// intended one: the accelerator warns at registration that `retention_sql` "is not
-/// applied to a `mode: memory` acceleration, so rows matching that predicate stay
-/// queryable", and this is what that warning is describing.
+/// `apply_retention_filters` is the only `build_deletion_vector_sink` caller that
+/// used to pass the table `write_lock` INTO the sink instead of holding it, and the
+/// mem-tier arm both deletion sinks reach requires the caller to hold that
+/// non-reentrant lock — so retention reached the durable tiers and nothing else.
+/// Under `mode: memory` those tiers are empty and the RAM tier is the whole table,
+/// so a matching row survived for the life of the process while a client `DELETE`
+/// over the same predicate removed it.
 ///
-/// The cause is one line of sink composition. `apply_retention_filters` is the only
-/// `build_deletion_vector_sink` caller that passes the table `write_lock` INTO the
-/// sink instead of holding it, and the wrapper that carries the mem-tier arm
-/// (`InlineAwareDeletionSink`) takes that same non-reentrant lock itself — so
-/// retention cannot compose it. Every other caller passes `None`, wraps, and
-/// therefore reaches the tier. A client `DELETE` on the same table DOES remove
-/// these rows (see `crates/runtime/tests/acceleration/cayenne_memory.rs`), which is
-/// what makes this an asymmetry rather than a property of memory mode.
-///
-/// When retention is routed through that wrapper, this test inverts and the
-/// registration warning must be retired in the same change.
+/// The survivors are asserted BY VALUE, not only by count: a repair that deletes
+/// the wrong rows, or too many, has to fail this as loudly as one that deletes none.
+/// Its file-mode twin above is the control — it must keep passing unchanged, which
+/// is what says the shared durable path was not disturbed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(not(target_os = "windows"))]
-async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow::Error> {
+async fn cayenne_memory_mode_applies_retention_sql() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -268,29 +268,26 @@ async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow
             }
             runtime_ready_check(&rt).await;
 
-            // Give retention a real chance to run before concluding it does not.
             // Cayenne arms retention from its own post-write maintenance, which is
-            // debounced and asynchronous, so checking straight after load would pass
-            // whether the rows are immune or merely not yet visited — and would keep
-            // passing after #14045 is fixed, which is the opposite of what a pin is
-            // for. Refreshing arms that maintenance again, then this waits for the
-            // rows to disappear and asserts they never do.
+            // debounced and asynchronous, so the initial load alone does not say when
+            // it has run. Refreshing arms that maintenance again, and the poll below
+            // is what waits for it rather than a fixed sleep.
             trigger_refresh(&rt, MEM_TABLE).await?;
 
-            let survivors = i64::try_from(
-                INITIAL_ROWS
-                    .iter()
-                    .filter(|(_, score)| *score >= SCORE_FLOOR)
-                    .count(),
-            )?;
-            let matching = INITIAL_ROWS.len() - usize::try_from(survivors)?;
+            let expected: Vec<(i64, i64)> = INITIAL_ROWS
+                .iter()
+                .copied()
+                .filter(|(_, score)| *score >= SCORE_FLOOR)
+                .collect();
+            let survivors = i64::try_from(expected.len())?;
+            let matching = INITIAL_ROWS.len() - expected.len();
             assert!(
                 matching > 0,
                 "the fixture must contain rows the retention predicate matches, or this \
                  test asserts nothing"
             );
 
-            let retention_applied = wait_until_true(std::time::Duration::from_secs(15), || {
+            let retention_applied = wait_until_true(std::time::Duration::from_secs(60), || {
                 let rt = Arc::clone(&rt);
                 async move {
                     row_count(&rt, MEM_TABLE)
@@ -311,25 +308,148 @@ async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow
             )
             .await?;
             eprintln!(
-                "[mode: memory] retention_sql `score < {SCORE_FLOOR}` after a refresh and a 15s \
-                 window; rows still served:\n{}\nof which below the floor:\n{}",
+                "[mode: memory] retention_sql `score < {SCORE_FLOOR}` after a refresh; rows \
+                 served:\n{}\nof which below the floor:\n{}",
                 arrow::util::pretty::pretty_format_batches(&rows)?,
                 arrow::util::pretty::pretty_format_batches(&below_floor)?
             );
 
             assert!(
-                !retention_applied,
-                "retention_sql now removes rows from a `mode: memory` acceleration — \
-                 #14045 appears fixed, so this test has served its purpose and should be \
-                 inverted to assert the {matching} matching rows are gone"
+                retention_applied,
+                "retention_sql must remove the {matching} matching row(s) from a \
+                 `mode: memory` acceleration (#14045); the table still holds {} row(s)",
+                row_count(&rt, MEM_TABLE).await?
             );
 
-            let all_rows = i64::try_from(INITIAL_ROWS.len())?;
-            assert_eq!(
-                row_count(&rt, MEM_TABLE).await?,
-                all_rows,
-                "current behavior: retention_sql does not remove rows from a mode: memory \
-                 acceleration, so all {all_rows} source rows are still served"
+            // By value, not only by count: this is what fails a repair that deletes the
+            // wrong rows as loudly as one that deletes none.
+            let mut lines = vec![
+                "+----+-------+".to_string(),
+                "| id | score |".to_string(),
+                "+----+-------+".to_string(),
+            ];
+            for (id, score) in &expected {
+                lines.push(format!("| {id: <2} | {score: <5} |"));
+            }
+            lines.push("+----+-------+".to_string());
+            let expected_table: Vec<&str> = lines.iter().map(String::as_str).collect();
+            assert_batches_eq!(&expected_table, &rows);
+
+            Ok(())
+        })
+        .await
+}
+
+/// The NULL-bearing fixture as `(id, Option<score>)`. Two rows match the predicate, two
+/// survive it on value, and two cannot be evaluated against it at all.
+const NULL_ROWS: [(i64, Option<i64>); 6] = [
+    (1, Some(85)),
+    (2, Some(92)),
+    (3, None),
+    (4, Some(76)),
+    (5, None),
+    (6, Some(95)),
+];
+
+/// Write `rows` to `path` as CSV, an absent `score` written as an empty field.
+fn write_nullable_source(
+    path: &std::path::Path,
+    rows: &[(i64, Option<i64>)],
+) -> Result<(), anyhow::Error> {
+    use std::fmt::Write as _;
+
+    let mut csv = String::from("id,score\n");
+    for (id, score) in rows {
+        match score {
+            Some(score) => writeln!(csv, "{id},{score}")?,
+            None => writeln!(csv, "{id},")?,
+        }
+    }
+    std::fs::write(path, csv)?;
+    Ok(())
+}
+
+/// A row the predicate cannot evaluate is KEPT, and a row it evaluates FALSE is kept too.
+///
+/// `SQL` deletes only where the predicate is TRUE, so `score < 90` must leave a NULL
+/// `score` alone — `NULL < 90` is NULL, not TRUE. This is the direction the ten-row
+/// fixture above cannot test, because every one of its rows answers the predicate
+/// definitively; it is also the direction that fails silently, since a retention pass
+/// that deleted the NULLs would still leave a table with no row below the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(not(target_os = "windows"))]
+async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_evaluate()
+-> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            crate::configure_test_datafusion();
+
+            let temp_dir = tempfile::tempdir()?;
+            let source = temp_dir.path().join("nullable_scores.csv");
+            write_nullable_source(&source, NULL_ROWS.as_ref())?;
+
+            let app = AppBuilder::new("test_cayenne_retention_sql_memory_null")
+                .with_dataset(make_memory_dataset(&source, MEM_NULL_TABLE))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            trigger_refresh(&rt, MEM_NULL_TABLE).await?;
+
+            let survivors = i64::try_from(
+                NULL_ROWS
+                    .iter()
+                    .filter(|(_, score)| score.is_none_or(|score| score >= SCORE_FLOOR))
+                    .count(),
+            )?;
+            let settled = wait_until_true(std::time::Duration::from_secs(60), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    row_count(&rt, MEM_NULL_TABLE)
+                        .await
+                        .is_ok_and(|n| n == survivors)
+                }
+            })
+            .await;
+
+            let rows = run_query(
+                &rt,
+                &format!("SELECT id, score FROM {MEM_NULL_TABLE} ORDER BY id"),
+            )
+            .await?;
+            eprintln!(
+                "[mode: memory, nullable] retention_sql `score < {SCORE_FLOOR}`; rows served:\n{}",
+                arrow::util::pretty::pretty_format_batches(&rows)?
+            );
+            assert!(
+                settled,
+                "retention must leave the {survivors} row(s) the predicate does not answer \
+                 TRUE for; the table holds {}",
+                row_count(&rt, MEM_NULL_TABLE).await?
+            );
+
+            // The NULLs are named individually rather than counted: a pass that deleted
+            // them and spared two others would satisfy the count above.
+            assert_batches_eq!(
+                &[
+                    "+----+-------+",
+                    "| id | score |",
+                    "+----+-------+",
+                    "| 2  | 92    |",
+                    "| 3  |       |",
+                    "| 5  |       |",
+                    "| 6  | 95    |",
+                    "+----+-------+",
+                ],
+                &rows
             );
 
             Ok(())

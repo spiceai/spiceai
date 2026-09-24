@@ -57,7 +57,7 @@ use super::on_conflict::{
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
-    pk_deletion_snapshot_for_strategy,
+    apply_mem_tier_delete, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -19511,9 +19511,13 @@ impl CayenneTableProvider {
                 Ok(RetentionPass::Deleted(deleted)) => {
                     retention_deleted = deleted;
                     if deleted > 0 {
+                        // The dataset goes in the message text, not only the field: this
+                        // is the one positive signal that `retention_sql` ran, and a
+                        // reader grepping for it needs to know which dataset it ran for.
                         tracing::info!(
                             table = self.table_metadata.table_name.as_str(),
-                            "Background retention deleted {deleted} row(s)"
+                            "Retention deleted {deleted} row(s) matching `retention_sql` from accelerated dataset '{}'",
+                            self.table_metadata.table_name
                         );
                     }
                 }
@@ -25174,11 +25178,10 @@ impl CayenneTableProvider {
     ///
     /// The sole caller is the post-write maintenance loop (see
     /// [`Self::run_maintenance_state`]), which runs outside any writer's
-    /// `write_lock`. The deletion sink is built with
-    /// `Some(Arc::clone(&self.write_lock))` so the sink itself serializes
-    /// against concurrent inserts / listing refreshes for the duration of the
-    /// scan — same exclusion guarantee the inline-retention path used to
-    /// provide, just held inside the sink rather than the writer.
+    /// `write_lock`. This pass therefore takes that lock itself and holds it
+    /// across both arms of the delete — the durable sink, then the mem-tier arm
+    /// — so concurrent inserts and listing refreshes are excluded for the whole
+    /// of one pass rather than for each half separately.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<RetentionPass> {
         let table_name = self.table_metadata.table_name.as_str();
         if self.retention_filters.is_empty() {
@@ -25199,7 +25202,12 @@ impl CayenneTableProvider {
         // whatever is there, the same way `delete_from` does for a user DELETE. The row
         // count is a relaxed atomic, so the common case of nothing inlined costs a load
         // and never queues for the exclusive lock the sink is about to take.
-        if self.cached_inlined_row_count() > 0 {
+        // Skipped under `mode: memory`, where `inlined_row_count` mirrors the RAM tier
+        // rather than a catalog inline corpus: there is nothing to materialize, and
+        // `checkpoint_inlined_data` would re-sync that counter from the (empty) corpus
+        // and report the tier as holding no rows. The mem-tier arm below is what reaches
+        // those rows.
+        if !self.is_memory_resident_mode() && self.cached_inlined_row_count() > 0 {
             let guard = self.write_lock.lock().await;
             let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
             // Defer while a staged inline-conflict tombstone is unpublished (Option D)
@@ -25313,18 +25321,13 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
-        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
-        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
-        // caller that passes the `write_lock` INTO the sink rather than holding it,
-        // and the wrapper takes that same non-reentrant lock itself. The consequence
-        // is that `retention_sql` does not reach a `mode: memory` tier, which the
-        // accelerator warns about at registration.
+        // Built with NO `write_lock`, so this pass can hold it itself across both arms
+        // of the delete — the durable sink here and the mem-tier arm below. One hold
+        // rather than two: a tier rebuild must not race a concurrent apply, and a
+        // second acquisition would let a write land between the two halves of a single
+        // retention pass.
         let sink = self
-            .build_deletion_vector_sink(
-                &filters,
-                Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::User,
-            )
+            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
             .await
             .map_err(|err| {
                 maintenance_metrics::track_maintenance(
@@ -25348,7 +25351,9 @@ impl CayenneTableProvider {
         // before the durable delete for the reason documented on it.
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
-        let deleted_count = match sink
+        let write_guard = self.write_lock.lock().await;
+
+        let file_deleted = match sink
             .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
             .await
         {
@@ -25365,6 +25370,37 @@ impl CayenneTableProvider {
                 });
             }
         };
+
+        // The sink above addresses durable Vortex files and catalog-inlined rows, so a
+        // row resident in the RAM mem-tier is in neither — and under `mode: memory`
+        // that tier IS the table, which is why a retention predicate reached nothing
+        // there (#14045). This is the same arm a client `DELETE` runs, so the two agree
+        // on what a predicate removes by construction rather than by convention.
+        //
+        // What is NOT adopted from the `DELETE` path is `checkpoint_mem_tier_for_delete`:
+        // it would materialize a `cdc_durability: memory` table's tier, which retention
+        // deliberately leaves to that table's own checkpoint. The filtered arm self-gates
+        // on memory residency, so it stays inert there.
+        let mem_tier_deleted = match apply_mem_tier_delete(self, &filters).await {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::Retention,
+                    MaintenanceOutcome::Failed,
+                );
+                return Err(CatalogError::InvalidOperation {
+                    message: format!(
+                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                        self.table_metadata.table_name
+                    ),
+                    source: Box::new(err),
+                });
+            }
+        };
+        drop(write_guard);
+
+        let deleted_count = file_deleted.saturating_add(mem_tier_deleted);
 
         maintenance_metrics::track_maintenance(
             table_name,
@@ -30696,6 +30732,32 @@ impl CayenneTableProvider {
         if self.has_retention_delete_filters() {
             // A checkpoint makes already-counted rows durable, so this arming call
             // carries no live-row delta and its claim is released rather than queued.
+            self.schedule_post_write_maintenance(
+                None,
+                false,
+                true,
+                0,
+                self.reserve_live_rows_delta().published(),
+            );
+        }
+    }
+
+    /// Arm retention over the rows a `mode: memory` write has just made visible.
+    ///
+    /// [`Self::arm_retention_after_checkpoint`] is what gives a `cdc_durability: memory`
+    /// table retention, and it can be, because those rows become durable at a
+    /// checkpoint. A `mode: memory` table never reaches one — the RAM tier is its
+    /// permanent store and [`Self::checkpoint_mem_tier_inner`] returns immediately — and
+    /// `write_cdc_in_memory` returns before any durable publish path schedules
+    /// maintenance. Nothing else queues the request, so its `retention_sql` predicate was
+    /// accepted at registration and then never evaluated (#14045).
+    ///
+    /// The delta is `0` and its claim released rather than queued, for the same reason
+    /// the checkpoint's arming carries none: this queues a retention request, not a
+    /// row-count change — the append that preceded it already did that bookkeeping
+    /// against the tier.
+    pub(crate) fn arm_retention_after_memory_resident_write(&self) {
+        if self.is_memory_resident_mode() && self.has_retention_delete_filters() {
             self.schedule_post_write_maintenance(
                 None,
                 false,

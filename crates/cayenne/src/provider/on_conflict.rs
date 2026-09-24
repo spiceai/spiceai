@@ -577,12 +577,19 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
     }
 }
 
-/// The mem-tier arm of a `DELETE`, shared by both deletion sinks.
+/// The mem-tier arm of a `DELETE`, shared by both deletion sinks and by the
+/// background retention pass (`CayenneTableProvider::apply_retention_filters`).
 ///
 /// Neither sink can see the in-memory tier: one addresses `(file, file-local
 /// position)` pairs and the other durable-file plus catalog-inlined rows, and a
 /// RAM-resident row is in none of those. Under `mode: memory` the tier is the
 /// PERMANENT store, so what the sinks miss is the whole table.
+///
+/// Retention calls this directly rather than composing [`InlineAwareDeletionSink`],
+/// which is what routes a client `DELETE` here: the wrapper would also checkpoint a
+/// `cdc_durability: memory` table's tier, which retention deliberately does not do.
+/// Sharing this function is what keeps the two in agreement about what a predicate
+/// removes.
 ///
 /// Delete-all discards the tier wholesale (#11987, #12072). A filtered delete
 /// evaluates the predicate against the tier and rebuilds it without the matching
@@ -605,7 +612,7 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
 /// reaches the position-based sink.
 ///
 /// The caller must hold the table `write_lock`.
-async fn apply_mem_tier_delete(
+pub(crate) async fn apply_mem_tier_delete(
     table: &CayenneTableProvider,
     filters: &[Expr],
 ) -> crate::provider::Result<u64> {

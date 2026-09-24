@@ -903,6 +903,10 @@ impl<'a> AppendMutationWriter<'a> {
             .record_inlined_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
+        // A `mode: memory` write ends here, with no durable publish behind it and no
+        // checkpoint ahead of it, so this is the only place its retention request can be
+        // queued. A no-op for every other table reaching this path.
+        self.table.arm_retention_after_memory_resident_write();
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
         Ok(MemWriteOutcome::Done(Box::new(
             CayenneCdcWrite::in_memory_staged(

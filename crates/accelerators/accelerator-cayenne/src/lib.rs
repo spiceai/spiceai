@@ -3011,36 +3011,6 @@ fn wrap_with_native_vector_indexes(
     }
 }
 
-/// The warning a `mode: memory` acceleration gets when it configures `retention_sql`.
-///
-/// A `retention_sql` predicate reaches the rows only through the deletion sink, which
-/// scans this table's Vortex files — and a memory-mode table has none: its rows live
-/// only in the RAM tier, whose tombstones address rows by primary key rather than by
-/// predicate. Saying so at registration is the point: keeping rows the operator asked
-/// to have deleted, with nothing in the log to explain it, is the worst of the outcomes.
-///
-/// Deliberately NOT extended to `retention_period`, which is a different mechanism:
-/// Cayenne injects it as a scan-time keep filter (`TimeRetentionFilterBuilder`), so
-/// expired rows are hidden from every read whether or not they were physically deleted,
-/// memory mode included. Naming it here would tell the operator their data is exposed
-/// when it is not.
-/// Whether a `mode: memory` acceleration warrants [`memory_mode_retention_warning`].
-///
-/// Deliberately keyed on `retention_sql` alone. `retention_period` is a scan-time keep
-/// filter, so its expired rows are excluded from every read in either mode — warning
-/// about it would tell the operator their data is exposed when it is not. An earlier
-/// revision of this warning did exactly that, which is why the condition is a named
-/// predicate with its own test rather than an inline `||`.
-const fn memory_mode_retention_warning_applies(memory_mode: bool, has_retention_sql: bool) -> bool {
-    memory_mode && has_retention_sql
-}
-
-fn memory_mode_retention_warning(table_name: &str) -> String {
-    format!(
-        "Dataset '{table_name}' (cayenne): `retention_sql` is not applied to a `mode: memory` acceleration, so rows matching that predicate stay queryable in the accelerated table. Set `mode: file` to have it applied, or use `retention_period`, which filters expired rows out of every read in either mode. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-    )
-}
-
 /// The column sets of the acceleration's `indexes`, one per entry, in a stable
 /// order: the entries arrive as a map, and a lookup is answered by the first
 /// index whose columns it pins.
@@ -3101,7 +3071,11 @@ fn unique_index_warning(table_name: &str) -> String {
 ///
 /// `retention_sql` is deliberately absent from this condition: Cayenne applies it through
 /// its own engine-level maintenance, armed by every write, overwrite, and mem-tier
-/// checkpoint, so it runs whatever the periodic check is set to.
+/// checkpoint, so it runs whatever the periodic check is set to. That includes a
+/// `mode: memory` acceleration, which reaches none of those three and arms from the
+/// memory-mode write itself — so this warning's advice to "use `retention_sql`" holds in
+/// either mode. `cayenne_memory_mode_applies_retention_sql` is what pins that; without
+/// it this sentence would send a memory-mode operator to a setting that did nothing.
 const fn retention_period_never_reclaimed_warning_applies(
     has_retention_period: bool,
     retention_check_enabled: bool,
@@ -3903,10 +3877,6 @@ impl DataAccelerator for CayenneAccelerator {
         } else {
             Vec::new()
         };
-
-        if memory_mode_retention_warning_applies(memory_mode, !retention_filters.is_empty()) {
-            tracing::warn!("{}", memory_mode_retention_warning(&table_name));
-        }
 
         if declares_unique_index(source) {
             tracing::warn!("{}", unique_index_warning(&table_name));
@@ -4964,7 +4934,6 @@ mod tests {
     #[test]
     fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
         for warning in [
-            memory_mode_retention_warning("events"),
             unique_index_warning("events"),
             retention_period_never_reclaimed_warning("events"),
         ] {
@@ -5037,47 +5006,6 @@ mod tests {
         assert!(
             warning.contains("retention_sql"),
             "the alternative that does run on every write is the actionable escape: {warning}"
-        );
-    }
-
-    #[test]
-    fn memory_mode_retention_warning_covers_retention_sql_and_spares_retention_period() {
-        assert!(
-            memory_mode_retention_warning_applies(true, true),
-            "a memory-mode table with retention_sql keeps rows the predicate matches"
-        );
-        assert!(
-            !memory_mode_retention_warning_applies(true, false),
-            "retention_period alone must NOT warn: its keep filter excludes expired rows \
-             from every read in either mode, so warning would claim an exposure that does \
-             not exist"
-        );
-        assert!(
-            !memory_mode_retention_warning_applies(false, true),
-            "a file-mode table applies retention_sql, so there is nothing to warn about"
-        );
-    }
-
-    #[test]
-    fn memory_mode_retention_warning_states_the_impact_and_the_fix() {
-        let warning = memory_mode_retention_warning("events");
-
-        assert!(
-            warning.contains("retention_sql"),
-            "the warning must name the setting it covers: {warning}"
-        );
-        assert!(
-            warning.contains("`retention_period`, which filters expired rows out of every read"),
-            "the warning must not leave the operator thinking period retention is affected \
-             too — it is a scan-time keep filter and works in either mode: {warning}"
-        );
-        assert!(
-            warning.contains("stay queryable"),
-            "the warning must say what the user will observe, not just what was skipped: {warning}"
-        );
-        assert!(
-            warning.contains("`mode: file`"),
-            "the warning must give the actionable fix: {warning}"
         );
     }
 

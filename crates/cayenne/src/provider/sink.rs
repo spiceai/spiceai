@@ -252,6 +252,12 @@ impl DataSink for CayenneDataSink {
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_inlined_pk_keys(&keys, record_seq);
             }
+            drop(_write_guard);
+            // A memory-mode write returns here with no durable publish behind it and no
+            // checkpoint ahead of it, so this is the only place its `retention_sql` can be
+            // queued — every other write path arms retention from a durable commit that
+            // memory mode never performs (#14045).
+            self.table.arm_retention_after_memory_resident_write();
             return Ok(rows);
         }
 
