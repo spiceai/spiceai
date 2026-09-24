@@ -17,8 +17,8 @@ mod source;
 mod stream;
 
 pub use access_plan::{
-    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
-    exclude_by_index, include_by_index,
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, exclude_by_index,
+    include_by_index,
 };
 pub use format::ProjectionPushdown;
 pub use format::ScanConcurrency;

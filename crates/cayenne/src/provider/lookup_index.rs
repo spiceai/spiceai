@@ -107,8 +107,7 @@ use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::{
-    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
-    include_by_index,
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, include_by_index,
 };
 use vortex_session::VortexSession;
 
@@ -910,7 +909,7 @@ impl RuntimeLookupSelection {
             .into_iter()
             .map(|(path, positions)| {
                 let plan = VortexAccessPlan::default()
-                    .with_selection(include_by_index(Buffer::from(positions)));
+                    .with_selection(include_by_index(&Buffer::from(positions)));
                 (path, Arc::new(plan))
             })
             .collect();
@@ -918,8 +917,7 @@ impl RuntimeLookupSelection {
             index,
             plans,
             empty: Arc::new(
-                VortexAccessPlan::default()
-                    .with_selection(include_by_index(Buffer::empty())),
+                VortexAccessPlan::default().with_selection(include_by_index(&Buffer::empty())),
             ),
         }
     }
@@ -1214,7 +1212,7 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
             return table_plan;
         };
         let selected = VortexAccessPlan::default()
-            .with_selection(include_by_index(Buffer::copy_from(candidates.as_slice())));
+            .with_selection(include_by_index(&Buffer::copy_from(candidates.as_slice())));
         self.state
             .counters
             .access_plans_attached
@@ -2952,8 +2950,8 @@ async fn read_back(
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
-    use vortex_scan::selection::Selection;
     use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+    use vortex_scan::selection::Selection;
 
     fn unbounded_pool() -> Arc<dyn MemoryPool> {
         Arc::new(UnboundedMemoryPool::default())
@@ -3317,7 +3315,7 @@ mod tests {
         let table_plan =
             VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(deleted));
         let candidates = VortexAccessPlan::default()
-            .with_selection(include_by_index(Buffer::from_iter([1u64, 3, 5, 9])));
+            .with_selection(include_by_index(&Buffer::from_iter([1u64, 3, 5, 9])));
         let Some(Selection::IncludeByIndex(kept)) =
             candidates.intersect(&table_plan).selection().cloned()
         else {

@@ -1546,10 +1546,9 @@ mod tests {
             _file: &PartitionedFile,
             _predicate: Option<&PhysicalExprRef>,
         ) -> Option<Arc<VortexAccessPlan>> {
-            Some(Arc::new(
-                VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(StrictSortedBuffer::default())),
-            ))
+            Some(Arc::new(VortexAccessPlan::default().with_selection(
+                Selection::IncludeByIndex(StrictSortedBuffer::default()),
+            )))
         }
     }
 

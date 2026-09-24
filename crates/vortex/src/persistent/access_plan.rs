@@ -128,7 +128,7 @@ impl VortexAccessPlan {
 /// that are not (unsorted or repeated) select the same set of rows through a
 /// roaring bitmap instead, so the rows read never depend on the input's order.
 #[must_use]
-pub fn include_by_index(positions: Buffer<u64>) -> Selection {
+pub fn include_by_index(positions: &Buffer<u64>) -> Selection {
     match StrictSortedBuffer::try_new(positions.clone()) {
         Ok(rows) => Selection::IncludeByIndex(rows),
         Err(_) => Selection::IncludeRoaring(positions.iter().copied().collect()),
@@ -138,7 +138,7 @@ pub fn include_by_index(positions: Buffer<u64>) -> Selection {
 /// A selection that reads every row except those at `positions`; see
 /// [`include_by_index`] for how unsorted or repeated positions are handled.
 #[must_use]
-pub fn exclude_by_index(positions: Buffer<u64>) -> Selection {
+pub fn exclude_by_index(positions: &Buffer<u64>) -> Selection {
     match StrictSortedBuffer::try_new(positions.clone()) {
         Ok(rows) => Selection::ExcludeByIndex(rows),
         Err(_) => Selection::ExcludeRoaring(positions.iter().copied().collect()),
@@ -163,7 +163,8 @@ fn intersect_selections(left: &Selection, right: &Selection) -> Selection {
         (Selection::All, other) | (other, Selection::All) => other.clone(),
         (Selection::IncludeByIndex(rows), other) | (other, Selection::IncludeByIndex(rows)) => {
             include_by_index(
-                rows.iter()
+                &rows
+                    .iter()
                     .copied()
                     .filter(|&position| selection_keeps(other, position))
                     .collect(),
@@ -171,7 +172,8 @@ fn intersect_selections(left: &Selection, right: &Selection) -> Selection {
         }
         (Selection::IncludeRoaring(rows), other) | (other, Selection::IncludeRoaring(rows)) => {
             include_by_index(
-                rows.iter()
+                &rows
+                    .iter()
                     .filter(|&position| selection_keeps(other, position))
                     .collect(),
             )
@@ -183,7 +185,7 @@ fn intersect_selections(left: &Selection, right: &Selection) -> Selection {
             let mut excluded: Vec<u64> = excluded_rows(left).chain(excluded_rows(right)).collect();
             excluded.sort_unstable();
             excluded.dedup();
-            exclude_by_index(excluded.into_iter().collect())
+            exclude_by_index(&excluded.into_iter().collect())
         }
     }
 }
@@ -226,10 +228,10 @@ mod tests {
         let selections = [
             None,
             Some(Selection::All),
-            Some(include_by_index(include)),
-            Some(include_by_index(Buffer::empty())),
-            Some(exclude_by_index(exclude)),
-            Some(exclude_by_index(exclude_other)),
+            Some(include_by_index(&include)),
+            Some(include_by_index(&Buffer::empty())),
+            Some(exclude_by_index(&exclude)),
+            Some(exclude_by_index(&exclude_other)),
             Some(Selection::IncludeRoaring(
                 roaring_rows.into_iter().collect(),
             )),

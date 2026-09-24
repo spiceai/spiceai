@@ -144,6 +144,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
     use datafusion::catalog::Session;
     use datafusion::common::Column;
+    use datafusion::common::TableReference;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::DefaultTableSource;
@@ -165,7 +166,6 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
-    use datafusion::common::TableReference;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
