@@ -108,6 +108,11 @@ datasets:
       file_format: parquet
       hive_partitioning_enabled: "true"
       refresh_skip: enabled
+      s3_changes_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/s3-events
+      s3_changes_region: us-east-1
+      s3_changes_key_prefix: data/
+      s3_changes_backfill_interval: 1h
+      s3_on_object_removed: ignore
 
   - name: test_s3_csv
     from: s3://my-bucket/csv-data/
