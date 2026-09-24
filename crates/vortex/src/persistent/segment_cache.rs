@@ -15,9 +15,10 @@ use opentelemetry::global;
 use opentelemetry::metrics::{Meter, ObservableCounter, ObservableGauge};
 use parking_lot::Mutex;
 use twox_hash::XxHash3_64;
+use vortex::array::ArrayRef;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
-use vortex::layout::segments::{SegmentCache, SegmentId};
+use vortex::layout::segments::{DecodedSegmentCache, SegmentCache, SegmentId};
 use vortex_utils::aliases::dash_map::{DashMap, Entry};
 
 /// Hasher for the segment cache key. XXH3 matches the
@@ -294,6 +295,10 @@ impl SegmentCacheMetrics {
 #[derive(Debug)]
 pub(crate) struct SharedSegmentCache {
     cache: Cache<SegmentKey, ByteBuffer, SegmentCacheHasher>,
+    /// Decoded arrays share the configured segment-cache budget equally with
+    /// encoded buffers. They cost considerably more memory per segment, so a
+    /// separate bounded cache preserves the encoded cache's wider working set.
+    decoded_cache: Cache<SegmentKey, ArrayRef, SegmentCacheHasher>,
     /// Weak per-path insertion states. An open file keeps its state alive; the
     /// last [`PathSegmentCache`] drop removes the weak registry entry, so paths
     /// retired over the process's lifetime do not accumulate as tombstones.
@@ -358,13 +363,24 @@ impl SharedSegmentCache {
     }
 
     fn build(max_capacity_bytes: u64, track_retirement: bool, name: &str) -> Self {
+        // Keep the existing configuration as the total reservation. Each cache
+        // gets an equal share, including the process-wide cache that runtime
+        // memory accounting reserves against this total.
+        let per_cache_capacity_bytes = max_capacity_bytes / 2;
         Self {
             label: [KeyValue::new("cache", name.to_owned())],
             cache: Cache::builder()
                 .name("vortex-datafusion-segment-cache")
-                .max_capacity(max_capacity_bytes)
+                .max_capacity(per_cache_capacity_bytes)
                 .weigher(|_, buffer: &ByteBuffer| {
                     u32::try_from(buffer.len().min(u32::MAX as usize)).unwrap_or(u32::MAX)
+                })
+                .build_with_hasher(SegmentCacheHasher::default()),
+            decoded_cache: Cache::builder()
+                .name("vortex-datafusion-decoded-segment-cache")
+                .max_capacity(per_cache_capacity_bytes)
+                .weigher(|_, array: &ArrayRef| {
+                    u32::try_from(array.nbytes().min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
                 })
                 .build_with_hasher(SegmentCacheHasher::default()),
             path_states: track_retirement.then(|| Arc::new(DashMap::default())),
@@ -392,9 +408,24 @@ impl SharedSegmentCache {
         observe(hits.min(*last_observed_accesses));
     }
 
-    /// A per-file view. `store` identifies the object store `path` is relative
-    /// to; see [`StoreKey`].
-    pub(crate) fn for_path(self: &Arc<Self>, store: StoreKey, path: Path) -> Arc<dyn SegmentCache> {
+    /// A per-file encoded-cache view used by this module's regression tests.
+    #[cfg(test)]
+    fn for_path(self: &Arc<Self>, store: StoreKey, path: Path) -> Arc<dyn SegmentCache> {
+        self.path_cache(store, path)
+    }
+
+    /// Per-file views of the encoded and decoded caches. Both trait objects
+    /// share one path state, so retirement covers a put in either cache.
+    pub(crate) fn for_path_with_decoded(
+        self: &Arc<Self>,
+        store: StoreKey,
+        path: Path,
+    ) -> (Arc<dyn SegmentCache>, Arc<dyn DecodedSegmentCache>) {
+        let cache = self.path_cache(store, path);
+        (Arc::<PathSegmentCache>::clone(&cache), cache)
+    }
+
+    fn path_cache(self: &Arc<Self>, store: StoreKey, path: Path) -> Arc<PathSegmentCache> {
         let state = self.registered_state(&path);
         Arc::new(PathSegmentCache {
             shared: Arc::clone(self),
@@ -554,51 +585,60 @@ impl SharedSegmentCache {
         // await hanging — bounding only the drain would move the unbounded wait
         // two statements down rather than remove it.
         let scan_cache = self.cache.clone();
+        let scan_decoded_cache = self.decoded_cache.clone();
         let scan_paths = paths.clone();
         let mut scan = tokio::task::spawn_blocking(move || {
-            scan_cache
+            let encoded_keys = scan_cache
                 .iter()
                 .filter_map(|(key, _)| {
                     scan_paths
                         .contains(key.1.as_ref())
                         .then(|| key.as_ref().clone())
                 })
-                .collect()
+                .collect();
+            let decoded_keys = scan_decoded_cache
+                .iter()
+                .filter_map(|(key, _)| {
+                    scan_paths
+                        .contains(key.1.as_ref())
+                        .then(|| key.as_ref().clone())
+                })
+                .collect();
+            (encoded_keys, decoded_keys)
         });
-        let keys: Vec<SegmentKey> = match tokio::time::timeout(INVALIDATION_SCAN_TIMEOUT, &mut scan)
-            .await
-        {
-            Ok(Ok(keys)) => keys,
-            Ok(Err(error)) => {
-                // The scan is the only way to find the retired keys, so a
-                // failed join leaves them cached. Report it rather than
-                // pretending the retirement completed.
-                tracing::error!(
-                    target: "vortex::segment_cache",
-                    %error,
-                    "Failed to search the Cayenne-accelerated data cached for the {count} file(s) just retired — {paths} — so the memory those files occupy is held until other reads push it out. Restart the runtime to reclaim it immediately. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: {error}",
-                    count = paths.len(),
-                    paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
-                );
-                Vec::new()
-            }
-            Err(_) => {
-                // Give up the queue slot as well as the wait. A search that
-                // has not started yet is dropped outright; one already
-                // running is not interruptible, but it was the wait, not the
-                // work, that was holding the caller.
-                scan.abort();
-                let timeout_secs = INVALIDATION_SCAN_TIMEOUT.as_secs();
-                tracing::error!(
-                    target: "vortex::segment_cache",
-                    timeout_secs,
-                    "Gave up after {timeout_secs}s searching the Cayenne-accelerated data cached for the {count} file(s) just retired — {paths} — so the memory those files occupy is held until other reads push it out. Restart the runtime to reclaim it immediately, and give the host less concurrent work. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: the host cannot keep up with the work already queued on it.",
-                    count = paths.len(),
-                    paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
-                );
-                Vec::new()
-            }
-        };
+        let (encoded_keys, decoded_keys): (Vec<SegmentKey>, Vec<SegmentKey>) =
+            match tokio::time::timeout(INVALIDATION_SCAN_TIMEOUT, &mut scan).await {
+                Ok(Ok(keys)) => keys,
+                Ok(Err(error)) => {
+                    // The scan is the only way to find the retired keys, so a
+                    // failed join leaves them cached. Report it rather than
+                    // pretending the retirement completed.
+                    tracing::error!(
+                        target: "vortex::segment_cache",
+                        %error,
+                        "Failed to search the Cayenne-accelerated data cached for the {count} file(s) just retired — {paths} — so the memory those files occupy is held until other reads push it out. Restart the runtime to reclaim it immediately. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: {error}",
+                        count = paths.len(),
+                        paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
+                    );
+                    (Vec::new(), Vec::new())
+                }
+                Err(_) => {
+                    // Give up the queue slot as well as the wait. A search that
+                    // has not started yet is dropped outright; one already
+                    // running is not interruptible, but it was the wait, not the
+                    // work, that was holding the caller.
+                    scan.abort();
+                    let timeout_secs = INVALIDATION_SCAN_TIMEOUT.as_secs();
+                    tracing::error!(
+                        target: "vortex::segment_cache",
+                        timeout_secs,
+                        "Gave up after {timeout_secs}s searching the Cayenne-accelerated data cached for the {count} file(s) just retired — {paths} — so the memory those files occupy is held until other reads push it out. Restart the runtime to reclaim it immediately, and give the host less concurrent work. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: the host cannot keep up with the work already queued on it.",
+                        count = paths.len(),
+                        paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
+                    );
+                    (Vec::new(), Vec::new())
+                }
+            };
         // Both give-up arms above fall through here with nothing to invalidate
         // rather than returning. Returning early would be correct now that
         // `registrations` cleans up on the way out, but falling through keeps
@@ -607,9 +647,12 @@ impl SharedSegmentCache {
         // `PathSegmentCache::drop` saw the extra strong reference — so the
         // cleanup has to run whichever way this ends, the paths here being
         // unique per snapshot and so never revisited.
-        if !keys.is_empty() {
-            for key in &keys {
+        if !encoded_keys.is_empty() || !decoded_keys.is_empty() {
+            for key in &encoded_keys {
                 self.cache.invalidate(key).await;
+            }
+            for key in &decoded_keys {
+                self.decoded_cache.invalidate(key).await;
             }
             // Direct invalidation removes the hash-table entries immediately,
             // but Moka's queued policy-removal records still retain the removed
@@ -644,11 +687,14 @@ impl SharedSegmentCache {
 
     pub(crate) async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
+        self.decoded_cache.run_pending_tasks().await;
     }
 
     pub(crate) async fn entry_count(&self) -> u64 {
         self.run_pending_tasks().await;
-        self.cache.entry_count()
+        self.cache
+            .entry_count()
+            .saturating_add(self.decoded_cache.entry_count())
     }
 }
 
@@ -772,6 +818,22 @@ impl PathSegmentCache {
             .as_ref()
             .is_some_and(|state| state.retired.load(Ordering::SeqCst))
     }
+
+    /// Register a write before it can race with retirement. The guard counts
+    /// writes for both encoded and decoded caches so invalidation cannot scan
+    /// between either insert and its retired-path cleanup.
+    fn register_active_put(&self) -> Option<ActivePutGuard<'_>> {
+        let state = self.state.as_ref()?;
+        if state.retired.load(Ordering::SeqCst) {
+            return None;
+        }
+        state.active_puts.fetch_add(1, Ordering::SeqCst);
+        let guard = ActivePutGuard(state);
+        if state.retired.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(guard)
+    }
 }
 
 #[async_trait]
@@ -798,18 +860,12 @@ impl SegmentCache for PathSegmentCache {
         // retirement: a put already registered makes invalidation wait; a put
         // that read `retired = false` just before the mark observes it on the
         // second check and never inserts.
-        let _active_put = if let Some(state) = self.state.as_ref() {
-            if state.retired.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            state.active_puts.fetch_add(1, Ordering::SeqCst);
-            let guard = ActivePutGuard(state);
-            if state.retired.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            Some(guard)
-        } else {
-            None
+        let _active_put = match self.state.as_ref() {
+            Some(_) => match self.register_active_put() {
+                Some(guard) => Some(guard),
+                None => return Ok(()),
+            },
+            None => None,
         };
 
         // Copy into an exact-sized allocation, after the retirement checks so a
@@ -884,6 +940,30 @@ impl SegmentCache for PathSegmentCache {
     }
 }
 
+#[async_trait]
+impl DecodedSegmentCache for PathSegmentCache {
+    async fn get(&self, id: SegmentId) -> VortexResult<Option<ArrayRef>> {
+        Ok(self.shared.decoded_cache.get(&self.key(id)).await)
+    }
+
+    async fn put(&self, id: SegmentId, array: ArrayRef) -> VortexResult<()> {
+        let _active_put = match self.state.as_ref() {
+            Some(_) => match self.register_active_put() {
+                Some(guard) => Some(guard),
+                None => return Ok(()),
+            },
+            None => None,
+        };
+
+        self.shared.decoded_cache.insert(self.key(id), array).await;
+
+        if self.is_retired() {
+            self.shared.decoded_cache.invalidate(&self.key(id)).await;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for PathSegmentCache {
     fn drop(&mut self) {
         let (Some(state), Some(path_states)) =
@@ -924,6 +1004,8 @@ mod tests {
     use opentelemetry_sdk::metrics::reader::MetricReader;
     use opentelemetry_sdk::metrics::{ManualReader, Pipeline, Temporality};
     use prometheus::proto::MetricType;
+    use vortex::array::IntoArray;
+    use vortex::buffer::buffer;
 
     use super::*;
 
@@ -1383,6 +1465,58 @@ mod tests {
                 .await
                 .expect("get should not error")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_segments_are_path_scoped_and_retired_with_encoded_segments() {
+        let shared = SharedSegmentCache::new(1 << 20, true, "decoded-roundtrip");
+        let retired_path = Path::from("snapshot-a/retired.vortex");
+        let live_path = Path::from("snapshot-b/live.vortex");
+        let (_retired_encoded, retired_decoded) =
+            shared.for_path_with_decoded(test_store(), retired_path.clone());
+        let (_live_encoded, live_decoded) =
+            shared.for_path_with_decoded(test_store(), live_path.clone());
+        let id = SegmentId::from(1);
+        let decoded = buffer![1u32, 2, 3, 4].into_array();
+
+        retired_decoded
+            .put(id, decoded.clone())
+            .await
+            .expect("cache the decoded retired segment");
+        live_decoded
+            .put(id, decoded.clone())
+            .await
+            .expect("cache the decoded live segment");
+
+        assert_eq!(
+            retired_decoded
+                .get(id)
+                .await
+                .expect("get should not error")
+                .expect("the decoded segment should be cached")
+                .nbytes(),
+            decoded.nbytes(),
+            "the decoded segment round-trips intact"
+        );
+
+        shared.invalidate_paths(HashSet::from([retired_path])).await;
+
+        assert!(
+            retired_decoded
+                .get(id)
+                .await
+                .expect("get should not error")
+                .is_none(),
+            "retirement must evict decoded segments as well as encoded bytes"
+        );
+        assert!(
+            live_decoded
+                .get(id)
+                .await
+                .expect("get should not error")
+                .is_some(),
+            "a decoded segment for a live path must remain cached"
         );
     }
 

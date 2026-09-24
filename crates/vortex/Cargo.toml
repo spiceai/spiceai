@@ -79,5 +79,9 @@ name = "in_list_pruning"
 harness = false
 name = "in_list_pruning_power"
 
+[[bench]]
+harness = false
+name = "decoded_segment_cache"
+
 [lints]
 workspace = true

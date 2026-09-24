@@ -135,7 +135,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `5e477a52254a670bd51a24d8e6fad5b464f4b41f` | `spiceai-54` |
+| [vortex](#vortex) | `2c98bccf0441a231d3cd5b111925bb370bef45f4` | `peasee/260924-vortex-decoded-segment-cache` |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
@@ -165,6 +165,7 @@ row here. Its behaviour is covered where the code lives, by
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
+| Decoded segment-cache hook (`DecodedSegmentCache`) in `vortex-layout` and `vortex-file` | Cayenne can only cache encoded bytes; even a cache hit has to deserialize every segment again, so high-request-rate scans keep paying decode CPU | silent (perf) | `crates/vortex/src/persistent/segment_cache.rs::decoded_segments_are_path_scoped_and_retired_with_encoded_segments` and `vortex-layout/src/layouts/flat/reader.rs::test::decoded_segment_cache_skips_the_encoded_segment_source` |
 | `FunctionSupport::with_aggregate_call_support` and `with_window_call_support`, and the aggregate/window arms of the walk that consult them (fork PR #70) | The name-based `FunctionRestriction` cannot refuse a *shape*, and the aggregate and window slots were unused entirely — so every aggregate and window call federated unconditionally. The BigQuery dialect declines the filtered-aggregate shapes it cannot rewrite exactly, and a declined rendering is a **failed query** unless federation refuses the same shape, because a federated statement has no local-execution fallback. Losing this patch therefore does not lose a pushdown, it breaks the query: `array_agg(v) FILTER (…)` reaches BigQuery as `FILTER` it cannot parse, and `COUNT(x) FILTER (…) OVER (…)` does the same through the window arm (measured: `Syntax error: Expected ")" but got "("`) | silent (query failure) | `crates/data-connectors/connector-adbc/src/lib.rs::bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`, which tests the allowlist *boundary* rather than a fixed set because the two sides live in different repositories, and `::bigquery_refuses_a_filtered_window_call` |
 | Arrow `Map` alias (`vortex-arrow`), both halves: the `DType` alias and the map-entry recursion in the session importer | Every write of a `Map` column fails with `Array encoding not implemented for Arrow data type Map(...)`. The table is created happily first, so it surfaces only on flush | silent | `crates/vortex/src/persistent/mod.rs::map_column_roundtrips_through_a_vortex_file`, and `crates/cayenne/src/schema.rs::vortex_encodes_exactly_the_types_not_listed_as_unsupported` for the whole type list |
 | Tokio one-shot for the spawned-task result channel (`vortex-io/src/runtime/handle.rs`) | Reentrant waker drop on the cancellation path → `SIGSEGV` under ordinary query cancellation | silent (crash) | `crates/cayenne/tests/vortex_task_cancellation.rs` |

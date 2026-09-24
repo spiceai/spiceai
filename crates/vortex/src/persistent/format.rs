@@ -608,8 +608,8 @@ impl VortexFormat {
         }
     }
 
-    /// Returns the current number of cached Vortex segments, or `None` when the
-    /// segment cache is disabled.
+    /// Returns the current number of cached encoded and decoded Vortex
+    /// segments, or `None` when the segment cache is disabled.
     pub async fn segment_cache_entry_count(&self) -> Option<u64> {
         match self.segment_cache.as_ref() {
             Some(cache) => Some(cache.entry_count().await),

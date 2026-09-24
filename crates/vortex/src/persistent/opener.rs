@@ -229,10 +229,13 @@ impl FileOpener for VortexOpener {
                 .with_labels(labels);
 
             if let Some(segment_cache) = segment_cache {
-                open_opts = open_opts.with_segment_cache(segment_cache.for_path(
+                let (encoded_cache, decoded_cache) = segment_cache.for_path_with_decoded(
                     Arc::clone(&object_store_url),
                     file.object_meta.location.clone(),
-                ));
+                );
+                open_opts = open_opts
+                    .with_segment_cache(encoded_cache)
+                    .with_decoded_segment_cache(decoded_cache);
             }
 
             if let Some(file_metadata_cache) = file_metadata_cache
