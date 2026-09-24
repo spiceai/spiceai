@@ -23,7 +23,9 @@ limitations under the License.
 //! under `.spice/data`, or to `runtime.state.location` when that is set. After
 //! a process restart, once accelerated full/append datasets finish their first
 //! refresh, those shapes are replayed with `SELECT DISTINCT` of the bound
-//! columns until the cache is full. Datasets stay not ready until that warmup
+//! columns until the cache is full. Templates that fail to plan or execute
+//! are dropped from the catalog so a full set of stale shapes cannot block
+//! recording current queries. Datasets stay not ready until that warmup
 //! completes, so `/v1/ready` does not succeed on a cold cache. Each replay
 //! (and its stream drain) is bounded by `runtime.query.timeout` or a default,
 //! and cancelled on runtime shutdown, so a stalled Internal-protocol query
@@ -233,7 +235,29 @@ impl ResultsCacheWarmer {
         self.schedule_persist();
     }
 
+    /// Drop templates that failed to plan or execute so a full catalog can
+    /// record current query shapes.
+    fn drop_and_persist(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let exclude: HashSet<u64> = ids.iter().copied().collect();
+        {
+            let mut catalog = self.catalog.lock();
+            catalog
+                .templates
+                .retain(|template| !exclude.contains(&template_id(template)));
+            catalog.ids = catalog.templates.iter().map(template_id).collect();
+            self.count.store(catalog.templates.len(), Ordering::Relaxed);
+        }
+        self.schedule_persist_excluding(exclude);
+    }
+
     fn schedule_persist(&self) {
+        self.schedule_persist_excluding(HashSet::new());
+    }
+
+    fn schedule_persist_excluding(&self, exclude: HashSet<u64>) {
         match &self.persist {
             WarmupPersist::Local(path) => {
                 let catalog = Arc::clone(&self.catalog);
@@ -270,7 +294,7 @@ impl ResultsCacheWarmer {
                     let _persist = remote_persist_lock.lock().await;
                     // Re-snapshot under the lock so this write includes any
                     // templates observed while we waited for earlier persists.
-                    persist_remote(state, catalog, count).await;
+                    persist_remote_excluding(state, catalog, count, exclude).await;
                 });
             }
         }
@@ -300,6 +324,17 @@ fn object_state_prefix(base_prefix: &str) -> String {
     } else {
         format!("{}/", base_prefix.trim_end_matches('/'))
     }
+}
+
+fn without_ids(templates: &[WarmupTemplate], exclude: &HashSet<u64>) -> Vec<WarmupTemplate> {
+    if exclude.is_empty() {
+        return templates.to_vec();
+    }
+    templates
+        .iter()
+        .filter(|template| !exclude.contains(&template_id(template)))
+        .cloned()
+        .collect()
 }
 
 fn merge_templates(base: &[WarmupTemplate], extra: &[WarmupTemplate]) -> Vec<WarmupTemplate> {
@@ -337,10 +372,19 @@ async fn persist_remote(
     catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
     count: Arc<AtomicUsize>,
 ) {
-    let mut local = catalog.lock().templates.clone();
+    persist_remote_excluding(state, catalog, count, HashSet::new()).await;
+}
+
+async fn persist_remote_excluding(
+    state: Arc<ObjectState<Vec<WarmupTemplate>>>,
+    catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
+    count: Arc<AtomicUsize>,
+    exclude: HashSet<u64>,
+) {
+    let mut local = without_ids(&catalog.lock().templates, &exclude);
     for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
         let (remote, version) = match state.get_with_version(WARMUP_STATE_KEY).await {
-            Ok(Some((templates, version))) => (templates, Some(version)),
+            Ok(Some((templates, version))) => (without_ids(&templates, &exclude), Some(version)),
             Ok(None) => (Vec::new(), None),
             Err(e) => {
                 tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
@@ -365,7 +409,7 @@ async fn persist_remote(
                     local = merged;
                 }
                 Ok(UpdateResult::Conflict { current }) => {
-                    local = merge_templates(&current, &merged);
+                    local = merge_templates(&without_ids(&current, &exclude), &merged);
                 }
                 Err(e) => {
                     tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
@@ -568,6 +612,7 @@ impl DataFusion {
         );
 
         let mut stored = 0_u64;
+        let mut unusable = Vec::new();
         for template in templates {
             if shutdown.is_cancelled() {
                 break;
@@ -580,7 +625,8 @@ impl DataFusion {
                 .warm_one_template(template, &request_context, cache_provider.as_ref())
                 .await
             {
-                Ok(count) => stored += count,
+                Ok(WarmupReplay::Stored(count)) => stored += count,
+                Ok(WarmupReplay::Unusable) => unusable.push(template_id(template)),
                 Err(WarmupBound::TimedOut) => {
                     tracing::warn!(
                         "SQL results cache warmup skipped a stored query plan that exceeded {replay_timeout:?}, so `/v1/ready` will not wait for that plan. Increase `runtime.query.timeout` if warmup queries need more time. See: https://spiceai.org/docs/reference/spicepod"
@@ -588,6 +634,15 @@ impl DataFusion {
                 }
                 Err(WarmupBound::Cancelled) => break,
             }
+        }
+
+        if !unusable.is_empty() {
+            let dropped = unusable.len();
+            tracing::info!(
+                "SQL results cache warmup dropped {dropped} stored query plan{} that failed to replay, so later queries can be recorded for the next cold start",
+                if dropped == 1 { "" } else { "s" }
+            );
+            self.results_cache_warmer.drop_and_persist(&unusable);
         }
 
         cache_provider.run_pending_tasks().await;
@@ -603,7 +658,7 @@ impl DataFusion {
         template: &WarmupTemplate,
         request_context: &Arc<RequestContext>,
         cache_provider: &cache::QueryResultsCacheProvider,
-    ) -> Result<u64, WarmupBound> {
+    ) -> Result<WarmupReplay, WarmupBound> {
         if template.bindings.is_empty() {
             return execute_warmup_sql(
                 self,
@@ -613,10 +668,16 @@ impl DataFusion {
                 request_context.cancellation_token(),
             )
             .await
-            .map(u64::from);
+            .map(|ok| {
+                if ok {
+                    WarmupReplay::Stored(1)
+                } else {
+                    WarmupReplay::Unusable
+                }
+            });
         }
         let Some(distinct_sql) = distinct_keys_sql(template) else {
-            return Ok(0);
+            return Ok(WarmupReplay::Unusable);
         };
 
         warm_distinct_key_rows(
@@ -756,6 +817,15 @@ enum WarmupBound {
     Cancelled,
 }
 
+/// Outcome of replaying one stored template. Timeouts stay [`WarmupBound`]
+/// so a slow plan is not dropped; planning and execution failures are
+/// [`Self::Unusable`] so the catalog can learn current shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmupReplay {
+    Stored(u64),
+    Unusable,
+}
+
 async fn bound_warmup_op<T>(
     shutdown: &CancellationToken,
     query_cancel: &CancellationToken,
@@ -817,7 +887,7 @@ async fn warm_distinct_key_rows(
     distinct_sql: &str,
     request_context: &Arc<RequestContext>,
     cache_provider: &cache::QueryResultsCacheProvider,
-) -> Result<u64, WarmupBound> {
+) -> Result<WarmupReplay, WarmupBound> {
     let timeout = request_context
         .query_timeout()
         .unwrap_or(DEFAULT_WARMUP_REPLAY_TIMEOUT);
@@ -839,12 +909,13 @@ async fn warm_distinct_key_rows(
         Ok(result) => result,
         Err(e) => {
             query_error_to_warmup_bound(shutdown, &e)?;
-            return Ok(0);
+            return Ok(WarmupReplay::Unusable);
         }
     };
 
     let mut stream = result.data;
     let mut stored = 0_u64;
+    let mut had_row = false;
     let max_size = cache_provider.max_size();
 
     loop {
@@ -854,6 +925,9 @@ async fn warm_distinct_key_rows(
                 Ok(None) => break,
                 Err(e) => {
                     stream_error_to_warmup_bound(shutdown, &e)?;
+                    if stored == 0 && !had_row {
+                        return Ok(WarmupReplay::Unusable);
+                    }
                     break;
                 }
             };
@@ -863,10 +937,11 @@ async fn warm_distinct_key_rows(
             // another nested replay so a large batch cannot outlive the
             // replay deadline and hold `/v1/ready`.
             warmup_row_deadline(shutdown, &query_cancel)?;
+            had_row = true;
             cache_provider.run_pending_tasks().await;
             let size_before = cache_provider.size().await;
             if size_before >= max_size {
-                return Ok(stored);
+                return Ok(WarmupReplay::Stored(stored));
             }
 
             let Ok(values) = (0..batch.num_columns())
@@ -889,7 +964,7 @@ async fn warm_distinct_key_rows(
                     stored += 1;
                     cache_provider.run_pending_tasks().await;
                     if cache_provider.size().await <= size_before {
-                        return Ok(stored);
+                        return Ok(WarmupReplay::Stored(stored));
                     }
                 }
                 Ok(false) => {}
@@ -897,7 +972,11 @@ async fn warm_distinct_key_rows(
             }
         }
     }
-    Ok(stored)
+    if stored > 0 || !had_row {
+        Ok(WarmupReplay::Stored(stored))
+    } else {
+        Ok(WarmupReplay::Unusable)
+    }
 }
 
 async fn execute_warmup_sql(
@@ -1550,6 +1629,115 @@ mod tests {
         );
     }
 
+    /// A full persisted catalog of obsolete shapes must drop them after
+    /// replay fails so a current query can be recorded.
+    #[tokio::test]
+    async fn failed_replay_frees_catalog_slot_for_a_new_plan() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-stale-full-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let stale: Vec<WarmupTemplate> = (0..MAX_WARMUP_PLANS)
+            .map(|i| WarmupTemplate {
+                sql: format!("SELECT id FROM missing_{i}"),
+                bindings: vec![],
+            })
+            .collect();
+        tokio::fs::write(
+            &store,
+            serde_json::to_vec(&stale).expect("serialize stale catalog"),
+        )
+        .await
+        .expect("write stale catalog");
+
+        let df = prepare_runtime(None, store.clone()).await;
+        let loaded = df.results_cache_warmer.templates_snapshot().len();
+        assert_eq!(loaded, MAX_WARMUP_PLANS);
+
+        register_table(&df, "orders", vec![1, 2, 3]);
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let new_plan = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        df.observe_results_cache_warmup_plan(&new_plan, &CacheNamespace::Public);
+        assert_eq!(
+            df.results_cache_warmer.templates_snapshot().len(),
+            MAX_WARMUP_PLANS,
+            "a full catalog must not record a new shape before stale entries are dropped"
+        );
+
+        df.run_warmup_templates(&df.results_cache_warmer.templates_snapshot(), None)
+            .await;
+        let after_replay = df.results_cache_warmer.templates_snapshot().len();
+        let replay_failures = loaded.saturating_sub(after_replay);
+
+        df.observe_results_cache_warmup_plan(&new_plan, &CacheNamespace::Public);
+        let final_catalog = df.results_cache_warmer.templates_snapshot();
+        let recorded_new = final_catalog.iter().any(|template| {
+            template
+                .bindings
+                .iter()
+                .any(|binding| binding.table == "orders")
+        });
+        eprintln!(
+            "loaded={loaded} replay_failures={replay_failures} recorded_new={recorded_new} final_catalog_size={}",
+            final_catalog.len()
+        );
+        assert_eq!(
+            replay_failures, MAX_WARMUP_PLANS,
+            "every stale template must be dropped after it fails to replay"
+        );
+        assert!(
+            recorded_new,
+            "a current plan must be recorded after stale entries are dropped"
+        );
+        assert_eq!(final_catalog.len(), 1);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[tokio::test]
+    async fn empty_distinct_replay_keeps_a_valid_template() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-empty-keep-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: "orders".to_string(),
+                column: "id".to_string(),
+            }],
+        };
+        tokio::fs::write(
+            &store,
+            serde_json::to_vec(std::slice::from_ref(&template)).expect("serialize"),
+        )
+        .await
+        .expect("write catalog");
+
+        let df = prepare_runtime(None, store.clone()).await;
+        register_table(&df, "orders", vec![]);
+        df.run_warmup_templates(&df.results_cache_warmer.templates_snapshot(), None)
+            .await;
+        assert_eq!(
+            df.results_cache_warmer.templates_snapshot().len(),
+            1,
+            "an empty DISTINCT result is not a failed plan and must stay in the catalog"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
     fn warmup_tpl(sql: &str) -> WarmupTemplate {
         WarmupTemplate {
             sql: sql.to_string(),
@@ -1629,6 +1817,34 @@ mod tests {
             template_sqls(&persisted),
             ["SELECT seed", "SELECT A", "SELECT B"]
         );
+    }
+
+    #[tokio::test]
+    async fn persist_remote_excluding_drops_unusable_templates() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let state = Arc::new(ObjectState::new(store));
+        let stale = warmup_tpl("SELECT stale");
+        let keep = warmup_tpl("SELECT keep");
+        state
+            .insert(WARMUP_STATE_KEY, &vec![stale.clone(), keep.clone()])
+            .await
+            .expect("seed catalog");
+
+        persist_remote_excluding(
+            Arc::clone(&state),
+            catalog_mutex(vec![keep.clone()]),
+            Arc::new(AtomicUsize::new(1)),
+            HashSet::from([template_id(&stale)]),
+        )
+        .await;
+
+        let persisted = state
+            .get(WARMUP_STATE_KEY)
+            .await
+            .expect("final get")
+            .expect("catalog exists");
+        assert_eq!(template_sqls(&persisted), ["SELECT keep"]);
     }
 
     #[tokio::test]
