@@ -31,7 +31,8 @@ use super::{
     AllocationOwner, CoveredRowRef, CoveringPageStore, CoveringReadView, EncodedKey, Error,
     IndexCatalog, IndexDefinition, IndexRun, IndexedSource, KeyDirectory, KeyDirectoryEntry,
     KeyPage, KeyPageId, KeyPageLease, PageLease, PayloadPage, PayloadPageId, PayloadPageLease,
-    Result, RunId, SchemaIdentity, SourceId, prepare_literal_seek, try_cover,
+    ProbeRequest, ProbeStep, Result, RunId, SchemaIdentity, SourceId, build_source, build_sources,
+    gather, prepare_literal_seek, probe_many, try_cover,
 };
 
 #[derive(Debug)]
@@ -108,6 +109,47 @@ fn row_ref(source: &SourceId, page: u32, row: usize) -> CoveredRowRef {
         u64::try_from(row).expect("test row ordinal fits"),
     )
     .expect("same-source row reference")
+}
+
+fn build_account(bytes: usize) -> Arc<CayenneMemoryAccount> {
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
+    Arc::new(CayenneMemoryAccount::new(
+        "covering-index-build-test",
+        &pool,
+    ))
+}
+
+fn key_value_batch(schema: Arc<Schema>, rows: usize, duplicate_key: bool) -> RecordBatch {
+    let keys: ArrayRef = Arc::new(Int64Array::from_iter_values((0..rows).map(|row| {
+        if duplicate_key {
+            7
+        } else {
+            i64::try_from(row).expect("test key fits i64")
+        }
+    })));
+    let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..rows).map(|row| format!("value-{row}")),
+    ));
+    RecordBatch::try_new(schema, vec![keys, values]).expect("valid source batch")
+}
+
+fn into_view(
+    definition: IndexDefinition,
+    source_id: SourceId,
+    built: super::BuiltCoveredSource,
+) -> Arc<CoveringReadView> {
+    let (source, runs, store) = built.into_parts();
+    let query_schema = source.schema().clone();
+    let page_store: Arc<dyn CoveringPageStore> = store;
+    let catalog = Arc::new(
+        IndexCatalog::new(definition, vec![source], runs.to_vec(), page_store)
+            .expect("complete built source creates a catalog"),
+    );
+    Arc::new(CoveringReadView::new(
+        catalog,
+        vec![source_id],
+        query_schema,
+    ))
 }
 
 #[test]
@@ -454,4 +496,137 @@ fn zero_column_payload_batches_retain_their_nonzero_row_count() {
     .expect("zero-column batch with rows");
     let page = PayloadPage::new(identity, batch).expect("payload page retains schema");
     assert_eq!(page.batch().num_rows(), 3);
+}
+
+#[tokio::test]
+async fn builder_packs_exact_page_limits_and_probe_streams_duplicate_spans() {
+    let schema = schema(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]);
+    let definition = definition(Arc::clone(&schema), &["key"]);
+    for (rows, expected_key_pages) in [(0, 0), (1, 1), (255, 1), (256, 1), (257, 2)] {
+        let source = SourceId::new(format!("limit-{rows}"), 1);
+        let built = build_source(
+            source,
+            definition.clone(),
+            (rows > 0)
+                .then(|| key_value_batch(Arc::clone(&schema), rows, false))
+                .into_iter()
+                .collect(),
+            build_account(8 * 1024 * 1024),
+        )
+        .await
+        .expect("admitted source builds");
+        assert_eq!(
+            built
+                .runs()
+                .iter()
+                .map(|run| run.directory().entries().len())
+                .sum::<usize>(),
+            expected_key_pages,
+            "{rows} rows use the configured key-page entry limit"
+        );
+    }
+
+    let source = SourceId::new("duplicate-span", 1);
+    let built = build_source(
+        source.clone(),
+        definition.clone(),
+        vec![key_value_batch(Arc::clone(&schema), 513, true)],
+        build_account(8 * 1024 * 1024),
+    )
+    .await
+    .expect("duplicate source builds");
+    assert_eq!(built.runs()[0].directory().entries().len(), 3);
+    assert_eq!(built.runs()[0].max_duplicate_key_count(), 513);
+
+    let key_column: ArrayRef = Arc::new(Int64Array::from(vec![7]));
+    let key = definition
+        .encode_probe_row(&[key_column], 0)
+        .expect("probe key encodes")
+        .expect("key is non-NULL");
+    let view = into_view(definition, source, built);
+    let empty = gather(&view, &[], &[1], 1, 1)
+        .await
+        .expect("empty gather retains its requested schema");
+    assert_eq!(empty.batch().num_rows(), 0);
+    assert_eq!(empty.batch().num_columns(), 1);
+    let mut cursor = probe_many(
+        Arc::clone(&view),
+        vec![ProbeRequest::new(4, key, vec![0, 1])],
+    );
+    let mut matches = Vec::new();
+    loop {
+        match cursor
+            .next_matches(200, 200 * std::mem::size_of::<super::ProbeMatch>())
+            .await
+            .expect("duplicate probe succeeds")
+        {
+            ProbeStep::Matches(chunk) => matches.extend(chunk),
+            ProbeStep::Pending => {}
+            ProbeStep::Exhausted => break,
+        }
+    }
+    assert_eq!(matches.len(), 513);
+    assert!(matches.iter().all(|matched| matched.request_ordinal() == 4));
+
+    let refs = vec![
+        matches[2].row_ref().clone(),
+        matches[1].row_ref().clone(),
+        matches[2].row_ref().clone(),
+    ];
+    let gathered = gather(&view, &refs, &[1], 3, 1024 * 1024)
+        .await
+        .expect("gather preserves repeated references");
+    let values = gathered
+        .batch()
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("gather retains its requested Utf8 column");
+    assert_eq!(values.value(0), "value-2");
+    assert_eq!(values.value(1), "value-1");
+    assert_eq!(values.value(2), "value-2");
+}
+
+#[tokio::test]
+async fn multiple_definitions_share_payload_pages_and_tight_admission_refuses_before_build() {
+    let schema = schema(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]);
+    let definitions = vec![
+        definition(Arc::clone(&schema), &["key"]),
+        definition(Arc::clone(&schema), &["value"]),
+    ];
+    let sources = build_sources(
+        SourceId::new("shared-pages", 1),
+        definitions,
+        vec![key_value_batch(Arc::clone(&schema), 10, false)],
+        build_account(8 * 1024 * 1024),
+    )
+    .await
+    .expect("two index definitions build over one payload source");
+    let first_id = sources[0].source().payload_pages()[0].clone();
+    let first = sources[0]
+        .page_store()
+        .load_payload_pages(std::slice::from_ref(&first_id))
+        .await
+        .expect("first store payload page");
+    let second = sources[1]
+        .page_store()
+        .load_payload_pages(std::slice::from_ref(&first_id))
+        .await
+        .expect("second store payload page");
+    assert!(Arc::ptr_eq(first[0].page(), second[0].page()));
+
+    let tight = build_source(
+        SourceId::new("tight-admission", 1),
+        definition(Arc::clone(&schema), &["key"]),
+        vec![key_value_batch(schema, 1, false)],
+        build_account(1),
+    )
+    .await;
+    assert!(matches!(tight, Err(Error::Unavailable { .. })));
 }

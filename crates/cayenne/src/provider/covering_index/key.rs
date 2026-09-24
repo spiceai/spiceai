@@ -340,6 +340,60 @@ impl IndexDefinition {
         let key = rows.row(0).as_ref().into();
         Ok(Some(EncodedKey(key)))
     }
+
+    /// Encode every row of a source batch, retaining the `None` marker for a
+    /// full key containing NULL. Builders use the same row converter as probes
+    /// so byte ordering cannot drift between construction and lookup.
+    pub(crate) fn encode_source_batch(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<Vec<Option<EncodedKey>>> {
+        if batch.schema_ref().as_ref() != self.schema.schema().as_ref() {
+            return Err(Error::InvalidContract {
+                message: "source batch schema differs from the index definition".to_string(),
+            });
+        }
+
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                batch
+                    .columns()
+                    .get(column.schema_index)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidContract {
+                        message: format!(
+                            "index column '{}' is outside its source batch schema",
+                            column.name
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let converter = RowConverter::new(
+            self.columns
+                .iter()
+                .map(|column| SortField::new(column.field.data_type().clone()))
+                .collect(),
+        )?;
+        let rows = converter.convert_columns(&columns)?;
+        if rows.num_rows() != batch.num_rows() {
+            return Err(Error::InvalidContract {
+                message: format!(
+                    "row converter produced {} keys for a {}-row source batch",
+                    rows.num_rows(),
+                    batch.num_rows()
+                ),
+            });
+        }
+
+        let mut encoded = Vec::with_capacity(batch.num_rows());
+        for (row, encoded_row) in rows.iter().enumerate() {
+            let contains_null = columns.iter().any(|column| column.is_null(row));
+            encoded.push((!contains_null).then(|| EncodedKey(encoded_row.as_ref().into())));
+        }
+        Ok(encoded)
+    }
 }
 
 /// Encoded full key bytes produced only by an [`IndexDefinition`].

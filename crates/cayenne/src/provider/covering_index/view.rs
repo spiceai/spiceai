@@ -19,9 +19,12 @@ limitations under the License.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, new_empty_array};
+
 use super::{
     CoveredRowRef, CoveringPageStore, EncodedKey, Error, IndexDefinition, IndexRun,
-    KeyDirectoryEntry, LiteralSeekSpan, PreparedLiteralSeek, Result, SchemaIdentity, SourceId,
+    KeyDirectoryEntry, KeyPageId, KeyPageLease, LiteralSeekSpan, PayloadPageId,
+    PreparedLiteralSeek, Result, SchemaIdentity, SourceId,
 };
 
 /// Immutable source coverage available to a captured view.
@@ -360,42 +363,390 @@ pub(crate) enum ProbeStep {
     Exhausted,
 }
 
+/// One distinct request key's work against one key page.
+#[derive(Debug)]
+struct ProbePageWork {
+    source: SourceId,
+    page: KeyPageId,
+    expected_entries: usize,
+    key: EncodedKey,
+    request_ordinals: Arc<[usize]>,
+}
+
+/// A loaded key page held only while the cursor consumes its matching range.
+#[derive(Debug)]
+struct ActiveProbePage {
+    work_index: usize,
+    lease: KeyPageLease,
+    next_entry: usize,
+    end_entry: usize,
+    next_request: usize,
+}
+
 /// Resumable state for page-bounded probing.
 ///
-/// The actual page traversal is intentionally not implemented in this contract
-/// step. The cursor's API distinguishes a temporary empty chunk from a proven
-/// empty result so an executor cannot mistake a page boundary for exhaustion.
+/// Work is sorted and deduplicated by key while retaining all originating
+/// request ordinals. The cursor holds at most one key-page lease while walking
+/// its duplicate span, so a very common key is emitted in bounded chunks.
 #[derive(Debug)]
 pub(crate) struct ProbeCursor {
-    _view: Arc<CoveringReadView>,
-    _requests: Arc<[ProbeRequest]>,
+    view: Arc<CoveringReadView>,
+    work: Vec<ProbePageWork>,
+    next_work: usize,
+    active: Option<ActiveProbePage>,
 }
 
 impl ProbeCursor {
     /// Begin a bounded probe over a pinned view.
     #[must_use]
     pub(crate) fn new(view: Arc<CoveringReadView>, requests: Vec<ProbeRequest>) -> Self {
+        let mut distinct = BTreeMap::<EncodedKey, Vec<usize>>::new();
+        for request in requests {
+            distinct
+                .entry(request.key().clone())
+                .or_default()
+                .push(request.request_ordinal());
+        }
+        let mut work = Vec::new();
+        for (key, request_ordinals) in distinct {
+            let request_ordinals: Arc<[usize]> = request_ordinals.into();
+            for run in view.catalog().runs() {
+                for entry in run.directory().candidate_pages(&key) {
+                    work.push(ProbePageWork {
+                        source: run.source().clone(),
+                        page: entry.page().clone(),
+                        expected_entries: entry.entry_count(),
+                        key: key.clone(),
+                        request_ordinals: Arc::clone(&request_ordinals),
+                    });
+                }
+            }
+        }
         Self {
-            _view: view,
-            _requests: requests.into(),
+            view,
+            work,
+            next_work: 0,
+            active: None,
         }
     }
 
     /// Advance no farther than `max_rows` and `byte_budget` permit.
-    ///
-    /// The page-run executor lands in step 06. Returning a typed error here
-    /// preserves the no-fallback-after-emission invariant; it is never reported
-    /// as an empty or exhausted probe.
     pub(crate) async fn next_matches(
         &mut self,
-        _max_rows: usize,
-        _byte_budget: usize,
+        max_rows: usize,
+        byte_budget: usize,
     ) -> Result<ProbeStep> {
-        std::future::ready(()).await;
-        Err(Error::NotImplemented {
-            operation: "covering-index page probe",
-        })
+        if max_rows == 0 || byte_budget == 0 {
+            return Err(Error::InvalidContract {
+                message: "probe chunk limits must both be greater than zero".to_string(),
+            });
+        }
+
+        let mut matches = Vec::new();
+        let mut emitted_bytes = 0usize;
+        loop {
+            if let Some(active) = self.active.as_mut() {
+                let work =
+                    self.work
+                        .get(active.work_index)
+                        .ok_or_else(|| Error::InvalidContract {
+                            message: "probe cursor lost its active page work".to_string(),
+                        })?;
+                if active.next_entry == active.end_entry {
+                    self.active = None;
+                    self.next_work = self.next_work.checked_add(1).ok_or(Error::Overflow {
+                        operation: "probe page work index",
+                    })?;
+                    continue;
+                }
+                let row_ref = active.lease.page().row_ref(active.next_entry)?;
+                validate_probe_row_ref(&self.view, &work.source, row_ref)?;
+                let match_bytes = std::mem::size_of::<ProbeMatch>();
+                let exceeds_bytes = emitted_bytes
+                    .checked_add(match_bytes)
+                    .is_none_or(|bytes| bytes > byte_budget);
+                if !matches.is_empty() && (matches.len() == max_rows || exceeds_bytes) {
+                    return Ok(ProbeStep::Matches(matches));
+                }
+                matches.push(ProbeMatch::new(
+                    *work
+                        .request_ordinals
+                        .get(active.next_request)
+                        .ok_or_else(|| Error::InvalidContract {
+                            message: "probe cursor lost a request ordinal".to_string(),
+                        })?,
+                    row_ref.clone(),
+                ));
+                emitted_bytes = emitted_bytes.saturating_add(match_bytes);
+                active.next_request =
+                    active.next_request.checked_add(1).ok_or(Error::Overflow {
+                        operation: "probe request ordinal index",
+                    })?;
+                if active.next_request == work.request_ordinals.len() {
+                    active.next_request = 0;
+                    active.next_entry =
+                        active.next_entry.checked_add(1).ok_or(Error::Overflow {
+                            operation: "probe key-page entry index",
+                        })?;
+                }
+                if matches.len() == max_rows {
+                    return Ok(ProbeStep::Matches(matches));
+                }
+                continue;
+            }
+
+            let Some(work) = self.work.get(self.next_work) else {
+                return if matches.is_empty() {
+                    Ok(ProbeStep::Exhausted)
+                } else {
+                    Ok(ProbeStep::Matches(matches))
+                };
+            };
+            let mut leases = self
+                .view
+                .catalog()
+                .page_store()
+                .load_key_pages(std::slice::from_ref(&work.page))
+                .await?;
+            let lease = leases.pop().ok_or_else(|| Error::InvalidContract {
+                message: "page store returned no lease for one requested key page".to_string(),
+            })?;
+            if !leases.is_empty() {
+                return Err(Error::InvalidContract {
+                    message: "page store returned too many leases for one requested key page"
+                        .to_string(),
+                });
+            }
+            let (first, end) = exact_key_range_for_page(
+                &work.page,
+                work.expected_entries,
+                lease.page(),
+                &work.key,
+            )?;
+            if first == end {
+                self.next_work = self.next_work.checked_add(1).ok_or(Error::Overflow {
+                    operation: "probe page work index",
+                })?;
+                continue;
+            }
+            self.active = Some(ActiveProbePage {
+                work_index: self.next_work,
+                lease,
+                next_entry: first,
+                end_entry: end,
+                next_request: 0,
+            });
+        }
     }
+}
+
+/// Start a bounded duplicate-preserving probe over a pinned view.
+#[must_use]
+pub(crate) fn probe_many(view: Arc<CoveringReadView>, requests: Vec<ProbeRequest>) -> ProbeCursor {
+    ProbeCursor::new(view, requests)
+}
+
+/// One bounded payload gather result. `consumed` tells the caller where the
+/// next request chunk begins without silently dropping repeated row references.
+#[derive(Debug)]
+pub(crate) struct GatherBatch {
+    batch: RecordBatch,
+    consumed: usize,
+}
+
+impl GatherBatch {
+    /// Requested projection in the exact requested row-reference order.
+    #[must_use]
+    pub(crate) fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    /// Number of input references represented in `batch`.
+    #[must_use]
+    pub(crate) const fn consumed(&self) -> usize {
+        self.consumed
+    }
+}
+
+/// Gather projected payload values for a bounded prefix of row references.
+///
+/// The implementation loads each distinct payload page once, uses Arrow's
+/// interleave kernel rather than scalar cells, and restores the caller's exact
+/// input order (including repeated references).
+pub(crate) async fn gather(
+    view: &CoveringReadView,
+    row_refs: &[CoveredRowRef],
+    projection: &[usize],
+    max_rows: usize,
+    byte_budget: usize,
+) -> Result<GatherBatch> {
+    if max_rows == 0 || byte_budget == 0 {
+        return Err(Error::InvalidContract {
+            message: "gather chunk limits must both be greater than zero".to_string(),
+        });
+    }
+    let mut count = row_refs.len().min(max_rows);
+    loop {
+        let batch = gather_prefix(view, &row_refs[..count], projection).await?;
+        if count <= 1 || batch.get_array_memory_size() <= byte_budget {
+            return Ok(GatherBatch {
+                batch,
+                consumed: count,
+            });
+        }
+        count = count.checked_add(1).ok_or(Error::Overflow {
+            operation: "gather prefix shrink",
+        })? / 2;
+    }
+}
+
+async fn gather_prefix(
+    view: &CoveringReadView,
+    row_refs: &[CoveredRowRef],
+    projection: &[usize],
+) -> Result<RecordBatch> {
+    let output_schema = view
+        .query_schema()
+        .schema()
+        .project(projection)
+        .map_err(|source| Error::Arrow { source })?;
+    if row_refs.is_empty() {
+        let columns = output_schema
+            .fields()
+            .iter()
+            .map(|field| new_empty_array(field.data_type()))
+            .collect();
+        return RecordBatch::try_new_with_options(
+            Arc::new(output_schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(0)),
+        )
+        .map_err(|source| Error::Arrow { source });
+    }
+
+    let mut grouped = BTreeMap::<PayloadPageId, Vec<(usize, usize)>>::new();
+    for (output, row_ref) in row_refs.iter().enumerate() {
+        validate_probe_row_ref(view, row_ref.source(), row_ref)?;
+        grouped
+            .entry(row_ref.payload_page().clone())
+            .or_default()
+            .push((output, row_ref.row_in_page()));
+    }
+    let page_ids = grouped.keys().cloned().collect::<Vec<_>>();
+    let leases = view
+        .catalog()
+        .page_store()
+        .load_payload_pages(&page_ids)
+        .await?;
+    if leases.len() != page_ids.len() {
+        return Err(Error::InvalidContract {
+            message: format!(
+                "page store returned {} payload leases for {} requested pages",
+                leases.len(),
+                page_ids.len()
+            ),
+        });
+    }
+
+    let mut position = vec![None; row_refs.len()];
+    let mut pages = Vec::with_capacity(leases.len());
+    for (page_index, (id, lease)) in page_ids.iter().zip(leases.iter()).enumerate() {
+        let source =
+            view.catalog()
+                .sources()
+                .get(id.source())
+                .ok_or_else(|| Error::InvalidContract {
+                    message: format!("payload page {id:?} belongs to an unknown source"),
+                })?;
+        if !lease.page().schema().matches(source.schema()) {
+            return Err(Error::InvalidContract {
+                message: format!("payload page {id:?} has a mismatched source schema"),
+            });
+        }
+        for (output, row) in grouped.get(id).ok_or_else(|| Error::InvalidContract {
+            message: format!("payload page {id:?} disappeared from its gather group"),
+        })? {
+            if *row >= lease.page().batch().num_rows() {
+                return Err(Error::InvalidContract {
+                    message: format!("row {row} is outside payload page {id:?}"),
+                });
+            }
+            position[*output] = Some((page_index, *row));
+        }
+        pages.push(lease.page().batch());
+    }
+    let positions = position
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::InvalidContract {
+            message: "gather output has an unassigned row position".to_string(),
+        })?;
+    let columns = projection
+        .iter()
+        .map(|column| gather_column(&pages, &positions, *column))
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new_with_options(
+        Arc::new(output_schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_refs.len())),
+    )
+    .map_err(|source| Error::Arrow { source })
+}
+
+fn gather_column(
+    pages: &[&RecordBatch],
+    positions: &[(usize, usize)],
+    column: usize,
+) -> Result<ArrayRef> {
+    let arrays = pages
+        .iter()
+        .map(|page| {
+            page.columns()
+                .get(column)
+                .map(AsRef::as_ref)
+                .ok_or_else(|| Error::InvalidContract {
+                    message: format!("projection column {column} is outside a payload page schema"),
+                })
+        })
+        .collect::<Result<Vec<&dyn Array>>>()?;
+    arrow::compute::interleave(&arrays, positions).map_err(|source| Error::Arrow { source })
+}
+
+fn validate_probe_row_ref(
+    view: &CoveringReadView,
+    source_id: &SourceId,
+    row_ref: &CoveredRowRef,
+) -> Result<()> {
+    if row_ref.source() != source_id || row_ref.payload_page().source() != source_id {
+        return Err(Error::InvalidContract {
+            message: "probe row reference crosses source generations".to_string(),
+        });
+    }
+    let source = view
+        .catalog()
+        .sources()
+        .get(source_id)
+        .ok_or_else(|| Error::InvalidContract {
+            message: format!("probe row reference names unknown source {source_id:?}"),
+        })?;
+    if !source.payload_pages().contains(row_ref.payload_page()) {
+        return Err(Error::InvalidContract {
+            message: format!(
+                "probe row reference names payload page {:?} absent from its source",
+                row_ref.payload_page()
+            ),
+        });
+    }
+    if row_ref.source_row_ordinal()
+        >= u64::try_from(source.row_count()).map_err(|_| Error::Overflow {
+            operation: "source row count conversion",
+        })?
+    {
+        return Err(Error::InvalidContract {
+            message: "probe row reference is outside its source row count".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Prepare compact literal-seek spans without materializing matching row refs.
@@ -416,10 +767,16 @@ pub(crate) async fn prepare_literal_seek(
         if entries.is_empty() {
             continue;
         }
-        let ids = entries
-            .iter()
-            .map(|entry| entry.page().clone())
-            .collect::<Vec<_>>();
+        let first_entry = entries.first().ok_or_else(|| Error::InvalidContract {
+            message: "literal seek lost its first candidate page".to_string(),
+        })?;
+        let last_entry = entries.last().ok_or_else(|| Error::InvalidContract {
+            message: "literal seek lost its last candidate page".to_string(),
+        })?;
+        let mut ids = vec![first_entry.page().clone()];
+        if last_entry.page() != first_entry.page() {
+            ids.push(last_entry.page().clone());
+        }
         let leases = view.catalog.page_store().load_key_pages(&ids).await?;
         if leases.len() != ids.len() {
             return Err(Error::InvalidContract {
@@ -431,12 +788,18 @@ pub(crate) async fn prepare_literal_seek(
             });
         }
 
-        for (entry, lease) in entries.iter().zip(leases.iter()) {
-            let (first, end) = exact_key_range(entry, lease.page(), key)?;
-            if first == end {
+        let first_lease = leases.first().ok_or_else(|| Error::InvalidContract {
+            message: "page store returned no boundary lease for a literal seek".to_string(),
+        })?;
+        let last_lease = leases.last().ok_or_else(|| Error::InvalidContract {
+            message: "page store returned no final boundary lease for a literal seek".to_string(),
+        })?;
+        let (first_offset, first_end) = exact_key_range(first_entry, first_lease.page(), key)?;
+        if first_entry.page() == last_entry.page() {
+            if first_offset == first_end {
                 continue;
             }
-            let matched = end.checked_sub(first).ok_or(Error::Overflow {
+            let matched = first_end.checked_sub(first_offset).ok_or(Error::Overflow {
                 operation: "literal seek entry count",
             })?;
             total = total.checked_add(matched).ok_or(Error::Overflow {
@@ -445,11 +808,50 @@ pub(crate) async fn prepare_literal_seek(
             spans.push(LiteralSeekSpan::single_page(
                 run.source().clone(),
                 run.run(),
-                entry.page().clone(),
-                first,
-                end,
+                first_entry.page().clone(),
+                first_offset,
+                first_end,
             )?);
+            continue;
         }
+
+        let (last_start, last_end) = exact_key_range(last_entry, last_lease.page(), key)?;
+        if first_offset == first_end || last_start == last_end {
+            return Err(Error::InvalidContract {
+                message: "literal seek directory bounds do not match their boundary key pages"
+                    .to_string(),
+            });
+        }
+        if first_end != first_entry.entry_count() || last_start != 0 {
+            return Err(Error::InvalidContract {
+                message: "literal seek duplicate range is not contiguous across key pages"
+                    .to_string(),
+            });
+        }
+        let mut matched = first_end.checked_sub(first_offset).ok_or(Error::Overflow {
+            operation: "literal seek first boundary count",
+        })?;
+        for entry in &entries[1..entries.len() - 1] {
+            matched = matched
+                .checked_add(entry.entry_count())
+                .ok_or(Error::Overflow {
+                    operation: "literal seek interior page count",
+                })?;
+        }
+        matched = matched.checked_add(last_end).ok_or(Error::Overflow {
+            operation: "literal seek final boundary count",
+        })?;
+        total = total.checked_add(matched).ok_or(Error::Overflow {
+            operation: "literal seek total entry count",
+        })?;
+        spans.push(LiteralSeekSpan::new(
+            run.source().clone(),
+            run.run(),
+            first_entry.page().clone(),
+            first_offset,
+            last_entry.page().clone(),
+            last_end,
+        )?);
     }
 
     PreparedLiteralSeek::new(spans, total)
@@ -482,6 +884,28 @@ fn exact_key_range(
     let lower = page_lower_bound(page, key)?;
     let upper = page_upper_bound(page, key)?;
     Ok((lower, upper))
+}
+
+fn exact_key_range_for_page(
+    page_id: &KeyPageId,
+    expected_entries: usize,
+    page: &super::KeyPage,
+    key: &EncodedKey,
+) -> Result<(usize, usize)> {
+    if page.is_empty() {
+        return Err(Error::InvalidContract {
+            message: format!("probe key page {page_id:?} is empty"),
+        });
+    }
+    if page.len() != expected_entries {
+        return Err(Error::InvalidContract {
+            message: format!(
+                "directory for {page_id:?} says {expected_entries} entries but page has {}",
+                page.len()
+            ),
+        });
+    }
+    Ok((page_lower_bound(page, key)?, page_upper_bound(page, key)?))
 }
 
 fn page_lower_bound(page: &super::KeyPage, key: &EncodedKey) -> Result<usize> {

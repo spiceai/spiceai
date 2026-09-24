@@ -1241,6 +1241,22 @@ impl CpuBudget {
         self.cores
     }
 
+    /// Threads in Cayenne's bounded covering-index construction pool.
+    ///
+    /// Index construction is optional work that must not consume an unbounded
+    /// share of a process with a large CPU entitlement. Keeping this derivation
+    /// here makes the CPU budget the single source of truth for every pool.
+    #[must_use]
+    pub const fn cayenne_index_threads(&self) -> usize {
+        if self.cores < 1 {
+            1
+        } else if self.cores > 4 {
+            4
+        } else {
+            self.cores
+        }
+    }
+
     /// `DuckDB`'s per-instance `threads` setting. `DuckDB` otherwise sizes its
     /// own pool from the host core count, the same over-commitment this crate
     /// exists to prevent.
@@ -2697,5 +2713,12 @@ mod tests {
         assert_eq!(format_millicores(3500), "3.5 cores");
         assert_eq!(format_millicores(500), "500m");
         assert_eq!(format_millicores(1250), "1.25 cores");
+    }
+
+    #[test]
+    fn cayenne_covering_index_threads_are_capped_by_the_cpu_budget() {
+        assert_eq!(budget(1).cayenne_index_threads(), 1);
+        assert_eq!(budget(4).cayenne_index_threads(), 4);
+        assert_eq!(budget(64).cayenne_index_threads(), 4);
     }
 }

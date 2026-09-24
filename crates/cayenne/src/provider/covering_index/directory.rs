@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use super::{EncodedKey, Error, KeyPageId, Result, SourceId};
+use super::{EncodedKey, Error, KeyPageId, ReservationToken, Result, SourceId};
 
 /// Identifier of one sorted key run within a source generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -151,10 +151,11 @@ impl KeyDirectory {
     /// single binary-search hit.
     #[must_use]
     pub(crate) fn candidate_pages(&self, key: &EncodedKey) -> Vec<&KeyDirectoryEntry> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.first_key() <= key && key <= entry.last_key())
-            .collect()
+        let first = self.entries.partition_point(|entry| entry.last_key() < key);
+        let end = self
+            .entries
+            .partition_point(|entry| entry.first_key() <= key);
+        self.entries[first..end].iter().collect()
     }
 }
 
@@ -164,6 +165,8 @@ pub(crate) struct IndexRun {
     source: SourceId,
     run: RunId,
     directory: KeyDirectory,
+    max_duplicate_key_count: usize,
+    reservation: Option<ReservationToken>,
 }
 
 impl IndexRun {
@@ -183,7 +186,20 @@ impl IndexRun {
             source,
             run,
             directory,
+            max_duplicate_key_count: 0,
+            reservation: None,
         })
+    }
+
+    /// Attach construction metadata and the directory's admitted allocation.
+    pub(crate) fn with_metadata(
+        mut self,
+        max_duplicate_key_count: usize,
+        reservation: ReservationToken,
+    ) -> Self {
+        self.max_duplicate_key_count = max_duplicate_key_count;
+        self.reservation = Some(reservation);
+        self
     }
 
     /// Source generation owning this run.
@@ -202,6 +218,12 @@ impl IndexRun {
     #[must_use]
     pub(crate) fn directory(&self) -> &KeyDirectory {
         &self.directory
+    }
+
+    /// Maximum number of identical full keys in this run.
+    #[must_use]
+    pub(crate) const fn max_duplicate_key_count(&self) -> usize {
+        self.max_duplicate_key_count
     }
 }
 
@@ -226,6 +248,37 @@ pub(crate) struct LiteralSeekSpan {
 }
 
 impl LiteralSeekSpan {
+    /// Validate a possibly multi-page range in a sorted run.
+    pub(crate) fn new(
+        source: SourceId,
+        run: RunId,
+        first_page: KeyPageId,
+        first_offset: usize,
+        last_page: KeyPageId,
+        end_offset: usize,
+    ) -> Result<Self> {
+        if first_page.source() != &source || last_page.source() != &source {
+            return Err(Error::InvalidContract {
+                message: format!("literal seek pages do not belong to source {source:?}"),
+            });
+        }
+        if first_page.page() > last_page.page()
+            || (first_page == last_page && first_offset >= end_offset)
+        {
+            return Err(Error::InvalidContract {
+                message: "literal seek span is not a nonempty page range".to_string(),
+            });
+        }
+        Ok(Self {
+            source,
+            run,
+            first_page,
+            first_offset,
+            last_page,
+            end_offset,
+        })
+    }
+
     /// Validate source ownership and a nonempty single-page range.
     pub(crate) fn single_page(
         source: SourceId,
@@ -234,24 +287,7 @@ impl LiteralSeekSpan {
         first_offset: usize,
         end_offset: usize,
     ) -> Result<Self> {
-        if page.source() != &source {
-            return Err(Error::InvalidContract {
-                message: format!("literal seek page {page:?} does not belong to {source:?}"),
-            });
-        }
-        if first_offset >= end_offset {
-            return Err(Error::InvalidContract {
-                message: "literal seek spans must contain at least one entry".to_string(),
-            });
-        }
-        Ok(Self {
-            source,
-            run,
-            first_page: page.clone(),
-            first_offset,
-            last_page: page,
-            end_offset,
-        })
+        Self::new(source, run, page.clone(), first_offset, page, end_offset)
     }
 }
 

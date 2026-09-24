@@ -62,7 +62,9 @@ limitations under the License.
     reason = "these contracts are introduced before their builder, publisher, and executor steps"
 )]
 
+mod build;
 mod directory;
+mod executor;
 mod key;
 mod page_store;
 mod view;
@@ -70,20 +72,23 @@ mod view;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use build::{BuiltCoveredSource, build_source, build_sources};
 pub(crate) use directory::{
     IndexRun, KeyDirectory, KeyDirectoryEntry, LiteralSeekSpan, PreparedLiteralSeek, RunId,
 };
+pub(crate) use executor::CayenneIndexExecutor;
 pub(crate) use key::{
     CoveredRowRef, EncodedKey, IndexColumn, IndexDefinition, KEY_CODEC_VERSION, KeyPageId,
     PayloadPageId, SchemaIdentity, SourceId,
 };
 pub(crate) use page_store::{
-    AllocationOwner, CoveringPageStore, KeyPage, KeyPageLease, PageLease, PayloadPage,
-    PayloadPageLease, ReservationToken,
+    AllocationOwner, CoveringPageStore, KeyPage, KeyPageLease, MemoryPageStore, PageLease,
+    PayloadPage, PayloadPageLease, ReservationToken,
 };
 pub(crate) use view::{
-    CoverageDecision, CoverageUnavailableReason, CoveringReadView, IndexCatalog, IndexedSource,
-    ProbeCursor, ProbeMatch, ProbeRequest, ProbeStep, prepare_literal_seek, try_cover,
+    CoverageDecision, CoverageUnavailableReason, CoveringReadView, GatherBatch, IndexCatalog,
+    IndexedSource, ProbeCursor, ProbeMatch, ProbeRequest, ProbeStep, gather, prepare_literal_seek,
+    probe_many, try_cover,
 };
 
 use snafu::prelude::*;
@@ -130,6 +135,17 @@ pub(crate) enum Error {
         /// The unavailable operation.
         operation: &'static str,
     },
+
+    /// Optional covering work could not be admitted or completed.
+    #[snafu(display("Covering-index work is unavailable: {operation}"))]
+    Unavailable {
+        /// The construction, executor, or allocation operation that declined.
+        operation: String,
+    },
+
+    /// A background build was cancelled before publication.
+    #[snafu(display("Covering-index build was cancelled"))]
+    Cancelled,
 
     /// Arrow rejected an array, schema, or record batch.
     #[snafu(transparent)]

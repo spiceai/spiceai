@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Immutable key/payload pages and their pinning contract.
 
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -285,4 +286,92 @@ pub(crate) trait CoveringPageStore: Debug + Send + Sync {
 
     /// Load each requested payload page in exactly the input order.
     async fn load_payload_pages(&self, ids: &[PayloadPageId]) -> Result<Vec<PayloadPageLease>>;
+}
+
+/// Immutable in-memory page store for a complete covered source.
+///
+/// The maps own one lease per page. Loading clones the lease, so repeated page
+/// identifiers preserve caller order while every consumer retains the page's
+/// accounting pin.
+#[derive(Debug, Default)]
+pub(crate) struct MemoryPageStore {
+    key_pages: BTreeMap<KeyPageId, KeyPageLease>,
+    payload_pages: BTreeMap<PayloadPageId, PayloadPageLease>,
+}
+
+impl MemoryPageStore {
+    /// Construct a store, rejecting duplicate IDs before publishing ownership.
+    pub(crate) fn new(
+        key_pages: impl IntoIterator<Item = (KeyPageId, KeyPageLease)>,
+        payload_pages: impl IntoIterator<Item = (PayloadPageId, PayloadPageLease)>,
+    ) -> Result<Self> {
+        let mut store = Self::default();
+        for (id, lease) in key_pages {
+            if store.key_pages.insert(id.clone(), lease).is_some() {
+                return Err(Error::InvalidContract {
+                    message: format!("memory page store contains key page {id:?} more than once"),
+                });
+            }
+        }
+        for (id, lease) in payload_pages {
+            if store.payload_pages.insert(id.clone(), lease).is_some() {
+                return Err(Error::InvalidContract {
+                    message: format!(
+                        "memory page store contains payload page {id:?} more than once"
+                    ),
+                });
+            }
+        }
+        Ok(store)
+    }
+
+    /// Whether this immutable store owns a payload page ID.
+    #[must_use]
+    pub(crate) fn contains_payload_page(&self, id: &PayloadPageId) -> bool {
+        self.payload_pages.contains_key(id)
+    }
+
+    /// Whether this immutable store owns a key page ID.
+    #[must_use]
+    pub(crate) fn contains_key_page(&self, id: &KeyPageId) -> bool {
+        self.key_pages.contains_key(id)
+    }
+
+    /// Clone every payload lease for another index over the same source.
+    ///
+    /// The leases share immutable pages and their buffer-owned charges; only
+    /// the other index's key pages need additional resident memory.
+    #[must_use]
+    pub(crate) fn payload_page_leases(&self) -> BTreeMap<PayloadPageId, PayloadPageLease> {
+        self.payload_pages.clone()
+    }
+}
+
+#[async_trait]
+impl CoveringPageStore for MemoryPageStore {
+    async fn load_key_pages(&self, ids: &[KeyPageId]) -> Result<Vec<KeyPageLease>> {
+        ids.iter()
+            .map(|id| {
+                self.key_pages
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingPage {
+                        page: format!("{id:?}"),
+                    })
+            })
+            .collect()
+    }
+
+    async fn load_payload_pages(&self, ids: &[PayloadPageId]) -> Result<Vec<PayloadPageLease>> {
+        ids.iter()
+            .map(|id| {
+                self.payload_pages
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingPage {
+                        page: format!("{id:?}"),
+                    })
+            })
+            .collect()
+    }
 }
