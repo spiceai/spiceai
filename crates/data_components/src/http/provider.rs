@@ -5250,7 +5250,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept request");
             let mut buffer = [0; 4096];
-            stream.read(&mut buffer).await.expect("read request");
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
             let body = "{\"error\":\"final-response\"}";
             let headers = format!(
                 "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
