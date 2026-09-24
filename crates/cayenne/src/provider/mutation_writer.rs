@@ -1255,7 +1255,7 @@ impl<'a> AppendMutationWriter<'a> {
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = self
             .table
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 prepared_stream,
                 target_size_bytes,
                 &new_snapshot_id,

@@ -9602,7 +9602,7 @@ impl CayenneTableProvider {
         // One index build for the whole snapshot: every shard's writer reports
         // its batches to the same builder (it serializes them internally), and
         // the index is finished once, after the last shard, over all the files.
-        let index_builder = self.begin_snapshot_lookup_index(snapshot_id);
+        let index_builder = self.begin_snapshot_index_build(snapshot_id);
         let mut handles = Vec::with_capacity(units.len());
         for unit in units {
             // A shallow writer clone (all Arc fields) so the encode can run on its
@@ -9663,7 +9663,7 @@ impl CayenneTableProvider {
             total_files = total_files.saturating_add(files);
             merged_stats.merge_from(stats.as_ref());
         }
-        self.finish_snapshot_lookup_index(index_builder, snapshot_id, total_rows)
+        self.finish_snapshot_index_build(index_builder, snapshot_id, total_rows)
             .await;
         Ok((total_files, merged_stats))
     }
@@ -17668,7 +17668,7 @@ impl CayenneTableProvider {
             // unsorted rewrite is free to fan out. No size estimate is needed
             // once pinned. See `rewrite_write_policy` for why the partition hint
             // cannot carry this on its own.
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 sorted_stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -21296,7 +21296,7 @@ impl CayenneTableProvider {
 
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_result = self
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -23413,7 +23413,7 @@ impl CayenneTableProvider {
         // range bounds for the encoders the write will actually create.
         let write_start = std::time::Instant::now();
         let write_result = self
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -24175,7 +24175,7 @@ impl CayenneTableProvider {
             total_input_bytes,
         );
         let write_result = self
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -30508,7 +30508,7 @@ impl CayenneTableProvider {
                 // N==1: the single coordinated encode over the merged corpus —
                 // byte-identical to the pre-sharding path.
                 let (_rows, files, stats) = self
-                    .write_to_indexed_snapshot(
+                    .write_new_snapshot_with_index(
                         stream,
                         target_size_bytes,
                         &new_snapshot_id,
@@ -31669,7 +31669,7 @@ impl CayenneTableProvider {
 
         // Write data to the new snapshot
         let (total_rows, chunk_count, stats_acc) = self
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -32861,7 +32861,7 @@ impl CayenneTableProvider {
             // lookup reads only the files, and rows, that can hold its key — and
             // no file at all from a snapshot that never saw it.
             let lookup_selection = self.lookup_index.as_ref().and_then(|state| {
-                state.probe_snapshot(snapshot_id, &scalar_for, scan.lookup_report)
+                state.probe_snapshot(snapshot_id, &scalar_for, scan.outcome_recorder)
             });
             let plan = self
                 .create_snapshot_scan_plan_with_config(
@@ -34611,7 +34611,7 @@ impl CayenneTableProvider {
     ///
     /// [`LookupIndexState::promote_snapshot`]: super::lookup_index::LookupIndexState::promote_snapshot
     #[expect(clippy::too_many_arguments)]
-    pub(crate) async fn write_to_indexed_snapshot(
+    pub(crate) async fn write_new_snapshot_with_index(
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
@@ -34621,7 +34621,22 @@ impl CayenneTableProvider {
         policy: super::delta_encoding::WritePolicy,
         range: Option<RangePartitioning<'_>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
-        let builder = self.begin_snapshot_lookup_index(snapshot_id);
+        if self.lookup_index.is_none() {
+            // No `indexes` declared: exactly the plain write.
+            return self
+                .write_to_snapshot_range_partitioned(
+                    stream,
+                    target_size_bytes,
+                    snapshot_id,
+                    target_partitions,
+                    estimated_bytes,
+                    policy,
+                    range,
+                    None,
+                )
+                .await;
+        }
+        let builder = self.begin_snapshot_index_build(snapshot_id);
         let written = self
             .write_to_snapshot_range_partitioned(
                 stream,
@@ -34634,7 +34649,7 @@ impl CayenneTableProvider {
                 Self::snapshot_index_observer(builder.as_ref()),
             )
             .await?;
-        self.finish_snapshot_lookup_index(builder, snapshot_id, written.0)
+        self.finish_snapshot_index_build(builder, snapshot_id, written.0)
             .await;
         Ok(written)
     }
@@ -34642,9 +34657,9 @@ impl CayenneTableProvider {
     /// Starts the write-time index build for a new snapshot directory, or `None`
     /// when the table is not indexed. Several writers may feed the returned
     /// builder at once — the mem-tier checkpoint encodes its shards into one
-    /// snapshot concurrently — and [`Self::finish_snapshot_lookup_index`] runs
+    /// snapshot concurrently — and [`Self::finish_snapshot_index_build`] runs
     /// once, after all of them.
-    fn begin_snapshot_lookup_index(
+    fn begin_snapshot_index_build(
         &self,
         snapshot_id: &str,
     ) -> Option<Arc<super::lookup_index::IncrementalIndexBuilder>> {
@@ -34661,11 +34676,11 @@ impl CayenneTableProvider {
         builder.map(|builder| Arc::clone(builder) as Arc<dyn VortexWriteObserver>)
     }
 
-    /// Finishes a build begun by [`Self::begin_snapshot_lookup_index`] once every
+    /// Finishes a build begun by [`Self::begin_snapshot_index_build`] once every
     /// file of `snapshot_id` is written, and registers the index under the
     /// snapshot id. A write with no rows leaves no files to index: the snapshot
     /// is either not published at all or publishes nothing a lookup could read.
-    async fn finish_snapshot_lookup_index(
+    async fn finish_snapshot_index_build(
         &self,
         builder: Option<Arc<super::lookup_index::IncrementalIndexBuilder>>,
         snapshot_id: &str,
@@ -34707,19 +34722,22 @@ impl CayenneTableProvider {
             .map(|state| state.snapshot_index_footprint())
     }
 
-    /// A guard for the index [`Self::write_to_indexed_snapshot`] will register
+    /// A guard for the index [`Self::write_new_snapshot_with_index`] will register
     /// under `snapshot_id`: dropped before the snapshot is published — an error
     /// returned with `?`, a cancelled write — it discards that index, so an
     /// abandoned write can never keep an unpublished index and its memory. Take
     /// it when the snapshot id is chosen and hold it until the publish.
     pub(crate) fn snapshot_index_guard(&self, snapshot_id: &str) -> SnapshotIndexGuard {
         SnapshotIndexGuard {
-            state: self.lookup_index.as_ref().map(Arc::clone),
-            snapshot_id: snapshot_id.to_string(),
+            // A table with no index allocates nothing here.
+            index: self
+                .lookup_index
+                .as_ref()
+                .map(|state| (Arc::clone(state), snapshot_id.to_string())),
         }
     }
 
-    /// Drops the per-snapshot index [`Self::write_to_indexed_snapshot`]
+    /// Drops the per-snapshot index [`Self::write_new_snapshot_with_index`]
     /// registered for a snapshot that will not be published.
     pub(crate) fn discard_snapshot_lookup_index(&self, snapshot_id: &str) {
         if let Some(state) = &self.lookup_index {
@@ -34853,7 +34871,7 @@ impl CayenneTableProvider {
         read_schema: &SchemaRef,
         pinned_index: Option<&Arc<super::lookup_index::SnapshotLookupIndex>>,
         visible_snapshot: &str,
-        report: Option<&Arc<super::lookup_index::LookupReport>>,
+        recorder: Option<&Arc<super::lookup_index::LookupOutcomeRecorder>>,
     ) -> Option<(
         Option<super::lookup_index::LookupSelection>,
         super::lookup_index::LookupIndexExplain,
@@ -34875,7 +34893,7 @@ impl CayenneTableProvider {
         // replaces nothing rather than an index that is already gone. The probe
         // uses the index and snapshot the scan's view captured together.
         let (selection, explain, should_build) =
-            match index_state.probe(pinned_index, visible_snapshot, &scalar_for, report) {
+            match index_state.probe(pinned_index, visible_snapshot, &scalar_for, recorder) {
                 super::lookup_index::LookupProbe::Selection(selection) => (
                     Some(selection),
                     super::lookup_index::LookupIndexExplain::not_applicable(Some(
@@ -35647,10 +35665,10 @@ impl TableProvider for CayenneTableProvider {
         // table without `indexes` and every other predicate shape resolve to.
         // Every snapshot this lookup reads notes its outcome on one report,
         // which records a single outcome when the scan is planned.
-        let lookup_report = self
+        let outcome_recorder = self
             .lookup_index
             .as_ref()
-            .map(super::lookup_index::LookupReport::new);
+            .map(super::lookup_index::LookupOutcomeRecorder::new);
         let lookup_resolution = self
             .resolve_lookup_index_selection(
                 state,
@@ -35658,7 +35676,7 @@ impl TableProvider for CayenneTableProvider {
                 &read_schema,
                 pinned_lookup_index.as_ref(),
                 &current_snapshot_id,
-                lookup_report.as_ref(),
+                outcome_recorder.as_ref(),
             )
             .await;
 
@@ -35754,7 +35772,7 @@ impl TableProvider for CayenneTableProvider {
                 protected_snapshots: protected_map,
                 deletion_snapshot: &deletion_snapshot,
                 read_schema: Arc::clone(&read_schema),
-                lookup_report: lookup_report.as_ref(),
+                outcome_recorder: outcome_recorder.as_ref(),
             })
             .await?;
 
@@ -37438,22 +37456,26 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
 /// published by the time the guard is dropped. See
 /// [`CayenneTableProvider::snapshot_index_guard`].
 pub(crate) struct SnapshotIndexGuard {
-    state: Option<Arc<super::lookup_index::LookupIndexState>>,
-    snapshot_id: String,
+    /// The table's index state and the guarded snapshot id; `None` when the
+    /// table declares no index.
+    index: Option<(Arc<super::lookup_index::LookupIndexState>, String)>,
 }
 
 impl std::fmt::Debug for SnapshotIndexGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotIndexGuard")
-            .field("snapshot_id", &self.snapshot_id)
+            .field(
+                "snapshot_id",
+                &self.index.as_ref().map(|(_, snapshot_id)| snapshot_id),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for SnapshotIndexGuard {
     fn drop(&mut self) {
-        if let Some(state) = &self.state {
-            state.discard_unpublished_snapshot(&self.snapshot_id);
+        if let Some((state, snapshot_id)) = &self.index {
+            state.discard_unpublished_snapshot(snapshot_id);
         }
     }
 }

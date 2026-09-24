@@ -781,20 +781,21 @@ pub(crate) struct LookupSelection {
     rows: usize,
     /// The lookup this selection belongs to, which records its outcome once for
     /// every snapshot the lookup reads. `None` records directly.
-    report: Option<Arc<LookupReport>>,
+    recorder: Option<Arc<LookupOutcomeRecorder>>,
 }
 
-/// One lookup's probe outcomes across every snapshot it reads — the current
-/// snapshot and each protected one — recorded as a single outcome on
-/// `cayenne_lookup_index_probe_total` when the lookup is dropped, so the metric
-/// counts one outcome per lookup however many snapshots it reads.
-pub(crate) struct LookupReport {
+/// Records one lookup's index outcome across every snapshot it reads — the
+/// current snapshot and each protected one — as a single outcome on
+/// `cayenne_lookup_index_probe_total` when it is dropped at the end of the
+/// lookup's planning, so the metric counts one outcome per lookup however many
+/// snapshots the lookup reads.
+pub(crate) struct LookupOutcomeRecorder {
     state: Arc<LookupIndexState>,
     /// The highest-ranked outcome noted so far, with its key shape.
     noted: Mutex<Option<(String, ProbeOutcome)>>,
 }
 
-impl LookupReport {
+impl LookupOutcomeRecorder {
     pub(crate) fn new(state: &Arc<LookupIndexState>) -> Arc<Self> {
         Arc::new(Self {
             state: Arc::clone(state),
@@ -813,7 +814,7 @@ impl LookupReport {
     }
 }
 
-impl Drop for LookupReport {
+impl Drop for LookupOutcomeRecorder {
     fn drop(&mut self) {
         if let Some((shape, outcome)) = self.noted.get_mut().take() {
             self.state.record_probe(&shape, outcome);
@@ -858,7 +859,7 @@ impl LookupSelection {
     ) {
         if !self.validate(snapshot_id, file_groups.iter().flat_map(FileGroup::iter)) {
             self.state.note_probe(
-                self.report.as_deref(),
+                self.recorder.as_deref(),
                 &self.shape,
                 ProbeOutcome::SnapshotMismatch,
             );
@@ -891,7 +892,7 @@ impl LookupSelection {
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
         if candidate_files == 0 {
             self.state
-                .note_probe(self.report.as_deref(), &self.shape, ProbeOutcome::Empty);
+                .note_probe(self.recorder.as_deref(), &self.shape, ProbeOutcome::Empty);
             return (
                 file_groups,
                 None,
@@ -904,7 +905,7 @@ impl LookupSelection {
             );
         }
         self.state.note_selection(
-            self.report.as_deref(),
+            self.recorder.as_deref(),
             &self.shape,
             candidate_files as u64,
             self.rows as u64,
@@ -2010,13 +2011,13 @@ impl LookupIndexState {
         self: &Arc<Self>,
         snapshot_id: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
-        report: Option<&Arc<LookupReport>>,
+        recorder: Option<&Arc<LookupOutcomeRecorder>>,
     ) -> Option<LookupSelection> {
         let shape = self.matched_shape(scalar_for)?;
         let Some(entry) = self.snapshots.load().get(snapshot_id).map(Arc::clone) else {
             // A snapshot written before this process started, or whose build was
             // refused.
-            self.note_probe(report.map(AsRef::as_ref), shape, ProbeOutcome::Unbuilt);
+            self.note_probe(recorder.map(AsRef::as_ref), shape, ProbeOutcome::Unbuilt);
             return None;
         };
         // The scan found this snapshot in the protected set it captured.
@@ -2028,7 +2029,7 @@ impl LookupIndexState {
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
-            report: report.map(Arc::clone),
+            recorder: recorder.map(Arc::clone),
         })
     }
 
@@ -2094,21 +2095,25 @@ impl LookupIndexState {
         index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
-        report: Option<&Arc<LookupReport>>,
+        recorder: Option<&Arc<LookupOutcomeRecorder>>,
     ) -> LookupProbe {
         let Some(shape) = self.matched_shape(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
         };
-        let index =
-            match self.index_for_scan(shape, index, visible_snapshot, report.map(AsRef::as_ref)) {
-                Ok(index) => index,
-                Err(outcome) => {
-                    return LookupProbe::Fallback(LookupIndexExplain::fallback(
-                        shape.to_string(),
-                        outcome,
-                    ));
-                }
-            };
+        let index = match self.index_for_scan(
+            shape,
+            index,
+            visible_snapshot,
+            recorder.map(AsRef::as_ref),
+        ) {
+            Ok(index) => index,
+            Err(outcome) => {
+                return LookupProbe::Fallback(LookupIndexExplain::fallback(
+                    shape.to_string(),
+                    outcome,
+                ));
+            }
+        };
         let Some(hit) = index.probe(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(
                 shape.to_string(),
@@ -2120,7 +2125,7 @@ impl LookupIndexState {
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
-            report: report.map(Arc::clone),
+            recorder: recorder.map(Arc::clone),
         })
     }
 
@@ -2134,14 +2139,14 @@ impl LookupIndexState {
         shape: &str,
         index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
-        report: Option<&LookupReport>,
+        recorder: Option<&LookupOutcomeRecorder>,
     ) -> Result<Arc<SnapshotLookupIndex>, LookupIndexExplainOutcome> {
         let Some(index) = index else {
-            self.note_probe(report, shape, ProbeOutcome::Unbuilt);
+            self.note_probe(recorder, shape, ProbeOutcome::Unbuilt);
             return Err(LookupIndexExplainOutcome::Unbuilt);
         };
         if index.snapshot_id != visible_snapshot {
-            self.note_probe(report, shape, ProbeOutcome::SnapshotMismatch);
+            self.note_probe(recorder, shape, ProbeOutcome::SnapshotMismatch);
             self.discard_stale(index);
             return Err(LookupIndexExplainOutcome::SnapshotMismatch);
         }
@@ -2198,20 +2203,31 @@ impl LookupIndexState {
         record_probe_outcome(&self.table_name, &self.counters, shape, outcome);
     }
 
-    /// Notes `outcome` on the lookup's `report`, or records it directly when the
+    /// Notes `outcome` on the lookup's `recorder`, or records it directly when the
     /// probe belongs to no multi-snapshot lookup.
-    fn note_probe(&self, report: Option<&LookupReport>, shape: &str, outcome: ProbeOutcome) {
-        match report {
-            Some(report) => report.note(shape, outcome),
+    fn note_probe(
+        &self,
+        recorder: Option<&LookupOutcomeRecorder>,
+        shape: &str,
+        outcome: ProbeOutcome,
+    ) {
+        match recorder {
+            Some(recorder) => recorder.note(shape, outcome),
             None => self.record_probe(shape, outcome),
         }
     }
 
     /// [`Self::record_selection`] for a probe that may belong to a lookup's
-    /// `report`: the candidate counts are summed per snapshot, the outcome once
+    /// `recorder`: the candidate counts are summed per snapshot, the outcome once
     /// per lookup.
-    fn note_selection(&self, report: Option<&LookupReport>, shape: &str, files: u64, rows: u64) {
-        let Some(report) = report else {
+    fn note_selection(
+        &self,
+        recorder: Option<&LookupOutcomeRecorder>,
+        shape: &str,
+        files: u64,
+        rows: u64,
+    ) {
+        let Some(recorder) = recorder else {
             self.record_selection(shape, files, rows);
             return;
         };
@@ -2221,7 +2237,7 @@ impl LookupIndexState {
         self.counters
             .candidate_rows
             .fetch_add(rows, Ordering::Relaxed);
-        report.note(shape, ProbeOutcome::Selected);
+        recorder.note(shape, ProbeOutcome::Selected);
     }
 
     fn record_selection(&self, shape: &str, files: u64, rows: u64) {
@@ -3576,14 +3592,14 @@ mod tests {
         ];
         for (noted, expected) in cases {
             let before = state.counters();
-            let report = LookupReport::new(&state);
+            let recorder = LookupOutcomeRecorder::new(&state);
             for outcome in &noted {
-                report.note("tenant", *outcome);
+                recorder.note("tenant", *outcome);
             }
-            drop(report);
+            drop(recorder);
             let after = state.counters();
             let delta = |pick: fn(&LookupIndexCounters) -> u64| pick(&after) - pick(&before);
-            let recorded = [
+            let counted = [
                 (ProbeOutcome::Selected, delta(|c| c.selected)),
                 (ProbeOutcome::Empty, delta(|c| c.empty)),
                 (ProbeOutcome::Unbuilt, delta(|c| c.unbuilt)),
@@ -3592,17 +3608,17 @@ mod tests {
                     delta(|c| c.snapshot_mismatch),
                 ),
             ];
-            for (outcome, count) in recorded {
+            for (outcome, count) in counted {
                 let want = u64::from(outcome == expected);
                 assert_eq!(
                     count, want,
-                    "{noted:?} recorded {outcome:?} {count} time(s)"
+                    "{noted:?} counted {outcome:?} {count} time(s)"
                 );
             }
         }
         // A lookup that probed nothing records nothing.
         let before = state.counters();
-        drop(LookupReport::new(&state));
+        drop(LookupOutcomeRecorder::new(&state));
         assert_eq!(state.counters(), before);
     }
 

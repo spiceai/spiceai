@@ -1199,9 +1199,9 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
     pub(crate) read_schema: SchemaRef,
-    /// The lookup's index report, shared with the current-snapshot branch so
+    /// The lookup's outcome recorder, shared with the current-snapshot branch so
     /// the lookup records one index outcome however many snapshots it reads.
-    pub(crate) lookup_report: Option<&'a Arc<super::lookup_index::LookupReport>>,
+    pub(crate) outcome_recorder: Option<&'a Arc<super::lookup_index::LookupOutcomeRecorder>>,
 }
 
 pub(crate) struct PreparedProtectedSnapshotUpdate {

@@ -562,7 +562,7 @@ impl CayenneTableProvider {
         let target_size_bytes = self.target_file_size_bytes();
 
         let (row_count, _writer_ops, stats) = match self
-            .write_to_indexed_snapshot(
+            .write_new_snapshot_with_index(
                 prepared.stream,
                 target_size_bytes,
                 &new_snapshot_id,
