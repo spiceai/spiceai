@@ -3647,10 +3647,14 @@ mod tests {
         let schema = two_col_schema();
         let tenant_expr: PhysicalExprRef = Arc::new(Column::new("tenant", 0));
         let item_expr: PhysicalExprRef = Arc::new(Column::new("item", 1));
+        // Strict greater-than: tenants 0,1,2,3 tile four shards only when the
+        // split points are 0,1,2. Bounds of 1,2,3 would pile 0 and 1 onto
+        // shard 0, and the remainder would fill the last shard after the guard
+        // could still hash anything.
         let bounds = vec![
+            ScalarValue::Int64(Some(0)),
             ScalarValue::Int64(Some(1)),
             ScalarValue::Int64(Some(2)),
-            ScalarValue::Int64(Some(3)),
         ];
 
         let mut head_tenants = Vec::with_capacity(usize::try_from(HEAD)?);
