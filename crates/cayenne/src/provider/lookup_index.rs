@@ -1498,11 +1498,6 @@ struct SnapshotIndexEntry {
     live: AtomicBool,
 }
 
-/// Registered indexes whose snapshot has not been published yet. Only a write
-/// in flight holds one, so more than this means writes were abandoned without
-/// discarding their index; the oldest are dropped.
-const MAX_UNPUBLISHED_SNAPSHOT_INDEXES: usize = 32;
-
 impl LookupIndexState {
     /// The index state for `specs`, or `None` when the table declares no index.
     pub(crate) fn new(
@@ -1823,7 +1818,6 @@ impl LookupIndexState {
     ) {
         let snapshot_id = builder.snapshot_id().to_string();
         let account = Arc::clone(&self.account);
-        let started = Instant::now();
         // A compaction rewrite indexes the whole table, which is seconds of sort
         // and compression, so it runs on the blocking pool like the refresh build.
         let finished =
@@ -1833,7 +1827,9 @@ impl LookupIndexState {
                 Ok(finished) => finished,
                 Err(error) => Err(format!("index build task failed: {error}")),
             };
-        super::table::record_cayenne_write_phase(&self.table_name, "lookup_index", started);
+        // Not reported as the `lookup_index` write phase: that phase times a
+        // full refresh finishing its index, and every checkpoint, upsert and
+        // merge builds one of these. The build's duration is in its debug log.
         match finished {
             Ok(Some(index)) => self.register_snapshot(Arc::new(index)),
             Ok(None) => {
@@ -1872,9 +1868,9 @@ impl LookupIndexState {
     }
 
     /// Adds `index` to the per-snapshot indexes, replacing any for the same
-    /// snapshot. Unpublished entries beyond [`MAX_UNPUBLISHED_SNAPSHOT_INDEXES`]
-    /// can only come from writes abandoned without discarding their index, so
-    /// the oldest of those are dropped.
+    /// snapshot. It stays unpublished until the snapshot is published; a write
+    /// abandoned before that drops its guard, which discards the index, so no
+    /// count limit is needed and none can evict a write still in flight.
     fn register_snapshot(&self, index: Arc<SnapshotLookupIndex>) {
         self.record_published(&index);
         {
@@ -1887,24 +1883,6 @@ impl LookupIndexState {
                     live: AtomicBool::new(false),
                 }),
             );
-            let mut unpublished: Vec<String> = next
-                .iter()
-                .filter(|(_, entry)| !entry.live.load(Ordering::Acquire))
-                .map(|(id, _)| id.clone())
-                .collect();
-            if unpublished.len() > MAX_UNPUBLISHED_SNAPSHOT_INDEXES {
-                // Snapshot ids are UUIDv7, so lexicographic order is creation order.
-                unpublished.sort_unstable();
-                let excess = unpublished.len() - MAX_UNPUBLISHED_SNAPSHOT_INDEXES;
-                for id in unpublished.into_iter().take(excess) {
-                    tracing::debug!(
-                        table = %self.table_name,
-                        snapshot_id = %id,
-                        "Dropped the secondary index of a snapshot that was never published"
-                    );
-                    next.remove(&id);
-                }
-            }
             self.snapshots.store(Arc::new(next));
         }
     }
@@ -3554,6 +3532,25 @@ mod tests {
         assert!(
             table.reserved_bytes() < with_both,
             "the abandoned index's memory was not released"
+        );
+    }
+
+    /// Many writes can be in flight at once, each with a registered but
+    /// unpublished index; none is evicted, so the oldest can still publish with
+    /// its index.
+    #[test]
+    fn many_unpublished_snapshot_indexes_are_all_kept() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let state = state(&pool, &table);
+        let ids: Vec<String> = (0..40).map(|i| format!("snapshot-{i:03}")).collect();
+        for id in &ids {
+            state.register_snapshot(Arc::new(one_row_index(&pool, &table, id)));
+        }
+        assert_eq!(state.snapshot_index_footprint().0, ids.len());
+        assert!(
+            state.mark_snapshot_live(&ids[0]),
+            "the oldest in-flight write lost its index"
         );
     }
 
