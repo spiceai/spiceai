@@ -94,9 +94,11 @@ impl DatasetLoads {
     }
 
     /// Stops every running load of `name`, and returns once none of them is
-    /// attempting or will attempt again. A no-op when `name` has no load
-    /// running.
-    pub(crate) async fn supersede(&self, name: &TableReference) {
+    /// attempting or will attempt again. Returns whether a load was running: a
+    /// load still retrying never registered the dataset, so the configuration
+    /// that replaces it has nothing to update and must be loaded instead. A
+    /// no-op returning `false` when `name` has no load running.
+    pub(crate) async fn supersede(&self, name: &TableReference) -> bool {
         let name = resolve_table_reference(name.clone());
         let Some((attempt_lock, token)) = self
             .loads
@@ -104,11 +106,12 @@ impl DatasetLoads {
             .get(&name)
             .map(|entry| (Arc::clone(&entry.attempt_lock), entry.token.clone()))
         else {
-            return;
+            return false;
         };
         token.cancel();
         // Released when the superseded load drops the attempt it was running.
         let _no_attempt_running = attempt_lock.lock().await;
+        true
     }
 }
 
@@ -159,7 +162,10 @@ mod tests {
                 .expect("the first attempt starts"),
         );
 
-        loads.supersede(&name("t")).await;
+        assert!(
+            loads.supersede(&name("t")).await,
+            "superseding a running load reports that it stopped one"
+        );
 
         assert!(
             load.start_attempt().await.is_none(),
@@ -288,7 +294,10 @@ mod tests {
         assert!(loads.loads.lock().is_empty());
 
         // With nothing running, superseding is a no-op and a later load is unaffected.
-        loads.supersede(&name("t")).await;
+        assert!(
+            !loads.supersede(&name("t")).await,
+            "with no load running there is nothing to stop"
+        );
         let later = loads.begin(&name("t"));
         assert!(later.start_attempt().await.is_some());
     }

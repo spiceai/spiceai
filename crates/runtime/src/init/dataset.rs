@@ -1899,18 +1899,23 @@ impl Runtime {
         // retrying, and its first successful attempt would register that
         // configuration over the one the Spicepod now declares (#1458). Stop it
         // before anything below initializes the new configuration's accelerator
-        // or registers it.
+        // or registers it. A dataset whose load was still retrying never
+        // registered, so its new configuration is loaded below like an added
+        // dataset's, retrying until its source answers, rather than updated once.
         let removed_datasets = current_app
             .datasets
             .iter()
             .filter(|ds| !new_app.datasets.iter().any(|d| d.name == ds.name))
             .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok());
+        let mut still_loading = HashSet::new();
         for name in datasets_to_apply
             .iter()
             .map(|ds| ds.name.clone())
             .chain(removed_datasets)
         {
-            self.dataset_loads.supersede(&name).await;
+            if self.dataset_loads.supersede(&name).await {
+                still_loading.insert(name);
+            }
         }
 
         let init_results = self
@@ -1958,7 +1963,9 @@ impl Runtime {
                 }
             };
 
-            if existing_datasets.iter().any(|d| d.name == ds.name) {
+            if existing_datasets.iter().any(|d| d.name == ds.name)
+                && !still_loading.contains(&ds.name)
+            {
                 // A `localpod` dataset whose parent this same diff adds — or queues, deeper in
                 // a chain — cannot bind to it until that parent is registered, so it is
                 // unloaded here and queued behind the parent's load below, exactly like a
@@ -1987,6 +1994,14 @@ impl Runtime {
 
                 Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
                 continue;
+            }
+
+            // A superseded attempt can be dropped after it registered the table
+            // and before its load completed.
+            if still_loading.contains(&ds.name) && self.df.table_exists(&ds.name) {
+                Arc::clone(&self)
+                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .await;
             }
 
             self.status
@@ -3553,6 +3568,103 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             !overwritten,
             "the earlier configuration's load registered over the corrected dataset: {:?}",
             columns().await
+        );
+
+        runtime.status.mark_shutdown();
+    }
+
+    /// A connector whose first construction fails with a retriable error, and
+    /// every later one returns a table with an `id` column.
+    struct FailsOnceConnectorFactory {
+        prefix: &'static str,
+        failed: &'static std::sync::atomic::AtomicBool,
+    }
+
+    impl DataConnectorFactory for FailsOnceConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create<'a>(
+            &'a self,
+            _params: ConnectorParams,
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+            Box::pin(async {
+                if self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>)
+                } else {
+                    Err(Box::new(std::io::Error::other("source not available yet"))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                }
+            })
+        }
+
+        fn prefix(&self) -> &'static str {
+            self.prefix
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    /// #1458, when the corrected configuration's source is not available yet
+    /// either: the dataset never registered, so the correction must keep
+    /// retrying its own source, as a newly added dataset does, rather than try
+    /// it once and leave the dataset in error until the next Spicepod change.
+    #[tokio::test]
+    async fn a_corrected_dataset_retries_until_its_source_answers() {
+        static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        register_connector_factory("never_reachable", Arc::new(UnreachableConnectorFactory)).await;
+        register_connector_factory(
+            "fails_once",
+            Arc::new(FailsOnceConnectorFactory {
+                prefix: "fails_once",
+                failed: &FAILED,
+            }),
+        )
+        .await;
+
+        let runtime = Arc::new(
+            crate::Runtime::builder()
+                .with_app(app::AppBuilder::new("corrected_retry").build())
+                .build()
+                .await,
+        );
+        let first = Arc::new(
+            app::AppBuilder::new("corrected_retry")
+                .with_dataset(spicepod_dataset("never_reachable:earlier", "t"))
+                .build(),
+        );
+        assert!(Arc::clone(&runtime).apply_app(first).await);
+
+        let corrected = Arc::new(
+            app::AppBuilder::new("corrected_retry")
+                .with_dataset(spicepod_dataset("fails_once:any", "t"))
+                .build(),
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                Arc::clone(&runtime).apply_app(corrected)
+            )
+            .await
+            .expect("correcting a dataset must not wait for its earlier load's source"),
+            "the corrected spicepod differs from the first one, so it must apply"
+        );
+
+        let t = TableReference::parse_str("t");
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(30), || async {
+                runtime.df.table_exists(&t)
+            })
+            .await,
+            "the corrected dataset must register once its source answers"
+        );
+        assert!(
+            FAILED.load(std::sync::atomic::Ordering::SeqCst),
+            "the corrected source's first attempt must have failed, or this test proves nothing"
         );
 
         runtime.status.mark_shutdown();
