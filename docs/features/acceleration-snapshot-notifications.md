@@ -14,7 +14,7 @@ The same notification loads the first snapshot. A reader that starts before any 
    - A dataset waiting out its retry backoff, for example because no snapshot existed when it started, retries immediately.
    - A dataset waits for the reload it asked for before asking for the next one, so a newer snapshot never restarts a download in progress. Announcements that arrive meanwhile are coalesced, and the latest is loaded once the reload finishes.
 5. **What gets loaded.** The refresh loads the current snapshot only if it is strictly newer than the one loaded, with the same schema check and checksum verification as a scheduled refresh. Snapshot mode never moves back to an older snapshot.
-6. **Other objects under the location.** Notifications for the snapshot files themselves and for removals are deleted without a refresh: a snapshot is not current until `metadata.json` names it.
+6. **Other objects under the location.** Notifications for the snapshot files themselves, for [writer leases](acceleration-snapshot-writer-lease.md), and for removals are deleted without a refresh: a snapshot is not current until `metadata.json` names it.
 7. **Objects outside the location.** A notification that names an object outside the snapshot location is **left on the queue** (not deleted) and logged as an error. The queue must receive only this location's notifications.
 8. **Invalid messages.** A message that is not an S3 event notification is logged and deleted.
 9. **Fallback to polling.** Every snapshot-mode dataset keeps checking the location on `refresh_check_interval` whether or not SQS is healthy, as it does without a queue. When SQS can't be reached (the client can't connect, or receives keep failing), datasets fall back to that check alone:

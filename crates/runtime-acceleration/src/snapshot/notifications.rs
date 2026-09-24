@@ -55,7 +55,9 @@ use tokio::task::JoinHandle;
 use url::Url;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoff, RetryBackoffBuilder};
 
-use super::{METADATA_FILE_NAME, SnapshotManager, s3_location_path};
+use super::{
+    METADATA_FILE_NAME, SNAPSHOTS_DOCS, SnapshotManager, format_duration, s3_location_path,
+};
 
 /// The snapshot location parameter naming the SQS queue, as registered in the
 /// location's parameter spec. Users write it with the `s3_` prefix, as
@@ -63,7 +65,6 @@ use super::{METADATA_FILE_NAME, SnapshotManager, s3_location_path};
 pub(super) const QUEUE_URL_PARAM: &str = "queue_url";
 const QUEUE_URL_KEY: &str = "s3_queue_url";
 
-const SNAPSHOTS_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/snapshots";
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// How long SQS can keep failing before the outage is logged as an error
 /// rather than a warning. Datasets keep checking the location on
@@ -625,15 +626,6 @@ fn receive_recovered_message(location: &NotificationLocation, lasted: Duration) 
     )
 }
 
-fn format_duration(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs >= 60 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
 fn metadata_read_warning(location: &NotificationLocation, error: &dyn std::error::Error) -> String {
     format!(
         "Failed to read the snapshot metadata of snapshot location '{location}' after an S3 event notification, so the notification was left on the SQS queue and datasets reload when it is delivered again or on `refresh_check_interval`. Cause: {error}. See: {SNAPSHOTS_DOCS}"
@@ -778,6 +770,14 @@ mod tests {
             "spice/snapshots/metadata.json",
         );
         assert_eq!(route(&location(), &message(removed, "r")), Route::Ack);
+
+        // Renewing a snapshot writer lease is not a new snapshot either.
+        let lease = s3_body(
+            "ObjectCreated:Put",
+            "my-bucket",
+            "spice/snapshots/leases/orders.json",
+        );
+        assert_eq!(route(&location(), &message(lease, "r")), Route::Ack);
     }
 
     #[test]

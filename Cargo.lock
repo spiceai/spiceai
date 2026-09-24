@@ -17421,6 +17421,7 @@ dependencies = [
  "duckdb",
  "fundu",
  "futures",
+ "gethostname",
  "hex",
  "object_store 0.13.2",
  "opentelemetry",

@@ -27,6 +27,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 fundu.workspace = true
 futures.workspace = true
+gethostname.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
 opentelemetry.workspace = true

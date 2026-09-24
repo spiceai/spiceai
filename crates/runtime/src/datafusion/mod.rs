@@ -5893,6 +5893,17 @@ async fn build_snapshot_creation_config(
     .await
     .map(|sm| {
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        // How often the dataset creates snapshots decides how long its snapshot
+        // writer lease lasts without renewal.
+        let snapshot_interval = match &snapshot_creation_trigger {
+            SnapshotCreateTrigger::Interval(interval) => Some(*interval),
+            SnapshotCreateTrigger::RefreshComplete => dataset.refresh_check_interval(),
+            SnapshotCreateTrigger::Batches(_) => None,
+        };
+        let sm = match snapshot_interval {
+            Some(interval) => sm.with_snapshot_interval(interval),
+            None => sm,
+        };
         let sm = if let Some(engine) = snapshot_engine_override {
             sm.with_snapshot_engine(engine)
         } else {
