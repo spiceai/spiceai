@@ -25,7 +25,7 @@ use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::project_schema;
+use datafusion::common::{DFSchema, project_schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -470,8 +470,27 @@ impl TableProvider for SparkConnectTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // A filter resolves against the table's own schema, which is what
+        // carries the column metadata a per-call support check may need.
+        // `None` would be safe but pessimistic -- a check that refuses on an
+        // unknown type would drop every such filter from the pushdown.
+        let scope = DFSchema::try_from(self.schema()).ok();
+
         let mut filter_push_down = vec![];
         for filter in filters {
+            // The deny-list has to be consulted here as well as in
+            // `can_execute_plan`: `PushDownFilter` runs first, so refusing to
+            // federate the plan only moves a denied predicate into the
+            // `TableScan`, and `scan` then hands it to Spark anyway. Same
+            // screen `SqlTable::supports_filters_pushdown` applies.
+            if self
+                .function_support
+                .as_ref()
+                .is_some_and(|support| !support.supports(filter, scope.as_ref()))
+            {
+                filter_push_down.push(TableProviderFilterPushDown::Unsupported);
+                continue;
+            }
             match expr_to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
@@ -758,9 +777,98 @@ mod tests {
                 .is_some_and(|sql| sql.contains("upper(")),
             "upper() is a Spark function and must keep federating. Got: {control_sql:?}"
         );
+
+        // The predicate half. `PushDownFilter` runs before the federation
+        // decision, so refusing to federate the plan is not enough on its own:
+        // a denied predicate lands in the `TableScan` and `scan` hands it to
+        // Spark regardless. `supports_filters_pushdown` is what keeps it out.
+        let predicate = "SELECT id FROM docs WHERE spice_only_udf(body) = '{\"color\":\"red\"}'";
+        let predicate_sql = federated_sql(&guarded, predicate).await;
+        assert!(
+            predicate_sql
+                .as_deref()
+                .is_none_or(|sql| !sql.contains(SPICE_ONLY_UDF)),
+            "a denied function in a WHERE clause must not reach Spark either. \
+             Got: {predicate_sql:?}"
+        );
+        assert_eq!(
+            rows(&guarded, predicate).await,
+            vec!["1".to_string()],
+            "and the predicate must still select the right row, evaluated locally"
+        );
+
+        // Control again, on the predicate path: a Spark function in a WHERE
+        // clause must keep being pushed down.
+        let control_predicate = federated_sql(
+            &guarded,
+            "SELECT id FROM docs WHERE upper(body) LIKE '%RED%'",
+        )
+        .await;
+        assert!(
+            control_predicate
+                .as_deref()
+                .is_some_and(|sql| sql.contains("upper(")),
+            "a Spark function in a WHERE clause must keep federating. Got: {control_predicate:?}"
+        );
+    }
+
+    /// The first column of every row `sql` returns, rendered as strings.
+    async fn rows(spark: &SparkConnect, sql: &str) -> Vec<String> {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+
+        let provider = spark
+            .table_provider(TableReference::bare("docs"))
+            .await
+            .expect("build the docs table provider");
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = datafusion::prelude::SessionContext::new_with_state(state);
+        ctx.register_udf(spice_only_udf());
+        ctx.register_table(TableReference::bare("docs"), provider)
+            .expect("register the docs table");
+
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan the query")
+            .collect()
+            .await
+            .expect("run the query");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column(0);
+                (0..batch.num_rows())
+                    .map(|row| {
+                        datafusion::common::ScalarValue::try_from_array(column, row)
+                            .expect("read the value")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     const SPICE_ONLY_UDF: &str = "spice_only_udf";
+
+    /// Stands in for any Spice-only UDF: Spark has no function of this name,
+    /// exactly as it has none called `json_get_str`.
+    fn spice_only_udf() -> datafusion::logical_expr::ScalarUDF {
+        use arrow::datatypes::DataType;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+
+        create_udf(
+            SPICE_ONLY_UDF,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        )
+    }
 
     /// A deny-list naming exactly one function, standing in for the Spice set
     /// the connectors install (`runtime_udfs_api::deny_spice_functions_for_table_providers`,
@@ -782,9 +890,7 @@ mod tests {
     /// The statement the federated plan for `sql` would send to Spark, or
     /// `None` when nothing federated.
     async fn federated_sql(spark: &SparkConnect, sql: &str) -> Option<String> {
-        use arrow::datatypes::DataType;
         use datafusion::execution::session_state::SessionStateBuilder;
-        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
         use datafusion::physical_plan::displayable;
         use datafusion::prelude::SessionContext;
         use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
@@ -794,23 +900,13 @@ mod tests {
             .await
             .expect("build the docs table provider");
 
-        // Stands in for any Spice-only UDF: Spark has no function of this
-        // name, exactly as it has none called `json_get_str`.
-        let spice_only = create_udf(
-            SPICE_ONLY_UDF,
-            vec![DataType::Utf8],
-            DataType::Utf8,
-            Volatility::Immutable,
-            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
-        );
-
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .build();
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_udf(spice_only);
+        ctx.register_udf(spice_only_udf());
         ctx.register_table(TableReference::bare("docs"), provider)
             .expect("register the docs table");
 
