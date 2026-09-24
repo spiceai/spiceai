@@ -1847,10 +1847,10 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let state = Arc::new(ObjectState::new(store));
-        let stale = warmup_tpl("SELECT stale");
+        let stale_tpl = warmup_tpl("SELECT stale");
         let keep = warmup_tpl("SELECT keep");
         state
-            .insert(WARMUP_STATE_KEY, &vec![stale.clone(), keep.clone()])
+            .insert(WARMUP_STATE_KEY, &vec![stale_tpl.clone(), keep.clone()])
             .await
             .expect("seed catalog");
 
@@ -1858,7 +1858,7 @@ mod tests {
             Arc::clone(&state),
             catalog_mutex(vec![keep.clone()]),
             Arc::new(AtomicUsize::new(1)),
-            HashSet::from([template_id(&stale)]),
+            HashSet::from([template_id(&stale_tpl)]),
         )
         .await;
 
@@ -1879,18 +1879,18 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new());
         let state = Arc::new(ObjectState::new(store));
 
-        // Remote catalog is full of stale shapes.
-        let stale: Vec<WarmupTemplate> = (0..MAX_WARMUP_PLANS)
+        // Remote catalog is full of unusable shapes.
+        let unusable: Vec<WarmupTemplate> = (0..MAX_WARMUP_PLANS)
             .map(|i| warmup_tpl(&format!("SELECT stale_{i}")))
             .collect();
-        let drop_id = template_id(&stale[0]);
+        let drop_id = template_id(&unusable[0]);
         state
-            .insert(WARMUP_STATE_KEY, &stale)
+            .insert(WARMUP_STATE_KEY, &unusable)
             .await
             .expect("seed catalog");
 
         // Local catalog already dropped the unusable shape and recorded a new one.
-        let keep: Vec<WarmupTemplate> = stale[1..].to_vec();
+        let keep: Vec<WarmupTemplate> = unusable[1..].to_vec();
         let fresh = warmup_tpl("SELECT fresh");
         let mut local = keep;
         local.push(fresh.clone());
@@ -1921,7 +1921,7 @@ mod tests {
             "fresh shape must survive; got {sqls:?}"
         );
         assert!(
-            !sqls.iter().any(|s| *s == "SELECT stale_0"),
+            !sqls.contains(&"SELECT stale_0"),
             "pruned shape must not be restored; got {sqls:?}"
         );
         assert_eq!(sqls.len(), MAX_WARMUP_PLANS);
@@ -2588,8 +2588,8 @@ mod tests {
         );
     }
 
-    /// Query::lifetime_guards cancels the child token when `runtime.query.timeout`
-    /// fires. That must be TimedOut (skip this plan), not Cancelled (abort the rest).
+    /// `Query::lifetime_guards` cancels the child token when `runtime.query.timeout`
+    /// fires. That must be `TimedOut` (skip this plan), not `Cancelled` (abort the rest).
     #[tokio::test]
     async fn query_lifetime_cancel_is_timeout_not_shutdown() {
         let shutdown = CancellationToken::new();
