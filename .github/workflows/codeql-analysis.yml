@@ -1,28 +1,64 @@
 name: 'CodeQL'
 
-# Security scanner: runs on push to trunk/release + a weekly schedule (and manual
-# dispatch), deliberately NOT in the merge queue — it isn't a required merge gate
-# and would add scan latency to every queue entry.
+# Rust CodeQL security scan. GitHub's automatic Code Quality job covers
+# interpreted languages. Compiled Rust needs this autobuild.
+#
+# Pull requests do not run this workflow. `pull_request` would load the file
+# from the PR, so a pull request could replace the scan with a clean SARIF.
+# `pull_request_target` would scan every PR head from the default-branch file.
+# The scan runs on the merge queue and on pushes to trunk and release branches.
+#
+# `merge_group` loads this file from the merge commit and checks out that
+# commit (`github.sha`). Do not add paths-ignore on `merge_group`: a skipped
+# scan would leave that merge unanalyzed. The default-branch uploader publishes
+# those results only when this file's blob at the queue SHA matches the default
+# branch, so a queued PR cannot substitute a clean producer. Do not add
+# `allow-unsafe-pr-checkout`: fork heads stay fail-closed.
+#
+# This workflow is read-only. The Analyze job never writes SARIF: a Cargo
+# build script shares that VM and can replace files under `runner.temp`
+# before `upload-artifact`. It uploads the finalized CodeQL database.
+# `Produce SARIF` runs on a fresh VM, analyzes that database, and publishes
+# the SARIF artifact. It runs the code-scanning suite shipped with its own
+# CLI. The suite stored in the database is written on the Analyze VM, so it
+# is not used. `codeql-upload.yml` (`workflow_run`, default branch) is what
+# calls `upload-sarif`.
 on:
-  workflow_dispatch:
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
   push:
-    branches: [trunk, release-*]
+    branches:
+      - trunk
+      - release-*
+      - release/*
     paths-ignore:
       - 'docs/**'
       - '.github/**'
-  schedule:
-    - cron: '19 18 * * 4'
+
+# The token stays read-only. The job must not request security-events: write.
+# codeql-upload.yml is what publishes SARIF.
+permissions:
+  contents: read
 
 jobs:
   analyze:
     name: Analyze
+    # Rust autobuild runs on the EPYC pool. merge_group checks out the queue
+    # merge commit, which contains the queued pull request, so that event does
+    # not receive MinIO credentials. Produce SARIF stays on a fresh hosted VM
+    # and does not check out that tree.
     runs-on: spiceai-dev-runners
     env:
-      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+    # An unbounded autobuild waits out GitHub's six-hour default (#12717).
+    # 150 minutes sits above a cold uncached rust analysis.
+    timeout-minutes: 150
     permissions:
       actions: read
       contents: read
-      security-events: write
 
     strategy:
       fail-fast: false
@@ -33,6 +69,9 @@ jobs:
         # https://docs.github.com/en/free-pro-team@latest/github/finding-security-vulnerabilities-and-errors-in-your-code/configuring-code-scanning#changing-the-languages-that-are-analyzed
 
     steps:
+      # push and merge_group scan github.sha. merge_group's github.sha is the
+      # queue merge commit, which is the SHA the upload records. Fork heads are
+      # not fetched: allow-unsafe-pr-checkout stays unset.
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,9 +87,10 @@ jobs:
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           languages: ${{ matrix.language }}
+          db-location: ${{ runner.temp }}/codeql_databases
           # If you wish to specify custom queries, you can do so here or in a config file.
           # By default, queries listed here will override any specified in a config file.
           # Prefix the list here with "+" to use these queries and those in the config file.
@@ -67,7 +107,7 @@ jobs:
       # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
       # If this step fails, then you should remove it and run the build manually (see below)
       - name: Autobuild
-        uses: github/codeql-action/autobuild@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/autobuild@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
 
       # ℹ️ Command-line programs to run using the OS shell.
       # 📚 https://git.io/JvXDl
@@ -89,5 +129,102 @@ jobs:
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+      # Finalize the database on this VM but do not run queries. Query output
+      # would land under runner.temp on the same user as the Cargo build.
+      - name: Finalize CodeQL database
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          skip-queries: true
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-sarif-unused
+
+      - name: Upload CodeQL database
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codeql-database-${{ matrix.language }}
+          path: ${{ runner.temp }}/codeql_databases
+          if-no-files-found: error
+          # Databases are large; only the follow-up SARIF job needs them.
+          retention-days: 1
+          # A full-job rerun reaches this step again in the same workflow run.
+          # Artifact names are immutable unless overwrite is set, and the
+          # default (`false`) fails that retry with HTTP 409.
+          overwrite: true
+
+  sarif:
+    name: Produce SARIF
+    needs: analyze
+    runs-on: ubuntu-24.04
+    # Query evaluation against an already-built Rust database, not an
+    # autobuild. Anything past this is wedged, not a cold cache.
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download CodeQL database
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: codeql-database-*
+          path: ${{ runner.temp }}/codeql-imported
+          merge-multiple: true
+
+      # Installs the CLI only. This job never checks out the scanned tree
+      # and never runs a Cargo build, so a process left by Analyze cannot
+      # reach the SARIF it produces.
+      - name: Setup CodeQL CLI
+        id: setup-codeql
+        uses: github/codeql-action/setup-codeql@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          languages: rust
+
+      - name: Analyze imported database
+        env:
+          CODEQL_PATH: ${{ steps.setup-codeql.outputs.codeql-path }}
+          IMPORTED_ROOT: ${{ runner.temp }}/codeql-imported
+          SARIF_DIR: ${{ runner.temp }}/codeql-sarif
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CODEQL_PATH}" || ! -x "${CODEQL_PATH}" ]]; then
+            echo "::error::CodeQL CLI was not installed, so SARIF was not produced."
+            exit 1
+          fi
+          mkdir -p "${SARIF_DIR}"
+          found=0
+          shopt -s nullglob
+          for db in "${IMPORTED_ROOT}"/*/; do
+            if [[ ! -f "${db}codeql-database.yml" ]]; then
+              continue
+            fi
+            lang="$(basename "${db}")"
+            # The suite inside the database is written on the Analyze VM, after
+            # the merge commit's build. That build can replace the default suite
+            # with one query from the standard pack, and path checks still pass.
+            # This job runs the code-scanning suite shipped with its CLI. Both
+            # jobs pin the same CodeQL action, so the pack matches the database.
+            # Do not pass the suite file stored in the database.
+            suite="codeql/${lang}-queries:codeql-suites/${lang}-code-scanning.qls"
+            found=1
+            echo "Analyzing ${lang} with ${suite}"
+            "${CODEQL_PATH}" database analyze \
+              --format=sarifv2.1.0 \
+              --output="${SARIF_DIR}/${lang}.sarif" \
+              -- \
+              "${db}" \
+              "${suite}"
+          done
+          if [[ "${found}" -eq 0 ]]; then
+            echo "::error::No CodeQL database was found in the imported artifact, so SARIF was not produced."
+            exit 1
+          fi
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codeql-sarif-rust
+          path: ${{ runner.temp }}/codeql-sarif
+          if-no-files-found: error
+          # A full-job rerun reaches this step again in the same workflow run.
+          overwrite: true

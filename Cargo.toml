@@ -36,6 +36,7 @@ members = [
     "crates/chat-api",
     "crates/embed-api",
     "crates/rerank-api",
+    "crates/evaluate-api",
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/otel-arrow",
@@ -84,6 +85,7 @@ members = [
     "crates/s3_vectors",
     "crates/s3_vectors_metadata_filter",
     "crates/search",
+    "crates/sharded-cache",
     "crates/tantivy_datafusion_filter",
     "crates/spice_cloud",
     "crates/spice-cloud-client",
@@ -217,6 +219,7 @@ aws-sdk-ec2 = { version = "1.113.0", default-features = false, features = ["defa
 aws-sdk-dynamodbstreams = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-glue = { version = "1.149.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.134.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1.102.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3vectors = { version = "1.26.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1.106.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-sts = { version = "1.105.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
@@ -274,7 +277,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "461e5f8777215c21a483da67023b07ec468ebc54" } # branch: spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "14fdd18233daab646859eb9ea115873a445b3df3" } # branch: spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -384,6 +387,7 @@ r2d2 = "0.8.10"
 rand = "0.10.1"
 rdkafka = { version = "0.39.0" }
 regex = "1.12.3"
+regex-syntax = "0.8.10"
 reqwest = { version = "0.13", features = ["json", "query", "rustls", "gzip", "brotli", "zstd", "deflate"] }
 reqsign-core = "3.0.0"
 rmcp = { version = "3.3.0", default-features = false }
@@ -505,6 +509,16 @@ split-debuginfo = "packed"
 
 [profile.lint]
 debug = "line-tables-only"
+# Deliberate: the two halves of the lint-profile gate want opposite things.
+# A local `make signoff` (or `RUST_PROFILE=lint make lint-rust`) reuses its own
+# target directory, where incremental compilation is the larger win. Plain
+# `make lint-rust` still selects `dev`. The CI gates that actually use this
+# profile (`pr.yml`, `pr-develop.yml`, and `signoff.yml` via `scripts/signoff`)
+# set `CARGO_INCREMENTAL=0`, which takes precedence over this field, so those
+# remote runs fall back to sccache — which cannot cache an incremental
+# compilation. Turning this off to "let sccache work" therefore buys nothing
+# on those gates (already overridden) and costs the local sign-off its
+# incremental reuse.
 incremental = true
 inherits = "dev"
 lto = "off"
@@ -574,7 +588,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "9d7be742f060d70066fc041319af787772716e0d" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b1e4dfc886de561759b70ead48b96" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 

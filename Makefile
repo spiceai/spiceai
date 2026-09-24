@@ -159,6 +159,9 @@ endif
 # name for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
 # real client's error mapping with no credentials and no external service.
+# `model2vec_hf_cache` is selected for a different reason: it is its own binary
+# because it sets a process-wide environment variable, which is only sound with
+# one test in the process.
 # `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
 # provider APIs and needs a `.env`, so it stays in the nightly gate.
 #
@@ -193,7 +196,18 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # on the rustc `--test` name, which is module-qualified
 # (`commands::tests::…`); the leaf name matches nothing and would leave
 # `make nextest` green after a dispatch dropped validation.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin)) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name)))
+#
+# The last three are fork-ledger guards as well, in integration-test targets
+# `kind(=lib)` cannot reach, and they ran nowhere before being named here:
+# `json_semantics` holds the three `datafusion-functions-json` guards,
+# `adbc_cancellation` the one guard shared by the `arrow-adbc` fork PR #4 and #65
+# rows, and `cpu_budget` the guard for vortex's `set_available_parallelism` —
+# six ledger rows across the three. Each is self-contained — a fake
+# in-process ADBC driver, a spicepod written to a temp dir, arrow built in
+# memory — needing no credentials and no service, and `--all --tests` compiles
+# all three whether or not they are selected, so leaving them out saved only the
+# seconds of running them and cost the coverage the ledger claimed.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin)) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

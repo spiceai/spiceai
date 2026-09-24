@@ -53,10 +53,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both self-hosted pools. `spiceai-macos` is the one #12794 names, but
-        # `spiceai-dev-runners` hosts are equally long-lived and accumulate the
-        # same way.
-        pool: [spiceai-macos, spiceai-dev-runners]
+        # Every self-hosted pool. `spiceai-macos` is the one #12794 names;
+        # `spiceai-macos-large` takes the longest builds and so fills fastest of
+        # the three, and `spiceai-dev-runners` hosts are equally long-lived and
+        # accumulate the same way.
+        pool: [spiceai-macos, spiceai-macos-large, spiceai-dev-runners]
         # A runner instance runs one job at a time, so N concurrent jobs on one
         # label occupy N distinct instances — which is the only way to address
         # individual instances behind a shared label. It is coverage by

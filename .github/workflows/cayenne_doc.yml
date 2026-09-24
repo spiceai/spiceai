@@ -3,9 +3,9 @@ name: Build Cayenne doc PDF
 # Renders the Cayenne technical reference (docs/cayenne/cayenne.md) to
 # Cayenne.pdf via docs/cayenne/build_pdf.py.
 #
-# Runs on push to trunk that touches docs/cayenne/** (or this workflow file),
-# and on manual dispatch — it builds and uploads Cayenne.pdf as a
-# downloadable, linkable artifact of the current trunk.
+# Runs on push to trunk or a release branch that touches docs/cayenne/** (or
+# this workflow file), and on manual dispatch — it builds and uploads
+# Cayenne.pdf as a downloadable, linkable artifact of that branch.
 #
 # Diagrams render locally through mermaid-cli, pinned in docs/cayenne/package.json
 # and installed with `npm ci`, so the build depends on nothing but the checkout.
@@ -23,14 +23,16 @@ on:
       - 'docs/cayenne/**'
       - '.github/workflows/cayenne_doc.yml'
   push:
-    branches: [trunk]
+    branches:
+      - trunk
+      - release/**
     paths:
       - 'docs/cayenne/**'
       - '.github/workflows/cayenne_doc.yml'
   workflow_dispatch:
 
-# Cancel a superseded run for the same ref — a newer push to trunk or to a pull
-# request branch, or a re-dispatch of this workflow.
+# Cancel a superseded run for the same ref — a newer push to trunk, a release
+# branch, or a pull request branch, or a re-dispatch of this workflow.
 concurrency:
   group: cayenne-doc-${{ github.ref }}
   cancel-in-progress: true
@@ -52,7 +54,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           cache: npm
@@ -142,8 +144,9 @@ jobs:
         working-directory: docs/cayenne
         run: python3 build_pdf.py
 
-      # Uploaded for every trigger: off trunk it is the linkable current build,
-      # and on a pull request it is the rendered document under review.
+      # Uploaded for every trigger: off trunk or a release branch it is that
+      # branch's linkable build, and on a pull request it is the rendered
+      # document under review.
       - name: Upload Cayenne PDF artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

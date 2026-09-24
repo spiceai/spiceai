@@ -72,6 +72,19 @@ guard. A patch with no guard is a patch the next re-cut can drop for free.
 A guard is a test **in this repo** that fails when the patch is missing. Not a
 comment, not a test in the fork.
 
+**And one the gate runs.** A test nothing runs makes this table claim coverage
+that does not exist, which is worse than a **GAP** — a gap is at least on the
+list below. `kind(=lib)` sweeps up every unit test, so the exposure is the
+integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
+`--all --tests` compiles them either way, so an unnamed binary is built and then
+skipped. Six rows' guards were found running nowhere for that reason, in three
+integration-test targets now named there: `json_semantics` for the
+`datafusion-functions-json` trio, `adbc_cancellation` for the two `arrow-adbc`
+cancellation rows (fork PRs #4 and #65, which share one test), and `cpu_budget`
+for vortex's `set_available_parallelism`. Nothing yet checks this automatically
+— adding a guard here means checking by hand that `NEXTEST_FILTER` selects the
+target it lives in, or that a workflow of its own runs it.
+
 The **Loss** column says how a missing patch would surface:
 
 - **silent** — it compiles and runs, and returns different results, hangs, crashes
@@ -105,10 +118,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `461e5f8777215c21a483da67023b07ec468ebc54` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `14fdd18233daab646859eb9ea115873a445b3df3` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
@@ -142,6 +155,14 @@ so patches to it are not fork state and are not listed. Only patches to
 `vortex-array`, `vortex-arrow`, `vortex-io`, `vortex-file`, `vortex-layout` and
 `vortex-utils` can be lost by a re-cut.
 
+Fork PR #33, which made the sink honour `target_file_size_mb`, is one of those
+vendored patches — it touches `vortex-datafusion` and nothing else — so it has no
+row here. Its behaviour is covered where the code lives, by
+`crates/vortex/src/persistent/sink.rs::test_file_splitting_62mb_into_4_files`,
+`…::test_file_splitting_compressible_data`,
+`…::test_write_large_batch_target_file_size_disabled` and
+`…::test_target_file_size_uses_single_sink_input_partition`.
+
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `FunctionSupport::with_aggregate_call_support` and `with_window_call_support`, and the aggregate/window arms of the walk that consult them (fork PR #70) | The name-based `FunctionRestriction` cannot refuse a *shape*, and the aggregate and window slots were unused entirely — so every aggregate and window call federated unconditionally. The BigQuery dialect declines the filtered-aggregate shapes it cannot rewrite exactly, and a declined rendering is a **failed query** unless federation refuses the same shape, because a federated statement has no local-execution fallback. Losing this patch therefore does not lose a pushdown, it breaks the query: `array_agg(v) FILTER (…)` reaches BigQuery as `FILTER` it cannot parse, and `COUNT(x) FILTER (…) OVER (…)` does the same through the window arm (measured: `Syntax error: Expected ")" but got "("`) | silent (query failure) | `crates/data-connectors/connector-adbc/src/lib.rs::bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`, which tests the allowlist *boundary* rather than a fixed set because the two sides live in different repositories, and `::bigquery_refuses_a_filtered_window_call` |
@@ -153,12 +174,11 @@ so patches to it are not fork state and are not listed. Only patches to
 | `set_available_parallelism` (`vortex-utils`) | Vortex sizes encode fan-out and scan lookahead from the machine's core count instead of the process's CPU entitlement, so a limited pod over-subscribes ([#12328](https://github.com/spiceai/spiceai/issues/12328)) | silent | `bin/spiced/tests/cpu_budget.rs::spicepod_cores_size_the_runtime_pools` |
 | `DECIMAL` → floating-point cast applies the scale (fork PR #51) | Decimal columns read back off by a factor of 10^scale | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::test_decimal_to_float_cast_applies_scale` |
 | `UncompressedSizeInBytes` statistic handling | `ColumnStatistics.byte_size` is wrong, so the optimizer mis-sizes joins built over Vortex scans | silent | `crates/vortex/src/persistent/format.rs::propagates_per_column_byte_size` |
-| Target file size respected in the sink (fork PR #33) | The writer ignores `target_file_size_mb` and emits one file per flush regardless of size | silent | `crates/vortex/src/persistent/format.rs::format_plumbs_target_file_size_mb` guards the plumbing only; the sink's own honouring of it is a **GAP** |
 | `vortex.date` → `vortex.timestamp` **array** cast (fork PR #28) | Upstream refuses the cast, so a pushed-down `CAST(date_col AS TIMESTAMP)` fails the scan on the rows it reads | silent | `crates/vortex/src/persistent/mod.rs::test_date_to_timestamp_extension_cast` |
 | `vortex.date` → `vortex.timestamp` **scalar** cast (fork PR #93) | The row above converts a chunk's rows. A scan also casts the file's `max` statistic — a scalar — to decide whether to read the file at all, and without this `Scalar::cast` re-labels it through the target's storage type instead of converting it. `date[days]` fails the scan; `date[ms]` shares `i64` with `timestamp[ns]`, so it succeeds with an instant 10^6 too small and the file is pruned as unable to match ([#13624](https://github.com/spiceai/spiceai/issues/13624)) | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows` for the failure, `…::a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file` for the wrongly pruned file |
 | Timestamp validation uses `storage_range`, and rendering never aborts (fork PR #93) | The row above converts a date into a count of the target unit; this is the range that count has to land inside, and the same fork PR carries both. A Jiff span's limits are not a timestamp's: they stop one short of `i64::MIN` nanoseconds — 1677-09-21, which a `timestamp[ns]` column holds as an ordinary value read from Arrow — so a scalar built from such a column's `min`/`max` statistic was refused although the array carried it, and the scan failed on data it could read. They also run past the last instant, and the unchecked constructors abort outside them, so rendering a count past the span range took the process down rather than reporting it. (No `vortex.date` reaches `i64::MIN` nanoseconds — neither of its units divides it — so this is the range being wrong, not the conversion.) | silent (wrong data), and abort | `crates/vortex/src/persistent/mod.rs::a_nanosecond_timestamp_scalar_spans_the_whole_i64_range`, which builds that scalar and renders it, and `…::a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting` for the other three units — they keep a span, so what the patch changes for them is that it is built and added through the checked forms, and only a count outside the range exercises that. The two cast guards above pass on either side of this row, so a re-cut that carried only the cast would not be caught without these |
 | Balanced `list_contains` OR tree for large `IN` lists (fork PR #37) | A large `IN (...)` filter builds a right-leaning OR tree; deep enough and the plan blows the stack during pushdown conversion | silent (crash) | `crates/vortex/src/persistent/mod.rs::test_large_in_list_filter_pushdown_stays_evaluable` — its decimal arm is the one that reaches the tree; a primitive list that long is answered by a set probe instead, so keep an arm on a type the probe declines |
-| Avoid session lock re-entry in writer init (fork PR #29) | Deadlock in `vortex-file` writer initialisation — the write never completes and the refresh hangs | silent (hang) | **GAP** |
+| Avoid session lock re-entry in writer init (fork PR #29) | Deadlock in `vortex-file` writer initialisation — the write never completes and the refresh hangs | silent (hang) | **GAP** — the deadlock needs a writer waiting on the session lock *between* the two reads this patch collapses into one, so a test either wins the race and passes on unpatched code or hangs the suite. That is a timing test, not a guard; what would close it is making the re-entry unrepresentable rather than avoided by convention |
 | Unsupported pushdown node bubbles `TRUE` rather than erroring; empty `IN` list handled (fork PR #8) | A predicate Vortex cannot convert fails the scan instead of degrading to "keep the row" | silent | vendored: the pushdown conversion now lives in `crates/vortex/src/convert/exprs.rs`, guarded by `test_empty_in_list_conversion_produces_boolean_literal` and the `can_be_pushed_down` unsupported-operand cases |
 | Intra-file decode parallelism — sub-split large chunk spans (fork PR #62) | Scan throughput on large chunk spans drops to single-stream decode | silent (perf) | **GAP** — a perf-only row; see [Open gaps](#open-gaps) for why it is deliberately unguarded |
 
@@ -215,7 +235,7 @@ catch.
 | Unparser: a sort above an aggregate given a scope of its own names that scope's output | The sort key is unprojected into the grouping expression, which names the relation the scope encloses, so the remote binder reports the qualifier as unknown. One predicate now owns the scope decision for both the projection acting on it and the sort reading it | silent (query failure) | in the fork, `plan_to_sql.rs::test_a_sort_over_a_scoped_aggregate_names_the_scope_not_its_grouping_expr` |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`), forwarded through `DFParquetMetadata` and `CachedParquetFileReader` on the **scan** path; `HEAD` when the listing has no version id, kept only when HEAD's ETag matches the listed ETag. Schema/statistics inference (`ParquetFormat::{infer_schema,infer_stats,infer_stats_and_ordering}`) does not forward the pin | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new. Losing only the metadata-path forward is enough: the scan footer is unpinned while the pages stay pinned. Losing the `HEAD` leaves versioned buckets pinning by ETag, so a replace 412s instead of reading the listed generation | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id`, `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` (listing/overwrite **scan** race). Planning-time schema/statistics footer reads are a remaining unpinned gap, unreproduced as a product failure |
-| Bloom-filter replacement readers reuse the version discovered on the listing-table scan | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | **GAP** — the scan/overwrite harness has no predicate and writes no bloom data; the fork's own bloom-filter reader tests are what cover this today |
+| Bloom-filter replacement readers reuse the version discovered on the listing-table scan (fork PR #213) | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | `crates/data-connector-api/src/listing/connector.rs::a_second_reader_for_the_same_file_keeps_the_version_the_first_one_pinned` for the factory, which is where the patch lives, and `crates/runtime/tests/s3_parquet_overwrite/mod.rs::a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation` for the scan that builds that second reader — the wire assertion is guarded by the plan's bloom-filter metric so it cannot pass by never taking the branch |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89, #167, and commit `d37a426e`) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | `crates/runtime/src/datafusion/query.rs::every_shape_the_fork_patches_cover_infers_its_parameter_type`, `…::a_limit_and_an_offset_placeholder_are_both_int64`, `…::a_comparison_of_two_placeholders_still_plans`, `…::a_placeholder_inferred_from_a_column_keeps_the_columns_metadata` |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217) | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
@@ -245,7 +265,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 | `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
 | `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
-| `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
+| `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/data-connector-api/src/listing/connector.rs::a_short_range_body_is_a_parquet_error_and_not_a_panic`, driven through `ParquetMetaDataPushDecoder`, which is the public surface `push_range` sits behind. The listing/overwrite harness cannot reach it: it 412s a pinned `If-Match` before a short *successful* range body is ever decoded |
 | `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 
 ## datafusion-ballista
@@ -260,11 +280,24 @@ so the rows below name the contracts, not every commit.
 | Cluster RPC TLS and API-key auth (fork PR #3) | Scheduler/executor traffic falls back to plaintext and unauthenticated | silent (security) | `crates/runtime/tests/tls/mod.rs` (two guards) |
 | Object-store shuffle storage (S3/Azure), `PrefixStore` wrapping, single-stream IPC per partition (fork PRs #9, #18, #40–#43) | Shuffles fall back to local disk, or S3 shuffle paths resolve to the wrong key | silent | `crates/runtime/tests/cluster/distributed_acceleration.rs` and the rest of `crates/runtime/tests/cluster/` |
 | In-memory shuffle storage with remote-fetch fallback (fork PRs #7, #8) | Every shuffle round-trips through storage | silent (perf) | `crates/runtime/tests/cluster/in_memory_shuffle.rs` |
-| Shuffle-fetch resilience: retry on a fresh connection, h2 receive-window sizing, bounded read inactivity, unordered stream consumption (fork PRs #61, #62, #63) | A transient fetch failure fails the whole query; large shuffles stall | silent | **GAP** |
+| Shuffle-fetch resilience: a buried `FetchFailed` surfaced so the scheduler can recover, retry on a fresh connection, h2 receive-window sizing, bounded read inactivity, unordered stream consumption (fork PRs #36, #61, #62, #63) | A transient fetch failure fails the whole query; large shuffles stall. The surfacing is the quiet half: a `FetchFailed` reaches the scheduler wrapped as `Shared(Arc(ArrowError(ExternalError(…))))`, and an unwrapping that stops at `ArrowError` leaves it buried, so `FailedTask::from` falls through to `FailedReason::ExecutionError` — non-retryable — and the `FetchPartitionError` recovery that reruns the offending map stage never runs | silent | **GAP** |
 | Scheduler lock hygiene across persists and awaits (fork PR #60) | Cluster wedge / runtime freeze under load | silent (hang) | **GAP** |
 | Don't swap null-aware anti joins in `JoinSelection` (fork PR #58) | A distributed anti-join returns wrong rows | silent (wrong data) | `crates/runtime/src/cluster/datafusion/mod.rs::a_null_among_the_values_leaves_no_row_selected`, `…::a_null_among_the_values_leaves_no_row_selected_where_no_swap_is_profitable`, `…::values_without_a_null_select_every_probe_absent_from_them`, `…::the_rule_neither_swaps_the_sides_nor_drops_the_flag` — these drive the scheduler's own rule rather than a live cluster, because a distributed `NOT IN` currently fails before it can return rows (the rule forces `CollectLeft` on a stage whose left input is already hash-partitioned, and `to_resolved` cannot repartition) |
 | Vortex columnar shuffle format (fork PR #7) | Shuffles fall back to Arrow IPC | build | compile-guarded |
-| Stuck-query detection and stale `TaskStatus` rejection (fork PRs #39, #53) | A reset partition's stale status is accepted, corrupting the execution graph | silent | **GAP** |
+| Stale `TaskStatus` rejection for reset partitions (fork PR #53) | A status update already in flight when its executor was lost arrives for a partition whose task info the reset cleared. Upstream unwraps that `None`, and the panic lands on the scheduler event-loop worker: the event channel closes and every later job submission and executor heartbeat fails with `Fail to send event due to channel closed` — one late packet wedges the cluster | silent (panic, then cluster wedge) | `crates/runtime/src/cluster/datafusion/mod.rs::stale_status_for_a_reset_partition` — `a_status_for_a_partition_with_no_scheduled_task_is_refused` and `a_status_for_a_partition_whose_task_is_still_scheduled_is_accepted`, asserted against `RunningStage::update_task_info` on a stage that `RunningStage::reset_tasks` has cleared for the lost executor while another executor's task stays scheduled, so a patch that refused every status fails the second. Driving the real `reset_stages_on_lost_executor` would be closer still, but `ExecutionGraph::pop_next_task` is `#[cfg(test)]` on the fork and unreachable from here |
+| Distributed `EXPLAIN` (fork PR #34) | The client wraps `LogicalPlan::Explain` in a `BallistaExplainNode` so the requested format survives serialization across the client/scheduler boundary; the scheduler unwraps it and substitutes a distributed-aware `ExplainExec`. Without it a cluster cannot explain its own plans, which is the only way to see how a statement was distributed | silent (no diagnostic) | `crates/runtime/tests/cluster/distributed_cayenne_catalog.rs` and `…/distributed_iceberg.rs` run `EXPLAIN` through the cluster harness (`harness.explain` issues `EXPLAIN <sql>`) and assert on the plan it emits |
+| Distributed `EXPLAIN ANALYZE` and `EXPLAIN FORMAT TREE` (fork PR #34) | The two other formats the same node carries. `ANALYZE` is what reports the rows and time each distributed operator actually saw, so without it a cluster's plan can be read but not measured | silent (no diagnostic) | **GAP** — nothing here issues either form *through the cluster*. `crates/runtime/tests/cluster/distributed_task_history.rs` looks like it does and does not: it submits the plain query and uses the `EXPLAIN ANALYZE` text only as the expected `input` label of a captured `plan` row, and asserts that no `EXPLAIN ANALYZE` query ran. Closing this needs the cluster harness to issue the statement itself |
+| `executor_id` persisted on `TaskInfo`, and `ExecutionGraph` exposed to embedded callers (fork PR #38) | The scheduler is embedded here rather than run as its own binary, so both are API this workspace calls; `executor_id` is also what lets a reset identify the tasks a lost executor was running | build | compile-guarded — `crates/runtime/src/cluster/datafusion/mod.rs`'s fork PR #53 guard constructs a `TaskInfo` with it, and `crates/runtime/src/cluster/shared_job_state.rs` uses the exposed graph |
+| `get_job_execution_graph` re-exposed as `pub` (fork PR #49) | An embedded scheduler cannot read the graph of a job it is running | build | compile-guarded by `crates/runtime/src/datafusion/query/handle.rs` |
+| Execution graphs serialized for cross-scheduler recovery (fork PR #56) | A job cannot be resumed by a scheduler other than the one that planned it, so a scheduler restart loses every in-flight distributed query | build | compile-guarded by `crates/runtime/src/cluster/shared_job_state.rs`, which calls `execution_graph_to_bytes`/`execution_graph_from_bytes` and holds an `ExecutionGraphBox` |
+| A missing partition file is read as an empty partition (fork PR #54) | A map task that produced no rows for a given reducer partition writes no file for it, and the executor's flight service answers the fetch `NotFound`. Read as a failed fetch that is a failed query; read as the data-level signal it is, the partition is simply empty. Fork PR #57 keeps the pooled client on a `NotFound` for the same reason — it is not a broken connection | silent (query failure) | **GAP** — needs a cluster and a shuffle with an empty partition |
+| Shuffle-fetch clients pooled per peer instead of dialled per fetch, with HTTP/2 keepalive on the pooled connections (fork PR #57) | `fetch_partition_remote` opened a fresh `BallistaClient` — a new gRPC connection and TLS handshake — for every partition fetch, and a distributed shuffle has every reducer partition fetch from every map peer, so one query issues thousands of concurrent connection attempts. Under CPU load those handshakes run slow enough that clients abort mid-handshake and peers report `connection reset by peer`, failing the fetch and the query. One client per `(host, port, use_tls)` is cloned per fetch instead, collapsing the storm to one connection per peer, and is evicted on failure so the next fetch reconnects | silent (query failure under load) | **GAP** — the failure needs a cluster under enough CPU load to slow a handshake; measured by the fork on a distributed TPC-H run |
+| A task's file scan is restricted to its own partition, and physical uncorrelated scalar subqueries are disabled (fork PR #57, porting apache/datafusion-ballista#1907 and #1909) | Each executor task runs one partition on its own plan instance, so a file scan's shared work queue drains the *whole* table per task: an N-fold over-read, and every aggregate over it inflated N-fold on a query that reports success. `create_query_stage_exec` restricts each `DataSourceExec` to its partition's file group before execution. The second half is a different failure: an uncorrelated scalar subquery plans as a physical `ScalarSubqueryExec` the executor cannot decode once stage splitting separates it, so TPC-H q11/q15/q22 fail outright unless the restricted configuration disables them into joins | silent (wrong data), and query failure | **GAP** — the over-read needs a distributed scan across more than one task to show, so a single-executor harness reads the same rows either way |
+| Reconciliation sweep for pull-based stage revival and lost job completion (fork PR #57) | Pull-based scheduling resolves downstream stages only on the event-driven path, so one lost or raced revival wedges the job forever: it stays `Running` with no available tasks, executors poll and get nothing, and the scheduler reports itself healthy. The same sweep re-emits `JobFinished` for a graph that is fully successful but still in the active cache, which is the other way a finished query never finishes | silent (hang) | **GAP** — needs a cluster and a lost revival; the fork observed it on a SF10 distributed TPC-H query whose correlated-subquery DAG completed its branch stages and never resolved the dependants |
+| Job graph persisted off the event loop and outside the execution-graph write lock, and awaited so job status advances monotonically (fork PR #57) | Persisting inside the lock and on the event loop drops task updates that arrive while the write is in flight; not awaiting it lets a status poll read a graph older than one it has already been shown, so job status goes backwards | silent (dropped task updates, status regression) | **GAP** — a race between a persist and a poll, so any test of it is a timing test |
+| Task statuses re-delivered after a failed `poll_work` (fork PR #57) | An executor that fails to deliver a batch of task statuses drops them, so the scheduler never learns those tasks finished and the stage waits on work that is already done | silent (hang) | **GAP** — needs a cluster and an induced `poll_work` failure |
+| Terminal job status persisted before the job leaves the active cache (fork PR #59) | `succeed_job` removed the job from the active execution-graph cache before the `save_job` write completed, so a concurrent `get_job_status` fell through to the not-yet-updated shared state and answered a stale `Running`. The distributed query client polls on a 2s budget, so it reported a timeout for a query that had in fact succeeded | silent (a successful query reported as a timeout) | **GAP** — a race between a status poll and a save, so any test of it is a timing test; measured by the fork against the client's poll budget |
+| Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | silent (no diagnostic) | **GAP** — the detection runs on the scheduler's own timer against live executor state, and the scheduler's task-issuing API is `#[cfg(test)]` on the fork, so there is no way from here to drive a query into the stuck state |
 
 ## datafusion-federation and datafusion-table-providers
 
@@ -313,6 +346,9 @@ silently disabled optimization rather than a build failure:
 | Analyzer: recursive work tables are neutral, with dialect renderability checked before selecting a remote plan (federation PR #84) | Recursive joins split at the work table, or an unsupported dialect receives a plan it cannot execute | silent (query failure / perf) | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_federates_a_recursive_cte_and_its_remote_join`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table`. The fork also guards unsupported-dialect fallback |
 | Analyzer: consider the complete recursive CTE before splitting its terms (federation PR #85) | A remote scalar-subquery bound makes an incomplete recursive term look unfederatable, so the enclosing CTE executes locally | silent (extra remote jobs) | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_federates_a_recursive_cte_and_its_remote_join` (the scalar-bound case) |
 | Analyzer: table rewrites resolve existing output names and preserve aliases and field metadata, including UNNEST projections (federation PR #84) | Computed output references stop resolving or explicit user aliases and metadata change | silent (query failure / output schema) | Real-engine grouped-expression cards in `test/scripts/bigquery_pushdown.py`; in the fork, `test_rewrite_table_scans_moves_a_pinned_name_with_its_table`, quoted user-alias controls, and `test_rewrite_unnest_preserves_alias_metadata` |
+| Schema cast is strict, so a value that will not fit its declared type errors instead of becoming NULL (federation PR #67) | `SchemaCastScanExec` brings every batch a remote returns to the schema the plan declared. Arrow's default cast is the *safe* one: a value the target type cannot hold becomes NULL rather than an error. So a federated column read one width too narrow — a remote `BIGINT` the plan typed `INT`, which is what a schema inferred from one source and used against another gives — answers with NULLs where the remote sent numbers, on a query that reports success | silent (wrong data) | `crates/data_components/src/federation.rs::a_federated_value_too_wide_for_its_declared_type_is_an_error_not_a_null`, which casts one past `i32::MAX` and requires the error, with an in-range value as the control so a cast that refused everything could not pass |
+| DML plans are returned unwrapped rather than federated (federation PR #73) | The analyzer wraps the largest federable sub-tree in a `FederatedPlanNode`, and a `Dml` node over a federated table qualifies. Wrapped, it cannot be rendered — the unparser has no `dml_to_sql` — and `DataFusion`'s physical planner dispatches `delete_from`/`update` by matching `LogicalPlan::Dml`, which it cannot do through a `LogicalPlan::Extension`, so `INSERT`/`UPDATE`/`DELETE` against a federated table stops working. The fork gives a third reason, that a wrapped `Dml` is invisible to a write-permission validator that walks for it; that is the fork's rationale rather than a claim reproduced here, because `validate_sql_query_operations` runs on the plan `create_logical_plan` returns and analyzer rules have not run at that point | silent (query failure) | `crates/data_components/src/federation.rs::nothing_under_a_dml_plan_is_federated_by_the_analyzer`, which asserts on the `Dml`'s *input* rather than its root: losing the patch federates what sits under the node rather than replacing it, so the root is a `Dml` either way. Its control establishes that the input is a shape the analyzer really does federate, without which the assertion would hold for the wrong reason — and a `Limit` is used rather than a filter because a filter is pushed into the scan before federation runs, collapsing the plan to a bare `TableScan` that the adaptor serves itself and the analyzer leaves alone. The fork's own `dml_plan_is_returned_unchanged` builds its DML over a plain table, where the early return is not what makes it pass. The same fork PR also has `FederatedTableProviderAdaptor` forward `delete_from` and `update` to the provider it wraps — an independent behaviour, since `TableProvider` defaults both to reporting the operation unsupported, so a re-cut can keep the early return and drop either method and still compile; `…::the_adaptor_forwards_dml_to_the_provider_it_wraps` covers that half |
+| `EXISTS`/`NOT EXISTS` subqueries are seen and federated by the analyzer (federation PR #74) | `Expr::Exists` fell through the expression walk, so the tables inside an `EXISTS` subquery were invisible to the provider verdict and the subquery was never federated: it executes locally, one scan per table reference, while the statement around it federates — the shape the scanless-correlation row above was measured at, 24 statements where one was correct. The patch also wraps a federated subquery in a no-op `Projection`, because `DecorrelatePredicateSubquery` will not take a `LogicalPlan::Extension` as a subquery and leaves the correlation undecorrelated otherwise | silent (perf, badly) | `crates/data_components/src/federation.rs::an_exists_subquery_over_a_federated_table_is_federated`, whose outer table is deliberately *not* federated so the statement cannot federate as one unit — it asserts nothing outside the subquery is wrapped, and then that the subquery is, so the second assertion cannot be met by the wrong node, and `…::a_not_exists_subquery_is_federated_and_stays_negated` for the negated shape — the patch rebuilds the expression rather than wrapping it, carrying `negated` across by hand, and a rebuild that reset the flag federates exactly as well while returning the complement of the rows asked for. In the fork, seven `sql/mod.rs` snapshots across same-provider, cross-provider and mixed-provider shapes, which leave with the patch |
 | ADBC schema fetch leaves a query's own `WITH` at the top level (table-providers PR #71) | A driver using the query-based schema fallback nests `WITH RECURSIVE` inside the schema-probe CTE, which BigQuery rejects | silent (query failure) | `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table`, which executes through the real driver; EXPLAIN alone does not exercise schema discovery |
 | Analyzer: federate a statement whose only tables are inside a subquery — `contains_federated_table` descends into subquery expressions, and a correlated reference to a relation that scans nothing is neutral rather than ambiguous | A query whose outer `FROM` is a constant relation and whose federated tables are all inside a scalar/`IN`/`EXISTS` subquery is not federated *at all, in any part*: the analyzer returns before doing anything, or the unresolved correlation reads as a second engine and that verdict propagates through every enclosing node. The statement reaches the engine as one scan per table reference — each re-executed for every place the plan mentions it — with every join and aggregate evaluated locally. A dashboard card of this shape was measured at 24 statements where one was correct | silent (perf, badly) | `datafusion-federation/src/sql/mod.rs::tests::a_correlation_against_a_scanless_relation_federates_as_one_statement` (in the fork, with `::a_correlation_against_a_scanning_relation_still_federates_as_one_statement` as the control); real-engine guard: `test/scripts/bigquery-pushdown.sh::correlated-subquery-over-constant-relation`. The neutral verdict is deliberately narrow — it needs a unique relation of that name that scans nothing — because binding a correlation to the wrong relation of the same name would return wrong rows rather than fail |
 
@@ -362,6 +398,7 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 | ICU extension statically linked into bundled DuckDB (fork PR #23) | Any query using a named timezone (`AT TIME ZONE 'America/New_York'`) fails at runtime, and DuckDB tries to download the extension from the network | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_resolves_a_named_time_zone_without_installing_icu` |
 | VSS (HNSW) extension statically linked (fork PR #37) | Vector search over a DuckDB accelerator fails, or silently falls back to a full scan | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_builds_an_hnsw_index_without_installing_vss` |
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
+| Thrift `TEnumIterator::operator==` backport for macOS 27 / libc++ (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ constructs Thrift enum maps with `iterator == end`, and the vendored Thrift header only defined `operator!=` | build (macOS 27) | `scripts/check_fork_patches.py::duckdb_thrift_iterator_equality` — reads `operator==(const TEnumIterator` out of the pinned revision's `duckdb.tar.gz`. The fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` covers the same property inside the fork and does not survive a re-cut of this pin |
 
 ## iceberg-rust
 
@@ -375,7 +412,8 @@ Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
-| `IcebergTableProvider::try_new` made public; extended file metadata | No construction path from Spice | build | compile-guarded |
+| `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
+| Extended file metadata (`FileIO::lister`, `FileMetadata::mode`) — **carries no code** | Nothing. Recorded so the next audit does not go looking: upstream moved opendal out of the core crate, and re-adding a `Lister` and an `EntryMode` there would put the dependency back and break every `Storage` impl. Spice reaches neither — its Hadoop catalog uses its own opendal `Operator::lister()` — so the commit on the branch is a README whitespace change kept for provenance | none | not applicable |
 
 ## async-openai
 
@@ -388,6 +426,9 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | `post`/`post_stream` and the GET operation made public | Non-OpenAI providers built on the same client lose their entry point | build | compile-guarded |
 | Don't serialize nulls; hide `usage` when null (fork PR #32) | Requests carry explicit `null`s that some OpenAI-compatible servers reject | silent (request failure) | `crates/runtime/src/model/wrapper/mod.rs::a_streamed_request_carries_no_null_stream_option`, with `…::unset_stream_options_serialize_to_an_empty_object` pinning the same property at the type |
 | `Eq`/`Hash` on `EmbeddingInput` and `CreateEmbeddingRequest` | Embedding request caching cannot key on the request | build | compile-guarded |
+| `Authorization` is sent only when there is a key to send | Spice builds every OpenAI client through `new_openai_client_with_chat_backend`, which starts from `with_api_key("")` on purpose — so the library cannot pick a key up from the environment — and overrides it only when one was configured. Upstream inserts the header unconditionally, so without this a model with no `api_key` sends `Authorization: Bearer ` with an empty value on every request, and an OpenAI-compatible endpoint that needs no key refuses the malformed credential instead of serving it | silent (request failure) | `crates/llms/src/openai/mod.rs::authorization_header_tests::a_client_with_no_api_key_sends_no_authorization_header`, which drives a health check through that constructor against a one-shot local endpoint and reads the request it received, with `::a_client_with_an_api_key_sends_it_as_a_bearer_token` as the control — otherwise the first would pass on a client that sent no credential at all |
+| `EasyInputMessage::type` is `#[serde(default)]` | The Responses API does not send `type` on every message, and upstream requires the field, so a reply that omits it fails to deserialize and the request errors — on the path `responses_adapter` builds and reads (`InputItem::EasyMessage`) | silent (request failure) | `crates/llms/src/openai/responses_adapter.rs::tests::a_responses_message_deserializes_with_or_without_its_type_field`, which deserializes the field both absent and present, so a default that swallowed the field would not pass |
+| A 404 ends the retry loop instead of being retried | The retry path treats a 404 as permanent, because it means the base URL is wrong rather than that the service is busy. Without it a mistyped `endpoint` is retried through the whole backoff budget before reporting, so a configuration error looks like a slow provider | silent (a configuration error reported late) | **GAP** — the difference is *when* the error arrives rather than what it is, and asserting that is a timing test. `binary(=list_models_errors)` covers the error mapping for the lister, not the retry decision |
 | Aggregated rate-limit retry logging; `retry-after` honoured from the response header (fork PRs #37, #38) | One `WARN` per retried request instead of one per burst; retries ignore the server's back-off hint | silent (log noise, throughput) | **GAP** |
 
 ## clickhouse-rs
@@ -397,7 +438,7 @@ by tag `0.2.2`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | **GAP** — `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs` covers `Date` only |
+| `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` (fork commit `7e98394f`, which is the pinned revision itself) | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs::a_date32_value_decodes_the_dates_a_date_column_cannot_hold` for the decode `block_to_arrow` calls and for `Date32` still reporting `SqlType::Date`, which is what selects that arm. The wire half is only reachable against a server — `column::factory`'s `"Date32"` arm is fed from the `pub(crate)` `Block::load`, and `Block::add_column` over `NaiveDate` builds the 16-bit column — so the `Date32` column in `test/scripts/setup-data-clickhouse.sql` guards it end-to-end in the ClickHouse quickstart job |
 | `ConnectionError::NoPacketReceived` | A dropped connection surfaces as a less specific error | build | compile-guarded |
 
 ## rusqlite and tokio-rusqlite
@@ -424,6 +465,14 @@ Upstream [SeaQL/sea-query](https://github.com/SeaQL/sea-query).
 Upstream [andrusha/snowflake-rs](https://github.com/andrusha/snowflake-rs), branch
 `spiceai-58`.
 
+Every row below is **GAP**, and none is reachable from this repo as it stands:
+`snowflake-api` builds its URL as `https://{account}.snowflakecomputing.com` with
+no host override, so no local server can stand in for Snowflake, and `responses`
+is a private module, so the response types cannot be deserialized directly
+either. Closing any of these needs a live Snowflake account, or an upstream
+change that lets the base URL be set — the cheaper of the two, and it would make
+all five testable at once.
+
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Streaming Arrow batches instead of collecting the whole result | Large Snowflake queries materialise fully in memory — OOM risk | silent (memory) | **GAP** |
@@ -439,7 +488,7 @@ Upstream [sreeise/graph-rs-sdk](https://github.com/sreeise/graph-rs-sdk).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Default drive for `Group` | SharePoint group-scoped datasets cannot resolve their drive | build | compile-guarded by `crates/data-connectors/connector-sharepoint` |
-| Tower service setup moved to `RequestHandler` (upstream PR #494) | Middleware (retry, tracing) is not applied to Graph requests | silent | **GAP** |
+| Tower service setup moved to `RequestHandler` (upstream PR #494) | Middleware (retry, tracing) is not applied to Graph requests | silent | **GAP** — nothing here configures Graph middleware, so there is no behaviour of *ours* to assert on, and the only seam that reaches the client is the opt-in `sharepoint-mock-host` feature, which the gate does not build. Closing it means configuring the retry middleware this patch exists to enable, which is a change to the connector rather than a test |
 
 ## docx-rs
 
@@ -448,7 +497,7 @@ Upstream [bokuweb/docx-rs](https://github.com/bokuweb/docx-rs).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `Render` trait for `Document`/`DocumentChild`, including paragraph newlines and table rendering | `.docx` documents cannot be turned into text — the document parser has no extraction path | build (trait) | `crates/document_parse/src/docx.rs` imports `docx_rs::Render` |
-| Paragraph and table newline placement | Extracted text runs together, changing chunk boundaries and therefore embeddings | silent (wrong text) | **GAP** |
+| Paragraph and table newline placement (fork commits `3bf3c89e` for paragraphs, `ccea2029` for tables) | Extracted text runs together, changing chunk boundaries and therefore embeddings | silent (wrong text) | `crates/document_parse/src/docx.rs::a_docx_separates_paragraphs_and_not_the_runs_inside_one` and `…::a_docx_table_separates_its_rows_and_cells`, which build a `.docx` in memory and assert the placement in both directions — the fork got this wrong once internally before fixing it, by separating paragraph children instead of document children |
 
 ## model2vec-rs
 
@@ -457,8 +506,8 @@ Upstream [MinishLab/model2vec-rs](https://github.com/MinishLab/model2vec-rs).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | IDs-only fast WordPiece tokenizer for the potion models | Static embedding throughput drops sharply | silent (perf) | **GAP** |
-| `config.json` made optional for sentence-transformers compatibility | Loading a sentence-transformers static model fails | silent (load failure) | **GAP** |
-| HF cache directory read from the environment | Models are re-downloaded instead of reusing the shared cache | silent | **GAP** |
+| `config.json` made optional, and the embedding tensor read from `embedding.weight` or `0` as well as `embeddings`, for sentence-transformers compatibility (fork commit `f1190f1f`) | Loading a sentence-transformers static model fails. Two independent halves of the same use case: such an export ships no `config.json` **and** names its tensor `embedding.weight`, so losing either one leaves the model failing to load | silent (load failure) | `crates/llms/src/model2vec.rs::a_local_model_loads_without_a_config_json` and `…::a_local_model_loads_with_the_sentence_transformers_tensor_names`, against a model directory the test writes — a tokenizer and a hand-built `safetensors` tensor, no `config.json`, and the tensor name as a parameter so each test is the other's control |
+| HF cache directory read from the environment (fork commit `1259c0d3`) | Models are re-downloaded instead of reusing the shared cache | silent | `crates/llms/tests/model2vec_hf_cache.rs::a_cached_model_is_read_from_the_directory_hf_hub_cache_names`. Its own test binary because it sets a process-wide environment variable, so it is selected by name in the Makefile's `NEXTEST_FILTER` alongside the other credential-free `llms` binaries |
 
 ## text-splitter
 
@@ -466,23 +515,33 @@ Upstream [benbrandt/text-splitter](https://github.com/benbrandt/text-splitter).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| Tokenizer sizing accounts for special characters (`src/chunk_size/huggingface.rs`) | Chunks are sized without the tokenizer's special tokens, so a chunk can exceed the model's context window at embed time | silent (embedding failure / truncation) | **GAP** — `crates/chunking` tests cover the splitter, not the sizing |
+| Tokenizer sizing accounts for special characters (`src/chunk_size/huggingface.rs`, fork commit `b33e4748`) | Chunks are sized without the tokenizer's special tokens, so a chunk can exceed the model's context window at embed time | silent (embedding failure / truncation) | `crates/chunking/src/lib.rs::a_tokenizer_sized_chunk_counts_the_special_tokens_the_model_will_add` for the sizing and `…::a_tokenizer_sized_chunk_fits_the_budget_the_model_will_measure_it_against` for the consequence, both against a `WordPiece` fixture built in the test rather than a downloaded model |
 
 ## mistral.rs and text-embeddings-inference
 
 Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) and
 [huggingface/text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference).
 
-The `mistral.rs` fork's base is `master@2d4ba4f16`, not a release tag, and it carries
-71 commits. Most are Spice-side integration (dependency re-pointing onto
-`spiceai/candle`, logging removal so the loader does not install a global
-subscriber).
+The `mistral.rs` fork's base is `master@2d4ba4f16`, not a release tag, and it
+carries 71 commits. Most are Spice-side integration (dependency re-pointing onto
+`spiceai/candle`, CUDA and Windows build fixes).
+
+Two rows this table used to carry — assistant messages with `tool_calls` in the
+chat template, and `tracing_subscriber.init()` removed from the loaders — are gone
+because neither is fork state any longer. Both behaviours are present in
+`master@2d4ba4f16` itself, the commit this fork line was cut from. It already
+defines `MessageContent` as `Either<String, Vec<IndexMap<String, Value>>>`, which
+is the widening the `tool_calls` patch existed to make; and no loader in either
+tree installs a global subscriber — the only `tracing_subscriber` call anywhere in
+`mistralrs-core` is a `try_init()` behind a `OnceLock` in `utils/debug.rs`, byte
+identical to upstream's, and `try_init` cannot displace a subscriber `spiced` has
+already installed. The Spice commits that once made those two changes are not
+ancestors of that base, so upstream reached the same state by its own route
+rather than by taking them. A re-cut cannot lose what the fork does not carry.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `mistral.rs`: i-quant MoE `index_select` + in-place row dequant | ~34% slower local MoE inference | silent (perf) | **GAP** |
-| `mistral.rs`: assistant messages with `tool_calls` handled in the chat template | Tool-calling conversations render wrong prompts, so the model loses tool context | silent (wrong output) | **GAP** |
-| `mistral.rs`: `tracing_subscriber.init()` removed from the loaders | The loader installs a global subscriber and hijacks `spiced`'s logging | silent (logging) | **GAP** |
 | `mistral.rs`: candle dependency re-pointed at `spiceai/candle` | Two candle versions in the graph | build | compile-guarded |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
 | `text-embeddings-inference`: pooling/model-loading fixes | Embeddings differ from the reference implementation | silent (wrong vectors) | **GAP** |
@@ -509,8 +568,11 @@ Upstream [sjrusso8/spark-connect-rs](https://github.com/sjrusso8/spark-connect-r
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| Default to the `http` scheme when `use_ssl` is false | A non-TLS Spark Connect endpoint is dialled over TLS and the connection fails | silent (connection failure) | **GAP** |
+| Default to the `http` scheme when `use_ssl` is false (fork PR #3) | A non-TLS Spark Connect endpoint is dialled over TLS and the connection fails | silent (connection failure) | `crates/data_components/src/spark_connect.rs::a_non_tls_spark_endpoint_is_dialled_in_plaintext`, which asserts the HTTP/2 preface arrives at a local plaintext listener through the real `SparkSessionBuilder::remote(…).build()` path, and `…::a_non_tls_connection_string_resolves_to_an_http_endpoint` for the mechanism |
 | Edmondo fork changes merged in | Spark Connect features Spice depends on go missing | build | compile-guarded |
+| A TLS endpoint is dialled with a TLS configuration — `ClientTlsConfig::new().with_native_roots()` — and `use_ssl` is exposed to ask (fork PR #7) | `Endpoint::connect` attaches no TLS configuration of its own, so without this a `use_ssl=true` endpoint is either dialled in the clear, which the server rejects, or refused by `tonic` for having no TLS configuration. Every dataset on a Databricks endpoint fails to load either way. The counterpart to the `http`-scheme row above: that one decides the scheme, this one supplies the TLS | build (the `use_ssl` accessor) + silent (connection failure) | `crates/data_components/src/spark_connect.rs::a_tls_spark_endpoint_is_dialled_with_a_tls_handshake`, which dials a listener that speaks no TLS and requires the first bytes to be a TLS handshake record. It pins that TLS is configured at all, not *which* root store was chosen — the roots a client trusts are not observable from its `ClientHello` — so `with_native_roots` itself rests on the accessor, which `::a_non_tls_connection_string_resolves_to_an_http_endpoint` calls and the compiler requires |
+| `SparkSession::set_token`, so a session's bearer token can be replaced without rebuilding it (fork PR #8) | A rotated Databricks token cannot be applied to a live session, so every session has to be torn down and rebuilt when a token refreshes | build | compile-guarded by `crates/data_components/src/spark_connect.rs`, which calls `session.set_token(Some(token))` on refresh |
+| `user_agent` read from the connection string, and used to replace the default rather than extend it (fork PRs #9, #10) | A Spark Connect client identifies itself to the server by user agent, and Databricks meters and attributes traffic by it. Without these the value in a connection string is ignored, or appended to `spark-connect-rs`'s own, so the traffic is attributed to the library. This is live on every production Databricks connection: `DatabricksSparkConnect::new_with_rate_controller` formats `user_agent=` into the connection string, `SparkSessionFactory::from_connection` keeps it in `base_options` (only `token` and `session_id` are dropped), and `render_connection` puts it back for `SparkSessionBuilder::remote` | silent (attribution) | `crates/data_components/src/spark_connect.rs::a_connection_string_user_agent_replaces_the_client_default`, which reads the value back off the `ChannelBuilder` and requires the library default to be *gone* — extending it would fail. Its control asserts that default is what appears when the option is absent, so the replacement assertion cannot be met by a builder carrying no user agent. Read through `Debug` because the value's only other appearance is the `client_type` field of an outgoing request, which needs a gRPC server to observe |
 
 ## delta-kernel-rs
 
@@ -541,7 +603,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**30 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**28 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -549,52 +611,59 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
-   PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-2. `snowflake-rs` chunked JSON responses and record-batch ordering.
-3. `clickhouse-rs` `Date32` range.
-4. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
-   change the text that gets embedded.
-5. `mistral.rs` `tool_calls` chat-template handling.
-6. `text-embeddings-inference` pooling and model-loading fixes — embeddings
-    differ from the reference implementation.
-
+1. `datafusion-ballista` a task's file scan restricted to its own partition (fork
+   PR #57) — without it every task drains the whole table, so a distributed
+   aggregate comes back inflated by the task count on a query that reports
+   success. Needs a scan spread across more than one task, so a single-executor
+   harness reads the same rows either way.
+2. `datafusion-ballista` stuck-query detection (fork PR #39) — a query that stops
+   making progress goes unreported. Its sibling, stale `TaskStatus` rejection, is
+   now guarded; this half needs the scheduler driven into the stuck state, and the
+   task-issuing API for that is `#[cfg(test)]` on the fork.
+3. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+   differ from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-7. `datafusion` bloom-filter replacement readers sharing the listed object
-    version — a predicate scan whose bloom-filter reader is built separately
-    falls back to stale `If-Match`, so a replaced object 412s; the query retries
-    or fails rather than mixing generations. The overwrite harness has no
-    bloom data.
-8. `vortex` session lock re-entry in writer init (fork PR #29).
-9. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
-    resilience (fork PRs #61–#63).
-10. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-11. `model2vec-rs` optional `config.json`.
-12. `snowflake-rs` async query response support — long-running queries time out.
-13. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
-    on a short read — a footer prefetch racing an in-place shrink panics the
-    reader thread rather than surfacing a retriable decode error. The
-    listing/overwrite harness 412s before a short successful range body
-    reaches the decoder.
+4. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+   resilience (fork PRs #36, #61–#63) — #36 is the quiet half, a `FetchFailed`
+   that reaches the scheduler buried in `Shared(Arc(ArrowError(ExternalError(…))))`
+   and is read as a non-retryable execution error, so the recovery that reruns
+   the offending map stage never runs.
+5. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
+   and #59: a missing partition file read as an empty partition; shuffle-fetch
+   clients pooled per peer; the reconciliation sweep that revives a lost stage or
+   finishes a job whose graph already succeeded; job-graph persistence moved off
+   the event loop and awaited; task statuses re-delivered after a failed
+   `poll_work`; and the terminal job status persisted before the job leaves the
+   active cache. Every one needs a running cluster to exhibit, and three are
+   races, so each row records what the fork measured rather than what a test
+   here could assert.
 
-**Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
-being honoured:
+**Blocked, not merely undone.** These have been looked at and cannot be closed by
+writing a test; each says what would unblock it:
 
-14. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
-    the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
-    one file per flush regardless of size.
-15. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
-    misconfigured warehouse produces an opaque error instead of an actionable one.
-16. `model2vec-rs` HF cache directory read from the environment — models are
-    re-downloaded instead of reusing the shared cache.
-17. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
-    installs a global subscriber and hijacks `spiced`'s logging.
+6. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+   live account, or an upstream change letting the base URL be set.
+7. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+   race, so any test of it is a timing test.
+8. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+   there is no behaviour of ours to assert on.
 
-**Security posture.** No correctness effect, but a silent downgrade:
+**Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-18. `graph-rs-sdk` tower middleware application.
+9. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+   `endpoint` is retried through the whole backoff budget before reporting, so a
+   configuration error looks like a slow provider. What changes is *when* the
+   error arrives, and asserting that is a timing test.
+
+**Diagnostics only.** The query is unaffected; what is lost is the ability to see
+how it ran:
+
+10. `datafusion-ballista` distributed `EXPLAIN ANALYZE` and `EXPLAIN FORMAT TREE`
+    (fork PR #34) — plain `EXPLAIN` is guarded through the cluster harness, and
+    these two are not issued through it by anything. Closing this needs the
+    harness to submit the statement rather than build its text as a label.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -602,8 +671,9 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-19. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+11. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
-    `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
-    cheap one exists); `async-openai` retry-after handling.
+    `snowflake-rs` streaming batches (memory, not latency — but see the
+    `snowflake-rs` note above: it is blocked with the rest of that fork);
+    `async-openai` retry-after handling.

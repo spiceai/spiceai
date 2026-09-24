@@ -9,5 +9,7 @@ runtime:
     caching_policy: tiny_lfu
     hashing_algorithm: blake3
     cache_key_type: sql
+    # Accepted for compatibility; ignored at runtime (Spice sharded cache).
+    # `engine: pingora` no longer selects Pingora — remove or leave unchanged.
     engine: pingora
     max_stale_while_revalidate: 60s

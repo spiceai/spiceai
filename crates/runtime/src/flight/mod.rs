@@ -38,7 +38,10 @@ use arrow_flight::{
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 use bytes::Bytes;
-use cache::result::{CacheStatus, query::QueryResult};
+use cache::result::{
+    CacheStatus,
+    query::{QueryResult, QueryResultSource, SendableCachedRawStream},
+};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -332,7 +335,15 @@ impl Service {
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages.
         let options = ipc_write_options;
-        let raw_schema = query_result.data.schema();
+        let cache_status = query_result.cache_status;
+        let (raw_schema, data_stream) = match query_result.into_source() {
+            QueryResultSource::CachedRaw { data, schema, .. } => {
+                (schema, FlightBatchStream::Shared(data))
+            }
+            QueryResultSource::Stream { data, .. } => {
+                (data.schema(), FlightBatchStream::Owned(data))
+            }
+        };
 
         let needs_view_cast = raw_schema
             .fields()
@@ -366,8 +377,6 @@ impl Service {
             ..Default::default()
         };
 
-        let cache_status = query_result.cache_status;
-
         // The schema is ready immediately. Batches are encoded as the Flight
         // response is polled so a ready result is never drained through `None`
         // at construction — that poll is what finishes query telemetry.
@@ -378,7 +387,7 @@ impl Service {
         account.reserve_now(flight_data_size(&schema_flight_data));
         let stream = InlineFlightStream {
             pending: VecDeque::from([Ok(schema_flight_data)]),
-            data_stream: Some(query_result.data),
+            data_stream: Some(data_stream),
             spawned: None,
             taken_bytes: 0,
             taken_batches: 0,
@@ -453,6 +462,47 @@ struct FlightEncodeArgs {
     request_context: Arc<RequestContext>,
 }
 
+enum ServedFlightBatch {
+    Owned(RecordBatch),
+    Shared(Arc<RecordBatch>),
+}
+
+impl ServedFlightBatch {
+    fn as_record_batch(&self) -> &RecordBatch {
+        match self {
+            Self::Owned(batch) => batch,
+            Self::Shared(batch) => batch,
+        }
+    }
+
+    fn array_memory_size(&self) -> usize {
+        self.as_record_batch().get_array_memory_size()
+    }
+}
+
+enum FlightBatchStream {
+    Owned(datafusion::execution::SendableRecordBatchStream),
+    Shared(SendableCachedRawStream),
+}
+
+impl Stream for FlightBatchStream {
+    type Item = Result<ServedFlightBatch, DataFusionError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Owned(stream) => Pin::new(stream)
+                .poll_next(cx)
+                .map(|item| item.map(|result| result.map(ServedFlightBatch::Owned))),
+            Self::Shared(stream) => Pin::new(stream)
+                .poll_next(cx)
+                .map(|item| item.map(|result| result.map(ServedFlightBatch::Shared))),
+        }
+    }
+}
+
 /// Flight response that encodes ready batches on the request task as the
 /// client polls, then hands any remainder to [`FlightEncodeStream`].
 ///
@@ -464,7 +514,7 @@ struct FlightEncodeArgs {
 /// encode path, including when this stream falls back to it.
 struct InlineFlightStream {
     pending: VecDeque<Result<FlightData, Status>>,
-    data_stream: Option<datafusion::execution::SendableRecordBatchStream>,
+    data_stream: Option<FlightBatchStream>,
     spawned: Option<FlightEncodeStream>,
     taken_bytes: usize,
     taken_batches: usize,
@@ -486,7 +536,7 @@ impl InlineFlightStream {
         Some(message)
     }
 
-    fn spawn_remaining(&mut self, prepend: Option<RecordBatch>) -> Result<(), Status> {
+    fn spawn_remaining(&mut self, prepend: Option<ServedFlightBatch>) -> Result<(), Status> {
         let Some(data_stream) = self.data_stream.take() else {
             return Err(Status::internal(
                 "Flight encode has no remaining record-batch stream to spawn",
@@ -538,7 +588,7 @@ impl Stream for InlineFlightStream {
             };
             match Pin::new(data_stream).poll_next(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
-                    this.taken_bytes += batch.get_array_memory_size();
+                    this.taken_bytes += batch.array_memory_size();
                     this.taken_batches += 1;
                     if inline_encode_budget_exhausted(this.taken_bytes, this.taken_batches) {
                         if let Err(status) = this.spawn_remaining(Some(batch)) {
@@ -616,7 +666,7 @@ impl Stream for InlineFlightStream {
 /// dedicated CPU runtime that overlap is free; on the shared IO-runtime
 /// fallback the spawn costs one scheduling hop before the first byte.
 fn spawn_flight_encode_stream(
-    data_stream: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    data_stream: BoxStream<'static, Result<ServedFlightBatch, DataFusionError>>,
     args: FlightEncodeArgs,
     account: Arc<EgressAccount>,
 ) -> FlightEncodeStream {
@@ -691,11 +741,15 @@ fn spawn_flight_encode_stream(
     }
 }
 
-/// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
+/// Encode one served batch into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
 /// advertised schema was expanded.
+///
+/// [`ServedFlightBatch::Owned`] is moved into the cast so a non-cache Flight
+/// query does not pay `RecordBatch::clone` before `cast_view_columns`.
+/// [`ServedFlightBatch::Shared`] clones only when that cast is required.
 fn encode_flight_batch(
-    batch: RecordBatch,
+    batch: ServedFlightBatch,
     needs_view_cast: bool,
     schema: &Arc<Schema>,
     encoder: &IpcDataGenerator,
@@ -703,16 +757,21 @@ fn encode_flight_batch(
     options: &IpcWriteOptions,
     compression_context: &mut CompressionContext,
 ) -> Result<(Vec<FlightData>, FlightData), Status> {
-    // Cast view columns to match the expanded schema we advertised.
+    let cast;
     let batch = if needs_view_cast {
-        arrow_tools::schema::cast_view_columns(batch, schema)
-            .map_err(|e| Status::internal(e.to_string()))?
+        let owned = match batch {
+            ServedFlightBatch::Owned(batch) => batch,
+            ServedFlightBatch::Shared(batch) => RecordBatch::clone(batch.as_ref()),
+        };
+        cast = arrow_tools::schema::cast_view_columns(owned, schema)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        &cast
     } else {
-        batch
+        batch.as_record_batch()
     };
 
     let (dicts, batch_data) = encoder
-        .encode(&batch, dict_tracker, options, compression_context)
+        .encode(batch, dict_tracker, options, compression_context)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     Ok((
@@ -1330,6 +1389,28 @@ mod tests {
         response
     }
 
+    /// Same as [`respond`], but the batches arrive as a Raw cache hit.
+    fn respond_cached_raw(
+        schema: &SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> BoxStream<'static, Result<FlightData, Status>> {
+        use cache::result::query::wrap_raw_batches;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(batches),
+                Arc::clone(schema),
+                CacheStatus::CacheHit,
+            ),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+        response
+    }
+
     async fn sent(mut response: BoxStream<'static, Result<FlightData, Status>>) -> Sent {
         let mut messages = Vec::new();
         while let Some(item) = response.next().await {
@@ -1845,5 +1926,126 @@ mod tests {
         assert!(error.is_none(), "{error:?}");
         assert!(!messages.is_empty());
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A Raw cache hit must produce the same Flight messages as the owned
+    /// stream for the success cases the encode path already covers.
+    #[tokio::test]
+    async fn cached_raw_flight_sends_what_the_owned_stream_sends() {
+        let plain: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let views: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            true,
+        )]));
+        let dictionary: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "vendor",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rows = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            batch(
+                &plain,
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+        };
+
+        let cases: Vec<(&str, &SchemaRef, Vec<RecordBatch>)> = vec![
+            (
+                "several batches, one empty, with NULLs",
+                &plain,
+                vec![
+                    rows(vec![Some(1), None], vec![Some("a"), None]),
+                    rows(vec![], vec![]),
+                    rows(vec![Some(3)], vec![Some("c")]),
+                ],
+            ),
+            ("an empty result", &plain, vec![]),
+            (
+                "view columns cast to the advertised types",
+                &views,
+                vec![batch(
+                    &views,
+                    vec![Arc::new(StringViewArray::from(vec![
+                        Some("x"),
+                        None,
+                        Some("a string longer than twelve bytes"),
+                    ])) as ArrayRef],
+                )],
+            ),
+            (
+                "a dictionary column",
+                &dictionary,
+                vec![batch(
+                    &dictionary,
+                    vec![Arc::new(DictionaryArray::<Int32Type>::from_iter([
+                        Some("alpha"),
+                        None,
+                        Some("alpha"),
+                        Some("bravo"),
+                    ])) as ArrayRef],
+                )],
+            ),
+        ];
+
+        for (case, schema, batches) in cases {
+            let owned_items: Vec<Result<RecordBatch, DataFusionError>> =
+                batches.iter().cloned().map(Ok).collect();
+            let owned = sent(respond(schema, owned_items, true)).await;
+            let cached = sent(respond_cached_raw(schema, batches)).await;
+            assert!(!owned.0.is_empty(), "{case}: the schema is always sent");
+            assert_eq!(owned, cached, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_raw_inline_flight_charges_queued_messages_against_the_memory_pool() {
+        use cache::result::query::wrap_raw_batches;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batches = vec![batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+        )];
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(batches),
+                Arc::clone(&schema),
+                CacheStatus::CacheHit,
+            ),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(
+            pool.reserved() > 0,
+            "the schema queued at construction must be charged against runtime.query.memory_limit"
+        );
+
+        let (messages, error) = sent(response).await;
+        assert!(
+            error.is_none(),
+            "the cached-raw result must encode: {error:?}"
+        );
+        assert!(
+            messages.len() >= 2,
+            "schema plus at least one batch must be sent"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "every queued FlightData reservation must be released once the response is consumed"
+        );
     }
 }
