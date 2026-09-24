@@ -3773,6 +3773,9 @@ mod test {
             parse_cayenne_optimizer_rules(&HashMap::new(), false),
             legacy_disabled
         );
+        assert!(CayenneOptimizerRules::auto_enabled().index_join());
+        assert!(CayenneOptimizerRules::all_enabled().index_join());
+        assert!(!CayenneOptimizerRules::none().index_join());
 
         assert_eq!(
             parse_cayenne_optimizer_rules(
@@ -3810,6 +3813,10 @@ mod test {
                 true,
             ),
             selected_rules
+        );
+        assert!(
+            !selected_rules.index_join(),
+            "an explicit legacy named-rule list must not implicitly enable the internal index join rule"
         );
 
         // `semi_join_pushdown` is on under both `auto` and `all`, and is also

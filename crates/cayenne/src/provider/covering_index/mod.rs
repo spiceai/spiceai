@@ -68,6 +68,7 @@ mod exec;
 mod executor;
 mod join;
 mod key;
+mod optimizer;
 mod page_store;
 mod view;
 mod visibility;
@@ -89,6 +90,7 @@ pub(crate) use key::{
     CoveredRowRef, EncodedKey, IndexColumn, IndexDefinition, KEY_CODEC_VERSION, KeyPageId,
     PayloadPageId, SchemaIdentity, SourceId,
 };
+pub use optimizer::CayenneIndexJoinRewriter;
 pub(crate) use page_store::{
     AllocationOwner, CoveringPageStore, KeyPage, KeyPageLease, MemoryPageStore, PageLease,
     PayloadPage, PayloadPageLease, ReservationToken,

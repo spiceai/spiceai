@@ -25,7 +25,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion_common::{DFSchema, DataFusionError, JoinSide, NullEquality, Result, Statistics};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::JoinType;
 use datafusion_physical_expr::{
@@ -113,6 +113,9 @@ pub(crate) struct CayenneIndexJoinExec {
     mapping: IndexJoinMapping,
     projection: Option<Arc<[usize]>>,
     filter: Option<JoinFilter>,
+    residual_filters: Arc<[JoinFilter]>,
+    additional_inner_filters: Arc<[PhysicalExprRef]>,
+    raw_output_candidate_upper_bound: Option<usize>,
     join_type: JoinType,
     null_equality: NullEquality,
     inner_static_filters: Arc<[Arc<dyn PhysicalExpr>]>,
@@ -120,13 +123,12 @@ pub(crate) struct CayenneIndexJoinExec {
     right_schema: SchemaRef,
     join_schema: SchemaRef,
     schema: SchemaRef,
-    memory_pool: Arc<dyn MemoryPool>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl CayenneIndexJoinExec {
-    /// Creates an eligible INNER or LEFT ordinary-equality index join.
+    /// Creates an eligible ordinary-equality index join.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         outer: Arc<dyn ExecutionPlan>,
@@ -138,16 +140,56 @@ impl CayenneIndexJoinExec {
         filter: Option<JoinFilter>,
         join_type: JoinType,
         null_equality: NullEquality,
-        memory_pool: Arc<dyn MemoryPool>,
     ) -> Result<Self> {
-        if !matches!(join_type, JoinType::Inner | JoinType::Left) {
+        Self::try_new_with_inner_filters(
+            outer,
+            inner_capability,
+            inner_definition,
+            outer_key_expressions,
+            mapping,
+            projection,
+            filter,
+            &[],
+            &[],
+            None,
+            join_type,
+            null_equality,
+        )
+    }
+
+    /// Creates a join while retaining filters captured above the inner scan and
+    /// residual equijoins not represented by the selected index key.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_inner_filters(
+        outer: Arc<dyn ExecutionPlan>,
+        inner_capability: CoveringIndexCapability,
+        inner_definition: &IndexDefinition,
+        outer_key_expressions: &[PhysicalExprRef],
+        mapping: IndexJoinMapping,
+        projection: Option<Vec<usize>>,
+        filter: Option<JoinFilter>,
+        additional_inner_filters: &[PhysicalExprRef],
+        residual_filters: &[JoinFilter],
+        raw_output_candidate_upper_bound: Option<usize>,
+        join_type: JoinType,
+        null_equality: NullEquality,
+    ) -> Result<Self> {
+        if !matches!(
+            join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right
+        ) {
             return Err(DataFusionError::Plan(format!(
-                "CayenneIndexJoinExec supports INNER and LEFT joins, not {join_type:?}"
+                "CayenneIndexJoinExec supports INNER, LEFT, and RIGHT joins, not {join_type:?}"
             )));
         }
         if join_type == JoinType::Left && !mapping.outer_is_left() {
             return Err(DataFusionError::Plan(
                 "CayenneIndexJoinExec LEFT join requires logical left as outer".to_string(),
+            ));
+        }
+        if join_type == JoinType::Right && mapping.outer_is_left() {
+            return Err(DataFusionError::Plan(
+                "CayenneIndexJoinExec RIGHT join requires logical right as outer".to_string(),
             ));
         }
         if null_equality != NullEquality::NullEqualsNothing {
@@ -188,6 +230,9 @@ impl CayenneIndexJoinExec {
             (Arc::clone(&inner_schema), outer.schema())
         };
         validate_join_filter(filter.as_ref(), &left_schema, &right_schema)?;
+        for residual in residual_filters {
+            validate_join_filter(Some(residual), &left_schema, &right_schema)?;
+        }
         let (join_schema, _) = build_join_schema(&left_schema, &right_schema, &join_type);
         let join_schema = Arc::new(join_schema);
         let schema = if let Some(projection) = &projection {
@@ -200,13 +245,18 @@ impl CayenneIndexJoinExec {
             outer.schema().as_ref(),
             inner_definition,
         )?;
-        let inner_static_filters = plan_static_filters(&inner_capability, &inner_access)?;
+        let inner_static_filters = plan_static_filters(&inner_capability, &inner_access)?
+            .iter()
+            .cloned()
+            .chain(additional_inner_filters.iter().cloned())
+            .collect::<Vec<_>>()
+            .into();
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             datafusion_physical_expr::Partitioning::UnknownPartitioning(
                 outer.output_partitioning().partition_count(),
             ),
-            if join_type == JoinType::Left {
+            if matches!(join_type, JoinType::Left | JoinType::Right) {
                 EmissionType::Both
             } else {
                 EmissionType::Incremental
@@ -222,6 +272,9 @@ impl CayenneIndexJoinExec {
             mapping,
             projection: projection.map(Into::into),
             filter,
+            residual_filters: residual_filters.to_vec().into(),
+            additional_inner_filters: additional_inner_filters.to_vec().into(),
+            raw_output_candidate_upper_bound,
             join_type,
             null_equality,
             inner_static_filters,
@@ -229,10 +282,15 @@ impl CayenneIndexJoinExec {
             right_schema,
             join_schema,
             schema,
-            memory_pool,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Conservative raw bound suitable for an outer index-join candidate.
+    #[must_use]
+    pub(crate) const fn raw_output_candidate_upper_bound(&self) -> Option<usize> {
+        self.raw_output_candidate_upper_bound
     }
 
     fn with_outer(&self, outer: Arc<dyn ExecutionPlan>) -> Result<Self> {
@@ -254,7 +312,7 @@ impl CayenneIndexJoinExec {
                 Ok(Arc::new(Column::new(field.name(), *index)) as PhysicalExprRef)
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::try_new(
+        Self::try_new_with_inner_filters(
             outer,
             self.inner_capability.clone(),
             self.inner_access.definition(),
@@ -264,9 +322,11 @@ impl CayenneIndexJoinExec {
                 .as_ref()
                 .map(|projection| projection.to_vec()),
             self.filter.clone(),
+            self.additional_inner_filters.as_ref(),
+            self.residual_filters.as_ref(),
+            self.raw_output_candidate_upper_bound,
             self.join_type,
             self.null_equality,
-            Arc::clone(&self.memory_pool),
         )
     }
 }
@@ -398,7 +458,7 @@ impl ExecutionPlan for CayenneIndexJoinExec {
             )));
         }
         let output_batch_size = context.session_config().batch_size().max(1);
-        let outer_stream = self.outer.execute(partition, context)?;
+        let outer_stream = self.outer.execute(partition, Arc::clone(&context))?;
         let state = IndexJoinState {
             outer_stream,
             outer_input: None,
@@ -410,6 +470,7 @@ impl ExecutionPlan for CayenneIndexJoinExec {
             inner_static_filters: Arc::clone(&self.inner_static_filters),
             mapping: self.mapping,
             filter: self.filter.clone(),
+            residual_filters: Arc::clone(&self.residual_filters),
             join_type: self.join_type,
             left_schema: Arc::clone(&self.left_schema),
             right_schema: Arc::clone(&self.right_schema),
@@ -418,7 +479,7 @@ impl ExecutionPlan for CayenneIndexJoinExec {
             projection: self.projection.clone(),
             output_batch_size,
             reservation: MemoryConsumer::new(format!("CayenneIndexJoinExec[{partition}]"))
-                .register(&self.memory_pool),
+                .register(context.memory_pool()),
             metrics: IndexJoinMetrics::new(&self.metrics, partition),
             done: false,
         };
@@ -629,6 +690,7 @@ struct IndexJoinState {
     inner_static_filters: Arc<[Arc<dyn PhysicalExpr>]>,
     mapping: IndexJoinMapping,
     filter: Option<JoinFilter>,
+    residual_filters: Arc<[JoinFilter]>,
     join_type: JoinType,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
@@ -683,7 +745,7 @@ impl IndexJoinState {
                     }
                     ProbeStep::Pending => tokio::task::yield_now().await,
                     ProbeStep::Exhausted => {
-                        if self.join_type == JoinType::Left
+                        if matches!(self.join_type, JoinType::Left | JoinType::Right)
                             && let Some(batch) = self.unmatched_batch()?
                         {
                             self.pending_output = Some(PendingOutput { batch, next_row: 0 });
@@ -930,28 +992,28 @@ impl IndexJoinState {
         outer_indices: UInt32Array,
         inner_indices: UInt32Array,
     ) -> Result<(UInt32Array, UInt32Array)> {
-        let Some(filter) = &self.filter else {
-            return Ok((outer_indices, inner_indices));
-        };
-        let filter_batch =
-            self.filter_batch(outer, inner, &outer_indices, &inner_indices, filter)?;
-        let values = filter
-            .expression()
-            .evaluate(&filter_batch)?
-            .into_array_of_size(filter_batch.num_rows())?;
-        let keep = values
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Cayenne index join ON filter returned {:?}, expected Boolean",
-                    values.data_type()
-                ))
-            })?;
-        Ok((
-            downcast_u32(&arrow::compute::filter(&outer_indices, keep)?)?,
-            downcast_u32(&arrow::compute::filter(&inner_indices, keep)?)?,
-        ))
+        let mut outer_indices = outer_indices;
+        let mut inner_indices = inner_indices;
+        for filter in self.filter.iter().chain(self.residual_filters.iter()) {
+            let filter_batch =
+                self.filter_batch(outer, inner, &outer_indices, &inner_indices, filter)?;
+            let values = filter
+                .expression()
+                .evaluate(&filter_batch)?
+                .into_array_of_size(filter_batch.num_rows())?;
+            let keep = values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Cayenne index join ON filter returned {:?}, expected Boolean",
+                        values.data_type()
+                    ))
+                })?;
+            outer_indices = downcast_u32(&arrow::compute::filter(&outer_indices, keep)?)?;
+            inner_indices = downcast_u32(&arrow::compute::filter(&inner_indices, keep)?)?;
+        }
+        Ok((outer_indices, inner_indices))
     }
 
     fn filter_batch(
@@ -1248,7 +1310,6 @@ mod tests {
         let outer_schema = outer.schema();
         let outer_plan = MemorySourceConfig::try_new_exec(&[vec![outer]], outer_schema, None)
             .expect("test outer plan builds");
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
         let key_expressions = key_columns
             .iter()
             .map(|column| Arc::new(Column::new("key", *column)) as PhysicalExprRef)
@@ -1263,7 +1324,6 @@ mod tests {
             filter,
             join_type,
             NullEquality::NullEqualsNothing,
-            pool,
         )
         .expect("test index join constructs");
         let context = SessionContext::new();

@@ -33,8 +33,9 @@ use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SC
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
-    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
+    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneIndexJoinRewriter,
+    CayenneJoinRewriter, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
+    CayenneStatsAggregateRewriter,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -77,9 +78,9 @@ use {
 };
 
 use crate::cluster::partition::service::PartitionService;
-#[cfg(feature = "duckdb")]
+#[cfg(any(feature = "duckdb", not(windows)))]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-#[cfg(feature = "duckdb")]
+#[cfg(any(feature = "duckdb", not(windows)))]
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -139,13 +140,15 @@ impl CayennePhysicalOptimizerRules {
     const ANTI_JOIN_SORT_MERGE: u8 = 1 << 2;
     const EXACT_JOIN_FILTER: u8 = 1 << 3;
     const STATS_AGGREGATE: u8 = 1 << 4;
+    const INDEX_JOIN: u8 = 1 << 5;
 
     const fn auto_enabled() -> Self {
         Self {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
-                | Self::STATS_AGGREGATE,
+                | Self::STATS_AGGREGATE
+                | Self::INDEX_JOIN,
         }
     }
 
@@ -155,7 +158,8 @@ impl CayennePhysicalOptimizerRules {
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
                 | Self::EXACT_JOIN_FILTER
-                | Self::STATS_AGGREGATE,
+                | Self::STATS_AGGREGATE
+                | Self::INDEX_JOIN,
         }
     }
 
@@ -319,6 +323,18 @@ impl CayenneOptimizerRules {
     pub fn set_exact_join_filter(&mut self, enabled: bool) {
         self.physical
             .set(CayennePhysicalOptimizerRules::EXACT_JOIN_FILTER, enabled);
+    }
+
+    #[must_use]
+    pub const fn index_join(self) -> bool {
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::INDEX_JOIN)
+    }
+
+    #[cfg(test)]
+    fn set_index_join(&mut self, enabled: bool) {
+        self.physical
+            .set(CayennePhysicalOptimizerRules::INDEX_JOIN, enabled);
     }
 }
 
@@ -1000,6 +1016,11 @@ impl DataFusionBuilder {
                 )),
             ))
             .with_runtime_env(Arc::clone(&query_runtime_env));
+
+        #[cfg(not(windows))]
+        if self.cayenne_optimizer_rules.index_join() {
+            state = with_cayenne_index_join_rewriter(state);
+        }
 
         #[cfg(feature = "duckdb")]
         {
@@ -1848,7 +1869,34 @@ pub(crate) fn coordinated_mem_tier_budget(
     remainder.clamp(floor, ceiling)
 }
 
+/// Insert the covering-index join rule between DataFusion's join selection and
+/// its first filter-pushdown pass. Later distribution, sort, and filter phases
+/// must still see the replacement plan.
 #[cfg(not(windows))]
+fn with_cayenne_index_join_rewriter(mut state: SessionStateBuilder) -> SessionStateBuilder {
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = state
+        .physical_optimizer_rules()
+        .clone()
+        .unwrap_or_else(|| PhysicalOptimizer::new().rules);
+    let join_selection = rules
+        .iter()
+        .position(|rule| rule.name() == "join_selection")
+        .expect("DataFusion physical optimizer must retain join_selection");
+    let filter_pushdown = rules
+        .iter()
+        .position(|rule| rule.name() == "FilterPushdown")
+        .expect("DataFusion physical optimizer must retain its first FilterPushdown");
+    assert!(
+        join_selection < filter_pushdown,
+        "DataFusion optimizer order changed: join_selection must precede FilterPushdown"
+    );
+    rules.insert(
+        join_selection + 1,
+        Arc::new(CayenneIndexJoinRewriter::new()),
+    );
+    state.with_physical_optimizer_rules(rules)
+}
+
 fn cayenne_optimizer_config(
     sort_merge_min_rows: Option<usize>,
     sort_merge_memory_pool_fraction: Option<f64>,
@@ -2940,12 +2988,13 @@ mod tests {
         assert_eq!(
             physical_rule_names,
             vec![
+                "CayenneIndexJoinRewriter",
                 "CayenneDynamicFilterSharing",
                 "CayenneMaintainedAggregateRewriter",
                 "CayenneStatsAggregateRewriter",
                 "CayenneAntiJoinSortMergeRewriter",
             ],
-            "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
+            "Default Cayenne physical optimizer selection should add the bounded covering-index join rewrite before filter pushdown while preserving prior safe defaults"
         );
     }
 
@@ -3093,6 +3142,8 @@ mod tests {
         anti_join_sort_merge.set_anti_join_sort_merge(true);
         let mut exact_join_filter = CayenneOptimizerRules::none();
         exact_join_filter.set_exact_join_filter(true);
+        let mut index_join = CayenneOptimizerRules::none();
+        index_join.set_index_join(true);
 
         let cases = [
             (
@@ -3137,6 +3188,7 @@ mod tests {
                 vec!["CayenneAntiJoinSortMergeRewriter"],
             ),
             (exact_join_filter, vec![], vec!["CayenneJoinRewriter"]),
+            (index_join, vec![], vec!["CayenneIndexJoinRewriter"]),
         ];
 
         for (rules, expected_logical_rules, expected_physical_rules) in cases {
@@ -3651,6 +3703,30 @@ mod tests {
             .iter()
             .map(|r| r.name())
             .collect();
+        let join_selection_position = rule_names
+            .iter()
+            .position(|name| *name == "join_selection")
+            .expect("DataFusion join selection rule should be registered");
+        let cayenne_index_join_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneIndexJoinRewriter")
+            .expect("Cayenne index join rewriter should be registered");
+        let first_filter_pushdown_position = rule_names
+            .iter()
+            .position(|name| *name == "FilterPushdown")
+            .expect("DataFusion filter pushdown rule should be registered");
+        let distribution_position = rule_names
+            .iter()
+            .position(|name| *name == "EnforceDistribution")
+            .expect("DataFusion distribution rule should be registered");
+        let sorting_position = rule_names
+            .iter()
+            .position(|name| *name == "EnforceSorting")
+            .expect("DataFusion sorting rule should be registered");
+        let final_filter_pushdown_position = rule_names
+            .iter()
+            .rposition(|name| *name == "FilterPushdown(Post)")
+            .expect("DataFusion post-enforcement filter pushdown should be registered");
         let sanity_check_position = rule_names
             .iter()
             .position(|name| *name == "SanityCheckPlan")
@@ -3672,6 +3748,14 @@ mod tests {
             .position(|name| *name == "CayenneJoinRewriter")
             .expect("Cayenne join rewriter should be registered when exact_join_filter is on");
 
+        assert!(
+            join_selection_position < cayenne_index_join_position
+                && cayenne_index_join_position < first_filter_pushdown_position
+                && first_filter_pushdown_position < distribution_position
+                && distribution_position < sorting_position
+                && sorting_position < final_filter_pushdown_position,
+            "CayenneIndexJoinRewriter must run after join selection and before both filter-pushdown phases, distribution, and sorting: {rule_names:?}"
+        );
         assert!(
             sanity_check_position < cayenne_filter_sharing_position,
             "CayenneDynamicFilterSharing must run after DataFusion's built-in physical optimizer rules"

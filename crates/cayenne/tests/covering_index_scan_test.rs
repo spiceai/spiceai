@@ -14,23 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Public SQL guard for the inactive covering-index scan implementation.
-//!
-//! The operator is constructible only inside the Cayenne crate until the
-//! Enhancement has the required sign-off. This real provider run proves the
-//! ordinary fallback remains the active public path while internal operator
-//! tests exercise the page-backed execution contract.
+//! Public SQL evidence for a covered literal scan.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
 
 use common::covering_index::{
-    CoveringIndexFixture, FixtureMode, PathSelector, TypedRow, TypedValue, assert_typed_bag,
+    CoveringIndexFixture, FixtureMode, PathSelector, TypedRow, TypedValue,
+    assert_no_vortex_data_access, assert_typed_bag,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inactive_covering_scan_preserves_file_point_query_fallback() {
+async fn covering_scan_serves_file_point_query_without_vortex_data() {
     let fixture = CoveringIndexFixture::new(FixtureMode::File).await;
     let evidence = fixture
         .execute(
@@ -38,7 +34,7 @@ async fn inactive_covering_scan_preserves_file_point_query_fallback() {
             "SELECT one, foreign_id FROM a WHERE some_value = 'blahblah'",
         )
         .await;
-    evidence.print("inactive_covering_scan_preserves_file_point_query_fallback");
+    evidence.print("covering_scan_serves_file_point_query_without_vortex_data");
 
     assert_typed_bag(
         &evidence,
@@ -50,16 +46,11 @@ async fn inactive_covering_scan_preserves_file_point_query_fallback() {
         ],
     );
     assert!(
-        !evidence.physical_plan.contains("CayenneIndexScanExec"),
-        "an unsigned Enhancement must not activate the covering scan:\n{}",
+        evidence.physical_plan.contains("CayenneIndexScanExec"),
+        "expected covering literal scan:\n{}",
         evidence.physical_plan
     );
-    assert!(
-        evidence.reads.execution.has_vortex_data_access() && evidence.vortex_metrics.reads > 0,
-        "ordinary fallback must retain Vortex access before activation: {:?}, {:?}",
-        evidence.reads.execution,
-        evidence.vortex_metrics,
-    );
+    assert_no_vortex_data_access(&evidence);
 }
 
 fn row(values: impl IntoIterator<Item = TypedValue>) -> TypedRow {

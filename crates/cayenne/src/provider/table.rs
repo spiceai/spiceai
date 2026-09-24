@@ -28687,9 +28687,8 @@ impl CayenneTableProvider {
     ///
     /// This runs only after object-store setup, transaction read tracking,
     /// integrity preflight, the captured scan view, and retention/filter
-    /// rewriting have all been resolved. It does not select the inactive
-    /// covering scan operator: a future physical rule receives only this pinned
-    /// capability and must still prove its own supported rewrite.
+    /// rewriting have all been resolved. The physical index-join rule receives
+    /// this pinned capability and independently proves that a rewrite is safe.
     fn covering_index_capability(
         &self,
         state: &dyn Session,
@@ -28727,6 +28726,80 @@ impl CayenneTableProvider {
                 None,
             )
         })
+    }
+
+    /// Select a covered literal lookup when every configured key column is
+    /// pinned by an ordinary equality predicate. The asynchronous preparation
+    /// reads only bounded key-page metadata; execution still gathers the
+    /// immutable view captured by this exact scan.
+    async fn covering_index_point_scan(
+        &self,
+        capability: &super::covering_index::CoveringIndexCapability,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        let properties = ExecutionProps::new();
+        let schema = DFSchema::try_from(
+            capability
+                .accesses()
+                .first()?
+                .view()
+                .query_schema()
+                .schema()
+                .as_ref()
+                .clone(),
+        )
+        .ok()?;
+        let static_filters = capability
+            .static_filters()
+            .iter()
+            .map(|filter| create_physical_expr(filter, &schema, &properties))
+            .collect::<DataFusionResult<Vec<_>>>()
+            .ok()?;
+        for access in capability.accesses() {
+            let mut key_columns = Vec::with_capacity(access.definition().columns().len());
+            for indexed in access.definition().columns() {
+                let Some(value) = filters
+                    .iter()
+                    .find_map(|filter| bare_column_scalar_for(filter, indexed.name()))
+                else {
+                    key_columns.clear();
+                    break;
+                };
+                let Ok(value) = value.cast_to(indexed.field().data_type()) else {
+                    key_columns.clear();
+                    break;
+                };
+                let Ok(value) = value.to_array_of_size(1) else {
+                    key_columns.clear();
+                    break;
+                };
+                key_columns.push(value);
+            }
+            if key_columns.len() != access.definition().columns().len() {
+                continue;
+            }
+            let Ok(Some(key)) = access.definition().encode_probe_row(&key_columns, 0) else {
+                continue;
+            };
+            let Ok(prepared) =
+                super::covering_index::prepare_literal_seek(access.view(), &key).await
+            else {
+                continue;
+            };
+            let Ok(scan) = super::covering_index::CayenneIndexScanExec::try_new(
+                capability.clone(),
+                access.clone(),
+                prepared,
+                static_filters.clone(),
+                capability.output_columns().to_vec(),
+                limit,
+            ) else {
+                continue;
+            };
+            return Some(Arc::new(scan));
+        }
+        None
     }
 
     /// All captured query-schema fields a covered scan would need before it can
@@ -35887,11 +35960,29 @@ impl TableProvider for CayenneTableProvider {
         }
 
         // Retain the immutable complete-index proof at the outer Cayenne scan
-        // boundary. The product Enhancement is not signed off, so this records
-        // an inactive capability only; ordinary Vortex/memory scan assembly
-        // below remains the sole live execution path.
+        // boundary so the physical index-join rule can prove a bounded lookup
+        // without consulting mutable provider state.
         let covering_index =
             self.covering_index_capability(state, &scan_view, projection, scan_filters);
+
+        // A literal covered scan is independently useful as the bounded outer
+        // input of the physical index-join rule. It is selected only when the
+        // provider already proved full source coverage and no later projection
+        // strip would change its output contract.
+        if !need_projection_strip
+            && let Some(capability) = &covering_index
+            && let Some(plan) = self
+                .covering_index_point_scan(capability, scan_filters, limit)
+                .await
+        {
+            return Ok(self.wrap_scan_plan_with_cayenne_metadata(
+                plan,
+                scan_guard,
+                maintained_aggregate_epoch,
+                None,
+                covering_index,
+            ));
+        }
 
         let mem_tier_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
             // Live (possibly widened) schema, NOT the construction-time

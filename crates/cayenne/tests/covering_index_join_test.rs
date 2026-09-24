@@ -14,18 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Public SQL controls for the inactive covering index join.
-//!
-//! Step 08 turns the indexed selector into an automatic index-join path. Until
-//! then this preserves the expected SQL bag and demonstrates that the ordinary
-//! hash-join fallback remains the only public execution route.
+//! Public SQL evidence for automatic covering-index joins.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
 
 use common::covering_index::{
-    CoveringIndexFixture, FixtureMode, PathSelector, TypedRow, TypedValue, assert_typed_bag,
+    CoveringIndexFixture, FixtureMode, PathSelector, TypedRow, TypedValue, assert_index_join_path,
+    assert_no_vortex_data_access, assert_typed_bag,
 };
 
 const INNER_SQL: &str = "
@@ -41,8 +38,8 @@ const LEFT_ON_SQL: &str = "
 ";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inactive_index_join_preserves_public_inner_and_left_on_bags() {
-    let fixture = CoveringIndexFixture::new(FixtureMode::Memory).await;
+async fn index_join_preserves_public_inner_and_left_on_bags() {
+    let fixture = CoveringIndexFixture::new(FixtureMode::File).await;
     for (sql, expected) in [
         (
             INNER_SQL,
@@ -64,13 +61,10 @@ async fn inactive_index_join_preserves_public_inner_and_left_on_bags() {
         ),
     ] {
         let evidence = fixture.execute(PathSelector::Indexed, sql).await;
-        evidence.print("inactive_index_join_preserves_public_inner_and_left_on_bags");
+        evidence.print("index_join_preserves_public_inner_and_left_on_bags");
         assert_typed_bag(&evidence, &expected);
-        assert!(
-            !evidence.physical_plan.contains("CayenneIndexJoinExec"),
-            "the optimizer is introduced in step 08, not direct-execution step 07:\n{}",
-            evidence.physical_plan
-        );
+        assert_index_join_path(&evidence);
+        assert_no_vortex_data_access(&evidence);
     }
 }
 

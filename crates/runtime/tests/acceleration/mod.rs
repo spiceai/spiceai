@@ -32,6 +32,8 @@ mod cayenne_append_overlap;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_append_timestamptz;
 #[cfg(not(target_os = "windows"))]
+mod cayenne_covering_index;
+#[cfg(not(target_os = "windows"))]
 mod cayenne_maintained_aggregates;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_memory;

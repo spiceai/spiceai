@@ -145,6 +145,7 @@ use crate::maintained_aggregate::{
     MaintainedAggregateExec, MaintainedAggregateRegistry, aggregate_shape_is_maintainable,
 };
 use crate::provider::CayenneAccelerationExec;
+pub use crate::provider::covering_index::CayenneIndexJoinRewriter;
 use crate::provider::delete::{Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec};
 use crate::provider::scan::{ScanDynamicFilter, ScanIdentity};
 

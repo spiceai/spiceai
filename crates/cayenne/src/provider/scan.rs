@@ -277,10 +277,6 @@ impl CayenneAccelerationExec {
     /// Return the immutable covering-index capability retained by this exact
     /// Cayenne scan, if its complete-view proof succeeded at planning time.
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "the following optimizer-integration step consumes this scan-bound capability"
-    )]
     pub(crate) fn covering_index(&self) -> Option<&CoveringIndexCapability> {
         self.covering_index.as_ref()
     }

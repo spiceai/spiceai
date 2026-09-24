@@ -33,10 +33,12 @@ use cayenne::lookup_index::LookupIndexCounters;
 use cayenne::metadata::{
     CdcDurability, CreateTableOptions, DeletionMode, ObjectStoreConfig, VortexConfig,
 };
+use cayenne::optimizer_rules::CayenneIndexJoinRewriter;
 use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_physical_plan::metrics::{MetricValue, MetricsSet};
@@ -285,6 +287,11 @@ impl CoveringIndexFixture {
             .await
             .expect("insert control b rows");
 
+        // A full refresh stages and publishes the durable covering catalogs
+        // used by the file-mode query path.
+        Self::overwrite_indexed_table(&a, a_rows()).await;
+        Self::overwrite_indexed_table(&b, b_rows()).await;
+
         let fixture = Self {
             _fixture: fixture,
             mode,
@@ -410,9 +417,11 @@ impl CoveringIndexFixture {
     async fn wait_for_index_capability(&self) {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            self.probe_indexes().await;
+            let covering_scans_ready = self.probe_indexes().await;
             let last = self.address_index_checkpoint(PathSelector::Indexed);
-            if index_capability_is_ready(self.mode, last) {
+            if (self.mode == FixtureMode::File && covering_scans_ready)
+                || index_capability_is_ready(self.mode, last)
+            {
                 return;
             }
             assert!(
@@ -424,25 +433,37 @@ impl CoveringIndexFixture {
         }
     }
 
-    async fn probe_indexes(&self) {
+    async fn probe_indexes(&self) -> bool {
         let context = self.query_context(PathSelector::Indexed);
+        let mut covering_scans_ready = true;
         for sql in [
             "SELECT a_id FROM a WHERE some_value = 'blahblah'",
             "SELECT b_row_id FROM b WHERE id = 10",
         ] {
-            context
-                .sql(sql)
+            let dataframe = context.sql(sql).await.expect("plan index readiness probe");
+            let plan = dataframe
+                .create_physical_plan()
                 .await
-                .expect("plan index readiness probe")
-                .collect()
+                .expect("create index readiness probe plan");
+            covering_scans_ready &= datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("CayenneIndexScanExec");
+            collect(plan, context.task_ctx())
                 .await
                 .expect("execute index readiness probe");
         }
+        covering_scans_ready
     }
 
     fn query_context(&self, selector: PathSelector) -> SessionContext {
-        let context =
-            SessionContext::new_with_config_rt(SessionConfig::new(), Arc::clone(&self.runtime_env));
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new())
+            .with_runtime_env(Arc::clone(&self.runtime_env))
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(CayenneIndexJoinRewriter::new()))
+            .build();
+        let context = SessionContext::new_with_state(state);
         let (a, b) = match selector {
             PathSelector::Indexed => (&self.a, &self.b),
             PathSelector::Baseline => (&self.a_control, &self.b_control),

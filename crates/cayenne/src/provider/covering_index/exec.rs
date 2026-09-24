@@ -155,18 +155,37 @@ impl CoveringIndexCapability {
         self.raw_candidate_upper_bound
     }
 
+    /// Whether this capability's ordinal map produces precisely `schema`.
+    #[must_use]
+    pub(crate) fn matches_output_schema(&self, schema: &SchemaRef) -> bool {
+        self.accesses.iter().all(|access| {
+            access
+                .view()
+                .query_schema()
+                .schema()
+                .project(&self.output_columns)
+                .is_ok_and(|output| output.as_ref() == schema.as_ref())
+        })
+    }
+
     /// Compose a bare-column projection through this capability's ordinal map.
     ///
     /// Expressions, out-of-range ordinals, and aliases that alter the exact
     /// Arrow field contract are deliberately ineligible. A later optimizer must
     /// retain the ordinary scan rather than invent a mapping for them.
     pub(crate) fn project_through(&self, projection: &ProjectionExec) -> Option<Self> {
+        let input_schema = projection.input().schema();
+        let output_schema = projection.schema();
         let output_columns = projection
             .expr()
             .iter()
-            .map(|expr| {
+            .enumerate()
+            .map(|(output_index, expr)| {
                 let column = expr.expr.downcast_ref::<Column>()?;
-                self.output_columns.get(column.index()).copied()
+                let input_field = input_schema.field(column.index());
+                let output_field = output_schema.field(output_index);
+                (input_field == output_field)
+                    .then(|| self.output_columns.get(column.index()).copied())?
             })
             .collect::<Option<Vec<_>>>()?;
         Some(Self {
@@ -265,6 +284,12 @@ impl CayenneIndexScanExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Exact pre-visibility candidate count for this literal lookup.
+    #[must_use]
+    pub(crate) const fn raw_candidate_upper_bound(&self) -> usize {
+        self.prepared.raw_entry_count()
     }
 
     fn with_scan_shape(
