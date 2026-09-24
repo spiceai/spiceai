@@ -294,7 +294,11 @@ impl ResultsCacheWarmer {
                     let _persist = remote_persist_lock.lock().await;
                     // Re-snapshot under the lock so this write includes any
                     // templates observed while we waited for earlier persists.
-                    persist_remote_excluding(state, catalog, count, exclude).await;
+                    if exclude.is_empty() {
+                        persist_remote(state, catalog, count).await;
+                    } else {
+                        persist_remote_excluding(state, catalog, count, exclude).await;
+                    }
                 });
             }
         }
