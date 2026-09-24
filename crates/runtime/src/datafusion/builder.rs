@@ -1338,7 +1338,7 @@ impl DataFusionBuilder {
             datafusion_ref,
             caching,
             results_cache_warmer: self.results_cache_warmer.unwrap_or_else(|| {
-                super::query::ResultsCacheWarmer::new(
+                super::query::ResultsCacheWarmer::new_unloaded(
                     self.results_cache_warmup_store
                         .unwrap_or_else(super::query::default_warmup_store_path),
                     self.results_cache_warmup_enabled,

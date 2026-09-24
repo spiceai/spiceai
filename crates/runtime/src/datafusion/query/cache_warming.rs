@@ -109,13 +109,20 @@ pub(crate) struct ResultsCacheWarmer {
 }
 
 impl ResultsCacheWarmer {
-    pub(crate) fn new(store_path: PathBuf, enabled: bool) -> Self {
+    /// Load a local warmup catalog without blocking a Tokio worker.
+    pub(crate) async fn new(store_path: PathBuf, enabled: bool) -> Self {
         let loaded = if enabled {
-            load_templates(&store_path)
+            load_templates(&store_path).await
         } else {
             Vec::new()
         };
         Self::from_loaded(&loaded, enabled, WarmupPersist::Local(store_path))
+    }
+
+    /// Local warmer that does not read the catalog. Sync `DataFusion` construction
+    /// uses this fallback; callers that need persisted shapes must use [`Self::new`].
+    pub(crate) fn new_unloaded(store_path: PathBuf, enabled: bool) -> Self {
+        Self::from_loaded(&[], enabled, WarmupPersist::Local(store_path))
     }
 
     async fn from_object_store(
@@ -270,8 +277,8 @@ impl ResultsCacheWarmer {
     }
 }
 
-fn load_templates(path: &Path) -> Vec<WarmupTemplate> {
-    let Ok(bytes) = std::fs::read(path) else {
+async fn load_templates(path: &Path) -> Vec<WarmupTemplate> {
+    let Ok(bytes) = tokio::fs::read(path).await else {
         return Vec::new();
     };
     serde_json::from_slice(&bytes).unwrap_or_default()
@@ -392,7 +399,7 @@ pub(crate) async fn build_results_cache_warmer(
     io_runtime: Handle,
 ) -> ResultsCacheWarmer {
     let Some(state) = runtime_state.filter(|_| enabled) else {
-        return ResultsCacheWarmer::new(default_warmup_store_path(), enabled);
+        return ResultsCacheWarmer::new(default_warmup_store_path(), enabled).await;
     };
 
     match crate::object_store_state::build_object_store(
@@ -416,7 +423,7 @@ pub(crate) async fn build_results_cache_warmer(
                 "Failed to initialize SQL results cache warmup state at '{}', so plan shapes will be stored on the local disk instead. Cause: {error}",
                 state.location
             );
-            ResultsCacheWarmer::new(default_warmup_store_path(), true)
+            ResultsCacheWarmer::new(default_warmup_store_path(), true).await
         }
     }
 }
@@ -1061,6 +1068,7 @@ mod tests {
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
+        let warmer = ResultsCacheWarmer::new(store, true).await;
         let runtime = RuntimeBuilder::new().build().await;
         Arc::new(
             DataFusion::builder(
@@ -1073,13 +1081,13 @@ mod tests {
                     .with_results_cache(Arc::new(cache_provider))
                     .with_plans_cache(plans_cache),
             ))
-            .with_results_cache_warmup_store(store)
-            .with_results_cache_warmup_enabled(true)
+            .with_results_cache_warmer(warmer)
             .build(),
         )
     }
 
     async fn prepare_runtime_disabled(store: PathBuf) -> Arc<DataFusion> {
+        let warmer = ResultsCacheWarmer::new(store, false).await;
         let runtime = RuntimeBuilder::new().build().await;
         Arc::new(
             DataFusion::builder(
@@ -1087,8 +1095,7 @@ mod tests {
                 runtime.accelerator_engine_registry(),
                 Handle::current(),
             )
-            .with_results_cache_warmup_store(store)
-            .with_results_cache_warmup_enabled(false)
+            .with_results_cache_warmer(warmer)
             .build(),
         )
     }
@@ -1286,7 +1293,7 @@ mod tests {
         df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
         wait_for_catalog(&store).await;
 
-        let reloaded = ResultsCacheWarmer::new(store.clone(), true);
+        let reloaded = ResultsCacheWarmer::new(store.clone(), true).await;
         assert_eq!(
             reloaded.templates_snapshot().len(),
             1,
@@ -1294,6 +1301,78 @@ mod tests {
         );
         let _ = std::fs::remove_file(&store);
         let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+    }
+
+    #[tokio::test]
+    async fn new_loads_local_catalog_via_tokio_fs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("results_cache_warmup.json");
+        let templates = vec![WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: "orders".to_string(),
+                column: "id".to_string(),
+            }],
+        }];
+        tokio::fs::write(
+            &path,
+            serde_json::to_vec(&templates).expect("serialize catalog"),
+        )
+        .await
+        .expect("write catalog");
+
+        let warmer = ResultsCacheWarmer::new(path, true).await;
+        assert_eq!(
+            warmer.templates_snapshot(),
+            templates,
+            "async local load must deserialize the persisted catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_returns_empty_catalog_when_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing-results_cache_warmup.json");
+        let warmer = ResultsCacheWarmer::new(path, true).await;
+        assert!(
+            warmer.templates_snapshot().is_empty(),
+            "a missing catalog is an empty start, not an error"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn load_templates_does_not_block_runtime_on_pending_fifo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("warmup.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(
+            status.success(),
+            "mkfifo should create the pending catalog path"
+        );
+
+        let load_path = path.clone();
+        let load = tokio::spawn(async move { load_templates(&load_path).await });
+
+        // On the current-thread test runtime, a blocking `std::fs::read` of this
+        // FIFO would stall this timeout. `tokio::fs` yields, so the runtime
+        // stays responsive while the catalog has no writer.
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::time::sleep(Duration::from_millis(50)),
+        )
+        .await
+        .expect("runtime must stay responsive while the catalog read is pending");
+        assert!(
+            !load.is_finished(),
+            "FIFO with no writer must still be pending; read_returned={}",
+            load.is_finished()
+        );
+        load.abort();
+        let _ = load.await;
     }
 
     #[tokio::test]
