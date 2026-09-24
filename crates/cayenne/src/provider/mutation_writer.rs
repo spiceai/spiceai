@@ -1250,11 +1250,12 @@ impl<'a> AppendMutationWriter<'a> {
         estimated_bytes: Option<u64>,
     ) -> Result<(u64, Arc<ColumnStatsAccumulator>, PkDigestSet, usize)> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let _index_guard = self.table.snapshot_index_guard(&new_snapshot_id);
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = self
             .table
-            .write_to_snapshot(
+            .write_new_snapshot_with_index(
                 prepared_stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -1270,6 +1271,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // fan-out sizing and the full default delta encoding.
                 estimated_bytes,
                 crate::provider::delta_encoding::WritePolicy::DELTA,
+                None,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
