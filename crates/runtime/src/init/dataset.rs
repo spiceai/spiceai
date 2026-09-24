@@ -29,6 +29,7 @@ use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
+use crate::init::dataset_loads::DatasetLoad;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, DataConnectorNotInBuildSnafu,
@@ -278,9 +279,10 @@ impl Runtime {
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
+            let load = self.dataset_loads.begin(&ds.name);
             let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
                 cloned_self
-                    .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                    .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                     .await;
             })
                 as Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -301,11 +303,14 @@ impl Runtime {
                 let ds_clone = Arc::clone(&ds);
                 let cloned_self = Arc::clone(&self);
                 let load_semaphore = Arc::clone(&semaphore);
+                // Registered now rather than once the parent has loaded, so a
+                // Spicepod change can supersede the load while it waits.
+                let load = self.dataset_loads.begin(&ds.name);
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
                     cloned_self
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                         .await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -712,17 +717,21 @@ impl Runtime {
     /// `read_provider` so that `dataset_load_parallelism` controls how many
     /// datasets query the source for schema at the same time. Connector
     /// creation and `DataFusion` registration run outside the permit.
+    ///
+    /// `load` is taken from `dataset_loads` when the load is queued, not when it
+    /// starts, so a load queued behind another (a `localpod` dataset behind its
+    /// parent) can be superseded while it waits.
     async fn load_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
         bootstrap_status: BootstrapStatus,
         load_semaphore: Arc<Semaphore>,
+        load: DatasetLoad,
     ) {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
         let shutdown_token = runtime.status.shutdown_token();
-        let load = self.dataset_loads.begin(&ds.name);
         let retry_fut = retry(retry_strategy, || async {
             // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
             if runtime.status.is_shutdown() {
@@ -821,7 +830,9 @@ impl Runtime {
             .update_dataset(&ds.name, status::ComponentStatus::Initializing);
 
         let semaphore = Arc::clone(&self.dataset_load_semaphore);
-        self.load_dataset(ds, bootstrap_status, semaphore).await;
+        let load = self.dataset_loads.begin(&ds.name);
+        self.load_dataset(ds, bootstrap_status, semaphore, load)
+            .await;
     }
 
     /// Apply schema inference to a freshly-resolved dataset.
@@ -1994,11 +2005,12 @@ impl Runtime {
             let runtime = Arc::clone(&self);
             let ds_clone = Arc::clone(ds);
             let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+            let load = self.dataset_loads.begin(&ds.name);
             added_futures.insert(
                 resolve_table_reference(ds.name.clone()),
                 Box::pin(async move {
                     runtime
-                        .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                        .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                         .await;
                 }),
             );
@@ -2099,10 +2111,13 @@ impl Runtime {
             })
             .collect();
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+        // Registered now rather than once the parent has loaded, so a Spicepod
+        // change can supersede the load while it waits.
+        let load = self.dataset_loads.begin(&ds.name);
         Box::pin(async move {
             let name = ds.name.clone();
             Arc::clone(&self)
-                .load_dataset(ds, bootstrap_status, load_semaphore)
+                .load_dataset(ds, bootstrap_status, load_semaphore, load)
                 .await;
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
@@ -3398,13 +3413,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         runtime.status.mark_shutdown();
     }
 
-    /// Held shut until a test opens it, so a load of `gated:` stays inside its
-    /// connector's construction, and once open that construction returns a table
-    /// with a `stale` column. Its only user is
-    /// `a_corrected_dataset_is_not_overwritten_by_its_earlier_load`.
-    static GATE: Semaphore = Semaphore::const_new(0);
-
-    struct GatedConnectorFactory;
+    /// A connector whose construction waits until its test opens `gate`, and then
+    /// returns a table with a `stale` column. Each test uses its own prefix and
+    /// gate, because the connector registry is process-wide.
+    struct GatedConnectorFactory {
+        prefix: &'static str,
+        gate: &'static Semaphore,
+    }
 
     impl DataConnectorFactory for GatedConnectorFactory {
         fn as_any(&self) -> &dyn Any {
@@ -3417,13 +3432,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             _context: &'a dyn crate::dataconnector::ConnectorContext,
         ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async {
-                let _open = GATE.acquire().await;
+                let _open = self.gate.acquire().await;
                 Ok(Arc::new(StaleConnector) as Arc<dyn DataConnector>)
             })
         }
 
         fn prefix(&self) -> &'static str {
-            "gated"
+            self.prefix
         }
 
         fn parameters(&self) -> &'static [ParameterSpec] {
@@ -3467,7 +3482,15 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     /// milliseconds of the gate opening.
     #[tokio::test]
     async fn a_corrected_dataset_is_not_overwritten_by_its_earlier_load() {
-        register_connector_factory("gated", Arc::new(GatedConnectorFactory)).await;
+        static GATE: Semaphore = Semaphore::const_new(0);
+        register_connector_factory(
+            "gated",
+            Arc::new(GatedConnectorFactory {
+                prefix: "gated",
+                gate: &GATE,
+            }),
+        )
+        .await;
         register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
 
         let runtime = Arc::new(
@@ -3530,6 +3553,74 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             !overwritten,
             "the earlier configuration's load registered over the corrected dataset: {:?}",
             columns().await
+        );
+
+        runtime.status.mark_shutdown();
+    }
+
+    /// #1458, for a load queued behind another: a `localpod` dataset waits for its
+    /// parent's load before its own starts, and one removed from the Spicepod
+    /// while it waits must not register once the parent loads.
+    #[tokio::test]
+    async fn a_removed_localpod_dataset_waiting_for_its_parent_never_registers() {
+        static GATE: Semaphore = Semaphore::const_new(0);
+        register_connector_factory(
+            "gated_parent",
+            Arc::new(GatedConnectorFactory {
+                prefix: "gated_parent",
+                gate: &GATE,
+            }),
+        )
+        .await;
+
+        let runtime = Arc::new(
+            crate::Runtime::builder()
+                .with_app(app::AppBuilder::new("queued_child").build())
+                .build()
+                .await,
+        );
+        let parent = || spicepod_dataset("gated_parent:any", "parent");
+        let with_child = Arc::new(
+            app::AppBuilder::new("queued_child")
+                .with_dataset(parent())
+                .with_dataset(spicepod_dataset("localpod:parent", "child"))
+                .build(),
+        );
+        assert!(Arc::clone(&runtime).apply_app(with_child).await);
+
+        let without_child = Arc::new(
+            app::AppBuilder::new("queued_child")
+                .with_dataset(parent())
+                .build(),
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                Arc::clone(&runtime).apply_app(without_child)
+            )
+            .await
+            .expect("removing a queued dataset must not wait for its parent"),
+            "the spicepod without the child differs, so it must apply"
+        );
+
+        GATE.add_permits(Semaphore::MAX_PERMITS);
+
+        let parent_ref = TableReference::parse_str("parent");
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(30), || async {
+                runtime.df.table_exists(&parent_ref)
+            })
+            .await,
+            "the parent must load once its source answers"
+        );
+        let child_ref = TableReference::parse_str("child");
+        let registered = test_framework::utils::wait_until_true(Duration::from_secs(3), || async {
+            runtime.df.table_exists(&child_ref)
+        })
+        .await;
+        assert!(
+            !registered,
+            "a localpod dataset removed from the Spicepod registered once its parent loaded"
         );
 
         runtime.status.mark_shutdown();
