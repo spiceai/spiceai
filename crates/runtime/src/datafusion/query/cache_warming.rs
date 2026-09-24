@@ -2559,7 +2559,7 @@ mod tests {
         let result = bound_warmup_op(
             &shutdown,
             &CancellationToken::new(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             std::future::pending::<()>(),
         )
         .await;
