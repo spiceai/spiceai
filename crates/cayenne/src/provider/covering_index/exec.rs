@@ -739,7 +739,7 @@ impl datafusion_physical_plan::RecordBatchStream for CayenneIndexScanStream {
     }
 }
 
-fn visible_mask(
+pub(crate) fn visible_mask(
     view: &CoveringReadView,
     batch: &RecordBatch,
     matches: &[ProbeMatch],

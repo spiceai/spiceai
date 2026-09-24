@@ -66,6 +66,7 @@ mod build;
 mod directory;
 mod exec;
 mod executor;
+mod join;
 mod key;
 mod page_store;
 mod view;
@@ -83,6 +84,7 @@ pub(crate) use directory::{
 };
 pub(crate) use exec::{CayenneIndexScanExec, CoveringIndexAccess, CoveringIndexCapability};
 pub(crate) use executor::CayenneIndexExecutor;
+pub(crate) use join::{CayenneIndexJoinExec, IndexJoinMapping};
 pub(crate) use key::{
     CoveredRowRef, EncodedKey, IndexColumn, IndexDefinition, KEY_CODEC_VERSION, KeyPageId,
     PayloadPageId, SchemaIdentity, SourceId,
