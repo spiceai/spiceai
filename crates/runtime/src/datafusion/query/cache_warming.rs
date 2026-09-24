@@ -1687,14 +1687,16 @@ mod tests {
 
         df.observe_results_cache_warmup_plan(&new_plan, &CacheNamespace::Public);
         let final_catalog = df.results_cache_warmer.templates_snapshot();
+        // `template_from_plan` stores quoted table idents (`"orders"`).
         let recorded_new = final_catalog.iter().any(|template| {
-            template
-                .bindings
-                .iter()
-                .any(|binding| binding.table == "orders")
+            template.sql.contains("orders")
+                || template
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.table.contains("orders"))
         });
         eprintln!(
-            "loaded={loaded} replay_failures={replay_failures} recorded_new={recorded_new} final_catalog_size={}",
+            "loaded={loaded} replay_failures={replay_failures} recorded_new={recorded_new} final_catalog_size={} final_catalog={final_catalog:?}",
             final_catalog.len()
         );
         assert_eq!(
