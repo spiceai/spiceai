@@ -29,10 +29,12 @@ limitations under the License.
 //!   2. **`prepare_for_upload`** — defensively switches the *copied* file
 //!      to `journal_mode=DELETE` so the uploaded snapshot has no `-wal`
 //!      sidecar at all and is fully self-contained.
-//!   3. **`finalize_file_snapshot`** — after a download is renamed over the
-//!      live file, removes the `-wal`/`-shm`/`-journal` the replaced database
-//!      left beside it, so the next connection cannot apply them to the
-//!      restored file.
+//!   3. **`prepare_file_restore`** — right before a download is renamed over
+//!      the live file, removes the live database's `-wal`/`-shm`/`-journal`,
+//!      so no connection that opens the path once the restored file is in
+//!      place can apply them to it.
+//!   4. **`finalize_file_snapshot`** — after the rename, removes any that a
+//!      connection to the replaced database created in between.
 
 use async_trait::async_trait;
 use snafu::prelude::*;
@@ -202,35 +204,53 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         false
     }
 
+    async fn prepare_file_restore(
+        &self,
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), super::SnapshotEngineError> {
+        // The rename replaces the database file but not the sidecars kept
+        // beside it, so they are removed first. A connection opening the path
+        // once the restored file is in place would otherwise take the stale
+        // `-wal` as the restored database's and apply it, and a checkpoint
+        // would then write the old pages into the restored file. Connections
+        // already open on the live file hold their own handles to the removed
+        // sidecars, so reads in flight are unaffected.
+        remove_sidecars(live_path, dataset_name).await
+    }
+
     async fn finalize_file_snapshot(
         &self,
         restored_path: &Path,
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
-        // The rename replaced the database file but not the sidecars the
-        // replaced database kept beside it. A connection opening the restored
-        // file in WAL mode would take that stale `-wal` as this database's and
-        // apply it, and a checkpoint would then write the old pages into the
-        // restored file. Connections still open on the replaced file hold their
-        // own handles to the removed sidecars, so reads in flight are unaffected.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = sidecar_path(restored_path, suffix);
-            match tokio::fs::remove_file(&sidecar).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(super::SnapshotEngineError::Sqlite {
-                        source: SqliteSnapshotError::RemoveSidecar {
-                            dataset: dataset_name.to_string(),
-                            path: sidecar,
-                            source,
-                        },
-                    });
-                }
+        // A connection to the replaced database opened after the sidecars were
+        // removed may have created new ones.
+        remove_sidecars(restored_path, dataset_name).await
+    }
+}
+
+async fn remove_sidecars(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = sidecar_path(database, suffix);
+        match tokio::fs::remove_file(&sidecar).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(super::SnapshotEngineError::Sqlite {
+                    source: SqliteSnapshotError::RemoveSidecar {
+                        dataset: dataset_name.to_string(),
+                        path: sidecar,
+                        source,
+                    },
+                });
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// `SQLite` names a database's sidecars by appending to the database path.
@@ -299,6 +319,32 @@ mod tests {
         (live_path, live)
     }
 
+    /// A live WAL-mode database with an unflushed WAL and its connection
+    /// still open, and a downloaded three-row snapshot beside it: the state
+    /// an accelerator's first reload replaces. The caller does the rename.
+    fn live_wal_database_and_download(tmp: &TempDir) -> (PathBuf, PathBuf, Connection) {
+        let live_path = tmp.path().join("orders.sqlite");
+        let live = Connection::open(&live_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch(
+            "PRAGMA wal_autocheckpoint=0; CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .expect("create");
+        assert!(sidecar_path(&live_path, "-wal").exists());
+
+        let download = tmp.path().join("download.sqlite");
+        let snapshot = Connection::open(&download).expect("open download");
+        snapshot
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO t(id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            )
+            .expect("write snapshot");
+        drop(snapshot);
+        (live_path, download, live)
+    }
+
     fn count_rows_in_wal_mode(path: &Path) -> i64 {
         let conn = Connection::open(path).expect("open fresh");
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
@@ -328,6 +374,43 @@ mod tests {
         // Closing the replaced database's connection afterwards changes nothing.
         drop(live);
         assert_eq!(count_rows_in_wal_mode(&path), 3);
+    }
+
+    #[tokio::test]
+    async fn a_connection_opening_the_path_during_a_restore_reads_the_restored_rows() {
+        let engine = SqliteSnapshotEngine::new();
+
+        // Control: with the sidecars removed only after the rename, a
+        // connection that opens the path in between applies the stale WAL and
+        // the restored rows are lost for good.
+        let unfixed = TempDir::new().expect("tmp");
+        let (live_path, download, live) = live_wal_database_and_download(&unfixed);
+        std::fs::rename(&download, &live_path).expect("restore");
+        assert_eq!(count_rows_in_wal_mode(&live_path), 0);
+        engine
+            .finalize_file_snapshot(&live_path, "orders")
+            .await
+            .expect("finalize");
+        assert_eq!(count_rows_in_wal_mode(&live_path), 0);
+        drop(live);
+
+        let tmp = TempDir::new().expect("tmp");
+        let (live_path, download, live) = live_wal_database_and_download(&tmp);
+        engine
+            .prepare_file_restore(&live_path, "orders")
+            .await
+            .expect("prepare");
+        std::fs::rename(&download, &live_path).expect("restore");
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
+        engine
+            .finalize_file_snapshot(&live_path, "orders")
+            .await
+            .expect("finalize");
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
+
+        // Closing the replaced database's connection afterwards changes nothing.
+        drop(live);
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
     }
 
     #[tokio::test]

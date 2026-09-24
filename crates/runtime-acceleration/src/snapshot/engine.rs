@@ -133,15 +133,32 @@ pub trait SnapshotEngine: Send + Sync {
         Ok(DirectorySnapshotPlan::default())
     }
 
-    /// Hook invoked by `SnapshotManager` right after a downloaded single-file
-    /// snapshot has been renamed over the accelerator's file, before anything
-    /// opens the restored file.
+    /// Hook invoked by `SnapshotManager` right before a downloaded single-file
+    /// snapshot is renamed over the accelerator's file.
     ///
-    /// Engines that keep state beside the primary file must remove what the
-    /// *replaced* file left there. `SQLite` in WAL mode is the case: the old
-    /// database's `-wal` and `-shm` stay behind after the rename, and the next
-    /// connection applies that stale write-ahead log to the restored file,
-    /// losing its rows.
+    /// Engines that keep state beside the primary file must remove it here: a
+    /// connection that opens the path once the restored file is in place would
+    /// otherwise pair it with the *replaced* file's state. `SQLite` in WAL mode
+    /// is the case: the old database's `-wal` and `-shm` would stay beside the
+    /// restored file, and a connection opening it applies that stale
+    /// write-ahead log, losing the restored rows for good. Removing them only
+    /// after the rename leaves a window for exactly that connection.
+    ///
+    /// Default implementation is a no-op.
+    async fn prepare_file_restore(
+        &self,
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (live_path, dataset_name);
+        Ok(())
+    }
+
+    /// Hook invoked by `SnapshotManager` right after a downloaded single-file
+    /// snapshot has been renamed over the accelerator's file.
+    ///
+    /// Engines remove what a connection to the replaced file created beside
+    /// the primary file after [`Self::prepare_file_restore`] ran.
     ///
     /// Default implementation is a no-op.
     async fn finalize_file_snapshot(

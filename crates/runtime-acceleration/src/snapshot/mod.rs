@@ -2254,6 +2254,20 @@ impl SnapshotManager {
         // because the accelerator's pool may still be holding readers open
         // against `local_path` in the gap before `reload_from_snapshot`
         // evicts them.
+        // Clear what the live file keeps beside it before the restored file
+        // takes its place; see `SnapshotEngine::prepare_file_restore`.
+        if let Err(source) = self
+            .snapshot_engine
+            .prepare_file_restore(local_path, &self.dataset_name)
+            .await
+        {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(SnapshotDownloadError::FinalizeFile {
+                path: local_path.clone(),
+                source: Box::new(source),
+            });
+        }
+
         if let Err(source) = fs::rename(&temp_path, local_path).await {
             if source.kind() == std::io::ErrorKind::AlreadyExists {
                 let sidecar_path = local_path.with_extension(format!("old.{}", std::process::id()));
@@ -2287,8 +2301,8 @@ impl SnapshotManager {
             }
         }
 
-        // Remove what the replaced file left beside it before anything opens
-        // the restored one; see `SnapshotEngine::finalize_file_snapshot`.
+        // Remove what a connection to the replaced file created beside it since;
+        // see `SnapshotEngine::finalize_file_snapshot`.
         self.snapshot_engine
             .finalize_file_snapshot(local_path, &self.dataset_name)
             .await
