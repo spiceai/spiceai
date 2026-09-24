@@ -159,6 +159,57 @@ assert_clear_pending() {
   echo "  ok: $name"
 }
 
+# The interpreter, resolved while PATH is still intact. `path_without_gh` below
+# drops whole directories, and on the ubuntu-24.04 runner this suite uses, `gh`
+# lives in `/usr/bin` — which, under the merged-/usr layout, is also where `bash`
+# is and what `/bin` points at. Looking the interpreter up on the filtered PATH
+# therefore fails with `env: bash: No such file or directory` and exit 127, so
+# both assertions below would report a failure without ever reaching the guard.
+bash_bin="$(command -v bash)"
+
+# Every PATH directory that holds an executable `gh`, removed — the state a runner
+# is in when the CLI is not reachable (#14234).
+#
+# Directories, because that is the only way to hide a command from `command -v`:
+# it walks PATH in order and takes the first executable named `gh`, so a shim
+# cannot shadow one. The subject needs nothing external before the guard returns,
+# which is what makes removing whole directories safe here.
+path_without_gh() {
+  local dir out=""
+  local IFS=:
+  for dir in $PATH; do
+    [[ -n "$dir" ]] || continue
+    [[ -x "$dir/gh" ]] && continue
+    out="${out:+$out:}$dir"
+  done
+  printf '%s' "$out"
+}
+
+# Runs `clear-pending` with no `gh` reachable, and checks the exit code ($2) and a
+# substring of the output ($3). Remaining arguments are environment assignments.
+assert_clear_pending_without_gh() {
+  local name="$1" want_rc="$2" want_output="$3"
+  shift 3
+  tests_run=$((tests_run + 1))
+
+  local output rc
+  # `env` rather than an assignment prefix: the extra settings arrive in "$@".
+  # `$bash_bin`, not `bash`: `env` resolves its command on the PATH it is handed.
+  output="$(env "PATH=$(path_without_gh)" "$@" \
+    "$bash_bin" "$subject" clear-pending "a canned reason" 2>&1)"
+  rc=$?
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ "$output" != *"$want_output"* ]]; then
+    fail_test "$name: expected '${want_output}' in the output, got '${output}'"
+    return
+  fi
+  echo "  ok: $name"
+}
+
 # Calls post_pending_status against a commit whose signoff status is $2, then
 # checks the posted statuses against $3 (empty = expect no post). Sourcing the
 # subject in a fresh bash calls the one function under test without running the
@@ -521,6 +572,21 @@ assert_clear_pending "an errored sign-off is left alone" error
 # Safe to run unconditionally at the end of a job, including one that never
 # posted anything.
 assert_clear_pending "a commit with no sign-off status is left alone" none
+
+# A runner whose PATH has lost `gh` (#14234). The remote job runs this handler on
+# every run that reached no verdict, so `require_tools`' hard failure put a second
+# red step — "GitHub CLI (gh) not found" — on a job that had already died in setup,
+# and that message, not the missing binary the setup step reported, is what the step
+# list shows. A handler that could not run has learned nothing about the branch, so
+# it says so and exits 0; `correct-cancelled`, the other half of the pair, already
+# treats its own missing tooling that way.
+#
+# Run by hand the command still refuses: a person asking for the status to be
+# restated has to be told that it was not.
+assert_clear_pending_without_gh "a remote run leaves the status alone and does not add a red step" \
+  0 "gh unavailable on this runner" SIGNOFF_REMOTE_RUN=1
+assert_clear_pending_without_gh "run by hand it still refuses" \
+  1 "GitHub CLI (gh) not found"
 
 echo
 if [[ "$failures" -gt 0 ]]; then
