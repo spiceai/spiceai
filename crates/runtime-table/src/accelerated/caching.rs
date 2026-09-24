@@ -298,7 +298,7 @@ struct UncoalescedFetch<'a> {
     /// `caching_stale_if_error` window is applied here the way the leader
     /// applies it.
     max_age: Duration,
-    expired_batches: Option<Vec<RecordBatch>>,
+    expired_batches: Option<CacheFallback>,
 }
 
 impl UncoalescedFetch<'_> {
@@ -332,7 +332,10 @@ impl UncoalescedFetch<'_> {
                 // carry a 429 or 5xx status; serve the expired cached response
                 // instead when `caching_stale_if_error` allows it.
                 if !cache::batches_cacheable(&batches)
-                    && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
+                    && let Some(stale) = match expired_batches {
+                        Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                        None => None,
+                    }
                 {
                     let staleness = staleness_past_max_age(&stale, max_age);
                     if stale_if_error.within_error_window(staleness) {
@@ -360,7 +363,10 @@ impl UncoalescedFetch<'_> {
                 futures::stream::empty(),
             )),
             Err(e) => {
-                if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
+                if let Some(batches) = match expired_batches {
+                    Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                    None => None,
+                } {
                     let staleness = staleness_past_max_age(&batches, max_age);
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
@@ -1206,6 +1212,35 @@ impl RevalidationOutcome {
 }
 
 /// Helper functions for cache refresh operations
+/// An expired response is read only when a failing origin needs a fallback.
+/// The deferred form avoids executing the accelerator scan on a backend-first read.
+enum CacheFallback {
+    Loaded(Vec<RecordBatch>),
+    Deferred {
+        input: Arc<dyn ExecutionPlan>,
+        partition: usize,
+        context: Arc<TaskContext>,
+    },
+}
+
+impl CacheFallback {
+    async fn read(self) -> Option<Vec<RecordBatch>> {
+        match self {
+            Self::Loaded(batches) => Some(batches),
+            Self::Deferred {
+                input,
+                partition,
+                context,
+            } => input
+                .execute(partition, context)
+                .ok()?
+                .try_collect()
+                .await
+                .ok(),
+        }
+    }
+}
+
 pub struct CacheRefreshHelper;
 
 impl CacheRefreshHelper {
@@ -2173,7 +2208,7 @@ impl CacheRefreshHelper {
         is_expired: bool,
         stale_if_error: StaleIfError,
         max_age: Duration,
-        expired_batches: Option<Vec<RecordBatch>>,
+        expired_batches: Option<CacheFallback>,
         io_runtime: &Handle,
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
@@ -2243,7 +2278,11 @@ impl CacheRefreshHelper {
                 // for `caching_stale_if_error` would get the origin's error
                 // body instead of the cached response they asked to fall back
                 // to.
-                if !batches_cacheable && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
+                if !batches_cacheable
+                    && let Some(stale) = match expired_batches {
+                        Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                        None => None,
+                    }
                 {
                     let staleness = staleness_past_max_age(&stale, max_age);
                     if stale_if_error.within_error_window(staleness) {
@@ -2352,7 +2391,10 @@ impl CacheRefreshHelper {
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
-                if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
+                if let Some(batches) = match expired_batches {
+                    Some(fallback) => fallback.read().await.filter(|b| !b.is_empty()),
+                    None => None,
+                } {
                     let staleness = staleness_past_max_age(&batches, max_age);
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
@@ -2788,6 +2830,59 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             .session_config()
             .get_extension::<runtime_request_context::RequestContext>();
 
+        // With neither a fresh nor an SWR window, a stale-if-error entry can
+        // only be served after a failing fetch. Do not execute its scan until
+        // that failure; successful fetches replace any stored response for the key.
+        if !self.filters.is_empty()
+            && self.max_age == Some(Duration::ZERO)
+            && self.stale_while_revalidate.unwrap_or_default().is_zero()
+            && self.stale_if_error.serves_stale_on_error()
+        {
+            let schema = self.input.schema();
+            let stream_schema = Arc::clone(&schema);
+            let input = Arc::clone(&self.input);
+            let federated = Arc::clone(&self.federated);
+            let session_state = Arc::clone(&self.session_state);
+            let dataset_name = self.dataset_name.clone();
+            let filters = self.filters.clone();
+            let limit = self.limit;
+            let stale_if_error = self.stale_if_error;
+            let io_runtime = self.io_runtime.clone();
+            let synchronized_children = Arc::clone(&self.synchronized_children);
+            let batch_write_tx = self.batch_write_tx.clone();
+            let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
+            let stream = futures::stream::once(async move {
+                let namespace = request_context.as_deref().map_or(
+                    runtime_request_context::CacheNamespace::System,
+                    runtime_request_context::RequestContext::cache_namespace,
+                );
+                CacheRefreshHelper::handle_cache_miss(
+                    federated,
+                    &session_state,
+                    &dataset_name,
+                    &filters,
+                    limit,
+                    stream_schema,
+                    true, // replace any stored response without a preliminary lookup
+                    stale_if_error,
+                    Duration::ZERO,
+                    Some(CacheFallback::Deferred {
+                        input,
+                        partition,
+                        context,
+                    }),
+                    &io_runtime,
+                    synchronized_children,
+                    batch_write_tx,
+                    namespace,
+                    in_flight_revalidations,
+                )
+                .await
+            })
+            .flatten();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
+        }
+
         // Execute the accelerator scan
         let accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
 
@@ -2882,7 +2977,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         // its `_fetched_at` — collecting them here does not
                         // commit to serving them.
                         let expired_batches = if stale_if_error.serves_stale_on_error() {
-                            Some(cached_batches)
+                            Some(CacheFallback::Loaded(cached_batches))
                         } else {
                             None
                         };
@@ -4748,10 +4843,10 @@ mod tests {
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
-            true,                  // is_expired
-            StaleIfError::Enabled, // stale_if_error enabled (∞)
-            Duration::ZERO,        // max_age (ignored by Enabled)
-            Some(vec![stale]),     // the expired entry to fall back to
+            true,                                     // is_expired
+            StaleIfError::Enabled,                    // stale_if_error enabled (∞)
+            Duration::ZERO,                           // max_age (ignored by Enabled)
+            Some(CacheFallback::Loaded(vec![stale])), // expired entry
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
@@ -4799,7 +4894,7 @@ mod tests {
             true,
             StaleIfError::Disabled, // stale_if_error disabled
             Duration::ZERO,         // max_age (ignored by Disabled)
-            Some(vec![stale]),
+            Some(CacheFallback::Loaded(vec![stale])),
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
@@ -4892,7 +4987,7 @@ mod tests {
             true,
             stale_if_error,
             max_age,
-            Some(vec![stale]),
+            Some(CacheFallback::Loaded(vec![stale])),
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
@@ -6087,6 +6182,237 @@ mod tests {
     /// Unix nanoseconds for `ago` before `now_nanos`.
     fn nanos_ago(now_nanos: i64, ago: Duration) -> i64 {
         now_nanos - i64::try_from(ago.as_nanos()).expect("duration fits in i64 nanoseconds")
+    }
+
+    #[derive(Debug)]
+    struct CountingCacheScan {
+        inner: Arc<dyn ExecutionPlan>,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DisplayAs for CountingCacheScan {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            self.inner.fmt_as(t, f)
+        }
+    }
+
+    impl ExecutionPlan for CountingCacheScan {
+        fn name(&self) -> &'static str {
+            "CountingCacheScan"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                inner: Arc::clone(&children[0]),
+                scans: Arc::clone(&self.scans),
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.execute(partition, context)
+        }
+    }
+
+    /// Counts accelerator executions through the actual caching scan plan.
+    /// A backend-first success must not execute its child, whereas an origin
+    /// failure reads it once, and the disabled and nonzero-TTL paths retain
+    /// their normal cache-first scan.
+    #[tokio::test]
+    async fn zero_ttl_backend_first_only_scans_on_failure() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos(),
+        )
+        .expect("timestamp");
+        let old_row = http_row(&schema, nanos_ago(now, Duration::from_secs(2)), "cached");
+        let filters = vec![col("request_path").eq(lit("/api/test"))];
+
+        for (ttl, swr, sie, status, expected_scans, expected_content) in [
+            (
+                Duration::ZERO,
+                None,
+                StaleIfError::For(Duration::from_mins(1)),
+                200,
+                0,
+                "origin",
+            ),
+            (
+                Duration::ZERO,
+                None,
+                StaleIfError::For(Duration::from_mins(1)),
+                503,
+                1,
+                "cached",
+            ),
+            (
+                Duration::ZERO,
+                None,
+                StaleIfError::Disabled,
+                503,
+                1,
+                "error",
+            ),
+            (
+                Duration::from_mins(1),
+                None,
+                StaleIfError::Enabled,
+                200,
+                1,
+                "cached",
+            ),
+            (
+                Duration::ZERO,
+                Some(Duration::from_mins(1)),
+                StaleIfError::Enabled,
+                200,
+                1,
+                "cached",
+            ),
+        ] {
+            let source = Arc::new(MockHttpTableProvider::with_status(
+                status,
+                if status == 200 { "origin" } else { "error" },
+            ));
+            let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+                Arc::clone(&schema),
+                vec![old_row.clone()],
+            ));
+            let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![old_row.clone()]], Arc::clone(&schema), None)
+                    .expect("cache input"),
+            )));
+            let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+                inner,
+                scans: Arc::clone(&scans),
+            });
+            let in_flight: InFlightRevalidations =
+                Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+            let exec = CachingAccelerationScanExec::new(
+                input,
+                Some(ttl),
+                swr,
+                sie,
+                source,
+                accelerator,
+                "http_data".to_string(),
+                Handle::current(),
+                filters.clone(),
+                None,
+                None,
+                Arc::new(Mutex::new(())),
+                in_flight,
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                tx,
+            );
+            let batches: Vec<RecordBatch> = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute")
+                .try_collect()
+                .await
+                .expect("collect");
+            let content = batches[0]
+                .column_by_name("content")
+                .expect("content")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string content")
+                .value(0);
+            assert_eq!(
+                content, expected_content,
+                "ttl={ttl:?} swr={swr:?} sie={sie:?}"
+            );
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                expected_scans,
+                "ttl={ttl:?} swr={swr:?} sie={sie:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_reads_deferred_cache_fallback_after_origin_failure() {
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "origin error"));
+        let schema = origin.schema();
+        let stale = http_row(&schema, 0, "cached");
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![stale]], Arc::clone(&schema), None)
+                .expect("cache input"),
+        )));
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CountingCacheScan {
+            inner,
+            scans: Arc::clone(&scans),
+        });
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let leader = leader_claim(&in_flight, "request");
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "request".to_string(), None)
+        else {
+            panic!("second caller must be a follower");
+        };
+        drop(leader);
+
+        let session_state = test_session_state();
+        let filters = [col("request_path").eq(lit("/api/test"))];
+        let stream = CacheRefreshHelper::follow_cache_miss(
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
+                dataset_name: "http_data",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: StaleIfError::Enabled,
+                max_age: Duration::ZERO,
+                expired_batches: Some(CacheFallback::Deferred {
+                    input,
+                    partition: 0,
+                    context: Arc::new(TaskContext::default()),
+                }),
+            },
+        )
+        .await;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect fallback");
+
+        assert_eq!(batches.len(), 1);
+        let content = batches[0]
+            .column_by_name("content")
+            .expect("content")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string content");
+        assert_eq!(content.value(0), "cached");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the deferred accelerator scan runs when the origin fails"
+        );
     }
 
     /// Regression guard for the shared `SessionState`. Every query plans its own
