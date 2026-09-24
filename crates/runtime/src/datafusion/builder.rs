@@ -234,7 +234,7 @@ impl CayenneOptimizerRules {
     }
 
     pub fn set_cross_join_reassociation(&mut self, enabled: bool) {
-        self.logical.cross_join_reassociation = enabled;
+        s       physical: CayennePhysicalOpti = enabled;
     }
 
     #[must_use]
