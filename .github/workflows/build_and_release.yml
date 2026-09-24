@@ -181,8 +181,8 @@ jobs:
     needs: setup-matrix
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-      # Internal builds include PostgreSQL acceleration for benchmarks; tagged releases omit it.
-      SPICED_FEATURES: ${{ matrix.target.is_tagged_release && 'release,models' || 'release,models,postgres-accel' }}
+      # Minimal feature set to speed up builds on this branch: no optional connectors or models.
+      SPICED_FEATURES: release
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
