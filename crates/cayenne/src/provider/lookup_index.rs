@@ -3610,10 +3610,7 @@ mod tests {
             ];
             for (outcome, count) in counted {
                 let want = u64::from(outcome == expected);
-                assert_eq!(
-                    count, want,
-                    "{noted:?} counted {outcome:?} {count} time(s)"
-                );
+                assert_eq!(count, want, "{noted:?} counted {outcome:?} {count} time(s)");
             }
         }
         // A lookup that probed nothing records nothing.
