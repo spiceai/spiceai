@@ -1386,7 +1386,9 @@ mod tests {
             load.is_finished()
         );
         load.abort();
-        let _ = load.await;
+        // `tokio::fs::read` uses `spawn_blocking`; abort does not unblock
+        // the FIFO open, so do not join the reader.
+        drop(load);
     }
 
     #[tokio::test]
