@@ -239,6 +239,9 @@ impl ResultsCacheWarmer {
             catalog.templates.push(template);
             self.count.store(catalog.templates.len(), Ordering::Relaxed);
         }
+        // A previously pruned id that is live again must not stay tombstoned
+        // or a queued prune persist can still drop it from the remote catalog.
+        self.pending_excludes.lock().remove(&id);
         self.schedule_persist();
     }
 
@@ -313,7 +316,10 @@ impl ResultsCacheWarmer {
                     let wrote =
                         persist_remote_excluding(state, catalog, count, exclude.clone()).await;
                     if wrote {
-                        pending_excludes.lock().retain(|id| !exclude.contains(id));
+                        let live = catalog.lock().ids.clone();
+                        pending_excludes
+                            .lock()
+                            .retain(|id| !exclude.contains(id) && !live.contains(id));
                     }
                 });
             }
@@ -389,14 +395,25 @@ fn apply_catalog(
 
 /// Returns `true` when the remote catalog was left consistent with `exclude`
 /// (written or already matching). `false` on I/O failure so pending tombstones
-/// are retained for a later attempt.
+/// are retained for a later attempt. Ids that are live in `catalog` are not
+/// excluded, so a queued prune cannot drop a re-observed shape.
 async fn persist_remote_excluding(
     state: Arc<ObjectState<Vec<WarmupTemplate>>>,
     catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
     count: Arc<AtomicUsize>,
     exclude: HashSet<u64>,
 ) -> bool {
-    let mut local = without_ids(&catalog.lock().templates, &exclude);
+    // A queued prune may still carry an id that was re-observed after
+    // `drop_and_persist`. Dropping a live shape here would leave it only
+    // in memory; the next process start would not warm it.
+    let (mut local, exclude) = {
+        let catalog = catalog.lock();
+        let exclude: HashSet<u64> = exclude
+            .into_iter()
+            .filter(|id| !catalog.ids.contains(id))
+            .collect();
+        (without_ids(&catalog.templates, &exclude), exclude)
+    };
     for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
         // Compare `merged` to the stored catalog, not the already-filtered
         // remote. Filtering stale ids in memory and then returning because
@@ -1925,6 +1942,41 @@ mod tests {
             "pruned shape must not be restored; got {sqls:?}"
         );
         assert_eq!(sqls.len(), MAX_WARMUP_PLANS);
+    }
+
+    /// Regression for Copilot on #14178: a prune persist that still carries a
+    /// tombstone must not drop that shape after it has been recorded again.
+    #[tokio::test]
+    async fn persist_remote_excluding_keeps_reobserved_live_template() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let object_state = Arc::new(ObjectState::new(store));
+        let shape = warmup_tpl("SELECT reobserved");
+        let tombstone_id = template_id(&shape);
+        object_state
+            .insert(WARMUP_STATE_KEY, &vec![shape.clone()])
+            .await
+            .expect("seed catalog");
+
+        let wrote = persist_remote_excluding(
+            Arc::clone(&object_state),
+            catalog_mutex(vec![shape.clone()]),
+            Arc::new(AtomicUsize::new(1)),
+            HashSet::from([tombstone_id]),
+        )
+        .await;
+        assert!(wrote, "persist should succeed");
+
+        let persisted = object_state
+            .get(WARMUP_STATE_KEY)
+            .await
+            .expect("final get")
+            .expect("catalog exists");
+        assert_eq!(
+            template_sqls(&persisted),
+            ["SELECT reobserved"],
+            "a live re-observed shape must remain on the remote catalog"
+        );
     }
 
     #[tokio::test]
