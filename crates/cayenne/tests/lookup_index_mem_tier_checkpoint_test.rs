@@ -100,7 +100,8 @@ async fn open(fixture: &common::TestFixture, shards: usize) -> Arc<CayenneTableP
         partition_column: None,
         vortex_config,
     };
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
@@ -207,7 +208,11 @@ async fn checkpointed_mem_tier_rows_are_indexed(shards: usize) {
     );
     cdc_upsert(&table, rows(0..ROWS / 2, 10)).await;
     assert!(
-        table.checkpoint_mem_tier().await.expect("second checkpoint") > 0,
+        table
+            .checkpoint_mem_tier()
+            .await
+            .expect("second checkpoint")
+            > 0,
         "the second checkpoint flushed nothing"
     );
 
@@ -258,7 +263,11 @@ async fn checkpointed_mem_tier_rows_are_indexed(shards: usize) {
             && after.access_plans_attached > before.access_plans_attached,
         "no lookup was served by row selection ({shards} shard(s)): {after:?}"
     );
-    let plan = explain(&table, &format!("SELECT value FROM {NAME} WHERE id = {}", ROWS - 1)).await;
+    let plan = explain(
+        &table,
+        &format!("SELECT value FROM {NAME} WHERE id = {}", ROWS - 1),
+    )
+    .await;
     assert!(
         plan.contains("snapshots_scanned=1, files_scanned=1"),
         "the lookup read snapshots that cannot hold its key ({shards} shard(s)):\n{plan}"

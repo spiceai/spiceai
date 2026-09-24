@@ -220,6 +220,18 @@ impl LookupIndexExplain {
 }
 
 impl ProbeOutcome {
+    /// How strongly this outcome describes a lookup that read several
+    /// snapshots: any snapshot read without its index outranks a selection,
+    /// and a selection outranks an empty answer.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Empty => 0,
+            Self::Selected => 1,
+            Self::SnapshotMismatch => 2,
+            Self::Unbuilt => 3,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Selected => "selected",
@@ -767,6 +779,46 @@ pub(crate) struct LookupSelection {
     shape: String,
     per_file: HashMap<String, Vec<u64>>,
     rows: usize,
+    /// The lookup this selection belongs to, which records its outcome once for
+    /// every snapshot the lookup reads. `None` records directly.
+    report: Option<Arc<LookupReport>>,
+}
+
+/// One lookup's probe outcomes across every snapshot it reads — the current
+/// snapshot and each protected one — recorded as a single outcome on
+/// `cayenne_lookup_index_probe_total` when the lookup is dropped, so the metric
+/// counts one outcome per lookup however many snapshots it reads.
+pub(crate) struct LookupReport {
+    state: Arc<LookupIndexState>,
+    /// The highest-ranked outcome noted so far, with its key shape.
+    noted: Mutex<Option<(String, ProbeOutcome)>>,
+}
+
+impl LookupReport {
+    pub(crate) fn new(state: &Arc<LookupIndexState>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::clone(state),
+            noted: Mutex::new(None),
+        })
+    }
+
+    fn note(&self, shape: &str, outcome: ProbeOutcome) {
+        let mut noted = self.noted.lock();
+        if noted
+            .as_ref()
+            .is_none_or(|(_, current)| outcome.rank() > current.rank())
+        {
+            *noted = Some((shape.to_string(), outcome));
+        }
+    }
+}
+
+impl Drop for LookupReport {
+    fn drop(&mut self) {
+        if let Some((shape, outcome)) = self.noted.get_mut().take() {
+            self.state.record_probe(&shape, outcome);
+        }
+    }
 }
 
 /// The result of probing a fully pinned lookup-index key.
@@ -805,8 +857,11 @@ impl LookupSelection {
         LookupIndexExplain,
     ) {
         if !self.validate(snapshot_id, file_groups.iter().flat_map(FileGroup::iter)) {
-            self.state
-                .record_probe(&self.shape, ProbeOutcome::SnapshotMismatch);
+            self.state.note_probe(
+                self.report.as_deref(),
+                &self.shape,
+                ProbeOutcome::SnapshotMismatch,
+            );
             if self.index.snapshot_id == snapshot_id && self.index.file_set != current {
                 self.state.discard_stale(&self.index);
             }
@@ -835,7 +890,8 @@ impl LookupSelection {
             .collect();
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
         if candidate_files == 0 {
-            self.state.record_probe(&self.shape, ProbeOutcome::Empty);
+            self.state
+                .note_probe(self.report.as_deref(), &self.shape, ProbeOutcome::Empty);
             return (
                 file_groups,
                 None,
@@ -847,8 +903,12 @@ impl LookupSelection {
                 ),
             );
         }
-        self.state
-            .record_selection(&self.shape, candidate_files as u64, self.rows as u64);
+        self.state.note_selection(
+            self.report.as_deref(),
+            &self.shape,
+            candidate_files as u64,
+            self.rows as u64,
+        );
         let provider = LookupAccessPlanProvider {
             state: self.state,
             selections: self.per_file,
@@ -1770,9 +1830,9 @@ impl LookupIndexState {
                     .builds_unpublished
                     .fetch_add(1, Ordering::Relaxed);
                 if self.snapshot_build_warned.swap(true, Ordering::Relaxed) {
-                    tracing::debug!(table = %self.table_name, snapshot_id = %snapshot_id, "{}", refused_build_message(&self.table_name));
+                    tracing::debug!(table = %self.table_name, snapshot_id = %snapshot_id, "{}", refused_snapshot_build_message(&self.table_name));
                 } else {
-                    tracing::warn!(table = %self.table_name, snapshot_id = %snapshot_id, "{}", refused_build_message(&self.table_name));
+                    tracing::warn!(table = %self.table_name, snapshot_id = %snapshot_id, "{}", refused_snapshot_build_message(&self.table_name));
                 }
             }
             Err(error) => self.snapshot_build_failed(&snapshot_id, &error),
@@ -1850,6 +1910,29 @@ impl LookupIndexState {
         true
     }
 
+    /// Drops the index of `snapshot_id` unless its snapshot was published (or
+    /// its index promoted to the current snapshot's). What a
+    /// [`SnapshotIndexGuard`](super::table::SnapshotIndexGuard) does on drop.
+    pub(crate) fn discard_unpublished_snapshot(&self, snapshot_id: &str) {
+        let published = self
+            .snapshots
+            .load()
+            .get(snapshot_id)
+            .is_none_or(|entry| entry.live.load(Ordering::Acquire));
+        if published {
+            return;
+        }
+        let _changing = self.snapshots_lock.lock();
+        let mut next = HashMap::clone(&self.snapshots.load());
+        if next
+            .get(snapshot_id)
+            .is_some_and(|entry| !entry.live.load(Ordering::Acquire))
+        {
+            next.remove(snapshot_id);
+            self.snapshots.store(Arc::new(next));
+        }
+    }
+
     /// Drops the index of a snapshot whose write was abandoned.
     pub(crate) fn discard_snapshot(&self, snapshot_id: &str) {
         if !self.snapshots.load().contains_key(snapshot_id) {
@@ -1866,8 +1949,9 @@ impl LookupIndexState {
     /// longer reports: a merge or rewrite folded it away. Entries not yet
     /// published are kept, because their write is still in flight.
     pub(crate) fn retain_live_snapshots(&self, is_live: impl Fn(&str) -> bool) {
-        let folded =
-            |id: &str, entry: &SnapshotIndexEntry| entry.live.load(Ordering::Acquire) && !is_live(id);
+        let folded = |id: &str, entry: &SnapshotIndexEntry| {
+            entry.live.load(Ordering::Acquire) && !is_live(id)
+        };
         if !self
             .snapshots
             .load()
@@ -1916,12 +2000,13 @@ impl LookupIndexState {
         self: &Arc<Self>,
         snapshot_id: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
+        report: Option<&Arc<LookupReport>>,
     ) -> Option<LookupSelection> {
         let shape = self.matched_shape(scalar_for)?;
         let Some(entry) = self.snapshots.load().get(snapshot_id).map(Arc::clone) else {
             // A snapshot written before this process started, or whose build was
             // refused.
-            self.record_probe(shape, ProbeOutcome::Unbuilt);
+            self.note_probe(report.map(AsRef::as_ref), shape, ProbeOutcome::Unbuilt);
             return None;
         };
         // The scan found this snapshot in the protected set it captured.
@@ -1933,6 +2018,7 @@ impl LookupIndexState {
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
+            report: report.map(Arc::clone),
         })
     }
 
@@ -1998,19 +2084,21 @@ impl LookupIndexState {
         index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
+        report: Option<&Arc<LookupReport>>,
     ) -> LookupProbe {
         let Some(shape) = self.matched_shape(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
         };
-        let index = match self.index_for_scan(shape, index, visible_snapshot) {
-            Ok(index) => index,
-            Err(outcome) => {
-                return LookupProbe::Fallback(LookupIndexExplain::fallback(
-                    shape.to_string(),
-                    outcome,
-                ));
-            }
-        };
+        let index =
+            match self.index_for_scan(shape, index, visible_snapshot, report.map(AsRef::as_ref)) {
+                Ok(index) => index,
+                Err(outcome) => {
+                    return LookupProbe::Fallback(LookupIndexExplain::fallback(
+                        shape.to_string(),
+                        outcome,
+                    ));
+                }
+            };
         let Some(hit) = index.probe(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(
                 shape.to_string(),
@@ -2022,6 +2110,7 @@ impl LookupIndexState {
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
+            report: report.map(Arc::clone),
         })
     }
 
@@ -2035,13 +2124,14 @@ impl LookupIndexState {
         shape: &str,
         index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
+        report: Option<&LookupReport>,
     ) -> Result<Arc<SnapshotLookupIndex>, LookupIndexExplainOutcome> {
         let Some(index) = index else {
-            self.record_probe(shape, ProbeOutcome::Unbuilt);
+            self.note_probe(report, shape, ProbeOutcome::Unbuilt);
             return Err(LookupIndexExplainOutcome::Unbuilt);
         };
         if index.snapshot_id != visible_snapshot {
-            self.record_probe(shape, ProbeOutcome::SnapshotMismatch);
+            self.note_probe(report, shape, ProbeOutcome::SnapshotMismatch);
             self.discard_stale(index);
             return Err(LookupIndexExplainOutcome::SnapshotMismatch);
         }
@@ -2067,7 +2157,7 @@ impl LookupIndexState {
         scan_files: &[ObjectMeta],
         keys: &[Vec<ScalarValue>],
     ) -> RuntimeProbe {
-        let Ok(index) = self.index_for_scan(&spec.label, index, visible_snapshot) else {
+        let Ok(index) = self.index_for_scan(&spec.label, index, visible_snapshot, None) else {
             return RuntimeProbe::IndexUnusable;
         };
         if !scan_files.iter().all(|file| index.indexes_file(file)) {
@@ -2096,6 +2186,32 @@ impl LookupIndexState {
 
     fn record_probe(&self, shape: &str, outcome: ProbeOutcome) {
         record_probe_outcome(&self.table_name, &self.counters, shape, outcome);
+    }
+
+    /// Notes `outcome` on the lookup's `report`, or records it directly when the
+    /// probe belongs to no multi-snapshot lookup.
+    fn note_probe(&self, report: Option<&LookupReport>, shape: &str, outcome: ProbeOutcome) {
+        match report {
+            Some(report) => report.note(shape, outcome),
+            None => self.record_probe(shape, outcome),
+        }
+    }
+
+    /// [`Self::record_selection`] for a probe that may belong to a lookup's
+    /// `report`: the candidate counts are summed per snapshot, the outcome once
+    /// per lookup.
+    fn note_selection(&self, report: Option<&LookupReport>, shape: &str, files: u64, rows: u64) {
+        let Some(report) = report else {
+            self.record_selection(shape, files, rows);
+            return;
+        };
+        self.counters
+            .candidate_files
+            .fetch_add(files, Ordering::Relaxed);
+        self.counters
+            .candidate_rows
+            .fetch_add(rows, Ordering::Relaxed);
+        report.note(shape, ProbeOutcome::Selected);
     }
 
     fn record_selection(&self, shape: &str, files: u64, rows: u64) {
@@ -2135,6 +2251,16 @@ pub(crate) fn record_probe_outcome(
 fn refused_build_message(table_name: &str) -> String {
     format!(
         "Dataset '{table_name}' (cayenne): its secondary index was not built because the query memory pool cannot fit it now, so lookups on it scan until a later attempt fits. Raise `runtime.query.memory_limit` or remove the entry from `indexes`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// What the warning says when the memory pool refuses to fit the index of one
+/// newly written snapshot. Unlike [`refused_build_message`], nothing retries
+/// this build: the rows are read without the index until compaction rewrites
+/// them into a snapshot whose index does fit.
+fn refused_snapshot_build_message(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): newly written rows were not added to its secondary index because the query memory pool cannot fit it, so lookups read those rows without the index until compaction rewrites them. Raise `runtime.query.memory_limit` or remove the entry from `indexes`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3203,6 +3329,31 @@ async fn read_back(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refused_snapshot_build_message_states_its_impact_and_fix() {
+        let message = super::refused_snapshot_build_message("orders");
+        assert!(
+            message.starts_with("Dataset 'orders' (cayenne): "),
+            "{message}"
+        );
+        assert!(
+            message.contains("until compaction rewrites them"),
+            "the message must say when the rows are indexed again: {message}"
+        );
+        assert!(
+            !message.contains("later attempt"),
+            "nothing retries a per-snapshot build: {message}"
+        );
+        assert!(
+            message.contains("`runtime.query.memory_limit`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-accelerators/cayenne"),
+            "{message}"
+        );
+    }
+
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
@@ -3297,6 +3448,152 @@ mod tests {
             specs.iter().map(KeySpec::label).collect::<Vec<_>>(),
             vec!["a", "(a, b)"]
         );
+    }
+
+    /// A one-file, one-row index over `snapshot_id`, reserved against `table`.
+    fn one_row_index(
+        pool: &Arc<dyn MemoryPool>,
+        table: &Arc<CayenneMemoryAccount>,
+        snapshot_id: &str,
+    ) -> SnapshotLookupIndex {
+        let schema = arrow_schema::Schema::new(vec![Field::new("tenant", DataType::Int64, false)]);
+        let files = vec![IndexedFile {
+            path: format!("{snapshot_id}/file.vortex"),
+            size: 1,
+            last_modified_ms: 0,
+        }];
+        let mut build = BuildState::new(&[spec(&["tenant"])], build_reservation(pool), &schema)
+            .expect("build state");
+        let file_id = build.file_id(&files[0].path).expect("file id");
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![7]))])
+                .expect("batch");
+        build
+            .ingest(file_id, RowPositions::Contiguous(0), &batch, &files[0].path)
+            .expect("ingest");
+        build
+            .into_index(
+                snapshot_id.to_string(),
+                &files,
+                Instant::now(),
+                None,
+                VortexSession::default(),
+                table,
+                FileSetVersion::default(),
+            )
+            .expect("finish")
+            .expect("fits")
+    }
+
+    fn state(
+        pool: &Arc<dyn MemoryPool>,
+        table: &Arc<CayenneMemoryAccount>,
+    ) -> Arc<LookupIndexState> {
+        LookupIndexState::new(
+            "guarded",
+            vec![spec(&["tenant"])],
+            Arc::clone(pool),
+            Arc::clone(table),
+            Arc::default(),
+        )
+        .expect("state")
+    }
+
+    /// What a `SnapshotIndexGuard` does on drop: an index whose snapshot was
+    /// never published is discarded and its memory released, while a published
+    /// one is kept.
+    #[test]
+    fn discarding_unpublished_snapshots_keeps_published_ones() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let state = state(&pool, &table);
+        state.register_snapshot(Arc::new(one_row_index(&pool, &table, "published")));
+        state.register_snapshot(Arc::new(one_row_index(&pool, &table, "abandoned")));
+        assert!(state.mark_snapshot_live("published"));
+        let with_both = table.reserved_bytes();
+
+        state.discard_unpublished_snapshot("published");
+        state.discard_unpublished_snapshot("abandoned");
+        state.discard_unpublished_snapshot("never-registered");
+
+        let snapshots = state.snapshots.load();
+        assert!(
+            snapshots.contains_key("published"),
+            "a published index was discarded"
+        );
+        assert!(
+            !snapshots.contains_key("abandoned"),
+            "an abandoned index was kept"
+        );
+        assert!(
+            table.reserved_bytes() < with_both,
+            "the abandoned index's memory was not released"
+        );
+    }
+
+    /// A lookup reading several snapshots records one outcome, the most telling
+    /// one, however many snapshots noted theirs.
+    #[test]
+    fn a_lookup_records_one_outcome_for_all_its_snapshots() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let state = state(&pool, &table);
+        let cases = [
+            (
+                vec![ProbeOutcome::Empty, ProbeOutcome::Empty],
+                ProbeOutcome::Empty,
+            ),
+            (
+                vec![
+                    ProbeOutcome::Empty,
+                    ProbeOutcome::Selected,
+                    ProbeOutcome::Empty,
+                ],
+                ProbeOutcome::Selected,
+            ),
+            (
+                vec![
+                    ProbeOutcome::Selected,
+                    ProbeOutcome::Unbuilt,
+                    ProbeOutcome::Empty,
+                ],
+                ProbeOutcome::Unbuilt,
+            ),
+            (
+                vec![ProbeOutcome::SnapshotMismatch, ProbeOutcome::Selected],
+                ProbeOutcome::SnapshotMismatch,
+            ),
+        ];
+        for (noted, expected) in cases {
+            let before = state.counters();
+            let report = LookupReport::new(&state);
+            for outcome in &noted {
+                report.note("tenant", *outcome);
+            }
+            drop(report);
+            let after = state.counters();
+            let delta = |pick: fn(&LookupIndexCounters) -> u64| pick(&after) - pick(&before);
+            let recorded = [
+                (ProbeOutcome::Selected, delta(|c| c.selected)),
+                (ProbeOutcome::Empty, delta(|c| c.empty)),
+                (ProbeOutcome::Unbuilt, delta(|c| c.unbuilt)),
+                (
+                    ProbeOutcome::SnapshotMismatch,
+                    delta(|c| c.snapshot_mismatch),
+                ),
+            ];
+            for (outcome, count) in recorded {
+                let want = u64::from(outcome == expected);
+                assert_eq!(
+                    count, want,
+                    "{noted:?} recorded {outcome:?} {count} time(s)"
+                );
+            }
+        }
+        // A lookup that probed nothing records nothing.
+        let before = state.counters();
+        drop(LookupReport::new(&state));
+        assert_eq!(state.counters(), before);
     }
 
     #[tokio::test]

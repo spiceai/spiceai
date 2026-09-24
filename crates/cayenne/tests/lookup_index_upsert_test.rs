@@ -79,7 +79,10 @@ fn rows(ids: std::ops::Range<i64>, version: u32) -> RecordBatch {
     .expect("fixture batch")
 }
 
-async fn open(fixture: &common::TestFixture, protected_trigger: usize) -> Arc<CayenneTableProvider> {
+async fn open(
+    fixture: &common::TestFixture,
+    protected_trigger: usize,
+) -> Arc<CayenneTableProvider> {
     let runtime_env = Arc::new(RuntimeEnv::default());
     // Background compaction is parked, so only the write-driven pass that
     // `protected_trigger` arms can fold protected snapshots.
@@ -103,7 +106,8 @@ async fn open(fixture: &common::TestFixture, protected_trigger: usize) -> Arc<Ca
         partition_column: None,
         vortex_config,
     };
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
@@ -265,6 +269,14 @@ async fn checkpointed_protected_snapshots_are_indexed_as_they_are_written() {
     let before = counters(&table);
     check_lookups(&table).await;
     let after = counters(&table);
+    // `check_lookups` runs 6 lookups, each reading the current snapshot and four
+    // protected ones, and each is counted as ONE probe outcome.
+    let outcomes = |c: &LookupIndexCounters| c.selected + c.empty + c.unbuilt + c.snapshot_mismatch;
+    assert_eq!(
+        outcomes(&after) - outcomes(&before),
+        6,
+        "expected one probe outcome per lookup: {before:?} -> {after:?}"
+    );
     assert_eq!(
         after.unbuilt, before.unbuilt,
         "a protected snapshot was read without an index: {after:?}"

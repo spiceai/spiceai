@@ -45,6 +45,7 @@ limitations under the License.
 //! of record and CDC (`refresh_mode: changes`) is the crash backstop, so a crash
 //! before commit simply drops the staged directory.
 
+use super::table::SnapshotIndexGuard;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
@@ -94,6 +95,8 @@ impl TransactionWriteToken {
 /// on-conflict deletions and validated keys captured during validation.
 struct StagedData {
     new_snapshot_id: String,
+    /// Discards the staged snapshot's secondary index unless it is published.
+    index_guard: SnapshotIndexGuard,
     on_conflict_deletions: OnConflictDeletions,
     validated_keys: PkDigestSet,
     stats: Arc<ColumnStatsAccumulator>,
@@ -112,6 +115,8 @@ pub struct CayenneStagedUpsert {
     /// commit against the table's live sequence high-water.
     token: TransactionWriteToken,
     new_snapshot_id: String,
+    /// Discards the staged snapshot's secondary index unless it is published.
+    index_guard: SnapshotIndexGuard,
     /// The prior versions this upsert supersedes, captured at validation time
     /// and applied under the fence at commit. Taken (`mem::take`) on commit.
     on_conflict_deletions: OnConflictDeletions,
@@ -138,6 +143,7 @@ impl CayenneStagedUpsert {
             table,
             token,
             new_snapshot_id: staged.new_snapshot_id,
+            index_guard: staged.index_guard,
             on_conflict_deletions: staged.on_conflict_deletions,
             validated_keys: staged.validated_keys,
             stats: staged.stats,
@@ -209,6 +215,7 @@ impl CayenneStagedUpsert {
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
+            _index_guard: self.index_guard,
             validated_keys: self.validated_keys,
             stats: self.stats,
             row_count: self.row_count,
@@ -351,6 +358,8 @@ impl CayenneStagedUpsert {
 pub struct PreparedTxnCommit {
     table: CayenneTableProvider,
     new_snapshot_id: String,
+    /// Discards the staged snapshot's secondary index unless `finish` publishes it.
+    _index_guard: SnapshotIndexGuard,
     validated_keys: PkDigestSet,
     stats: Arc<ColumnStatsAccumulator>,
     row_count: u64,
@@ -549,6 +558,7 @@ impl CayenneTableProvider {
         let post_validation = prepared.post_validation();
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let index_guard = self.snapshot_index_guard(&new_snapshot_id);
         let target_size_bytes = self.target_file_size_bytes();
 
         let (row_count, _writer_ops, stats) = match self
@@ -584,6 +594,7 @@ impl CayenneTableProvider {
 
         Ok(StagedData {
             new_snapshot_id,
+            index_guard,
             on_conflict_deletions,
             validated_keys,
             stats,

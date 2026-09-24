@@ -1250,6 +1250,7 @@ impl<'a> AppendMutationWriter<'a> {
         estimated_bytes: Option<u64>,
     ) -> Result<(u64, Arc<ColumnStatsAccumulator>, PkDigestSet, usize)> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let _index_guard = self.table.snapshot_index_guard(&new_snapshot_id);
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = self
