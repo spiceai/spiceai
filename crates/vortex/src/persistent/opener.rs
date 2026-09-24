@@ -54,6 +54,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
 use crate::VortexAccessPlan;
+use crate::VortexRuntimeAccessPlanProvider;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::make_vortex_predicate;
@@ -112,6 +113,8 @@ pub(crate) struct VortexOpener {
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
+    /// Provider consulted after runtime dynamic filters have been populated.
+    pub runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
 }
 
 impl FileOpener for VortexOpener {
@@ -149,6 +152,9 @@ impl FileOpener for VortexOpener {
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
+        let runtime_access_plan_provider =
+            self.runtime_access_plan_provider.as_ref().map(Arc::clone);
+        let runtime_predicate = self.filter.as_ref().map(Arc::clone);
 
         // Replace column access for partition columns with literals
         let literal_value_cols: std::collections::HashMap<String, ScalarValue> = self
@@ -170,6 +176,24 @@ impl FileOpener for VortexOpener {
         }
 
         Ok(async move {
+            let runtime_access_plan = match runtime_access_plan_provider.as_ref() {
+                Some(provider) => {
+                    provider
+                        .runtime_access_plan_for_file(&file, runtime_predicate.as_ref())
+                        .await
+                }
+                None => None,
+            };
+
+            // A runtime index may prove that this file has no candidate rows. Return
+            // before opening the Vortex footer or constructing its layout reader.
+            if runtime_access_plan
+                .as_deref()
+                .is_some_and(VortexAccessPlan::is_empty)
+            {
+                return Ok(stream::empty().boxed());
+            }
+
             // Create FilePruner when we have a predicate and either dynamic expressions
             // or file statistics available. The pruner can eliminate files without
             // opening them based on:
@@ -465,8 +489,20 @@ impl FileOpener for VortexOpener {
 
             let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
 
-            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
-                scan_builder = vortex_plan.apply_to_builder(scan_builder);
+            // A runtime plan narrows the planning-time plan rather than replacing
+            // it, so rows the planning-time plan excludes (deleted rows, say) stay
+            // excluded whatever the runtime provider returns.
+            match (
+                file.extensions.get::<VortexAccessPlan>(),
+                runtime_access_plan.as_deref(),
+            ) {
+                (Some(planned), Some(runtime)) => {
+                    scan_builder = planned.intersect(runtime).apply_to_builder(scan_builder);
+                }
+                (Some(plan), None) | (None, Some(plan)) => {
+                    scan_builder = plan.apply_to_builder(scan_builder);
+                }
+                (None, None) => {}
             }
 
             if let Some(row_range) = row_range {
@@ -919,6 +955,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         }
     }
 
@@ -1187,6 +1224,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         let filter = col("a").lt(lit(100_i32));
@@ -1276,6 +1314,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         let stream = opener.open(file)?.await?;
@@ -1430,6 +1469,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         // This should succeed and return the correctly projected and cast data
@@ -1492,7 +1532,45 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         }
+    }
+
+    #[derive(Debug)]
+    struct EmptyRuntimeAccessPlanProvider;
+
+    #[async_trait::async_trait]
+    impl VortexRuntimeAccessPlanProvider for EmptyRuntimeAccessPlanProvider {
+        async fn runtime_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _predicate: Option<&PhysicalExprRef>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            Some(Arc::new(
+                VortexAccessPlan::default()
+                    .with_selection(Selection::IncludeByIndex(StrictSortedBuffer::default())),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_selection_skips_file_open() -> anyhow::Result<()> {
+        let _ = take_scans_built();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let schema = make_test_batch_with_10_rows().schema();
+        let file = PartitionedFile::new("/path/does-not-exist.vortex".to_string(), 100);
+        let mut opener = make_test_opener(
+            object_store,
+            Arc::clone(&schema),
+            ProjectionExprs::from_indices(&[0], &schema),
+        );
+        opener.runtime_access_plan_provider = Some(Arc::new(EmptyRuntimeAccessPlanProvider));
+
+        let data = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
+
+        assert!(data.is_empty());
+        assert_eq!(take_scans_built(), 0);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1699,6 +1777,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         let file = PartitionedFile::new(file_path.to_string(), data_size);

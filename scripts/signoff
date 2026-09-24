@@ -2458,6 +2458,21 @@ cmd_correct_cancelled() {
 # once, at the end of a run that has already stopped working.
 cmd_clear_pending() {
   local reason="${1:-Sign-off run ended before the checks completed — sign off again}"
+
+  # In a remote run this is a cleanup handler, and a handler that cannot run has
+  # learned nothing about the branch. `require_tools` would `fail` here, so on a
+  # runner whose PATH has no `gh` the `Resolve an incomplete sign-off` step exits
+  # 1 with "GitHub CLI (gh) not found" — a second red step on a job that already
+  # died in setup, and the one message in the step list is about this handler
+  # rather than about the host that is actually broken (#14234). `correct-cancelled`,
+  # the other half of the pair that handles a run which reached no verdict, already
+  # treats its own missing tooling that way; this is the same rule for the same
+  # reason. Run by hand, the command still refuses: a person asking for the status
+  # to be restated needs to be told it was not.
+  if is_remote_run && ! command -v gh >/dev/null 2>&1; then
+    info "gh unavailable on this runner — leaving the ${STATUS_CONTEXT} status alone."
+    return 0
+  fi
   require_tools
 
   local revision sha repo state

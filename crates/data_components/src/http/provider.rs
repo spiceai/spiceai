@@ -35,6 +35,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
@@ -1105,6 +1106,13 @@ impl HttpTableProvider {
 
     #[must_use]
     pub fn base_table_schema() -> Schema {
+        // The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker lives on the
+        // *schema*, not the `response_status` field: it is a provenance
+        // signal ("this batch really came from the HTTP connector's own
+        // fetch"), not a per-column attribute, so it must survive being
+        // rebuilt into a narrower, decomposed schema (see
+        // `build_json_nest_schema`) the same way whether or not
+        // `response_status` itself is one of the columns kept.
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("request_query", DataType::Utf8, true),
@@ -1133,6 +1141,10 @@ impl HttpTableProvider {
                 true,
             ),
         ])
+        .with_metadata(std::collections::HashMap::from([(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            "1".to_string(),
+        )]))
     }
 
     /// Extract path and query from filters
@@ -2052,6 +2064,13 @@ pub struct HttpExec {
     /// When `true`, the partitions are a template that will be expanded
     /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
     deferred_partitions: bool,
+    /// Counts fetches that turned into a successful batch despite carrying a
+    /// retryable `response_status` (5xx/429) — see
+    /// [`crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME`]. Lives on the plan tree
+    /// rather than the batch schema, so it survives a user projection that
+    /// prunes `response_status` out of the batch before `cache::batches_cacheable`
+    /// ever sees it.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl HttpExec {
@@ -2105,6 +2124,7 @@ impl HttpExec {
             limit,
             properties,
             deferred_partitions: false,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -2175,12 +2195,23 @@ impl HttpExec {
             existing.len(),
         );
 
-        Ok(Self::new(
+        // Share `self.metrics` rather than starting a fresh
+        // `ExecutionPlanMetricsSet`: `HttpWithDeferredParamsExec::execute`
+        // dynamically rewrites and runs a fresh `HttpExec` built from this
+        // method, discarding it once the stream completes, while the plan
+        // tree `cache::plan_saw_transient_http_failure` walks still holds
+        // only the original, pre-rewrite `HttpExec` template. Cloning
+        // `ExecutionPlanMetricsSet` shares its underlying metrics set, so a
+        // counter incremented on the rewritten exec is visible through the
+        // template's `metrics()` too.
+        let mut expanded = Self::new(
             Arc::clone(&self.projected_schema),
             Arc::clone(&self.provider),
             new_partitions,
             self.limit,
-        ))
+        );
+        expanded.metrics = self.metrics.clone();
+        Ok(expanded)
     }
 
     async fn fetch_and_create_batch(
@@ -2219,14 +2250,41 @@ impl HttpExec {
         let content_rows =
             parse_content_with_map_to_array(&result.content, self.limit, map_to_array);
 
-        self.create_batch_from_rows(
+        let batch = self.create_batch_from_rows(
             path.as_deref(),
             query.as_deref(),
             body.as_deref(),
             request_headers.as_deref(),
             &content_rows,
             &result,
-        )
+        )?;
+
+        if HttpTableProvider::is_retryable_status(result.response_status) {
+            MetricBuilder::new(&self.metrics)
+                .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
+                .add(1);
+        }
+
+        Ok(batch)
+    }
+
+    /// `self.projected_schema` with [`crate::HTTP_RESPONSE_STATUS_METADATA_KEY`]
+    /// overridden to `status`, so a batch carries the real HTTP status of the
+    /// fetch that produced it even when a JSON-decomposed dataset's declared
+    /// schema has no `response_status` column to hold it. The value also
+    /// doubles as the provenance signal `cache::http_fetch_status` checks
+    /// (only this connector ever sets it) -- a plain presence check, not a
+    /// fixed sentinel, since the value now varies per fetch.
+    fn schema_with_fetch_status(&self, status: u16) -> SchemaRef {
+        let mut metadata = self.projected_schema.metadata().clone();
+        metadata.insert(
+            crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            status.to_string(),
+        );
+        Arc::new(Schema::new_with_metadata(
+            self.projected_schema.fields().clone(),
+            metadata,
+        ))
     }
 
     /// Create a `RecordBatch` from pre-parsed content rows and HTTP response metadata.
@@ -2239,9 +2297,37 @@ impl HttpExec {
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
     ) -> DataFusionResult<RecordBatch> {
+        // A body that decomposes to zero rows is ambiguous on its own: for a 2xx
+        // response it is a legitimate empty result, but for a retryable failure
+        // (5xx/429, e.g. an empty or `[]` error body) there are no rows to carry
+        // `response_status` on at all — an empty batch here would be
+        // indistinguishable from a real empty result to `cache::batches_cacheable`
+        // and to any caller, which is the empty-result shape #14157 was reported
+        // against. A row-count-independent signal is needed, and this connector
+        // has no side channel to carry one through `TableProvider::scan` — so
+        // surface it as an actual fetch error instead of a successful empty
+        // batch. `CacheRefreshHelper::handle_cache_miss`'s existing `Err` arm
+        // already implements stale-if-error correctly (serve the cached copy
+        // inside the window, propagate the error past it or with nothing
+        // cached), and for any other refresh mode or an unaccelerated query the
+        // error reaches the caller directly rather than being cached by the
+        // independent SQL results cache as if it were data.
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
+            if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                return Err(if fetch_result.response_status == 429 {
+                    Error::RateLimited {
+                        message: "the origin answered 429 Too Many Requests with an empty body"
+                            .to_string(),
+                    }
+                } else {
+                    Error::HttpServerError {
+                        status: fetch_result.response_status,
+                    }
+                }
+                .into());
+            }
             return RecordBatch::try_new(
                 Arc::clone(&self.projected_schema),
                 self.projected_schema
@@ -2300,8 +2386,11 @@ impl HttpExec {
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
-        let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)?;
+        let batch = RecordBatch::try_new(
+            self.schema_with_fetch_status(fetch_result.response_status),
+            columns,
+        )
+        .map_err(DataFusionError::from)?;
         Ok(batch)
     }
 
@@ -2524,8 +2613,11 @@ impl HttpExec {
             }
         }
 
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)
+        RecordBatch::try_new(
+            self.schema_with_fetch_status(fetch_result.response_status),
+            columns,
+        )
+        .map_err(DataFusionError::from)
     }
 
     /// Parse content into individual rows
@@ -2655,6 +2747,10 @@ impl ExecutionPlan for HttpExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -2926,8 +3022,32 @@ impl ExecutionPlan for HttpExec {
                             state.done = true;
                         }
 
-                        // Skip empty pages internally — loop again instead of yielding
+                        // Skip empty pages internally — loop again instead of yielding.
+                        // An empty page is ambiguous the same way a non-paginated empty
+                        // body is (see `create_batch_from_rows`): a retryable status
+                        // (5xx/429) with no rows means this page carries an origin
+                        // failure, not a legitimate end of data, and `state.done` being
+                        // true for it — the common case, since a failed page usually
+                        // carries no valid `next` link either — would otherwise let
+                        // pagination end the stream with `Ok(None)` before this fetch's
+                        // status is ever checked, bypassing `create_batch_from_rows`
+                        // entirely.
                         if content_rows.is_empty() {
+                            if HttpTableProvider::is_retryable_status(fetch_result.response_status)
+                            {
+                                return Err(if fetch_result.response_status == 429 {
+                                    Error::RateLimited {
+                                        message: "the origin answered 429 Too Many Requests \
+                                            with an empty body"
+                                            .to_string(),
+                                    }
+                                } else {
+                                    Error::HttpServerError {
+                                        status: fetch_result.response_status,
+                                    }
+                                }
+                                .into());
+                            }
                             if state.done {
                                 return Ok(None);
                             }
@@ -2943,6 +3063,12 @@ impl ExecutionPlan for HttpExec {
                             &content_rows,
                             &fetch_result,
                         )?;
+
+                        if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                            MetricBuilder::new(&exec.metrics)
+                                .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
+                                .add(1);
+                        }
 
                         state.rows_fetched += num_rows;
 
@@ -7639,6 +7765,109 @@ mod tests {
         )
     }
 
+    /// Like [`start_query_param_pagination_server`], but the final "page" is a
+    /// retryable origin failure (`503` with an empty body) rather than a
+    /// legitimate empty page.
+    async fn start_query_param_pagination_server_with_failing_final_page(
+        stop_offset: usize,
+    ) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let request_target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let request_url = Url::parse(&format!("http://localhost{request_target}"))
+                        .expect("request target should form a valid URL");
+                    let offset = request_url
+                        .query_pairs()
+                        .find_map(|(key, value)| {
+                            (key == "offset")
+                                .then(|| value.parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+
+                    let response = if offset < stop_offset {
+                        let body = format!(r#"{{"docs":[{{"id":{offset}}}]}}"#);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        let body = r#"{"docs":[]}"#;
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid")
+    }
+
+    /// Regression test: a paginated fetch that ends on a retryable-status,
+    /// empty-body page (e.g. the origin starts answering `503` mid-pagination)
+    /// must surface that as an error rather than the "no more pages" case at
+    /// provider.rs's pagination loop, which returns `Ok(None)` before
+    /// `create_batch_from_rows`'s own retryable-status check ever runs.
+    #[tokio::test]
+    async fn test_pagination_surfaces_a_retryable_empty_final_page_as_an_error() {
+        use datafusion::prelude::SessionContext;
+
+        let base_url = start_query_param_pagination_server_with_failing_final_page(2).await;
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_max_retries(0)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(1),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: None,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config should be valid");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let result = ctx
+            .sql("SELECT content FROM items")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 503 on the final page must surface as an error, not a silently truncated \
+            successful result"
+        );
+    }
+
     #[tokio::test]
     async fn test_pagination_without_max_pages_fetches_past_default_limit() {
         use datafusion::prelude::SessionContext;
@@ -8409,6 +8638,7 @@ mod tests {
             column_order.iter().map(|s| (*s).to_string()).collect(),
             json_field.to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -8429,6 +8659,83 @@ mod tests {
             response_status: 200,
             response_headers: Vec::new(),
         }
+    }
+
+    /// Regression coverage for #14157's empty-result shape: a retryable
+    /// status (5xx) whose body decomposes to zero content rows has nothing
+    /// to carry `response_status` on, so a successful empty batch here would
+    /// be indistinguishable from a real empty result to every caller
+    /// (`cache::batches_cacheable`, the independent SQL results cache, and a
+    /// plain unaccelerated query) regardless of refresh mode. Must surface as
+    /// an error instead.
+    #[test]
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_5xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 503,
+            ..empty_fetch_result()
+        };
+
+        let err = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 503 must be an error, not a successful empty batch");
+        assert!(
+            err.to_string().contains("503"),
+            "error should name the status code, got: {err}"
+        );
+    }
+
+    /// Same as above for a zero-row 429 (rate limited), which uses a
+    /// different error variant than a 5xx.
+    #[test]
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_429_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 429,
+            ..empty_fetch_result()
+        };
+
+        exec.create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 429 must be an error, not a successful empty batch");
+    }
+
+    /// A genuinely empty 2xx result (the origin really has no rows to
+    /// return) must stay a successful empty batch.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_genuine_2xx_empty_result() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &empty_fetch_result())
+            .expect("a genuine empty 2xx result must not error");
+
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    /// A non-retryable zero-row status (e.g. a 4xx with an empty body) is not
+    /// this connector's problem to second-guess: stays a successful empty
+    /// batch, matching a 2xx.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_zero_row_4xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 404,
+            ..empty_fetch_result()
+        };
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect("a zero-row 4xx must not error");
+
+        assert_eq!(batch.num_rows(), 0);
     }
 
     /// Like `nested_exec`, but accepts an explicit Arrow schema so a
@@ -8475,6 +8782,7 @@ mod tests {
                 "details".to_string(),
             ],
             "details".to_string(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -8714,6 +9022,7 @@ mod tests {
             vec!["id".to_string(), "name".to_string(), "details".to_string()],
             "details".to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -8756,6 +9065,7 @@ mod tests {
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let provider = Arc::new(
             base_provider().with_json_nesting(nesting.clone(), nesting_schema_utf8(&nesting)),
@@ -8789,6 +9099,7 @@ mod tests {
         let nesting = HttpJsonNesting::new(
             vec!["id".to_string(), "details".to_string()],
             "details".to_string(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         let provider = Arc::new(
@@ -8836,6 +9147,12 @@ mod tests {
                 "details".to_string(),
             ],
             "details".to_string(),
+            ["request_path".to_string(), "response_status".to_string()]
+                .into_iter()
+                .collect(),
+            // Both are user-declared in `column_order` above, so both
+            // legitimately take a same-named body key away from the
+            // catch-all — this test is exercising exactly that case.
             ["request_path".to_string(), "response_status".to_string()]
                 .into_iter()
                 .collect(),
@@ -9040,6 +9357,36 @@ mod tests {
         assert_eq!(result.partitions[4].1, Some("q2".to_string()));
         assert_eq!(result.partitions[5].0, Some("/b".to_string()));
         assert_eq!(result.partitions[5].1, Some("q3".to_string()));
+    }
+
+    /// `HttpWithDeferredParamsExec::execute` runs a fresh `HttpExec` built by
+    /// `with_expanded_params` and discards it once the stream completes, while
+    /// `cache::plan_saw_transient_http_failure` only ever walks the original,
+    /// pre-expansion template captured in the plan tree — so the expanded
+    /// exec must increment the *same* `HTTP_TRANSIENT_FAILURE_METRIC_NAME`
+    /// counter as its template, not a fresh one, for that fallback to see it.
+    #[test]
+    fn test_with_expanded_params_shares_metrics_with_template() {
+        let exec = make_exec(vec![(None, None, None, None)], None);
+        let expanded = exec
+            .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
+            .expect("expand should succeed");
+
+        MetricBuilder::new(&expanded.metrics)
+            .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, 0)
+            .add(1);
+
+        let template_count = exec
+            .metrics()
+            .and_then(|m| m.sum_by_name(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME))
+            .map(|v| v.as_usize());
+        assert_eq!(
+            template_count,
+            Some(1),
+            "a counter incremented on the expanded exec must be visible through the \
+            original template's metrics(), since that template is what the plan tree \
+            (and cache::plan_saw_transient_http_failure) still holds after expansion"
+        );
     }
 
     #[test]
