@@ -101,3 +101,35 @@ pub const INFERRED_SHARD_KEY_METADATA_KEY: &str = "spice.inferred_shard_key";
 /// The value is a JSON array of objects:
 /// `[{ "column": "created_at", "distinct_count": 100000, "correlation": 0.99 }]`.
 pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stats";
+
+/// Arrow schema metadata key the HTTP connector sets on every batch it
+/// produces (via `HttpTableProvider::schema_with_fetch_status`) to the real,
+/// per-fetch HTTP status as a string (e.g. `"503"`) — not a fixed sentinel.
+///
+/// `refresh_mode: caching` (and the independent, runtime-wide SQL results
+/// cache) calls `cache::batches_cacheable` on every fetch to tell a
+/// transient origin failure from real data, regardless of connector.
+/// Inferring that a batch came from the HTTP connector by its column names
+/// and types alone is not sound: an unrelated `refresh_mode: caching`
+/// dataset (e.g. a `localpod` table) can legitimately have its own
+/// `response_status: UInt16` and `_fetched_at` columns, and a business value
+/// of `503` in that column is not an origin failure. This key's mere
+/// presence on the *schema* (not a field) is the provenance signal that
+/// tells the two cases apart, and it survives a schema rebuilt into a
+/// narrower, JSON-decomposed shape regardless of which columns that schema
+/// keeps.
+pub const HTTP_RESPONSE_STATUS_METADATA_KEY: &str = "spice.http_response_status";
+
+/// `ExecutionPlan::metrics()` counter name the HTTP connector's `HttpExec`
+/// increments once per fetch/page it turned into a successful batch that
+/// actually carried a retryable status (5xx/429) — the same "retryable but
+/// not zero rows" case `HTTP_RESPONSE_STATUS_METADATA_KEY` and the
+/// `response_status` column exist to report, but readable even when a user
+/// projection (e.g. `SELECT rank FROM http_data`) prunes `response_status`
+/// out of the batch before it ever reaches `cache::batches_cacheable`.
+/// Metrics live on the plan tree, not the batch schema, so column pruning
+/// cannot remove them; a plan-metrics walk from the root, summed by this
+/// name, is how a caller checks for this failure past an arbitrary
+/// projection. Named for the fetch/page it counts, not the rows in it — one
+/// increment can stand for a batch of any row count, including zero.
+pub const HTTP_TRANSIENT_FAILURE_METRIC_NAME: &str = "http_transient_failure_fetches";

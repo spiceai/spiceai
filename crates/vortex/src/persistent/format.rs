@@ -73,6 +73,7 @@ use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
+use super::access_plan::VortexRuntimeAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
 use super::cache::cache_footer;
 use super::segment_cache;
@@ -298,6 +299,7 @@ pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
     write_observer: Option<Arc<dyn VortexWriteObserver>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
@@ -310,6 +312,13 @@ impl Debug for VortexFormat {
             .field(
                 "access_plan_provider",
                 &self.access_plan_provider.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "runtime_access_plan_provider",
+                &self
+                    .runtime_access_plan_provider
+                    .as_ref()
+                    .map(|_| "configured"),
             )
             .field(
                 "write_observer",
@@ -497,6 +506,7 @@ impl VortexFormat {
             session,
             opts,
             access_plan_provider: None,
+            runtime_access_plan_provider: None,
             write_observer: None,
             segment_cache,
             write_shard: None,
@@ -625,6 +635,19 @@ impl VortexFormat {
     ) -> Self {
         Self {
             access_plan_provider: Some(access_plan_provider),
+            ..self.clone()
+        }
+    }
+
+    /// Creates a format whose scans also plan each file from the scan's runtime
+    /// predicate as the file opens. See [`VortexRuntimeAccessPlanProvider`].
+    #[must_use]
+    pub fn with_runtime_access_plan_provider(
+        &self,
+        runtime_access_plan_provider: Arc<dyn VortexRuntimeAccessPlanProvider>,
+    ) -> Self {
+        Self {
+            runtime_access_plan_provider: Some(runtime_access_plan_provider),
             ..self.clone()
         }
     }
@@ -1107,6 +1130,10 @@ impl FileFormat for VortexFormat {
 
         source = source
             .with_file_metadata_cache(state.runtime_env().cache_manager.get_file_metadata_cache());
+
+        if let Some(provider) = self.runtime_access_plan_provider.as_ref() {
+            source = source.with_runtime_access_plan_provider(Arc::clone(provider));
+        }
 
         let conf = FileScanConfigBuilder::from(file_scan_config)
             .with_source(Arc::new(source))
