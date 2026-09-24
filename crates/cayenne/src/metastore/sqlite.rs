@@ -80,6 +80,12 @@ fn reclaim_freelist_pages(
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
+/// Rows per `tokio_rusqlite` call in [`SqliteTransaction::execute_many`]: a
+/// manifest rewrite pays a round trip per this many files rather than per file,
+/// and a cancelled batch runs at most this many further rows under the write
+/// lock before the transaction rolls back.
+const EXECUTE_MANY_ROWS_PER_CALL: usize = 1_024;
+
 /// Default WAL-size cap (bytes) for [`SqliteMetastoreConfig::wal_truncate_threshold_bytes`]
 /// — the size above which the background maintenance-tick checkpoint escalates
 /// from PASSIVE to TRUNCATE (cycle-8 TASK A2). See that field for the rationale.
@@ -1911,28 +1917,33 @@ impl MetastoreTransaction for SqliteTransaction {
         let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
         })?;
-        if params.is_empty() {
-            return Ok(());
-        }
-        let sql = sql.to_string();
-        let rows: Vec<Vec<rusqlite::types::Value>> = params
-            .into_iter()
-            .map(|row| row.into_iter().map(to_sqlite_value).collect())
-            .collect();
+        let sql: Arc<str> = Arc::from(sql);
 
-        // One `call` for every row: the statement is prepared once and each row
-        // is a step on the connection thread, not a channel round trip.
-        conn.call(move |conn| {
-            let mut stmt = conn.prepare_cached(&sql)?;
-            for row in &rows {
-                stmt.execute(rusqlite::params_from_iter(row))?;
-            }
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(|e| {
-            convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
-        })?;
+        // One `call` per chunk of rows: the statement is prepared once and each
+        // row is a step on the connection thread, not a channel round trip. A
+        // `call` runs to completion even if its caller stops waiting, so the
+        // chunk bounds what a cancelled batch still executes under the write
+        // lock before the transaction's `Drop` can roll it back.
+        let mut rows = params.into_iter().peekable();
+        while rows.peek().is_some() {
+            let chunk: Vec<Vec<rusqlite::types::Value>> = rows
+                .by_ref()
+                .take(EXECUTE_MANY_ROWS_PER_CALL)
+                .map(|row| row.into_iter().map(to_sqlite_value).collect())
+                .collect();
+            let sql = Arc::clone(&sql);
+            conn.call(move |conn| {
+                let mut stmt = conn.prepare_cached(&sql)?;
+                for row in &chunk {
+                    stmt.execute(rusqlite::params_from_iter(row))?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(|e| {
+                convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
+            })?;
+        }
 
         Ok(())
     }
@@ -2122,78 +2133,69 @@ mod tests {
         count
     }
 
-    /// `execute_many` runs its statement once per entry, in order, and the first
-    /// entry that fails stops the batch with that entry's error — what a loop of
-    /// `execute` calls does, so the caller's rollback leaves nothing behind.
+    /// `execute_many` runs its statement once per entry, in order, across chunk
+    /// boundaries, and the first entry that fails stops the batch with that
+    /// entry's error — what a loop of `execute` calls does, so the caller's
+    /// rollback leaves nothing behind.
     #[tokio::test]
     async fn test_execute_many_runs_every_entry_and_stops_at_the_first_failure() {
         const INSERT: &str = "INSERT INTO t (id, label) VALUES (?1, ?2)";
+        fn row(id: i64) -> Vec<MetastoreValue> {
+            vec![
+                MetastoreValue::Integer(id),
+                MetastoreValue::Text(format!("row-{id}")),
+            ]
+        }
+        let chunk = i64::try_from(EXECUTE_MANY_ROWS_PER_CALL).expect("chunk size fits i64");
         let (_dir, metastore) = temp_metastore();
         metastore
             .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
             .await
             .expect("create table");
 
+        // Two full chunks and a partial third.
+        let total = chunk * 2 + 17;
         let tx = metastore.begin_transaction().await.expect("begin");
         tx.execute_many(INSERT, Vec::new())
             .await
             .expect("an empty batch is a no-op");
-        let rows = (0..1_000)
-            .map(|i| {
-                vec![
-                    MetastoreValue::Integer(i),
-                    MetastoreValue::Text(format!("row-{i}")),
-                ]
-            })
-            .collect();
-        tx.execute_many(INSERT, rows).await.expect("insert batch");
+        tx.execute_many(INSERT, (0..total).map(row).collect())
+            .await
+            .expect("insert batch");
         tx.commit().await.expect("commit");
 
         let tx = metastore.begin_transaction().await.expect("begin");
         assert_eq!(
             count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t").await,
-            1_000,
-            "every entry of the batch must run"
+            total,
+            "every entry of every chunk must run"
         );
-        let result = tx
-            .execute_many(
-                INSERT,
-                vec![
-                    vec![
-                        MetastoreValue::Integer(5_000),
-                        MetastoreValue::Text("first".to_string()),
-                    ],
-                    vec![
-                        MetastoreValue::Integer(0),
-                        MetastoreValue::Text("duplicate key".to_string()),
-                    ],
-                    vec![
-                        MetastoreValue::Integer(5_001),
-                        MetastoreValue::Text("after the failure".to_string()),
-                    ],
-                ],
-            )
-            .await;
+        // A full first chunk of new keys, then a duplicate at the start of the
+        // second chunk, then more new keys the batch must never reach.
+        let first_new = total;
+        let mut batch: Vec<Vec<MetastoreValue>> = (first_new..first_new + chunk).map(row).collect();
+        batch.push(row(0));
+        batch.extend((first_new + chunk..first_new + chunk + 5).map(row));
+        let result = tx.execute_many(INSERT, batch).await;
         assert!(
             matches!(result, Err(CatalogError::ConstraintViolation { .. })),
             "the failing entry's constraint violation must surface: {result:?}"
         );
         assert_eq!(
-            count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t WHERE id = 5000").await,
-            1,
-            "entries before the failure stay applied until the caller rolls back"
-        );
-        assert_eq!(
-            count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t WHERE id = 5001").await,
-            0,
-            "entries after the failure never run"
+            count_rows(
+                tx.as_ref(),
+                &format!("SELECT COUNT(*) FROM t WHERE id >= {first_new}")
+            )
+            .await,
+            chunk,
+            "entries before the failure stay applied until the caller rolls back, and none after it run"
         );
         tx.rollback().await.expect("rollback");
 
         let tx = metastore.begin_transaction().await.expect("begin");
         assert_eq!(
             count_rows(tx.as_ref(), "SELECT COUNT(*) FROM t").await,
-            1_000,
+            total,
             "rolling back drops the partially applied batch"
         );
         tx.rollback().await.expect("rollback");

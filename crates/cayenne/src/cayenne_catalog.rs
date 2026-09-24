@@ -1020,10 +1020,15 @@ impl CayenneCatalog {
         // tier's inline corpus along with everything else keyed on the old snapshot.
         self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
             .await?;
-        let rows = cold_files
-            .iter()
-            .map(|f| {
-                vec![
+        // One statement per file rather than `execute_many`: each row carries
+        // a statistics blob and a primary-key bloom of up to
+        // `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, so binding them all at once would
+        // hold a second copy of every bloom for the whole write transaction,
+        // while a round trip per file is noise beside writing its blobs.
+        for f in cold_files {
+            txn.execute(ExecuteParams {
+                sql: COLD_TIER_FILE_UPSERT_SQL,
+                params: vec![
                     MetastoreValue::Text(f.table_id.clone()),
                     MetastoreValue::Text(f.file_url.clone()),
                     MetastoreValue::Integer(f.row_count),
@@ -1034,10 +1039,11 @@ impl CayenneCatalog {
                     f.pk_bloom
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Blob),
-                ]
+                ],
             })
-            .collect();
-        txn.execute_many(COLD_TIER_FILE_UPSERT_SQL, rows).await
+            .await?;
+        }
+        Ok(())
     }
 
     /// # Errors
