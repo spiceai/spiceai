@@ -671,9 +671,9 @@ fn first_full_or_append_refresh_settled_for(
     if completion.closed_without_a_refresh() {
         // Scheduler: no local refresh will run. Wait for the distributed
         // Ready (often held so `/v1/ready` stays false during warmup), or
-        // stop waiting if this dataset will never become ready.
-        return dataset_ready_for_warmup(status, name)
-            || dataset_will_not_become_ready(status, name);
+        // stop waiting if this dataset or view will never become ready.
+        // Accelerated views publish under `view:*`, not `dataset:*`.
+        return table_ready_for_warmup(status, name) || table_will_not_become_ready(status, name);
     }
     if completion.has_recorded() || completion.has_terminal_failure() {
         return true;
@@ -683,7 +683,7 @@ fn first_full_or_append_refresh_settled_for(
     // and warmup is once-only. A one-shot failure records a
     // terminal-failure outcome in `after_refresh_task_completed`
     // instead of settling on Error or on a successful completion.
-    dataset_is_disabled(status, name)
+    table_is_disabled(status, name)
 }
 
 fn same_spice_table(left: &TableReference, right: &TableReference) -> bool {
@@ -694,27 +694,41 @@ fn same_spice_table(left: &TableReference, right: &TableReference) -> bool {
             .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
-fn dataset_ready_for_warmup(status: &status::RuntimeStatus, name: &TableReference) -> bool {
+fn spice_table_status_is(
+    statuses: impl IntoIterator<Item = (TableReference, status::ComponentStatus)>,
+    name: &TableReference,
+    pred: impl Fn(&status::ComponentStatus) -> bool,
+) -> bool {
+    statuses
+        .into_iter()
+        .any(|(key, st)| same_spice_table(&key, name) && pred(&st))
+}
+
+fn table_ready_for_warmup(status: &status::RuntimeStatus, name: &TableReference) -> bool {
     status
         .dataset_ready_or_held_keys()
-        .iter()
-        .any(|key| same_spice_table(key, name))
+        .into_iter()
+        .any(|key| same_spice_table(&key, name))
+        || spice_table_status_is(status.get_view_statuses(), name, |st| {
+            matches!(st, status::ComponentStatus::Ready)
+        })
 }
 
-fn dataset_will_not_become_ready(status: &status::RuntimeStatus, name: &TableReference) -> bool {
-    status.get_dataset_statuses().iter().any(|(key, st)| {
-        same_spice_table(key, name)
-            && matches!(
-                st,
-                status::ComponentStatus::Error(_) | status::ComponentStatus::Disabled
-            )
-    })
+fn table_will_not_become_ready(status: &status::RuntimeStatus, name: &TableReference) -> bool {
+    let terminal = |st: &status::ComponentStatus| {
+        matches!(
+            st,
+            status::ComponentStatus::Error(_) | status::ComponentStatus::Disabled
+        )
+    };
+    spice_table_status_is(status.get_dataset_statuses(), name, terminal)
+        || spice_table_status_is(status.get_view_statuses(), name, terminal)
 }
 
-fn dataset_is_disabled(status: &status::RuntimeStatus, name: &TableReference) -> bool {
-    status.get_dataset_statuses().iter().any(|(key, st)| {
-        same_spice_table(key, name) && matches!(st, status::ComponentStatus::Disabled)
-    })
+fn table_is_disabled(status: &status::RuntimeStatus, name: &TableReference) -> bool {
+    let disabled = |st: &status::ComponentStatus| matches!(st, status::ComponentStatus::Disabled);
+    spice_table_status_is(status.get_dataset_statuses(), name, disabled)
+        || spice_table_status_is(status.get_view_statuses(), name, disabled)
 }
 
 fn warmup_replay_timeout(app: Option<&Arc<App>>) -> Duration {
@@ -2935,6 +2949,92 @@ mod tests {
                 &disabled
             ),
             "Disabled is terminal for warmup the same way Error is"
+        );
+    }
+
+    /// Scheduler accelerated views close `RefreshCompletion` the same way
+    /// datasets do, but readiness is published with `update_view`.
+    #[test]
+    fn scheduler_accelerated_view_ready_settles_warmup() {
+        let completion = RefreshCompletion::new();
+        completion.close();
+        let status = status::RuntimeStatus::new();
+        let name = TableReference::bare("sales_by_region");
+        status.hold_dataset_ready();
+        status.update_view(&name, status::ComponentStatus::Refreshing);
+
+        assert!(
+            !first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &name
+            ),
+            "a scheduler view still Refreshing must not start warmup"
+        );
+
+        status.update_view(&name, status::ComponentStatus::Ready);
+        let view_status = status.get_view_statuses().get(&name).cloned();
+        let dataset_status = status.get_dataset_status(&name);
+        let current_settled = first_full_or_append_refresh_settled_for(
+            RefreshMode::Full,
+            Some(&completion),
+            &status,
+            &name,
+        );
+        eprintln!(
+            "scheduler view warmup: view_status={view_status:?} dataset_status={dataset_status:?} current_settled={current_settled}"
+        );
+        assert_eq!(
+            view_status,
+            Some(status::ComponentStatus::Ready),
+            "readiness for an accelerated view is published under view:*"
+        );
+        assert_eq!(
+            dataset_status, None,
+            "an accelerated view must not require a dataset:* status"
+        );
+        assert!(
+            current_settled,
+            "view Ready with no dataset status must release warmup"
+        );
+
+        let qualified = TableReference::full("spice", "public", "sales_by_region");
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &qualified
+            ),
+            "bare and spice.public names must resolve as the same view"
+        );
+
+        let failed = TableReference::bare("broken_view");
+        status.update_view(
+            &failed,
+            status::ComponentStatus::error_with_message("partition load failed"),
+        );
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &failed
+            ),
+            "a scheduler view that errored will never become Ready; do not hang warmup"
+        );
+
+        let disabled = TableReference::bare("legacy_view");
+        status.update_view(&disabled, status::ComponentStatus::Disabled);
+        assert!(
+            first_full_or_append_refresh_settled_for(
+                RefreshMode::Full,
+                Some(&completion),
+                &status,
+                &disabled
+            ),
+            "a Disabled view is terminal for warmup the same way Error is"
         );
     }
 
