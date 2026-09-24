@@ -23592,6 +23592,10 @@ impl CayenneTableProvider {
                 Arc::new(new_map)
             });
             self.sync_protected_snapshot_lookup_indexes(Some(&new_snapshot_id));
+            // The cached ScanView bakes the protected map: without this bump a
+            // wait-free hit keeps serving the folded inputs, whose indexes the
+            // sync above just released, until the next write.
+            self.notify_scan_input_change();
         }
 
         // The merged-away inputs are now unreferenced by the catalog: RETIRE
@@ -24341,6 +24345,8 @@ impl CayenneTableProvider {
             if clean_prefix_holds {
                 self.prune_deletion_index_at_or_below(prune_cutoff);
             }
+            // As in the subset merge: a cached ScanView still names the folded inputs.
+            self.notify_scan_input_change();
         }
 
         if clean_prefix_holds {
