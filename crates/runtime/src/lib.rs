@@ -775,6 +775,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<crate::model::EvaluateModelStore>> {
+        self.llm_runtime_stores.evaluate_models()
+    }
+
+    #[must_use]
     pub fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
         Arc::clone(&self.rerankers)
     }
