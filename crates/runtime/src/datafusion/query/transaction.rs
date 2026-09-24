@@ -421,7 +421,8 @@ fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReferenc
         LogicalPlan::Dml(dml) => Some(match &dml.op {
             WriteOp::Insert(_) | WriteOp::Update => Ok(dml.table_name.clone()),
             WriteOp::Delete => Err("DELETE"),
-            WriteOp::Ctas | WriteOp::Truncate => Err("this operation"),
+            WriteOp::MergeInto(_) => Err("MERGE"),
+            _ => Err("this operation"),
         }),
         LogicalPlan::Extension(ext) => {
             let dml = ext

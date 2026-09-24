@@ -29,11 +29,11 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::TableReference;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
-use datafusion::common::TableReference;
 
 use crate::utils::{register_test_connectors, wait_until_true};
 

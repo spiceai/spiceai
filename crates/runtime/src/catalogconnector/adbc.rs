@@ -36,9 +36,9 @@ use data_components::adbc_helpers::{
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::common::TableReference;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
@@ -115,7 +115,7 @@ pub enum Error {
     UnableToCreateConnectionPool {
         driver_location: String,
         uri: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        source: datafusion_table_providers::sql::db_connection_pool::adbcpool::Error,
     },
 
     #[snafu(display(
@@ -398,7 +398,9 @@ impl AdbcCatalogProvider {
             tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<String>)>> {
                 let conn = pool
                     .connect_sync()
-                    .map_err(|e| Error::UnableToListSchemas { source: e })?;
+                    .map_err(|e| Error::UnableToListSchemas {
+                        source: Box::new(e),
+                    })?;
 
                 let sync_conn = conn.as_sync().ok_or_else(|| Error::UnableToListSchemas {
                     source: "ADBC connection does not support synchronous operations".into(),

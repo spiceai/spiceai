@@ -21,6 +21,8 @@ datafusion-common.workspace = true
 datafusion-federation.workspace = true
 datafusion-datasource = { workspace = true }
 datafusion-expr.workspace = true
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 datafusion-table-providers.workspace = true
 flight_client = { path = "../flight_client" }
 r2d2 = { optional = true, workspace = true }
@@ -44,6 +46,8 @@ duckdb = [
     "dep:duckdb",
     "dep:r2d2"
 ]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

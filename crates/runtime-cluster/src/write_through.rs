@@ -30,11 +30,12 @@ use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
 use arrow_tools::{ipc, map_entries::MapEntriesNormalizer};
 use datafusion::{
-    common::DFSchema,
+    common::{DFSchema, ResolvedTableReference, TableReference},
     scalar::ScalarValue,
-    sql::{ResolvedTableReference, TableReference},
 };
-use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
+use datafusion_expr::{
+    Expr, execution_props::ExecutionProps, lit, physical_planning_context::PhysicalPlanningContext,
+};
 use futures::{Stream, TryStreamExt as _, stream::BoxStream};
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -732,6 +733,7 @@ async fn route_batch_and_assign_unseen(
                     &combined,
                     &df_schema,
                     &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
                 )
                 .context(CreatePhysicalFilterSnafu {
                     executor_id: executor_id.clone(),
@@ -910,6 +912,7 @@ fn build_partition_physical_exprs(
                 e,
                 &df_schema,
                 &ExecutionProps::new(),
+                &PhysicalPlanningContext::default(),
             )
             .context(ParsePartitionExprSnafu)?;
             Ok((e.clone(), physical))
@@ -974,6 +977,7 @@ fn build_executor_filters(
             &combined,
             &df_schema,
             &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
         )
         .context(CreatePhysicalFilterSnafu {
             executor_id: executor_id.clone(),
@@ -1626,7 +1630,7 @@ mod tests {
     #[tokio::test]
     async fn a_dictionary_message_wearing_the_keepalive_sentinel_is_refused_not_skipped() {
         use arrow::ipc::writer::{
-            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+            DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
         };
 
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
@@ -1654,7 +1658,7 @@ mod tests {
                 &batch,
                 &mut tracker,
                 &options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .expect("encoding a dictionary batch");
         let encoded_dictionary = dictionaries

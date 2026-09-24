@@ -34,10 +34,10 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::{ScanArgs, ScanResult, Session, TableProvider},
-    common::{Constraints, Statistics},
+    common::{Constraints, DFSchemaRef, Statistics},
     datasource::TableType,
     error::Result as DataFusionResult,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
+    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp, dml::MergeIntoClause},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
@@ -251,6 +251,20 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         state: &dyn Session,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         below.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        below
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
     }
 }
 
@@ -573,6 +587,19 @@ impl TableProvider for SpiceTable {
 
     async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.layer.truncate(&self.below, state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.layer
+            .merge_into(&self.below, state, source, merge_schema, on, clauses)
+            .await
     }
 }
 

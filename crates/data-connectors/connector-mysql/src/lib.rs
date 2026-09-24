@@ -27,7 +27,7 @@ use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
-    Error as DbConnectionPoolError, dbconnection,
+    dbconnection::{self, Error as DbConnectionPoolError},
     mysqlpool::{self, MySQLConnectionPool},
 };
 use mysql_async::{Metrics, prelude::Queryable};

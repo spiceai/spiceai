@@ -28,9 +28,9 @@ use crate::{
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
+use ::datafusion::common::ResolvedTableReference;
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
-use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
@@ -43,12 +43,12 @@ use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
 use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
-use ballista_core::{ConfigProducer, RuntimeProducer};
+use ballista_core::{BALLISTA_PROTOCOL_VERSION, ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
 use ballista_scheduler::cluster::{BallistaCluster, ClusterState, JobState};
-use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
+use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig, WorkAvailableReason};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::state::execution_graph::RunningTaskInfo;
@@ -1491,10 +1491,11 @@ pub async fn initialize_cluster_executor(
         grpc_port: 0,
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(concurrent_tasks)),
+                resource: Some(Resource::Vcores(concurrent_tasks)),
             }],
         }),
         os_info: None,
+        ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
     };
 
     // Use advertise address as node_id for metrics
@@ -1956,8 +1957,10 @@ async fn create_scheduler_server(
 
     // Create callback that broadcasts PollNow to all connected executors when work is available.
     let registry_for_callback = executor_stream_registry.clone();
-    let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
-        Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
+    let on_work_available: Arc<dyn Fn(WorkAvailableReason) + Send + Sync> =
+        Arc::new(move |reason: WorkAvailableReason| {
+            registry_for_callback.broadcast_poll_now(&format!("{reason:?}"));
+        });
 
     let registry_for_cancel = executor_stream_registry.clone();
     let on_cancel_tasks: OnCancelTasksFn =
@@ -1983,20 +1986,10 @@ async fn create_scheduler_server(
                         return None;
                     };
 
-                    let Ok(partition_id) = u32::try_from(task.partition_id) else {
-                        tracing::warn!(
-                            executor_id,
-                            partition_id = task.partition_id,
-                            "Skipping cancel task with out-of-range partition_id"
-                        );
-                        return None;
-                    };
-
                     Some(TaskCancelInfo {
                         task_id,
                         job_id: task.job_id.to_string(),
                         stage_id,
-                        partition_id,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2025,7 +2018,7 @@ async fn create_scheduler_server(
             let metadata = cluster_state_for_slots.registered_executor_metadata().await;
             let total: usize = metadata
                 .iter()
-                .map(|m| m.specification.task_slots as usize)
+                .map(|m| m.specification.vcores as usize)
                 .sum();
             let prev = slots_counter.swap(total, Ordering::Relaxed);
             if total != prev {

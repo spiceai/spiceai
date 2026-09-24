@@ -30,7 +30,8 @@ use datafusion::{
     logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp},
     physical_expr::{OrderingRequirements, PhysicalSortExpr},
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
+        ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution,
+        ExecutionPlan, PhysicalExpr, PlanProperties, ReplaceChildrenOptions, StatisticsArgs,
         collect,
         empty::EmptyExec,
         execution_plan::{CardinalityEffect, InvariantLevel},
@@ -524,6 +525,19 @@ impl TableProvider for PartitionTableProvider {
         ))
     }
 
+    async fn merge_into(
+        &self,
+        _state: &dyn Session,
+        _source: Arc<dyn ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "PartitionTableProvider does not support MERGE INTO".to_string(),
+        ))
+    }
+
     async fn insert_into(
         &self,
         _state: &dyn Session,
@@ -760,6 +774,22 @@ impl ExecutionPlan for PartitionedUnionExec {
         "PartitionedUnionExec"
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+            DataFusionError,
+        >,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion, DataFusionError> {
+        self.inner_union.apply_expressions(f)
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.inner_union.dynamic_expressions_produced()
+    }
+
     fn static_name() -> &'static str
     where
         Self: Sized,
@@ -779,8 +809,18 @@ impl ExecutionPlan for PartitionedUnionExec {
         self.inner_union.check_invariants(check)
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; input_distribution_requirements is the modern path"
+    )]
     fn required_input_distribution(&self) -> Vec<Distribution> {
         self.inner_union.required_input_distribution()
+    }
+
+    fn input_distribution_requirements(
+        &self,
+    ) -> datafusion::physical_plan::InputDistributionRequirements {
+        self.inner_union.input_distribution_requirements()
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -799,9 +839,10 @@ impl ExecutionPlan for PartitionedUnionExec {
         self.inner_union.children()
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         if children.is_empty() {
             return Err(DataFusionError::Plan(
@@ -812,9 +853,33 @@ impl ExecutionPlan for PartitionedUnionExec {
         Ok(Arc::new(PartitionedUnionExec::try_new(children)?))
     }
 
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.with_new_children(children)
+    }
+
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )
     }
 
     fn repartitioned(
@@ -837,11 +902,35 @@ impl ExecutionPlan for PartitionedUnionExec {
         self.inner_union.metrics()
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; statistics_from_inputs is the modern path"
+    )]
     fn partition_statistics(
         &self,
         partition: Option<usize>,
     ) -> Result<Arc<Statistics>, DataFusionError> {
         self.inner_union.partition_statistics(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>, DataFusionError> {
+        self.inner_union.statistics_from_inputs(input_stats, args)
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.inner_union.child_stats_requests(partition)
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>, DataFusionError> {
+        Ok(None)
     }
 
     fn supports_limit_pushdown(&self) -> bool {

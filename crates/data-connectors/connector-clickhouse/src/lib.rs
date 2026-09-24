@@ -37,7 +37,7 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use datafusion::datasource::TableProvider;
-use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::Error as DbConnectionPoolError;
 use factory::ClickhouseTableFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use pool::ClickhouseConnectionPool;

@@ -48,12 +48,12 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::TableReference;
 use datafusion::common::{Constraints, ToDFSchema};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::common::TableReference;
 use datafusion_table_providers::util::test::MockExec;
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
@@ -157,7 +157,7 @@ fn create_cmd(name: &str, schema: SchemaRef) -> datafusion::logical_expr::Create
     datafusion::logical_expr::CreateExternalTable {
         schema: df_schema,
         name: TableReference::bare(name),
-        location: String::new(),
+        locations: vec![String::new()],
         file_type: String::new(),
         table_partition_cols: vec![],
         if_not_exists: true,

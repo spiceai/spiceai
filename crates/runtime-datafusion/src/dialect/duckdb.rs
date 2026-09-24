@@ -851,13 +851,14 @@ mod tests {
     use arrow::array::{FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field};
     use datafusion::{
+        common::TableReference,
         common::{Column, Spans},
         functions::regex::expr_fn::regexp_count,
         functions_nested::make_array::make_array_udf,
         logical_expr::expr::ScalarFunction,
         prelude::{Expr, col, lit},
         scalar::ScalarValue,
-        sql::{TableReference, unparser::Unparser},
+        sql::unparser::Unparser,
     };
 
     use crate::dialect::new_duckdb_dialect;

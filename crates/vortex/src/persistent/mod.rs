@@ -746,21 +746,25 @@ mod tests {
     /// second path.
     #[test]
     fn test_date_to_timestamp_extension_cast() -> anyhow::Result<()> {
-        use datafusion::arrow::array::{Array as _, AsArray as _, Date32Array};
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{Array as _, ArrayRef, AsArray as _, Date32Array};
         use datafusion::arrow::datatypes::{DataType, Field, TimeUnit, TimestampMillisecondType};
-        use vortex::array::ArrayRef as VortexArrayRef;
         use vortex::array::VortexSessionExecute;
         use vortex::array::builtins::ArrayBuiltins;
-        use vortex::arrow::{ArrowSessionExt, FromArrowArray, FromArrowType};
-        use vortex::dtype::{DType, Nullability};
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::dtype::Nullability;
 
         // 1970-01-01, 2024-01-15, and a NULL, so the cast has to carry validity as
         // well as values.
-        let dates = Date32Array::from(vec![Some(0), Some(19_737), None]);
-        let source = VortexArrayRef::from_arrow(&dates, true)?;
+        let session = VortexSession::default();
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![Some(0), Some(19_737), None]));
+        let source = session.arrow().from_arrow_array(dates, true)?;
 
         let millis = DataType::Timestamp(TimeUnit::Millisecond, None);
-        let target = DType::from_arrow((&millis, Nullability::Nullable));
+        let target = session
+            .arrow()
+            .from_arrow_datatype(&millis, Nullability::Nullable)?;
         let cast = source.cast(target.clone())?;
         assert_eq!(
             cast.dtype(),
@@ -771,7 +775,6 @@ mod tests {
         // Read the values back rather than stopping at the type: a cast that lands
         // on `vortex.timestamp` and puts the wrong instants in it is the failure
         // this guard is for, and it would pass a type-and-length assertion.
-        let session = VortexSession::default();
         let arrow = session.arrow().execute_arrow(
             cast,
             Some(&Field::new("event_ts", millis, true)),
@@ -884,23 +887,24 @@ mod tests {
     #[tokio::test]
     async fn a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file()
     -> anyhow::Result<()> {
-        use datafusion::arrow::array::Date64Array;
-        use vortex::array::ArrayRef as VortexArrayRef;
-        use vortex::arrow::FromArrowArray;
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{ArrayRef, Date64Array};
+        use vortex::arrow::ArrowSessionExt;
 
         let ctx = TestSessionContext::default();
         let session = VortexSession::default();
 
         // 1999-12-31, 2024-01-15, NULL, 2024-03-01 as milliseconds since the epoch.
-        let dates = Date64Array::from(vec![
+        let dates: ArrayRef = Arc::new(Date64Array::from(vec![
             Some(946_598_400_000i64),
             Some(1_705_276_800_000),
             None,
             Some(1_709_251_200_000),
-        ]);
+        ]));
         let events = StructArray::try_new(
             ["event_date"].into(),
-            vec![VortexArrayRef::from_arrow(&dates, true)?],
+            vec![session.arrow().from_arrow_array(dates, true)?],
             4,
             Validity::NonNullable,
         )?;

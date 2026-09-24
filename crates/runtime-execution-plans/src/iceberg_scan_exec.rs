@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Result, Statistics, TableReference};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
@@ -274,8 +275,18 @@ impl ExecutionPlan for IcebergScanExec {
         check_default_invariants(self, check)
     }
 
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![]
+    }
+
+    fn input_distribution_requirements(
+        &self,
+    ) -> datafusion::physical_plan::InputDistributionRequirements {
+        datafusion::physical_plan::InputDistributionRequirements::new(vec![])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -296,9 +307,10 @@ impl ExecutionPlan for IcebergScanExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.is_empty() {
             Ok(self)
@@ -309,8 +321,38 @@ impl ExecutionPlan for IcebergScanExec {
         }
     }
 
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_new_children(children)
+    }
+
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn repartitioned(
@@ -372,11 +414,50 @@ impl ExecutionPlan for IcebergScanExec {
         }
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; statistics_from_inputs is the modern path"
+    )]
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         match &self.source {
             ScanSource::Planned(inner) => inner.partition_statistics(partition),
             ScanSource::Deferred { .. } => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
         }
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        match &self.source {
+            // `inner` is deliberately hidden from `children()` (see the module
+            // docs), so it is never visited by the generic tree walk that feeds
+            // `input_stats` — compute its statistics directly instead.
+            ScanSource::Planned(inner) => datafusion::physical_plan::StatisticsContext::new()
+                .compute(
+                    &**inner,
+                    &datafusion::physical_plan::StatisticsArgs::new()
+                        .with_partition(args.partition()),
+                ),
+            ScanSource::Deferred { .. } => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
+        }
+    }
+
+    fn child_stats_requests(
+        &self,
+        _partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        // Leaf node: no children to request statistics from.
+        Vec::new()
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 
     fn supports_limit_pushdown(&self) -> bool {

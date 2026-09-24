@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::DFSchema;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::sql::parser::{DFParser, Statement};
+use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{Delete, Expr as SQLExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::common::{TableReference};
-use datafusion::sql::sqlparser;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 use tokio::runtime::Handle;

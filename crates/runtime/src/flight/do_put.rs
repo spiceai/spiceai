@@ -28,8 +28,8 @@ use arrow_tools::ipc::{declares_ipc_data, declares_record_batch};
 use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::schema::verify_schema;
 use datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    common::TableReference, error::DataFusionError, execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use opentelemetry::{KeyValue, Value};
 use prost::Message as _;

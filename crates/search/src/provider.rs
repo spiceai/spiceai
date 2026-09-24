@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, Constraint, Constraints, DFSchemaRef, JoinType},
+    common::{Column, Constraint, Constraints, DFSchemaRef, JoinType, TableReference},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
@@ -29,7 +29,6 @@ use datafusion::{
     },
     physical_plan::ExecutionPlan,
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
-    sql::TableReference,
 };
 use datafusion_expr::select_expr::SelectExpr;
 use futures::future::BoxFuture;

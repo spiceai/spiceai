@@ -202,7 +202,6 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::catalog::MemTable;
-    use datafusion::execution::context::SessionState;
     use datafusion::logical_expr::{
         ColumnarValue, Extension, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
         builder::LogicalTableSource, create_udf, expr::ScalarFunction,
@@ -267,7 +266,8 @@ mod tests {
         async fn plan_federation(
             &self,
             _node: &FederatedPlanNode,
-            _session_state: &SessionState,
+            _session: &dyn datafusion::catalog::Session,
+            _planning_ctx: &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             unreachable!("logical rewrite tests never physically plan the federated node")
         }

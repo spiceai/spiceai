@@ -33,9 +33,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use datafusion::catalog::TableFunctionImpl;
+use datafusion::common::TableReference;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::sql::{
-    TableReference,
     parser::{self, DFParser},
     sqlparser::{ast, dialect::PostgreSqlDialect},
 };

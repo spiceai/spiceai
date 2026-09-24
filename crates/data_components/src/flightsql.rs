@@ -43,6 +43,7 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
     common::Statistics,
+    common::TableReference,
     common::utils::quote_identifier,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -57,7 +58,6 @@ use datafusion::{
         project_schema,
         stream::RecordBatchStreamAdapter,
     },
-    sql::TableReference,
 };
 use runtime_request_context::RequestContext;
 use tonic::codegen::Bytes;
@@ -804,6 +804,17 @@ impl ExecutionPlan for FlightSqlExec {
         "FlightSqlExec"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
@@ -1154,8 +1165,8 @@ mod tests {
     };
     use bytes::Bytes;
     use datafusion::{
-        execution::TaskContext, physical_expr::PhysicalSortExpr, physical_plan::ExecutionPlan,
-        sql::TableReference,
+        common::TableReference, execution::TaskContext, physical_expr::PhysicalSortExpr,
+        physical_plan::ExecutionPlan,
     };
     use flight_client::cookie::{CookieService, CookieStore};
     use futures::{StreamExt, TryStreamExt};
@@ -1538,6 +1549,7 @@ mod tests {
     async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
         use datafusion::catalog::TableProvider;
         use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
         use datafusion::prelude::{SessionContext, col, lit};
 
         let table = stamped_table();
@@ -1548,8 +1560,8 @@ mod tests {
             .scan(&session, None, &[], None)
             .await
             .expect("unfiltered scan should build");
-        let unfiltered = plan
-            .partition_statistics(None)
+        let unfiltered = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             unfiltered.num_rows,
@@ -1564,8 +1576,8 @@ mod tests {
             .scan(&session, None, std::slice::from_ref(&filter), None)
             .await
             .expect("filtered scan should build");
-        let filtered = plan
-            .partition_statistics(None)
+        let filtered = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             filtered.num_rows,
@@ -1588,6 +1600,7 @@ mod tests {
     async fn scan_marks_stamped_statistics_inexact_when_limit_pushed() {
         use datafusion::catalog::TableProvider;
         use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
         use datafusion::prelude::SessionContext;
 
         let table = stamped_table();
@@ -1597,8 +1610,8 @@ mod tests {
             .scan(&session, None, &[], Some(10))
             .await
             .expect("limited scan should build");
-        let limited = plan
-            .partition_statistics(None)
+        let limited = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             limited.num_rows,
@@ -1620,13 +1633,15 @@ mod tests {
     #[tokio::test]
     async fn with_fetch_marks_stamped_statistics_inexact() {
         use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 
         let exec = build_exec(lazy_client(), Arc::new(CookieStore::new()))
             .with_statistics(stamped_statistics());
 
         // No limit anywhere: the scan returns the whole stamped slice.
         assert_eq!(
-            exec.partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&exec, &StatisticsArgs::new())
                 .expect("statistics should be available")
                 .num_rows,
             Precision::Exact(150_000),
@@ -1636,8 +1651,8 @@ mod tests {
         let limited = exec
             .with_fetch(Some(10))
             .expect("with_fetch should produce a plan");
-        let stats = limited
-            .partition_statistics(None)
+        let stats = StatisticsContext::new()
+            .compute(&*limited, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             stats.num_rows,
@@ -1655,8 +1670,8 @@ mod tests {
             .with_fetch(None)
             .expect("with_fetch should produce a plan");
         assert_eq!(
-            unchanged
-                .partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&*unchanged, &StatisticsArgs::new())
                 .expect("statistics should be available")
                 .num_rows,
             Precision::Exact(150_000),

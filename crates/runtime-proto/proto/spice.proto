@@ -225,11 +225,12 @@ message CancelTasksCommand {
 }
 
 // Identifies a single running task that should be cancelled.
+// (job_id, stage_id, task_id) is globally unique, matching Ballista's own
+// task identity (`RunningTaskInfo`).
 message TaskCancelInfo {
     uint32 task_id = 1;
     string job_id = 2;
     uint32 stage_id = 3;
-    uint32 partition_id = 4;
 }
 
 // Command sent from scheduler to executor to refresh a specific dataset.

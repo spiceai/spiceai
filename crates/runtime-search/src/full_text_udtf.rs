@@ -653,10 +653,10 @@ mod tests {
     use super::{TextSearchTableFunc, TextSearchTableFuncArgs, suggest_column};
     use crate::table_provider_explorer::TableProviderExplorer;
     use datafusion::common::Column;
+    use datafusion::common::TableReference;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
-    use datafusion::common::TableReference;
     use spice_table::Index;
     use std::collections::BTreeMap;
     use std::sync::Arc;

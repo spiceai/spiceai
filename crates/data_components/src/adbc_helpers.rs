@@ -22,8 +22,8 @@ limitations under the License.
 
 use adbc_core::options::OptionDatabase;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
-use datafusion::datasource::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;

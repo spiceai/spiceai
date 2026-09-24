@@ -31,8 +31,8 @@ use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use datafusion::datasource::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;

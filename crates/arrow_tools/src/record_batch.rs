@@ -939,8 +939,11 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
     } else {
         let data = source.to_data();
         let mut compacted = MutableArrayData::new(vec![&data], false, source.len());
-        compacted.extend(0, 0, source.len());
-        make_array(compacted.freeze())
+        match compacted.try_extend(0, 0, source.len()) {
+            Ok(()) => make_array(compacted.freeze()),
+            // Leave the column alone rather than return a partial copy.
+            Err(_) => return Arc::clone(column),
+        }
     };
 
     // A container's view children come out of that copy still selecting from

@@ -36,7 +36,7 @@ use anyhow::ensure;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use datafusion::{assert_batches_eq, sql::TableReference};
+use datafusion::{assert_batches_eq, common::TableReference};
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};

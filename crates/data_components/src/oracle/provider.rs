@@ -26,9 +26,9 @@ use std::sync::{Arc, RwLock};
 use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::common::TableReference;
 use snafu::prelude::*;
 
 use super::OracleTableProvider;

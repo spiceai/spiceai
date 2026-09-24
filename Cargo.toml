@@ -178,9 +178,9 @@ large_futures = "allow"
 too_many_lines = "allow"
 
 [workspace.dependencies]
-adbc_core = "0.23"
-adbc_driver_manager = "0.23"
-adbc_ffi = "0.23"
+adbc_core = "0.24"
+adbc_driver_manager = "0.24"
+adbc_ffi = "0.24"
 ahash = "0.8.12"
 anyhow = "1.0.103"
 async-channel = "1.9"
@@ -193,11 +193,10 @@ arrow-csv = "59.2.0"
 arrow-flight = "59.2.0"
 arrow-ipc = "59.2.0"
 arrow-json = "59.2.0"
-# TODO(datafusion-55): arrow-odbc 22 caps its own arrow dependency at "<59"
-# (see the comment this replaced) - it will not resolve against Arrow 59.2.0
-# without a newer arrow-odbc release. Check crates.io/upstream for a version
-# that raises the cap before this can build with the `odbc` feature enabled.
-arrow-odbc = "22"
+# Bumped from 22 (capped arrow at "<59") to 25, which accepts arrow >=29, <60
+# per the DataFusion 55 upgrade plan (matches the precedent from the DF53/
+# Arrow 58 upgrade, spiceai/spiceai#11118).
+arrow-odbc = "25"
 arrow-row = "59.2.0"
 arrow-schema = "59.2.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "6bda5533dd118afcf80aa6f5ef59ad35277627a7", features = [
@@ -231,10 +230,14 @@ aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
-# TODO(datafusion-55): pending spiceai/datafusion-ballista spiceai-55 rev (agent: datafusion-ballista)
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0" } # branch: spiceai-54 (merged PR #64)
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0" }
+# LOCAL ONLY: branch spiceai-55 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/datafusion-ballista.git", rev = "dc44e9b9c568fff3acee14ea45bed92cc548b52a"` # branch: spiceai-55
+# once pushed. Based on upstream's "Merge upstream (DataFusion 55) into spiceai-55";
+# datafusion/datafusion-proto/etc. deps are plain crates.io semver in ballista's own
+# workspace Cargo.toml, so the datafusion [patch.crates-io] path override below covers it.
+ballista-core = { path = "/Users/viktor/workspace/df55-prep/datafusion-ballista/ballista/core" }
+ballista-executor = { path = "/Users/viktor/workspace/df55-prep/datafusion-ballista/ballista/executor" }
+ballista-scheduler = { path = "/Users/viktor/workspace/df55-prep/datafusion-ballista/ballista/scheduler" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -269,18 +272,25 @@ datafusion-expr = "55.1.0"
 # LOCAL ONLY: branch spiceai-55 not pushed yet. Replace with
 # `git = "https://github.com/spiceai/datafusion-federation.git", rev = "df9f43a"` # branch: spiceai-55
 # once pushed.
-datafusion-federation = { path = "/Users/viktor/workspace/datafusion-federation-2/datafusion-federation", features = ["sql"] }
+datafusion-federation = { path = "/Users/viktor/workspace/df55-prep/datafusion-federation-spiceai-55/datafusion-federation", features = ["sql"] }
 datafusion-functions = "55.1.0"
 datafusion-functions-aggregate = "55.1.0"
 datafusion-functions-aggregate-common = "55.1.0"
 datafusion-functions-nested = "55.1.0"
-datafusion-functions-json = { git = "https://github.com/spiceai/datafusion-functions-json.git", rev = "ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc" } # branch: spiceai-54
+# Fork dropped for the DF55 bump: upstream's v0.55.3 tag contains all three
+# Spice-relevant fixes from the spiceai-54 fork (ca9d4c6 #125, 774c570 #124,
+# 2d7a86f #121; confirmed ancestors via `git merge-base --is-ancestor`), so
+# there's nothing left to carry and the fork's own "54"-only version
+# requirement on datafusion was the source of a duplicate-major-version
+# resolution (datafusion@54.1.0 alongside our patched 55.1.0).
+datafusion-functions-json = "0.55.3"
 datafusion-physical-expr = "55.1.0"
 datafusion-physical-expr-adapter = "55.1.0"
 datafusion-physical-expr-common = "55.1.0"
 datafusion-physical-plan = "55.1.0"
 datafusion-proto = { version = "55.1.0", features = ["json"] }
 datafusion-proto-common = "55.1.0"
+datafusion-proto-models = "55.1.0"
 datafusion-pruning = "55.1.0"
 datafusion-spark = "55.1.0"
 datafusion-substrait = "55.1.0"
@@ -326,7 +336,12 @@ iceberg-catalog-glue = "=0.10.1"
 iceberg-catalog-rest = "=0.10.1"
 iceberg-datafusion = "=0.10.1"
 iceberg-storage-opendal = { version = "=0.10.1", features = ["opendal-s3", "opendal-gcs", "opendal-fs"] }
-iceberg_test_utils = "=0.10.1"
+# Direct path, not a version + [patch.crates-io] entry like its siblings above:
+# iceberg_test_utils has never been published to crates.io at any version, so
+# `[patch.crates-io]` has no existing registry entry to hang a substitution on
+# and cargo metadata/tree fails outright with "no matching package named
+# iceberg_test_utils found" instead of falling back to the patch.
+iceberg_test_utils = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/test_utils" }
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
@@ -341,7 +356,7 @@ loom = "0.7"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.5.2", features = ["openssl-tls"] }
-mysql_async = { version = "0.36.2", features = ["native-tls-tls", "chrono", "binlog"] }
+mysql_async = { version = "0.37", features = ["native-tls-tls", "chrono", "binlog"] }
 nix = "0.30"
 num_cpus = "1.16"
 object_store = { version = "0.13.1", features = [
@@ -350,11 +365,11 @@ object_store = { version = "0.13.1", features = [
     "azure",
     "http",
 ] }
-odbc-api = { version = "20" }
+odbc-api = { version = "29" }
 opendal = { version = "0.57", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
 # orc-rust 0.8.0 is the first release on Arrow ^58.0, matching the workspace Arrow 58 pin.
 # Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
-orc-rust = { version = "0.8.0", default-features = false, features = ["async"] }
+orc-rust = { version = "0.9.0", default-features = false, features = ["async"] }
 opentelemetry = { version = "0.32", default-features = false, features = [
     "metrics",
     "trace",
@@ -424,15 +439,21 @@ runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 # TODO(datafusion-55): pending spiceai/snowflake-rs spiceai-59 rev (agent: arrow-only-forks-bundle)
 # LOCAL ONLY: branch spiceai-59 not pushed yet. Replace with
-# `git = "https://github.com/spiceai/snowflake-rs.git", rev = "ed4b017"` # branch: spiceai-59
-# once pushed.
+# `git = "https://github.com/spiceai/snowflake-rs.git", rev = "7f6a41ff95d28244e25f5d1bbf18ee7c86fe725a"` # branch: spiceai-59
+# once pushed. Also pins object_store back to 0.13.2 (was 0.14, a duplicate
+# alongside the workspace's own object_store 0.13.2).
 snowflake-api = { path = "/Users/viktor/workspace/df55-prep/snowflake-rs/snowflake-api" }
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "4624f1ec96c519d0bde4fee8c4e75b0498a2181d", features = ["client", "server"] }
+# LOCAL ONLY: rev 4624f1ec pinned above has arrow capped at <59 (a
+# arrow-schema duplicate against this workspace's own 59.2.0). Replace with
+# a pushed spicebench rev once the Arrow 59 bump below is on origin; for now
+# point at the local prep clone, which carries that bump as an uncommitted-
+# to-origin local commit (see spicebench's own git log).
+system-adapter-protocol = { path = "/Users/viktor/workspace/df55-prep/spicebench/crates/system-adapter-protocol", features = ["client", "server"] }
 tantivy = "0.26.0"
 tempfile = "3"
 tiberius = { git = "https://github.com/spiceai/tiberius", rev = "9ae93c65222b51b0579945ffce5cba053cb23cca", default-features = false, features = [
@@ -554,9 +575,15 @@ lto = "off"
 # call it exists to interrupt, so a cancel cannot reach a running query. Spice
 # needs it to, or an abandoned query holds its pooled connection until the
 # remote query finishes on its own.
-adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "34a465e97fb529075f953adf40bc2e02de755bec" } # branch: spiceai (fork PR #4)
-adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "34a465e97fb529075f953adf40bc2e02de755bec" }
-adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "34a465e97fb529075f953adf40bc2e02de755bec" }
+# LOCAL ONLY: branch spiceai-maint-24 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/arrow-adbc.git", rev = "fe5f49581968880c664a1466f234fec2301ca7bf"` # branch: spiceai-maint-24
+# once pushed. Re-cut from upstream/maint-24 (adbc_core 0.24.0, arrow range
+# already `>=58, <60` upstream - no bump needed there). Cherry-picked the
+# cancel-during-execute patch (fork PR #4) cleanly, no conflicts; dropped the
+# old "require arrow 58" commit since upstream's own range already covers 59.
+adbc_core = { path = "/Users/viktor/workspace/df55-prep/arrow-adbc/rust/core" }
+adbc_driver_manager = { path = "/Users/viktor/workspace/df55-prep/arrow-adbc/rust/driver_manager" }
+adbc_ffi = { path = "/Users/viktor/workspace/df55-prep/arrow-adbc/rust/ffi" }
 # LOCAL ONLY: branch spiceai-55 not pushed yet. Replace every entry
 # below with `git = "https://github.com/spiceai/datafusion.git", rev = "6b0459891"` # branch: spiceai-55
 # once pushed (full workspace check clean; 607+195+213+58+102+18 tests pass
@@ -591,6 +618,7 @@ datafusion-physical-optimizer = { path = "/Users/viktor/workspace/df55-prep/data
 datafusion-physical-plan = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/physical-plan" }
 datafusion-proto = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/proto" }
 datafusion-proto-common = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/proto-common" }
+datafusion-proto-models = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/proto-models" }
 datafusion-pruning = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/pruning" }
 datafusion-session = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/session" }
 datafusion-spark = { path = "/Users/viktor/workspace/df55-prep/datafusion/datafusion/spark" }
@@ -622,11 +650,18 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 delta_kernel = { path = "/Users/viktor/workspace/df55-prep/delta-kernel-rs/kernel" }
 delta_kernel_default_engine = { path = "/Users/viktor/workspace/df55-prep/delta-kernel-rs/default-engine" }
 
+# The [workspace.dependencies] entry above for datafusion-federation is a
+# direct path, which covers Spice's own crates but does nothing for a
+# third-party crate that pulls datafusion-federation via its own crates.io
+# version requirement - datafusion-table-providers-adbc's own Cargo.toml
+# does exactly that (`datafusion-federation = "0.5"`), which was resolving
+# to a real crates.io 0.5.7 release alongside our patched 0.4.2 until this
+# entry was added. Same local checkout as the path override above.
+datafusion-federation = { path = "/Users/viktor/workspace/df55-prep/datafusion-federation-spiceai-55/datafusion-federation" }
+
 # LOCAL ONLY: branch spiceai-1.4.4-arrow59 not pushed yet. Replace with
 # `git = "https://github.com/spiceai/duckdb-rs.git", rev = "875974763e847eb4dc4e071f875f5bbecdd63b47"` # branch: spiceai-1.4.4-arrow59
-# once pushed. Must still match whatever rev datafusion-table-providers pins
-# for duckdb once that fork's own DF55 prep lands, or cargo resolves two
-# copies of duckdb - reconcile then.
+# once pushed.
 duckdb = { path = "/Users/viktor/workspace/df55-prep/duckdb-rs/crates/duckdb" }
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
@@ -643,7 +678,6 @@ iceberg-catalog-glue = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/
 iceberg-catalog-rest = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/catalog/rest" }
 iceberg-datafusion = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/integrations/datafusion" }
 iceberg-storage-opendal = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/storage/opendal" }
-iceberg_test_utils = { path = "/Users/viktor/workspace/df55-prep/iceberg-rust/crates/test_utils" }
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
@@ -680,3 +714,24 @@ vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-scan" }
 vortex-session = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-session" }
 vortex-utils = { path = "/Users/viktor/workspace/df55-prep/vortex-spiceai-55/vortex-utils" }
+
+# `[patch]` tables in a dependency's own manifest are not honored once that
+# dependency is reached as a non-member path dependency of this workspace -
+# only the top-level workspace's own `[patch]` sections apply to the whole
+# resolved graph. datafusion-table-providers' own Cargo.toml already has a
+# `[patch."https://github.com/spiceai/duckdb-rs.git"]` pointing at this same
+# local checkout, but it's inert from here, which is why `cargo tree -d`
+# still showed two copies of duckdb (this rev's local path, and the old
+# 76655d2f git rev) until this section was added. Mirrors the crates.io
+# duckdb patch above; both must move together.
+#
+# NOTE: this table must stay the LAST thing in the file (or otherwise be
+# followed by nothing meant for [patch.crates-io]) - TOML tables run until
+# the next `[header]`, so anything placed after this line would silently
+# apply here instead of to crates-io. (Learned the hard way: an earlier
+# version of this edit inserted this table in the middle of
+# [patch.crates-io], which silently reassigned every entry below it -
+# iceberg-*, arrow-*, vortex-*, spiceai, ballista - to this table instead,
+# and cargo fell back to unpatched crates.io releases for all of them.)
+[patch."https://github.com/spiceai/duckdb-rs.git"]
+duckdb = { path = "/Users/viktor/workspace/df55-prep/duckdb-rs/crates/duckdb" }

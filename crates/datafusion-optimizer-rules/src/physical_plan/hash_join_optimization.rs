@@ -26,7 +26,9 @@ use datafusion::{
     config::ConfigOptions,
     error::DataFusionError,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{ExecutionPlan, empty::EmptyExec, joins::HashJoinExec},
+    physical_plan::{
+        ExecutionPlan, StatisticsArgs, StatisticsContext, empty::EmptyExec, joins::HashJoinExec,
+    },
 };
 use datafusion_expr::JoinType;
 
@@ -94,7 +96,7 @@ impl PhysicalOptimizerRule for EmptyHashJoinExecPhysicalOptimization {
 }
 
 fn guaranteed_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let Ok(stats) = plan.partition_statistics(None) else {
+    let Ok(stats) = StatisticsContext::new().compute(&**plan, &StatisticsArgs::new()) else {
         return false;
     };
     match stats.num_rows {

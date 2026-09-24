@@ -36,10 +36,11 @@ use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};
 use datafusion::catalog::CatalogProviderList;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::utils::quote_identifier;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -246,6 +247,12 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn execute(
@@ -515,6 +522,12 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
 
     fn execute(
         &self,
@@ -653,6 +666,12 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
 
     fn execute(
         &self,
@@ -779,6 +798,13 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
             input,
         )))
     }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn execute(
         &self,
         _partition: usize,
@@ -877,6 +903,12 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
             self.assignments_sql.clone(),
             input,
         )))
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
     fn execute(
         &self,
@@ -987,6 +1019,12 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
             self.io_runtime.clone(),
             input,
         )))
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
     fn execute(
         &self,
@@ -1156,6 +1194,12 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
             ));
         }
         Ok(self)
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
     fn execute(
         &self,

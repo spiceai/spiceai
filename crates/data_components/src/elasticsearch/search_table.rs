@@ -154,6 +154,17 @@ impl DisplayAs for ElasticsearchKnnExec {
 }
 
 impl ExecutionPlan for ElasticsearchKnnExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "ElasticsearchKnnExec"
     }
@@ -387,6 +398,17 @@ impl DisplayAs for ElasticsearchTextSearchExec {
 }
 
 impl ExecutionPlan for ElasticsearchTextSearchExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "ElasticsearchTextSearchExec"
     }

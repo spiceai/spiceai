@@ -300,6 +300,7 @@ mod tests {
         Decimal128Array, Float64Array, RecordBatch, StringViewArray, UInt64Array,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::TableReference;
     use datafusion::config::ConfigOptions;
     use datafusion::execution::TaskContext;
     use datafusion::functions_aggregate::average::avg_udaf;
@@ -318,7 +319,6 @@ mod tests {
         SendableRecordBatchStream, collect,
     };
     use datafusion::scalar::ScalarValue;
-    use datafusion::common::TableReference;
     use datafusion_datasource::memory::MemorySourceConfig;
     use flight_client::cookie::CookieStore;
     use std::fmt;
@@ -488,7 +488,12 @@ mod tests {
             .into_iter()
             .map(|c| replace_pushdown_with_memory(Arc::clone(c), data))
             .collect::<Result<_>>()?;
-        plan.with_new_children(new_children)
+        plan.replace_children(
+            new_children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
     }
 
     fn plan_display(plan: &Arc<dyn ExecutionPlan>) -> String {
@@ -980,6 +985,16 @@ mod tests {
     }
 
     impl ExecutionPlan for MockNonFlightExec {
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            )
+                -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn name(&self) -> &'static str {
             "MockNonFlightExec"
         }

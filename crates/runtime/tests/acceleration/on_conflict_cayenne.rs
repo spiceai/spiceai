@@ -27,8 +27,8 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::{
-    assert_batches_eq, datasource::TableProvider, physical_plan::collect, prelude::*,
-    sql::TableReference,
+    assert_batches_eq, common::TableReference, datasource::TableProvider, physical_plan::collect,
+    prelude::*,
 };
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated::AcceleratedTable};

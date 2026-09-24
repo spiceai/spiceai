@@ -19,10 +19,9 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use datafusion::{
-    common::{DFSchema, Statistics},
+    common::{DFSchema, Statistics, TableReference},
     error::DataFusionError,
     prelude::SessionContext,
-    sql::TableReference,
 };
 use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;

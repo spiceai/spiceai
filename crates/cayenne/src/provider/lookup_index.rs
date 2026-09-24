@@ -870,6 +870,10 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
             .counters
             .access_plans_attached
             .fetch_add(1, Ordering::Relaxed);
+        // `candidates`/`positions` are already sorted ascending — `selection_keeps`
+        // above relies on that same invariant for its `binary_search` calls.
+        let positions =
+            vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(positions).ok()?;
         Some(Arc::new(
             VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions)),
         ))
@@ -2434,14 +2438,18 @@ async fn read_back(
 
         let vxf = session
             .open_options()
-            .open_object_store(store, &file.path)
+            .open_object_store(store, file.path.as_str().into())
             .await
             .map_err(|e| format!("open {}: {e}", file.path))?;
 
+        let bound_projection = projection
+            .clone()
+            .bind(vxf.dtype())
+            .map_err(|e| format!("bind projection {}: {e}", file.path))?;
         let mut stream = vxf
             .scan()
             .map_err(|e| format!("scan {}: {e}", file.path))?
-            .with_projection(projection.clone())
+            .with_projection(bound_projection)
             .into_stream()
             .map_err(|e| format!("stream {}: {e}", file.path))?;
 
@@ -2543,7 +2551,12 @@ mod tests {
             .filter(|&p| selection_keeps(&exclude, p))
             .collect();
         assert_eq!(kept, vec![1, 5]);
-        let include = Selection::IncludeByIndex(Buffer::from_iter([5u64, 9]));
+        let include = Selection::IncludeByIndex(
+            vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(Buffer::from_iter([
+                5u64, 9,
+            ]))
+            .expect("sorted, unique test buffer"),
+        );
         assert!(selection_keeps(&include, 9));
         assert!(!selection_keeps(&include, 1));
         assert!(selection_keeps(&Selection::All, 1));

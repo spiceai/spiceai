@@ -23,9 +23,9 @@ use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, i256};
 use async_trait::async_trait;
 use datafusion::{
+    common::TableReference,
     datasource::TableProvider,
     sql::{
-        TableReference,
         sqlparser::{
             dialect::GenericDialect,
             parser::{Parser, ParserError},

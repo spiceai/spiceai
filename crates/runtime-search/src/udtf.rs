@@ -28,11 +28,11 @@ use itertools::Itertools;
 use spicepod::component::embeddings::EmbeddingAggregation;
 
 use datafusion::common::Column;
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::expr::{FieldMetadata, ScalarFunction};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use datafusion::common::TableReference;
 
 // ---------------------------------------------------------------------------
 // Shared utility

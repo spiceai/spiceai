@@ -8,7 +8,7 @@ use vortex::array::MaskFuture;
 use vortex::dtype::DType;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexResult;
-use vortex::expr::Expression;
+use vortex::expr::BoundExpression;
 use vortex::layout::ArrayFuture;
 use vortex::layout::LayoutReader;
 use vortex::layout::RowSplits;
@@ -75,7 +75,7 @@ impl LayoutReader for DeferredProjectionReader {
     fn pruning_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
         self.inner.pruning_evaluation(row_range, expr, mask)
@@ -84,7 +84,7 @@ impl LayoutReader for DeferredProjectionReader {
     fn filter_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
         self.inner.filter_evaluation(row_range, expr, mask)
@@ -93,7 +93,7 @@ impl LayoutReader for DeferredProjectionReader {
     fn projection_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
         let inner = Arc::clone(&self.inner);
@@ -185,7 +185,7 @@ mod tests {
         fn pruning_evaluation(
             &self,
             _row_range: &Range<u64>,
-            _expr: &Expression,
+            _expr: &BoundExpression,
             mask: Mask,
         ) -> VortexResult<MaskFuture> {
             Ok(MaskFuture::ready(if self.reject {
@@ -198,7 +198,7 @@ mod tests {
         fn filter_evaluation(
             &self,
             _row_range: &Range<u64>,
-            _expr: &Expression,
+            _expr: &BoundExpression,
             mask: MaskFuture,
         ) -> VortexResult<MaskFuture> {
             Ok(mask)
@@ -207,7 +207,7 @@ mod tests {
         fn projection_evaluation(
             &self,
             _row_range: &Range<u64>,
-            _expr: &Expression,
+            _expr: &BoundExpression,
             mask: MaskFuture,
         ) -> VortexResult<ArrayFuture> {
             self.projection_calls.fetch_add(1, Ordering::Relaxed);
@@ -231,8 +231,9 @@ mod tests {
     #[tokio::test]
     async fn rejected_split_does_not_construct_a_projection() -> VortexResult<()> {
         let (reader, calls) = reader(true);
+        let dtype = reader.dtype().clone();
         let arrays = ScanBuilder::new(VortexSession::default(), reader)
-            .with_filter(gt(root(), lit(0i32)))
+            .with_filter(gt(root(), lit(0i32)).bind(&dtype)?)
             .into_stream()?
             .try_collect::<Vec<_>>()
             .await?;
@@ -244,8 +245,9 @@ mod tests {
     #[tokio::test]
     async fn matching_split_preserves_all_projected_values() -> VortexResult<()> {
         let (reader, calls) = reader(false);
+        let dtype = reader.dtype().clone();
         let arrays = ScanBuilder::new(VortexSession::default(), reader)
-            .with_filter(gt(root(), lit(0i32)))
+            .with_filter(gt(root(), lit(0i32)).bind(&dtype)?)
             .into_stream()?
             .try_collect::<Vec<_>>()
             .await?;
@@ -267,7 +269,8 @@ mod tests {
     async fn failed_filter_does_not_construct_a_projection() -> VortexResult<()> {
         let (reader, calls) = reader(false);
         let mask = MaskFuture::new(4, async { Err(vortex_err!("filter failed")) });
-        let result = reader.projection_evaluation(&(0..4), &root(), mask)?.await;
+        let expr = root().bind(reader.dtype())?;
+        let result = reader.projection_evaluation(&(0..4), &expr, mask)?.await;
         assert!(
             result.is_err(),
             "a failed filter must surface as a failed projection"
@@ -502,7 +505,8 @@ mod tests {
     async fn sparse_mask_preserves_selected_values() -> VortexResult<()> {
         let (reader, calls) = reader(false);
         let mask = MaskFuture::ready(Mask::from_iter([false, true, false, true]));
-        let projected = reader.projection_evaluation(&(0..4), &root(), mask)?;
+        let expr = root().bind(reader.dtype())?;
+        let projected = reader.projection_evaluation(&(0..4), &expr, mask)?;
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         let array = projected.await?;
         assert_eq!(array.len(), 2);

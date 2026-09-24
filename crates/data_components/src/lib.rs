@@ -21,9 +21,8 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     catalog::CatalogProvider,
-    common::{Statistics, stats::Precision},
+    common::{Statistics, TableReference, stats::Precision},
     datasource::TableProvider,
-    sql::TableReference,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};

@@ -785,7 +785,11 @@ impl DataConnector for MongoDB {
         )?;
         let provider = self
             .mongodb_factory
-            .table_provider(dataset.path().into(), dataset.schema.clone(), projection)
+            .table_provider_with_projection(
+                dataset.path().into(),
+                dataset.schema.clone(),
+                projection,
+            )
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",

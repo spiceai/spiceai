@@ -818,7 +818,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
-            location: String::new(),
+            locations: vec![String::new()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -900,7 +900,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("decimal_test"),
-            location: String::new(),
+            locations: vec![String::new()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -994,7 +994,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("list_test"),
-            location: String::new(),
+            locations: vec![String::new()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1113,7 +1113,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("dict_test"),
-            location: String::new(),
+            locations: vec![String::new()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

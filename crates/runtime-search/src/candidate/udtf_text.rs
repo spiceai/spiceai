@@ -25,8 +25,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::error::DataFusionError;
 use datafusion::common::TableReference;
+use datafusion::error::DataFusionError;
 use search::generation::CandidateGeneration;
 use tonic::async_trait;
 

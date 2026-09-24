@@ -104,7 +104,8 @@ pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
         Some(&val_uuid_like),   // UUID-like pattern
         None,                   // null value
     ];
-    let fixed_size_binary_array = FixedSizeBinaryArray::from(input_arg);
+    let fixed_size_binary_array = FixedSizeBinaryArray::try_from(input_arg)
+        .expect("failed to create arrow fixed-size binary array");
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         "fixed_size_binary",

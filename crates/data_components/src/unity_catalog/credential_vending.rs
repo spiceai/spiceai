@@ -396,9 +396,9 @@ pub async fn vended_object_store(
 mod delta {
     use std::collections::HashMap;
 
+    use datafusion::common::TableReference;
     use datafusion::config::TableParquetOptions;
     use datafusion::datasource::TableProvider;
-    use datafusion::common::TableReference;
     use secrecy::{ExposeSecret, SecretString};
     use snafu::prelude::*;
     use tokio::runtime::Handle;

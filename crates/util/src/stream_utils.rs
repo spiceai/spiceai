@@ -31,7 +31,9 @@ use datafusion::physical_plan::execution_plan::{
 };
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    InputDistributionRequirements, Partitioning, PlanProperties, ReplaceChildrenOptions,
+    StatisticsArgs,
 };
 use parking_lot::Mutex;
 
@@ -242,6 +244,15 @@ impl ExecutionPlan for StreamingExec {
         None
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn static_name() -> &'static str
     where
         Self: Sized,
@@ -261,11 +272,21 @@ impl ExecutionPlan for StreamingExec {
         check_default_invariants(self, check)
     }
 
-    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
-        vec![
-            datafusion::physical_plan::Distribution::UnspecifiedDistribution;
+    fn dynamic_expressions_produced(
+        &self,
+    ) -> Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+        Vec::new()
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
             self.children().len()
-        ]
+        ])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -277,14 +298,9 @@ impl ExecutionPlan for StreamingExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        self.required_input_distribution()
-            .into_iter()
-            .map(|dist| {
-                !matches!(
-                    dist,
-                    datafusion::physical_plan::Distribution::SinglePartition
-                )
-            })
+        self.input_distribution_requirements()
+            .per_child_distributions()
+            .map(|dist| !matches!(dist, Distribution::SinglePartition))
             .collect()
     }
 
@@ -299,9 +315,31 @@ impl ExecutionPlan for StreamingExec {
         Ok(self)
     }
 
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_new_children(children)
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )
     }
 
     fn repartitioned(
@@ -347,6 +385,30 @@ impl ExecutionPlan for StreamingExec {
         Ok(Arc::new(datafusion::common::Statistics::new_unknown(
             &self.schema(),
         )))
+    }
+
+    #[expect(
+        deprecated,
+        reason = "delegates to this leaf node's existing partition_statistics override"
+    )]
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<datafusion::common::Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<datafusion::common::Statistics>> {
+        self.partition_statistics(args.partition())
+    }
+
+    fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
+        self.children().iter().map(|_| ChildStats::Skip).collect()
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 
     fn supports_limit_pushdown(&self) -> bool {

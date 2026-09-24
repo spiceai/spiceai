@@ -18,9 +18,9 @@ use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider},
+    common::TableReference,
     datasource::TableProvider,
     error::DataFusionError,
-    sql::TableReference,
 };
 use futures::{StreamExt, TryStreamExt};
 use snafu::prelude::*;

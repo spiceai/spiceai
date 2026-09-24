@@ -68,6 +68,20 @@ impl DisplayAs for TeeExec {
 
 #[async_trait]
 impl ExecutionPlan for TeeExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        // Sole input is a declared child (see `children()`) that the generic tree
+        // walk driving this method already visits separately — this node holds no
+        // physical expressions of its own.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "TeeExec"
     }

@@ -47,9 +47,9 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cache::{QueryResultsCacheProvider, key::RawCacheKey, to_cached_record_batch_stream};
+use datafusion::common::TableReference;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::common::TableReference;
 use futures::StreamExt;
 use spicepod::component::caching::SQLResultsCacheConfig;
 

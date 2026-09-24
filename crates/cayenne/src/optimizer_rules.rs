@@ -379,7 +379,12 @@ impl PhysicalOptimizerRule for CayenneDynamicFilterSharing {
                 return Ok(Transformed::no(node));
             }
 
-            let new_node = node.with_new_children(vec![left, right])?;
+            let new_node = node.replace_children(
+                vec![left, right],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?;
             Ok(Transformed::yes(new_node))
         })
         .data()
@@ -585,7 +590,10 @@ impl PhysicalOptimizerRule for CayenneStatsAggregateRewriter {
             // Statistics of the aggregate's input are aligned to the schema the
             // aggregate's column indices reference. Soundness guard #2 lives in
             // `stats_aggregate_batch`: every value consumed must be `Exact`.
-            let Ok(input_stats) = query_aggregate.input().partition_statistics(None) else {
+            let Ok(input_stats) = datafusion::physical_plan::StatisticsContext::new().compute(
+                &**query_aggregate.input(),
+                &datafusion::physical_plan::StatisticsArgs::new(),
+            ) else {
                 return Ok(Transformed::no(node));
             };
             let Some(batch) = crate::stats_aggregate::stats_aggregate_batch(
@@ -1096,7 +1104,14 @@ fn wrap_sort_merge_to_hash_join_schema(
 /// 19 GB non-spillable `HashJoinInput` that then exhausts the pool. `None`
 /// means unknown → treat as oversized, except a same-schema self-join.
 fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
-    match hash_join.left().partition_statistics(None).ok()?.num_rows {
+    match datafusion::physical_plan::StatisticsContext::new()
+        .compute(
+            &**hash_join.left(),
+            &datafusion::physical_plan::StatisticsArgs::new(),
+        )
+        .ok()?
+        .num_rows
+    {
         Precision::Exact(row_count) => Some(row_count),
         Precision::Inexact(_) | Precision::Absent => None,
     }
@@ -1461,7 +1476,14 @@ fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<
     // hash table regardless of join type.
     let build_input = hash_join.left();
 
-    match build_input.partition_statistics(None).ok()?.num_rows {
+    match datafusion::physical_plan::StatisticsContext::new()
+        .compute(
+            &**build_input,
+            &datafusion::physical_plan::StatisticsArgs::new(),
+        )
+        .ok()?
+        .num_rows
+    {
         Precision::Exact(row_count) => Some(row_count),
         Precision::Inexact(_) | Precision::Absent => None,
     }
@@ -1493,7 +1515,14 @@ fn exact_join_filter_build_key_bytes(
 }
 
 fn exact_join_filter_probe_rows(hash_join: &HashJoinExec) -> Option<usize> {
-    match hash_join.right().partition_statistics(None).ok()?.num_rows {
+    match datafusion::physical_plan::StatisticsContext::new()
+        .compute(
+            &**hash_join.right(),
+            &datafusion::physical_plan::StatisticsArgs::new(),
+        )
+        .ok()?
+        .num_rows
+    {
         Precision::Exact(row_count) | Precision::Inexact(row_count) => Some(row_count),
         Precision::Absent => None,
     }
@@ -1805,8 +1834,13 @@ fn apply_filter_additions(
         return Ok((plan, false));
     }
 
-    plan.with_new_children(new_children)
-        .map(|plan| (plan, true))
+    plan.replace_children(
+        new_children,
+        datafusion::physical_plan::ReplaceChildrenOptions::new(
+            datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+        ),
+    )
+    .map(|plan| (plan, true))
 }
 
 impl std::fmt::Debug for CayenneJoinRewriter {
@@ -2637,6 +2671,16 @@ mod tests {
             Ok(())
         }
 
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            )
+                -> DFResult<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> DFResult<datafusion::common::tree_node::TreeNodeRecursion> {
+            datafusion::physical_plan::apply_expression_roots(self.filter.iter(), f)
+        }
+
         fn try_pushdown_filters(
             &self,
             filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -2677,7 +2721,7 @@ mod tests {
         filter: Option<Arc<dyn PhysicalExpr>>,
         statistics: Statistics,
     ) -> Arc<dyn ExecutionPlan> {
-        let table_schema = TableSchema::new(Arc::clone(schema), Vec::new());
+        let table_schema = TableSchema::from(Arc::clone(schema));
         let source = Arc::new(TestFileSource::new(table_schema, filter));
         let file = PartitionedFile::from(ObjectMeta {
             location: Path::from(path),

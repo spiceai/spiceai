@@ -12,11 +12,17 @@ version.workspace = true
 arrow-schema.workspace = true
 data_components = { path = "../data_components" }
 datafusion.workspace = true
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 futures.workspace = true
 iceberg-datafusion.workspace = true
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-proto = { path = "../runtime-proto" }
 tokio = { workspace = true, features = ["sync"] }
+
+[features]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

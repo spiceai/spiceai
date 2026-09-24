@@ -114,9 +114,9 @@ use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuil
 use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::cache::cache_manager::{
-    CachedFileList, CachedFileMetadata, FileStatisticsCache,
+    CachedFileList, CachedFileMetadata, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT, FileStatisticsCache,
 };
-use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
+use datafusion_execution::cache::default_cache::DefaultCache;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::utils::conjunction;
@@ -133,6 +133,7 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
@@ -750,6 +751,15 @@ struct SnapshotScanListingRequest<'a> {
     limit: Option<usize>,
     scan_schema: SchemaRef,
     captured_files: Option<&'a CapturedSnapshotFiles>,
+    /// Whether to collect per-file statistics during this listing.
+    ///
+    /// `ListingOptions` no longer carries this (`DataFusion` moved it to be read
+    /// live from `SessionConfig::collect_statistics` instead of baked into the
+    /// table's listing options), so callers pass it explicitly: most read it
+    /// from `state.config_options()`, but `lookup_index_snapshot_files` forces
+    /// `false` regardless of session config to skip statistics collection
+    /// entirely for the index-only listing it needs.
+    collect_stat: bool,
 }
 
 /// The unpruned warm file set captured with a scan's inline and deletion views.
@@ -1760,7 +1770,7 @@ pub struct CayenneTableProvider {
     /// File statistics cache used by the direct snapshot scan planner. This
     /// replaces the per-scan `ListingTable` cache while preserving repeated
     /// scan behavior when `collect_statistics` asks us to read Vortex footers.
-    scan_file_statistics: Arc<dyn FileStatisticsCache>,
+    scan_file_statistics: Arc<FileStatisticsCache>,
     /// Unpruned snapshot directory listing (paths + footer stats) for the
     /// current file set. Keyed by snapshot id, [`Self::current_dir_generation`],
     /// and [`Self::listing_cache_epoch`] so a publish that adds files cannot
@@ -4019,6 +4029,8 @@ fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistic
     /// rather than let a many-file merge pay for it at plan time.
     const MAX_BANDS: usize = 2_048;
 
+    let stats_ctx = StatisticsContext::new();
+
     // All-or-nothing, for the same reason the fine path is: a set missing one
     // plan's rows is not a smaller distribution, it is a WRONG one, and the
     // histogram cannot tell the difference. Dropping the failures instead would
@@ -4029,7 +4041,7 @@ fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistic
     let aggregates = || -> Vec<Arc<Statistics>> {
         plans
             .iter()
-            .map(|plan| plan.partition_statistics(None).ok())
+            .map(|plan| stats_ctx.compute(&**plan, &StatisticsArgs::new()).ok())
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
     };
@@ -4045,7 +4057,10 @@ fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistic
     let mut bands = Vec::with_capacity(partitions);
     for plan in plans {
         for partition in 0..plan.output_partitioning().partition_count() {
-            let Ok(stats) = plan.partition_statistics(Some(partition)) else {
+            let Ok(stats) = stats_ctx.compute(
+                &**plan,
+                &StatisticsArgs::new().with_partition(Some(partition)),
+            ) else {
                 return aggregates();
             };
             bands.push(stats);
@@ -7126,12 +7141,17 @@ impl CayenneTableProvider {
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
-        session_config: &SessionConfig,
+        // `ListingOptions` no longer carries `target_partitions`/`collect_stat`
+        // (DataFusion moved both to be read live from `SessionConfig` at scan
+        // time instead of baked into the table's listing options), so this
+        // parameter is currently unused; callers still pass their session config
+        // in case a future option needs to be baked in the same way.
+        _session_config: &SessionConfig,
     ) -> ListingOptions {
         let file_format: Arc<dyn FileFormat> = Arc::new(
             vortex_format.with_access_plan_provider(Self::position_deletion_plans(strategy)),
         );
-        ListingOptions::new(file_format).with_session_config_options(session_config)
+        ListingOptions::new(file_format)
     }
 
     /// The per-file access plans every scan of this table attaches: the
@@ -8568,7 +8588,11 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
-            scan_file_statistics: Arc::new(DefaultFileStatisticsCache::default()),
+            scan_file_statistics: Arc::new(
+                DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
+                    DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+                ),
+            ),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
             listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
@@ -9908,10 +9932,7 @@ impl CayenneTableProvider {
         // file and nothing bounds it, so the count is the growth signal even
         // without a byte figure.
         telemetry::cayenne::track_scan_file_statistics_entries(
-            u64::try_from(datafusion_execution::cache::CacheAccessor::len(
-                &*self.scan_file_statistics,
-            ))
-            .unwrap_or(u64::MAX),
+            u64::try_from(self.scan_file_statistics.len()).unwrap_or(u64::MAX),
             &dimensions,
         );
     }
@@ -10399,7 +10420,9 @@ impl CayenneTableProvider {
         let bounds = if let Some(bounds) = histogram {
             bounds
         } else {
-            let stats = merged.partition_statistics(None).ok()?;
+            let stats = StatisticsContext::new()
+                .compute(&**merged, &StatisticsArgs::new())
+                .ok()?;
             range_bounds_from_statistics(&stats, index, shards)?
         };
 
@@ -12092,6 +12115,7 @@ impl CayenneTableProvider {
                 state: &state,
                 table_url: &table_url,
                 options: &options,
+                collect_stat: state.config_options().execution.collect_statistics,
                 partition_filters: &[],
                 data_filters: &[],
                 snapshot_id: &snapshot_id,
@@ -17298,8 +17322,8 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let state = ctx.state();
         let plan = TableProvider::scan(self, &state, Some(&vec![index]), &[], None).await?;
-        let total_rows = plan
-            .partition_statistics(None)
+        let total_rows = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .ok()
             .and_then(|stats| stats.num_rows.get_value().copied());
         // Without a row count, sample sparsely rather than hold the column.
@@ -25032,11 +25056,18 @@ impl CayenneTableProvider {
         let arrow_schema = plan.schema();
         let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone())?;
         let execution_props = ExecutionProps::new();
+        // No scalar subqueries in a retention filter, so an empty planning
+        // context (no lambda/subquery state to thread through) is correct here.
+        let planning_ctx = datafusion_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion_common::HashMap::default(),
+            datafusion_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
 
         let physical_filter = datafusion_physical_expr::create_physical_expr(
             retention_filter,
             &df_schema,
             &execution_props,
+            &planning_ctx,
         )?;
 
         let filter_exec = FilterExec::try_new(physical_filter, plan)?;
@@ -25095,10 +25126,18 @@ impl CayenneTableProvider {
             return plan;
         };
 
+        // No scalar subqueries in a scan filter, so an empty planning context
+        // (no lambda/subquery state to thread through) is correct here.
+        let planning_ctx = datafusion_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion_common::HashMap::default(),
+            datafusion_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
+
         match datafusion_physical_expr::create_physical_expr(
             &predicate,
             &df_schema,
             &execution_props,
+            &planning_ctx,
         )
         .and_then(|physical_filter| FilterExec::try_new(physical_filter, Arc::clone(&plan)))
         {
@@ -28092,6 +28131,7 @@ impl CayenneTableProvider {
                 state: &state,
                 table_url: &table_url,
                 options: &options,
+                collect_stat: state.config_options().execution.collect_statistics,
                 partition_filters: &[],
                 data_filters: &[],
                 snapshot_id,
@@ -32215,10 +32255,16 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<Vec<Arc<dyn PhysicalExpr>>> {
         let df_schema = DFSchema::try_from(self.table_schema().as_ref().clone())?;
         let execution_props = ExecutionProps::new();
+        // No scalar subqueries in an inlined-delete filter, so an empty planning
+        // context (no lambda/subquery state to thread through) is correct here.
+        let planning_ctx = datafusion_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion_common::HashMap::default(),
+            datafusion_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
 
         filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props))
+            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props, &planning_ctx))
             .collect()
     }
 
@@ -32826,14 +32872,15 @@ impl CayenneTableProvider {
         file_schema: &SchemaRef,
         options: &ListingOptions,
     ) -> TableSchema {
-        TableSchema::new(
-            Arc::clone(file_schema),
-            options
-                .table_partition_cols
-                .iter()
-                .map(|(name, data_type)| Arc::new(Field::new(name, data_type.clone(), false)))
-                .collect(),
-        )
+        TableSchema::builder(Arc::clone(file_schema))
+            .with_table_partition_cols(
+                options
+                    .table_partition_cols
+                    .iter()
+                    .map(|(name, data_type)| Arc::new(Field::new(name, data_type.clone(), false)))
+                    .collect::<Vec<_>>(),
+            )
+            .build()
     }
 
     /// Build the `file_sort_order` (`Vec<Vec<SortExpr>>`) advertised on a
@@ -33059,6 +33106,7 @@ impl CayenneTableProvider {
                 state,
                 table_url: &table_url,
                 options: &options,
+                collect_stat: state.config_options().execution.collect_statistics,
                 partition_filters: &partition_filters,
                 data_filters: &data_filters,
                 snapshot_id,
@@ -33125,9 +33173,9 @@ impl CayenneTableProvider {
                 &scan_schema,
                 &partitioned_file_lists,
                 first_output_ordering,
-                options.target_partitions,
+                scan_config.target_partitions(),
             ) {
-                Ok(new_groups) if new_groups.len() <= options.target_partitions => {
+                Ok(new_groups) if new_groups.len() <= scan_config.target_partitions() => {
                     partitioned_file_lists = new_groups;
                     ordering_is_sound = true;
                 }
@@ -33359,7 +33407,7 @@ impl CayenneTableProvider {
                 limit
             };
 
-        let file_groups = FileGroup::new(kept).split_files(options.target_partitions);
+        let file_groups = FileGroup::new(kept).split_files(scan_config.target_partitions());
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, Arc::clone(&scan_schema), true, false)?;
 
@@ -33483,7 +33531,7 @@ impl CayenneTableProvider {
         // disjoint from the original domain is still disjoint afterward. Raw
         // footer row counts are not live-row counts, however, so pending
         // deletions separately disable LIMIT early-stop and exact aggregates.
-        let collect_stats = request.options.collect_stat;
+        let collect_stats = request.collect_stat;
         let has_pending_deletions = self.has_pending_deletions();
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
         let dir_generation = request.captured_files.map_or_else(
@@ -33550,7 +33598,9 @@ impl CayenneTableProvider {
         let (file_groups, grouped_by_partition) = if threshold > 0
             && !request.options.table_partition_cols.is_empty()
         {
-            let grouped = file_group.group_by_partition_values(request.options.target_partitions);
+            let grouped = file_group.group_by_partition_values(
+                request.state.config_options().execution.target_partitions,
+            );
             if grouped.len() >= threshold {
                 (grouped, true)
             } else {
@@ -33559,13 +33609,14 @@ impl CayenneTableProvider {
                     .flat_map(FileGroup::into_inner)
                     .collect::<Vec<_>>();
                 (
-                    FileGroup::new(all_files).split_files(request.options.target_partitions),
+                    FileGroup::new(all_files)
+                        .split_files(request.state.config_options().execution.target_partitions),
                     false,
                 )
             }
         } else {
             (
-                file_group.split_files(request.options.target_partitions),
+                file_group.split_files(request.state.config_options().execution.target_partitions),
                 false,
             )
         };
@@ -33671,7 +33722,7 @@ impl CayenneTableProvider {
                 };
                 Ok(part_file.with_statistics(statistics))
             })
-            .buffer_unordered(meta_fetch_concurrency);
+            .buffer_unordered(meta_fetch_concurrency.into());
 
         let (file_group, truncated) =
             Self::collect_scan_files_with_limit(files, None, collect_stats).await?;
@@ -33737,10 +33788,14 @@ impl CayenneTableProvider {
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
     ) -> datafusion_common::Result<Arc<Statistics>> {
+        let schema_fingerprint = Arc::new(
+            datafusion_execution::cache::SchemaFingerprint::from_schema(&self.table_schema()),
+        );
+
         if let Some(cached) = self.scan_file_statistics.get(&TableScopedPath {
             table: None,
             path: part_file.object_meta.location.clone(),
-        }) && cached.is_valid_for(&part_file.object_meta)
+        }) && cached.is_valid_for(&part_file.object_meta, &schema_fingerprint)
         {
             return Ok(cached.statistics);
         }
@@ -33774,6 +33829,7 @@ impl CayenneTableProvider {
                 },
                 CachedFileMetadata::new(
                     part_file.object_meta.clone(),
+                    Arc::clone(&schema_fingerprint),
                     Arc::clone(&statistics),
                     None,
                 ),
@@ -33821,7 +33877,12 @@ impl CayenneTableProvider {
                 table: None,
                 path: part_file.object_meta.location.clone(),
             },
-            CachedFileMetadata::new(part_file.object_meta.clone(), Arc::clone(&statistics), None),
+            CachedFileMetadata::new(
+                part_file.object_meta.clone(),
+                Arc::clone(&schema_fingerprint),
+                Arc::clone(&statistics),
+                None,
+            ),
         );
 
         Ok(statistics)
@@ -33923,7 +33984,9 @@ impl CayenneTableProvider {
             return None;
         };
         // DataFusion accessor for whole-plan (all-partition) statistics.
-        let stats = plan.partition_statistics(None).ok()?;
+        let stats = StatisticsContext::new()
+            .compute(&**plan, &StatisticsArgs::new())
+            .ok()?;
         let col = stats.column_statistics.get(*pk_idx)?;
         let (DFPrecision::Exact(lo), DFPrecision::Exact(hi)) = (&col.min_value, &col.max_value)
         else {
@@ -34538,14 +34601,14 @@ impl CayenneTableProvider {
             self.context.file_format(),
             &self.pk_deletion_strategy,
             state.config(),
-        )
-        .with_collect_stat(false);
+        );
         let scan_schema = Self::snapshot_scan_schema(read_schema, &options);
         let listed = self
             .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
                 state,
                 table_url: &table_url,
                 options: &options,
+                collect_stat: false,
                 partition_filters: &[],
                 data_filters: &[],
                 snapshot_id,
@@ -40688,7 +40751,7 @@ mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(arrow_record.schema().to_dfschema().expect("to df schema")),
             name: table_name.into(),
-            location: String::new(),
+            locations: vec![String::new()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -47444,6 +47507,7 @@ mod tests {
                 state: &ctx.state(),
                 table_url: &table_url,
                 options: &options,
+                collect_stat: ctx.state().config_options().execution.collect_statistics,
                 partition_filters: &[],
                 data_filters: &[],
                 snapshot_id: &snapshot_id,
@@ -47492,11 +47556,11 @@ mod tests {
 
         assert_eq!(direct_plan.schema(), listing_plan.schema());
         assert_eq!(
-            direct_plan
-                .partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&*direct_plan, &StatisticsArgs::new())
                 .expect("direct scan plan statistics should be available"),
-            listing_plan
-                .partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&*listing_plan, &StatisticsArgs::new())
                 .expect("ListingTable scan plan statistics should be available")
         );
         assert_eq!(
@@ -47785,6 +47849,7 @@ mod tests {
                 state: &ctx.state(),
                 table_url: &table_url,
                 options: &options,
+                collect_stat: ctx.state().config_options().execution.collect_statistics,
                 partition_filters: &[],
                 data_filters: std::slice::from_ref(&sel_filter),
                 snapshot_id: &snapshot_id,
@@ -47807,6 +47872,7 @@ mod tests {
                 state: &ctx.state(),
                 table_url: &table_url,
                 options: &options,
+                collect_stat: ctx.state().config_options().execution.collect_statistics,
                 partition_filters: &[],
                 data_filters: std::slice::from_ref(&sel_filter),
                 snapshot_id: &snapshot_id,
@@ -47831,6 +47897,7 @@ mod tests {
                 state: &ctx.state(),
                 table_url: &table_url,
                 options: &options,
+                collect_stat: ctx.state().config_options().execution.collect_statistics,
                 partition_filters: &[],
                 data_filters: &[],
                 snapshot_id: &snapshot_id,
@@ -48568,6 +48635,7 @@ mod tests {
             state: &ctx.state(),
             table_url: &table_url,
             options: &options,
+            collect_stat: ctx.state().config_options().execution.collect_statistics,
             partition_filters: &[],
             data_filters: &[],
             snapshot_id: &snapshot_id,
@@ -54262,8 +54330,8 @@ mod tests {
             .scan(&ctx.state(), None, &[], None)
             .await
             .expect("scan plan builds");
-        let stats = plan
-            .partition_statistics(None)
+        let stats = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("partition statistics available");
         if let DFPrecision::Exact(n) = stats.num_rows {
             let n = i64::try_from(n).expect("num_rows fits i64");
@@ -64355,12 +64423,18 @@ mod tests {
     /// delta-apply helper has a cache to operate on regardless of the default
     /// session configuration.
     fn runtime_env_with_list_files_cache() -> Arc<RuntimeEnv> {
-        use datafusion_execution::cache::DefaultListFilesCache;
-        use datafusion_execution::cache::cache_manager::CacheManagerConfig;
+        use datafusion_execution::cache::cache_manager::{
+            CacheManagerConfig, DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+        };
         use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 
-        let cache_config = CacheManagerConfig::default()
-            .with_list_files_cache(Some(Arc::new(DefaultListFilesCache::default())));
+        let cache_config =
+            CacheManagerConfig::default().with_list_files_cache(Some(Arc::new(DefaultCache::<
+                TableScopedPath,
+                CachedFileList,
+            >::new(
+                DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+            ))));
         Arc::new(
             RuntimeEnvBuilder::new()
                 .with_cache_manager(cache_config)
@@ -64520,6 +64594,16 @@ mod tests {
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion_physical_plan::PhysicalExpr>,
+            ) -> datafusion_common::Result<
+                datafusion_common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
         }
         fn with_new_children(
             self: Arc<Self>,

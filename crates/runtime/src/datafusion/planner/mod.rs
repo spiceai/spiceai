@@ -47,11 +47,11 @@ mod update;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::common::config::Dialect;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::common::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::CreateTableOptions;
 use datafusion::sql::sqlparser::ast::Expr as SQLExpr;
@@ -364,6 +364,9 @@ async fn plan_distributed_dml(
         WriteOp::Truncate => Err(DataFusionError::Internal(
             "TRUNCATE should not reach DML planner".to_string(),
         )),
+        _ => Err(DataFusionError::Internal(format!(
+            "{expected_op:?} should not reach DML planner"
+        ))),
     }
 }
 

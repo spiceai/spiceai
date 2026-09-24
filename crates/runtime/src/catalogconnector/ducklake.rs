@@ -234,7 +234,7 @@ impl CatalogConnector for DuckLakeCatalog {
                             super::Error::UnableToGetCatalogProvider {
                                 connector: PREFIX.to_string(),
                                 connector_component: connector_component_for_pool.clone(),
-                                source: e,
+                                source: Box::new(e),
                             }
                         })?,
                     ))
@@ -244,7 +244,7 @@ impl CatalogConnector for DuckLakeCatalog {
                             super::Error::UnableToGetCatalogProvider {
                                 connector: PREFIX.to_string(),
                                 connector_component: connector_component_for_pool.clone(),
-                                source: e,
+                                source: Box::new(e),
                             }
                         })?,
                     ))
@@ -254,7 +254,7 @@ impl CatalogConnector for DuckLakeCatalog {
                     super::Error::UnableToGetCatalogProvider {
                         connector: PREFIX.to_string(),
                         connector_component: connector_component_for_pool.clone(),
-                        source: e,
+                        source: Box::new(e),
                     }
                 })?;
 

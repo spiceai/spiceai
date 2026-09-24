@@ -20,8 +20,7 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
-use vortex::arrow::FromArrowType;
-use vortex::dtype::DType;
+use vortex::arrow::ArrowSession;
 use vortex::dtype::Nullability;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
@@ -146,7 +145,11 @@ impl DefaultExpressionConvertor {
         };
         // Match the DataFusion return field (UInt64, nullability from the list argument)
         // so a pushed `array_length` has the same type the plan already expects.
-        let return_dtype = DType::from_arrow((scalar_fn.return_type(), nullability));
+        let return_dtype = ArrowSession::default()
+            .from_arrow_datatype(scalar_fn.return_type(), nullability)
+            .map_err(|e| {
+                exec_datafusion_err!("Failed to convert return type to a Vortex dtype: {e}")
+            })?;
         Ok(cast(list_length(input), return_dtype))
     }
 
@@ -263,7 +266,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(cast_expr) = df.downcast_ref::<df_expr::CastExpr>() {
-            let cast_dtype = DType::from_arrow((cast_expr.cast_type(), Nullability::Nullable));
+            let cast_dtype = ArrowSession::default()
+                .from_arrow_datatype(cast_expr.cast_type(), Nullability::Nullable)
+                .map_err(|e| {
+                    exec_datafusion_err!("Failed to convert cast type to a Vortex dtype: {e}")
+                })?;
             let child = self.convert(cast_expr.expr().as_ref())?;
             return Ok(cast(child, cast_dtype));
         }
@@ -855,6 +862,7 @@ mod tests {
     use insta::assert_snapshot;
     use rstest::rstest;
     use vortex::VortexSessionDefault;
+    use vortex::dtype::DType;
     use vortex::dtype::PType;
     use vortex::dtype::StructFields;
     use vortex::session::VortexSession;
@@ -1074,8 +1082,11 @@ mod tests {
             Nullability::NonNullable,
         );
         let session = VortexSession::default();
-        let pruning_expr = result
-            .falsify(&scope, &session)
+        let bound = result
+            .bind(&scope)
+            .expect("IN-list expression should bind to scope");
+        let pruning_expr = bound
+            .falsify(&session)
             .expect("falsify should not error")
             .expect("converted IN-list should support min/max pruning");
 

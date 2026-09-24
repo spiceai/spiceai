@@ -305,6 +305,34 @@ impl CayenneAccelerationExec {
         Some(partition_decode_share(total, partitions, partition))
     }
 
+    /// Refills column statistics wiped to `Precision::Absent` from
+    /// [`Self::optimizer_column_overlay`], if attached.
+    ///
+    /// The overlay is a per-table (global) aggregate: its min/max/NDV
+    /// describe the whole table, not any single partition. Only the
+    /// table-wide aggregate stats (`partition == None`) may be refilled from
+    /// it. Per-partition stats (`partition == Some(_)`) must pass through
+    /// unchanged — filling them from the global aggregate would violate
+    /// partition-statistics semantics and mislead partition-level
+    /// pruning/optimization.
+    fn overlay_column_statistics(
+        &self,
+        child_stats: Arc<Statistics>,
+        partition: Option<usize>,
+    ) -> Arc<Statistics> {
+        let Some(overlay) = self
+            .optimizer_column_overlay
+            .as_ref()
+            .filter(|_| partition.is_none())
+        else {
+            return child_stats;
+        };
+        Arc::new(restore_absent_column_statistics(
+            Arc::unwrap_or_clone(child_stats),
+            overlay,
+        ))
+    }
+
     /// Returns a stable identity for the underlying scan source, derived from
     /// the `FileScanConfig`'s `object_store_url` plus the sorted set of file
     /// paths backing the inner `DataSourceExec`.
@@ -885,7 +913,13 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    plan.with_new_children(new_children).map(Some)
+    plan.replace_children(
+        new_children,
+        datafusion::physical_plan::ReplaceChildrenOptions::new(
+            datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+        ),
+    )
+    .map(Some)
 }
 
 pub(crate) fn round_robin_repartition_if_needed(
@@ -950,6 +984,19 @@ impl ExecutionPlan for CayenneAccelerationExec {
         None
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        // `inner` is a declared child (see `children()` below) that the generic
+        // tree walk driving this method already visits separately.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -977,8 +1024,24 @@ impl ExecutionPlan for CayenneAccelerationExec {
         check_default_invariants(self, check)
     }
 
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        // `inner` is a declared child (see `children()` below), and this
+        // method is shallow — it must not report expressions the child
+        // produces. This wrapper produces none of its own.
+        Vec::new()
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn input_distribution_requirements(
+        &self,
+    ) -> datafusion::physical_plan::InputDistributionRequirements {
+        datafusion::physical_plan::InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -997,9 +1060,10 @@ impl ExecutionPlan for CayenneAccelerationExec {
         vec![&self.inner]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::ReplaceChildrenOptions,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::External(
@@ -1016,9 +1080,37 @@ impl ExecutionPlan for CayenneAccelerationExec {
         Ok(Arc::new(self.wrap_rewritten_child(input)))
     }
 
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_new_children(children)
+    }
+
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Keep,
+            ),
+        )
     }
 
     fn repartitioned(
@@ -1097,26 +1189,41 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; statistics_from_inputs is the modern path"
+    )]
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let child_stats = self.inner.partition_statistics(partition)?;
-        // The overlay is a per-table (global) aggregate: its min/max/NDV
-        // describe the whole table, not any single partition. Only the
-        // table-wide aggregate stats (`partition == None`) may be refilled from
-        // it. Per-partition stats (`partition == Some(_)`) must pass through
-        // unchanged — filling them from the global aggregate would violate
-        // `partition_statistics(Some(_))` semantics and mislead partition-level
-        // pruning/optimization.
-        let Some(overlay) = self
-            .optimizer_column_overlay
-            .as_ref()
-            .filter(|_| partition.is_none())
-        else {
-            return Ok(child_stats);
-        };
-        Ok(Arc::new(restore_absent_column_statistics(
-            Arc::unwrap_or_clone(child_stats),
-            overlay,
-        )))
+        Ok(self.overlay_column_statistics(child_stats, partition))
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let child_stats = input_stats.first().cloned().ok_or_else(|| {
+            DataFusionError::Internal(
+                "CayenneAccelerationExec requires exactly one input".to_string(),
+            )
+        })?;
+        Ok(self.overlay_column_statistics(child_stats, args.partition()))
+    }
+
+    fn child_stats_requests(
+        &self,
+        partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        vec![datafusion::physical_plan::ChildStats::At(partition)]
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 
     // Allow optimizer to push limits through to inputs
@@ -2218,6 +2325,10 @@ mod tests {
     /// selection / pruning signal that the deletion-filter path deliberately
     /// relaxes to `Inexact` only when deletions are present.
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics override directly"
+    )]
     fn cayenne_exec_passes_through_exact_partition_statistics() {
         use datafusion_common::stats::Precision;
 
@@ -2315,6 +2426,10 @@ mod tests {
     /// intentionally left Absent (they trip `DataFusion`'s empty-interval assertion
     /// on range filters and aren't needed by build-side selection / cardinality).
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics override directly"
+    )]
     fn overlay_refills_union_wiped_join_key_statistics() {
         use datafusion_common::{ColumnStatistics, ScalarValue};
         use datafusion_physical_plan::empty::EmptyExec;

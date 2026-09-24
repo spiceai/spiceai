@@ -1516,7 +1516,7 @@ mod mcp_origin_tests {
     use http::StatusCode;
     use rmcp::{
         ServerHandler,
-        model::{ProtocolVersion, ServerCapabilities, ServerInfo},
+        model::{ProtocolVersion, ServerCapabilities, ServerConfig},
     };
     use spicepod::component::runtime::Runtime as SpicepodRuntime;
     use std::sync::Arc;
@@ -1532,8 +1532,8 @@ mod mcp_origin_tests {
     struct OriginCheckServer;
 
     impl ServerHandler for OriginCheckServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_protocol_version(ProtocolVersion::V_2026_07_28)
         }
     }

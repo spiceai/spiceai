@@ -73,7 +73,8 @@ async fn scan_statistics(
     ctx: &SessionContext,
 ) -> TestResult<(Precision<usize>, Vec<Precision<usize>>)> {
     let plan = table.scan(&ctx.state(), None, &[], None).await?;
-    let stats = plan.partition_statistics(None)?;
+    let stats = datafusion::physical_plan::StatisticsContext::new()
+        .compute(&*plan, &datafusion::physical_plan::StatisticsArgs::new())?;
     let per_column = stats
         .column_statistics
         .iter()

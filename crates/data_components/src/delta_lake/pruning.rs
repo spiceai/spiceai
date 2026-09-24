@@ -75,9 +75,17 @@ pub(crate) fn prune_partitions(
     // Now that we have the `RecordBatch`, use DataFusion to evaluate the filters.
     let props = ExecutionProps::new();
 
+    // No scalar subqueries in a partition-pruning filter, so an empty planning
+    // context (no lambda/subquery state to thread through) is correct here.
+    let planning_ctx =
+        datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion::common::HashMap::default(),
+            datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
+
     // Applies `filter` to `batch`
     let do_filter = |filter| -> Result<ArrayRef, datafusion::error::DataFusionError> {
-        let expr = create_physical_expr(filter, &df_schema, &props)?;
+        let expr = create_physical_expr(filter, &df_schema, &props, &planning_ctx)?;
         expr.evaluate(&batch)?.into_array(partitioned_files.len())
     };
 

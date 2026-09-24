@@ -316,6 +316,17 @@ impl ExecutionPlan for IcebergDeleteExec {
         "IcebergDeleteExec"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
@@ -715,10 +726,17 @@ impl IcebergDeletionProvider {
                 .ok_or_else(|| {
                     DataFusionError::Internal("Filter list unexpectedly empty".to_string())
                 })?;
+            // No scalar subqueries in a delete predicate, so an empty planning context
+            // (no lambda/subquery state to thread through) is correct here.
+            let planning_ctx = datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+                datafusion::common::HashMap::default(),
+                datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(),
+            );
             let physical_filter = datafusion::physical_expr::create_physical_expr(
                 &combined_filter,
                 &df_schema,
                 state.execution_props(),
+                &planning_ctx,
             )?;
             Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(
                 physical_filter,

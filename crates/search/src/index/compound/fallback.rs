@@ -325,6 +325,19 @@ impl ExecutionPlan for FallbackOnEmptyScanExec {
         "FallbackOnEmptyScanExec"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        )
+            -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion> {
+        // `primary` and `secondary` are declared children (see `children()` below)
+        // that the generic tree walk driving this method already visits separately —
+        // this node holds no physical expressions of its own.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

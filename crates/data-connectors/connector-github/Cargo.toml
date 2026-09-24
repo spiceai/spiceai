@@ -32,6 +32,8 @@ chrono.workspace = true
 connector-graphql = { path = "../connector-graphql" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 futures.workspace = true
 globset.workspace = true
 governor.workspace = true
@@ -60,6 +62,8 @@ spicepod = { path = "../../spicepod" }
 
 [features]
 default = []
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

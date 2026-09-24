@@ -35,6 +35,7 @@ datafusion-expr = { workspace = true }
 datafusion-functions-aggregate-common = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+datafusion-proto-models = { workspace = true, optional = true }
 datafusion-pruning = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
@@ -111,6 +112,8 @@ chdb-bench = ["dep:chdb-rust"]
 # the perf matrix in docs/dev/cayenne_vs_duckdb_benchmarks.md.
 result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["datafusion-physical-plan/proto", "dep:datafusion-proto-models"]
 
 [dev-dependencies]
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }

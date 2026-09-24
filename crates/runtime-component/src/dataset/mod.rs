@@ -18,12 +18,10 @@ use arrow_schema::SchemaRef;
 
 use crate::{access::AccessMode, find_first_delimiter};
 use acceleration::Engine;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        dialect::{Dialect, GenericDialect},
-        parser::{Parser, ParserError},
-    },
+use datafusion::common::TableReference;
+use datafusion::sql::sqlparser::{
+    dialect::{Dialect, GenericDialect},
+    parser::{Parser, ParserError},
 };
 use snafu::prelude::*;
 use spicepod::{

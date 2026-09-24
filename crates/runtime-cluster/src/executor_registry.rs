@@ -27,8 +27,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{
     catalog::TableProvider,
-    common::{Statistics, stats::Precision},
-    sql::TableReference,
+    common::{Statistics, TableReference, stats::Precision},
 };
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;

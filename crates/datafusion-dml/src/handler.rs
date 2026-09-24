@@ -24,11 +24,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, dml::InsertOp};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::common::TableReference;
 
 /// Parameters for [`CatalogDmlHandler::delete_exec`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

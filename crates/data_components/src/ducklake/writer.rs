@@ -35,7 +35,8 @@ use arrow::datatypes::SchemaRef;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, DataFusionError, SchemaExt};
+use datafusion::common::TableReference;
+use datafusion::common::{Constraints, DFSchemaRef, DataFusionError, SchemaExt};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::error::Result as DFResult;
@@ -44,7 +45,6 @@ use datafusion::logical_expr::{Expr, LogicalPlan, TableType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
-use datafusion::common::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion_table_providers::duckdb::DuckDB;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -211,6 +211,19 @@ impl TableProvider for DuckDbFederatedTableWriter {
     async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.read_provider.truncate(state).await
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.read_provider
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 struct DuckDbFederatedDataSink {
@@ -263,7 +276,9 @@ impl DataSink for DuckDbFederatedDataSink {
 
         let write_handle: JoinHandle<datafusion::common::Result<u64>> = tokio::task::spawn_blocking(
             move || {
-                let mut db_conn = pool.connect_sync().map_err(DataFusionError::External)?;
+                let mut db_conn = pool
+                    .connect_sync()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;

@@ -19,8 +19,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::error::Result as DFResult;
+use datafusion::catalog::Session;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -47,13 +49,23 @@ impl ExtensionPlanner for DmlExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        state: &SessionState,
+        session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         let Some(DmlExtensionNode { op, handler, .. }) =
             node.as_any().downcast_ref::<DmlExtensionNode>()
         else {
             return Ok(None);
         };
+
+        let state = session
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "DML extension planning requires a concrete SessionState".to_string(),
+                )
+            })?;
 
         match op.clone() {
             DmlNodeOp::Delete(p) => handler.delete_exec(p, physical_inputs.to_vec(), state),

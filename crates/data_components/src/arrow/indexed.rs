@@ -35,11 +35,11 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraint, Constraints, Result};
+use datafusion::common::{Constraint, Constraints, DFSchemaRef, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
@@ -897,6 +897,21 @@ impl TableProvider for IndexedMemTable {
         self.mark_dirty();
         self.inner.truncate(state).await
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // A merge can insert, update, or delete rows; every stored RowLocation is now invalid.
+        self.mark_dirty();
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 #[async_trait]
@@ -1005,6 +1020,17 @@ impl DisplayAs for IndexedLookupExec {
 impl ExecutionPlan for IndexedLookupExec {
     fn name(&self) -> &'static str {
         "IndexedLookupExec"
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -1786,7 +1812,9 @@ mod tests {
                 .scan(&session_state, None, std::slice::from_ref(&filter), None)
                 .await
                 .expect("scan");
-            let stats = plan.partition_statistics(None).expect("statistics");
+            let stats = datafusion::physical_plan::StatisticsContext::new()
+                .compute(&*plan, &datafusion::physical_plan::StatisticsArgs::new())
+                .expect("statistics");
             assert_eq!(
                 stats.num_rows,
                 datafusion::common::stats::Precision::Exact(expected),

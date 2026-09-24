@@ -1083,7 +1083,7 @@ impl AcceleratorExternalTableBuilder {
                 .build()
             })?,
             name: self.table_name.clone(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

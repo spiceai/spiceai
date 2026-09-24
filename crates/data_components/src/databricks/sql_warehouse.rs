@@ -22,9 +22,9 @@ use arrow::{
 use arrow_tools::map_entries::MapEntriesNormalizer;
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::EmptyRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference, datasource::TableProvider, error::DataFusionError,
+    execution::SendableRecordBatchStream, physical_plan::EmptyRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{

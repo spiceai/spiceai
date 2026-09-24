@@ -39,13 +39,13 @@ use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signatu
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
+    common::TableReference,
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{Operator, SortExpr, expr::ScalarFunction},
     physical_plan::ExecutionPlan,
     prelude::{Expr, lit},
     scalar::ScalarValue,
-    sql::TableReference,
 };
 
 use datafusion_expr::{
@@ -1160,11 +1160,11 @@ mod tests {
     use crate::model::EmbeddingModelStore;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
     use datafusion::datasource::MemTable;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
-    use datafusion::common::TableReference;
     use datafusion_expr::TableProviderFilterPushDown;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};

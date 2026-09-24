@@ -31,8 +31,8 @@ use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, DataConnectorResult,
 };
-use datafusion::datasource::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
@@ -103,7 +103,7 @@ impl DuckDB {
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
                     connector_component: params.component.clone(),
-                    source,
+                    source: Box::new(source),
                 })?
                 .with_unsupported_type_action(
                     params
@@ -128,7 +128,7 @@ impl DuckDB {
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
                     connector_component: params.component.clone(),
-                    source,
+                    source: Box::new(source),
                 })?
                 .with_unsupported_type_action(
                     params

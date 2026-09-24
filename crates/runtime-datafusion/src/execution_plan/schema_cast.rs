@@ -216,6 +216,20 @@ impl fmt::Debug for SchemaCastScanExec {
 // for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for SchemaCastScanExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        // Sole input is a declared child (see `children()`) that the generic tree
+        // walk driving this method already visits separately — this node holds no
+        // physical expressions of its own.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
         None
     }
@@ -247,8 +261,23 @@ impl ExecutionPlan for SchemaCastScanExec {
         check_default_invariants(self, check)
     }
 
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        // This exec casts values in place and produces no dynamic expressions
+        // of its own (see the `apply_expressions` note above).
+        Vec::new()
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn input_distribution_requirements(
+        &self,
+    ) -> datafusion::physical_plan::InputDistributionRequirements {
+        datafusion::physical_plan::InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -267,9 +296,10 @@ impl ExecutionPlan for SchemaCastScanExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
             Ok(Arc::new(Self::new(
@@ -283,9 +313,37 @@ impl ExecutionPlan for SchemaCastScanExec {
         }
     }
 
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_new_children(children)
+    }
+
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Keep,
+            ),
+        )
     }
 
     fn repartitioned(
@@ -320,8 +378,37 @@ impl ExecutionPlan for SchemaCastScanExec {
         self.input.metrics()
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; statistics_from_inputs is the modern path"
+    )]
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().cloned().ok_or_else(|| {
+            DataFusionError::Internal("SchemaCastScanExec requires exactly one input".to_string())
+        })
+    }
+
+    fn child_stats_requests(
+        &self,
+        partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        vec![datafusion::physical_plan::ChildStats::At(partition)]
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 
     // Allow optimizer to push limits through to inputs

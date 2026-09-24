@@ -505,6 +505,19 @@ impl ExecutionPlan for MaintainedAggregateExec {
         "MaintainedAggregateExec"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        // `inner` is a declared child (see `children()` below) that the generic
+        // tree walk driving this method already visits separately.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn static_name() -> &'static str
     where
         Self: Sized,
@@ -2755,6 +2768,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated with_new_children shim directly"
+    )]
     fn maintained_aggregate_exec_exposes_inner_child() -> DataFusionResult<()> {
         let exec = Arc::new(MaintainedAggregateExec::try_new(batch())?);
 

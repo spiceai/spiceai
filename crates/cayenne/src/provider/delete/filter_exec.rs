@@ -441,6 +441,18 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
     fn name(&self) -> &'static str {
         "KeyBasedDeletionFilterExec"
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        // `input` is a declared child that the generic tree walk driving this
+        // method already visits separately.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
@@ -458,6 +470,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         vec![true]
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; this impl predates statistics_from_inputs"
+    )]
     fn partition_statistics(
         &self,
         partition: Option<usize>,
@@ -954,6 +970,18 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
     fn name(&self) -> &'static str {
         "Int64PkDeletionFilterExec"
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        // `input` is a declared child that the generic tree walk driving this
+        // method already visits separately.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
@@ -971,6 +999,10 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         vec![true]
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; this impl predates statistics_from_inputs"
+    )]
     fn partition_statistics(
         &self,
         partition: Option<usize>,
@@ -1415,6 +1447,17 @@ mod tests {
             vec![&self.inner]
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<
+                datafusion_common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn with_new_children(
             self: Arc<Self>,
             children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1815,6 +1858,10 @@ mod tests {
     /// deletions exist, so a clean scan keeps its `Exact` per-partition stats.
     /// This asserts the precondition the deletion-filter downgrade relaxes from.
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn clean_scan_reports_exact_partition_statistics() {
         let scan = exact_int64_scan();
         let stats = scan
@@ -1828,6 +1875,10 @@ mod tests {
     /// join-side selection / pruning still has a number to work with instead of
     /// the `Unknown` the `ExecutionPlan` default would return.
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn int64_deletion_filter_downgrades_partition_statistics_to_inexact() {
         let exec = Int64PkDeletionFilterExec::new(
             exact_int64_scan(),
@@ -1852,6 +1903,10 @@ mod tests {
 
     /// Same downgrade for the byte-keyed (composite/non-integer PK) filter.
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn key_based_deletion_filter_downgrades_partition_statistics_to_inexact() {
         let exec = KeyBasedDeletionFilterExec::new(
             exact_int64_scan(),
@@ -1876,6 +1931,10 @@ mod tests {
     /// the LIVE relation, not the pre-deletion on-disk count. Per-partition stats
     /// keep the upper bound, since the per-partition delete distribution is unknown.
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn deletion_filter_aggregate_num_rows_is_delete_aware() {
         // 3-row scan, 1 deleted key (Ignore: the delete is never overridden).
         let exec = Int64PkDeletionFilterExec::new(
@@ -1899,6 +1958,10 @@ mod tests {
     /// bound: only deletions newer than the cutoff apply and we don't cheaply
     /// know how many that is, so no subtraction.
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn deletion_filter_protected_snapshot_keeps_upper_bound() {
         let exec = Int64PkDeletionFilterExec::new(
             exact_int64_scan(),
@@ -1919,6 +1982,10 @@ mod tests {
     /// catastrophically under-sizing a heavily-upserted CDC table (the dangerous
     /// over-subtraction direction that would wrongly broadcast a large relation).
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn deletion_filter_does_not_subtract_reinserted_upserts() {
         // 2 deleted keys, 1 of them re-inserted (upsert, insert_seq > delete_seq)
         // -> net removed = delete_len(2) - insert_len(1) = 1.
@@ -1944,6 +2011,10 @@ mod tests {
     /// collapsing `num_rows` toward 0 — collapsing is the dangerous direction (it
     /// can make a non-empty relation look empty and get it wrongly broadcast).
     #[test]
+    #[expect(
+        deprecated,
+        reason = "exercises the still-required deprecated partition_statistics method directly"
+    )]
     fn deletion_filter_keeps_upper_bound_when_deletes_exceed_rows() {
         let tombstones = Arc::new(DeletionIndex::from_map(HashMap::from([
             (1_i64, 5_i64),

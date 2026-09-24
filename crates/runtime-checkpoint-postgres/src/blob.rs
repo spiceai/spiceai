@@ -51,7 +51,9 @@ impl BlobCheckpointStore for PostgresBlobCheckpointStore {
             .pool
             .connect_direct()
             .await
-            .map_err(|source| CheckpointError::Store { source })?;
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
         let table = self.table_name;
 
         // Ensure the sidecar table exists so a fresh accelerator reads as "no
@@ -105,7 +107,9 @@ impl BlobCheckpointStore for PostgresBlobCheckpointStore {
             .pool
             .connect_direct()
             .await
-            .map_err(|source| CheckpointError::Store { source })?;
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
         let table = self.table_name;
 
         let create_table = format!(

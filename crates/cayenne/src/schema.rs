@@ -322,9 +322,8 @@ mod tests {
     use arrow_tools::type_rewrite::apply_rules;
     use datafusion_table_providers::UnsupportedTypeAction;
     use vortex::VortexSessionDefault;
-    use vortex::array::ArrayRef as VortexArrayRef;
     use vortex::array::VortexSessionExecute;
-    use vortex::arrow::{ArrowSessionExt, FromArrowArray};
+    use vortex::arrow::ArrowSessionExt;
     use vortex_session::VortexSession;
 
     use super::{
@@ -533,7 +532,9 @@ mod tests {
     /// Round-trip an empty array of `data_type` through Vortex's Arrow conversions.
     fn vortex_can_encode(session: &VortexSession, data_type: &DataType) -> Result<(), String> {
         let empty = new_empty_array(data_type);
-        let array = VortexArrayRef::from_arrow(empty.as_ref(), true)
+        let array = session
+            .arrow()
+            .from_arrow_array(empty, true)
             .map_err(|e| format!("writing it fails: {e}"))?;
         session
             .arrow()

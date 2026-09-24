@@ -33,12 +33,12 @@ use arrow::datatypes::SchemaRef;
 use ballista_core::JobId;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::job_status;
-use ballista_core::serde::scheduler::PartitionLocation;
+use ballista_core::serde::scheduler::{PartitionLocation, ShuffleLayout};
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::scheduler_server::job_state_event::JobState as BallistaJobState;
 use cache::key::RawCacheKey;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::common::TableReference;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
@@ -1064,11 +1064,18 @@ impl PartitionResultStream {
                 )))
             })?;
 
+            let layout = if location.is_sort_shuffle {
+                ShuffleLayout::Sort
+            } else {
+                ShuffleLayout::Passthrough
+            };
             let stream = client
-                .fetch_partition(
+                .fetch_partition_proxied(
                     &executor_meta.id,
                     &location.partition_id,
                     &location.path,
+                    location.file_id,
+                    layout,
                     &executor_meta.host,
                     executor_meta.port,
                     USE_FLIGHT_TRANSFER,

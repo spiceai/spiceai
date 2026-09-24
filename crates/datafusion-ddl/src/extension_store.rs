@@ -26,9 +26,9 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
-use datafusion::common::{ResolvedTableReference, TableReference};
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
 

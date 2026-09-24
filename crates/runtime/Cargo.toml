@@ -58,9 +58,9 @@ datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-ddl = { path = "../datafusion-ddl" }
 datafusion-dml = { path = "../datafusion-dml" }
-datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules", features = ["proto"] }
 datafusion-proto = { workspace = true }
-datafusion-spark.workspace = true
+datafusion-spark = { workspace = true, features = ["core"] }
 datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
@@ -146,15 +146,15 @@ runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
-runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-datafusion = { path = "../runtime-datafusion", features = ["proto"] }
 runtime-drasi = { path = "../runtime-drasi" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }
-runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-index = { path = "../runtime-datafusion-index", features = ["proto"] }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-tls = { path = "../runtime-tls" }
-runtime-execution-plans = { path = "../runtime-execution-plans" }
+runtime-execution-plans = { path = "../runtime-execution-plans", features = ["proto"] }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
@@ -165,7 +165,7 @@ runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-status = { path = "../runtime-status" }
-runtime-table-partition = { path = "../runtime-table-partition" }
+runtime-table-partition = { path = "../runtime-table-partition", features = ["proto"] }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
@@ -208,7 +208,7 @@ tracing-subscriber.workspace = true
 turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util", features = ["datafusion", "http"] }
+util = { path = "../util", features = ["datafusion", "http", "proto"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = "9", features = [
     "axum",
@@ -255,7 +255,7 @@ connector-flightsql = { path = "../data-connectors/connector-flightsql" }
 connector-ftp = { path = "../data-connectors/connector-ftp" }
 connector-gcs = { path = "../data-connectors/connector-gcs" }
 connector-git = { path = "../data-connectors/connector-git" }
-connector-github = { path = "../data-connectors/connector-github" }
+connector-github = { path = "../data-connectors/connector-github", features = ["proto"] }
 connector-glue = { path = "../data-connectors/connector-glue" }
 connector-graphql = { path = "../data-connectors/connector-graphql" }
 connector-imap = { path = "../data-connectors/connector-imap" }
@@ -435,7 +435,7 @@ vortex = []
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
 
 [target.'cfg(not(windows))'.dependencies]
-cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
+cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider", "proto"] }
 vortex.workspace = true
 vortex-datafusion.workspace = true
 

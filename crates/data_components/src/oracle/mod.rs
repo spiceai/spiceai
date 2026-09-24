@@ -21,12 +21,12 @@ use snafu::{ResultExt, Snafu};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     logical_expr::{Operator, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
     prelude::Expr,
-    sql::TableReference,
 };
 
 use std::sync::Arc;

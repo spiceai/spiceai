@@ -27,9 +27,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::Result as DataFusionResult,
     physical_plan::{PhysicalExpr, SendableRecordBatchStream},
-    sql::{TableReference, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,

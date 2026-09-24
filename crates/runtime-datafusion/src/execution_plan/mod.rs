@@ -99,10 +99,18 @@ pub fn wrap_with_filter(
 
     tracing::trace!("Wrapping execution plan with FilterExec for: {joined_filters}");
 
+    // No scalar subqueries in a scan filter, so an empty planning context (no
+    // lambda/subquery state to thread through) is correct here.
+    let planning_ctx =
+        datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion::common::HashMap::default(),
+            datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
     let physical_expr = create_physical_expr(
         &joined_filters,
         &input_dfschema,
         session_state.execution_props(),
+        &planning_ctx,
     )?;
 
     let filtered_input = FilterExec::try_new(physical_expr, input)?;
@@ -130,10 +138,18 @@ pub(crate) fn filter_plan(
 
     tracing::trace!("Creating physical expression for filter: {joined_filters}");
 
+    // No scalar subqueries in a scan filter, so an empty planning context (no
+    // lambda/subquery state to thread through) is correct here.
+    let planning_ctx =
+        datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion::common::HashMap::default(),
+            datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
     let physical_expr = create_physical_expr(
         &joined_filters,
         &input_dfschema,
         scan_params.state.execution_props(),
+        &planning_ctx,
     )?;
 
     let filtered_input = FilterExec::try_new(physical_expr, input)?;

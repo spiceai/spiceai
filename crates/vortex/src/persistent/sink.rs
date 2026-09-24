@@ -51,10 +51,8 @@ use object_store::path::Path;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use vortex::array::ArrayRef;
 use vortex::array::stream::ArrayStreamAdapter;
-use vortex::arrow::FromArrowArray;
-use vortex::arrow::FromArrowType;
+use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
@@ -422,7 +420,13 @@ impl FileSink for VortexSink {
         mut file_stream_rx: DemuxedStreamReceiver,
         object_store: Arc<dyn ObjectStore>,
     ) -> DFResult<u64> {
-        let dtype = DType::from_arrow(get_writer_schema(&self.config));
+        let dtype = self
+            .session
+            .arrow()
+            .from_arrow_schema(&get_writer_schema(&self.config))
+            .map_err(|e| {
+                exec_datafusion_err!("Failed to convert writer schema to a Vortex dtype: {e}")
+            })?;
         let mut write_tasks: JoinSet<DFResult<u64>> = JoinSet::new();
 
         while let Some((path, mut rx)) = file_stream_rx.recv().await {
@@ -511,7 +515,13 @@ impl DataSink for VortexSink {
             .runtime_env()
             .object_store(&self.config.object_store_url)?;
         let writer_schema = get_writer_schema(&self.config);
-        let dtype = DType::from_arrow(writer_schema);
+        let dtype = self
+            .session
+            .arrow()
+            .from_arrow_schema(&writer_schema)
+            .map_err(|e| {
+                exec_datafusion_err!("Failed to convert writer schema to a Vortex dtype: {e}")
+            })?;
         let write_id = Uuid::now_v7().simple().to_string();
         let base_output_path = self.base_output_path()?;
         let partition_column_names = self
@@ -1220,7 +1230,11 @@ fn start_file_writer(
                 )
             })?;
 
-        let stream = receiver.map(|rb| ArrayRef::from_arrow(rb, false));
+        let array_session = session.clone();
+        let stream = receiver.map(move |rb| {
+            let schema = rb.schema();
+            array_session.arrow().from_arrow_record_batch(rb, &schema)
+        });
         let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
         let summary = session
@@ -1439,8 +1453,7 @@ mod tests {
     use datafusion_physical_expr::expressions::Column;
     use object_store::path::Path;
     use vortex::VortexSessionDefault;
-    use vortex::arrow::FromArrowType;
-    use vortex::dtype::DType;
+    use vortex::arrow::ArrowSessionExt;
     use vortex::file::WriteSummary;
     use vortex::session::VortexSession;
 
@@ -2865,11 +2878,15 @@ mod tests {
         shard_spec: ShardSpec,
         memory_pool: &Arc<dyn MemoryPool>,
     ) -> datafusion_common::Result<Vec<(Path, WriteSummary)>> {
-        let dtype = DType::from_arrow(Arc::clone(&schema));
+        let session = VortexSession::default();
+        let dtype = session
+            .arrow()
+            .from_arrow_schema(&schema)
+            .expect("schema should convert to a Vortex dtype");
         let base = ListingTableUrl::parse("file:///table/")
             .expect("file:///table/ should parse as a listing url");
         write_record_batch_stream_to_files(
-            VortexSession::default(),
+            session,
             store,
             dtype,
             data,

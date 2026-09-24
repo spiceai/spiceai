@@ -22,9 +22,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::optimizer::OptimizerRule;
-use datafusion::common::TableReference;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;

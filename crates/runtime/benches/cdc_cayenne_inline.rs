@@ -41,9 +41,9 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError,
     changes_schema,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion::common::TableReference;
 use futures::StreamExt;
 use futures::stream as fstream;
 use runtime::accelerated::refresh::Refresh;

@@ -22,10 +22,10 @@ limitations under the License.
 //! for the analyzer rule to consume, strips them from the statement, and
 //! delegates the cleaned statement to `DataFusion`'s standard planner.
 
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::common::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     ColumnOption, CreateTable, CreateTableOptions, SqlOption, Statement as SQLStatement,

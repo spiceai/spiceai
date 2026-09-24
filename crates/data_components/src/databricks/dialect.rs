@@ -137,13 +137,13 @@ fn array_has_to_array_contains(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::TableReference;
     use datafusion::common::{Column, Spans};
     use datafusion::functions_nested::array_has::array_has_udf;
     use datafusion::functions_nested::make_array::make_array_udf;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::prelude::lit;
     use datafusion::scalar::ScalarValue;
-    use datafusion::common::TableReference;
     use datafusion::sql::unparser::Unparser;
 
     fn create_dialect() -> DatabricksDialect {

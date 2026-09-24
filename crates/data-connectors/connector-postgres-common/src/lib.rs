@@ -27,6 +27,7 @@ limitations under the License.
 //! directly.
 
 use datafusion_common::utils::quote_identifier;
+use datafusion_table_providers::postgres::Error as PostgresPoolError;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
 
@@ -48,6 +49,7 @@ pub enum Error {
         "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     ConnectionFailed {
+        #[snafu(source(from(PostgresPoolError, Box::new)))]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 

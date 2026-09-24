@@ -1201,10 +1201,18 @@ impl CayenneDeletionSink {
     ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         let execution_props = ExecutionProps::new();
+        // No scalar subqueries in a delete filter, so an empty planning context
+        // (no lambda/subquery state to thread through) is correct here.
+        let planning_ctx =
+            datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+                datafusion::common::HashMap::default(),
+                datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(
+                ),
+            );
 
         let physical_filters = filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props))
+            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props, &planning_ctx))
             .collect::<datafusion_common::Result<Vec<_>>>()?;
 
         Ok(physical_filters)

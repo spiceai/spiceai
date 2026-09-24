@@ -32,14 +32,12 @@ use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
 use datafusion::{
+    common::TableReference,
     prelude::Expr,
-    sql::{
-        TableReference,
-        sqlparser::{
-            ast::{Ident, ObjectNamePart, visit_relations_mut},
-            dialect::PostgreSqlDialect,
-            parser::Parser,
-        },
+    sql::sqlparser::{
+        ast::{Ident, ObjectNamePart, visit_relations_mut},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
     },
 };
 

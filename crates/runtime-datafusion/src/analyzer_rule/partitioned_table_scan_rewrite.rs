@@ -21,6 +21,7 @@ use std::{
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     common::{
         Result, ToDFSchema,
         tree_node::{Transformed, TransformedResult},
@@ -35,7 +36,6 @@ use datafusion::{
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
-    sql::TableReference,
 };
 use parking_lot::RwLock;
 

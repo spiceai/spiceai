@@ -507,10 +507,9 @@ async fn handle_scheduler_message(
             for task in cmd.tasks {
                 match executor
                     .cancel_task(
-                        task.task_id as usize,
                         task.job_id.clone().into(),
                         task.stage_id as usize,
-                        task.partition_id as usize,
+                        task.task_id as usize,
                     )
                     .await
                 {

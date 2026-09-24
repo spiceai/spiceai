@@ -20,13 +20,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Column, Expr, JoinType, col};
-use datafusion::common::TableReference;
 use datafusion_common::ResolvedTableReference;
 use datafusion_dml::{CatalogDmlHandler, MergeParams};
 

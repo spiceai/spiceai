@@ -19,9 +19,9 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::compute::filter_record_batch;
 use datafusion::{
-    common::tree_node::TreeNodeRecursion, execution::SendableRecordBatchStream,
-    logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference, common::tree_node::TreeNodeRecursion,
+    execution::SendableRecordBatchStream, logical_expr::LogicalPlan,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 
 use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey, Sizeable};

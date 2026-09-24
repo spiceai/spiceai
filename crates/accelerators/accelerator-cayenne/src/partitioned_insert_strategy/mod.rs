@@ -60,6 +60,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, dml::InsertOp};
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::encode_composite_key;
@@ -278,8 +279,14 @@ fn create_partition_physical_exprs(
                 &Expr::Column(Column::new_unqualified(c.name.clone())),
                 &input_dfschema,
                 &execution_props,
+                &PhysicalPlanningContext::default(),
             ),
-            other => create_physical_expr(other, &input_dfschema, &execution_props),
+            other => create_physical_expr(
+                other,
+                &input_dfschema,
+                &execution_props,
+                &PhysicalPlanningContext::default(),
+            ),
         })
         .collect()
 }

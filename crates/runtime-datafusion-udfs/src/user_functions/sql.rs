@@ -42,12 +42,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
-use datafusion::common::{Column, DFSchema, DataFusionError, Result as DataFusionResult, Spans};
+use datafusion::common::{
+    Column, DFSchema, DataFusionError, Result as DataFusionResult, Spans, TableReference,
+};
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
-    TableScan, Volatility as DfVolatility,
+    TableScanBuilder, Volatility as DfVolatility,
     simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
@@ -55,7 +57,6 @@ use datafusion::physical_plan::{PhysicalExpr, expressions::CastExpr};
 use datafusion::prelude::{DataFrame, Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::{
-    TableReference,
     parser::DFParser,
     sqlparser::{
         ast,
@@ -331,13 +332,11 @@ impl ScalarUDFImpl for SqlScalarTableArgUdf {
         #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
-        let table_scan = TableScan::try_new(
+        let table_scan = TableScanBuilder::new(
             TableReference::bare(format!("{}_result", self.name)),
             table_source,
-            None,
-            vec![],
-            None,
-        )?;
+        )
+        .build()?;
         Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
             Subquery {
                 subquery: Arc::new(LogicalPlan::TableScan(table_scan)),

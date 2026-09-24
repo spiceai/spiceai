@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use datafusion_common::ScalarValue;
-use vortex::arrow::FromArrowType;
+use vortex::arrow::ArrowSession;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
@@ -103,7 +103,7 @@ impl TryToDataFusion<ScalarValue> for Scalar {
             DType::Utf8(_) => {
                 let value = match self.as_utf8().value() {
                     Some(value) => {
-                        let bytes = Vec::<u8>::from(value.clone().into_inner().into_inner());
+                        let bytes = value.clone().into_inner().to_vec();
                         match String::from_utf8(bytes) {
                             Ok(value) => Some(value),
                             Err(err) => {
@@ -116,17 +116,15 @@ impl TryToDataFusion<ScalarValue> for Scalar {
 
                 ScalarValue::Utf8(value)
             }
-            DType::Binary(_) => ScalarValue::Binary(
-                self.as_binary()
-                    .value()
-                    .cloned()
-                    .map(|b| Vec::<u8>::from(b.into_inner())),
-            ),
+            DType::Binary(_) => {
+                ScalarValue::Binary(self.as_binary().value().cloned().map(|b| b.to_vec()))
+            }
             DType::Struct(..) => vortex_bail!("struct scalar conversion is not supported"),
             DType::List(..) => vortex_bail!("list scalar conversion is not supported"),
             DType::FixedSizeList(..) => {
                 vortex_bail!("fixed-size list scalar conversion is not supported")
             }
+            DType::Map(..) => vortex_bail!("map scalar conversion is not supported"),
             DType::Union(..) => vortex_bail!("union scalar conversion is not supported"),
             DType::Variant(_) => vortex_bail!("variant scalar conversion is not supported"),
             DType::Extension(ext) => {
@@ -252,7 +250,8 @@ impl FromDataFusion<ScalarValue> for Scalar {
             ScalarValue::Date32(v)
             | ScalarValue::Time32Second(v)
             | ScalarValue::Time32Millisecond(v) => {
-                let dtype = DType::from_arrow((&value.data_type(), Nullability::Nullable));
+                let dtype = ArrowSession::default()
+                    .from_arrow_datatype(&value.data_type(), Nullability::Nullable)?;
                 Scalar::try_new(dtype, v.map(vortex::scalar::ScalarValue::from))?
             }
             ScalarValue::Date64(v)
@@ -262,7 +261,8 @@ impl FromDataFusion<ScalarValue> for Scalar {
             | ScalarValue::TimestampMillisecond(v, _)
             | ScalarValue::TimestampMicrosecond(v, _)
             | ScalarValue::TimestampNanosecond(v, _) => {
-                let dtype = DType::from_arrow((&value.data_type(), Nullability::Nullable));
+                let dtype = ArrowSession::default()
+                    .from_arrow_datatype(&value.data_type(), Nullability::Nullable)?;
                 Scalar::try_new(dtype, v.map(vortex::scalar::ScalarValue::from))?
             }
             ScalarValue::Decimal32(decimal, precision, scale) => {
@@ -751,8 +751,7 @@ mod tests {
             .value()
             .cloned()
             .expect("converted scalar should hold a binary value")
-            .into_inner()
-            .into();
+            .to_vec();
         assert_eq!(result_bytes, vec![1u8, 2, 3, 4, 5]);
     }
 }

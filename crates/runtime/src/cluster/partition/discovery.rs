@@ -33,7 +33,7 @@ use datafusion::sql::sqlparser::{
     dialect::GenericDialect,
     parser::Parser,
 };
-use datafusion::{prelude::SessionContext, sql::TableReference};
+use datafusion::{common::TableReference, prelude::SessionContext};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use util::session_state::builder_from_existing;

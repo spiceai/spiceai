@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::common::{Column, UnnestOptions};
 use datafusion::datasource::{DefaultTableSource, ViewTable};
 use datafusion::error::DataFusionError;
@@ -22,7 +23,6 @@ use datafusion::functions::math::isnan;
 use datafusion::functions_aggregate::expr_fn::{avg, first_value, max, sum};
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::prelude::{array_element, substring};
-use datafusion::common::TableReference;
 use datafusion_expr::expr::{ScalarFunction, WindowFunction, WindowFunctionDefinition};
 use datafusion_expr::{
     Expr as LogicalExpr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
@@ -743,8 +743,8 @@ mod tests {
     use super::*;
     use crate::{embedding_col, offset_col};
     use datafusion::catalog::TableProvider;
-    use datafusion::common::utils::quote_identifier;
     use datafusion::common::TableReference;
+    use datafusion::common::utils::quote_identifier;
     use datafusion_expr::expr::WindowFunctionDefinition;
     use spicepod::component::embeddings::EmbeddingAggregation;
 

@@ -29,7 +29,7 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, sql::TableReference};
+use datafusion::{common::TableReference, error::DataFusionError};
 use itertools::Itertools;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::QueryEngine;

@@ -26,15 +26,15 @@ use arrow::{compute::concat_batches, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::Constraints,
+    common::{Constraints, tree_node::TreeNodeRecursion},
     datasource::TableProvider,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, metrics::MetricsSet,
-        stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+        metrics::MetricsSet, stream::RecordBatchStreamAdapter,
     },
 };
 use futures::StreamExt;
@@ -218,6 +218,19 @@ impl TableProvider for UpsertDedupTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.inner.truncate(state).await
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 /// An execution plan that applies deduplication to batches before passing them downstream.
@@ -305,6 +318,13 @@ impl ExecutionPlan for UpsertDedupExec {
             self.constraints.clone(),
             self.upsert_options.clone(),
         )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn execute(
@@ -841,7 +861,12 @@ mod tests {
         ));
 
         let rebuilt = Arc::clone(&dedup)
-            .with_new_children(vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])])
+            .replace_children(
+                vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
             .expect("rebuild with one child");
 
         assert_eq!(rows_of(rebuilt).await, vec![(1, "second".to_string())]);
@@ -894,13 +919,23 @@ mod tests {
         ));
 
         Arc::clone(&dedup)
-            .with_new_children(vec![])
+            .replace_children(
+                vec![],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
             .expect_err("no children must be rejected");
         dedup
-            .with_new_children(vec![
-                source(&[vec![batch(&[(1, "a")])]]),
-                source(&[vec![batch(&[(2, "b")])]]),
-            ])
+            .replace_children(
+                vec![
+                    source(&[vec![batch(&[(1, "a")])]]),
+                    source(&[vec![batch(&[(2, "b")])]]),
+                ],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
             .expect_err("two children must be rejected");
     }
 }

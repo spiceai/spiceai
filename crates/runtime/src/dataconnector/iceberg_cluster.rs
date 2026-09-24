@@ -36,9 +36,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
 use datafusion::common::Result as DFResult;
+use datafusion::common::TableReference;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::common::TableReference;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 
 use runtime_execution_plans::{IcebergScanExec, session_is_distributed};

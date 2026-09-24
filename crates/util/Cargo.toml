@@ -27,12 +27,16 @@ tracing-subscriber.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 datafusion = { workspace = true, optional = true }
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 parking_lot.workspace = true
 
 [features]
 default = ["datafusion"]
 datafusion = ["dep:datafusion"]
 http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["datafusion", "dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

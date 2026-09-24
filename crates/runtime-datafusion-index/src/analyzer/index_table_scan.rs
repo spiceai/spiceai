@@ -26,6 +26,7 @@ use std::{
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
+    catalog::Session,
     common::{
         DFSchemaRef, Statistics,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -33,11 +34,16 @@ use datafusion::{
     config::ConfigOptions,
     datasource::DefaultTableSource,
     error::{DataFusionError, Result},
-    execution::{SendableRecordBatchStream, SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
+    execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::{
+        Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+        physical_planning_context::PhysicalPlanningContext,
+    },
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr,
+        ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution,
+        ExecutionPlan, InputDistributionRequirements, PhysicalExpr, ReplaceChildrenOptions,
+        StatisticsArgs,
         execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -300,7 +306,8 @@ impl ExtensionPlanner for IndexTableScanExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(index_table_scan_node) = node.as_any().downcast_ref::<IndexTableScanNode>() else {
             return Ok(None);
@@ -372,6 +379,20 @@ impl ExecutionPlan for IndexerExec {
         None
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // `input_exec` is a declared child (see `children()` below) that the generic
+        // tree walk driving this method already visits separately — delegating to it
+        // here would double-report its expressions.
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn name(&self) -> &'static str {
         "IndexerExec"
     }
@@ -412,6 +433,10 @@ impl ExecutionPlan for IndexerExec {
         vec![Distribution::SinglePartition]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::SinglePartition])
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
@@ -431,13 +456,17 @@ impl ExecutionPlan for IndexerExec {
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(datafusion::error::DataFusionError::Internal(
                 "IndexerExec requires exactly one input".to_string(),
@@ -452,6 +481,27 @@ impl ExecutionPlan for IndexerExec {
             input_exec: input,
             indexes: self.indexes.clone(),
         }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_new_children(children)
     }
 
     // Allow optimizer to push limits through to inputs
@@ -563,9 +613,38 @@ impl ExecutionPlan for IndexerExec {
         self.input_exec.metrics()
     }
 
+    #[expect(
+        deprecated,
+        reason = "kept for direct callers of the deprecated method; statistics_from_inputs is the modern path"
+    )]
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input_exec.partition_statistics(partition)
     }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().cloned().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "IndexerExec requires exactly one input".to_string(),
+            )
+        })
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
+
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         // Propagate the fetch limit to the child input if it supports it
         if let Some(child_with_fetch) = self.input_exec.with_fetch(limit) {
@@ -647,9 +726,9 @@ mod test {
             array::{ArrayRef, Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
         },
-        catalog::{MemTable, TableProvider},
+        catalog::{MemTable, Session, TableProvider},
         error::DataFusionError,
-        execution::{SessionState, SessionStateBuilder, context::QueryPlanner},
+        execution::{SessionStateBuilder, context::QueryPlanner},
         logical_expr::LogicalPlan,
         physical_plan::ExecutionPlan,
         physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
@@ -674,7 +753,7 @@ mod test {
         async fn create_physical_plan(
             &self,
             logical_plan: &LogicalPlan,
-            session_state: &SessionState,
+            session_state: &dyn Session,
         ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
             let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
                 IndexTableScanExtensionPlanner::new(),

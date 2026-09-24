@@ -73,7 +73,8 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, StatisticsArgs,
+    StatisticsContext,
 };
 use futures::StreamExt;
 
@@ -158,6 +159,15 @@ impl DisplayAs for BroadcastJoinFlightSqlExec {
 impl ExecutionPlan for BroadcastJoinFlightSqlExec {
     fn name(&self) -> &'static str {
         "BroadcastJoinFlightSqlExec"
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -395,7 +405,7 @@ fn side_num_rows(side: &FederatedSide) -> Option<usize> {
     let mut total = 0usize;
     let mut any = false;
     for fe in &side.flight_execs {
-        if let Ok(stats) = fe.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(*fe, &StatisticsArgs::new())
             && let Some(n) = stats.num_rows.get_value()
         {
             total += *n;
@@ -432,7 +442,10 @@ fn safe_output_partitioning(part: &Partitioning, out_schema: &SchemaRef) -> Opti
             Some(Partitioning::Hash(mapped, *n))
         }
         Partitioning::RoundRobinBatch(n) => Some(Partitioning::RoundRobinBatch(*n)),
-        Partitioning::UnknownPartitioning(_) => None,
+        // Like a Hash key that didn't remap cleanly: this join can't establish the
+        // ordering a range partitioning promises, so leave the union unwrapped
+        // rather than claim a partitioning contract this function doesn't implement.
+        Partitioning::UnknownPartitioning(_) | Partitioning::Range(_) => None,
     }
 }
 
@@ -684,11 +697,11 @@ mod tests {
 
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
     use datafusion::common::stats::Precision;
     use datafusion::physical_expr::expressions::IsNotNullExpr;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::PartitionMode;
-    use datafusion::common::TableReference;
     use tonic::transport::Channel;
 
     fn dummy_client() -> FlightSqlClient {

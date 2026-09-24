@@ -25,10 +25,10 @@ use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     logical_expr::Operator,
     physical_plan::collect,
     prelude::{Expr, SessionContext},
-    sql::TableReference,
 };
 use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};

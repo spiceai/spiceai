@@ -32,14 +32,15 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
     write_back::WriteBackDeliverer,
 };
-use datafusion::datasource::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::postgres::{DynPostgresConnectionPool, PostgresTableFactory};
-use datafusion_table_providers::sql::db_connection_pool::dbconnection;
-use datafusion_table_providers::sql::db_connection_pool::{
-    Error as DbConnectionPoolError,
-    postgrespool::{self, PostgresConnectionPool},
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
+    self, Error as DbConnectionPoolError,
+};
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::{
+    self, PostgresConnectionPool,
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use datafusion_table_providers::util::column_reference::ColumnReference;
@@ -1183,7 +1184,11 @@ async fn build_write_back_deliverer(
     // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
     // PG10–12 equivalent. Read the server version at setup so delivery does
     // not re-decide per pass.
-    let conn = postgres.pool.connect_direct().await.map_err(&setup_error)?;
+    let conn = postgres
+        .pool
+        .connect_direct()
+        .await
+        .map_err(|source| setup_error(Box::new(source)))?;
     let server_version_num: i32 = conn
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])

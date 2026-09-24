@@ -114,7 +114,8 @@ async fn scan_bounds(
 ) -> TestResult<(Option<ScalarValue>, Option<ScalarValue>)> {
     let plan = table.scan(&ctx.state(), None, &[], None).await?;
     let index = schema().index_of(column)?;
-    let stats = plan.partition_statistics(None)?;
+    let stats = datafusion::physical_plan::StatisticsContext::new()
+        .compute(&*plan, &datafusion::physical_plan::StatisticsArgs::new())?;
     let column_stats: &ColumnStatistics = stats
         .column_statistics
         .get(index)

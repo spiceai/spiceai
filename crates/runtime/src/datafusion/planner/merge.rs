@@ -30,10 +30,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use cayenne::ddl::LocalMergePlanInput;
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Extension, LogicalPlan};
-use datafusion::common::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr as SQLExpr, MergeAction, MergeClause, MergeClauseKind,

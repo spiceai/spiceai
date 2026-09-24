@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::common::TableReference;
+use datafusion::logical_expr::LogicalPlan;
 use fundu::ParseError;
 use key::CacheKey;
 use key::RawCacheKey;

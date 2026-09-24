@@ -55,10 +55,10 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
     changes_schema, now_unix_ms,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
-use datafusion::common::TableReference;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };

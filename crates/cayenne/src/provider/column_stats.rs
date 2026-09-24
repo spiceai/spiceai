@@ -37,7 +37,8 @@ use arrow::datatypes::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
-use vortex::arrow::FromArrowType;
+use vortex::arrow::ArrowSession;
+use vortex::error::VortexExpect;
 
 /// Joint accumulator state held under a single mutex so `update()` and
 /// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`
@@ -130,14 +131,16 @@ impl ColumnStatsAccumulator {
             .fields()
             .iter()
             .map(|f| {
-                vortex::dtype::DType::from_arrow((
-                    f.data_type(),
-                    if f.is_nullable() {
-                        vortex::dtype::Nullability::Nullable
-                    } else {
-                        vortex::dtype::Nullability::NonNullable
-                    },
-                ))
+                ArrowSession::default()
+                    .from_arrow_datatype(
+                        f.data_type(),
+                        if f.is_nullable() {
+                            vortex::dtype::Nullability::Nullable
+                        } else {
+                            vortex::dtype::Nullability::NonNullable
+                        },
+                    )
+                    .vortex_expect("arrow data type to dtype")
             })
             .collect();
         // NDV sketches only for NDV-tracked columns (integers, strings, temporal);

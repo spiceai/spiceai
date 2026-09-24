@@ -395,6 +395,25 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         "HttpWithDeferredParamsExec"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+            DataFusionError,
+        >,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion, DataFusionError> {
+        // `http_side` and `build_side` are declared children (see `children()` below)
+        // that the generic tree walk driving this method already visits separately —
+        // this node holds no physical expressions of its own.
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn static_name() -> &'static str
     where
         Self: Sized,
@@ -421,6 +440,15 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
     /// No specific distribution required for either child.
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::UnspecifiedDistribution; 2]
+    }
+
+    fn input_distribution_requirements(
+        &self,
+    ) -> datafusion::physical_plan::InputDistributionRequirements {
+        datafusion::physical_plan::InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            2
+        ])
     }
 
     /// No ordering required for either child.
@@ -454,6 +482,29 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         _partition: Option<usize>,
     ) -> Result<Arc<Statistics>, DataFusionError> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema())))
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> Result<Arc<Statistics>, DataFusionError> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
+    }
+
+    fn child_stats_requests(
+        &self,
+        _partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        vec![datafusion::physical_plan::ChildStats::Skip; 2]
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>, DataFusionError> {
+        Ok(None)
     }
 
     /// Limit pushdown is not supported — the output stream is assembled
@@ -520,9 +571,10 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         vec![&self.http_side, &self.build_side]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         if children.len() != 2 {
             return Err(DataFusionError::Internal(
@@ -537,9 +589,37 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         )))
     }
 
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    #[expect(
+        deprecated,
+        reason = "compatibility shim for the still-required deprecated trait method"
+    )]
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.with_new_children(children)
+    }
+
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.replace_children(
+            children,
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Keep,
+            ),
+        )
     }
 
     fn execute(

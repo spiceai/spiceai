@@ -35,6 +35,7 @@ use tokio::sync::RwLock;
 
 use datafusion::{
     arrow::record_batch::RecordBatch,
+    common::tree_node::TreeNodeRecursion,
     error::DataFusionError,
     execution::context::TaskContext,
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
@@ -130,6 +131,17 @@ impl DisplayAs for PartitionerExec {
 impl ExecutionPlan for PartitionerExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        // `partition_by` holds logical `Expr`s, not physical ones, and `input` is a
+        // declared child (see `children()` below) that the generic tree walk driving
+        // this method already visits separately — delegating to it here would
+        // double-report its expressions.
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -345,7 +357,19 @@ fn create_physical_expr(
 ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
     let input_dfschema = DFSchema::try_from(schema)?;
     let execution_props = ExecutionProps::new();
-    datafusion::physical_expr::create_physical_expr(expr, &input_dfschema, &execution_props)
+    // No scalar subqueries in a partition-key expression, so an empty planning
+    // context (no lambda/subquery state to thread through) is correct here.
+    let planning_ctx =
+        datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion::common::HashMap::default(),
+            datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
+    datafusion::physical_expr::create_physical_expr(
+        expr,
+        &input_dfschema,
+        &execution_props,
+        &planning_ctx,
+    )
 }
 
 fn filter_batch_by_indices(
@@ -396,6 +420,13 @@ impl fmt::Debug for PartitionInputExec {
 impl ExecutionPlan for PartitionInputExec {
     fn name(&self) -> &'static str {
         "PartitionInsertExec"
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn schema(&self) -> SchemaRef {

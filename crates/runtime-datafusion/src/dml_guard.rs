@@ -144,6 +144,25 @@ pub fn ensure_dml_restriction_reaches_the_table(plan: &LogicalPlan) -> Result<()
         // An insert names its rows outright, and a truncate means every row on
         // purpose; neither has a condition that could be dropped.
         WriteOp::Insert(_) | WriteOp::Ctas | WriteOp::Truncate => return Ok(()),
+        // A MERGE's ON-condition and WHEN-clauses restrict which rows are
+        // updated/deleted exactly like an UPDATE/DELETE's WHERE clause, but this
+        // guard has not been analyzed against its plan shape. Per this module's
+        // own rule, anything unanalyzed is refused rather than approximated.
+        WriteOp::MergeInto(_) => {
+            return Err(DataFusionError::NotImplemented(
+                "MERGE statements are not yet supported by the row-condition safety guard"
+                    .to_string(),
+            ));
+        }
+        // `WriteOp` is `#[non_exhaustive]`: a future DataFusion release can add a
+        // variant this guard has not been analyzed against. Per this module's own
+        // rule, an unrecognized write is refused rather than approximated.
+        _ => {
+            return Err(DataFusionError::NotImplemented(
+                "This write statement is not yet supported by the row-condition safety guard"
+                    .to_string(),
+            ));
+        }
     };
 
     let mut found = None;

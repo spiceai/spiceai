@@ -36,10 +36,10 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use data_http_rate_control as http_rate_control;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::common::TableReference;
 use opentelemetry::KeyValue;
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,

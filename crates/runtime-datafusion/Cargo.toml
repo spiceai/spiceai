@@ -22,6 +22,8 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json.workspace = true
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 datafusion-table-providers.workspace = true
 futures.workspace = true
 itertools.workspace = true
@@ -50,13 +52,17 @@ uuid.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
-datafusion-spark.workspace = true
+datafusion-spark = { workspace = true, features = ["core"] }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true
 insta.workspace = true
 object_store.workspace = true
 regex.workspace = true
 tokio.workspace = true
+
+[features]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

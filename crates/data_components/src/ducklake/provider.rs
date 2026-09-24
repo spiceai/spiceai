@@ -25,8 +25,8 @@ use std::sync::{Arc, RwLock};
 use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
-use datafusion::error::Result as DFResult;
 use datafusion::common::TableReference;
+use datafusion::error::Result as DFResult;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
@@ -179,9 +179,9 @@ impl DuckLakeCatalogProvider {
 
         // Query schemas from the attached `DuckLake` catalog using `information_schema`
         let schema_names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let conn = pool
-                .connect_sync()
-                .map_err(|e| Error::ConnectionFailed { source: e })?;
+            let conn = pool.connect_sync().map_err(|e| Error::ConnectionFailed {
+                source: Box::new(e),
+            })?;
 
             let duckdb_wrapper = conn
                 .as_any()
@@ -286,7 +286,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
 
         let conn = pool
             .connect_sync()
-            .map_err(datafusion::error::DataFusionError::External)?;
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let duckdb_wrapper = conn
             .as_any()
@@ -386,7 +386,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
 
         let conn = pool
             .connect_sync()
-            .map_err(datafusion::error::DataFusionError::External)?;
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let duckdb_wrapper = conn
             .as_any()
@@ -510,9 +510,9 @@ impl DuckLakeSchemaProvider {
 
         // Query tables from the attached `DuckLake` catalog using `information_schema`
         let table_names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let conn = pool
-                .connect_sync()
-                .map_err(|e| Error::ConnectionFailed { source: e })?;
+            let conn = pool.connect_sync().map_err(|e| Error::ConnectionFailed {
+                source: Box::new(e),
+            })?;
 
             let duckdb_wrapper = conn
                 .as_any()
@@ -687,7 +687,7 @@ impl SchemaProvider for DuckLakeSchemaProvider {
 
         let conn = pool
             .connect_sync()
-            .map_err(datafusion::error::DataFusionError::External)?;
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let duckdb_wrapper = conn
             .as_any()

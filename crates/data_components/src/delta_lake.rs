@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::array::{Array, make_array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_tools::type_rewrite::relabel_array_data;
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, exec_err};
 use datafusion::config::TableParquetOptions;
@@ -45,10 +46,6 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
-use datafusion::common::TableReference;
-use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::ScanFile;
@@ -56,6 +53,9 @@ use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
+use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::storage::store_from_url_opts;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
@@ -416,10 +416,14 @@ impl DeltaTable {
                 })
                 .collect::<Vec<_>>()
         });
-        let table_schema = datafusion_datasource::TableSchema::new(
-            Arc::clone(schema),
-            partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
-        );
+        let table_schema = datafusion_datasource::TableSchema::builder(Arc::clone(schema))
+            .with_table_partition_cols(
+                partition_cols
+                    .iter()
+                    .map(|f| Arc::new(f.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .build();
         tracing::trace!(
             table_parquet_options = ?self.table_parquet_options,
             "Creating Delta Lake ParquetSource"
@@ -906,6 +910,13 @@ fn map_delta_data_type_to_arrow_data_type(
             }
             delta_kernel::schema::PrimitiveType::Decimal(d) => {
                 DataType::Decimal128(d.precision(), d.scale() as i8)
+            }
+            delta_kernel::schema::PrimitiveType::Void => DataType::Null,
+            delta_kernel::schema::PrimitiveType::IntervalYearMonth => {
+                DataType::Interval(IntervalUnit::YearMonth)
+            }
+            delta_kernel::schema::PrimitiveType::IntervalDayTime => {
+                DataType::Interval(IntervalUnit::DayTime)
             }
         },
         delta_kernel::schema::DataType::Array(array_type) => DataType::List(Arc::new(Field::new(

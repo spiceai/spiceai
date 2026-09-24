@@ -26,10 +26,9 @@ use cache::{
     to_cached_record_batch_stream,
 };
 use datafusion::{
-    common::ParamValues,
+    common::{ParamValues, TableReference},
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
-    sql::TableReference,
 };
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,

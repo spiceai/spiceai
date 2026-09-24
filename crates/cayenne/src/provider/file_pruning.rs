@@ -64,10 +64,18 @@ pub(crate) fn build_listing_pruning_predicate(
     };
 
     let execution_props = ExecutionProps::new();
+    // No scalar subqueries in a pruning predicate, so an empty planning context
+    // (no lambda/subquery state to thread through) is correct here.
+    let planning_ctx =
+        datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::new(
+            datafusion::common::HashMap::default(),
+            datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults::default(),
+        );
     Ok(Some(create_physical_expr(
         &predicate,
         &df_schema,
         &execution_props,
+        &planning_ctx,
     )?))
 }
 

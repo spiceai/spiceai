@@ -22,14 +22,14 @@ use std::{
 
 use arrow::datatypes::Field;
 use datafusion::{
+    common::TableReference,
     common::tree_node::Transformed,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    logical_expr::{Extension, LogicalPlan, Projection, TableScan},
+    logical_expr::{Extension, LogicalPlan, Projection, TableScan, TableScanBuilder},
     optimizer::{ApplyOrder, OptimizerRule},
     prelude::{Expr, col},
     scalar::ScalarValue,
-    sql::TableReference,
 };
 use runtime_datafusion_index::analyzer::IndexTableScanNode;
 use search::index::{VectorScanTableProvider, derived_columns_from_vector_index};
@@ -127,13 +127,15 @@ impl AvoidDerivedVectorColumnOnIndexRule {
         let derived_indices: HashSet<usize> = derived_cols.keys().copied().collect();
         proj.retain(|p| !derived_indices.contains(p));
 
-        let tbl_scan = TableScan::try_new(
+        let tbl_scan = TableScanBuilder::new(
             table_scan.table_name.clone(),
             Arc::clone(&table_scan.source),
-            Some(proj),
-            table_scan.filters.clone(),
-            table_scan.fetch,
-        )?;
+        )
+        .with_projection(Some(proj))
+        .with_filters(table_scan.filters.clone())
+        .with_fetch(table_scan.fetch)
+        .with_statistics_requests(table_scan.statistics_requests.clone())
+        .build()?;
 
         // Build projection maintaining original column order. For `derived` columns, add NULL literal expressions.
         // This ensures the output schema matches the original schema, and mimics the VectorIndex having no vectors.

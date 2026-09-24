@@ -25,7 +25,7 @@ data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 adbc_core.workspace = true
 adbc_driver_manager.workspace = true
-arrow.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
 async-trait.workspace = true
 blake3.workspace = true
 data_components = { path = "../../data_components", features = ["adbc"] }

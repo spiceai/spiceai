@@ -563,7 +563,7 @@ fn join_schema() -> SchemaRef {
 }
 
 fn cayenne_scan_with_rows(schema: &SchemaRef, path: &str, rows: usize) -> Arc<dyn ExecutionPlan> {
-    let table_schema = TableSchema::new(Arc::clone(schema), Vec::new());
+    let table_schema = TableSchema::from(Arc::clone(schema));
     let source = Arc::new(BenchFileSource::new(table_schema));
     let file = PartitionedFile::from(ObjectMeta {
         location: ObjectPath::from(path),

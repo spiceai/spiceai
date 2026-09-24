@@ -39,14 +39,14 @@ pub mod tests {
     use async_trait::async_trait;
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
+        common::TableReference,
         datasource::{DefaultTableSource, TableType},
         error::DataFusionError,
         logical_expr::TableProviderFilterPushDown,
         physical_plan::{DisplayAs, ExecutionPlan},
         prelude::{Expr, SessionConfig, SessionContext},
-        sql::TableReference,
     };
-    use datafusion_expr::{LogicalPlan, TableScan};
+    use datafusion_expr::{LogicalPlan, TableScanBuilder};
     use search::index::VectorIndex;
     use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex};
     use snafu::ResultExt;
@@ -88,12 +88,28 @@ pub mod tests {
             self.0.children()
         }
 
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            self.0.apply_expressions(f)
+        }
+
         fn with_new_children(
             self: Arc<Self>,
             children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(ExplainExecutionPlan(
-                Arc::clone(&self.0).with_new_children(children)?,
+                Arc::clone(&self.0).replace_children(
+                    children,
+                    datafusion::physical_plan::ReplaceChildrenOptions::new(
+                        datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                    ),
+                )?,
                 self.1.clone(),
                 self.2,
                 self.3.clone(),
@@ -206,17 +222,17 @@ pub mod tests {
                 ))]],
             )?;
 
-            Ok(LogicalPlan::TableScan(TableScan::try_new(
-                "tbl",
-                Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
-                    mem_table,
-                    "PretendVectorIndex",
-                ))
-                    as Arc<dyn TableProvider>)),
-                None,
-                vec![],
-                None,
-            )?))
+            Ok(LogicalPlan::TableScan(
+                TableScanBuilder::new(
+                    "tbl",
+                    Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                        mem_table,
+                        "PretendVectorIndex",
+                    ))
+                        as Arc<dyn TableProvider>)),
+                )
+                .build()?,
+            ))
         }
     }
 
@@ -266,21 +282,21 @@ pub mod tests {
                     false,
                 ))],
             );
-            Ok(LogicalPlan::TableScan(TableScan::try_new(
-                "explain",
-                Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
-                    MemTable::try_new(
-                        Arc::clone(&schema),
-                        vec![vec![one_row_default_record_batch_for_schema(&schema)]],
-                    )
-                    .boxed()?,
-                    "PretendVectorIndex",
-                ))
-                    as Arc<dyn TableProvider>)),
-                None,
-                vec![],
-                None,
-            )?)
+            Ok(LogicalPlan::TableScan(
+                TableScanBuilder::new(
+                    "explain",
+                    Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                        MemTable::try_new(
+                            Arc::clone(&schema),
+                            vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                        )
+                        .boxed()?,
+                        "PretendVectorIndex",
+                    ))
+                        as Arc<dyn TableProvider>)),
+                )
+                .build()?,
+            )
             .into())
         }
     }

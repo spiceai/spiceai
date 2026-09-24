@@ -26,10 +26,10 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::catalog::CatalogProviderList;
+use datafusion::common::TableReference;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::common::TableReference;
 
 use crate::CreateTableStatementExtension;
 

@@ -105,11 +105,11 @@ use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Result as DataFusionResult;
+use datafusion::common::TableReference;
 use datafusion::functions::expr_fn::octet_length;
 use datafusion::functions_aggregate::expr_fn::{bool_or, count, max, min, sum};
 use datafusion::prelude::{DataFrame, Expr, SessionContext, cast, coalesce, col, lit};
 use datafusion::scalar::ScalarValue;
-use datafusion::common::TableReference;
 use tokio::runtime::Handle;
 
 use datafusion::logical_expr::{LogicalPlanBuilder, LogicalPlanBuilderOptions, Operator};

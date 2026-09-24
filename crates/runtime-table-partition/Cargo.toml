@@ -15,6 +15,8 @@ async-trait.workspace = true
 chrono.workspace = true
 data_components = { path = "../data_components" }
 datafusion.workspace = true
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 futures.workspace = true
 parking_lot = "0.12"
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
@@ -33,6 +35,10 @@ tempfile.workspace = true
 [[bench]]
 name = "scan_benchmark"
 harness = false
+
+[features]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

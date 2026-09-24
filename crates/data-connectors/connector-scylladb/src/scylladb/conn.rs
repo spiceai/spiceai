@@ -30,10 +30,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 const CQL_DECIMAL_PRECISION: u8 = 38;
 const CQL_DECIMAL_SCALE: i8 = 2;
 use async_stream::stream;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };

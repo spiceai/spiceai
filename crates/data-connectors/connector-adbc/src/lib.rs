@@ -21,8 +21,8 @@ use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
-use datafusion::datasource::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -90,7 +90,7 @@ pub enum Error {
     UnableToCreateConnectionPool {
         driver_location: String,
         uri: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        source: datafusion_table_providers::sql::db_connection_pool::adbcpool::Error,
     },
 
     #[snafu(display(
@@ -2466,6 +2466,7 @@ mod function_support_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatchIterator;
     use arrow::util::pretty::pretty_format_batches;
+    use datafusion::common::TableReference;
     use datafusion::common::tree_node::TreeNode;
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::{MemTable, TableProvider, provider_as_source};
@@ -2478,7 +2479,6 @@ mod function_support_tests {
     use datafusion::optimizer::AnalyzerRule;
     use datafusion::physical_plan::{collect, displayable};
     use datafusion::prelude::{SessionContext, col, lit};
-    use datafusion::common::TableReference;
     use datafusion_federation::sql::federation_analyzer_rule;
     use datafusion_federation::{
         FederatedPlanNode, FederatedPlanner, FederatedTableProviderAdaptor,

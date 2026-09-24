@@ -18,8 +18,8 @@ limitations under the License.
 //! crate. The runtime side implements these; this crate only holds trait objects.
 
 use async_trait::async_trait;
-use datafusion::error::DataFusionError;
 use datafusion::common::TableReference;
+use datafusion::error::DataFusionError;
 use datafusion_expr::Expr;
 use spicepod::partitioning::PartitionedBy;
 

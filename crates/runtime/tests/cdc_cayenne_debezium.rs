@@ -72,10 +72,10 @@ use data_components::debezium::arrow::changes::to_change_batch;
 use data_components::debezium::change_event::ChangeEvent;
 #[cfg(feature = "debezium")]
 use data_components::schema_projection::SchemaProjection;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
-use datafusion::common::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;

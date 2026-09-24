@@ -26,10 +26,11 @@ use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::common::TableReference;
+use datafusion_table_providers::postgres::Error as PostgresPoolError;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
@@ -53,6 +54,7 @@ pub enum Error {
         "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     ConnectionFailed {
+        #[snafu(source(from(PostgresPoolError, Box::new)))]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -1074,11 +1076,11 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::Session;
+    use datafusion::common::TableReference;
     use datafusion::datasource::{TableProvider, TableType};
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::Expr;
-    use datafusion::common::TableReference;
     use globset::{Glob, GlobSetBuilder};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};

@@ -48,8 +48,8 @@ use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
-use ::datafusion::error::DataFusionError;
 use ::datafusion::common::{ResolvedTableReference, TableReference};
+use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::sqlparser;
 use app::App;
 

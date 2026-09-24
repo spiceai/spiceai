@@ -77,14 +77,15 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::Session;
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, DFSchemaRef, Result, exec_err, internal_err, plan_err};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{
     Extension, Filter, LogicalPlan, TableSource, UserDefinedLogicalNode,
     UserDefinedLogicalNodeCore, Volatility,
@@ -936,7 +937,8 @@ impl ExtensionPlanner for CayenneCteMaterializationPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(materialized) = node.as_any().downcast_ref::<MaterializedCteNode>() {
             if physical_inputs.len() != 2 {
@@ -1009,6 +1011,17 @@ impl DisplayAs for MaterializedCteExec {
 impl ExecutionPlan for MaterializedCteExec {
     fn name(&self) -> &'static str {
         "MaterializedCteExec"
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1219,6 +1232,17 @@ impl DisplayAs for CteScanExec {
 impl ExecutionPlan for CteScanExec {
     fn name(&self) -> &'static str {
         "CteScanExec"
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

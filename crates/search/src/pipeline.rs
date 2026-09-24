@@ -15,17 +15,14 @@ use std::sync::Arc;
 
 use datafusion::{
     catalog::TableProvider,
-    common::Column,
+    common::{Column, TableReference},
     datasource::DefaultTableSource,
     error::DataFusionError,
-    sql::{
-        TableReference,
-        sqlparser::{
-            ast::{Expr as SqlExpr, Value, ValueWithSpan},
-            dialect::GenericDialect,
-            parser::Parser,
-            tokenizer::Token,
-        },
+    sql::sqlparser::{
+        ast::{Expr as SqlExpr, Value, ValueWithSpan},
+        dialect::GenericDialect,
+        parser::Parser,
+        tokenizer::Token,
     },
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};

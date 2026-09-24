@@ -12,6 +12,8 @@ version.workspace = true
 async-trait.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 datafusion.workspace = true
+datafusion-physical-plan = { workspace = true, optional = true, features = ["proto"] }
+datafusion-proto-models = { workspace = true, optional = true }
 futures.workspace = true
 itertools.workspace = true
 snafu.workspace = true
@@ -20,6 +22,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+
+[features]
+# Enable when ballista-core's `datafusion-proto` dep unifies `datafusion-physical-plan/proto` workspace-wide.
+proto = ["dep:datafusion-physical-plan", "dep:datafusion-proto-models"]
 
 [lints]
 workspace = true

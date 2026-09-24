@@ -44,6 +44,7 @@ use arrow_tools::schema::verify_schema;
 use cache::{CacheProbe, PlanOrCached};
 use datafusion::{
     common::ParamValues,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
     logical_expr::LogicalPlan,
@@ -52,7 +53,6 @@ use datafusion::{
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
-    sql::TableReference,
 };
 use datafusion_functions_json::{JsonUnionEncoder, JsonUnionValue};
 use error_code::ErrorCode;
@@ -583,7 +583,10 @@ impl Query {
             return None;
         }
 
-        let statistics = match physical_plan.partition_statistics(None) {
+        let statistics = match datafusion::physical_plan::StatisticsContext::new().compute(
+            &**physical_plan,
+            &datafusion::physical_plan::StatisticsArgs::new(),
+        ) {
             Ok(statistics) => statistics,
             Err(error) => {
                 tracing::debug!(%error, "Unable to estimate Flight result size for adaptive batch size");
@@ -2767,7 +2770,12 @@ fn strip_root_order_preserving_repartition(
     let plan = if Arc::ptr_eq(children[0], &rewritten_child) {
         plan
     } else {
-        plan.with_new_children(vec![rewritten_child])?
+        plan.replace_children(
+            vec![rewritten_child],
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )?
     };
 
     if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
@@ -4796,6 +4804,17 @@ mod tests {
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             self.children.iter().collect()
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::common::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(

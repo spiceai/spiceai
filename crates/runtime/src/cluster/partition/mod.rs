@@ -20,7 +20,7 @@ mod startup;
 
 use std::collections::HashMap;
 
-use datafusion::sql::ResolvedTableReference;
+use datafusion::common::ResolvedTableReference;
 use datafusion_expr::Expr;
 use snafu::Snafu;
 
@@ -192,7 +192,9 @@ pub(crate) async fn local_executor_table_statistics(
     // present AND at least one column carries a min/max bound.
     let session_state = df.ctx.state();
     let scan_stats = match provider.scan(&session_state, None, &[], None).await {
-        Ok(plan) => plan.partition_statistics(None).ok(),
+        Ok(plan) => datafusion::physical_plan::StatisticsContext::new()
+            .compute(&*plan, &datafusion::physical_plan::StatisticsArgs::new())
+            .ok(),
         Err(_) => None,
     };
     if let Some(stats) = scan_stats

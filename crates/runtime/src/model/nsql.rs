@@ -34,8 +34,7 @@ use datafusion::arrow::{
 };
 use datafusion::{
     DATAFUSION_VERSION,
-    common::{Constraint, Constraints, DataFusionError, utils::quote_identifier},
-    sql::TableReference,
+    common::{Constraint, Constraints, DataFusionError, TableReference, utils::quote_identifier},
 };
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;

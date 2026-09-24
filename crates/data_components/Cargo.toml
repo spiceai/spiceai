@@ -68,7 +68,7 @@ mysql_async = { workspace = true, optional = true }
 # Value-only row-image parsing (mysql_replication::binlog::TableMapRowDecoder):
 # `ParseBuf` is not re-exported by mysql_async; the version matches the
 # mysql_async pin so this adds no extra compilation unit.
-mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+mysql_common = { version = "0.37.1", default-features = false, features = ["binlog"], optional = true }
 # Included-column bitmaps in mysql_common's rows-event API are bitvec slices.
 bitvec = { version = "1", optional = true }
 num_cpus = "1.16"
@@ -99,9 +99,12 @@ serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
+# LOCAL ONLY: branch arrow-59 not pushed yet. Replace with
+# `git = "https://github.com/spiceai/spark-connect-rs.git", rev = "31bbcd13ea38d1da60ce57156a180cf11bb61a22"` # branch: arrow-59
+# once pushed.
+spark-connect-rs = { path = "/Users/viktor/workspace/df55-prep/spark-connect-rs/rust", features = [
     "tls",
-], optional = true } # branch: spiceai-58
+], optional = true }
 telemetry = { path = "../telemetry" }
 tempfile.workspace = true
 tiberius = { workspace = true, optional = true }

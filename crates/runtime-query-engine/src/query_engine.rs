@@ -30,12 +30,12 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use datafusion::common::ParamValues;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::common::TableReference;
 use snafu::Snafu;
 
 use crate::allowlist::ResolvedTableAwareAllowlist;

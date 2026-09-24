@@ -15,11 +15,8 @@ limitations under the License.
 */
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::{
-    common::Column,
-    sql::{
-        ResolvedTableReference, TableReference,
-        sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
-    },
+    common::{Column, ResolvedTableReference, TableReference},
+    sql::sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
 };
 use reqwest::Client;
 use serde_json::Value;

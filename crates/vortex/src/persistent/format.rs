@@ -55,7 +55,6 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use vortex::VortexSessionDefault;
 use vortex::arrow::ArrowSessionExt;
-use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -881,7 +880,13 @@ impl FileFormat for VortexFormat {
                         })
                 })
             })
-            .buffer_unordered(state.config_options().execution.meta_fetch_concurrency)
+            .buffer_unordered(
+                state
+                    .config_options()
+                    .execution
+                    .meta_fetch_concurrency
+                    .into(),
+            )
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -1007,7 +1012,13 @@ impl FileFormat for VortexFormat {
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                let target_dtype = DType::from_arrow(field.as_ref());
+                let target_dtype = session.arrow().from_arrow_field(field.as_ref()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to infer statistics for Vortex file {}: column '{}' has no Vortex dtype: {e}",
+                        object.location,
+                        field.name()
+                    ))
+                })?;
                 let min = stat_bound_to_df(
                     Stat::Min,
                     stats_set.get(Stat::Min),
@@ -1319,6 +1330,7 @@ mod tests {
     use super::*;
     use crate::common_tests::TestSessionContext;
     use crate::convert::FromDataFusion;
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
     use datafusion_common::arrow::datatypes::i256;
 
     #[test]
@@ -1535,10 +1547,8 @@ mod tests {
         let state = ctx.session.state();
 
         // --- All columns: per-column byte_size present, total == sum ---------
-        let all = provider
-            .scan(&state, None, &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let all_plan = provider.scan(&state, None, &[], None).await?;
+        let all = StatisticsContext::new().compute(&*all_plan, &StatisticsArgs::new())?;
         assert_eq!(all.num_rows.get_value(), Some(&n), "row count");
 
         let id_bytes = *all.column_statistics[0]
@@ -1576,10 +1586,10 @@ mod tests {
         // --- Projected scans: total reflects ONLY the projected columns ------
         // Project [id] (fixed-width): total is just the int column.
         let proj_id_cols = vec![0usize];
-        let proj_id = provider
+        let proj_id_plan = provider
             .scan(&state, Some(&proj_id_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+            .await?;
+        let proj_id = StatisticsContext::new().compute(&*proj_id_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_id.total_byte_size.get_value(),
             Some(&id_bytes),
@@ -1588,10 +1598,8 @@ mod tests {
 
         // Project [s] (variable-width survives, fat `data` dropped).
         let proj_s_cols = vec![1usize];
-        let proj_s = provider
-            .scan(&state, Some(&proj_s_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let proj_s_plan = provider.scan(&state, Some(&proj_s_cols), &[], None).await?;
+        let proj_s = StatisticsContext::new().compute(&*proj_s_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_s.total_byte_size.get_value(),
             Some(&s_bytes),

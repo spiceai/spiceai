@@ -19,7 +19,7 @@ use clickhouse_rs::ClientHandle;
 use data_components::Read;
 use data_components::federation::create_spice_federated_table_provider;
 use data_components::function_support::FunctionSupport;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
     sql_provider_datafusion::{self, SqlTable},

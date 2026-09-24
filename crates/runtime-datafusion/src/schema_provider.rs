@@ -20,10 +20,10 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::{
     catalog::SchemaProvider,
+    common::TableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result},
     execution::context::SessionContext,
-    sql::TableReference,
 };
 use snafu::{OptionExt, Snafu};
 
@@ -191,9 +191,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
         catalog::{MemoryCatalogProvider, SchemaProvider},
+        common::TableReference,
         datasource::{TableProvider, empty::EmptyTable},
         execution::context::SessionContext,
-        sql::TableReference,
     };
 
     use super::ensure_schema_exists;

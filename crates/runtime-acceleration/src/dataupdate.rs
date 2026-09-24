@@ -17,9 +17,10 @@ limitations under the License.
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::{
@@ -346,6 +347,13 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         Ok(self)
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn execute(
         &self,
         _partition: usize,
@@ -371,9 +379,9 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::common::TableReference;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::common::TableReference;
 
     fn one_column_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int32Array::from(values))])

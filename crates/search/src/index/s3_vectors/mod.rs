@@ -42,6 +42,7 @@ use datafusion::functions::core::union_extract::UnionExtractFun;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::prelude::arrow_cast;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
 use futures::future::join_all;
@@ -155,8 +156,12 @@ impl SearchIndex for S3Vector {
             Some(partition_by) => {
                 let input_dfschema = DFSchema::try_from(Arc::clone(&input_schema))?;
                 let execution_props = ExecutionProps::new();
-                let physical_expr =
-                    create_physical_expr(partition_by, &input_dfschema, &execution_props)?;
+                let physical_expr = create_physical_expr(
+                    partition_by,
+                    &input_dfschema,
+                    &execution_props,
+                    &PhysicalPlanningContext::default(),
+                )?;
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 let mut data = vec![];

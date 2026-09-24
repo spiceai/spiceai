@@ -28,10 +28,10 @@ use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
 use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
-use vortex::arrow::{FromArrowType, ToArrowDatum};
+use vortex::arrow::{ArrowSession, ToArrowDatum};
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::{DType, DecimalDType, Nullability, i256 as VortexI256};
-use vortex::error::VortexResult;
+use vortex::error::{VortexExpect, VortexResult};
 use vortex::expr::stats::{Precision as VortexPrecision, Stat};
 use vortex::file::FileStatistics;
 use vortex::flatbuffers::WriteFlatBufferExt;
@@ -97,7 +97,9 @@ fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> 
         ScalarValue::Date32(Some(v))
         | ScalarValue::Time32Second(Some(v))
         | ScalarValue::Time32Millisecond(Some(v)) => {
-            let dtype = DType::from_arrow((&sv.data_type(), Nullability::Nullable));
+            let dtype = ArrowSession::default()
+                .from_arrow_datatype(&sv.data_type(), Nullability::Nullable)
+                .ok()?;
             Scalar::try_new(dtype, Some(vortex::scalar::ScalarValue::from(*v))).ok()?
         }
         ScalarValue::Date64(Some(v))
@@ -107,7 +109,9 @@ fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> 
         | ScalarValue::TimestampMillisecond(Some(v), _)
         | ScalarValue::TimestampMicrosecond(Some(v), _)
         | ScalarValue::TimestampNanosecond(Some(v), _) => {
-            let dtype = DType::from_arrow((&sv.data_type(), Nullability::Nullable));
+            let dtype = ArrowSession::default()
+                .from_arrow_datatype(&sv.data_type(), Nullability::Nullable)
+                .ok()?;
             Scalar::try_new(dtype, Some(vortex::scalar::ScalarValue::from(*v))).ok()?
         }
         _ => return None,
@@ -198,9 +202,7 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
         }
         DType::Binary(_) => {
             let bytes = scalar.as_binary().value().cloned()?;
-            Some(ScalarValue::Binary(Some(Vec::<u8>::from(
-                bytes.into_inner(),
-            ))))
+            Some(ScalarValue::Binary(Some(bytes.to_vec())))
         }
         DType::Extension(_) => {
             // Temporal types (Date/Time/Timestamp) are represented as Vortex
@@ -702,7 +704,9 @@ pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResul
 
 /// Convert an Arrow [`Schema`] to a Vortex struct [`DType`].
 pub(crate) fn vortex_struct_dtype_from_schema(schema: &Schema) -> DType {
-    DType::from_arrow(schema)
+    ArrowSession::default()
+        .from_arrow_schema(schema)
+        .vortex_expect("arrow schema to dtype")
 }
 
 /// Build a [`FileStatistics`] from per-column [`StatsSet`] entries and the table schema.
@@ -995,10 +999,11 @@ mod tests {
         let second_set = column_stats_to_stats_set(&second_stats);
         let first_file_stats = build_file_statistics(vec![first_set], &schema);
         let first_blob = serialize_file_statistics(&first_file_stats).expect("serialize ok");
-        let dtypes = vec![DType::from_arrow((
-            schema.field(0).data_type(),
-            Nullability::Nullable,
-        ))];
+        let dtypes = vec![
+            ArrowSession::default()
+                .from_arrow_datatype(schema.field(0).data_type(), Nullability::Nullable)
+                .expect("arrow data type to dtype"),
+        ];
 
         let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
             .expect("statistics should merge");
@@ -1366,10 +1371,11 @@ mod tests {
         let first_blob =
             serialize_file_statistics(&build_file_statistics(vec![first_set], &schema))
                 .expect("serialize ok");
-        let dtypes = vec![DType::from_arrow((
-            schema.field(0).data_type(),
-            Nullability::Nullable,
-        ))];
+        let dtypes = vec![
+            ArrowSession::default()
+                .from_arrow_datatype(schema.field(0).data_type(), Nullability::Nullable)
+                .expect("arrow data type to dtype"),
+        ];
 
         let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
             .expect("statistics should merge");

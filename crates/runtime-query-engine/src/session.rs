@@ -25,12 +25,12 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::common::TableReference;
 
 use crate::query_engine::{Error, QueryEngine, QueryRequest, Result, UpdateType};
 

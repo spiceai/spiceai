@@ -23,6 +23,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use datafusion::catalog::{ScanArgs, ScanResult, Session};
+use datafusion::common::TableReference;
 use datafusion::common::{Constraints, ScalarValue, SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::{TableProvider, TableType};
@@ -37,7 +38,6 @@ use datafusion::physical_plan::{
     metrics::MetricsSet,
     stream::RecordBatchStreamAdapter,
 };
-use datafusion::common::TableReference;
 use datafusion::sql::unparser::{Unparser, dialect::Dialect};
 use futures::{StreamExt, stream};
 use snafu::prelude::*;
@@ -64,7 +64,7 @@ pub enum Error {
     #[snafu(display("Failed to get Snowflake connection for table {table}: {source}"))]
     UnableToGetConnection {
         table: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to access Snowflake connection for table {table}: {reason}"))]
@@ -346,6 +346,17 @@ impl DisplayAs for DmlCountExec {
 }
 
 impl ExecutionPlan for DmlCountExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "DmlCountExec"
     }
@@ -421,6 +432,17 @@ impl DisplayAs for UpdateExec {
 }
 
 impl ExecutionPlan for UpdateExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "UpdateExec"
     }

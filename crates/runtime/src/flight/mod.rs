@@ -27,7 +27,7 @@ use crate::opentelemetry::create_metrics_service;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
-use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
@@ -360,7 +360,7 @@ impl Service {
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
-        let compression_context = CompressionContext::default();
+        let compression_context = IpcWriteContext::default();
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
@@ -457,7 +457,7 @@ struct FlightEncodeArgs {
     encoder: IpcDataGenerator,
     dict_tracker: DictionaryTracker,
     options: IpcWriteOptions,
-    compression_context: CompressionContext,
+    compression_context: IpcWriteContext,
     cpu_runtime: Option<Handle>,
     request_context: Arc<RequestContext>,
 }
@@ -755,7 +755,7 @@ fn encode_flight_batch(
     encoder: &IpcDataGenerator,
     dict_tracker: &mut DictionaryTracker,
     options: &IpcWriteOptions,
-    compression_context: &mut CompressionContext,
+    compression_context: &mut IpcWriteContext,
 ) -> Result<(Vec<FlightData>, FlightData), Status> {
     let cast;
     let batch = if needs_view_cast {

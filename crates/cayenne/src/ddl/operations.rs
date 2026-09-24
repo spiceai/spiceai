@@ -26,12 +26,12 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::TableReference;
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{Expr, SessionContext};
-use datafusion::common::TableReference;
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion_table_providers::UnsupportedTypeAction;
