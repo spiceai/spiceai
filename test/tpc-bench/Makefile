@@ -314,29 +314,33 @@ mysql-init:
 # MySQL's LOAD DATA reads an empty field as the column type's zero value - an empty
 # integer field lands as 0, never NULL - while PostgreSQL's `\copy ... CSV` reads that
 # same empty field as NULL. dsdgen writes a NULL as an empty field (and the DuckDB
-# tpcds/tpch extensions export with QUOTE '', so they write one too, which is why an
-# empty field is the only spelling a NULL has in these files). Loading them into MySQL
-# unchanged therefore replaces every NULL with 0 and every empty string with '', so the
-# MySQL arms benchmark different data from every other engine seeded from the same
-# files: tpcds_q76, whose three predicates are all `IS NULL`, answers 0 rows there and
-# 11 everywhere else.
+# tpcds/tpch extensions export with QUOTE '', so they write one too), so loading these
+# files into MySQL unchanged replaces every NULL foreign key with 0. The MySQL arms then
+# benchmark different data from every other arm seeded from the same files, and nothing
+# downstream can tell: row counts still match, and only a query keying on NULL-ness
+# disagrees. tpcds_q76, whose three predicates are all `IS NULL`, is that query.
 #
-# Rendering each empty field as \N - the sequence LOAD DATA reads as NULL under its
-# default ESCAPED BY '\' - makes MySQL agree with the rest of the fleet. The `:a`/`ta`
-# loop is what carries consecutive empty fields (`a||b` -> `a|\N|\N|b`), which a single
-# pass would only half-convert because the substitutions overlap; the last two
-# expressions cover a leading and a trailing empty field, which have no `||` to match.
-# The leading `s/|$$//` drops the trailing delimiter dsdgen/dbgen end each row with, and
-# must run first so a trailing empty field is not mistaken for that delimiter.
-MYSQL_LOAD_PREP = sed -e 's/|$$//' -e ':a' -e 's/||/|\\N|/g' -e 'ta' -e 's/^|/\\N|/' -e 's/|$$/|\\N/'
+# The repair is type-directed rather than a rewrite of the data file, because the file
+# cannot distinguish a NULL from an empty string and a blanket rewrite would null the
+# empty strings too - `time_dim.t_meal_time` is 50,400 empty strings and zero NULLs.
+# `mysql-null-spec.awk` turns the table's own column types into a LOAD DATA spec that
+# NULLIFs only the columns where an empty field cannot be anything but NULL, and binds
+# text columns positionally so they keep their empty strings. The tables must already
+# exist, which `mysql-*-init` guarantees.
+#
+# TPC-H contains no NULLs and no empty strings, so `mysql-load` was never wrong; it uses
+# the same spec so the two loaders cannot drift.
+MYSQL_NULL_SPEC = awk -f ./mysql-null-spec.awk
+MYSQL_COLUMN_TYPES = SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='$(DB_NAME)' AND table_name=
 
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
 mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		$(MYSQL_LOAD_PREP) "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
+		spec=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;" | $(MYSQL_NULL_SPEC)); \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
@@ -371,8 +375,9 @@ mysql-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
-		$(MYSQL_LOAD_PREP) "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
+		spec=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;" | $(MYSQL_NULL_SPEC)); \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 

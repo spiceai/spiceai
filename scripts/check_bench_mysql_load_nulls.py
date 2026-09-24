@@ -4,9 +4,9 @@
 # MySQL bench-loader NULL guard.
 #
 # The benchmark fleet seeds every engine from one set of pipe-delimited files, in
-# which a NULL is written as an EMPTY field — that is the only spelling it has,
-# because dsdgen/dbgen quote nothing and the DuckDB tpch/tpcds extensions export
-# with QUOTE ''. The loaders do not agree on what an empty field means:
+# which a NULL is written as an EMPTY field — dsdgen quotes nothing, and the
+# DuckDB tpch/tpcds extensions export with QUOTE '', so they write one too. The
+# loaders do not agree on what an empty field means:
 #
 #   * PostgreSQL `\copy … CSV`  reads an empty field as NULL.
 #   * MySQL `LOAD DATA`         reads it as the column type's zero value — an
@@ -18,10 +18,11 @@
 # is that query — its three predicates are all `IS NULL` — and it answered 0 rows
 # on all four MySQL configs against 11 on the other 49 (#13152).
 #
-# `$(MYSQL_LOAD_PREP)` in `test/tpc-bench/Makefile` is the repair: it renders each
-# empty field as `\N`, which LOAD DATA reads as NULL. This guard pins that every
-# MySQL bulk-load recipe routes its input through it, so a loader added later
-# cannot reintroduce the divergence by copying the older recipe.
+# `mysql-null-spec.awk` is the repair: it turns the table's own column types into
+# a `LOAD DATA` spec that NULLIFs an empty field only where the type says it can
+# mean nothing else. This guard pins that every MySQL bulk-load recipe builds and
+# passes that spec, so a loader added later cannot reintroduce the divergence by
+# copying a recipe from before the fix.
 #
 # Usage:
 #   scripts/check_bench_mysql_load_nulls.py    # validate (exit 1 on drift, 2 if unreadable)
@@ -37,15 +38,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 BENCH_MAKEFILE = REPO / "test" / "tpc-bench" / "Makefile"
+SPEC_AWK = REPO / "test" / "tpc-bench" / "mysql-null-spec.awk"
 
-PREP_VAR = "MYSQL_LOAD_PREP"
+SPEC_VAR = "MYSQL_NULL_SPEC"
 
 # A recipe line that bulk-loads a local file into MySQL.
-LOAD_DATA_RE = re.compile(r"LOAD\s+DATA\s+(LOCAL\s+)?INFILE\s+'([^']+)'", re.IGNORECASE)
+LOAD_DATA_RE = re.compile(r"LOAD\s+DATA\s+(?:LOCAL\s+)?INFILE\s+'([^']+)'", re.IGNORECASE)
 
-# The line that writes the staged copy the LOAD DATA above reads, e.g.
-#   $(MYSQL_LOAD_PREP) "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
-STAGE_RE = re.compile(r"^\s*(?P<prep>.*?)\s*\"[^\"]+\"\s*>\s*(?P<dest>\S+?);?\s*\\?\s*$")
+# The line that builds the column spec, e.g.
+#   spec=$(mysql … -e "$(MYSQL_COLUMN_TYPES)'$$table' …" | $(MYSQL_NULL_SPEC)); \
+SPEC_BUILD_RE = re.compile(rf"(?P<var>\w+)=\$\$\(.*\|\s*\$\({re.escape(SPEC_VAR)}\)\s*\)")
 
 # The start of a recipe: a target name, then a colon that is not `:=`.
 TARGET_RE = re.compile(r"^([A-Za-z0-9_.\-/]+)\s*:(?!=)")
@@ -79,45 +81,38 @@ def loader_errors(text: str, rel: str) -> tuple[list[str], int]:
     """Every problem in a bench Makefile's MySQL loaders, and how many it inspected.
 
     Split out of `main` so the self-test can drive it in-process: asserting on the
-    returned strings is what distinguishes the three failure modes from each other,
+    returned strings is what distinguishes the failure modes from each other,
     which a subprocess exit code cannot.
     """
-    if not re.search(rf"^{re.escape(PREP_VAR)}\s*[:+?]?=", text, re.MULTILINE):
+    if not re.search(rf"^{re.escape(SPEC_VAR)}\s*[:+?]?=", text, re.MULTILINE):
         return [
-            f"{rel}: `{PREP_VAR}` is not defined, so no MySQL loader can render an "
-            f"empty field as NULL."
+            f"{rel}: `{SPEC_VAR}` is not defined, so no MySQL loader can tell an empty "
+            f"field that means NULL from one that means an empty string."
         ], 0
 
     errors: list[str] = []
     checked = 0
     for target, lines in recipe_blocks(text):
-        # Map each staged destination to the command that produced it, so a LOAD
-        # DATA can be traced back to whether its input went through the prep.
-        staged: dict[str, str] = {}
-        for line in lines:
-            stage = STAGE_RE.match(line)
-            if stage and stage.group("prep"):
-                staged[stage.group("dest")] = stage.group("prep")
+        # The shell variables this recipe assigns from the spec generator. A
+        # LOAD DATA must interpolate one of them.
+        spec_vars = {
+            match.group("var")
+            for line in lines
+            if (match := SPEC_BUILD_RE.search(line))
+        }
 
         for line in lines:
             load = LOAD_DATA_RE.search(line)
             if not load:
                 continue
             checked += 1
-            infile = load.group(2)
-            prep = staged.get(infile)
-            if prep is None:
+            infile = load.group(1)
+            if not any(f"$${var}" in line for var in spec_vars):
                 errors.append(
-                    f"{rel}: target `{target}` loads {infile!r} into MySQL but no "
-                    f"line in the recipe stages that file, so this guard cannot tell "
-                    f"whether its empty fields become NULL. Stage it with "
-                    f"`$({PREP_VAR}) <source> > {infile}`."
-                )
-            elif f"$({PREP_VAR})" not in prep:
-                errors.append(
-                    f"{rel}: target `{target}` stages {infile!r} with `{prep}` instead "
-                    f"of `$({PREP_VAR})`, so every empty field in it loads into MySQL "
-                    f"as the column type's zero value rather than NULL."
+                    f"{rel}: target `{target}` loads {infile!r} into MySQL without a "
+                    f"column spec from $({SPEC_VAR}), so every empty field in a "
+                    f"numeric column lands as 0 instead of NULL. Build the spec from "
+                    f"`information_schema` and pass it after the FIELDS/LINES clauses."
                 )
 
     if not checked:
@@ -132,21 +127,25 @@ def main() -> int:
     rel = str(BENCH_MAKEFILE.relative_to(REPO))
     errors, checked = loader_errors(read(BENCH_MAKEFILE), rel)
 
+    if not SPEC_AWK.exists():
+        errors.append(
+            f"{SPEC_AWK.relative_to(REPO)} is missing, so $({SPEC_VAR}) cannot run."
+        )
+
     if errors:
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         print(
             f"\n{len(errors)} MySQL bench-loader NULL problem(s). A pipe-delimited "
             f"bench file writes NULL as an empty field, which MySQL's LOAD DATA reads "
-            f"as 0 unless it is rendered as `\\N` first — see `{PREP_VAR}` in "
-            f"{rel} and issue #13152.",
+            f"as 0 — see `{SPEC_VAR}` in {rel} and issue #13152.",
             file=sys.stderr,
         )
         return 1
 
     print(
-        f"MySQL bench loaders OK: {checked} `LOAD DATA` recipe(s) stage their input "
-        f"through $({PREP_VAR})."
+        f"MySQL bench loaders OK: {checked} `LOAD DATA` recipe(s) pass a column spec "
+        f"from $({SPEC_VAR})."
     )
     return 0
 

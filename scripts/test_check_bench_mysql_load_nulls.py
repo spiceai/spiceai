@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # Copyright 2024-2026 The Spice.ai OSS Authors
 #
-# Exercises `scripts/check_bench_mysql_load_nulls.py` and, separately, the
-# `$(MYSQL_LOAD_PREP)` transform the guard pins.
+# Exercises `scripts/check_bench_mysql_load_nulls.py` and, separately,
+# `test/tpc-bench/mysql-null-spec.awk` — the program that decides which columns a
+# MySQL bench load may read an empty field as NULL in.
 #
-# Two halves, because the guard and the transform fail in different ways:
+# Two halves, because the guard and the spec generator fail in different ways:
 #
-#   * The guard's parser only ever scans today's Makefile. With both its regexes
+#   * The guard's parser only ever scans today's Makefile. With its regexes
 #     matching nothing it would report agreement, so a parser regression would
 #     pass unnoticed on a clean tree — the fixtures below pin it against a loader
-#     that skips the prep, one staged with a bare `sed`, one whose input is never
-#     staged, and a file with no loader at all.
-#   * The transform is the thing that actually has to be right, and it is a sed
-#     program in a Makefile that nothing else executes in CI. It is read out of
-#     the shipped Makefile — not restated here — and run, so this cannot drift
-#     away from what the loaders use.
+#     that passes no spec, one whose spec comes from somewhere else, and a file
+#     with no loader at all.
+#   * The awk program is the thing that has to be right, and nothing else in CI
+#     runs it: the loaders only invoke it against a live MySQL. Driving it here
+#     over a fixture column listing needs no database.
 #
 # Usage:
 #   scripts/test_check_bench_mysql_load_nulls.py    # exit 0 when every case passes
@@ -23,38 +23,37 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 # Imported rather than driven through a subprocess: asserting on the returned
-# strings is what tells the three failure modes apart, which an exit code cannot.
+# strings is what tells the failure modes apart, which an exit code cannot.
 from check_bench_mysql_load_nulls import loader_errors  # noqa: E402
 
-BENCH_MAKEFILE = REPO / "test" / "tpc-bench" / "Makefile"
+SPEC_AWK = REPO / "test" / "tpc-bench" / "mysql-null-spec.awk"
 
 REL = "test/tpc-bench/Makefile"
 
-PREP_DEF = (
-    "MYSQL_LOAD_PREP = sed -e 's/|$$//' -e ':a' -e 's/||/|\\\\N|/g' -e 'ta' "
-    "-e 's/^|/\\\\N|/' -e 's/|$$/|\\\\N/'\n"
-)
+SPEC_DEF = "MYSQL_NULL_SPEC = awk -f ./mysql-null-spec.awk\n"
 TARGET = "\nmysql-tpcds-load:\n"
-PREP_STAGE = "\t$(MYSQL_LOAD_PREP) \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
-BARE_STAGE = "\tsed 's/|$$//' \"$(TPCDS_DATA_DIR)/$$table.dat\" > ./tmp/$$table.dat; \\\n"
-LOAD_LINE = (
-    "\tmysql -h$(DB_HOST) --local-infile=1 $(DB_NAME) -e \"LOAD DATA LOCAL INFILE "
-    "'./tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES "
-    "TERMINATED BY '\\n';\"; \\\n"
+SPEC_BUILD = (
+    "\tspec=$$(mysql -N -B $(DB_NAME) -e \"$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY "
+    "ordinal_position;\" | $(MYSQL_NULL_SPEC)); \\\n"
 )
+LOAD_WITH_SPEC = (
+    "\tmysql --local-infile=1 $(DB_NAME) -e \"LOAD DATA LOCAL INFILE "
+    "'./tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES "
+    "TERMINATED BY '\\n' $$spec;\"; \\\n"
+)
+LOAD_NO_SPEC = LOAD_WITH_SPEC.replace(" $$spec;", ";")
 
-GOOD = PREP_DEF + TARGET + PREP_STAGE + LOAD_LINE
-BARE_SED = PREP_DEF + TARGET + BARE_STAGE + LOAD_LINE
-UNSTAGED = PREP_DEF + TARGET + LOAD_LINE
-NO_PREP_VAR = TARGET.lstrip("\n") + BARE_STAGE + LOAD_LINE
-NO_LOADER = PREP_DEF + "\nsomething-else:\n\techo hi\n"
+GOOD = SPEC_DEF + TARGET + SPEC_BUILD + LOAD_WITH_SPEC
+NO_SPEC_PASSED = SPEC_DEF + TARGET + SPEC_BUILD + LOAD_NO_SPEC
+NEVER_BUILT = SPEC_DEF + TARGET + LOAD_NO_SPEC
+NO_SPEC_VAR = TARGET.lstrip("\n") + LOAD_NO_SPEC
+NO_LOADER = SPEC_DEF + "\nsomething-else:\n\techo hi\n"
 
 FAILURES: list[str] = []
 CHECKS = 0
@@ -84,26 +83,19 @@ def test_guard_parser() -> None:
     print("guard parser")
 
     errors, checked = loader_errors(GOOD, REL)
-    check("a loader staged through $(MYSQL_LOAD_PREP) is accepted", errors, [])
+    check("a loader passing the spec is accepted", errors, [])
     check("  and its LOAD DATA was actually inspected", checked, 1)
 
-    errors, _ = loader_errors(BARE_SED, REL)
-    check("a loader staged with a bare sed yields one error", len(errors), 1)
+    errors, _ = loader_errors(NO_SPEC_PASSED, REL)
+    check("a loader that builds a spec but never passes it is rejected", len(errors), 1)
     check_contains("  the error names the target", errors[0], "mysql-tpcds-load")
-    check_contains("  and says what the bad staging was", errors[0], "instead")
 
-    errors, _ = loader_errors(UNSTAGED, REL)
-    check("a loader whose input is never staged yields one error", len(errors), 1)
-    check_contains("  the error says nothing stages it", errors[0], "no ")
-    check(
-        "  the unstaged error is distinct from the bare-sed error",
-        errors[0] == loader_errors(BARE_SED, REL)[0][0],
-        False,
-    )
+    errors, _ = loader_errors(NEVER_BUILT, REL)
+    check("a loader that never builds a spec is rejected", len(errors), 1)
 
-    errors, _ = loader_errors(NO_PREP_VAR, REL)
-    check("a Makefile with no MYSQL_LOAD_PREP yields one error", len(errors), 1)
-    check_contains("  the error names the missing variable", errors[0], "MYSQL_LOAD_PREP")
+    errors, _ = loader_errors(NO_SPEC_VAR, REL)
+    check("a Makefile with no MYSQL_NULL_SPEC is rejected", len(errors), 1)
+    check_contains("  the error names the missing variable", errors[0], "MYSQL_NULL_SPEC")
 
     # A guard that matches nothing must not report success — that is how a parser
     # regression would otherwise pass on a clean tree.
@@ -112,77 +104,54 @@ def test_guard_parser() -> None:
     check("  and nothing was inspected", checked, 0)
 
 
-def shipped_prep_command() -> str:
-    """The `MYSQL_LOAD_PREP` recipe as `make` expands it, read from the real Makefile.
-
-    Via `make -n` rather than by re-parsing the assignment, so make's own escaping
-    (`$$` -> `$`) is applied by make and this cannot disagree with what the loaders run.
-    """
-    expanded = subprocess.run(
-        ["make", "-C", str(BENCH_MAKEFILE.parent), "-n", "mysql-tpcds-load"],
-        capture_output=True, text=True, check=False,
+def spec_for(listing: list[tuple[str, str]]) -> str:
+    """Run the shipped awk program over a `column_name<TAB>data_type` listing."""
+    stdin = "".join(f"{name}\t{dtype}\n" for name, dtype in listing)
+    return subprocess.run(
+        ["awk", "-f", str(SPEC_AWK)],
+        input=stdin, capture_output=True, text=True, check=True,
     ).stdout
-    for line in expanded.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("sed "):
-            # The staged source is the first quoted argument; everything before it
-            # is the transform.
-            return stripped.split(' "', 1)[0]
-    raise AssertionError(
-        "could not read the expanded MYSQL_LOAD_PREP out of `make -n mysql-tpcds-load`"
+
+
+def test_spec_generator() -> None:
+    print("mysql-null-spec.awk (the shipped program)")
+
+    # The shape that matters: an empty field in a numeric column can only be NULL,
+    # so it is NULLIF'd; in a text column it is a legitimate empty string, so the
+    # column binds positionally and is left alone. Getting the second half wrong is
+    # what a blanket rewrite of the data file does — it would null the 50,400 empty
+    # strings in `time_dim.t_meal_time`, of which none is NULL.
+    check(
+        "numeric columns are NULLIF'd, text columns bind directly",
+        spec_for([("a_sk", "int"), ("a_name", "char"), ("a_price", "decimal")]),
+        "(@v1,a_name,@v3) SET a_sk=NULLIF(@v1,''),a_price=NULLIF(@v3,'')",
     )
-
-
-def test_transform_semantics() -> None:
-    print("MYSQL_LOAD_PREP transform (read from the shipped Makefile)")
-    try:
-        prep = shipped_prep_command()
-    except AssertionError as exc:
-        check("reads the shipped transform", str(exc), "")
-        return
-    print("  ok   reads the shipped transform")
-
-    # dsdgen/dbgen format: pipe-separated, one trailing '|', NULL written as an
-    # empty field. Covers a leading, middle, trailing, and consecutive NULL, plus
-    # a row with none, and values that merely contain 'N' or are a literal 0.
-    rows = [
-        "1|101|11|19.99|",
-        "2|102||29.99|",
-        "|106|16|69.99|",
-        "7|107|17||",
-        "8|108|||",
-        "9|N|Nz|0|",
-    ]
-    expected = [
-        ["1", "101", "11", "19.99"],
-        ["2", "102", r"\N", "29.99"],
-        [r"\N", "106", "16", "69.99"],
-        ["7", "107", "17", r"\N"],
-        ["8", "108", r"\N", r"\N"],
-        ["9", "N", "Nz", "0"],
-    ]
-
-    with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "t.dat"
-        src.write_text("\n".join(rows) + "\n", encoding="utf-8")
-        out = subprocess.run(
-            f"{prep} {src}", shell=True, capture_output=True, text=True, check=False
-        )
-    check("transform exits cleanly", (out.returncode, out.stderr.strip()), (0, ""))
-
-    got = [line.split("|") for line in out.stdout.splitlines()]
-    check("every row parses to the PostgreSQL CSV NULL reading", got, expected)
-
-    # The point of the whole transform: exactly the empty fields become NULL. A
-    # literal 0 must never become NULL, and a NULL never 0.
-    empties = sum(1 for row in rows for field in row[:-1].split("|") if field == "")
-    nulls = sum(1 for row in got for field in row if field == r"\N")
-    check("one \\N out per empty field in, and no others", nulls, empties)
+    check(
+        "an all-text table gets no SET clause, so no empty string is touched",
+        spec_for([("a", "char"), ("b", "varchar"), ("c", "text")]),
+        "(a,b,c)",
+    )
+    check(
+        "an all-numeric table NULLIFs every column",
+        spec_for([("a", "int"), ("b", "bigint")]),
+        "(@v1,@v2) SET a=NULLIF(@v1,''),b=NULLIF(@v2,'')",
+    )
+    check(
+        "dates and times are NULLIF'd — an empty field is not a valid one",
+        spec_for([("d", "date"), ("t", "time"), ("ts", "timestamp")]),
+        "(@v1,@v2,@v3) SET d=NULLIF(@v1,''),t=NULLIF(@v2,''),ts=NULLIF(@v3,'')",
+    )
+    check(
+        "the remaining text-ish types are left alone too",
+        spec_for([("a", "varbinary"), ("b", "blob"), ("c", "enum"), ("d", "json")]),
+        "(a,b,c,d)",
+    )
+    check("an empty listing yields nothing rather than an empty spec", spec_for([]), "")
 
 
 def main() -> int:
     test_guard_parser()
-    test_transform_semantics()
+    test_spec_generator()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} of {CHECKS} checks failed:", file=sys.stderr)
