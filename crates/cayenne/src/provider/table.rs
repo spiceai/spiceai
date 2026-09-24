@@ -9579,6 +9579,10 @@ impl CayenneTableProvider {
         // redundant syncs per checkpoint drain. This leaves them a `stat` each.
         self.ensure_local_snapshot_dir(snapshot_id).await?;
 
+        // One index build for the whole snapshot: every shard's writer reports
+        // its batches to the same builder (it serializes them internally), and
+        // the index is finished once, after the last shard, over all the files.
+        let index_builder = self.begin_snapshot_lookup_index(snapshot_id);
         let mut handles = Vec::with_capacity(units.len());
         for unit in units {
             // A shallow writer clone (all Arc fields) so the encode can run on its
@@ -9586,6 +9590,7 @@ impl CayenneTableProvider {
             let provider = self.clone_for_write();
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
+            let observer = Self::snapshot_index_observer(index_builder.as_ref());
             handles.push(tokio::spawn(async move {
                 let unit_bytes = unit
                     .iter()
@@ -9609,13 +9614,15 @@ impl CayenneTableProvider {
                 let shard_target_partitions =
                     Self::shard_encode_target_partitions(unit_bytes, target_size_bytes);
                 provider
-                    .write_to_snapshot(
+                    .write_to_snapshot_range_partitioned(
                         stream,
                         target_size_bytes,
                         &snapshot_id,
                         shard_target_partitions,
                         estimated_bytes,
                         super::delta_encoding::WritePolicy::DELTA,
+                        None,
+                        observer,
                     )
                     .await
             }));
@@ -9625,15 +9632,19 @@ impl CayenneTableProvider {
         // error (so the slot is NOT advanced and the tier is not cleared); the
         // already-written shard files are unreferenced and swept as orphans.
         let mut total_files = 0usize;
+        let mut total_rows = 0u64;
         let merged_stats = Arc::new(ColumnStatsAccumulator::new(schema));
         for handle in handles {
-            let (_rows, files, stats) = handle.await.map_err(|source| Error::Internal {
+            let (rows, files, stats) = handle.await.map_err(|source| Error::Internal {
                 table: self.table_name().to_string(),
                 message: format!("mem-tier checkpoint shard encode task failed: {source}"),
             })??;
+            total_rows = total_rows.saturating_add(rows);
             total_files = total_files.saturating_add(files);
             merged_stats.merge_from(stats.as_ref());
         }
+        self.finish_snapshot_lookup_index(index_builder, snapshot_id, total_rows)
+            .await;
         Ok((total_files, merged_stats))
     }
 
@@ -30426,13 +30437,14 @@ impl CayenneTableProvider {
                 // N==1: the single coordinated encode over the merged corpus —
                 // byte-identical to the pre-sharding path.
                 let (_rows, files, stats) = self
-                    .write_to_snapshot(
+                    .write_to_indexed_snapshot(
                         stream,
                         target_size_bytes,
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                         super::delta_encoding::WritePolicy::DELTA,
+                        None,
                     )
                     .await?;
                 (files, stats)
@@ -30463,10 +30475,14 @@ impl CayenneTableProvider {
                 .await?
             };
 
+            // The checkpoint's index was registered by the write above; a
+            // checkpoint that fails before publishing never publishes it.
             let is_s3 = self.table_metadata.path.starts_with("s3://");
             if !is_s3 {
                 let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-                Self::sync_snapshot_dir(&snapshot_dir).await?;
+                Self::sync_snapshot_dir(&snapshot_dir)
+                    .await
+                    .inspect_err(|_| self.discard_snapshot_lookup_index(&new_snapshot_id))?;
             }
 
             let update = self
@@ -30476,7 +30492,8 @@ impl CayenneTableProvider {
                     sequence_number,
                     &corpus_keys,
                 )
-                .await?;
+                .await
+                .inspect_err(|_| self.discard_snapshot_lookup_index(&new_snapshot_id))?;
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
@@ -34477,15 +34494,7 @@ impl CayenneTableProvider {
         policy: super::delta_encoding::WritePolicy,
         range: Option<RangePartitioning<'_>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
-        // Keys are encoded against the STORED schema, as in
-        // `begin_lookup_index_build`.
-        let builder = self
-            .lookup_index
-            .as_ref()
-            .and_then(|state| state.begin_snapshot_build(snapshot_id, &self.table_schema()));
-        let observer = builder
-            .as_ref()
-            .map(|builder| Arc::clone(builder) as Arc<dyn VortexWriteObserver>);
+        let builder = self.begin_snapshot_lookup_index(snapshot_id);
         let written = self
             .write_to_snapshot_range_partitioned(
                 stream,
@@ -34495,26 +34504,68 @@ impl CayenneTableProvider {
                 estimated_bytes,
                 policy,
                 range,
-                observer,
+                Self::snapshot_index_observer(builder.as_ref()),
             )
             .await?;
-        // A write with no rows leaves no files to index: the snapshot is either
-        // not published at all or publishes nothing a lookup could read.
-        if let (Some(builder), Some(state)) = (builder, &self.lookup_index)
-            && written.0 > 0
-        {
-            let file_set = self.file_set_version();
-            let read_schema = self.read_schema();
-            let ctx = self.create_session_context();
-            let session = ctx.state();
-            if let Some((_store, files)) = self
-                .lookup_index_snapshot_files(&session, snapshot_id, &read_schema)
-                .await
-            {
-                state.finish_snapshot_build(builder, files, file_set).await;
-            }
-        }
+        self.finish_snapshot_lookup_index(builder, snapshot_id, written.0)
+            .await;
         Ok(written)
+    }
+
+    /// Starts the write-time index build for a new snapshot directory, or `None`
+    /// when the table is not indexed. Several writers may feed the returned
+    /// builder at once — the mem-tier checkpoint encodes its shards into one
+    /// snapshot concurrently — and [`Self::finish_snapshot_lookup_index`] runs
+    /// once, after all of them.
+    fn begin_snapshot_lookup_index(
+        &self,
+        snapshot_id: &str,
+    ) -> Option<Arc<super::lookup_index::IncrementalIndexBuilder>> {
+        // Keys are encoded against the STORED schema, as in
+        // `begin_lookup_index_build`.
+        self.lookup_index
+            .as_ref()
+            .and_then(|state| state.begin_snapshot_build(snapshot_id, &self.table_schema()))
+    }
+
+    fn snapshot_index_observer(
+        builder: Option<&Arc<super::lookup_index::IncrementalIndexBuilder>>,
+    ) -> Option<Arc<dyn VortexWriteObserver>> {
+        builder.map(|builder| Arc::clone(builder) as Arc<dyn VortexWriteObserver>)
+    }
+
+    /// Finishes a build begun by [`Self::begin_snapshot_lookup_index`] once every
+    /// file of `snapshot_id` is written, and registers the index under the
+    /// snapshot id. A write with no rows leaves no files to index: the snapshot
+    /// is either not published at all or publishes nothing a lookup could read.
+    async fn finish_snapshot_lookup_index(
+        &self,
+        builder: Option<Arc<super::lookup_index::IncrementalIndexBuilder>>,
+        snapshot_id: &str,
+        rows: u64,
+    ) {
+        let (Some(builder), Some(state)) = (builder, &self.lookup_index) else {
+            return;
+        };
+        if rows == 0 {
+            return;
+        }
+        let file_set = self.file_set_version();
+        let read_schema = self.read_schema();
+        let ctx = self.create_session_context();
+        let session = ctx.state();
+        if let Some((_store, files)) = self
+            .lookup_index_snapshot_files(&session, snapshot_id, &read_schema)
+            .await
+        {
+            state.finish_snapshot_build(builder, files, file_set).await;
+        } else {
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                snapshot_id,
+                "Could not list a newly written snapshot's files, so it publishes without a secondary index"
+            );
+        }
     }
 
     /// Drops the per-snapshot index [`Self::write_to_indexed_snapshot`]
@@ -34532,8 +34583,17 @@ impl CayenneTableProvider {
         let Some(state) = &self.lookup_index else {
             return;
         };
-        if let Some(snapshot_id) = published {
-            state.mark_snapshot_live(snapshot_id);
+        if let Some(snapshot_id) = published
+            && !state.mark_snapshot_live(snapshot_id)
+        {
+            // Lookups read this snapshot in full until compaction folds it. Every
+            // writer of a protected snapshot builds its index as it writes, so
+            // this names a writer that does not, or a build that was refused.
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                snapshot_id,
+                "Published a protected snapshot without a secondary index"
+            );
         }
         let protected = self.protected_snapshots.load();
         state.retain_live_snapshots(|snapshot_id| protected.contains_key(snapshot_id));

@@ -1417,13 +1417,14 @@ impl LookupIndexState {
     /// can only come from writes abandoned without discarding their index, so
     /// the oldest of those are dropped.
     fn register_snapshot(&self, index: Arc<SnapshotLookupIndex>) {
+        self.record_published(&index);
         {
             let _changing = self.snapshots_lock.lock();
             let mut next = HashMap::clone(&self.snapshots.load());
             next.insert(
                 index.snapshot_id.clone(),
                 Arc::new(SnapshotIndexEntry {
-                    index: Arc::clone(&index),
+                    index,
                     live: AtomicBool::new(false),
                 }),
             );
@@ -1437,21 +1438,28 @@ impl LookupIndexState {
                 unpublished.sort_unstable();
                 let excess = unpublished.len() - MAX_UNPUBLISHED_SNAPSHOT_INDEXES;
                 for id in unpublished.into_iter().take(excess) {
+                    tracing::debug!(
+                        table = %self.table_name,
+                        snapshot_id = %id,
+                        "Dropped the secondary index of a snapshot that was never published"
+                    );
                     next.remove(&id);
                 }
             }
             self.snapshots.store(Arc::new(next));
         }
-        self.record_published(&index);
     }
 
     /// Records that `snapshot_id` joined the table's protected set, so its index
     /// is dropped once the snapshot later leaves it. Called where the snapshot
-    /// is published.
-    pub(crate) fn mark_snapshot_live(&self, snapshot_id: &str) {
-        if let Some(entry) = self.snapshots.load().get(snapshot_id) {
-            entry.live.store(true, Ordering::Release);
-        }
+    /// is published. Returns whether the snapshot has an index.
+    pub(crate) fn mark_snapshot_live(&self, snapshot_id: &str) -> bool {
+        let snapshots = self.snapshots.load();
+        let Some(entry) = snapshots.get(snapshot_id) else {
+            return false;
+        };
+        entry.live.store(true, Ordering::Release);
+        true
     }
 
     /// Drops the index of a snapshot whose write was abandoned.
