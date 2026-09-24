@@ -465,9 +465,7 @@ pub enum Error {
         Check that the dataset's source is reachable and that the refresh configuration is valid. \
         See: https://spiceai.org/docs/components/data-accelerators"
     ))]
-    HotReloadRefreshFailed {
-        dataset: TableReference,
-    },
+    HotReloadRefreshFailed { dataset: TableReference },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
