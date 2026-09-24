@@ -3629,7 +3629,7 @@ impl DataFusion {
         {
             accelerated_table.attach_task(self.io_runtime.spawn(reload_on_snapshot_notifications(
                 subscription,
-                state,
+                move || state.current_loaded_id(),
                 requester,
                 completion,
             )));

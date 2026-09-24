@@ -107,13 +107,13 @@ impl SnapshotRefreshState {
 /// resumes after the next refresh that succeeds.
 pub async fn reload_on_snapshot_notifications(
     mut subscription: Subscription,
-    state: SnapshotRefreshState,
+    loaded_snapshot_id: impl Fn() -> Option<u64> + Send,
     requester: Arc<dyn RefreshRequester>,
     completion: RefreshCompletion,
 ) {
     let mut last_requested = None;
     while let Some(announced) = subscription.next_snapshot().await {
-        let known = last_requested.max(state.current_loaded_id());
+        let known = last_requested.max(loaded_snapshot_id());
         if known.is_some_and(|known| announced <= known) {
             continue;
         }
@@ -623,7 +623,186 @@ async fn get_row_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accelerated::refresh_completion::RefreshRequestId;
     use arrow_schema::{DataType, Field};
+    use data_connector_api::accelerated::RefreshRequestError;
+    use runtime_acceleration::snapshot::notifications::TestAnnouncer;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::task::JoinHandle;
+
+    /// Stands in for a table's refresh loop. Each request is a reload of the
+    /// snapshot published when it was requested; it completes at once unless
+    /// held, like a download still in progress.
+    #[derive(Debug, Default)]
+    struct FakeRefresh {
+        completion: RefreshCompletion,
+        requests: AtomicUsize,
+        published: StdMutex<Option<u64>>,
+        loaded: Arc<StdMutex<Option<u64>>>,
+        held: StdMutex<Vec<(RefreshRequestId, Option<u64>)>>,
+        hold: AtomicBool,
+        gone: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RefreshRequester for FakeRefresh {
+        async fn request_refresh(&self) -> Result<(), RefreshRequestError> {
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(RefreshRequestError::TableGone);
+            }
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let id = self.completion.issue();
+            let snapshot = *lock(&self.published);
+            if self.hold.load(Ordering::SeqCst) {
+                lock(&self.held).push((id, snapshot));
+            } else {
+                self.finish(id, snapshot);
+            }
+            Ok(())
+        }
+    }
+
+    impl FakeRefresh {
+        fn publish(&self, snapshot_id: u64) {
+            *lock(&self.published) = Some(snapshot_id);
+        }
+
+        fn finish(&self, id: RefreshRequestId, snapshot: Option<u64>) {
+            *lock(&self.loaded) = snapshot;
+            self.completion.record(id);
+        }
+
+        /// Completes the reloads held so far and stops holding new ones.
+        fn release(&self) {
+            self.hold.store(false, Ordering::SeqCst);
+            let held = std::mem::take(&mut *lock(&self.held));
+            for (id, snapshot) in held {
+                self.finish(id, snapshot);
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+
+        fn loaded(&self) -> Option<u64> {
+            *lock(&self.loaded)
+        }
+
+        /// Runs the reload loop for `dataset` against this fake.
+        fn spawn_loop(self: &Arc<Self>, dataset: &str) -> (TestAnnouncer, JoinHandle<()>) {
+            let (announcer, subscription) = TestAnnouncer::subscribe(dataset);
+            let loaded = Arc::clone(&self.loaded);
+            let task = tokio::spawn(reload_on_snapshot_notifications(
+                subscription,
+                move || *lock(&loaded),
+                Arc::clone(self) as Arc<dyn RefreshRequester>,
+                self.completion.clone(),
+            ));
+            (announcer, task)
+        }
+    }
+
+    fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Lets the loop run to its next wait. The test runtime is single-threaded,
+    /// so a bounded number of yields is enough for it to act on an announcement.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn each_new_snapshot_is_requested_once() {
+        let fake = Arc::new(FakeRefresh::default());
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        fake.publish(1);
+        announcer.announce("orders", 1);
+        settle().await;
+        assert_eq!(fake.requests(), 1);
+        assert_eq!(fake.loaded(), Some(1));
+
+        // Another dataset's publish repeats this dataset's unchanged snapshot.
+        announcer.announce("customers", 9);
+        settle().await;
+        assert_eq!(
+            fake.requests(),
+            1,
+            "an unchanged snapshot is not requested again"
+        );
+
+        fake.publish(2);
+        announcer.announce("orders", 2);
+        settle().await;
+        assert_eq!(fake.requests(), 2);
+        assert_eq!(fake.loaded(), Some(2));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_newer_snapshot_waits_for_the_reload_in_flight() {
+        let fake = Arc::new(FakeRefresh::default());
+        fake.hold.store(true, Ordering::SeqCst);
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        fake.publish(1);
+        announcer.announce("orders", 1);
+        settle().await;
+        assert_eq!(fake.requests(), 1);
+
+        // A request would cancel the reload in flight, so none is made yet.
+        fake.publish(2);
+        announcer.announce("orders", 2);
+        settle().await;
+        assert_eq!(
+            fake.requests(),
+            1,
+            "a newer snapshot must not restart the reload in flight"
+        );
+
+        // Once snapshot 1 lands, the coalesced announcement of 2 is acted on.
+        fake.release();
+        settle().await;
+        assert_eq!(fake.requests(), 2);
+        assert_eq!(fake.loaded(), Some(2));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_already_loaded_is_not_requested() {
+        let fake = Arc::new(FakeRefresh::default());
+        *lock(&fake.loaded) = Some(3);
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        announcer.announce("orders", 3);
+        settle().await;
+        assert_eq!(fake.requests(), 0);
+
+        fake.publish(4);
+        announcer.announce("orders", 4);
+        settle().await;
+        assert_eq!(fake.requests(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_loop_ends_when_the_table_stops_accepting_refreshes() {
+        let fake = Arc::new(FakeRefresh::default());
+        fake.gone.store(true, Ordering::SeqCst);
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        announcer.announce("orders", 1);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop must end once the table is gone")
+            .expect("the loop must not panic");
+    }
 
     /// A live (in-place) widening evolution moves the accelerator ahead of the
     /// start-time federated schema; the checkpoint must record the accelerator's

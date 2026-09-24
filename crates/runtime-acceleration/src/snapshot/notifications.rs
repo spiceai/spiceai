@@ -36,7 +36,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use runtime_secrets::Secrets;
@@ -65,6 +65,11 @@ const QUEUE_URL_KEY: &str = "s3_queue_url";
 
 const SNAPSHOTS_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/snapshots";
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// How long SQS can keep failing before the outage is logged as an error
+/// rather than a warning. Datasets keep checking the location on
+/// `refresh_check_interval` throughout, so this marks when an operator should
+/// act, not when data goes stale.
+const SQS_OUTAGE_ERROR_AFTER: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -310,6 +315,39 @@ impl Subscription {
     }
 }
 
+/// Feeds a [`Subscription`] directly, without an SQS consumer, so code that
+/// reacts to announcements can be tested. Test-only: behind `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestAnnouncer {
+    announce: watch::Sender<Announced>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestAnnouncer {
+    /// A subscription for `dataset` and the announcer that feeds it. Call it
+    /// from within a Tokio runtime.
+    pub fn subscribe(dataset: &str) -> (Self, Subscription) {
+        let (announce, announced) = watch::channel(Announced::new());
+        let consumer = Arc::new(Consumer {
+            announced: announced.clone(),
+            task: tokio::spawn(std::future::pending()),
+        });
+        let subscription = Subscription {
+            announced,
+            dataset: dataset.to_string(),
+            _consumer: consumer,
+        };
+        (Self { announce }, subscription)
+    }
+
+    /// Announce `snapshot_id` as `dataset`'s current snapshot.
+    pub fn announce(&self, dataset: &str, snapshot_id: u64) {
+        self.announce.send_modify(|announced| {
+            announced.insert(dataset.to_string(), snapshot_id);
+        });
+    }
+}
+
 /// What to do with one SQS message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
@@ -372,11 +410,12 @@ async fn run_consumer(
 /// credentials are not yet available).
 async fn connect(config: &NotificationConfig) -> SqsQueue {
     let mut backoff = retry_backoff();
+    let mut outage = SqsOutage::default();
     loop {
         match build_sqs_client(&config.credentials, &config.region).await {
             Ok(client) => return SqsQueue::new(client, config.queue_url.clone()),
             Err(error) => {
-                tracing::warn!("{}", connect_failure_warning(&config.location, &error));
+                outage.log_failure(&config.location, SqsCall::Connect, &error, Instant::now());
                 tokio::time::sleep(backoff.next_backoff().unwrap_or(RETRY_BACKOFF_CAP)).await;
             }
         }
@@ -390,15 +429,93 @@ async fn consume(
     announce: &watch::Sender<Announced>,
 ) {
     let mut backoff = retry_backoff();
+    let mut outage = SqsOutage::default();
     loop {
         match queue.receive().await {
             Ok(messages) => {
                 backoff.reset();
+                if let Some(lasted) = outage.recover(Instant::now()) {
+                    tracing::info!("{}", receive_recovered_message(location, lasted));
+                }
                 process_batch(queue, location, manager, announce, messages).await;
             }
             Err(error) => {
-                tracing::warn!("{}", receive_failure_warning(location, &error));
+                outage.log_failure(location, SqsCall::Receive, &error, Instant::now());
                 tokio::time::sleep(backoff.next_backoff().unwrap_or(RETRY_BACKOFF_CAP)).await;
+            }
+        }
+    }
+}
+
+/// An SQS request the consumer retries while it fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqsCall {
+    Connect,
+    Receive,
+}
+
+/// Where an ongoing SQS outage stands, so it is logged when it starts, again
+/// if it lasts past [`SQS_OUTAGE_ERROR_AFTER`], and when it ends, rather than
+/// on every retry.
+#[derive(Debug, Default)]
+struct SqsOutage {
+    since: Option<Instant>,
+    escalated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutageStep {
+    /// The first failure: log a warning.
+    Started,
+    /// Still failing past the threshold, reported once: log an error.
+    Escalated(Duration),
+    /// Still failing, already reported.
+    Continuing,
+}
+
+impl SqsOutage {
+    fn fail(&mut self, now: Instant) -> OutageStep {
+        let Some(since) = self.since else {
+            self.since = Some(now);
+            return OutageStep::Started;
+        };
+        let lasted = now.saturating_duration_since(since);
+        if !self.escalated && lasted >= SQS_OUTAGE_ERROR_AFTER {
+            self.escalated = true;
+            OutageStep::Escalated(lasted)
+        } else {
+            OutageStep::Continuing
+        }
+    }
+
+    /// Ends the outage, returning how long it lasted, or `None` when there was
+    /// none.
+    fn recover(&mut self, now: Instant) -> Option<Duration> {
+        self.escalated = false;
+        self.since
+            .take()
+            .map(|since| now.saturating_duration_since(since))
+    }
+
+    fn log_failure(
+        &mut self,
+        location: &NotificationLocation,
+        call: SqsCall,
+        error: &dyn std::error::Error,
+        now: Instant,
+    ) {
+        match self.fail(now) {
+            OutageStep::Started => {
+                tracing::warn!("{}", sqs_failure_message(location, call, error, None));
+            }
+            OutageStep::Escalated(lasted) => {
+                tracing::error!(
+                    "{}",
+                    sqs_failure_message(location, call, error, Some(lasted))
+                );
+            }
+            OutageStep::Continuing => {
+                tracing::debug!("{}", sqs_failure_message(location, call, error, None));
             }
         }
     }
@@ -475,22 +592,46 @@ fn listening_message(location: &NotificationLocation) -> String {
     )
 }
 
-fn receive_failure_warning(
+/// The line for a failing SQS call: the start of an outage (`lasted` is
+/// `None`), or one that has lasted past [`SQS_OUTAGE_ERROR_AFTER`].
+fn sqs_failure_message(
     location: &NotificationLocation,
+    call: SqsCall,
     error: &dyn std::error::Error,
+    lasted: Option<Duration>,
 ) -> String {
+    let (action, fix) = match call {
+        SqsCall::Connect => (
+            "connect to the SQS queue in `s3_queue_url`",
+            "Check the AWS credentials for the snapshot location.",
+        ),
+        SqsCall::Receive => (
+            "receive S3 event notifications from the SQS queue in `s3_queue_url`",
+            "Check the queue URL and the `sqs:ReceiveMessage` permission.",
+        ),
+    };
+    let lasted = lasted.map_or_else(String::new, |lasted| {
+        format!(" for {}", format_duration(lasted))
+    });
     format!(
-        "Failed to receive S3 event notifications for snapshot location '{location}' from the SQS queue in `s3_queue_url`, so datasets with `refresh_mode: snapshot` reload only on `refresh_check_interval` until it recovers. Cause: {error}. Check the queue URL and `sqs:ReceiveMessage` permission. See: {SNAPSHOTS_DOCS}"
+        "Failed to {action} for snapshot location '{location}'{lasted}, so datasets with `refresh_mode: snapshot` fall back to checking the location every `refresh_check_interval` until it recovers. Cause: {error}. {fix} See: {SNAPSHOTS_DOCS}"
     )
 }
 
-fn connect_failure_warning(
-    location: &NotificationLocation,
-    error: &dyn std::error::Error,
-) -> String {
+fn receive_recovered_message(location: &NotificationLocation, lasted: Duration) -> String {
     format!(
-        "Failed to connect to the SQS queue in `s3_queue_url` for snapshot location '{location}', so datasets with `refresh_mode: snapshot` reload only on `refresh_check_interval` until it connects. Cause: {error}. Check the AWS credentials for the snapshot location. See: {SNAPSHOTS_DOCS}"
+        "Snapshot location '{location}' is receiving S3 event notifications from the SQS queue in `s3_queue_url` again after {}, so datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published.",
+        format_duration(lasted)
     )
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn metadata_read_warning(location: &NotificationLocation, error: &dyn std::error::Error) -> String {
@@ -522,6 +663,7 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use s3_event_notifications::queue::QueueError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const QUEUE_URL: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/spice-snapshots";
 
@@ -809,29 +951,46 @@ mod tests {
     async fn subscriptions_share_a_consumer_that_stops_with_the_last_one() {
         let notifications = SnapshotNotifications::default();
         let orders = build_manager_for_api_tests(Arc::new(InMemory::new()));
-        let mut spawns = 0;
-        let mut subscribe = || {
+        let spawns = AtomicUsize::new(0);
+        let subscribe = || {
             notifications.subscribe_with(&config(), &orders, |_announce| {
-                spawns += 1;
+                spawns.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(futures::future::pending())
             })
+        };
+        let running = || {
+            notifications
+                .consumers
+                .lock()
+                .values()
+                .filter(|consumer| consumer.upgrade().is_some())
+                .count()
         };
 
         let first = subscribe();
         let second = subscribe();
-        assert!(Arc::ptr_eq(&first._consumer, &second._consumer));
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "subscriptions to one queue share its consumer"
+        );
+        assert_eq!(running(), 1);
 
-        let consumer = Arc::downgrade(&first._consumer);
         drop(first);
-        assert!(consumer.upgrade().is_some(), "still used by `second`");
+        assert_eq!(running(), 1, "still used by `second`");
         drop(second);
-        assert!(
-            consumer.upgrade().is_none(),
+        assert_eq!(
+            running(),
+            0,
             "the consumer stops with its last subscription"
         );
 
         let _again = subscribe();
-        assert_eq!(spawns, 2, "a later subscription starts a new consumer");
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "a later subscription starts a new consumer"
+        );
     }
 
     #[tokio::test]
@@ -887,11 +1046,29 @@ mod tests {
         assert!(listening.contains("`refresh_mode: snapshot`"));
 
         let error = std::io::Error::other("AccessDenied");
-        let receive = receive_failure_warning(&location, &error);
+        let receive = sqs_failure_message(&location, SqsCall::Receive, &error, None);
         assert!(receive.contains("'s3://my-bucket/spice/snapshots'"));
-        assert!(receive.contains("reload only on `refresh_check_interval`"));
+        assert!(
+            receive.contains("fall back to checking the location every `refresh_check_interval`")
+        );
         assert!(receive.contains("Cause: AccessDenied"));
+        assert!(receive.contains("`sqs:ReceiveMessage`"));
         assert!(receive.contains(SNAPSHOTS_DOCS));
+
+        let lasting = sqs_failure_message(
+            &location,
+            SqsCall::Receive,
+            &error,
+            Some(Duration::from_secs(301)),
+        );
+        assert!(lasting.contains("'s3://my-bucket/spice/snapshots' for 5m,"));
+
+        let connect = sqs_failure_message(&location, SqsCall::Connect, &error, None);
+        assert!(connect.contains("Failed to connect to the SQS queue in `s3_queue_url`"));
+        assert!(connect.contains("AWS credentials"));
+
+        let recovered = receive_recovered_message(&location, Duration::from_secs(42));
+        assert!(recovered.contains("again after 42s"));
 
         let outside = outside_location_error(&location, "my-bucket", "events/a.parquet");
         assert!(outside.contains("'s3://my-bucket/events/a.parquet'"));
@@ -901,14 +1078,51 @@ mod tests {
         for line in [
             listening,
             receive,
+            lasting,
+            connect,
+            recovered,
             outside,
-            connect_failure_warning(&location, &error),
             metadata_read_warning(&location, &error),
             invalid_notification_warning(&location, &error),
         ] {
             assert!(!line.contains(QUEUE_URL), "never log the queue URL: {line}");
             assert!(!line.contains('\n'), "log lines are single-line: {line}");
         }
+    }
+
+    #[test]
+    fn an_sqs_outage_is_warned_once_escalated_once_and_ends_on_recovery() {
+        let start = Instant::now();
+        let mut outage = SqsOutage::default();
+        assert_eq!(outage.recover(start), None, "no outage to end");
+
+        assert_eq!(outage.fail(start), OutageStep::Started);
+        assert_eq!(
+            outage.fail(start + Duration::from_secs(30)),
+            OutageStep::Continuing
+        );
+        let past = start + SQS_OUTAGE_ERROR_AFTER;
+        assert_eq!(
+            outage.fail(past),
+            OutageStep::Escalated(SQS_OUTAGE_ERROR_AFTER)
+        );
+        assert_eq!(
+            outage.fail(past + Duration::from_secs(30)),
+            OutageStep::Continuing,
+            "the error is logged once per outage"
+        );
+
+        let ended = past + Duration::from_mins(1);
+        assert_eq!(
+            outage.recover(ended),
+            Some(SQS_OUTAGE_ERROR_AFTER + Duration::from_mins(1))
+        );
+        assert_eq!(outage.recover(ended), None);
+        assert_eq!(
+            outage.fail(ended),
+            OutageStep::Started,
+            "the next outage is reported afresh"
+        );
     }
 
     fn snapshots(location: &str, params: &[(&str, &str)]) -> Snapshots {
@@ -988,7 +1202,8 @@ mod tests {
             )],
         ))
         .await
-        .expect_err("an ARN is not a queue URL");
+        .err()
+        .expect("an ARN is not a queue URL");
         assert!(matches!(arn, Error::QueueUrlIsArn), "{arn}");
 
         let loopback = resolve(&snapshots(
@@ -999,7 +1214,8 @@ mod tests {
             )],
         ))
         .await
-        .expect_err("loopback is not an SQS queue");
+        .err()
+        .expect("loopback is not an SQS queue");
         assert!(matches!(loopback, Error::QueueUrlNotSqs), "{loopback}");
 
         let empty = resolve(&snapshots(
@@ -1007,7 +1223,8 @@ mod tests {
             &[("s3_queue_url", " ")],
         ))
         .await
-        .expect_err("an empty queue URL");
+        .err()
+        .expect("an empty queue URL");
         assert!(matches!(empty, Error::EmptyQueueUrl), "{empty}");
 
         let gcs = resolve(&snapshots(
@@ -1015,7 +1232,8 @@ mod tests {
             &[("s3_queue_url", QUEUE_URL)],
         ))
         .await
-        .expect_err("S3 notifications only come from S3");
+        .err()
+        .expect("S3 notifications only come from S3");
         assert!(
             matches!(gcs, Error::LocationNotS3 { ref location } if location == "gs://my-bucket/snapshots/"),
             "{gcs}"

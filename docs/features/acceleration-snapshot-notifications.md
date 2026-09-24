@@ -17,7 +17,12 @@ The same notification loads the first snapshot. A reader that starts before any 
 6. **Other objects under the location.** Notifications for the snapshot files themselves and for removals are deleted without a refresh: a snapshot is not current until `metadata.json` names it.
 7. **Objects outside the location.** A notification that names an object outside the snapshot location is **left on the queue** (not deleted) and logged as an error. The queue must receive only this location's notifications.
 8. **Invalid messages.** A message that is not an S3 event notification is logged and deleted.
-9. **Poll floor.** `refresh_check_interval` still applies as the completeness floor. It covers a purged queue, a changed notification configuration, and messages that expired while Spice was down.
+9. **Fallback to polling.** Every snapshot-mode dataset keeps checking the location on `refresh_check_interval` whether or not SQS is healthy, as it does without a queue. When SQS can't be reached (the client can't connect, or receives keep failing), datasets fall back to that check alone:
+   - The outage is logged as a warning when it starts.
+   - It is logged as an error if it lasts more than 5 minutes.
+   - An info line is logged when notifications resume.
+
+   The same check covers a purged queue, a changed notification configuration, and messages that expired while Spice was down.
 
 ## Minimal configuration
 
