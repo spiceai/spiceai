@@ -57871,6 +57871,143 @@ mod tests {
         staged.finish().await.expect("finalize the staged write");
     }
 
+    /// A transaction that began before a pipelined staged append of the key it
+    /// read must be refused when it commits inside that append's staged window.
+    ///
+    /// The append takes the `!stage_on_conflict` arm — purely-new keys into a
+    /// table holding no tombstones, which is `do_nothing`'s steady state
+    /// (`may_have_on_conflict_deletions` is set only for `Upsert`) — so it
+    /// publishes into the current snapshot and reserves no sequence of its own.
+    ///
+    /// Neither writer sees the other: the transaction staged its row before the
+    /// append existed, and the append validated before the transaction published.
+    /// The commit's per-key OCC re-check is the only thing between them, so the
+    /// append's Stage-A key record has to carry a sequence strictly above the
+    /// transaction's begin token — a stamp equal to that token reads as
+    /// "committed before you began" and both rows publish under one declared
+    /// primary key. Regression test for #13685.
+    #[tokio::test]
+    async fn a_transaction_committing_inside_a_staged_append_window_is_refused() {
+        let ctx = SessionContext::new();
+        let table = "staged_append_txn_occ";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // 1. The transaction begins and reads key 77, finding it absent. The
+        //    footprint is that one key and it is complete (a bounded PK
+        //    predicate), so the commit takes the per-key OCC path.
+        let token = provider.transaction_write_token().await;
+        let footprint = std::collections::HashSet::from([int64_pk_digest(77)]);
+
+        // 2. It stages its own row for 77 while the table is still empty.
+        let staged = provider
+            .begin_staged_upsert_occ(
+                token,
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),
+                1,
+            )
+            .await
+            .expect("the transaction's write should stage");
+
+        // 3. A CDC pipelined append of the SAME key stages inside that window. It
+        //    validated against a table that does not hold the transaction's staged
+        //    row, so it keeps 77 too.
+        let append = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[1])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("the CDC append should stage");
+        assert!(
+            append.has_pending_finalize(),
+            "the append must still be staged when the transaction commits, or the window under \
+             test never opens"
+        );
+
+        // 4. The transaction commits. Its read of 77 is stale — the append owns
+        //    that key now — so the commit has to be refused.
+        let outcome = staged.commit(footprint, true).await;
+
+        append.finish().await.expect("finalize the staged append");
+
+        assert!(
+            matches!(outcome, Err(Error::WriteConflict { .. })),
+            "a transaction whose footprint key was taken by a staged append must abort with a \
+             write conflict, got {outcome:?}"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table).await,
+            vec![(77, 1)],
+            "key 77 must have exactly one live row: the append's"
+        );
+    }
+
+    /// The same window over the SYNCHRONOUS append path: an ordinary insert
+    /// publishing into the current snapshot with no on-conflict deletions has to
+    /// order itself against a transaction that read the key it appends, for the
+    /// same reason and by the same means as the pipelined case above. Sibling
+    /// regression test for #13685.
+    #[tokio::test]
+    async fn a_transaction_committing_across_a_plain_append_of_its_key_is_refused() {
+        let ctx = SessionContext::new();
+        let table = "plain_append_txn_occ";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let token = provider.transaction_write_token().await;
+        let footprint = std::collections::HashSet::from([int64_pk_digest(77)]);
+
+        let staged = provider
+            .begin_staged_upsert_occ(
+                token,
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),
+                1,
+            )
+            .await
+            .expect("the transaction's write should stage");
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[77], &[1]),
+        )
+        .await;
+
+        let outcome = staged.commit(footprint, true).await;
+
+        assert!(
+            matches!(outcome, Err(Error::WriteConflict { .. })),
+            "a transaction whose footprint key was appended by another writer must abort with a \
+             write conflict, got {outcome:?}"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table).await,
+            vec![(77, 1)],
+            "key 77 must have exactly one live row: the append's"
+        );
+    }
+
     /// The `u128` PK digest for a single-column `Int64` primary key, as the
     /// keyset stores it.
     fn int64_pk_digest(id: i64) -> u128 {
