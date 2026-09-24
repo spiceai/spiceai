@@ -68,6 +68,7 @@ mod executor;
 mod key;
 mod page_store;
 mod view;
+mod visibility;
 
 #[cfg(test)]
 mod tests;
@@ -89,10 +90,11 @@ pub(crate) use page_store::{
     PayloadPage, PayloadPageLease, ReservationToken,
 };
 pub(crate) use view::{
-    CoverageDecision, CoverageUnavailableReason, CoveringIndexCatalog, CoveringReadView,
-    GatherBatch, IndexCatalog, IndexedSource, ProbeCursor, ProbeMatch, ProbeRequest, ProbeStep,
-    gather, prepare_literal_seek, probe_many, try_cover,
+    CapturedSource, CoverageDecision, CoverageUnavailableReason, CoveringIndexCatalog,
+    CoveringReadView, GatherBatch, IndexCatalog, IndexedSource, ProbeCursor, ProbeMatch,
+    ProbeRequest, ProbeStep, SourceRows, gather, prepare_literal_seek, probe_many, try_cover,
 };
+pub(crate) use visibility::{PrimaryKeyLayout, SourceRole, VisibilityAdapter};
 
 use snafu::prelude::*;
 

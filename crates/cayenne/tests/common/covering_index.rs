@@ -376,15 +376,25 @@ impl CoveringIndexFixture {
     /// writer. This is deliberately test-only fixture plumbing: publication
     /// assertions for the private covering catalog remain in the library tests.
     pub async fn overwrite_indexed_a(&self, batch: RecordBatch) {
+        Self::overwrite_indexed_table(&self.a, batch).await;
+    }
+
+    /// Replace the indexed `b` source through Cayenne's real full-refresh
+    /// writer. It exercises a payload-only change under an unchanged lookup
+    /// key without exposing the fixture's private provider internals.
+    pub async fn overwrite_indexed_b(&self, batch: RecordBatch) {
+        Self::overwrite_indexed_table(&self.b, batch).await;
+    }
+
+    async fn overwrite_indexed_table(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
         let context = SessionContext::new();
         let source = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
             &[vec![batch]],
-            a_schema(),
+            table.schema(),
             None,
         )
         .expect("create overwrite source");
-        let plan = self
-            .a
+        let plan = table
             .insert_into(
                 &context.state(),
                 source,

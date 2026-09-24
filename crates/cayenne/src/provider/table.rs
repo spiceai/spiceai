@@ -1253,9 +1253,20 @@ struct RawScanInput {
     /// from this by `build_scan_view`; the raw file-side snapshot is retained here
     /// so its index `Arc` pins the generation (ABA-safe ptr identity, #11303).
     deletion_snapshot: PkDeletionSnapshot,
+    /// Per-file position-delete vectors captured in the same `scan_state_lock`
+    /// window as [`Self::deletion_snapshot`]. The `Arc` keeps every vector that
+    /// a covering row's original physical ordinal is checked against alive; its
+    /// pointer participates in the scan-view identity below, so a later vector
+    /// publish cannot be paired with old covered row references.
+    position_deletions: Arc<crate::provider::deletion_strategy::PositionBitmap>,
     /// Protected-snapshot map (`protected_snapshots.load_full()`), captured in the
     /// SAME `scan_state_lock` block as `deletion_snapshot` and `inlined_view`.
     protected_map: Arc<HashMap<String, i64>>,
+    /// The immutable files of every protected snapshot, captured under the
+    /// listing fence with its cutoff. A covering proof must not list these
+    /// directories later, after a compaction or snapshot transition changed what
+    /// the ordinary captured scan would have read.
+    protected_files: Arc<BTreeMap<String, CapturedSnapshotFiles>>,
     /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
     /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
     inlined_view: Arc<Vec<Arc<InlinedViewEntry>>>,
@@ -1333,6 +1344,7 @@ impl RawScanInput {
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             mem_tier_versions: self.mem_tier_shards.iter().map(|s| s.version).collect(),
             deletion_index_ptr: self.deletion_snapshot.index_ptr(),
+            position_deletions_ptr: Arc::as_ptr(&self.position_deletions).addr(),
             protected_map_ptr: Arc::as_ptr(&self.protected_map).addr(),
             inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
             lookup_index_ptr: self
@@ -1404,6 +1416,10 @@ struct ScanViewKey {
     maintained_aggregate_epoch: Option<u64>,
     mem_tier_versions: Vec<u64>,
     deletion_index_ptr: Option<usize>,
+    /// Position vectors are independently published immutable state. Retaining
+    /// their `Arc` in `RawScanInput` makes this pointer ABA-safe for as long as
+    /// a cached scan view can use it.
+    position_deletions_ptr: usize,
     protected_map_ptr: usize,
     inlined_view_ptr: usize,
     /// A background build publishing for the same snapshot must mint a new
@@ -1442,6 +1458,12 @@ struct ScanView {
     /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
     /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
     union_tombstones: crate::provider::mem_tier::InMemTombstones,
+    /// Every concrete source a normal scan of this view can read, each paired
+    /// with the exact source-role visibility adapter captured under the same
+    /// fences as `raw`. A covering plan consumes this immutable manifest rather
+    /// than re-listing warm/protected/cold sources or sampling live mem-tier
+    /// state later.
+    covering_manifest: Arc<[super::covering_index::CapturedSource]>,
     /// Seqlock generation this bundle was validated at (even — a non-torn capture).
     /// Folded into the [`ScanViewKey`] so a live schema-evolution mints a fresh key,
     /// and compared on both reuse fast paths so a serve is never a pre-evolution
@@ -28088,7 +28110,7 @@ impl CayenneTableProvider {
         // completes (a durable-publish burst) would starve this capture indefinitely.
         let capture_wait_start = Instant::now();
         let mut capture_attempts: u32 = 0;
-        let (deletion_snapshot, protected_map, inlined_view) = loop {
+        let (deletion_snapshot, position_deletions, protected_map, inlined_view) = loop {
             capture_attempts += 1;
             let final_attempt = capture_attempts >= Self::MAX_SCAN_CAPTURE_ATTEMPTS;
             let captured = {
@@ -28116,6 +28138,7 @@ impl CayenneTableProvider {
                 view.map(|inlined_view| {
                     (
                         self.pk_deletion_snapshot(),
+                        self.pk_deletion_strategy.position_cache().load_full(),
                         self.protected_snapshots.load_full(),
                         inlined_view,
                     )
@@ -28146,6 +28169,15 @@ impl CayenneTableProvider {
             .as_ref()
             .and_then(|state| state.published());
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
+        let mut protected_files = BTreeMap::new();
+        if covering_catalog.is_some() {
+            for snapshot_id in protected_map.keys() {
+                protected_files.insert(
+                    snapshot_id.clone(),
+                    self.capture_warm_files(snapshot_id).await?,
+                );
+            }
+        }
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         // The cold half of the file set, resolved under the SAME held fence as the
@@ -28187,7 +28219,9 @@ impl CayenneTableProvider {
             mem_tier_shards,
             maintained_aggregate_epoch,
             deletion_snapshot,
+            position_deletions,
             protected_map,
+            protected_files: Arc::new(protected_files),
             inlined_view,
             current_snapshot_id,
             lookup_index,
@@ -28376,13 +28410,278 @@ impl CayenneTableProvider {
         let visible_segments = self.visible_mem_tier_segments(&raw.mem_tier_shards)?;
         let union_tombstones =
             crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
+        let covering_manifest = if raw.covering_catalog.is_some() {
+            self.covering_source_manifest(&raw, &merged_deletions, &union_tombstones)?
+        } else {
+            Arc::new([])
+        };
         Ok(ScanView {
             raw,
             merged_deletions,
             visible_segments,
             union_tombstones,
+            covering_manifest,
             structural_version,
         })
+    }
+
+    /// Assemble the complete source manifest that a covering access path must
+    /// prove. This runs while `RawScanInput` still retains the scan fence's
+    /// captured warm listing, protected listings, cold manifest, inline entries,
+    /// memory generations, deletion snapshots, and position vectors. It never
+    /// samples live state, so a later checkpoint/compaction cannot make a plan
+    /// see a different source set halfway through its lifetime.
+    fn covering_source_manifest(
+        &self,
+        raw: &RawScanInput,
+        merged_deletions: &PkDeletionSnapshot,
+        union_tombstones: &crate::provider::mem_tier::InMemTombstones,
+    ) -> datafusion_common::Result<Arc<[super::covering_index::CapturedSource]>> {
+        use super::covering_index::{
+            CapturedSource, PrimaryKeyLayout, SourceId, SourceRole, SourceRows, VisibilityAdapter,
+        };
+
+        let primary_key = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                PrimaryKeyLayout::new(Vec::new(), None)
+            }
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                PrimaryKeyLayout::new(self.pk_column_indices.clone(), None)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let converter = self.pk_row_converter.as_ref().map_or_else(
+                    || {
+                        self.build_pk_converter(&self.pk_column_indices)
+                            .map(Arc::new)
+                    },
+                    |converter| Ok(Arc::clone(converter)),
+                )?;
+                PrimaryKeyLayout::new(self.pk_column_indices.clone(), Some(converter))
+            }
+        };
+        let table_id: Arc<str> = Arc::from(self.table_metadata.table_id.as_str());
+        let mut sources = Vec::new();
+        let warm_handling = if raw.protected_map.is_empty() {
+            InsertRecordHandling::Apply
+        } else {
+            InsertRecordHandling::Ignore
+        };
+
+        let mut add_file = |snapshot_id: &str,
+                            file: &PartitionedFile,
+                            role: SourceRole,
+                            handling: InsertRecordHandling|
+         -> datafusion_common::Result<()> {
+            let path = file.object_meta.location.to_string();
+            let source = SourceId::file(
+                Arc::clone(&table_id),
+                snapshot_id,
+                path.clone(),
+                file.object_meta.size,
+                file.object_meta.last_modified.timestamp_millis(),
+            );
+            let position_deletions = raw.position_deletions.get(&path).map(Arc::clone);
+            let visibility = VisibilityAdapter::file(
+                role,
+                merged_deletions.clone(),
+                handling,
+                primary_key.clone(),
+                position_deletions,
+            )
+            .map_err(|error| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Failed to capture covering visibility for table {}: {error}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+            sources.push(CapturedSource::new(
+                source,
+                role,
+                SourceRows::Unknown,
+                visibility,
+            ));
+            Ok(())
+        };
+
+        for file in raw.warm_files.files.iter() {
+            add_file(
+                &raw.current_snapshot_id,
+                file,
+                SourceRole::Warm,
+                warm_handling,
+            )?;
+        }
+        for (snapshot_id, cutoff) in raw.protected_map.iter() {
+            let protected_files = raw.protected_files.get(snapshot_id).ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Captured protected snapshot {snapshot_id} has no captured file manifest"
+                ))
+            })?;
+            for file in protected_files.files.iter() {
+                add_file(
+                    snapshot_id,
+                    file,
+                    SourceRole::Protected {
+                        min_delete_sequence: *cutoff,
+                    },
+                    InsertRecordHandling::Ignore,
+                )?;
+            }
+        }
+        if let Some(cold_files) = &raw.cold_files {
+            for file in cold_files.iter() {
+                let size = u64::try_from(file.file_size_bytes).map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Cold file '{}' for table {} has a negative size",
+                        file.file_url, self.table_metadata.table_name
+                    ))
+                })?;
+                let source = SourceId::cold(
+                    Arc::clone(&table_id),
+                    raw.current_snapshot_id.as_str(),
+                    file.file_url.as_str(),
+                    size,
+                    file.min_sequence,
+                    file.max_sequence,
+                );
+                let position_deletions = raw.position_deletions.get(&file.file_url).map(Arc::clone);
+                let visibility = VisibilityAdapter::file(
+                    SourceRole::Cold,
+                    merged_deletions.clone(),
+                    InsertRecordHandling::Ignore,
+                    primary_key.clone(),
+                    position_deletions,
+                )
+                .map_err(|error| {
+                    datafusion_common::DataFusionError::Internal(format!(
+                        "Failed to capture covering cold visibility for table {}: {error}",
+                        self.table_metadata.table_name
+                    ))
+                })?;
+                sources.push(CapturedSource::new(
+                    source,
+                    SourceRole::Cold,
+                    SourceRows::Unknown,
+                    visibility,
+                ));
+            }
+        }
+        for entry in raw.inlined_view.iter() {
+            let row_count = entry
+                .batches
+                .iter()
+                .try_fold(0usize, |count, batch| count.checked_add(batch.num_rows()))
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(
+                        "inline covering source row count overflowed".to_string(),
+                    )
+                })?;
+            let sequence = entry.envelope.sequence_number;
+            sources.push(CapturedSource::new(
+                SourceId::inline(
+                    Arc::clone(&table_id),
+                    entry.envelope.inlined_id.as_str(),
+                    sequence,
+                ),
+                SourceRole::Inline {
+                    data_sequence: sequence,
+                },
+                SourceRows::Known(row_count),
+                VisibilityAdapter::inline(sequence, union_tombstones.clone(), primary_key.clone()),
+            ));
+        }
+        for (shard_index, shard) in raw.mem_tier_shards.iter().enumerate() {
+            let shard_index = u32::try_from(shard_index).map_err(|_| {
+                datafusion_common::DataFusionError::Internal(
+                    "memory-tier shard index exceeded covering source identity range".to_string(),
+                )
+            })?;
+            for (segment_index, segment) in shard.segments.iter().enumerate() {
+                let segment_index = u32::try_from(segment_index).map_err(|_| {
+                    datafusion_common::DataFusionError::Internal(
+                        "memory-tier segment index exceeded covering source identity range"
+                            .to_string(),
+                    )
+                })?;
+                for (batch_index, batch) in segment.batches.iter().enumerate() {
+                    let batch_index = u32::try_from(batch_index).map_err(|_| {
+                        datafusion_common::DataFusionError::Internal(
+                            "memory-tier batch index exceeded covering source identity range"
+                                .to_string(),
+                        )
+                    })?;
+                    let data_sequence = segment.data_sequence;
+                    sources.push(CapturedSource::new(
+                        SourceId::memory(
+                            Arc::clone(&table_id),
+                            shard.version,
+                            shard_index,
+                            segment_index,
+                            batch_index,
+                        ),
+                        SourceRole::Memory { data_sequence },
+                        SourceRows::Known(batch.num_rows()),
+                        VisibilityAdapter::memory(
+                            data_sequence,
+                            shard.tombstones.clone(),
+                            primary_key.clone(),
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(sources.into())
+    }
+
+    /// Build the optional covering read view from one already captured scan
+    /// view. The method is intentionally separate from ordinary scan planning:
+    /// later operators call it before selecting the optional path, while all
+    /// incomplete producer states continue to return the normal scan.
+    #[expect(
+        dead_code,
+        reason = "the covering scan and join operators consume this proof in the following implementation steps"
+    )]
+    fn try_cover_scan_view(
+        &self,
+        state: &dyn Session,
+        scan_view: &Arc<ScanView>,
+        definition: &super::covering_index::IndexDefinition,
+        required_columns: &[usize],
+    ) -> super::covering_index::Result<super::covering_index::CoverageDecision> {
+        let Some(catalogs) = &scan_view.raw.covering_catalog else {
+            return Ok(super::covering_index::CoverageDecision::Unavailable(
+                super::covering_index::CoverageUnavailableReason::MissingSource,
+            ));
+        };
+        let Some(catalog) = catalogs.catalog_for(definition) else {
+            return Ok(super::covering_index::CoverageDecision::Unavailable(
+                super::covering_index::CoverageUnavailableReason::DefinitionMismatch,
+            ));
+        };
+        let transaction_active = state
+            .config()
+            .get_extension::<runtime_request_context::RequestContext>()
+            .and_then(|context| context.extension::<super::transaction::CayenneTransaction>())
+            .is_some();
+        let eligibility_failure = if transaction_active {
+            Some(super::covering_index::CoverageUnavailableReason::TransactionOrDistributedContext)
+        } else if self.context.integrity_checksums() {
+            Some(super::covering_index::CoverageUnavailableReason::IntegrityPreflight)
+        } else {
+            None
+        };
+        let query_schema =
+            super::covering_index::SchemaIdentity::identity(&scan_view.raw.read_schema)?;
+        let view = super::covering_index::CoveringReadView::capture(
+            Arc::clone(catalog),
+            catalogs.is_complete(),
+            scan_view.covering_manifest.iter().cloned(),
+            query_schema,
+            Arc::clone(&scan_view.raw.scan_guard),
+            eligibility_failure,
+            self.time_retention_filter_builder.clone(),
+        )?;
+        super::covering_index::try_cover(Arc::new(view), definition, required_columns)
     }
 
     /// Cap on concurrent in-flight builds cached for dedup. Read-your-writes scans key

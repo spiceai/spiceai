@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, new_empty_array};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 
 use super::{
@@ -27,6 +28,9 @@ use super::{
     IndexRun, KeyDirectoryEntry, KeyPageId, KeyPageLease, LiteralSeekSpan, MemoryPageStore,
     PayloadPageId, PayloadPageLease, PreparedLiteralSeek, Result, SchemaIdentity, SourceId,
 };
+use super::{SourceRole, VisibilityAdapter};
+use crate::provider::TimeRetentionFilterBuilder;
+use crate::provider::scan::SnapshotScanRef;
 
 /// Immutable source coverage available to a captured view.
 #[derive(Clone, Debug)]
@@ -360,6 +364,9 @@ pub(crate) enum CoverageUnavailableReason {
     UnavailableResources,
     /// An active transaction or distributed execution cannot retain this local view.
     TransactionOrDistributedContext,
+    /// The ordinary scan must still read the source to complete configured
+    /// end-to-end integrity verification.
+    IntegrityPreflight,
 }
 
 /// Result of attempting to prove complete optional coverage.
@@ -371,30 +378,187 @@ pub(crate) enum CoverageDecision {
     Unavailable(CoverageUnavailableReason),
 }
 
+/// Whether a manifest entry is known to be empty at the captured scan point.
+///
+/// `Unknown` deliberately does not mean empty. A source that normal scanning
+/// can reach but whose row count was not materialized must still have a
+/// compatible covering artifact before the optional path can run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceRows {
+    /// The source has an exact captured physical row count.
+    Known(usize),
+    /// The scan can read this source, but no exact row count was captured.
+    Unknown,
+}
+
+impl SourceRows {
+    #[must_use]
+    const fn is_known_empty(self) -> bool {
+        matches!(self, Self::Known(0))
+    }
+}
+
+/// One source a normal scan of a captured view can reach.
+///
+/// This is intentionally a map entry, not a derived listing at probe time: a
+/// file rewrite, cold promotion, or in-memory batch replacement after capture
+/// must not change what the covering proof considers complete.
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedSource {
+    source: SourceId,
+    role: SourceRole,
+    rows: SourceRows,
+    visibility: VisibilityAdapter,
+}
+
+impl CapturedSource {
+    /// Create one explicit captured source and its source-role visibility rule.
+    #[must_use]
+    pub(crate) fn new(
+        source: SourceId,
+        role: SourceRole,
+        rows: SourceRows,
+        visibility: VisibilityAdapter,
+    ) -> Self {
+        Self {
+            source,
+            role,
+            rows,
+            visibility,
+        }
+    }
+
+    /// Generation-qualified source identity.
+    #[must_use]
+    pub(crate) fn source(&self) -> &SourceId {
+        &self.source
+    }
+
+    /// Scan branch whose rules govern this source.
+    #[must_use]
+    pub(crate) const fn role(&self) -> SourceRole {
+        self.role
+    }
+
+    /// Exact source cardinality, where the capture has one.
+    #[must_use]
+    pub(crate) const fn rows(&self) -> SourceRows {
+        self.rows
+    }
+
+    /// Retained source-role deletion/removal interpretation.
+    #[must_use]
+    pub(crate) fn visibility(&self) -> &VisibilityAdapter {
+        &self.visibility
+    }
+}
+
 /// Scan-visible source manifest and other state held by a covering read.
 ///
 /// Step 05 wires this to `ScanView` and the existing visibility captures. The
 /// manifest itself is already explicit here so callers cannot silently treat a
 /// partially built catalog as coverage for a captured scan.
-#[derive(Debug)]
 pub(crate) struct CoveringReadView {
     catalog: Arc<IndexCatalog>,
-    source_manifest: BTreeSet<SourceId>,
+    catalog_complete: bool,
+    eligibility_failure: Option<CoverageUnavailableReason>,
+    source_manifest: BTreeMap<SourceId, CapturedSource>,
     query_schema: SchemaIdentity,
+    /// Retains the configured retention rule, not a precomputed cutoff. A
+    /// covering executor builds the expression when it evaluates a query so
+    /// time-based retention keeps the same moving-boundary semantics as the
+    /// ordinary scan.
+    retention_filter: Option<TimeRetentionFilterBuilder>,
+    /// Pins the table snapshot directories while a covering operator outlives
+    /// the `ScanView` that created it. Source adapters retain their own
+    /// deletion/cache arcs; this guard retains the file paths themselves.
+    scan_guard: Option<Arc<SnapshotScanRef>>,
+}
+
+impl std::fmt::Debug for CoveringReadView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoveringReadView")
+            .field("catalog_sources", &self.catalog.sources().len())
+            .field("catalog_complete", &self.catalog_complete)
+            .field("eligibility_failure", &self.eligibility_failure)
+            .field("manifest_sources", &self.source_manifest.len())
+            .field("has_retention_filter", &self.retention_filter.is_some())
+            .field("has_scan_guard", &self.scan_guard.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CoveringReadView {
-    /// Capture an immutable catalog and the full source manifest a scan can read.
+    /// Construct the position-only form used by page-store unit tests. Production
+    /// scan capture must use [`Self::capture`], which retains a scan guard and
+    /// the actual source-role adapters.
     pub(crate) fn new(
         catalog: Arc<IndexCatalog>,
         source_manifest: impl IntoIterator<Item = SourceId>,
         query_schema: SchemaIdentity,
     ) -> Self {
+        let visibility = VisibilityAdapter::position_only_file();
+        let source_manifest = source_manifest
+            .into_iter()
+            .map(|source| {
+                let rows = catalog
+                    .sources()
+                    .get(&source)
+                    .map_or(SourceRows::Unknown, |indexed| {
+                        SourceRows::Known(indexed.row_count())
+                    });
+                (
+                    source.clone(),
+                    CapturedSource::new(source, SourceRole::Warm, rows, visibility.clone()),
+                )
+            })
+            .collect();
         Self {
             catalog,
-            source_manifest: source_manifest.into_iter().collect(),
+            catalog_complete: true,
+            eligibility_failure: None,
+            source_manifest,
             query_schema,
+            retention_filter: None,
+            scan_guard: None,
         }
+    }
+
+    /// Capture a complete manifest and all state needed to interpret it later.
+    ///
+    /// This validates duplicate identities at construction time; a missing
+    /// source is never later inferred to be an empty source.
+    pub(crate) fn capture(
+        catalog: Arc<IndexCatalog>,
+        catalog_complete: bool,
+        sources: impl IntoIterator<Item = CapturedSource>,
+        query_schema: SchemaIdentity,
+        scan_guard: Arc<SnapshotScanRef>,
+        eligibility_failure: Option<CoverageUnavailableReason>,
+        retention_filter: Option<TimeRetentionFilterBuilder>,
+    ) -> Result<Self> {
+        let mut source_manifest = BTreeMap::new();
+        for source in sources {
+            if source_manifest
+                .insert(source.source().clone(), source)
+                .is_some()
+            {
+                return Err(Error::InvalidContract {
+                    message: "captured covering source manifest has a duplicate source identity"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            catalog,
+            catalog_complete,
+            eligibility_failure,
+            source_manifest,
+            query_schema,
+            retention_filter,
+            scan_guard: Some(scan_guard),
+        })
     }
 
     /// The atomically captured catalog.
@@ -405,7 +569,7 @@ impl CoveringReadView {
 
     /// Every source a normal scan of this view could read.
     #[must_use]
-    pub(crate) fn source_manifest(&self) -> &BTreeSet<SourceId> {
+    pub(crate) fn source_manifest(&self) -> &BTreeMap<SourceId, CapturedSource> {
         &self.source_manifest
     }
 
@@ -414,40 +578,119 @@ impl CoveringReadView {
     pub(crate) fn query_schema(&self) -> &SchemaIdentity {
         &self.query_schema
     }
+
+    /// Construct the current time-based retention predicate for covered rows.
+    ///
+    /// This deliberately runs when the query is evaluated, rather than when
+    /// the read view or its index artifact was captured. Freezing a cutoff here
+    /// would let a paused plan return rows that a normal scan would now hide.
+    #[must_use]
+    pub(crate) fn retention_keep_filter(&self) -> Option<datafusion::logical_expr::Expr> {
+        self.retention_filter
+            .as_ref()
+            .map(TimeRetentionFilterBuilder::keep_filter)
+    }
+
+    /// Return the captured source-role adapter for `source`.
+    #[must_use]
+    pub(crate) fn visibility_for(&self, source: &SourceId) -> Option<&VisibilityAdapter> {
+        self.source_manifest
+            .get(source)
+            .map(CapturedSource::visibility)
+    }
+
+    /// Apply the captured source's ordinary scan visibility to candidate payload
+    /// rows. Index scan and join execution call this before residual predicates;
+    /// callers must pass original physical source ordinals, not candidate indexes.
+    pub(crate) fn select_visible_rows(
+        &self,
+        source: &SourceId,
+        batch: &RecordBatch,
+        physical_ordinals: &[u64],
+    ) -> Result<Vec<usize>> {
+        self.visibility_for(source)
+            .ok_or_else(|| Error::InvalidContract {
+                message: format!("covered source {source:?} is absent from the captured manifest"),
+            })?
+            .select_visible_rows(batch, physical_ordinals)
+    }
 }
 
 /// Prove whether a captured view has complete, compatible index coverage.
 ///
-/// This is deliberately conservative. A nonempty source must have an admitted
-/// payload page and at least one run, and every required output/filter column
-/// must be represented by the captured query schema. Later steps extend the
-/// proof with existing visibility and transaction state before a planner can
-/// select the optional path.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the staged contract reserves typed errors for visibility validation before planning"
-)]
+/// This is deliberately conservative. Every captured source must have its
+/// compatible artifact and source-role visibility rule; a nonempty source is
+/// never inferred from an absent catalog entry. Required output/filter columns
+/// must also have a proven captured-schema adapter before a planner can select
+/// the optional path.
 pub(crate) fn try_cover(
     view: Arc<CoveringReadView>,
     definition: &IndexDefinition,
     required_columns: &[usize],
 ) -> Result<CoverageDecision> {
+    if let Some(reason) = view.eligibility_failure {
+        return Ok(CoverageDecision::Unavailable(reason));
+    }
+    if !view.catalog_complete {
+        return Ok(CoverageDecision::Unavailable(
+            CoverageUnavailableReason::MissingSource,
+        ));
+    }
     if !view.catalog.definition().matches(definition) {
         return Ok(CoverageDecision::Unavailable(
             CoverageUnavailableReason::DefinitionMismatch,
         ));
     }
-    if required_columns
-        .iter()
-        .any(|column| *column >= view.query_schema.schema().fields().len())
+    if !schema_adaptation_is_supported(view.catalog.definition().schema(), view.query_schema())
+        || required_columns.iter().any(|column| {
+            *column >= view.query_schema.schema().fields().len()
+                || view
+                    .query_schema()
+                    .column_mapping()
+                    .get(*column)
+                    .is_none_or(|source| *source >= definition.schema().schema().fields().len())
+        })
     {
         return Ok(CoverageDecision::Unavailable(
             CoverageUnavailableReason::UnsupportedTypeOrExpression,
         ));
     }
 
-    for source_id in view.source_manifest() {
+    let catalog_sources = view
+        .catalog
+        .sources()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let captured_nonempty_or_unknown = view
+        .source_manifest()
+        .iter()
+        .filter(|(_, source)| !source.rows().is_known_empty())
+        .map(|(source, _)| source.clone())
+        .collect::<BTreeSet<_>>();
+    if catalog_sources != captured_nonempty_or_unknown {
+        return Ok(CoverageDecision::Unavailable(
+            CoverageUnavailableReason::MissingSource,
+        ));
+    }
+
+    for (source_id, captured) in view.source_manifest() {
+        if !captured.visibility().is_complete() {
+            return Ok(CoverageDecision::Unavailable(
+                CoverageUnavailableReason::IncompleteVisibility,
+            ));
+        }
+        if captured.visibility().role() != Some(captured.role()) {
+            return Err(Error::InvalidContract {
+                message: format!(
+                    "captured source {source_id:?} has a visibility adapter for a different source role"
+                ),
+            });
+        }
         let Some(source) = view.catalog.sources().get(source_id) else {
+            if captured.rows().is_known_empty() {
+                continue;
+            }
             return Ok(CoverageDecision::Unavailable(
                 CoverageUnavailableReason::MissingSource,
             ));
@@ -457,7 +700,17 @@ pub(crate) fn try_cover(
                 CoverageUnavailableReason::UnsupportedTypeOrExpression,
             ));
         }
-        if source.row_count() == 0 {
+        if let SourceRows::Known(rows) = captured.rows()
+            && rows != source.row_count()
+        {
+            return Err(Error::InvalidContract {
+                message: format!(
+                    "covering source {source_id:?} has {} rows but its captured manifest has {rows}",
+                    source.row_count()
+                ),
+            });
+        }
+        if captured.rows().is_known_empty() {
             continue;
         }
         if source.payload_pages().is_empty()
@@ -474,6 +727,36 @@ pub(crate) fn try_cover(
     }
 
     Ok(CoverageDecision::Complete(view))
+}
+
+fn schema_adaptation_is_supported(source: &SchemaIdentity, query: &SchemaIdentity) -> bool {
+    if source.schema().fields().len() != query.schema().fields().len()
+        || source.column_mapping().len() != query.column_mapping().len()
+    {
+        return false;
+    }
+    source
+        .schema()
+        .fields()
+        .iter()
+        .zip(query.schema().fields())
+        .all(|(source, query)| {
+            source.name() == query.name()
+                && source.is_nullable() == query.is_nullable()
+                && source.metadata() == query.metadata()
+                && data_type_adaptation_is_supported(source.data_type(), query.data_type())
+        })
+}
+
+fn data_type_adaptation_is_supported(source: &DataType, query: &DataType) -> bool {
+    source == query
+        || matches!(
+            (source, query),
+            (DataType::Utf8, DataType::Utf8View)
+                | (DataType::Utf8View, DataType::Utf8)
+                | (DataType::Binary, DataType::BinaryView)
+                | (DataType::BinaryView, DataType::Binary)
+        )
 }
 
 /// One non-NULL full equality key correlated with its originating row.
@@ -820,6 +1103,26 @@ async fn gather_prefix(
         .map_err(|source| Error::Arrow { source });
     }
 
+    let source_projection = projection
+        .iter()
+        .map(|column| {
+            view.query_schema()
+                .column_mapping()
+                .get(*column)
+                .copied()
+                .ok_or_else(|| Error::InvalidContract {
+                    message: format!("projection column {column} is outside the captured schema"),
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_schema = view
+        .catalog()
+        .definition()
+        .schema()
+        .schema()
+        .project(&source_projection)
+        .map_err(|source| Error::Arrow { source })?;
+
     let mut grouped = BTreeMap::<PayloadPageId, Vec<(usize, usize)>>::new();
     for (output, row_ref) in row_refs.iter().enumerate() {
         validate_probe_row_ref(view, row_ref.source(), row_ref)?;
@@ -877,16 +1180,23 @@ async fn gather_prefix(
         .ok_or_else(|| Error::InvalidContract {
             message: "gather output has an unassigned row position".to_string(),
         })?;
-    let columns = projection
+    let columns = source_projection
         .iter()
         .map(|column| gather_column(&pages, &positions, *column))
         .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new_with_options(
-        Arc::new(output_schema),
+    let source_batch = RecordBatch::try_new_with_options(
+        Arc::new(source_schema),
         columns,
         &RecordBatchOptions::new().with_row_count(Some(row_refs.len())),
     )
-    .map_err(|source| Error::Arrow { source })
+    .map_err(|source| Error::Arrow { source })?;
+    arrow_tools::record_batch::try_cast_to(source_batch, Arc::new(output_schema)).map_err(
+        |source| Error::InvalidContract {
+            message: format!(
+                "failed to adapt gathered payload to the captured query schema: {source}"
+            ),
+        },
+    )
 }
 
 fn gather_column(

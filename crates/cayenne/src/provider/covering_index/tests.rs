@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -31,9 +31,16 @@ use super::{
     AllocationOwner, CoveredRowRef, CoveringPageStore, CoveringReadView, EncodedKey, Error,
     IndexCatalog, IndexDefinition, IndexRun, IndexedSource, KeyDirectory, KeyDirectoryEntry,
     KeyPage, KeyPageId, KeyPageLease, PageLease, PayloadPage, PayloadPageId, PayloadPageLease,
-    ProbeRequest, ProbeStep, Result, RunId, SchemaIdentity, SourceId, build_source, build_sources,
-    gather, prepare_literal_seek, probe_many, try_cover,
+    PrimaryKeyLayout, ProbeRequest, ProbeStep, Result, RunId, SchemaIdentity, SourceId, SourceRole,
+    VisibilityAdapter, build_source, build_sources, gather, prepare_literal_seek, probe_many,
+    try_cover,
 };
+use crate::provider::delete::InsertRecordHandling;
+use crate::provider::deletion_index::DeletionIndex;
+use crate::provider::deletion_strategy::PositionDeletionVector;
+use crate::provider::mem_tier::InMemTombstones;
+use crate::provider::on_conflict::PkDeletionSnapshot;
+use roaring::RoaringBitmap;
 
 #[derive(Debug)]
 struct TestPageStore {
@@ -629,4 +636,111 @@ async fn multiple_definitions_share_payload_pages_and_tight_admission_refuses_be
     )
     .await;
     assert!(matches!(tight, Err(Error::Unavailable { .. })));
+}
+
+#[test]
+fn file_visibility_preserves_apply_ignore_cutoff_and_physical_position_rules() {
+    let schema = schema(vec![Field::new("id", DataType::Int64, false)]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+        .expect("test primary-key batch");
+    let deletions = PkDeletionSnapshot::Int64Pk {
+        tombstones: Arc::new(DeletionIndex::from_maps(
+            HashMap::from([(1, 10), (2, 20)]),
+            HashMap::from([(1, 11)]),
+        )),
+    };
+    let primary_key = PrimaryKeyLayout::new(vec![0], None);
+
+    let warm = VisibilityAdapter::file(
+        SourceRole::Warm,
+        deletions.clone(),
+        InsertRecordHandling::Apply,
+        primary_key.clone(),
+        None,
+    )
+    .expect("warm visibility adapter");
+    assert_eq!(
+        warm.select_visible_rows(&batch, &[0, 1, 2])
+            .expect("warm visibility"),
+        vec![0, 2],
+        "a re-insert makes only the current warm row visible"
+    );
+
+    let cold = VisibilityAdapter::file(
+        SourceRole::Cold,
+        deletions.clone(),
+        InsertRecordHandling::Ignore,
+        primary_key.clone(),
+        None,
+    )
+    .expect("cold visibility adapter");
+    assert_eq!(
+        cold.select_visible_rows(&batch, &[0, 1, 2])
+            .expect("cold visibility"),
+        vec![2],
+        "old cold rows do not inherit re-insert visibility"
+    );
+
+    let protected = VisibilityAdapter::file(
+        SourceRole::Protected {
+            min_delete_sequence: 10,
+        },
+        deletions,
+        InsertRecordHandling::Ignore,
+        primary_key,
+        None,
+    )
+    .expect("protected visibility adapter");
+    assert_eq!(
+        protected
+            .select_visible_rows(&batch, &[0, 1, 2])
+            .expect("protected visibility"),
+        vec![0, 2],
+        "the protected cutoff ignores delete sequence 10 but applies sequence 20"
+    );
+
+    let positions = PositionDeletionVector::new(RoaringBitmap::from_iter([0, 257]));
+    let position_only = VisibilityAdapter::file(
+        SourceRole::Warm,
+        PkDeletionSnapshot::PositionBased,
+        InsertRecordHandling::Apply,
+        PrimaryKeyLayout::new(Vec::new(), None),
+        Some(Arc::new(positions)),
+    )
+    .expect("position visibility adapter");
+    assert_eq!(
+        position_only
+            .select_visible_rows(&batch, &[0, 257, 1])
+            .expect("position visibility"),
+        vec![2],
+        "position vectors apply to original physical ordinals, not candidate indexes"
+    );
+}
+
+#[test]
+fn inline_and_memory_visibility_use_their_captured_sequence_tombstones() {
+    let schema = schema(vec![Field::new("id", DataType::Int64, false)]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])
+        .expect("test inline batch");
+    let mut tombstones = InMemTombstones::default();
+    tombstones.int64_pk.insert(1, 11);
+    let primary_key = PrimaryKeyLayout::new(vec![0], None);
+
+    let older_inline = VisibilityAdapter::inline(10, tombstones.clone(), primary_key.clone());
+    assert_eq!(
+        older_inline
+            .select_visible_rows(&batch, &[0, 1])
+            .expect("inline visibility"),
+        vec![1],
+        "a later tombstone hides the old inline payload before residual predicates"
+    );
+
+    let newer_memory = VisibilityAdapter::memory(12, tombstones, primary_key);
+    assert_eq!(
+        newer_memory
+            .select_visible_rows(&batch, &[0, 1])
+            .expect("memory visibility"),
+        vec![0, 1],
+        "a source inserted after its tombstone remains visible"
+    );
 }

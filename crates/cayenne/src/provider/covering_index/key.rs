@@ -56,6 +56,30 @@ enum SourceIdentity {
         size: u64,
         last_modified_ms: i64,
     },
+    /// One immutable inline-corpus entry. The entry id and sequence are both
+    /// retained: an inline rewrite can preserve a sequence while replacing the
+    /// payload, and a later entry can legitimately share the same sequence in a
+    /// recovery/replay boundary.
+    Inline { inlined_id: Arc<str>, sequence: i64 },
+    /// One batch in a pinned in-memory tier generation. `tier_version` is the
+    /// content generation of the `Arc<MemTier>` capture, not its checkpoint
+    /// epoch: a checkpoint can preserve an epoch while replacing its batches.
+    Memory {
+        tier_version: u64,
+        shard: u32,
+        segment: u32,
+        batch: u32,
+    },
+    /// One cold-manifest file paired with the warm snapshot that published the
+    /// manifest. Cold metadata does not carry a modification timestamp, so the
+    /// full manifest row identity is retained instead of inventing one.
+    Cold {
+        snapshot_id: Arc<str>,
+        path: Arc<str>,
+        size: u64,
+        min_sequence: i64,
+        max_sequence: i64,
+    },
 }
 
 impl SourceId {
@@ -88,6 +112,66 @@ impl SourceId {
         }
     }
 
+    /// Create an identity for one decoded, immutable inline entry.
+    #[must_use]
+    pub(crate) fn inline(
+        table_id: impl Into<Arc<str>>,
+        inlined_id: impl Into<Arc<str>>,
+        sequence: i64,
+    ) -> Self {
+        Self {
+            table_id: table_id.into(),
+            identity: SourceIdentity::Inline {
+                inlined_id: inlined_id.into(),
+                sequence,
+            },
+        }
+    }
+
+    /// Create an identity for one immutable memory-tier batch generation.
+    #[must_use]
+    pub(crate) fn memory(
+        table_id: impl Into<Arc<str>>,
+        tier_version: u64,
+        shard: u32,
+        segment: u32,
+        batch: u32,
+    ) -> Self {
+        Self {
+            table_id: table_id.into(),
+            identity: SourceIdentity::Memory {
+                tier_version,
+                shard,
+                segment,
+                batch,
+            },
+        }
+    }
+
+    /// Create an identity for one cold-manifest file captured with a warm
+    /// snapshot. The caller must retain that manifest for as long as it uses
+    /// this source identity.
+    #[must_use]
+    pub(crate) fn cold(
+        table_id: impl Into<Arc<str>>,
+        snapshot_id: impl Into<Arc<str>>,
+        path: impl Into<Arc<str>>,
+        size: u64,
+        min_sequence: i64,
+        max_sequence: i64,
+    ) -> Self {
+        Self {
+            table_id: table_id.into(),
+            identity: SourceIdentity::Cold {
+                snapshot_id: snapshot_id.into(),
+                path: path.into(),
+                size,
+                min_sequence,
+                max_sequence,
+            },
+        }
+    }
+
     /// The table that owns this source.
     #[must_use]
     pub(crate) fn table_id(&self) -> &str {
@@ -103,7 +187,10 @@ impl SourceId {
     pub(crate) const fn generation(&self) -> Option<u64> {
         match &self.identity {
             SourceIdentity::Generation(generation) => Some(*generation),
-            SourceIdentity::File { .. } => None,
+            SourceIdentity::File { .. }
+            | SourceIdentity::Inline { .. }
+            | SourceIdentity::Memory { .. }
+            | SourceIdentity::Cold { .. } => None,
         }
     }
 }
