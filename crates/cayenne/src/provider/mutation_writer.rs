@@ -577,31 +577,6 @@ impl<'a> AppendMutationWriter<'a> {
                 // bare ProtectedSnapshot).
                 let stage_on_conflict = may_have_on_conflict_deletions || pending_pk_deletions;
 
-                // The key record below has to ORDER this append, not merely note
-                // it: per-key OCC (`transaction_has_conflict`) aborts a transaction
-                // only when a footprint key carries `sequence > that transaction's
-                // begin token`, so a stamp EQUAL to the token reads as "committed
-                // before you began" and the transaction commits straight through
-                // this append's staged window — one declared primary key, two live
-                // rows (#13685).
-                //
-                // The `stage_on_conflict` arm draws its sequences from
-                // `prepare_on_conflict_deletions_for_staged_snapshot`, so the table
-                // high water below is already this append's own. The other arm
-                // publishes into the current snapshot and draws nothing, leaving
-                // that high water at exactly what such a token holds — so it takes
-                // a sequence of its own here, the same shape
-                // `begin_deferred_snapshot_append` gives its `append_sequence`.
-                // Both readings of the check then see the append: the per-key stamp
-                // moves, and so does the per-table high water that the degraded
-                // fallback compares. Drawn BEFORE anything is staged, so a failure
-                // to draw one aborts a write that has published nothing.
-                let append_sequence = if stage_on_conflict {
-                    None
-                } else {
-                    Some(self.table.reserve_sequences_local(1).await?)
-                };
-
                 let (staging_snapshot_id, target_snapshot_id, target_kind) = if stage_on_conflict {
                     let (staging_snapshot_id, target_snapshot_id) =
                         CayenneTableProvider::new_staging_snapshot_id_pair();
@@ -716,12 +691,44 @@ impl<'a> AppendMutationWriter<'a> {
                 // steady state, where the overlap decides whether one key ends up
                 // with one live row or two (#13642).
                 //
-                // This append's own sequence, drawn above (see there for why an
-                // unordered stamp is a lost update). The publish re-stamps with the
-                // commit's high water, which is this sequence or later.
-                let record_seq = match append_sequence {
-                    Some(sequence) => sequence,
-                    None => self.table.sequence_high_water().await,
+                // This record has to ORDER the append, not merely note it: per-key
+                // OCC (`transaction_has_conflict`) aborts a transaction only when a
+                // footprint key carries `sequence > that transaction's begin token`,
+                // so a stamp EQUAL to the token reads as "committed before you
+                // began" and the transaction commits straight through this append's
+                // staged window — one declared primary key, two live rows (#13685).
+                //
+                // The `stage_on_conflict` arm draws its sequences in
+                // `prepare_on_conflict_deletions_for_staged_snapshot`, so the high
+                // water is already this append's own. The other arm publishes into
+                // the current snapshot and draws nothing, leaving that high water at
+                // exactly what such a token holds — so it draws one here, the same
+                // shape `begin_deferred_snapshot_append` gives its `append_sequence`.
+                // Both readings of the check then see the append: the per-key stamp
+                // moves, and so does the per-table high water the degraded fallback
+                // compares.
+                //
+                // Only when this append actually has keys to record. An append that
+                // validated away to nothing publishes no row for a transaction to
+                // race, so moving the high water for it would abort a concurrent
+                // transaction on the degraded fallback for a write nobody can
+                // observe. Drawn before `finish()` publishes, so a failure to draw
+                // one rolls back a write that is still private.
+                let record_seq = if stage_on_conflict || validated_keys.is_empty() {
+                    self.table.sequence_high_water().await
+                } else {
+                    match self.table.reserve_sequences_local(1).await {
+                        Ok(sequence) => sequence,
+                        Err(error) => {
+                            if let Err(cleanup_error) = prepared_append.rollback().await {
+                                tracing::warn!(
+                                    "Failed to roll back the staged append for table {} after its sequence reservation failed: {cleanup_error}",
+                                    self.table.table_name(),
+                                );
+                            }
+                            return Err(error.into());
+                        }
+                    }
                 };
                 self.table.record_file_pk_keys(&validated_keys, record_seq);
                 self.table.attach_inflight_staged_pk_keys(
@@ -1177,19 +1184,14 @@ impl<'a> AppendMutationWriter<'a> {
 
         let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
 
-        // Same ordering rule as the pipelined staged append above, and the same
-        // consequence when it is missing (#13685). The `needs_new_snapshot` arm
-        // draws this batch's sequences while writing its snapshot; the plain-append
-        // arm publishes into the current snapshot and draws none, so it takes one
-        // here and stamps with it below. Drawn before EITHER arm writes: the plain
-        // arm's `write_staged_append` publishes its rows before it returns, so a
-        // sequence drawn afterwards could only fail a write whose rows are already
-        // live — and skip their key record, leaving the keyset missing live keys.
-        let append_sequence = if needs_new_snapshot {
-            None
-        } else {
-            Some(self.table.reserve_sequences_local(1).await?)
-        };
+        // The plain-append arm's own sequence, for the same ordering rule as the
+        // pipelined staged append above (#13685). `write_staged_append` draws it
+        // between writing the rows and publishing them — the only seam where the
+        // row count is known and nothing is visible yet — and returns it here to
+        // stamp with. `None` on the `needs_new_snapshot` arm, which draws this
+        // batch's sequences while writing its snapshot, and on an append that
+        // wrote no rows, which has nothing for a transaction to race.
+        let mut append_sequence: Option<i64> = None;
 
         // Taken before either publish below: both make rows visible well before
         // the `num_rows` delta describing them reaches the maintenance queue, and
@@ -1222,9 +1224,10 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
             let write_start = Instant::now();
-            let (rows, writer_ops, stats_acc) = self
+            let (rows, writer_ops, stats_acc, drawn_sequence) = self
                 .write_staged_append(prepared_stream, target_size_bytes, estimated_bytes)
                 .await?;
+            append_sequence = drawn_sequence;
 
             tracing::debug!(
                 table = self.table.table_name(),
@@ -1543,12 +1546,20 @@ impl<'a> AppendMutationWriter<'a> {
         })
     }
 
+    /// Write a batch into the current snapshot and publish it.
+    ///
+    /// The fourth element of the result is the sequence this append drew for its
+    /// primary-key OCC stamp, `None` when it wrote no rows. It is drawn here, in
+    /// the one place that knows the row count while the rows are still invisible:
+    /// `finalize_staged_write` below publishes them, and a stamp that does not
+    /// sit above every transaction begin token issued before that publish lets a
+    /// transaction commit over this append (#13685).
     async fn write_staged_append(
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
-    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>, Option<i64>)> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
         self.table
             .clear_staging_snapshot_dir(&staging_snapshot_id)
@@ -1595,6 +1606,16 @@ impl<'a> AppendMutationWriter<'a> {
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
 
+        // Drawn before the publish below and only for an append that wrote rows:
+        // an append that wrote none publishes nothing for a transaction to race,
+        // so moving the high water for it would abort a concurrent transaction on
+        // the per-table degraded fallback over a write nobody can observe.
+        let append_sequence = if result.0 > 0 {
+            Some(self.table.reserve_sequences_local(1).await?)
+        } else {
+            None
+        };
+
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
             None,
@@ -1608,7 +1629,7 @@ impl<'a> AppendMutationWriter<'a> {
         // publish-bound signal (the single-writer finalization on the CDC-apply path).
         self.context.record_publish_latency(publish_start.elapsed());
 
-        Ok(result)
+        Ok((result.0, result.1, result.2, append_sequence))
     }
 
     async fn write_staged_append_prepared(

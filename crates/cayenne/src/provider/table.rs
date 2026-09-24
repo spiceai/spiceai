@@ -57877,7 +57877,8 @@ mod tests {
     /// The append takes the `!stage_on_conflict` arm — purely-new keys into a
     /// table holding no tombstones, which is `do_nothing`'s steady state
     /// (`may_have_on_conflict_deletions` is set only for `Upsert`) — so it
-    /// publishes into the current snapshot and reserves no sequence of its own.
+    /// publishes into the current snapshot, and nothing on that path draws a
+    /// sequence for it except the draw this test pins.
     ///
     /// Neither writer sees the other: the transaction staged its row before the
     /// append existed, and the append validated before the transaction published.
@@ -58005,6 +58006,86 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, table).await,
             vec![(77, 1)],
             "key 77 must have exactly one live row: the append's"
+        );
+    }
+
+    /// An append that writes no rows must not move the table's sequence high
+    /// water.
+    ///
+    /// The sequence a current-snapshot append draws exists to order it against a
+    /// transaction that read one of its keys (#13685). An append that wrote
+    /// nothing publishes no row for any transaction to race, so drawing one for it
+    /// buys no ordering and costs a false abort: `transaction_has_conflict` falls
+    /// back to `current_high_water != stage_seq` whenever the keyset is degraded
+    /// or cleared, and that reads any movement of the high water as a conflict.
+    ///
+    /// A retention table is the shape that reaches this: retention filters bar the
+    /// inline buffer (`InlineMutationPolicy::from_blocking_conditions`), which is
+    /// what absorbs an empty batch on an ordinary table, so the batch goes to the
+    /// plain-append arm and writes zero rows. Partitioned tables take the same
+    /// route. An empty refresh tick is the steady state for both.
+    #[tokio::test]
+    async fn an_append_that_writes_no_rows_leaves_the_sequence_high_water_alone() {
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&catalog),
+            CreateTableOptions {
+                table_name: "retention_empty_append".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    deletion_mode: crate::metadata::DeletionMode::Key,
+                    ..VortexConfig::default()
+                },
+            },
+            vec![datafusion::prelude::col("value").gt(datafusion::prelude::lit(0_i64))],
+            ctx.runtime_env(),
+        )
+        .await
+        .expect("retention table");
+
+        let before = provider.sequence_high_water().await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[], &[]),
+        )
+        .await;
+        assert_eq!(
+            provider.sequence_high_water().await,
+            before,
+            "an append that wrote no rows must leave the high water alone, or every empty \
+             refresh tick aborts a concurrent transaction that falls back to the per-table check"
+        );
+
+        // The same table still orders an append that DOES write rows, so the
+        // assertion above cannot be satisfied by never drawing a sequence at all.
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1], &[1]),
+        )
+        .await;
+        assert!(
+            provider.sequence_high_water().await > before,
+            "an append that wrote rows must still move the high water (#13685)"
         );
     }
 
