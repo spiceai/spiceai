@@ -18,6 +18,8 @@
 //! process cache needs to remove that decode work across independent scans.
 
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -47,6 +49,7 @@ use vortex::session::VortexSession;
 const ROW_COUNT: usize = 320_000;
 const LOOKUP_ORDER_KEY: i64 = 80_000;
 const MEBIBYTE: u64 = 1024 * 1024;
+const PHASE_SAMPLE_COUNT: u32 = 100;
 /// Matches Cayenne's configured segment-cache budget: encoded and fully
 /// decoded segments each receive half.
 const TOTAL_CACHE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
@@ -148,6 +151,21 @@ struct Fixture {
     path: Path,
     file_size: u64,
     footer: Footer,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScanTimings {
+    open: Duration,
+    plan: Duration,
+    execute: Duration,
+}
+
+impl ScanTimings {
+    fn add_assign(&mut self, timings: Self) {
+        self.open += timings.open;
+        self.plan += timings.plan;
+        self.execute += timings.execute;
+    }
 }
 
 fn build_runtime() -> Runtime {
@@ -349,7 +367,8 @@ async fn scan_file(
     fixture: &Fixture,
     encoded_cache: Arc<dyn SegmentCache>,
     decoded_cache: Option<Arc<dyn DecodedSegmentCache>>,
-) -> u64 {
+) -> (u64, ScanTimings) {
+    let open_start = Instant::now();
     let reader = Arc::new(ObjectStoreReadAt::new(
         Arc::clone(&fixture.store),
         fixture.path.clone(),
@@ -369,28 +388,62 @@ async fn scan_file(
         .open_read(reader)
         .await
         .expect("open benchmark Vortex file");
+    let open = open_start.elapsed();
+    let plan_start = Instant::now();
     let stream = file
         .scan()
         .expect("build benchmark scan")
         .with_filter(eq(col("orderkey"), lit(LOOKUP_ORDER_KEY)))
         .into_array_stream()
         .expect("execute benchmark scan");
+    let plan = plan_start.elapsed();
     pin_mut!(stream);
 
+    let execute_start = Instant::now();
     let mut row_count = 0_u64;
     while let Some(array) = stream.next().await {
         row_count +=
             u64::try_from(array.expect("read benchmark array").len()).expect("row count fits u64");
     }
-    row_count
+    (
+        row_count,
+        ScanTimings {
+            open,
+            plan,
+            execute: execute_start.elapsed(),
+        },
+    )
 }
 
 fn warm_scan(runtime: &Runtime, fixture: &Fixture, caches: &CachePair, decoded: bool) -> u64 {
-    runtime.block_on(scan_file(
-        fixture,
-        caches.encoded(),
-        decoded.then(|| caches.decoded()),
-    ))
+    runtime
+        .block_on(scan_file(
+            fixture,
+            caches.encoded(),
+            decoded.then(|| caches.decoded()),
+        ))
+        .0
+}
+
+fn print_decoded_cache_phase_timings(runtime: &Runtime, fixture: &Fixture, caches: &CachePair) {
+    let mut timings = ScanTimings::default();
+    for _ in 0..PHASE_SAMPLE_COUNT {
+        let (row_count, scan_timings) =
+            runtime.block_on(scan_file(fixture, caches.encoded(), Some(caches.decoded())));
+        assert_eq!(
+            row_count, 1,
+            "decoded-cache timing scan finds the requested order key"
+        );
+        timings.add_assign(scan_timings);
+    }
+
+    let samples = f64::from(PHASE_SAMPLE_COUNT);
+    eprintln!(
+        "decoded-segment-cache timing (TPCH-like lookup, {PHASE_SAMPLE_COUNT} warm scans): open={:.2}us plan={:.2}us execute={:.2}us",
+        timings.open.as_secs_f64() * 1_000_000.0 / samples,
+        timings.plan.as_secs_f64() * 1_000_000.0 / samples,
+        timings.execute.as_secs_f64() * 1_000_000.0 / samples,
+    );
 }
 
 fn bench_decoded_segment_cache(c: &mut Criterion) {
@@ -412,6 +465,7 @@ fn bench_decoded_segment_cache(c: &mut Criterion) {
 
     let (encoded_bytes, decoded_bytes) = runtime.block_on(memory_ratio(&decoded));
     print_memory_ratio("TPCH-like lookup", encoded_bytes, decoded_bytes);
+    print_decoded_cache_phase_timings(&runtime, &fixture, &decoded);
 
     let mut group = c.benchmark_group("decoded_segment_cache_scan");
     group.bench_function("encoded_cache_only", |b| {
