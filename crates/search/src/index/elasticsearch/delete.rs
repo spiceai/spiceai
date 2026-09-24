@@ -123,11 +123,21 @@ pub fn document_key_columns(primary_key: &[Field]) -> Vec<String> {
 const DELETE_CHUNK_ROWS: usize = 512;
 
 /// Member budget for one group-remainder `_delete_by_query` ([`group_requests`]). Whole key
-/// groups are accumulated until their members reach this many, which bounds both halves of the
-/// request at once: the `bool.should` clause count (one clause per group, and every group holds at
-/// least one member) and the `ids` list inside each clause. Spent in members rather than in
-/// clauses for that reason — [`DELETE_CHUNK_ROWS`] bounds one `should` clause per *row*, which is
-/// a different accounting.
+/// groups are accumulated until their members reach this many, which bounds both the group count
+/// (every group holds at least one member) and the `ids` list inside each group's clause. Spent
+/// in members rather than in groups for that reason — [`DELETE_CHUNK_ROWS`] bounds one `should`
+/// clause per *row*, which is a different accounting.
+///
+/// A group is not one clause: Elasticsearch counts the leaves of nested `bool`s towards one
+/// budget (it answers `too_many_nested_clauses` when they exceed it), and each group contributes
+/// one `term` leaf per key column plus its `ids` leaf. So the widest request this budget admits
+/// carries `PRUNE_MEMBERS_PER_REQUEST * (key columns + 1)` leaves — 1024, 1536 and 2048 for a
+/// one-, two- and three-column key.
+///
+/// Those fit: on Elasticsearch 8 the clause budget is derived from the node's heap rather than
+/// taken from `indices.query.bool.max_clause_count` (deprecated there, and ignored), measuring
+/// 9362 on a 1 GiB-heap node and 2340 on a 256 MiB one — so even the narrowest node Elasticsearch
+/// will start leaves the three-column request room to spare.
 const PRUNE_MEMBERS_PER_REQUEST: usize = 512;
 
 /// Deletes every document whose `key_columns` match a row of `keys` — an exact-key delete when
@@ -3691,5 +3701,67 @@ mod tests {
             serde_json::json!([{ "term": { "id": 7 } }]),
             "the chunk id must not narrow the delete: {query}"
         );
+    }
+
+    /// Every leaf query under `query`, counting through nested `bool`s the way Elasticsearch
+    /// does when it raises `too_many_nested_clauses`.
+    fn leaf_clause_count(query: &Value) -> usize {
+        let Some(bool_query) = query.get("bool") else {
+            return 1;
+        };
+        ["should", "filter", "must", "must_not"]
+            .iter()
+            .filter_map(|occur| bool_query.get(*occur))
+            .flat_map(|clauses| match clauses {
+                Value::Array(clauses) => clauses.as_slice(),
+                clause => std::slice::from_ref(clause),
+            })
+            .map(leaf_clause_count)
+            .sum()
+    }
+
+    /// The group budget is spent in members, but Elasticsearch charges the request in leaves, and
+    /// a group is worth one `term` leaf per key column plus its `ids` leaf. Pins that ceiling so a
+    /// group that grows a clause — or a budget raised on the member accounting alone — has to say
+    /// so here rather than in a rejected delete, which lands *after* the bulk write and leaves the
+    /// index carrying the chunks the prune existed to remove.
+    ///
+    /// The bound is the smallest clause budget an Elasticsearch 8 node was measured to derive from
+    /// its heap (2340 on a 256 MiB heap; 9362 on 1 GiB). `indices.query.bool.max_clause_count` is
+    /// deprecated and ignored there, so its old 1024 default is not the ceiling to size against.
+    #[test]
+    fn group_remainder_request_leaf_count_stays_within_the_smallest_supported_clause_budget() {
+        const SMALLEST_MEASURED_CLAUSE_BUDGET: usize = 2340;
+
+        for key_columns in 1..=3 {
+            // One member each, so the member budget admits as many groups as it can — the shape
+            // that carries the most leaves for a given budget.
+            let groups: Vec<MemberGroup> = (0..PRUNE_MEMBERS_PER_REQUEST)
+                .map(|group| MemberGroup {
+                    terms: (0..key_columns)
+                        .map(|column| json!({ "term": { format!("k{column}"): format!("g{group}") } }))
+                        .collect(),
+                    survivors: vec![format!("id{group}")],
+                })
+                .collect();
+
+            let requests = group_requests(groups);
+            assert_eq!(
+                requests.len(),
+                1,
+                "{key_columns} key columns: the member budget should hold every group in one request"
+            );
+
+            let leaves = leaf_clause_count(&requests[0]);
+            assert_eq!(
+                leaves,
+                PRUNE_MEMBERS_PER_REQUEST * (key_columns + 1),
+                "{key_columns} key columns: a group is worth one term leaf per column plus its ids leaf"
+            );
+            assert!(
+                leaves <= SMALLEST_MEASURED_CLAUSE_BUDGET,
+                "{key_columns} key columns: {leaves} leaves exceeds the {SMALLEST_MEASURED_CLAUSE_BUDGET} a 256 MiB-heap node allows"
+            );
+        }
     }
 }
