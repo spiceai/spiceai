@@ -13,15 +13,18 @@ limitations under the License.
 use crate::accelerated::SnapshotCreateTrigger;
 use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
+use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshCompletionOutcome};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
+use data_connector_api::accelerated::RefreshRequester;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::notifications::Subscription;
 use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
@@ -88,6 +91,39 @@ impl SnapshotRefreshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(snapshot_id);
+    }
+}
+
+/// Reloads a `refresh_mode: snapshot` table each time its snapshot location
+/// announces a snapshot of it newer than the one it has loaded or last asked
+/// for. Returns when the table stops accepting refreshes.
+///
+/// A request cancels the refresh in flight, so the loop waits for the reload it
+/// asked for before asking again. Otherwise a writer that publishes faster than
+/// this reader downloads would restart the download each time and the reader
+/// would never finish one. Announcements that arrive meanwhile coalesce, and
+/// the latest is acted on once the reload lands. If the reload fails, the
+/// scheduled refresh (`refresh_check_interval`) keeps trying, and the loop
+/// resumes after the next refresh that succeeds.
+pub async fn reload_on_snapshot_notifications(
+    mut subscription: Subscription,
+    state: SnapshotRefreshState,
+    requester: Arc<dyn RefreshRequester>,
+    completion: RefreshCompletion,
+) {
+    let mut last_requested = None;
+    while let Some(announced) = subscription.next_snapshot().await {
+        let known = last_requested.max(state.current_loaded_id());
+        if known.is_some_and(|known| announced <= known) {
+            continue;
+        }
+        last_requested = Some(announced);
+        let reloaded = completion.next();
+        if requester.request_refresh().await.is_err()
+            || reloaded.wait().await == RefreshCompletionOutcome::Abandoned
+        {
+            return;
+        }
     }
 }
 

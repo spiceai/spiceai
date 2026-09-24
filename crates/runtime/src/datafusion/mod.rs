@@ -22,7 +22,7 @@ use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
-use crate::accelerated::snapshots::SnapshotRefreshState;
+use crate::accelerated::snapshots::{SnapshotRefreshState, reload_on_snapshot_notifications};
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
@@ -59,11 +59,15 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use data_connector_api::federated::FederatedTableProvider;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::notifications::{
+    NotificationConfig, SnapshotNotifications, Subscription,
+};
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -537,6 +541,12 @@ pub enum Error {
         source: crate::dataaccelerator::FilePathError,
     },
 
+    #[snafu(display("Failed to register dataset {dataset_name}: {source}"))]
+    SnapshotNotificationsConfig {
+        dataset_name: String,
+        source: runtime_acceleration::snapshot::notifications::Error,
+    },
+
     #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
     PreRefreshPartitionDiscoveryFailed {
         table_name: String,
@@ -577,6 +587,8 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // An invalid `snapshots.params.s3_queue_url`.
+                | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -872,6 +884,10 @@ pub struct DataFusion {
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
+    /// The SQS consumers that reload `refresh_mode: snapshot` datasets when
+    /// their snapshot location reports a new snapshot. Shared, so datasets on
+    /// one queue use one consumer.
+    snapshot_notifications: SnapshotNotifications,
     /// Datasets whose table provider is installed somewhere other than the
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
@@ -3071,6 +3087,20 @@ impl DataFusion {
                 (accelerated_table_provider, None)
             };
 
+        // Subscribed before the table is built, so a bad `s3_queue_url` fails the
+        // dataset before its first refresh starts.
+        let snapshot_subscription = match &snapshot_refresh_state {
+            Some(state) => self
+                .subscribe_to_snapshot_notifications(
+                    dataset,
+                    &acceleration_settings.snapshot_behavior,
+                    state,
+                )
+                .await?
+                .map(|subscription| (subscription, state.clone())),
+            None => None,
+        };
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -3587,12 +3617,61 @@ impl DataFusion {
             .await
             .context(AccelerationRegistrationSnafu)?;
 
-        accelerated_table_builder
-            .build()
-            .await
-            .context(UnableToBuildAcceleratedTableSnafu {
+        let mut accelerated_table = accelerated_table_builder.build().await.context(
+            UnableToBuildAcceleratedTableSnafu {
                 dataset_name: dataset.name.to_string(),
-            })
+            },
+        )?;
+
+        if let Some((subscription, state)) = snapshot_subscription
+            && let Some(requester) = accelerated_table.refresh_requester()
+            && let Some(completion) = accelerated_table.refresher().refresh_completion()
+        {
+            accelerated_table.attach_task(self.io_runtime.spawn(reload_on_snapshot_notifications(
+                subscription,
+                state,
+                requester,
+                completion,
+            )));
+        }
+
+        Ok(accelerated_table)
+    }
+
+    /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
+    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
+    /// SQS queue that receives them. `None` when no queue is configured, and on
+    /// a scheduler, which loads no accelerations itself.
+    async fn subscribe_to_snapshot_notifications(
+        &self,
+        dataset: &Dataset,
+        snapshot_behavior: &SnapshotBehavior,
+        state: &SnapshotRefreshState,
+    ) -> Result<Option<Subscription>> {
+        let (SnapshotBehavior::Enabled(snapshots, secrets, io_runtime, _)
+        | SnapshotBehavior::BootstrapOnly(snapshots, secrets, io_runtime)) = snapshot_behavior
+        else {
+            return Ok(None);
+        };
+        // The runtime's secrets are gone only while it shuts down.
+        let Some(secrets) = secrets.upgrade() else {
+            return Ok(None);
+        };
+        let config = NotificationConfig::resolve(snapshots, secrets)
+            .await
+            .context(SnapshotNotificationsConfigSnafu {
+                dataset_name: dataset.name.to_string(),
+            })?;
+        if matches!(
+            self.cluster_config.effective_role(),
+            Some(crate::config::ClusterRole::Scheduler)
+        ) {
+            return Ok(None);
+        }
+        Ok(config.map(|config| {
+            self.snapshot_notifications
+                .subscribe(&config, &state.manager, io_runtime)
+        }))
     }
 
     // Compare the checkpoint schema (from the previous run) against the source/refresh

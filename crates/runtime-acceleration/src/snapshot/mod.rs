@@ -62,6 +62,7 @@ mod behavior;
 pub mod directory_archive;
 pub mod engine;
 pub mod metrics;
+pub mod notifications;
 pub use crate::layout::AccelerationLayout;
 pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
 use engine::{SnapshotEngine, create_snapshot_engine};
@@ -1048,6 +1049,27 @@ impl SnapshotManager {
             return Ok(None);
         };
         Ok(dataset_entry.current_snapshot_id)
+    }
+
+    /// The current snapshot id of every dataset in this manager's snapshot
+    /// location, read from its metadata in one request. A dataset without a
+    /// current snapshot is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing the snapshot metadata fails.
+    pub async fn current_snapshot_ids(
+        &self,
+    ) -> Result<HashMap<String, u64>, SnapshotDownloadError> {
+        let Some(handle) = self.load_metadata().await? else {
+            return Ok(HashMap::new());
+        };
+        Ok(handle
+            .metadata
+            .datasets
+            .into_iter()
+            .filter_map(|(name, dataset)| Some((name, dataset.current_snapshot_id?)))
+            .collect())
     }
 
     /// Downloads the latest snapshot only if its `snapshot_id` is strictly
@@ -3015,7 +3037,10 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for S3 client."),
         ParameterSpec::runtime("allow_http")
-            .description("Allow HTTP protocol for S3 endpoint.")
+            .description("Allow HTTP protocol for S3 endpoint."),
+        ParameterSpec::component(notifications::QUEUE_URL_PARAM)
+            .description("The URL of an SQS queue that receives the snapshot location's S3 event notifications. Datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published instead of waiting for `refresh_check_interval`.")
+            .secret(),
     ]
 });
 
@@ -3023,6 +3048,13 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 enum S3ObjectStoreError {
     #[snafu(display("Failed to build S3 object store: {source}"))]
     BuilderError { source: S3ObjectStoreBuilderError },
+}
+
+/// The object path of an `s3://` snapshot location inside its bucket. The
+/// notification consumer matches S3 event keys against the same path, so both
+/// derive it here.
+fn s3_location_path(url: &Url) -> ObjectPath {
+    ObjectPath::from(url.path())
 }
 
 /// Build the object store backing a snapshot location, dispatching on the
@@ -3056,8 +3088,7 @@ async fn build_snapshot_object_store(
                 );
             })
             .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path());
-            Some((store, path))
+            Some((store, s3_location_path(snapshots_location_url)))
         }
         "abfss" | "abfs" => {
             let params = snapshot_config
@@ -5523,7 +5554,7 @@ mod tests {
 
     /// Builds a `SnapshotManager` for metadata-only API tests.
     /// Uses `AccelerationLayout::None` since API tests only read/write metadata.
-    fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
+    pub(super) fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
         let object_store: Arc<dyn ObjectStore> = store;
         let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
 
