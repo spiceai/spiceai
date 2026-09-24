@@ -391,7 +391,28 @@ impl TableProvider for LocationPruningListingTable {
                 filters.len()
             ]);
         }
-        self.inner.supports_filters_pushdown(filters)
+
+        let inner_results = self.inner.supports_filters_pushdown(filters)?;
+
+        // `scan`'s head()-based fast path (`extract_location_predicates`) applies only
+        // the `_location` predicates it can extract from the full filter list — it never
+        // evaluates any other column, including other metadata columns `inner` would
+        // otherwise report as `Exact`. Force those back to `Inexact` here so DataFusion
+        // keeps re-applying them above the scan instead of trusting the fast path to have
+        // already filtered on them; this is what makes it safe for `scan` to always take
+        // the fast path for whatever `_location` predicates are present, regardless of
+        // what else is in the query.
+        Ok(filters
+            .iter()
+            .zip(inner_results)
+            .map(|(filter, inner_result)| {
+                if filter.column_refs().iter().all(|c| c.name == "_location") {
+                    inner_result
+                } else {
+                    datafusion_expr::TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -3924,6 +3945,76 @@ mod tests {
                 .list_called
                 .load(std::sync::atomic::Ordering::SeqCst),
             "Listing should not be invoked when location predicates are present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_location_pushdown_stays_inexact_for_other_metadata_filters() {
+        // `scan`'s head()-based fast path only ever applies the `_location`
+        // predicates it can extract — it never evaluates any other filter. A
+        // `_last_modified` predicate combined with a `_location` predicate must
+        // stay `Inexact` so DataFusion keeps re-applying it above the scan;
+        // otherwise the fast path silently drops it (regression test for
+        // spiceai#14264: mixed `_location` + metadata-column predicates
+        // returning wrong rows once the metadata predicate is reported `Exact`
+        // with no residual filter re-applying it).
+        let ctx = SessionContext::new();
+        let no_list_store = Arc::new(NoListObjectStore::new(create_meta(
+            "prefix/file.parquet",
+            100,
+            128,
+        )));
+        let store_url = Url::parse("s3://bucket").expect("store url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::clone(&no_list_store) as Arc<dyn ObjectStore>,
+        );
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
+        let file_format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![]);
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("value", arrow_schema::DataType::Utf8, true),
+            MetadataColumn::Location(Some("s3://bucket/".into())).field(),
+            MetadataColumn::LastModified.field(),
+        ]));
+
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+            ".parquet",
+        );
+
+        use datafusion_expr::{col, lit};
+        let location_filter = col("_location").eq(lit("s3://bucket/prefix/file.parquet"));
+        let last_modified_filter = col("_last_modified").gt(lit(
+            ScalarValue::TimestampMicrosecond(Some(0), Some("UTC".into())),
+        ));
+
+        let pushdown = provider
+            .supports_filters_pushdown(&[&location_filter, &last_modified_filter])
+            .expect("supports_filters_pushdown");
+
+        assert_eq!(
+            pushdown[1],
+            datafusion_expr::TableProviderFilterPushDown::Inexact,
+            "a filter on any column other than _location must stay Inexact, since \
+             the location fast path never evaluates it"
         );
     }
 
