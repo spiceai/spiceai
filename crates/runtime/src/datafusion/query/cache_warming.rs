@@ -322,13 +322,9 @@ impl ResultsCacheWarmer {
                             .collect::<HashSet<_>>()
                     };
                     let catalog_for_write = Arc::clone(&catalog);
-                    let wrote = persist_remote_excluding(
-                        state,
-                        catalog_for_write,
-                        count,
-                        exclude.clone(),
-                    )
-                    .await;
+                    let wrote =
+                        persist_remote_excluding(state, catalog_for_write, count, exclude.clone())
+                            .await;
                     if wrote {
                         let live = catalog.lock().ids.clone();
                         pending_excludes
