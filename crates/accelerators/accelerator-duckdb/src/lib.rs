@@ -195,7 +195,8 @@ impl DuckDBAccelerator {
         cmd: &CreateExternalTable,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let superseded = superseded_inferred_indexes(cmd);
+        let declared = declared_indexes(cmd);
+        let superseded = superseded_inferred_indexes(cmd, &declared);
         if superseded.is_empty() {
             return Ok(());
         }
@@ -226,7 +227,7 @@ impl DuckDBAccelerator {
                     .get_underlying_conn_mut()
                     .transaction()
                     .boxed()?;
-                let dropped = drop_indexes_named(&tx, &table_name, &superseded)?;
+                let dropped = drop_indexes_named(&tx, &table_name, &superseded, &declared)?;
                 tx.commit().boxed()?;
                 if !dropped.is_empty() {
                     tracing::debug!(
@@ -1397,19 +1398,9 @@ fn list_internal_data_tables(
     Ok(tables)
 }
 
-/// The source indexes that schema inference reports for `cmd` but that the acceleration
-/// does not declare: the ones an earlier inference copied onto a stored table (see
-/// `apply_inferred_schema`).
-fn superseded_inferred_indexes(cmd: &CreateExternalTable) -> HashSet<ColumnReference> {
-    let inferred = data_components::inferred_schema::InferredSchema::from_metadata(
-        cmd.schema.as_arrow().metadata(),
-    );
-    if inferred.indexes.is_empty() {
-        return HashSet::new();
-    }
-
-    let declared: HashSet<ColumnReference> = cmd
-        .options
+/// The column sets of the indexes the acceleration declares in its `indexes` option.
+fn declared_indexes(cmd: &CreateExternalTable) -> HashSet<ColumnReference> {
+    cmd.options
         .get("indexes")
         .map(|indexes| {
             datafusion_table_providers::util::hashmap_from_option_string::<String, IndexType>(
@@ -1420,8 +1411,19 @@ fn superseded_inferred_indexes(cmd: &CreateExternalTable) -> HashSet<ColumnRefer
             .map(ColumnReference::new)
             .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
+/// The source indexes that schema inference reports for `cmd` but that the acceleration
+/// does not declare: the ones an earlier inference copied onto a stored table (see
+/// `apply_inferred_schema`).
+fn superseded_inferred_indexes(
+    cmd: &CreateExternalTable,
+    declared: &HashSet<ColumnReference>,
+) -> HashSet<ColumnReference> {
+    let inferred = data_components::inferred_schema::InferredSchema::from_metadata(
+        cmd.schema.as_arrow().metadata(),
+    );
     inferred
         .indexes
         .iter()
@@ -1431,11 +1433,13 @@ fn superseded_inferred_indexes(cmd: &CreateExternalTable) -> HashSet<ColumnRefer
 }
 
 /// Drops every index the `DuckDB` writer created for one of `superseded` on `table_name` or
-/// one of its internal `__data_{table_name}_{unix_ms}` tables. Returns the dropped names.
+/// one of its internal `__data_{table_name}_{unix_ms}` tables, never one whose name a
+/// `declared` index also generates. Returns the dropped names.
 fn drop_indexes_named(
     tx: &duckdb::Transaction<'_>,
     table_name: &str,
     superseded: &HashSet<ColumnReference>,
+    declared: &HashSet<ColumnReference>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut tables = vec![table_name.to_string()];
     tables.extend(
@@ -1443,18 +1447,25 @@ fn drop_indexes_named(
             .into_iter()
             .map(|(name, _)| name),
     );
-    // Keyed by the owning table as well as the name: the writer joins table and column
-    // names with `_`, so `orders (customer_id)` and `orders_customer (id)` share the name
-    // `i_orders_customer_id`, and a name alone would reach another dataset's index.
-    let writer_indexes: HashSet<(String, String)> = tables
-        .iter()
-        .cartesian_product(superseded)
-        .map(|(table, columns)| {
-            (
-                table.clone(),
-                IndexBuilder::new(table, columns.iter().collect()).index_name(),
-            )
-        })
+    // Keyed by the owning table as well as the name, and never a name a declared index
+    // also generates: the writer joins table and column names with `_`, so
+    // `orders (customer_id)` and `orders_customer (id)` share `i_orders_customer_id`, and
+    // on one table `(a, b)` and a column `a_b` share `i_t_a_b`.
+    let writer_names = |columns: &HashSet<ColumnReference>| -> HashSet<(String, String)> {
+        tables
+            .iter()
+            .cartesian_product(columns)
+            .map(|(table, columns)| {
+                (
+                    table.clone(),
+                    IndexBuilder::new(table, columns.iter().collect()).index_name(),
+                )
+            })
+            .collect()
+    };
+    let writer_indexes: HashSet<(String, String)> = writer_names(superseded)
+        .difference(&writer_names(declared))
+        .cloned()
         .collect();
 
     let mut stmt = tx
@@ -4203,7 +4214,7 @@ mod tests {
     fn superseded_inferred_indexes_are_the_undeclared_inferred_ones() {
         let cmd = cmd_with_inferred_indexes(&[(&["last", "first"], false)], None);
         assert_eq!(
-            super::superseded_inferred_indexes(&cmd),
+            super::superseded_inferred_indexes(&cmd, &super::declared_indexes(&cmd)),
             std::collections::HashSet::from([
                 datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
                     "first".to_string(),
@@ -4220,9 +4231,9 @@ mod tests {
             Some("email:unique;(first, last):enabled"),
         );
         assert!(
-            super::superseded_inferred_indexes(&cmd).is_empty(),
+            super::superseded_inferred_indexes(&cmd, &super::declared_indexes(&cmd)).is_empty(),
             "a declared index is configuration, not a superseded inference: {:?}",
-            super::superseded_inferred_indexes(&cmd)
+            super::superseded_inferred_indexes(&cmd, &super::declared_indexes(&cmd))
         );
     }
 
@@ -4250,7 +4261,9 @@ mod tests {
                 "first".to_string(),
             ]),
         ]);
-        let mut dropped = super::drop_indexes_named(&tx, "t", &superseded).expect("drop succeeds");
+        let mut dropped =
+            super::drop_indexes_named(&tx, "t", &superseded, &std::collections::HashSet::new())
+                .expect("drop succeeds");
         tx.commit().expect("transaction commits");
         dropped.sort();
 
@@ -4295,7 +4308,13 @@ mod tests {
                 "customer_id".to_string(),
             ]),
         ]);
-        let dropped = super::drop_indexes_named(&tx, "orders", &superseded).expect("drop succeeds");
+        let dropped = super::drop_indexes_named(
+            &tx,
+            "orders",
+            &superseded,
+            &std::collections::HashSet::new(),
+        )
+        .expect("drop succeeds");
         tx.commit().expect("transaction commits");
 
         assert!(
@@ -4315,6 +4334,40 @@ mod tests {
                 "orders_customer".to_string(),
                 "i_orders_customer_id".to_string()
             )]
+        );
+    }
+
+    // On one table an inferred `(a, b)` and a declared column `a_b` both generate
+    // `i_t_a_b`; the declared index owns the name.
+    #[test]
+    fn drop_indexes_named_keeps_a_declared_index_with_the_same_name() {
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+        let mut conn =
+            duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
+        conn.execute_batch(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, a_b BIGINT);
+             CREATE UNIQUE INDEX i_t_a_b ON t (a_b);",
+        )
+        .expect("fixture table and index are created");
+
+        let tx = conn.transaction().expect("transaction begins");
+        let superseded = std::collections::HashSet::from([ColumnReference::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ])]);
+        let declared =
+            std::collections::HashSet::from([ColumnReference::new(vec!["a_b".to_string()])]);
+        let dropped =
+            super::drop_indexes_named(&tx, "t", &superseded, &declared).expect("drop succeeds");
+        tx.commit().expect("transaction commits");
+
+        assert!(dropped.is_empty(), "dropped a declared index: {dropped:?}");
+        conn.execute_batch("INSERT INTO t VALUES (1, 1, 1, 30);")
+            .expect("first row inserts");
+        assert!(
+            conn.execute_batch("INSERT INTO t VALUES (2, 2, 2, 30);")
+                .is_err(),
+            "the declared unique index must still reject a duplicate"
         );
     }
 }
