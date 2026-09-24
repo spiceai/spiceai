@@ -48,12 +48,20 @@ LOAD_WITH_SPEC = (
     "TERMINATED BY '\\n' $$spec;\"; \\\n"
 )
 LOAD_NO_SPEC = LOAD_WITH_SPEC.replace(" $$spec;", ";")
+SPEC_GUARD = '\t[ -n "$$spec" ] || { echo "no column types"; exit 1; }; \\\n'
 
-GOOD = SPEC_DEF + TARGET + SPEC_BUILD + LOAD_WITH_SPEC
-NO_SPEC_PASSED = SPEC_DEF + TARGET + SPEC_BUILD + LOAD_NO_SPEC
+GOOD = SPEC_DEF + TARGET + SPEC_BUILD + SPEC_GUARD + LOAD_WITH_SPEC
+NO_SPEC_PASSED = SPEC_DEF + TARGET + SPEC_BUILD + SPEC_GUARD + LOAD_NO_SPEC
 NEVER_BUILT = SPEC_DEF + TARGET + LOAD_NO_SPEC
 NO_SPEC_VAR = TARGET.lstrip("\n") + LOAD_NO_SPEC
 NO_LOADER = SPEC_DEF + "\nsomething-else:\n\techo hi\n"
+# Builds and passes a spec, but loads whatever the generator produced. An
+# unreachable server makes that the empty string, and MySQL then reads every empty
+# field as 0 — the exact corruption the spec exists to prevent, back on the error
+# path, under a recipe that still prints success.
+UNGUARDED_SPEC = SPEC_DEF + TARGET + SPEC_BUILD + LOAD_WITH_SPEC
+# The check is there, but after the load it was supposed to stop.
+GUARDED_TOO_LATE = SPEC_DEF + TARGET + SPEC_BUILD + LOAD_WITH_SPEC + SPEC_GUARD
 
 FAILURES: list[str] = []
 CHECKS = 0
@@ -92,6 +100,13 @@ def test_guard_parser() -> None:
 
     errors, _ = loader_errors(NEVER_BUILT, REL)
     check("a loader that never builds a spec is rejected", len(errors), 1)
+
+    errors, _ = loader_errors(UNGUARDED_SPEC, REL)
+    check("a loader that never checks the spec is non-empty is rejected", len(errors), 1)
+    check_contains("  the error names the unchecked variable", errors[0], "`$spec`")
+
+    errors, _ = loader_errors(GUARDED_TOO_LATE, REL)
+    check("a check placed after the load it should stop is rejected", len(errors), 1)
 
     errors, _ = loader_errors(NO_SPEC_VAR, REL)
     check("a Makefile with no MYSQL_NULL_SPEC is rejected", len(errors), 1)

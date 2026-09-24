@@ -49,6 +49,12 @@ LOAD_DATA_RE = re.compile(r"LOAD\s+DATA\s+(?:LOCAL\s+)?INFILE\s+'([^']+)'", re.I
 #   spec=$(mysql … -e "$(MYSQL_COLUMN_TYPES)'$$table' …" | $(MYSQL_NULL_SPEC)); \
 SPEC_BUILD_RE = re.compile(rf"(?P<var>\w+)=\$\$\(.*\|\s*\$\({re.escape(SPEC_VAR)}\)\s*\)")
 
+# The emptiness check that refuses a load the spec generator produced nothing for,
+# e.g. `[ -n "$$spec" ] || { echo …; exit 1; }`. The generator prints nothing for an
+# empty listing, and awk in a pipeline hides the exit status of the `mysql` feeding
+# it, so an unreachable server yields an empty spec and a silently spec-less load.
+SPEC_GUARD_RE = re.compile(r"""\[\s+-n\s+"\$\$(?P<var>\w+)"\s+\]""")
+
 # The start of a recipe: a target name, then a colon that is not `:=`.
 TARGET_RE = re.compile(r"^([A-Za-z0-9_.\-/]+)\s*:(?!=)")
 
@@ -100,19 +106,37 @@ def loader_errors(text: str, rel: str) -> tuple[list[str], int]:
             for line in lines
             if (match := SPEC_BUILD_RE.search(line))
         }
+        # The subset of those the recipe has already refused to load on when empty,
+        # accumulated as the recipe is walked: a check placed *after* the load runs
+        # too late to stop it, so position is part of what this pins.
+        guarded_vars: set[str] = set()
 
         for line in lines:
+            if match := SPEC_GUARD_RE.search(line):
+                guarded_vars.add(match.group("var"))
             load = LOAD_DATA_RE.search(line)
             if not load:
                 continue
             checked += 1
             infile = load.group(1)
-            if not any(f"$${var}" in line for var in spec_vars):
+            passed = {var for var in spec_vars if f"$${var}" in line}
+            if not passed:
                 errors.append(
                     f"{rel}: target `{target}` loads {infile!r} into MySQL without a "
                     f"column spec from $({SPEC_VAR}), so every empty field in a "
                     f"numeric column lands as 0 instead of NULL. Build the spec from "
                     f"`information_schema` and pass it after the FIELDS/LINES clauses."
+                )
+            elif not passed & guarded_vars:
+                var = sorted(passed)[0]
+                errors.append(
+                    f"{rel}: target `{target}` loads {infile!r} with a `${var}` it "
+                    f"never checks is non-empty. $({SPEC_VAR}) prints nothing when the "
+                    f"`information_schema` query returns nothing, and the pipeline hides "
+                    f"that query's exit status, so an unreachable server loads every "
+                    f"table with no column spec at all and the recipe still reports "
+                    f'success. Add `[ -n "$${var}" ] || {{ echo …; exit 1; }}` before the '
+                    f"load."
                 )
 
     if not checked:
