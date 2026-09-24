@@ -839,6 +839,13 @@ pub struct QueryResultsCacheProvider {
     /// instance, not a fresh [`get_hash_builder`] call.
     hash_builder: HashBuilder,
     table_changes: TableChangeClock,
+    /// The subset of `table_changes` recorded because a table went *away* rather
+    /// than changed. Kept apart because the stale-serving window is an agreement
+    /// to serve one more previous result while a revalidation replaces it, and a
+    /// query over an unloaded dataset has no revalidation that can land — so a
+    /// mark from this clock must invalidate outright where an ordinary one would
+    /// degrade to stale (spiceai/spiceai#14251).
+    unloaded_tables: TableChangeClock,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -913,6 +920,7 @@ impl QueryResultsCacheProvider {
             hashing_algorithm: config.hashing_algorithm,
             hash_builder,
             table_changes: TableChangeClock::default(),
+            unloaded_tables: TableChangeClock::default(),
         };
 
         Ok(cache_provider)
@@ -1190,7 +1198,16 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub async fn evict_for_table(&self, table_name: TableReference) -> Result<()> {
-        self.mark_table_changed(&table_name);
+        // Both clocks, and the unload one first. Evicting only removes the entries
+        // that exist *now*: a query that passed the write-side check before this
+        // point can still publish its result afterwards — `put_raw_key` accepts it,
+        // because correctness is the read-time check, not the write-side one
+        // (`crates/cache/src/utils.rs`). Without this mark `entry_validity` would
+        // then rule that late entry `StaleWhileRevalidate` and serve the unloaded
+        // dataset for the whole window.
+        let at = std::time::Instant::now();
+        self.unloaded_tables.record_change(&table_name, at);
+        self.table_changes.record_change(&table_name, at);
         self.evict_marked(table_name).await
     }
 
@@ -1258,6 +1275,13 @@ impl QueryResultsCacheProvider {
         };
         if mark < read_started_at {
             return EntryValidity::Valid;
+        }
+
+        // A table this entry read has been unloaded since the read began. No
+        // revalidation of this query can succeed, so there is nothing for the
+        // stale-serving window to bridge to and the entry is simply gone.
+        if self.unloaded_tables.changed_since(tables, read_started_at) {
+            return EntryValidity::Invalidated;
         }
 
         match self.stale_serving_window() {
@@ -2089,6 +2113,72 @@ mod tests {
         assert!(
             provider.tables_changed_since(&tables, read_started_at),
             "a result whose read began before the unload must not be stored after it"
+        );
+    }
+
+    /// spiceai/spiceai#14251, the ordering the eviction alone does not cover: a query
+    /// that began before the unload can still *publish* afterwards. The write-side
+    /// `tables_changed_since` check is explicitly not the guard — `crates/cache/src/utils.rs`
+    /// says correctness comes from the read-time check — so `put_raw_key` accepts that
+    /// late entry, and with a window configured `entry_validity` would otherwise rule it
+    /// `StaleWhileRevalidate` and serve an unloaded dataset for the whole window, with no
+    /// revalidation able to end it early.
+    ///
+    /// The refresh path is asserted beside it on the same provider, because the window is
+    /// supposed to keep absorbing an ordinary contents change.
+    #[tokio::test]
+    async fn a_result_published_after_an_unload_is_not_servable_as_stale() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid cache provider");
+
+        // The read begins before either invalidation, as a query already in flight would.
+        let read_started_at = std::time::Instant::now();
+
+        provider
+            .invalidate_for_table(TableReference::bare("orders"))
+            .await
+            .expect("invalidation should succeed");
+        provider
+            .evict_for_table(TableReference::bare("customer"))
+            .await
+            .expect("eviction should succeed");
+
+        let now = std::time::Instant::now();
+
+        let unloaded: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        assert_eq!(
+            provider.entry_validity(&unloaded, read_started_at, now),
+            EntryValidity::Invalidated,
+            "a result that read an unloaded dataset must not be served, however long the stale window is"
+        );
+
+        let refreshed: HashSet<TableReference> = HashSet::from([TableReference::bare("orders")]);
+        assert_eq!(
+            provider.entry_validity(&refreshed, read_started_at, now),
+            EntryValidity::StaleWhileRevalidate,
+            "the control: an ordinary contents change still absorbs into the window"
+        );
+
+        // A query joining both is ruled by the unloaded one: any single table going away
+        // is enough to leave the whole result unservable.
+        let both: HashSet<TableReference> = HashSet::from([
+            TableReference::bare("customer"),
+            TableReference::bare("orders"),
+        ]);
+        assert_eq!(
+            provider.entry_validity(&both, read_started_at, now),
+            EntryValidity::Invalidated,
+            "one unloaded input is enough, even alongside a table that only changed"
+        );
+
+        // And a read that began *after* the unload is untouched by it — the watermark
+        // must not invalidate everything forever.
+        let after_unload = std::time::Instant::now();
+        assert_eq!(
+            provider.entry_validity(&unloaded, after_unload, after_unload),
+            EntryValidity::Valid,
+            "a read that began after the unload is unaffected by it"
         );
     }
 
