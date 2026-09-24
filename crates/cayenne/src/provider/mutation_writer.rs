@@ -724,10 +724,17 @@ impl<'a> AppendMutationWriter<'a> {
                     match self.table.reserve_sequences_local(1).await {
                         Ok(sequence) => sequence,
                         Err(error) => {
+                            // `debug!`, not `warn!`: a new user-visible log line is
+                            // product surface and this fix carries no Enhancement
+                            // for one. The rollback failure is not dropped — the
+                            // staged WAL it leaves is rolled forward idempotently by
+                            // the next write's `ensure_no_incomplete_write` — and the
+                            // reservation error is what the caller sees.
                             if let Err(cleanup_error) = prepared_append.rollback().await {
-                                tracing::warn!(
-                                    "Failed to roll back the staged append for table {} after its sequence reservation failed: {cleanup_error}",
-                                    self.table.table_name(),
+                                tracing::debug!(
+                                    table = self.table.table_name(),
+                                    %cleanup_error,
+                                    "Rollback of a staged append failed after its sequence draw failed; recovery will roll the staging WAL forward"
                                 );
                             }
                             return Err(error.into());
@@ -1609,9 +1616,26 @@ impl<'a> AppendMutationWriter<'a> {
         self.context.record_io_latency(write_start.elapsed());
 
         // Zero rows publishes nothing, so there is nothing for a transaction to
-        // race and no sequence to draw (see the fn doc).
+        // race and no sequence to draw (see the fn doc). A draw that fails on a
+        // block refill leaves the private files this write just staged, so it
+        // takes the same cleanup the write-error arm above takes.
         let append_sequence = if rows > 0 {
-            Some(self.table.reserve_sequences_local(1).await?)
+            match self.table.reserve_sequences_local(1).await {
+                Ok(sequence) => Some(sequence),
+                Err(error) => {
+                    if let Err(cleanup_err) = self
+                        .table
+                        .clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                            self.table.table_name(),
+                        );
+                    }
+                    return Err(error.into());
+                }
+            }
         } else {
             None
         };
