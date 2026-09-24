@@ -42,7 +42,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 - [ ] Create `release/X.Y` from `trunk` one day before release.
   - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md).
 - [ ] Lock the branch to critical fixes only and notify the team.
-- [ ] (Docs DRI) Create `release/X.Y.Z` in [spiceai/docs](https://github.com/spiceai/docs). All PRs should target the release branch until the release goes live.
 
 ## Pre-Release Testing & Validation
 
@@ -217,6 +216,7 @@ Testing focus DRIs are responsible for:
 ## Final Updates
 
 - [ ] Merge any pending [Docs PRs](https://github.com/spiceai/docs/pulls).
+- [ ] **Minor release only:** (Docs DRI) Manually dispatch [Create Versioned Docs Release](https://github.com/spiceai/docs/actions/workflows/create_release.yml) in [spiceai/docs](https://github.com/spiceai/docs) with version `X.Y` and base branch `trunk`. Review and merge the generated PR, confirming it adds `website/versioned_docs/version-X.Y.x/`, `website/versioned_sidebars/version-X.Y.x-sidebars.json`, and `X.Y.x` at the start of `website/versions.json`.
 
 - [ ] Merge any pending Merge pending [Cookbook PRs](https://github.com/spiceai/cookbook/pulls)
 
@@ -252,7 +252,6 @@ Testing focus DRIs are responsible for:
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
-  - [ ] (Docs DRI) Create and merge PR from `release/X.Y.Z` into `trunk`.
   - [ ] (Docs DRI) Tag the merged `trunk` commit `vX.Y.Z`.
 - [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
   - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
