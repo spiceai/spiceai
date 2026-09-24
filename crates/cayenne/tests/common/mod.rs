@@ -34,6 +34,8 @@ use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
 use tempfile::TempDir;
 
+pub mod covering_index;
+
 /// Backend type for parameterized tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
