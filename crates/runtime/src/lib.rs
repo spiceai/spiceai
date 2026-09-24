@@ -459,6 +459,13 @@ pub enum Error {
         timeout_secs: u64,
     },
 
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration's first refresh failed and will not be retried.         Reloading the dataset from scratch instead.         Check that the dataset's source is reachable and that the refresh configuration is valid.         See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshFailed {
+        dataset: TableReference,
+    },
+
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 

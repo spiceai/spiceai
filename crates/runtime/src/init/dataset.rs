@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
+use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
@@ -36,7 +36,8 @@ use crate::{
     DurableWriteBackPrerequisitesUnmetSnafu, DurableWriteBackRecreatingModeSnafu,
     DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
     DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
-    HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
+    HotReloadRefreshFailedSnafu, HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu,
+    PermanentDatasetFailureSnafu,
     Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
@@ -2220,12 +2221,18 @@ pub struct RegisterDatasetContext {
 /// signal is closed when it is built and the waiter resolves at once rather than
 /// spending the bound.
 ///
-/// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
-/// [`Error::HotReloadRefreshTimedOut`] when the table is still unloaded once
-/// there is nothing left to wait for, which drops the in-place swap in favour of
-/// a full reload. That is the bound expiring, a terminal refresh failure, or
-/// the new table being dropped before its first refresh: waiting out the rest
-/// of the bound on a table nobody can refresh only delays the same verdict.
+/// Returns `Ok(())` when the table loaded (or the runtime is shutting down).
+///
+/// When the table is still unloaded once there is nothing left to wait for,
+/// drops the in-place swap in favour of a full reload:
+/// - [`Error::HotReloadRefreshFailed`] for a terminal refresh failure (or the
+///   new table being dropped before its first refresh), so an immediate load
+///   failure is not reported as a timeout.
+/// - [`Error::HotReloadRefreshTimedOut`] when the bound expires with no
+///   completion.
+///
+/// Waiting out the rest of the bound on a table nobody can refresh only delays
+/// the same verdict.
 async fn await_hot_reload_initial_refresh(
     dataset_name: &TableReference,
     initial_load_completed: &(dyn Fn() -> bool + Sync),
@@ -2237,6 +2244,7 @@ async fn await_hot_reload_initial_refresh(
         return Ok(());
     }
 
+    let mut wait_outcome = None;
     tokio::select! {
         // A `RefreshCompletionWaiter` for any completion is satisfied by a
         // *successful* refresh that finished before this wait began, so the
@@ -2244,8 +2252,11 @@ async fn await_hot_reload_initial_refresh(
         // terminal failure falls through to the flag re-check below rather
         // than returning: no successful load is coming, but a load that
         // landed before the recorders went still counts.
-        outcome = completion.wait() => if outcome.is_answered() {
-            return Ok(());
+        outcome = completion.wait() => {
+            if outcome.is_answered() {
+                return Ok(());
+            }
+            wait_outcome = Some(outcome);
         },
         () = shutdown_token.cancelled() => return Ok(()),
         () = tokio::time::sleep(timeout) => {}
@@ -2256,6 +2267,18 @@ async fn await_hot_reload_initial_refresh(
     // leaves a table that must not be discarded.
     if initial_load_completed() {
         return Ok(());
+    }
+
+    // A terminal failure (or abandoned wait) ended immediately — do not claim
+    // the bound expired.
+    if matches!(
+        wait_outcome,
+        Some(RefreshCompletionOutcome::TerminalFailure | RefreshCompletionOutcome::Abandoned)
+    ) {
+        return HotReloadRefreshFailedSnafu {
+            dataset: dataset_name.clone(),
+        }
+        .fail();
     }
 
     HotReloadRefreshTimedOutSnafu {
@@ -3592,8 +3615,8 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .expect_err("a failed one-shot load is not a loaded table");
 
             assert!(
-                matches!(err, Error::HotReloadRefreshTimedOut { .. }),
-                "expected the hot-reload bound to be reported, got: {err}"
+                matches!(err, Error::HotReloadRefreshFailed { .. }),
+                "expected a terminal refresh failure, got: {err}"
             );
             assert_eq!(
                 started.elapsed(),
