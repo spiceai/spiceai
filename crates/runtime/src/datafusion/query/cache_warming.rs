@@ -239,6 +239,10 @@ impl ResultsCacheWarmer {
             catalog.templates.push(template);
             self.count.store(catalog.templates.len(), Ordering::Relaxed);
         }
+        // A re-observed shape is live again: drop any prune tombstone so a
+        // concurrent ordinary persist (or a still-queued prune) does not
+        // filter it out of the remote catalog.
+        self.pending_excludes.lock().remove(&id);
         self.schedule_persist();
     }
 
@@ -308,7 +312,12 @@ impl ResultsCacheWarmer {
                     // shapes from a stale remote catalog.
                     let exclude = {
                         let pending = pending_excludes.lock();
-                        exclude.union(&pending).copied().collect::<HashSet<_>>()
+                        let catalog = catalog.lock();
+                        exclude
+                            .union(&pending)
+                            .copied()
+                            .filter(|id| !catalog.ids.contains(id))
+                            .collect::<HashSet<_>>()
                     };
                     let wrote =
                         persist_remote_excluding(state, catalog, count, exclude.clone()).await;
