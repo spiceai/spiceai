@@ -1385,10 +1385,23 @@ mod tests {
             "FIFO with no writer must still be pending; read_returned={}",
             load.is_finished()
         );
-        load.abort();
-        // `tokio::fs::read` uses `spawn_blocking`; abort does not unblock
-        // the FIFO open, so do not join the reader.
-        drop(load);
+
+        // `tokio::fs::read` uses `spawn_blocking`; the FIFO open finishes
+        // only after a writer appears, so complete the read before the
+        // test runtime shuts down.
+        let write_path = path;
+        let writer = tokio::task::spawn_blocking(move || std::fs::write(write_path, b"[]"));
+        let loaded = load
+            .await
+            .expect("catalog load should finish after a writer opens the FIFO");
+        writer
+            .await
+            .expect("writer task")
+            .expect("write empty catalog");
+        assert!(
+            loaded.is_empty(),
+            "an empty JSON array is a valid empty catalog"
+        );
     }
 
     #[tokio::test]
