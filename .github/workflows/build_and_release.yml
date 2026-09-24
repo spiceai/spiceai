@@ -182,7 +182,9 @@ jobs:
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       # Internal builds include PostgreSQL acceleration for benchmarks; tagged releases omit it.
-      SPICED_FEATURES: ${{ matrix.target.is_tagged_release && 'release,models' || 'release,models,postgres-accel' }}
+      # Throwaway test branch: `snapshots` added to build a feature-enabled binary for local
+      # testing of #13589 (FTS-in-snapshots). Do NOT merge to trunk — snapshots is enterprise-only.
+      SPICED_FEATURES: ${{ matrix.target.is_tagged_release && 'release,models' || 'release,models,postgres-accel,snapshots' }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -396,7 +398,7 @@ jobs:
           # and .github/actions/build-spiced sets it on both of its build steps — and this
           # step is the only `metal` build that bypasses both by calling cargo directly.
           MISTRALRS_METAL_PRECOMPILE: 0
-        run: cargo build --release --features release,models,metal --target-dir ../../target
+        run: cargo build --release --features release,models,metal,snapshots --target-dir ../../target
 
       - name: tar binary (metal)
         if: matrix.target.target_os == 'darwin'
