@@ -92,7 +92,7 @@ const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 /// What a caller of [`Runtime::invalidate_cached_results_because`] is doing to the
 /// dataset, which decides what the operator is told they will observe when the
 /// invalidation itself fails.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum CacheInvalidation {
     /// The dataset stays registered and its contents may change.
     Reload,
@@ -1201,10 +1201,17 @@ impl Runtime {
         }
     }
 
+    /// Unregisters `ds_name` and discards what is cached over it.
+    ///
+    /// `cause` is the caller's intent, which this cannot infer: two of its three
+    /// callers unregister the dataset only to register a replacement, and telling
+    /// the results cache those were unloads would deny them the stale-serving
+    /// window their reload is exactly what revalidates.
     async fn remove_dataset(
         self: Arc<Self>,
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
+        cause: CacheInvalidation,
     ) {
         if self.df.table_exists(&ds_name) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
@@ -1225,13 +1232,20 @@ impl Runtime {
 
         // Deregistering the table is not enough to stop it being read: a cached
         // logical plan holds the `TableSource` it was planned against, so a query
-        // executed before the removal keeps executing against the retired provider
-        // — answering rows from a dataset the catalog no longer lists, and holding
-        // that provider's memory reservations against the query pool. A cached
-        // result reads the same way. `update_dataset` and `remove_view` discard
-        // both for the same reason; removal is the arm that did not.
+        // executed before this point keeps executing against the retired provider,
+        // answering rows from a dataset the catalog no longer lists (#14251). A
+        // cached result reads the same way. Both discards happen *here*, after the
+        // deregistration, rather than in the callers that used to do them before it:
+        // a query planning in the window between a caller's discard and the
+        // deregistration would otherwise cache a plan over the provider being retired.
+        //
+        // The plan discard is deliberately the blanket one, as `update_dataset` and
+        // `remove_view` both use. `invalidate_for_table` would reach this dataset's own
+        // plans, but a dataset leaves the app at human timescale and the cost of being
+        // wrong about which plans reach it is the defect above, so the price paid is a
+        // replan of everything else.
         self.df.clear_cached_plans().await;
-        self.invalidate_cached_results_because(&ds_name, CacheInvalidation::Unload)
+        self.invalidate_cached_results_because(&ds_name, cause)
             .await;
 
         tracing::info!("Unloaded dataset {}", &ds_name);
@@ -1321,7 +1335,11 @@ impl Runtime {
                 }
 
                 Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .remove_dataset(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
+                    )
                     .await;
 
                 let initialized = DatasetInitialization::plan_eager(
@@ -1382,13 +1400,10 @@ impl Runtime {
         cause: CacheInvalidation,
     ) {
         let caching = self.df.caching();
-        // An unload takes the evicting path. `invalidate_for_table` defers to
-        // `stale_while_revalidate_ttl` where it is configured, and that window is an
-        // agreement to serve one more previous result *while a revalidation replaces
-        // the entry* — which a query over an unloaded dataset can never do, so the
-        // result would be served for the whole window with nothing able to end it
-        // early. A `cache_key_type: sql` hit is answered before planning, so the plan
-        // cache above does not reach it either (#14251).
+        // An unload takes the evicting path, which a `cache_key_type: sql` hit needs
+        // because such a hit is answered before planning and the plan cache therefore
+        // never reaches it. See [`cache::QueryResultsCacheProvider::evict_for_table`]
+        // for why the stale-serving window must not absorb an unload.
         let outcome = match cause {
             CacheInvalidation::Reload => caching.invalidate_for_table(dataset.clone()).await,
             CacheInvalidation::Unload => caching.evict_for_table(dataset.clone()).await,
@@ -1986,14 +2001,17 @@ impl Runtime {
                     && (added_futures.contains_key(&parent)
                         || is_queued_localpod(&localpod_by_parent, &parent))
                 {
-                    // What `update_dataset` does around its own swap: a plan or result cached
-                    // over the table being unloaded must not answer once the chain below
-                    // registers its replacement. An accelerated dataset's initial refresh
-                    // invalidates again on completion; a pass-through one has only this.
-                    self.df.clear_cached_plans().await;
-                    self.invalidate_cached_results_for(&ds.name).await;
+                    // A plan or result cached over the table being unloaded must not
+                    // answer once the chain below registers its replacement;
+                    // `remove_dataset` discards both, after the deregistration. An
+                    // accelerated dataset's initial refresh invalidates again on
+                    // completion; a pass-through one has only this.
                     Arc::clone(&self)
-                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .remove_dataset(
+                            ds.name.clone(),
+                            ds.acceleration.as_ref(),
+                            CacheInvalidation::Reload,
+                        )
                         .await;
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
@@ -2101,7 +2119,7 @@ impl Runtime {
                 self.status
                     .update_dataset(&ds_name, status::ComponentStatus::Disabled);
                 Arc::clone(&self)
-                    .remove_dataset(ds_name, ds_acceleration.as_ref())
+                    .remove_dataset(ds_name, ds_acceleration.as_ref(), CacheInvalidation::Unload)
                     .await;
             }
         }
@@ -3305,14 +3323,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "id",
-                arrow_schema::DataType::Int64,
-                false,
-            )]));
-            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
-                .expect("empty MemTable with a single column");
-            Ok(Arc::new(table) as Arc<dyn TableProvider>)
+            Ok(empty_table())
         }
     }
 
@@ -3352,6 +3363,21 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     fn spicepod_dataset(from: &str, name: &str) -> spicepod::component::dataset::Dataset {
         spicepod::component::dataset::Dataset::new(from, name)
+    }
+
+    /// An empty single-column table: a schema for a connector to answer with, and a real
+    /// registration for the removal path to deregister rather than passing over a name
+    /// that was never there.
+    fn empty_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        Arc::new(
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("empty MemTable with a single column"),
+        )
     }
 
     /// Regression test for #12862: `apply_dataset_diff` awaited each added
@@ -4611,7 +4637,9 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
-    /// The other half: an apply that removes nothing must not throw the plan cache away.
+    /// The premise the test above rests on: the discard belongs to the *removal*, not to
+    /// applying a diff. Were `apply_dataset_diff` to clear unconditionally, the assertion
+    /// above would hold for a reason that has nothing to do with `remove_dataset`.
     #[tokio::test]
     async fn an_apply_that_removes_no_dataset_keeps_cached_plans() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
@@ -4664,28 +4692,12 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
-    /// An empty single-column table to register under a dataset name, so the removal path
-    /// has a real registration to deregister rather than passing over a name that was never
-    /// there.
-    fn empty_table() -> Arc<dyn datafusion::catalog::TableProvider> {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
-        ]));
-        Arc::new(
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
-                .expect("an empty MemTable is valid"),
-        )
-    }
-
     /// An app declaring `names` as `file:` datasets. The `from` never has to resolve: the
     /// removal arm reads only which names left the app.
     fn app_with_datasets(names: &[&str]) -> Arc<App> {
         let mut builder = app::AppBuilder::new("dataset_removal");
         for name in names {
-            builder = builder.with_dataset(spicepod::component::dataset::Dataset::new(
-                "file:data.csv",
-                (*name).to_string(),
-            ));
+            builder = builder.with_dataset(spicepod_dataset("file:data.csv", name));
         }
         Arc::new(builder.build())
     }

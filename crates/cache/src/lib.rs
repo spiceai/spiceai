@@ -570,9 +570,7 @@ impl Caching {
     }
 
     /// [`Self::invalidate_for_table`], for a table that is going away rather than
-    /// changing: the results cache drops its entries instead of deferring to
-    /// `stale_while_revalidate_ttl`, which has no revalidation to wait for once the
-    /// table is unloaded. See [`QueryResultsCacheProvider::evict_for_table`].
+    /// changing. See [`QueryResultsCacheProvider::evict_for_table`].
     ///
     /// # Errors
     ///
@@ -840,11 +838,15 @@ pub struct QueryResultsCacheProvider {
     hash_builder: HashBuilder,
     table_changes: TableChangeClock,
     /// The subset of `table_changes` recorded because a table went *away* rather
-    /// than changed. Kept apart because the stale-serving window is an agreement
-    /// to serve one more previous result while a revalidation replaces it, and a
-    /// query over an unloaded dataset has no revalidation that can land — so a
-    /// mark from this clock must invalidate outright where an ordinary one would
-    /// degrade to stale (spiceai/spiceai#14251).
+    /// than changed, which [`QueryResultsCacheProvider::entry_validity`] must rule
+    /// on differently — see [`QueryResultsCacheProvider::evict_for_table`].
+    ///
+    /// A second clock rather than a kind on the shared one, because the two collapse
+    /// independently: `TableChangeClock` folds itself into a conservative
+    /// `discarded_floor` past `MAX_TRACKED_TABLES`, and a floor on this clock reads as
+    /// "everything was unloaded", which turns stale serving off process-wide until it
+    /// ages out. Confined here that needs 4096 distinct *unloaded* tables; on the
+    /// shared clock any 4096 refreshed tables would do it.
     unloaded_tables: TableChangeClock,
 }
 
@@ -1157,7 +1159,7 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        self.mark_table_changed(&table_name);
+        self.mark_table_changed(&table_name, std::time::Instant::now());
 
         // With `stale_while_revalidate_ttl` configured, the mark *is* the
         // invalidation: dependent entries stay resident so that a hit inside
@@ -1194,20 +1196,24 @@ impl QueryResultsCacheProvider {
     /// hit is answered before planning, so discarding the logical plan does not reach
     /// it and this is the only thing that does.
     ///
+    /// This is the one place that argument is written out; the other sites that carry
+    /// it — the `unloaded_tables` clock, `entry_validity`, `Caching::evict_for_table`
+    /// — point here.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub async fn evict_for_table(&self, table_name: TableReference) -> Result<()> {
-        // Both clocks, and the unload one first. Evicting only removes the entries
-        // that exist *now*: a query that passed the write-side check before this
-        // point can still publish its result afterwards — `put_raw_key` accepts it,
-        // because correctness is the read-time check, not the write-side one
-        // (`crates/cache/src/utils.rs`). Without this mark `entry_validity` would
-        // then rule that late entry `StaleWhileRevalidate` and serve the unloaded
-        // dataset for the whole window.
+        // The unload clock as well, from the same instant. Evicting only removes the
+        // entries that exist *now*: a query that passed the write-side check before
+        // this point can still publish its result afterwards — `put_raw_key` accepts
+        // it, because correctness is the read-time check and the write-side one is
+        // only an optimisation (`crates/cache/src/utils.rs`). Without this mark
+        // `entry_validity` would rule that late entry `StaleWhileRevalidate` and
+        // serve the unloaded dataset for the whole window.
         let at = std::time::Instant::now();
         self.unloaded_tables.record_change(&table_name, at);
-        self.table_changes.record_change(&table_name, at);
+        self.mark_table_changed(&table_name, at);
         self.evict_marked(table_name).await
     }
 
@@ -1215,9 +1221,8 @@ impl QueryResultsCacheProvider {
     /// after: a writer that started before this point must be rejected by
     /// `tables_changed_since`, and stamping afterwards leaves exactly the same gap
     /// one step earlier.
-    fn mark_table_changed(&self, table_name: &TableReference) {
-        self.table_changes
-            .record_change(table_name, std::time::Instant::now());
+    fn mark_table_changed(&self, table_name: &TableReference, at: std::time::Instant) {
+        self.table_changes.record_change(table_name, at);
     }
 
     /// The eviction both paths above share, once the clock is already stamped.
@@ -1277,6 +1282,15 @@ impl QueryResultsCacheProvider {
             return EntryValidity::Valid;
         }
 
+        // Asked before the unload clock, not after: without a window there is no
+        // staleness anyone has agreed to serve, so the answer is `Invalidated`
+        // whatever the unload clock says — and the second clock lookup, which is on
+        // the hit path, is skipped entirely for every deployment that has not opted
+        // into `stale_while_revalidate_ttl`.
+        let Some(stale_ttl) = self.stale_serving_window() else {
+            return EntryValidity::Invalidated;
+        };
+
         // A table this entry read has been unloaded since the read began. No
         // revalidation of this query can succeed, so there is nothing for the
         // stale-serving window to bridge to and the entry is simply gone.
@@ -1284,17 +1298,15 @@ impl QueryResultsCacheProvider {
             return EntryValidity::Invalidated;
         }
 
-        match self.stale_serving_window() {
-            // A window long enough to overflow the clock is one that never
-            // closes, which is the answer `checked_add` is standing in for.
-            Some(stale_ttl)
-                if mark
-                    .checked_add(stale_ttl)
-                    .is_none_or(|window_ends| now <= window_ends) =>
-            {
-                EntryValidity::StaleWhileRevalidate
-            }
-            _ => EntryValidity::Invalidated,
+        // A window long enough to overflow the clock is one that never closes, which
+        // is the answer `checked_add` is standing in for.
+        if mark
+            .checked_add(stale_ttl)
+            .is_none_or(|window_ends| now <= window_ends)
+        {
+            EntryValidity::StaleWhileRevalidate
+        } else {
+            EntryValidity::Invalidated
         }
     }
 
