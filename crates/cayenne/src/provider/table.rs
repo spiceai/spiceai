@@ -3014,6 +3014,17 @@ fn retention_deferred_transient_message(table_name: &str) -> String {
     )
 }
 
+/// The line an operator reads when `retention_sql` actually removed rows.
+///
+/// The one positive signal that the policy ran, so it carries the dataset in the text and
+/// not only in a `tracing` field: a reader grepping this line needs to know which dataset
+/// it ran for, and the field is invisible to `grep`.
+fn retention_deleted_message(table_name: &str, deleted: u64) -> String {
+    format!(
+        "Retention deleted {deleted} row(s) matching `retention_sql` from accelerated dataset '{table_name}'"
+    )
+}
+
 /// Writes up to this many rows index their memory-tier segment on the writing
 /// task; larger ones hash and sort their keys on the blocking pool.
 const MEM_TIER_INDEX_INLINE_ROWS: usize = 1_024;
@@ -19511,13 +19522,10 @@ impl CayenneTableProvider {
                 Ok(RetentionPass::Deleted(deleted)) => {
                     retention_deleted = deleted;
                     if deleted > 0 {
-                        // The dataset goes in the message text, not only the field: this
-                        // is the one positive signal that `retention_sql` ran, and a
-                        // reader grepping for it needs to know which dataset it ran for.
                         tracing::info!(
                             table = self.table_metadata.table_name.as_str(),
-                            "Retention deleted {deleted} row(s) matching `retention_sql` from accelerated dataset '{}'",
-                            self.table_metadata.table_name
+                            "{}",
+                            retention_deleted_message(&self.table_metadata.table_name, deleted)
                         );
                     }
                 }
@@ -25177,9 +25185,9 @@ impl CayenneTableProvider {
     ///
     /// One function rather than a `format!` per arm so a reword cannot land on some of
     /// them: the pass can fail at the inline materialization, the predicate coercion, the
-    /// sink build, or the mem-tier arm, and a user reading any of the four is owed the
-    /// same three things — which dataset, what is still queryable because of it, and
-    /// where to look next.
+    /// sink build, the durable delete, or the mem-tier arm, and a user reading any of the
+    /// five is owed the same three things — which dataset, what is still queryable because
+    /// of it, and where to look next.
     fn retention_failed_message(&self) -> String {
         format!(
             "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
@@ -25365,7 +25373,7 @@ impl CayenneTableProvider {
                     MaintenanceOutcome::Failed,
                 );
                 return Err(CatalogError::InvalidOperation {
-                    message: "Failed to execute retention filters.".to_string(),
+                    message: self.retention_failed_message(),
                     source: err,
                 });
             }
@@ -55451,6 +55459,40 @@ mod tests {
             inlined_before,
             "the seal shadow must not be materialized: its rows are still live in RAM"
         );
+    }
+
+    /// The success line is the only evidence a user gets that `retention_sql` ran, so a
+    /// reword must not be able to drop what they read it for: which dataset, that the
+    /// rows went because of `retention_sql`, and how many. Pinned here because the text
+    /// is the surface specified in #14337, and a `tracing` field is not a substitute for
+    /// the dataset appearing in the text a `grep` returns.
+    #[test]
+    fn retention_deleted_message_names_the_dataset_predicate_and_count() {
+        let message = retention_deleted_message("events", 7);
+
+        assert!(
+            message.contains("'events'"),
+            "the line must name the dataset in its text, not only in a field: {message}"
+        );
+        assert!(
+            message.contains("retention_sql"),
+            "it must say WHY the rows went, so it is not read as an unexplained delete: {message}"
+        );
+        assert!(
+            message.contains("7 row(s)"),
+            "it must carry the row count next to its unit, so the line reads as one fact \
+             and the quantity no prose reconstructs cannot drift from what it counts: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "log messages stay on one line: {message}"
+        );
+        for internal in ["sink", "deletion vector", "tier", "seal"] {
+            assert!(
+                !message.contains(internal),
+                "'{internal}' is an internal concept the operator cannot act on: {message}"
+            );
+        }
     }
 
     /// Both deferral errors reach an operator through a synchronous maintenance drain, so
