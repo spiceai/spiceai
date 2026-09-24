@@ -4814,6 +4814,13 @@ pub(crate) struct OverwriteRangePlan {
     from_input_head: bool,
 }
 
+/// Put `column` first on the shard key so `range_bounds` apply to it. Every
+/// other column is kept so a hash fallback can rebalance a composite key.
+fn lead_with_range_column(shard_key_columns: &mut Vec<String>, column: &str) {
+    shard_key_columns.retain(|name| name != column);
+    shard_key_columns.insert(0, column.to_string());
+}
+
 impl OverwriteRangePlan {
     pub(crate) fn partitioning(&self) -> RangePartitioning<'_> {
         RangePartitioning {
@@ -9679,11 +9686,12 @@ impl CayenneTableProvider {
                 if let Some(range) = range.as_ref() {
                     // The bounds describe `range.column` when the caller named
                     // one (a table without a primary key routes on a column that
-                    // is not its shard key), so the router must split that column.
+                    // is not its shard key), so that column leads the shard key
+                    // and the rest stay for a hash fallback.
                     if config.range_bounds.is_some()
                         && let Some(column) = range.column
                     {
-                        config.shard_key_columns = vec![column.to_string()];
+                        lead_with_range_column(&mut config.shard_key_columns, column);
                     }
                     // Without bounds the write hashes the shard key; the run sort
                     // then orders each shard by its leading column instead.
@@ -10842,17 +10850,12 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
-        // The sink builds `ShardSpec::Range` only for a SINGLE key expression
-        // (`vortex::persistent::format`), so a composite key must be narrowed to
-        // the column the bounds actually describe — its leading one — or the
-        // bounds are computed, passed down, and then silently ignored in favour
-        // of hashing. The full key is preserved whenever there are no bounds, so
-        // the hash fallback keeps clustering on everything it always did.
-        let mut shard_key_columns = self.resolved_shard_key_columns();
+        // Bounds describe one column — the first `shard_key_columns` entry after
+        // the caller leads with `range.column`. The rest of the key is kept so
+        // an estimated-bounds hash fallback can still rebalance a composite key;
+        // a single-column key hashes that same column.
+        let shard_key_columns = self.resolved_shard_key_columns();
         let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
-        if range_bounds.is_some() {
-            shard_key_columns.truncate(1);
-        }
         Some(WriteShardConfig {
             write_concurrency: shard_count,
             shard_key_columns,
@@ -46524,13 +46527,12 @@ mod tests {
         );
     }
 
-    /// Bounds describe ONE column, and the sink builds `ShardSpec::Range` only for
-    /// a single key expression. A composite key must therefore be narrowed to its
-    /// leading column when bounds are present, or they are computed, passed down
-    /// and then silently dropped in favour of hashing — the feature would look
-    /// wired up and do nothing.
+    /// Bounds describe ONE column, and the sink range-partitions on the first
+    /// shard-key expression. A composite key must keep every column so an
+    /// estimated-bounds hash fallback can still rebalance when the remainder is
+    /// one value of that leading column.
     #[tokio::test]
-    async fn test_write_shard_format_narrows_a_composite_key_to_carry_range_bounds() {
+    async fn test_write_shard_format_keeps_a_composite_key_when_range_bounds_are_set() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("o_id", DataType::Int64, false),
             Field::new("line", DataType::Int64, false),
@@ -46562,8 +46564,8 @@ mod tests {
         );
         assert!(hashed.range_bounds.is_none());
 
-        // With bounds: narrowed to the leading column, which is the one the
-        // bounds speak about and the only shape the sink range-partitions.
+        // With bounds: the leading column is the range key, and the rest of the
+        // composite key stays so a hash fallback can still rebalance.
         let bounds = vec![
             ScalarValue::Int64(Some(10)),
             ScalarValue::Int64(Some(20)),
@@ -46576,8 +46578,8 @@ mod tests {
             .clone();
         assert_eq!(
             ranged.shard_key_columns,
-            vec!["o_id".to_string()],
-            "range bounds describe the leading column only, so the key narrows to it"
+            vec!["o_id".to_string(), "line".to_string()],
+            "range bounds describe the leading column; the full key is kept for hash fallback"
         );
         assert_eq!(
             ranged.range_bounds.as_deref(),
@@ -46585,7 +46587,7 @@ mod tests {
             "the bounds must survive to the sink"
         );
 
-        // An empty bound list is not a split; it must not narrow the hash key.
+        // An empty bound list is not a split; hashing keeps every key column.
         let empty = provider
             .write_shard_format(4, tsb, None, EncodeFanOut::Sized, Some(&[]))
             .write_shard()
@@ -46597,6 +46599,32 @@ mod tests {
             "no usable bounds means hashing, which keeps every key column"
         );
         assert!(empty.range_bounds.is_none());
+    }
+
+    #[test]
+    fn lead_with_range_column_keeps_the_rest_of_a_composite_key() {
+        let mut leading = vec!["o_id".to_string(), "line".to_string()];
+        super::lead_with_range_column(&mut leading, "o_id");
+        assert_eq!(leading, vec!["o_id".to_string(), "line".to_string()]);
+
+        let mut rest = vec!["o_id".to_string(), "line".to_string()];
+        super::lead_with_range_column(&mut rest, "line");
+        assert_eq!(rest, vec!["line".to_string(), "o_id".to_string()]);
+
+        let mut missing = vec!["o_id".to_string(), "line".to_string()];
+        super::lead_with_range_column(&mut missing, "tenant_id");
+        assert_eq!(
+            missing,
+            vec![
+                "tenant_id".to_string(),
+                "o_id".to_string(),
+                "line".to_string()
+            ]
+        );
+
+        let mut empty = Vec::new();
+        super::lead_with_range_column(&mut empty, "id");
+        assert_eq!(empty, vec!["id".to_string()]);
     }
 
     #[tokio::test]

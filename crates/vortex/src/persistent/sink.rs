@@ -107,12 +107,17 @@ pub(super) enum ShardSpec {
     ///
     /// `hash_fallback` marks bounds estimated from a sample that may not describe
     /// the rows still to come. If one shard then receives far more than its share
-    /// (see [`RangeImbalanceGuard`]), the rest of the write hashes the key
-    /// instead, so one encoder is not left with the remainder of the write. The
-    /// guard checks at most every `RangeImbalanceGuard::SLICE_ROWS` rows, slicing
-    /// larger batches, so it can act inside a batch as well as between batches.
+    /// (see [`RangeImbalanceGuard`]), the rest of the write hashes `hash_exprs`
+    /// instead, so one encoder is not left with the remainder of the write.
+    /// `hash_exprs` is the full shard key: a single-column key is `[expr]`; a
+    /// composite key that range-routed on its leading column keeps every column
+    /// so the fallback can rebalance when the unsampled remainder is one value
+    /// of `expr`. The guard checks at most every
+    /// `RangeImbalanceGuard::SLICE_ROWS` rows, slicing larger batches, so it can
+    /// act inside a batch as well as between batches.
     Range {
         expr: PhysicalExprRef,
+        hash_exprs: Vec<PhysicalExprRef>,
         bounds: Vec<ScalarValue>,
         partitions: usize,
         run_sort_bytes: Option<u64>,
@@ -180,7 +185,7 @@ impl ShardSpec {
 /// judged before [`Self::MIN_ROWS`] rows, which keeps a batch or two of
 /// clustered keys from tripping it.
 struct RangeImbalanceGuard {
-    expr: PhysicalExprRef,
+    hash_exprs: Vec<PhysicalExprRef>,
     rows: Vec<u64>,
     total: u64,
 }
@@ -194,9 +199,9 @@ impl RangeImbalanceGuard {
     /// the guard has seen any of it.
     const SLICE_ROWS: usize = 65_536;
 
-    fn new(expr: PhysicalExprRef, shards: usize) -> Self {
+    fn new(hash_exprs: Vec<PhysicalExprRef>, shards: usize) -> Self {
         Self {
-            expr,
+            hash_exprs,
             rows: vec![0; shards],
             total: 0,
         }
@@ -741,9 +746,17 @@ async fn write_record_batch_stream_to_files(
     let mut imbalance_guard = match output_options.shard_spec {
         ShardSpec::Range {
             expr,
+            hash_exprs,
             hash_fallback: true,
             ..
-        } if num_shards > 1 => Some(RangeImbalanceGuard::new(Arc::clone(expr), num_shards)),
+        } if num_shards > 1 => {
+            let hash_exprs = if hash_exprs.is_empty() {
+                vec![Arc::clone(expr)]
+            } else {
+                hash_exprs.clone()
+            };
+            Some(RangeImbalanceGuard::new(hash_exprs, num_shards))
+        }
         _ => None,
     };
 
@@ -804,7 +817,7 @@ async fn write_record_batch_stream_to_files(
                                 );
                                 *router = ShardRouter::Partitioned(
                                     BatchPartitioner::new_hash_partitioner(
-                                        vec![Arc::clone(&guard.expr)],
+                                        guard.hash_exprs.clone(),
                                         num_shards,
                                         Time::default(),
                                     )?,
@@ -3127,6 +3140,24 @@ mod tests {
             .expect("single-column i64 batch")
     }
 
+    fn two_col_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Int64, false),
+            Field::new("item", DataType::Int64, false),
+        ]))
+    }
+
+    fn two_col_batch(schema: &SchemaRef, tenants: Vec<i64>, items: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(tenants)),
+                Arc::new(Int64Array::from(items)),
+            ],
+        )
+        .expect("two-column i64 batch")
+    }
+
     /// Range partitioning must split EVERY batch across the shards it spans.
     ///
     /// This is the property that makes it usable where contiguous whole-batch
@@ -3241,6 +3272,7 @@ mod tests {
             None,
             ShardSpec::Range {
                 expr: Arc::new(Column::new("a", 0)),
+                hash_exprs: vec![Arc::new(Column::new("a", 0))],
                 bounds: vec![
                     ScalarValue::Int64(Some(48)),
                     ScalarValue::Int64(Some(96)),
@@ -3460,6 +3492,7 @@ mod tests {
             None,
             ShardSpec::Range {
                 expr: Arc::new(Column::new("a", 0)),
+                hash_exprs: vec![Arc::new(Column::new("a", 0))],
                 bounds: vec![ScalarValue::Int64(Some(499))],
                 partitions: 2,
                 run_sort_bytes: Some(per_run),
@@ -3546,6 +3579,7 @@ mod tests {
                 None,
                 ShardSpec::Range {
                     expr: Arc::new(Column::new("a", 0)),
+                    hash_exprs: vec![Arc::new(Column::new("a", 0))],
                     bounds: bounds.clone(),
                     partitions: 4,
                     run_sort_bytes: Some(64 * 1024 * 1024),
@@ -3597,12 +3631,105 @@ mod tests {
         Ok(())
     }
 
+    /// Range routing on a composite key uses the leading column. When the
+    /// unsampled remainder is one value of that column and many of the rest,
+    /// hashing only the range column cannot rebalance — every remaining row
+    /// still hashes to one shard. The fallback must hash the full key.
+    ///
+    /// The leading-only arm is the control: it is the previous fallback and
+    /// leaves the remainder on at most two shards (the range shard that already
+    /// held keys at or above the last bound, plus at most one hash bucket).
+    #[tokio::test]
+    async fn test_range_sharding_hash_fallback_uses_the_full_composite_key() -> anyhow::Result<()> {
+        const HEAD: i64 = 280_000;
+        const REST: i64 = 320_000;
+        const REMAINDER_TENANT: i64 = 7;
+        let schema = two_col_schema();
+        let tenant_expr: PhysicalExprRef = Arc::new(Column::new("tenant", 0));
+        let item_expr: PhysicalExprRef = Arc::new(Column::new("item", 1));
+        let bounds = vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(2)),
+            ScalarValue::Int64(Some(3)),
+        ];
+
+        let mut head_tenants = Vec::with_capacity(usize::try_from(HEAD)?);
+        let mut head_items = Vec::with_capacity(usize::try_from(HEAD)?);
+        for i in 0..HEAD {
+            head_tenants.push(i % 4);
+            head_items.push(i);
+        }
+        let rest_tenants = vec![REMAINDER_TENANT; usize::try_from(REST)?];
+        let rest_items: Vec<i64> = (0..REST).collect();
+
+        let batches = vec![
+            two_col_batch(&schema, head_tenants, head_items),
+            two_col_batch(&schema, rest_tenants, rest_items),
+        ];
+
+        for (hash_exprs, expected_min_shards, expected_max_shards, label) in [
+            (vec![Arc::clone(&tenant_expr)], 1, 2, "leading column only"),
+            (
+                vec![Arc::clone(&tenant_expr), Arc::clone(&item_expr)],
+                4,
+                4,
+                "full composite key",
+            ),
+        ] {
+            let ctx = TestSessionContext::default();
+            let results = run_sharded_write(
+                ctx.store.clone(),
+                Arc::clone(&schema),
+                batches_to_stream(Arc::clone(&schema), batches.clone()),
+                None,
+                ShardSpec::Range {
+                    expr: Arc::clone(&tenant_expr),
+                    hash_exprs,
+                    bounds: bounds.clone(),
+                    partitions: 4,
+                    run_sort_bytes: Some(64 * 1024 * 1024),
+                    hash_fallback: true,
+                },
+            )
+            .await?;
+
+            let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+            assert_eq!(
+                total_rows,
+                u64::try_from(HEAD + REST)?,
+                "no row may be dropped or duplicated ({label})"
+            );
+
+            let mut shards_with_remainder = 0;
+            for (path, _) in &results {
+                let values = int64_values(
+                    &ctx.session
+                        .sql(&format!("SELECT tenant FROM '/{path}'"))
+                        .await?
+                        .collect()
+                        .await?,
+                );
+                if values
+                    .iter()
+                    .any(|v| v.is_some_and(|tenant| tenant == REMAINDER_TENANT))
+                {
+                    shards_with_remainder += 1;
+                }
+            }
+            assert!(
+                (expected_min_shards..=expected_max_shards).contains(&shards_with_remainder),
+                "{label}: remainder tenant should land on {expected_min_shards}..={expected_max_shards} shards, got {shards_with_remainder}"
+            );
+        }
+        Ok(())
+    }
+
     /// The imbalance guard trips only once enough rows have been routed and one
     /// shard holds far more than its share.
     #[test]
     fn range_imbalance_guard_trips_on_a_dominant_shard_only() {
         let expr: PhysicalExprRef = Arc::new(Column::new("a", 0));
-        let mut balanced = RangeImbalanceGuard::new(Arc::clone(&expr), 4);
+        let mut balanced = RangeImbalanceGuard::new(vec![Arc::clone(&expr)], 4);
         for _ in 0..100 {
             for shard in 0..4 {
                 balanced.record(shard, 8192);
@@ -3610,14 +3737,14 @@ mod tests {
         }
         assert!(!balanced.is_imbalanced(), "an even split is not imbalanced");
 
-        let mut early = RangeImbalanceGuard::new(Arc::clone(&expr), 4);
+        let mut early = RangeImbalanceGuard::new(vec![Arc::clone(&expr)], 4);
         early.record(3, 100_000);
         assert!(
             !early.is_imbalanced(),
             "too few rows routed to judge the split yet"
         );
 
-        let mut dominant = RangeImbalanceGuard::new(Arc::clone(&expr), 4);
+        let mut dominant = RangeImbalanceGuard::new(vec![Arc::clone(&expr)], 4);
         for shard in 0..4 {
             dominant.record(shard, 40_000);
         }
@@ -3627,7 +3754,7 @@ mod tests {
             "240,000 of 360,000 rows on one of four shards"
         );
 
-        let mut two = RangeImbalanceGuard::new(expr, 2);
+        let mut two = RangeImbalanceGuard::new(vec![expr], 2);
         two.record(0, 100_000);
         two.record(1, 200_000);
         assert!(
@@ -3721,6 +3848,7 @@ mod tests {
             None,
             ShardSpec::Range {
                 expr: Arc::new(Column::new("a", 0)),
+                hash_exprs: vec![Arc::new(Column::new("a", 0))],
                 bounds: vec![ScalarValue::Int64(Some(499))],
                 partitions: 2,
                 run_sort_bytes: Some(1024 * 1024),
@@ -3833,6 +3961,7 @@ mod tests {
             None,
             ShardSpec::Range {
                 expr: Arc::new(Column::new("a", 0)),
+                hash_exprs: vec![Arc::new(Column::new("a", 0))],
                 bounds: vec![ScalarValue::Int64(Some(99))],
                 partitions: 2,
                 run_sort_bytes: Some(1024 * 1024),
