@@ -194,6 +194,11 @@ struct Workload {
     pk_keyset_cache_mb: Option<usize>,
     /// `true` = cold (datalake) tier enabled on a local `file://` store
     cold: bool,
+    /// `true` = the table declares secondary indexes on `id` (the key) and
+    /// `value` (a non-unique column), so every point lookup the checks run goes
+    /// through the per-snapshot indexes, and each seed must show the index was
+    /// actually used.
+    indexed: bool,
 }
 
 // ============================================================================
@@ -265,6 +270,7 @@ async fn create_table(
     durability: Durability,
     pk_keyset_cache_mb: Option<usize>,
     cold: bool,
+    indexed: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     // Local `file://` cold store per table (no object-store config needed —
     // the default local store resolves it).
@@ -293,8 +299,16 @@ async fn create_table(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    let table = if indexed {
+        Arc::new(
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+                .with_secondary_indexes(indexed_columns())
+                .create(opts)
+                .await?,
+        )
+    } else {
+        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?)
+    };
     if durability == Durability::Memory {
         // Arm mem-mode deferral (the runtime does this on the first replayable
         // committer); without it mem-mode CDC writes take the durable path.
@@ -309,15 +323,28 @@ async fn create_table(
     Ok((table, ctx))
 }
 
+/// The `indexes` an [`Workload::indexed`] table declares — re-passed on every
+/// reopen, because index definitions come from each registration.
+fn indexed_columns() -> Vec<Vec<String>> {
+    vec![vec!["id".to_string()], vec!["value".to_string()]]
+}
+
 async fn reopen_table(
     fixture: &TestFixture,
     name: &str,
+    indexed: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
+    let secondary_indexes = if indexed {
+        indexed_columns()
+    } else {
+        Vec::new()
+    };
     let provider = Arc::new(
         CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_secondary_indexes(secondary_indexes)
             .open(name)
             .await?,
     );
@@ -642,7 +669,58 @@ async fn verify_aggregate_queries(
         assert_eq!(got, expected, "{ctx_msg}: COUNT(*) WHERE id = {k} mismatch");
         k += step;
     }
+
+    // On an indexed table, point lookups on the non-unique `value` index too:
+    // a value can be held by several keys, or by none.
+    if provider.lookup_index_counters().is_some() {
+        let mut values: Vec<i64> = model.values().copied().collect();
+        values.sort_unstable();
+        values.dedup();
+        let step = (values.len() / 8).max(1);
+        let probes = values
+            .iter()
+            .step_by(step)
+            .copied()
+            .chain(std::iter::once(-1));
+        for v in probes {
+            let got = scalar_i64(
+                ctx,
+                &format!("SELECT COUNT(*) FROM {name} WHERE value = {v}"),
+            )
+            .await?;
+            let expected =
+                i64::try_from(model.values().filter(|&&x| x == v).count()).expect("fits i64");
+            assert_eq!(
+                got, expected,
+                "{ctx_msg}: COUNT(*) WHERE value = {v} mismatch"
+            );
+        }
+    }
     Ok(())
+}
+
+/// On an indexed table, fails unless the index took part in at least one of the
+/// point lookups the checks ran, so an indexed config can never pass by silently
+/// scanning every snapshot instead.
+///
+/// "Took part" means it narrowed some snapshot's read to selected rows
+/// (`access_plans_attached`) or answered a lookup outright (`selected` /
+/// `empty`).
+fn assert_index_used(provider: &CayenneTableProvider, ctx_msg: &str) {
+    if let Some(counters) = provider.lookup_index_counters() {
+        assert!(
+            index_participation(provider) > 0,
+            "{ctx_msg}: the index took part in no lookup: {counters:?}"
+        );
+    }
+}
+
+/// How many times the index took part in a lookup on this provider instance
+/// (see [`assert_index_used`]); `0` for a table without an index.
+fn index_participation(provider: &CayenneTableProvider) -> u64 {
+    provider.lookup_index_counters().map_or(0, |counters| {
+        counters.access_plans_attached + counters.selected + counters.empty
+    })
 }
 
 // ============================================================================
@@ -808,6 +886,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.durability,
         w.pk_keyset_cache_mb,
         w.cold,
+        w.indexed,
     )
     .await?;
     let mut rng = Rng::new(seed);
@@ -843,7 +922,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     table.checkpoint_mem_tier().await?;
                 }
                 table.drain_in_flight_maintenance().await?;
-                let (t, c) = reopen_table(fixture, &name).await?;
+                let (t, c) = reopen_table(fixture, &name, w.indexed).await?;
                 table = t;
                 ctx = c;
                 // Re-arm mem-mode deferral on the fresh provider instance.
@@ -886,7 +965,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // before reopening from the catalog (see the loop's Op::Restart).
     settle(&table, w.durability).await?;
     table.drain_in_flight_maintenance().await?;
-    let (t, c) = reopen_table(fixture, &name).await?;
+    if w.indexed {
+        let msg = format!("seq final settle mode={:?} seed={seed}", w.mode);
+        verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &msg).await?;
+        assert_index_used(table.as_ref(), &msg);
+    }
+    let (t, c) = reopen_table(fixture, &name, w.indexed).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
         "seq final compact+restart diverged mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
@@ -906,6 +990,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.durability,
         w.pk_keyset_cache_mb,
         w.cold,
+        w.indexed,
     )
     .await?;
     let mut rng = Rng::new(seed);
@@ -1003,7 +1088,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     guard.checkpoint_mem_tier().await?;
                 }
                 guard.drain_in_flight_maintenance().await?;
-                let (nt, nc) = reopen_table(fixture, &name).await?;
+                let (nt, nc) = reopen_table(fixture, &name, w.indexed).await?;
                 if w.durability == Durability::Memory {
                     nt.install_slot_advancer(Arc::new(NoopSlotAdvancer));
                 }
@@ -1045,6 +1130,9 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&live, &model, &msg);
     verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &msg).await?;
+    if w.indexed {
+        assert_index_used(table.as_ref(), &msg);
+    }
     Ok(())
 }
 
@@ -1177,6 +1265,7 @@ fn sequential(mode: Mode) -> Workload {
         seeds: scaled_seeds(24),
         pk_keyset_cache_mb: None,
         cold: false,
+        indexed: false,
     }
 }
 // Sequential memory-CDC: drives the mem-tier append + checkpoint + seq-prefix bake
@@ -1195,6 +1284,7 @@ fn sequential_memory() -> Workload {
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
         cold: false,
+        indexed: false,
     }
 }
 fn concurrent_mixed(mode: Mode) -> Workload {
@@ -1209,6 +1299,35 @@ fn concurrent_mixed(mode: Mode) -> Workload {
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
         cold: false,
+        indexed: false,
+    }
+}
+// Indexed variants: the same walks, on a table that declares secondary indexes,
+// so every point lookup the checks run goes through the per-snapshot indexes —
+// across protected snapshots, compaction folds and rewrites, in both deletion
+// modes (`Position` is the default for a PK table). Restarts are off: indexes
+// are not rebuilt for the snapshots written before a restart, so after one the
+// lookups read those snapshots in full and would not exercise the index.
+fn sequential_indexed(mode: Mode) -> Workload {
+    Workload {
+        indexed: true,
+        weights: OpWeights {
+            restart: 0,
+            ..SEQUENTIAL_MIXED
+        },
+        seeds: scaled_seeds(12),
+        ..sequential(mode)
+    }
+}
+fn concurrent_mixed_indexed(mode: Mode) -> Workload {
+    Workload {
+        indexed: true,
+        weights: OpWeights {
+            restart: 0,
+            ..CONCURRENT_MIXED
+        },
+        seeds: scaled_seeds(8),
+        ..concurrent_mixed(mode)
     }
 }
 // Concurrent memory-CDC: foreground mem-tier upserts/deletes racing a background
@@ -1225,6 +1344,7 @@ fn concurrent_memory() -> Workload {
         seeds: scaled_seeds(8),
         pk_keyset_cache_mb: None,
         cold: false,
+        indexed: false,
     }
 }
 // High-collision variant: a small key space with many ops drives repeated
@@ -1250,6 +1370,7 @@ fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Work
         seeds: scaled_seeds(6),
         pk_keyset_cache_mb,
         cold: false,
+        indexed: false,
     }
 }
 fn concurrent_upsert_only(mode: Mode) -> Workload {
@@ -1264,6 +1385,7 @@ fn concurrent_upsert_only(mode: Mode) -> Workload {
         seeds: scaled_seeds(10),
         pk_keyset_cache_mb: None,
         cold: false,
+        indexed: false,
     }
 }
 // Sequential cold walk: mixed ops + promotion/GC, model-checked after every op.
@@ -1292,6 +1414,7 @@ fn sequential_cold() -> Workload {
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
         cold: true,
+        indexed: false,
     }
 }
 // Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
@@ -1317,6 +1440,7 @@ fn concurrent_cold() -> Workload {
         seeds: scaled_seeds(6),
         pk_keyset_cache_mb: None,
         cold: true,
+        indexed: false,
     }
 }
 
@@ -1423,7 +1547,8 @@ async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
     for mode in [Mode::Key, Mode::Position] {
         let name = format!("reupsert_min_{mode:?}");
-        let (table, ctx) = create_table(&f, &name, mode, Durability::File, None, false).await?;
+        let (table, ctx) =
+            create_table(&f, &name, mode, Durability::File, None, false, false).await?;
 
         overwrite(&table, &[(1, 100)]).await?;
         delete_key(&table, 1, Durability::File).await?;
@@ -1486,6 +1611,32 @@ async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
+// --- Indexed convergence: the walks above through the secondary indexes ---
+async fn prop_sequential_indexed_key_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_indexed(Mode::Key)).await
+}
+async fn prop_sequential_indexed_position_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_indexed(Mode::Position)).await
+}
+test_with_backends!(prop_sequential_indexed_key_impl);
+test_with_backends!(prop_sequential_indexed_position_impl);
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_indexed_key_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_indexed(Mode::Key))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_indexed_position_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_indexed(Mode::Position))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
 // Dense (small key space) variant of the above — many ops per key against the
 // background compactor, maximizing same-key delete/re-upsert/compaction races.
 // Run on BOTH conflict-detection paths: the exact PK index (default) and the
@@ -1531,7 +1682,8 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 
 async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64) -> TestResult<()> {
     let name = format!("iso_{mode:?}_{seed}");
-    let (table, ctx) = create_table(fixture, &name, mode, Durability::File, None, false).await?;
+    let (table, ctx) =
+        create_table(fixture, &name, mode, Durability::File, None, false, false).await?;
     let mut rng = Rng::new(seed);
 
     let n: i64 = 200;
@@ -1622,6 +1774,180 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestR
 async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// ============================================================================
+// Indexed point lookups racing upserts and compaction
+// ============================================================================
+//
+// Readers look up keys through the secondary index WHILE a writer upserts new
+// versions (each a new protected snapshot) and a background loop merges and
+// rewrites them. That is the interleaving the per-snapshot index lifecycle is
+// argued safe for, not only tested at rest: a lookup that captured a protected
+// set a merge then folds must still read that snapshot — through its index or,
+// if the index was pruned, in full — and never lose, duplicate or roll back a
+// row.
+
+/// Encodes key `k` at version `version` as one `value`, so a reader can check
+/// both that a row belongs to the key it asked for and how new it is.
+fn versioned(k: i64, version: i64) -> i64 {
+    k * 1_000_000 + version
+}
+
+/// Every `value` the lookup of `k` returns.
+async fn lookup_values(ctx: &SessionContext, name: &str, k: i64) -> TestResult<Vec<i64>> {
+    let batches = ctx
+        .sql(&format!("SELECT value FROM {name} WHERE id = {k}"))
+        .await?
+        .collect()
+        .await?;
+    let mut values = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value is Int64");
+        values.extend(column.values().iter().copied());
+    }
+    Ok(values)
+}
+
+async fn run_concurrent_indexed_lookups_seed(
+    fixture: &TestFixture,
+    mode: Mode,
+    seed: u64,
+) -> TestResult<()> {
+    const KEYS: i64 = 200;
+    const ROUNDS: i64 = 120;
+    const KEYS_PER_ROUND: i64 = 20;
+    let name = format!("idx_lookup_{mode:?}_{seed}");
+    let (table, ctx) =
+        create_table(fixture, &name, mode, Durability::File, None, false, true).await?;
+    let seed_rows: Vec<(i64, i64)> = (0..KEYS).map(|k| (k, versioned(k, 0))).collect();
+    upsert(&table, &seed_rows, Durability::File).await?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let comp_table = Arc::clone(&table);
+    let comp_stop = Arc::clone(&stop);
+    let compactor = tokio::spawn(async move {
+        while !comp_stop.load(Ordering::Relaxed) {
+            if let Err(e) = settle(&comp_table, Durability::File).await {
+                panic!("background compaction failed: {e}");
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let read_ctx = SessionContext::new();
+    read_ctx.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let read_stop = Arc::clone(&stop);
+    let read_name = name.clone();
+    let reader = tokio::spawn(async move {
+        let mut rng = Rng::new(seed ^ 0x5EED);
+        // The newest version this reader has newest_version per key: a later lookup must
+        // never return an older one.
+        let mut newest_version: BTreeMap<i64, i64> = BTreeMap::new();
+        let mut lookups = 0u64;
+        while !read_stop.load(Ordering::Relaxed) {
+            let k = rng.below_i64(KEYS);
+            let values = match lookup_values(&read_ctx, &read_name, k).await {
+                Ok(values) => values,
+                Err(e) => return Err(format!("lookup of {k} failed: {e}")),
+            };
+            let [value] = values.as_slice() else {
+                return Err(format!(
+                    "lookup of {k} returned {} rows: {values:?}",
+                    values.len()
+                ));
+            };
+            if value / 1_000_000 != k {
+                return Err(format!("lookup of {k} returned another key's row: {value}"));
+            }
+            let version = value % 1_000_000;
+            if let Some(&last) = newest_version.get(&k)
+                && version < last
+            {
+                return Err(format!(
+                    "lookup of {k} went back from version {last} to {version}"
+                ));
+            }
+            newest_version.insert(k, version);
+            lookups += 1;
+            tokio::task::yield_now().await;
+        }
+        Ok(lookups)
+    });
+
+    let mut rng = Rng::new(seed);
+    let mut model: Model = seed_rows.iter().copied().collect();
+    for round in 1..=ROUNDS {
+        let rows: Vec<(i64, i64)> = (0..KEYS_PER_ROUND)
+            .map(|_| rng.below_i64(KEYS))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|k| (k, versioned(k, round)))
+            .collect();
+        upsert(&table, &rows, Durability::File).await?;
+        model.extend(rows);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    compactor.await.expect("compaction task joins");
+    let lookups = match reader.await.expect("reader task joins") {
+        Ok(lookups) => lookups,
+        Err(violation) => panic!("INDEXED LOOKUP FAILURE (mode={mode:?} seed={seed}): {violation}"),
+    };
+    assert!(
+        lookups > 0,
+        "the reader ran no lookup (mode={mode:?} seed={seed})"
+    );
+
+    settle(&table, Durability::File).await?;
+    table.drain_in_flight_maintenance().await?;
+    let live = read_rows(&ctx, &name).await?;
+    assert_converged(
+        &live,
+        &model,
+        &format!("indexed lookups final state mode={mode:?} seed={seed}"),
+    );
+    for k in 0..KEYS {
+        assert_eq!(
+            lookup_values(&ctx, &name, k).await?,
+            [model[&k]],
+            "final lookup of {k} (mode={mode:?} seed={seed})"
+        );
+    }
+    assert_index_used(
+        table.as_ref(),
+        &format!("indexed lookups mode={mode:?} seed={seed}"),
+    );
+    Ok(())
+}
+
+async fn run_concurrent_indexed_lookups_mode(fixture: &TestFixture, mode: Mode) -> TestResult<()> {
+    for seed in 0..scaled_seeds(4) {
+        run_concurrent_indexed_lookups_seed(fixture, mode, seed).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_indexed_lookups_key_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_indexed_lookups_mode(&f, Mode::Key).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_indexed_lookups_position_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_indexed_lookups_mode(&f, Mode::Position).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
