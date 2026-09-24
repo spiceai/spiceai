@@ -85,7 +85,7 @@ const MAX_REMOTE_PERSIST_ATTEMPTS: usize = 8;
 /// Per-replay wall-clock bound. Warmup uses [`Protocol::Internal`], which does
 /// not inherit `runtime.query.timeout`; without an explicit bound a stalled
 /// DISTINCT or drain can hold `/v1/ready` forever.
-const DEFAULT_WARMUP_REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_WARMUP_REPLAY_TIMEOUT: Duration = Duration::from_mins(1);
 
 struct WarmupCatalog {
     templates: Vec<WarmupTemplate>,
@@ -385,14 +385,6 @@ fn apply_catalog(
     catalog.ids = merged.iter().map(template_id).collect();
     count.store(merged.len(), Ordering::Relaxed);
     catalog.templates = merged;
-}
-
-async fn persist_remote(
-    state: Arc<ObjectState<Vec<WarmupTemplate>>>,
-    catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
-    count: Arc<AtomicUsize>,
-) -> bool {
-    persist_remote_excluding(state, catalog, count, HashSet::new()).await
 }
 
 /// Returns `true` when the remote catalog was left consistent with `exclude`
@@ -879,7 +871,6 @@ async fn bound_warmup_op<T>(
 /// before the returned future is polled, so dropping an unpolled task
 /// (refresh runtime shutting down) still releases `/v1/ready`. A stalled
 /// replay is interrupted when `shutdown` is cancelled (runtime shutdown).
-#[must_use]
 fn run_warmup_releasing_ready<F>(
     status: Arc<status::RuntimeStatus>,
     shutdown: CancellationToken,
@@ -1096,7 +1087,7 @@ fn warmup_bound_from_shutdown(shutdown: &CancellationToken) -> WarmupBound {
 
 /// Stop DISTINCT-key replay when runtime shutdown or the DISTINCT query
 /// lifetime timer has fired. A cancelled child with shutdown still live is
-/// TimedOut so later templates can still warm.
+/// `TimedOut` so later templates can still warm.
 fn warmup_row_deadline(
     shutdown: &CancellationToken,
     query_cancel: &CancellationToken,
@@ -1812,10 +1803,11 @@ mod tests {
         let stale_merged = merge_templates(&stale_remote, std::slice::from_ref(&template_a));
         assert_eq!(template_sqls(&stale_merged), ["SELECT seed", "SELECT A"]);
 
-        persist_remote(
+        persist_remote_excluding(
             Arc::clone(&state),
             catalog_mutex(vec![template_a.clone(), template_b.clone()]),
             Arc::new(AtomicUsize::new(2)),
+            HashSet::new(),
         )
         .await;
         match state
@@ -1832,10 +1824,11 @@ mod tests {
             other => panic!("expected Conflict so B is not dropped, got {other:?}"),
         }
 
-        persist_remote(
+        persist_remote_excluding(
             Arc::clone(&state),
             catalog_mutex(vec![template_a]),
             Arc::new(AtomicUsize::new(1)),
+            HashSet::new(),
         )
         .await;
         let persisted = state
@@ -1947,15 +1940,17 @@ mod tests {
             .await
             .expect("seed catalog");
 
-        let stale_persist = persist_remote(
+        let stale_persist = persist_remote_excluding(
             Arc::clone(&state),
             catalog_mutex(vec![template_a.clone()]),
             Arc::new(AtomicUsize::new(1)),
+            HashSet::new(),
         );
-        let newer = persist_remote(
+        let newer = persist_remote_excluding(
             Arc::clone(&state),
             catalog_mutex(vec![template_a, template_b]),
             Arc::new(AtomicUsize::new(2)),
+            HashSet::new(),
         );
         tokio::join!(stale_persist, newer);
 
