@@ -207,12 +207,14 @@ impl SchemaCastScanExec {
     /// col_index has gone out of bounds` (regression test for #14144).
     ///
     /// Each output column takes the child statistic for the input column of the
-    /// same name, and unknown statistics when the name is absent or ambiguous — the
-    /// same by-name, unambiguous-only mapping [`Self::output_equivalence_properties`]
-    /// uses, and for the same reason: a repeated name could otherwise attach one
-    /// column's statistics to another column's values. Row and byte-size estimates
-    /// carry over unchanged; this exec casts values in place and does not change the
-    /// row count.
+    /// same name, and unknown statistics when the name is absent, ambiguous, or the
+    /// output field retypes the column — the same by-name, unambiguous,
+    /// same-type mapping [`Self::output_equivalence_properties`] uses, and for the
+    /// same reason: a repeated name could otherwise attach one column's statistics
+    /// to another column's values, and a retype (`try_cast_to`) leaves a
+    /// `ScalarValue` whose type disagrees with the field it is now attached to. Row
+    /// and byte-size estimates carry over unchanged; this exec casts values in
+    /// place and does not change the row count.
     fn project_statistics(&self, input_stats: &Statistics) -> Statistics {
         let input_schema = self.input.schema();
         let occurs_once = |schema: &SchemaRef, name: &str| {
@@ -233,10 +235,15 @@ impl SchemaCastScanExec {
                 if !occurs_once(&self.output_schema, name) || !occurs_once(&input_schema, name) {
                     return ColumnStatistics::new_unknown();
                 }
-                input_schema
-                    .index_of(name)
-                    .ok()
-                    .and_then(|idx| input_stats.column_statistics.get(idx))
+                let Some((input_idx, input_field)) = input_schema.column_with_name(name) else {
+                    return ColumnStatistics::new_unknown();
+                };
+                if input_field.data_type() != output_field.data_type() {
+                    return ColumnStatistics::new_unknown();
+                }
+                input_stats
+                    .column_statistics
+                    .get(input_idx)
                     .cloned()
                     .unwrap_or_else(ColumnStatistics::new_unknown)
             })
@@ -1352,6 +1359,34 @@ mod tests {
             projected.column_statistics[1].max_value,
             Precision::Exact(ScalarValue::Int64(Some(3))),
             "output column 1 is `id`, carrying `id`'s bounds"
+        );
+    }
+
+    /// A retyped column (`Int64` input cast to `Utf8` output) must not carry the
+    /// input column's statistics forward: `try_cast_to` converts the values, so an
+    /// `Int64` `max_value` would disagree with the `Utf8` field it is now attached
+    /// to. Same guard as [`Self::output_equivalence_properties`], applied to
+    /// statistics.
+    #[test]
+    fn retyped_columns_report_unknown_statistics() {
+        let input_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let schema_cast = SchemaCastScanExec::new(input, target_schema);
+
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(1),
+            total_byte_size: Precision::Inexact(8),
+            column_statistics: vec![column_stat_with_max(3)],
+        };
+
+        let projected = schema_cast.project_statistics(&input_stats);
+
+        assert_eq!(
+            projected.column_statistics[0],
+            ColumnStatistics::new_unknown(),
+            "an Int64 max_value must not be advertised for a Utf8 output field"
         );
     }
 
