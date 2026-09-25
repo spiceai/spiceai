@@ -38,7 +38,7 @@ use datafusion::{
     logical_expr::{
         Expr, Filter, Join, LogicalPlan, Subquery,
         expr::{Exists, InSubquery, SetComparison},
-        utils::{conjunction, split_conjunction_owned},
+        utils::{conjunction, find_out_reference_exprs, split_conjunction},
     },
     optimizer::{
         ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule, optimize_unions::OptimizeUnions,
@@ -91,16 +91,15 @@ impl OptimizerRule for CorrelatedFilterPushDown {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let Some(split) = split_held_predicates(&plan)? else {
-            return self.inner.rewrite(plan, config);
-        };
-
-        let SplitFilter {
+        let Some(SplitFilter {
             held,
             pushable,
             join,
             direct,
-        } = split;
+        }) = split_held_predicates(&plan)?
+        else {
+            return self.inner.rewrite(plan, config);
+        };
 
         // Nothing below the held predicates can move, so leave the node as it is
         // rather than reporting a change on every optimizer pass.
@@ -116,9 +115,6 @@ impl OptimizerRule for CorrelatedFilterPushDown {
             None => Arc::unwrap_or_clone(join),
         };
 
-        let Some(held) = conjunction(held) else {
-            return Ok(Transformed::yes(below));
-        };
         Ok(Transformed::yes(LogicalPlan::Filter(Filter::try_new(
             held,
             Arc::new(below),
@@ -127,8 +123,8 @@ impl OptimizerRule for CorrelatedFilterPushDown {
 }
 
 struct SplitFilter {
-    /// Conjuncts that must stay above the join.
-    held: Vec<Expr>,
+    /// The conjuncts that must stay above the join, and-ed together.
+    held: Expr,
     /// Conjuncts the inner rule may push as usual.
     pushable: Vec<Expr>,
     /// The join beneath the filter (and any filters stacked directly on it).
@@ -147,49 +143,41 @@ fn split_held_predicates(plan: &LogicalPlan) -> Result<Option<SplitFilter>> {
         return Ok(None);
     };
 
-    let mut conjuncts = split_conjunction_owned(filter.predicate.clone());
-    let mut input = Arc::clone(&filter.input);
-    let mut direct = true;
+    let mut predicates = vec![&filter.predicate];
+    let mut input = &filter.input;
     while let LogicalPlan::Filter(child) = input.as_ref() {
-        conjuncts.extend(split_conjunction_owned(child.predicate.clone()));
-        let next = Arc::clone(&child.input);
-        input = next;
-        direct = false;
+        predicates.push(&child.predicate);
+        input = &child.input;
     }
 
     let LogicalPlan::Join(join) = input.as_ref() else {
         return Ok(None);
     };
 
-    if !conjuncts.iter().any(has_correlated_subquery) {
-        return Ok(None);
+    let mut held = vec![];
+    let mut pushable = vec![];
+    for conjunct in predicates.iter().flat_map(|p| split_conjunction(p)) {
+        if spans_join_sides(conjunct, join)? {
+            held.push(conjunct.clone());
+        } else {
+            pushable.push(conjunct.clone());
+        }
     }
 
     // One source executes the whole join as one statement, where the pushed
     // placement is unparsed back into a single scope.
-    if has_single_federation_provider(plan)? {
+    let Some(held) = conjunction(held) else {
         return Ok(None);
-    }
-
-    let mut held = vec![];
-    let mut pushable = vec![];
-    for conjunct in conjuncts {
-        if spans_join_sides(&conjunct, join)? {
-            held.push(conjunct);
-        } else {
-            pushable.push(conjunct);
-        }
-    }
-
-    if held.is_empty() {
+    };
+    if has_single_federation_provider(plan)? {
         return Ok(None);
     }
 
     Ok(Some(SplitFilter {
         held,
         pushable,
-        join: input,
-        direct,
+        direct: Arc::ptr_eq(input, &filter.input),
+        join: Arc::clone(input),
     }))
 }
 
@@ -203,29 +191,25 @@ fn subquery_of(expr: &Expr) -> Option<&Subquery> {
     }
 }
 
-fn has_correlated_subquery(expr: &Expr) -> bool {
-    expr.exists(|e| {
-        Ok(subquery_of(e).is_some_and(|subquery| !subquery.outer_ref_columns.is_empty()))
-    })
-    .unwrap_or(true)
-}
-
-/// Whether `predicate` needs columns from both sides of `join` once the outer
-/// references of its subqueries are counted, or names a column neither side
-/// has. Holding such a predicate is always correct: it stays where the query
-/// wrote it.
+/// Whether `predicate` holds a correlated subquery and, once the outer
+/// references inside its subqueries are counted, needs columns from both sides
+/// of `join` or names a column neither side has. Holding such a predicate is
+/// always correct: it stays where the query wrote it.
 fn spans_join_sides(predicate: &Expr, join: &Join) -> Result<bool> {
-    if !has_correlated_subquery(predicate) {
-        return Ok(false);
-    }
-
+    let mut correlated = false;
     let mut columns: HashSet<Column> = predicate.column_refs().into_iter().cloned().collect();
     predicate.apply(|expr| {
-        if let Some(subquery) = subquery_of(expr) {
+        if let Some(subquery) = subquery_of(expr)
+            && !subquery.outer_ref_columns.is_empty()
+        {
+            correlated = true;
             collect_outer_references(subquery, &mut columns)?;
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
+    if !correlated {
+        return Ok(false);
+    }
 
     let left = join.left.schema();
     let right = join.right.schema();
@@ -237,25 +221,19 @@ fn spans_join_sides(predicate: &Expr, join: &Join) -> Result<bool> {
 /// Every outer reference inside `subquery`, including those of subqueries
 /// nested within it.
 fn collect_outer_references(subquery: &Subquery, columns: &mut HashSet<Column>) -> Result<()> {
-    for expr in &subquery.outer_ref_columns {
-        collect_outer_reference_columns(expr, columns)?;
-    }
+    let mut insert = |expr: &Expr| {
+        for outer in find_out_reference_exprs(expr) {
+            if let Expr::OuterReferenceColumn(_, column) = outer {
+                columns.insert(column);
+            }
+        }
+    };
+    subquery.outer_ref_columns.iter().for_each(&mut insert);
     subquery.subquery.apply_with_subqueries(|node| {
         node.apply_expressions(|expr| {
-            collect_outer_reference_columns(expr, columns)?;
+            insert(expr);
             Ok(TreeNodeRecursion::Continue)
-        })?;
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(())
-}
-
-fn collect_outer_reference_columns(expr: &Expr, columns: &mut HashSet<Column>) -> Result<()> {
-    expr.apply(|e| {
-        if let Expr::OuterReferenceColumn(_, column) = e {
-            columns.insert(column.clone());
-        }
-        Ok(TreeNodeRecursion::Continue)
+        })
     })?;
     Ok(())
 }
@@ -264,27 +242,22 @@ fn collect_outer_reference_columns(expr: &Expr, columns: &mut HashSet<Column>) -
 /// federation provider.
 fn has_single_federation_provider(plan: &LogicalPlan) -> Result<bool> {
     let mut sole: Option<FederationProviderRef> = None;
-    let mut single = true;
     plan.apply_with_subqueries(|node| {
         let LogicalPlan::TableScan(scan) = node else {
             return Ok(TreeNodeRecursion::Continue);
         };
-        let Some(source) = get_table_source(&scan.source)? else {
-            single = false;
-            return Ok(TreeNodeRecursion::Stop);
-        };
-        let provider = source.federation_provider();
-        match &sole {
-            None => sole = Some(provider),
-            Some(existing) if existing.as_ref() == provider.as_ref() => {}
-            Some(_) => {
-                single = false;
+        let provider = get_table_source(&scan.source)?.map(|source| source.federation_provider());
+        match (&sole, provider) {
+            (None, Some(provider)) => sole = Some(provider),
+            (Some(existing), Some(provider)) if existing.as_ref() == provider.as_ref() => {}
+            _ => {
+                sole = None;
                 return Ok(TreeNodeRecursion::Stop);
             }
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok(single && sole.is_some())
+    Ok(sole.is_some())
 }
 
 #[cfg(test)]
