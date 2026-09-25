@@ -511,6 +511,10 @@ name = "pk_keyset_present_path"
 harness = false
 name = "scan_view_reuse_qps"
 
+[[bench]]
+harness = false
+name = "covering_index_join"
+
 # Result *correctness* (not perf): inventory completeness + pure compare path.
 [[test]]
 name = "result_correctness_inventory_test"

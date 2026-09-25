@@ -410,6 +410,18 @@ impl CoveringIndexFixture {
         }
     }
 
+    /// Execute one query without evidence collection for the Criterion
+    /// comparison bench. The fixture is still the real public provider path.
+    pub async fn collect_query(&self, selector: PathSelector, sql: &str) -> Vec<RecordBatch> {
+        self.query_context(selector)
+            .sql(sql)
+            .await
+            .expect("plan covering-index benchmark query")
+            .collect()
+            .await
+            .expect("execute covering-index benchmark query")
+    }
+
     /// Replace the indexed `a` source through Cayenne's real full-refresh
     /// writer. This is deliberately test-only fixture plumbing: publication
     /// assertions for the private covering catalog remain in the library tests.

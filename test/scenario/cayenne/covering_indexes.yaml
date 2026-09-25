@@ -1,0 +1,14 @@
+# The selective TPC-H dimension chain exercises an address-independent
+# covering scan and two bounded index join edges.
+name: cayenne_covering_indexes
+
+queries:
+  - name: customer_nation_region
+    sql: |
+      SELECT c_name, c_address, r_name
+      FROM customer
+      JOIN nation ON n_nationkey = c_nationkey
+      JOIN region ON n_regionkey = r_regionkey
+      WHERE c_name = 'Customer#000030003'
+    expected_results:
+      row_count: 1

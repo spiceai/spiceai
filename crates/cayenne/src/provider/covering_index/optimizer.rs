@@ -387,5 +387,22 @@ fn projection_is_bare_columns(projection: &ProjectionExec) -> bool {
 }
 
 fn schema_cast_is_identity(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    only_child(plan).is_some_and(|input| input.schema().as_ref() == plan.schema().as_ref())
+    let Some(input) = only_child(plan) else {
+        return false;
+    };
+    let input_schema = input.schema();
+    let output_schema = plan.schema();
+    // `SchemaCastScanExec` may replace schema or field metadata without
+    // changing Arrow values. Metadata is not consumed by index key mapping or
+    // execution; position, name, type, and nullability are the value contract.
+    input_schema.fields().len() == output_schema.fields().len()
+        && input_schema
+            .fields()
+            .iter()
+            .zip(output_schema.fields())
+            .all(|(input, output)| {
+                input.name() == output.name()
+                    && input.data_type() == output.data_type()
+                    && input.is_nullable() == output.is_nullable()
+            })
 }
