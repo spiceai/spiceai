@@ -497,6 +497,80 @@ async fn write_restore_journal(
     Ok(())
 }
 
+struct RestoreJournal {
+    identity: String,
+    aside_name: Option<String>,
+}
+
+fn parse_restore_journal(text: &str) -> Option<RestoreJournal> {
+    let mut lines = text.lines();
+    let identity = lines.next()?.trim();
+    if identity.is_empty() || !(identity.starts_with("unix ") || identity.starts_with("windows ")) {
+        return None;
+    }
+    let mut aside_name = None;
+    for line in lines {
+        let Some(name) = line.strip_prefix("aside ") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+        {
+            return None;
+        }
+        aside_name = Some(name.to_string());
+    }
+    Some(RestoreJournal {
+        identity: identity.to_string(),
+        aside_name,
+    })
+}
+
+/// Records the file name the live database will be moved to before a
+/// Windows replace installs the download. Recovery renames that file back
+/// when the live path is missing.
+pub(crate) async fn record_sqlite_restore_aside(
+    database: &Path,
+    aside: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    let journal = restore_journal_path(database);
+    let text = tokio::fs::read_to_string(&journal)
+        .await
+        .map_err(|source| journal_error(dataset_name, journal.clone(), source, false))?;
+    let Some(parsed) = parse_restore_journal(&text) else {
+        return Err(super::SnapshotEngineError::Sqlite {
+            source: SqliteSnapshotError::InvalidRestoreJournal {
+                dataset: dataset_name.to_string(),
+                path: journal,
+            },
+        });
+    };
+    let Some(name) = aside.file_name().and_then(|name| name.to_str()) else {
+        return Err(super::SnapshotEngineError::Sqlite {
+            source: SqliteSnapshotError::InvalidRestoreJournal {
+                dataset: dataset_name.to_string(),
+                path: aside.to_path_buf(),
+            },
+        });
+    };
+    let body = format!("{}\naside {name}\n", parsed.identity);
+    let mut temporary = restore_journal_path(database).into_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    tokio::fs::write(&temporary, body.as_bytes())
+        .await
+        .map_err(|source| journal_error(dataset_name, temporary.clone(), source, true))?;
+    tokio::fs::rename(&temporary, &journal)
+        .await
+        .map_err(|source| journal_error(dataset_name, journal, source, true))?;
+    Ok(())
+}
+
 async fn remove_restore_journal(
     database: &Path,
     dataset_name: &str,
@@ -592,29 +666,48 @@ pub async fn recover_interrupted_sqlite_restore(
         return Ok(());
     }
     let journal = restore_journal_path(database);
-    let recorded = match tokio::fs::read_to_string(&journal).await {
+    let text = match tokio::fs::read_to_string(&journal).await {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => return Err(journal_error(dataset_name, journal, source, false)),
     };
-    let recorded = recorded.trim();
-    if recorded.is_empty() || !(recorded.starts_with("unix ") || recorded.starts_with("windows ")) {
+    let Some(parsed) = parse_restore_journal(&text) else {
         return Err(super::SnapshotEngineError::Sqlite {
             source: SqliteSnapshotError::InvalidRestoreJournal {
                 dataset: dataset_name.to_string(),
                 path: journal,
             },
         });
-    }
+    };
     match tokio::fs::metadata(database).await {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(super::SnapshotEngineError::Sqlite {
-                source: SqliteSnapshotError::RestoreJournalWithoutDatabase {
-                    dataset: dataset_name.to_string(),
-                    path: journal,
-                },
-            });
+            let Some(name) = parsed.aside_name.as_deref() else {
+                return Err(super::SnapshotEngineError::Sqlite {
+                    source: SqliteSnapshotError::RestoreJournalWithoutDatabase {
+                        dataset: dataset_name.to_string(),
+                        path: journal,
+                    },
+                });
+            };
+            let aside = database
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name);
+            match tokio::fs::rename(&aside, database).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(super::SnapshotEngineError::Sqlite {
+                        source: SqliteSnapshotError::RestoreJournalWithoutDatabase {
+                            dataset: dataset_name.to_string(),
+                            path: journal,
+                        },
+                    });
+                }
+                Err(source) => {
+                    return Err(journal_error(dataset_name, aside, source, false));
+                }
+            }
         }
         Err(source) => {
             return Err(journal_error(
@@ -628,10 +721,25 @@ pub async fn recover_interrupted_sqlite_restore(
     let current = file_identity(database)
         .await
         .map_err(|source| journal_error(dataset_name, database.to_path_buf(), source, false))?;
-    if current == recorded {
+    if current == parsed.identity {
         unpark_sidecars(database, dataset_name).await?;
     } else {
         discard_parked_sidecars(database, dataset_name).await?;
+        if let Some(name) = parsed.aside_name.as_deref() {
+            let aside = database
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name);
+            if aside != database {
+                match tokio::fs::remove_file(&aside).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(journal_error(dataset_name, aside, source, false));
+                    }
+                }
+            }
+        }
     }
     remove_restore_journal(database, dataset_name).await
 }
@@ -913,6 +1021,41 @@ mod tests {
         assert_eq!(fresh_row_count(&live_path).expect("recovered"), 3);
         assert!(sidecar_path(&live_path, "-wal").exists());
         assert!(!parked_sidecar_path(&live_path, "-wal").exists());
+        assert!(!restore_journal_path(&live_path).exists());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_windows_swap_restores_the_database_from_the_aside_file() {
+        let tmp = TempDir::new().expect("tmp");
+        let live_path = tmp.path().join("orders.sqlite");
+        let live = Connection::open(&live_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO t(id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        )
+        .expect("write live rows into the wal");
+        let engine = SqliteSnapshotEngine::new();
+        engine
+            .prepare_file_restore(&live_path, "orders")
+            .await
+            .expect("park the wal");
+        let aside = live_path.with_extension(format!("old.{}", std::process::id()));
+        record_sqlite_restore_aside(&live_path, &aside, "orders")
+            .await
+            .expect("record aside");
+        std::fs::rename(&live_path, &aside).expect("move the live database aside");
+        assert!(!live_path.exists());
+        std::mem::forget(live);
+
+        recover_interrupted_sqlite_restore(&live_path, "orders")
+            .await
+            .expect("restore the aside file");
+        assert_eq!(fresh_row_count(&live_path).expect("rows are back"), 3);
+        assert!(live_path.exists());
+        assert!(!aside.exists());
         assert!(!restore_journal_path(&live_path).exists());
     }
 

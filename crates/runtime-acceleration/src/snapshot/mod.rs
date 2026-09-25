@@ -765,6 +765,19 @@ pub(crate) async fn replace_downloaded_file(
     if let Err(source) = fs::rename(temp_path, local_path).await {
         if source.kind() == std::io::ErrorKind::AlreadyExists {
             let aside = local_path.with_extension(format!("old.{}", std::process::id()));
+            // Name the aside file in the journal before moving the live
+            // database, so a crash in between can rename it back.
+            #[cfg(feature = "sqlite")]
+            if let Err(source) =
+                engine::record_sqlite_restore_aside(local_path, &aside, dataset_name).await
+            {
+                let _ = fs::remove_file(temp_path).await;
+                let _ = engine.abort_file_restore(local_path, dataset_name).await;
+                return Err(SnapshotDownloadError::FinalizeFile {
+                    path: local_path.to_path_buf(),
+                    source: Box::new(source),
+                });
+            }
             if let Err(swap_err) = fs::rename(local_path, &aside).await {
                 let _ = fs::remove_file(temp_path).await;
                 return Err(
