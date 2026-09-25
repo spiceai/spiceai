@@ -32,8 +32,11 @@ limitations under the License.
 //!   3. **`prepare_file_restore`** — right before a download is renamed over
 //!      the live file, moves the live database's `-wal`/`-shm`/`-journal`
 //!      aside, so no connection that opens the path once the restored file is
-//!      in place can apply them to it. **`abort_file_restore`** moves them
+//!      in place can apply them to it. A journal beside the file records the
+//!      database's identity first. **`abort_file_restore`** moves the sidecars
 //!      back when that rename does not replace the file.
+//!      [`recover_interrupted_sqlite_restore`] does the same after a crash,
+//!      or deletes the parked sidecars when the rename did replace the file.
 //!   4. **`finalize_file_snapshot`** — after the rename, deletes the sidecars
 //!      that were set aside and any that a connection to the replaced database
 //!      created in between.
@@ -104,6 +107,30 @@ pub enum SqliteSnapshotError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[snafu(display(
+        "Failed to read the snapshot restore journal {path:?} for dataset '{dataset}': {source}"
+    ))]
+    ReadRestoreJournal {
+        dataset: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display(
+        "Failed to write the snapshot restore journal {path:?} for dataset '{dataset}': {source}"
+    ))]
+    WriteRestoreJournal {
+        dataset: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display(
+        "The snapshot restore journal {path:?} for dataset '{dataset}' is invalid, so the parked SQLite sidecars were left in place"
+    ))]
+    InvalidRestoreJournal { dataset: String, path: PathBuf },
+    #[snafu(display(
+        "The snapshot restore journal {path:?} for dataset '{dataset}' is present but the database file is not, so the parked SQLite sidecars were left in place"
+    ))]
+    RestoreJournalWithoutDatabase { dataset: String, path: PathBuf },
     #[snafu(display(
         "SQLite snapshot preparation task failed unexpectedly for dataset '{dataset}'"
     ))]
@@ -227,6 +254,21 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         live_path: &Path,
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
+        // Finish an earlier attempt that crashed after parking sidecars before
+        // this one records a new journal and parks again.
+        recover_interrupted_sqlite_restore(live_path, dataset_name).await?;
+        match tokio::fs::metadata(live_path).await {
+            Ok(_) => write_restore_journal(live_path, dataset_name).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(journal_error(
+                    dataset_name,
+                    live_path.to_path_buf(),
+                    source,
+                    true,
+                ));
+            }
+        }
         // The rename replaces the database file but not the sidecars kept
         // beside it, so they are moved aside first. A connection opening the
         // path once the restored file is in place would otherwise take the
@@ -236,7 +278,13 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         // put them back when the rename does not replace the file. Connections
         // already open on the live file hold their own handles to the moved
         // sidecars, so reads in flight are unaffected.
-        park_sidecars(live_path, dataset_name).await
+        if let Err(error) = park_sidecars(live_path, dataset_name).await {
+            // Parking rolled its own partial move back. Drop the journal so
+            // the next open does not treat this attempt as interrupted.
+            let _ = remove_restore_journal(live_path, dataset_name).await;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn abort_file_restore(
@@ -244,7 +292,8 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         live_path: &Path,
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
-        unpark_sidecars(live_path, dataset_name).await
+        unpark_sidecars(live_path, dataset_name).await?;
+        remove_restore_journal(live_path, dataset_name).await
     }
 
     async fn finalize_file_snapshot(
@@ -258,7 +307,8 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         discard_parked_sidecars(restored_path, dataset_name).await?;
         // A connection to the replaced database opened after the sidecars were
         // moved aside may have created new ones at the live names.
-        remove_sidecars(restored_path, dataset_name).await
+        remove_sidecars(restored_path, dataset_name).await?;
+        remove_restore_journal(restored_path, dataset_name).await
     }
 }
 
@@ -356,6 +406,170 @@ async fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
         }
         Err(error) => Err(error),
     }
+}
+
+fn restore_journal_path(database: &Path) -> PathBuf {
+    let mut path = database.as_os_str().to_owned();
+    path.push(".spice-restore");
+    PathBuf::from(path)
+}
+
+/// Identity of `database` before a restore renames another file over it.
+/// A crash after the sidecars are parked compares this with the file that is
+/// there now: the same file means the rename did not happen.
+async fn file_identity(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = tokio::fs::metadata(path).await?;
+        Ok(format!("unix {} {}", meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let meta = tokio::fs::metadata(path).await?;
+        let volume = meta.volume_serial_number().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "volume serial number unavailable",
+            )
+        })?;
+        let index = meta.file_index().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "file index unavailable")
+        })?;
+        Ok(format!("windows {volume} {index}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no file identity on this platform",
+        ))
+    }
+}
+
+fn journal_error(
+    dataset_name: &str,
+    path: PathBuf,
+    source: std::io::Error,
+    write: bool,
+) -> super::SnapshotEngineError {
+    let dataset = dataset_name.to_string();
+    super::SnapshotEngineError::Sqlite {
+        source: if write {
+            SqliteSnapshotError::WriteRestoreJournal {
+                dataset,
+                path,
+                source,
+            }
+        } else {
+            SqliteSnapshotError::ReadRestoreJournal {
+                dataset,
+                path,
+                source,
+            }
+        },
+    }
+}
+
+async fn write_restore_journal(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    let identity = file_identity(database)
+        .await
+        .map_err(|source| journal_error(dataset_name, database.to_path_buf(), source, true))?;
+    let journal = restore_journal_path(database);
+    let mut temporary = journal.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    tokio::fs::write(&temporary, identity.as_bytes())
+        .await
+        .map_err(|source| journal_error(dataset_name, temporary.clone(), source, true))?;
+    tokio::fs::rename(&temporary, &journal)
+        .await
+        .map_err(|source| journal_error(dataset_name, journal, source, true))?;
+    Ok(())
+}
+
+async fn remove_restore_journal(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    let journal = restore_journal_path(database);
+    match tokio::fs::remove_file(&journal).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(journal_error(dataset_name, journal, source, false)),
+    }
+}
+
+/// Puts parked `SQLite` sidecars back, or deletes them, after a restore was
+/// interrupted before it could finish.
+///
+/// The journal stores the identity of the database file from before the
+/// rename. The same file means the replacement never landed, so the parked
+/// `-wal`/`-shm`/`-journal` are moved back. A different file means the
+/// replacement landed, so those sidecars are deleted rather than applied to it.
+/// No journal means there is nothing to finish.
+///
+/// Call this before opening the database. A connection opened while the log is
+/// still parked does not see the rows that exist only in that log.
+///
+/// # Errors
+///
+/// Returns an error when the journal cannot be read, the journal text is not a
+/// file identity, the database file is missing while a journal is present, the
+/// current file's identity cannot be read, or the parked sidecars cannot be
+/// moved back or deleted.
+pub async fn recover_interrupted_sqlite_restore(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    let journal = restore_journal_path(database);
+    let recorded = match tokio::fs::read_to_string(&journal).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(journal_error(dataset_name, journal, source, false)),
+    };
+    let recorded = recorded.trim();
+    if recorded.is_empty() || !(recorded.starts_with("unix ") || recorded.starts_with("windows ")) {
+        return Err(super::SnapshotEngineError::Sqlite {
+            source: SqliteSnapshotError::InvalidRestoreJournal {
+                dataset: dataset_name.to_string(),
+                path: journal,
+            },
+        });
+    }
+    match tokio::fs::metadata(database).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(super::SnapshotEngineError::Sqlite {
+                source: SqliteSnapshotError::RestoreJournalWithoutDatabase {
+                    dataset: dataset_name.to_string(),
+                    path: journal,
+                },
+            });
+        }
+        Err(source) => {
+            return Err(journal_error(
+                dataset_name,
+                database.to_path_buf(),
+                source,
+                false,
+            ));
+        }
+    }
+    let current = file_identity(database)
+        .await
+        .map_err(|source| journal_error(dataset_name, database.to_path_buf(), source, false))?;
+    if current == recorded {
+        unpark_sidecars(database, dataset_name).await?;
+    } else {
+        discard_parked_sidecars(database, dataset_name).await?;
+    }
+    remove_restore_journal(database, dataset_name).await
 }
 
 async fn remove_sidecars(
@@ -594,6 +808,71 @@ mod tests {
         );
         drop(live);
         assert_eq!(fresh_row_count(&live_path).expect("read after close"), 3);
+        assert!(
+            !restore_journal_path(&live_path).exists(),
+            "a finished attempt does not leave a restore journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_restore_before_the_rename_is_recovered_on_reopen() {
+        let tmp = TempDir::new().expect("tmp");
+        let live_path = tmp.path().join("orders.sqlite");
+        let live = Connection::open(&live_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO t(id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        )
+        .expect("write live rows into the wal");
+        let engine = SqliteSnapshotEngine::new();
+        engine
+            .prepare_file_restore(&live_path, "orders")
+            .await
+            .expect("park the wal");
+        // A crash does not run `SQLite`'s clean shutdown, which would checkpoint
+        // the still-open log back into the main file. Leak the connection so
+        // this reopen is that crash, not a checkpoint.
+        std::mem::forget(live);
+        let interrupted = fresh_row_count(&live_path).expect_err("parked wal is not readable");
+        assert!(
+            interrupted.to_string().contains("no such table")
+                || interrupted.to_string().contains("disk I/O error"),
+            "interrupted reopen: {interrupted}"
+        );
+
+        recover_interrupted_sqlite_restore(&live_path, "orders")
+            .await
+            .expect("recover");
+        assert_eq!(fresh_row_count(&live_path).expect("recovered"), 3);
+        assert!(sidecar_path(&live_path, "-wal").exists());
+        assert!(!parked_sidecar_path(&live_path, "-wal").exists());
+        assert!(!restore_journal_path(&live_path).exists());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_restore_after_the_rename_discards_the_parked_wal() {
+        let tmp = TempDir::new().expect("tmp");
+        let (live_path, download, live) = live_wal_database_and_download(&tmp);
+        let engine = SqliteSnapshotEngine::new();
+        engine
+            .prepare_file_restore(&live_path, "orders")
+            .await
+            .expect("park the wal");
+        std::fs::rename(&download, &live_path).expect("replacement landed");
+        // Same crash as the pre-rename case: no clean shutdown checkpoint.
+        std::mem::forget(live);
+
+        recover_interrupted_sqlite_restore(&live_path, "orders")
+            .await
+            .expect("discard parked wal");
+        // The parked log belongs to the replaced file. Applying it would make
+        // this read 0.
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
+        assert!(!parked_sidecar_path(&live_path, "-wal").exists());
+        assert!(!restore_journal_path(&live_path).exists());
     }
 
     #[tokio::test]

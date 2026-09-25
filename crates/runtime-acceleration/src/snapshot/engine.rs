@@ -30,6 +30,8 @@ pub use duckdb::DuckDBSnapshotEngine;
 mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteSnapshotEngine;
+#[cfg(feature = "sqlite")]
+pub use sqlite::recover_interrupted_sqlite_restore;
 
 #[cfg(feature = "turso")]
 mod turso;
