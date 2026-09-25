@@ -654,7 +654,7 @@ jobs:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.4 min (run 34213792762).
-    # 60 is kept deliberately as a stuck-runner backstop, roughly five times that.
+    # 60 is kept deliberately as a stuck-runner backstop, 4.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -717,7 +717,7 @@ jobs:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 9.0 min (run 34213792762).
-    # 60 is kept deliberately as a stuck-runner backstop, roughly five times that.
+    # 60 is kept deliberately as a stuck-runner backstop, 6.7x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -784,7 +784,7 @@ jobs:
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
-    # 60 is kept deliberately as a stuck-runner backstop, roughly five times that.
+    # 60 is kept deliberately as a stuck-runner backstop, 5.5x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -845,7 +845,7 @@ jobs:
     name: Data Components Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
-    # 60 is kept deliberately as a stuck-runner backstop, roughly five times that.
+    # 60 is kept deliberately as a stuck-runner backstop, 8.0x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -899,7 +899,7 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).
-    # 60 is kept deliberately as a stuck-runner backstop, roughly five times that.
+    # 60 is kept deliberately as a stuck-runner backstop, 7.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
