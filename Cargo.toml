@@ -292,7 +292,7 @@ datafusion-substrait = "55.1.0"
 # Upstream restructured this fork into per-provider crates
 # (datafusion-table-providers-{sqlite,postgres,mysql,duckdb,...} under crates/)
 # with `core/` (this facade) re-exporting them at the same paths Spice already uses.
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "157e6652e35a44e74edee46b5dc0436b4adc7b92" } # branch: viktor/df-55-upgrade
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "216e4c87859774842b3b22af5dc6b88248cf517c" } # branch: viktor/df-55-upgrade
 delta_kernel = { version = "0.28.0", features = [
     "default-engine-base",
     "arrow-59",

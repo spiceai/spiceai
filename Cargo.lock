@@ -7381,7 +7381,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "datafusion",
@@ -7398,7 +7398,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-adbc"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7422,7 +7422,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-common"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7457,7 +7457,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-duckdb"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -7486,7 +7486,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-mongodb"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -7510,7 +7510,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-mysql"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "async-stream",
@@ -7535,7 +7535,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-postgres"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7572,7 +7572,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-sqlite"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=157e6652e35a44e74edee46b5dc0436b4adc7b92#157e6652e35a44e74edee46b5dc0436b4adc7b92"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=216e4c87859774842b3b22af5dc6b88248cf517c#216e4c87859774842b3b22af5dc6b88248cf517c"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -19402,8 +19402,7 @@ dependencies = [
 [[package]]
 name = "sea-query"
 version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "546040c653a705e60ec65ecd3191a809603734bebbc225775916dea9ae409b31"
+source = "git+https://github.com/spiceai/sea-query.git?rev=f173c07266c704e4338957a744a1c6f42d1b814a#f173c07266c704e4338957a744a1c6f42d1b814a"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -19416,8 +19415,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0b0f466921cdd3cf4b89d5c3ac2173dba89a873ab395b123a645de181ec7537"
+source = "git+https://github.com/spiceai/sea-query.git?rev=f173c07266c704e4338957a744a1c6f42d1b814a#f173c07266c704e4338957a744a1c6f42d1b814a"
 dependencies = [
  "darling 0.20.11",
  "heck 0.4.1",
