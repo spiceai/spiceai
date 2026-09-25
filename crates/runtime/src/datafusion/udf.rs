@@ -1229,8 +1229,8 @@ mod tests {
         // the capture groups and the empty string rather than NULL for a
         // non-match (#13809), and DuckDB has no `regexp_instr` at all. Both must
         // stay local, while the three the dialect renders faithfully keep
-        // federating — `regexp_count` among them, whose rendering coalesces the
-        // NULL `len(regexp_extract_all(NULL, p))` to the kernel's 0 (#13870).
+        // federating — `regexp_count` among them, which renders as
+        // `len(regexp_extract_all(..))` and propagates NULL as the kernel does.
         for support in [
             deny_spice_functions_for_duckdb(),
             Arc::new(deny_spice_functions_for_duckdb_table_providers()),

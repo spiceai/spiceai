@@ -89,7 +89,7 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             ) as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern)), 0)
+            // DuckDB dialect: len(regexp_extract_all(string, pattern))
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
             Box::new(
