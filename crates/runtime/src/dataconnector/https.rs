@@ -70,6 +70,7 @@ use reqwest::{
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
@@ -379,12 +380,13 @@ impl Https {
             })
             .unwrap_or_default();
 
-        let rate_control = http_rate_control::resolve_config(
+        let mut rate_control = http_rate_control::resolve_config(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
             dataset,
             "https",
         )?;
+        rate_control.apply_default_acquire_timeout(self.configured_client_timeout());
 
         // Both of these bound memory, so an unparseable value is refused rather
         // than quietly replaced by a default: silently falling back would leave
@@ -859,22 +861,31 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
-        let timeout_secs = self
-            .params
-            .get("client_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
+    fn configured_client_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("client_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS),
+        )
+    }
 
-        let connect_timeout_secs = self
-            .params
-            .get("connect_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(10);
+    fn configured_connect_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("connect_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+    }
+
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
+        let client_timeout = self.configured_client_timeout();
+        let connect_timeout = self.configured_connect_timeout();
 
         let pool_max_idle_per_host = self
             .params
@@ -894,8 +905,8 @@ impl Https {
 
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(connect_timeout)
+            .timeout(client_timeout)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {

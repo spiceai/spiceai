@@ -59,6 +59,7 @@ const RUNTIME_ADAPTIVE_RATE_CONTROL: &str = "http_adaptive_rate_control";
 const RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD: &str =
     "http_adaptive_rate_control_failure_threshold";
 const RUNTIME_ADAPTIVE_RATE_CONTROL_WINDOW: &str = "http_adaptive_rate_control_window";
+const RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT: &str = "http_rate_control_acquire_timeout";
 
 /// Every `http_*` rate-control key this module reads from `runtime.params`.
 /// Exposed as the authoritative list for this family; the startup unknown-param
@@ -74,6 +75,7 @@ pub const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
     RUNTIME_ADAPTIVE_RATE_CONTROL,
     RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD,
     RUNTIME_ADAPTIVE_RATE_CONTROL_WINDOW,
+    RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
 ];
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
@@ -153,6 +155,10 @@ pub struct HttpRateControlConfig {
     /// The adaptive control for this origin, or `None` when disabled — a disabled
     /// origin keeps the plain static rate limiter with no adaptive controller.
     pub adaptive_rate_control: Option<AdaptiveRateControl>,
+    /// Upper bound on how long a request waits to acquire rate-control capacity
+    /// before failing instead of waiting indefinitely. `None` = wait
+    /// indefinitely. `Some(ZERO)` is normalized to `None` at build time.
+    pub acquire_timeout: Option<Duration>,
 }
 
 impl HttpRateControlConfig {
@@ -168,6 +174,16 @@ impl HttpRateControlConfig {
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
             adaptive_rate_control: None,
+            acquire_timeout: None,
+        }
+    }
+
+    /// Fill the acquire-timeout bound from the connector's request timeouts when
+    /// the user set no explicit `rate_control_acquire_timeout`. A parsed explicit
+    /// `0` (`Some(ZERO)`) is left untouched so it still disables the bound.
+    pub fn apply_default_acquire_timeout(&mut self, client_timeout: Duration) {
+        if self.acquire_timeout.is_none() {
+            self.acquire_timeout = Some(default_acquire_timeout(client_timeout));
         }
     }
 
@@ -626,7 +642,7 @@ fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -
 }
 
 #[must_use]
-pub fn parameter_specs() -> [ParameterSpec; 8] {
+pub fn parameter_specs() -> [ParameterSpec; 9] {
     [
         ParameterSpec::runtime("max_concurrent_requests")
             .description("Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled."),
@@ -638,6 +654,8 @@ pub fn parameter_specs() -> [ParameterSpec; 8] {
             .description("Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
         ParameterSpec::runtime("rate_control_jitter_max")
             .description("Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+        ParameterSpec::runtime("rate_control_acquire_timeout")
+            .description("Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set."),
         ParameterSpec::runtime("adaptive_rate_control")
             .description("Client-side adaptive throttling that lowers the effective HTTP request rate when the upstream origin fails or times out, then raises it again as the origin recovers, scaling within the configured static rate limits. Overrides runtime.params.http_adaptive_rate_control when set. Values: 'disabled' (default) or 'enabled'."),
         ParameterSpec::runtime("adaptive_rate_control_failure_threshold")
@@ -693,6 +711,14 @@ pub fn resolve_config_for_component<S: BuildHasher>(
             runtime_params,
             connector_component,
             dataconnector,
+        )?,
+        acquire_timeout: parse_optional_duration_param(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+            "rate_control_acquire_timeout",
+            RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
         )?,
     };
 
@@ -1236,6 +1262,14 @@ fn build_shared_rate_controller(
     if let Some(control) = config.adaptive_rate_control {
         builder = builder.with_adaptive(control);
     }
+    // A zero timeout means "no bound" (wait indefinitely), matching the param
+    // docs; `fundu` also parses "inf" to a saturated max, which is likewise
+    // effectively unbounded.
+    if let Some(acquire_timeout) = config.acquire_timeout
+        && !acquire_timeout.is_zero()
+    {
+        builder = builder.with_acquire_timeout(acquire_timeout);
+    }
 
     SharedRateController {
         config: config.clone(),
@@ -1406,6 +1440,20 @@ fn parse_optional_failure_threshold_param<S: BuildHasher>(
             connector_component: connector_component.clone(),
             source: source.into(),
         })
+}
+
+/// Default bound for the permit-acquire wait when `rate_control_acquire_timeout`
+/// is unset: the connector's own `client_timeout`. The acquire happens once per
+/// request attempt, so a queued request should wait for a slot about as long as
+/// one in-flight request can take (a concurrency slot frees, or a governor token
+/// refills, on that timescale); waiting longer means the holder is stuck and
+/// failing fast is correct. Scales automatically when the user raises
+/// `client_timeout` for a slow origin. Bounds the otherwise-unbounded permit
+/// wait (#14348). `client_timeout` already includes the connect phase, so
+/// connect_timeout is deliberately not added.
+#[must_use]
+pub fn default_acquire_timeout(client_timeout: Duration) -> Duration {
+    client_timeout
 }
 
 fn parse_optional_duration_param<S: BuildHasher>(

@@ -89,6 +89,7 @@ mod tests {
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
             adaptive_rate_control: None,
+            acquire_timeout: None,
         }
     }
 
@@ -103,6 +104,7 @@ mod tests {
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
             adaptive_rate_control: None,
+            acquire_timeout: None,
         }
     }
 

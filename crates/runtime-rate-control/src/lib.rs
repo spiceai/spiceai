@@ -92,6 +92,11 @@ pub enum Error {
         "The rate limiter has insufficient capacity for a request with weight '{weight}'. Reduce the request size, or increase the rate limit, and try again."
     ))]
     InsufficientCapacity { weight: u32 },
+
+    #[snafu(display(
+        "Timed out after {waited:?} waiting for rate-control capacity to admit the request. The configured rate limit could not free a slot in time. Increase the rate limit, raise `rate_control_acquire_timeout`, or lower request concurrency, then try again. See: https://spiceai.org/docs/reference/spicepod/runtime#http-rate-control"
+    ))]
+    AcquireTimeout { waited: Duration },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -180,6 +185,7 @@ pub struct RateControllerBuilder {
     metrics: Option<Arc<RateControllerMetrics>>,
     persistence: Option<PersistenceConfig>,
     adaptive: Option<AdaptiveRateControl>,
+    acquire_timeout: Option<Duration>,
 }
 
 impl RateControllerBuilder {
@@ -203,6 +209,15 @@ impl RateControllerBuilder {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
         self.max_concurrent_requests = Some(max_concurrent_requests);
+        self
+    }
+
+    /// Bound how long any `acquire*` call may wait for capacity (semaphore,
+    /// per-second/minute quotas, and cluster leased buckets combined) before
+    /// failing with [`Error::AcquireTimeout`]. Unset means wait indefinitely.
+    #[must_use]
+    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = Some(timeout);
         self
     }
 
@@ -385,6 +400,7 @@ impl RateControllerBuilder {
             persistence_origin,
             adaptive,
             resolution,
+            self.acquire_timeout,
         )
     }
 }
@@ -482,6 +498,11 @@ pub struct RateController {
     /// is scaled by). [`ADAPTIVE_WEIGHT_RESOLUTION`] with adaptive control, else
     /// `1`. Purely internal — divided back out of any logical metric.
     resolution: u32,
+    /// Upper bound on how long any `acquire*` call waits for capacity before
+    /// returning [`Error::AcquireTimeout`]. `None` = wait indefinitely (the
+    /// legacy behaviour). Bounds the whole acquire — semaphore, governor quotas,
+    /// and leased buckets — as one deadline.
+    acquire_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for RateController {
@@ -500,6 +521,7 @@ impl std::fmt::Debug for RateController {
             .field("persistence_origin", &self.persistence_origin)
             .field("adaptive", &self.adaptive.is_some())
             .field("resolution", &self.resolution)
+            .field("acquire_timeout", &self.acquire_timeout)
             .finish()
     }
 }
@@ -529,10 +551,14 @@ impl Permit {
     /// Returns the same errors as [`RateController::acquire`].
     pub async fn until_ready(&self) -> Result<()> {
         let wait_start = tokio::time::Instant::now();
-        let result = self
-            .rate_controller
-            .wait_for_rate_limiters(self.weight)
-            .await;
+        let wait_fut = self.rate_controller.wait_for_rate_limiters(self.weight);
+        let result = match self.rate_controller.acquire_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, wait_fut).await {
+                Ok(inner) => inner,
+                Err(_elapsed) => Err(Error::AcquireTimeout { waited: timeout }),
+            },
+            None => wait_fut.await,
+        };
 
         let wait_duration = wait_start.elapsed();
         match result {
@@ -689,6 +715,7 @@ impl RateController {
         persistence_origin: Option<String>,
         adaptive: Option<Arc<AdaptiveController>>,
         resolution: u32,
+        acquire_timeout: Option<Duration>,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
             min: Duration::ZERO,
@@ -705,6 +732,7 @@ impl RateController {
             persistence_origin,
             adaptive,
             resolution,
+            acquire_timeout,
         })
     }
 
@@ -771,8 +799,32 @@ impl RateController {
     ///
     /// # Errors
     ///
-    /// See [`Self::acquire_weighted`].
+    /// See [`Self::acquire_weighted`]. Additionally returns
+    /// [`Error::AcquireTimeout`] if a bound is configured and the wait for
+    /// capacity exceeds it.
     pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
+        let Some(timeout) = self.acquire_timeout else {
+            return self.acquire_inner(weight).await;
+        };
+        let wait_start = tokio::time::Instant::now();
+        match tokio::time::timeout(timeout, self.acquire_inner(weight)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // The inner future is cancelled at the await it was parked on, so
+                // it records no outcome — attribute the failure here.
+                // NOTE (cluster mode): `acquire_inner` consumes leased-bucket
+                // tokens one at a time (`for _ in 0..weight { bucket.acquire() }`);
+                // a deadline that fires mid-loop drops the future after some
+                // tokens are already spent. Verify partial-consumption behaviour
+                // against a 2-node setup before relying on the bound in cluster
+                // mode. Local (governor/semaphore) mode has no such state.
+                self.metrics.record_acquire_error(wait_start.elapsed());
+                Err(Error::AcquireTimeout { waited: timeout })
+            }
+        }
+    }
+
+    async fn acquire_inner(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
         let wait_start = tokio::time::Instant::now();
 
