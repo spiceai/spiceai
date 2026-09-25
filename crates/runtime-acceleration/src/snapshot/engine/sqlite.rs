@@ -491,7 +491,7 @@ async fn write_restore_journal(
     tokio::fs::write(&temporary, identity.as_bytes())
         .await
         .map_err(|source| journal_error(dataset_name, temporary.clone(), source, true))?;
-    tokio::fs::rename(&temporary, &journal)
+    rename_over(&temporary, &journal)
         .await
         .map_err(|source| journal_error(dataset_name, journal, source, true))?;
     Ok(())
@@ -565,7 +565,10 @@ pub(crate) async fn record_sqlite_restore_aside(
     tokio::fs::write(&temporary, body.as_bytes())
         .await
         .map_err(|source| journal_error(dataset_name, temporary.clone(), source, true))?;
-    tokio::fs::rename(&temporary, &journal)
+    // `rename` replaces an existing file on Unix and does not on Windows.
+    // The journal is created once and then rewritten when the aside file is
+    // named, so the second rename has to replace the first.
+    rename_over(&temporary, &journal)
         .await
         .map_err(|source| journal_error(dataset_name, journal, source, true))?;
     Ok(())
