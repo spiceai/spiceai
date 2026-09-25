@@ -141,9 +141,26 @@ impl CayenneIndexJoinExec {
         join_type: JoinType,
         null_equality: NullEquality,
     ) -> Result<Self> {
+        let inner_schema = Arc::new(
+            inner_capability
+                .accesses()
+                .iter()
+                .find(|access| access.definition().matches(inner_definition))
+                .ok_or_else(|| {
+                    DataFusionError::Plan(
+                        "CayenneIndexJoinExec inner definition is not retained by its capability"
+                            .to_string(),
+                    )
+                })?
+                .view()
+                .query_schema()
+                .schema()
+                .project(inner_capability.output_columns())?,
+        );
         Self::try_new_with_inner_filters(
             outer,
             inner_capability,
+            inner_schema,
             inner_definition,
             outer_key_expressions,
             mapping,
@@ -163,6 +180,7 @@ impl CayenneIndexJoinExec {
     pub(crate) fn try_new_with_inner_filters(
         outer: Arc<dyn ExecutionPlan>,
         inner_capability: CoveringIndexCapability,
+        inner_schema: SchemaRef,
         inner_definition: &IndexDefinition,
         outer_key_expressions: &[PhysicalExprRef],
         mapping: IndexJoinMapping,
@@ -217,13 +235,14 @@ impl CayenneIndexJoinExec {
                         .to_string(),
                 )
             })?;
-        let inner_schema = Arc::new(
+        let captured_inner_schema = Arc::new(
             inner_access
                 .view()
                 .query_schema()
                 .schema()
                 .project(inner_capability.output_columns())?,
         );
+        ensure_compatible_inner_schema(&captured_inner_schema, &inner_schema)?;
         let (left_schema, right_schema) = if mapping.outer_is_left() {
             (outer.schema(), Arc::clone(&inner_schema))
         } else {
@@ -315,6 +334,11 @@ impl CayenneIndexJoinExec {
         Self::try_new_with_inner_filters(
             outer,
             self.inner_capability.clone(),
+            if self.mapping.outer_is_left() {
+                Arc::clone(&self.right_schema)
+            } else {
+                Arc::clone(&self.left_schema)
+            },
             self.inner_access.definition(),
             &keys,
             self.mapping,
@@ -329,6 +353,27 @@ impl CayenneIndexJoinExec {
             self.null_equality,
         )
     }
+}
+
+/// The index gather path may replace only the nullable bit of a scan field.
+/// `SchemaCastScanExec` performs that relabeling without changing values; its
+/// output must still become the replacement join's public schema.
+fn ensure_compatible_inner_schema(captured: &SchemaRef, requested: &SchemaRef) -> Result<()> {
+    if captured.fields().len() != requested.fields().len()
+        || !captured
+            .fields()
+            .iter()
+            .zip(requested.fields())
+            .all(|(captured, requested)| {
+                captured.name() == requested.name() && captured.data_type() == requested.data_type()
+            })
+    {
+        return Err(DataFusionError::Plan(
+            "CayenneIndexJoinExec inner schema differs from the captured covered schema"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for CayenneIndexJoinExec {
@@ -944,6 +989,17 @@ impl IndexJoinState {
             return Ok(None);
         }
         let inner = inner.project(&self.inner_output_columns)?;
+        let inner_schema = if self.mapping.outer_is_left() {
+            &self.right_schema
+        } else {
+            &self.left_schema
+        };
+        let inner = arrow_tools::record_batch::try_cast_to(inner, Arc::clone(inner_schema))
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "Failed to adapt covered rows to the index join schema: {error}"
+                ))
+            })?;
         let inner_indices = UInt32Array::from(
             (0..inner.num_rows())
                 .map(|row| {

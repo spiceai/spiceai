@@ -96,6 +96,7 @@ impl PhysicalOptimizerRule for CayenneIndexJoinRewriter {
 #[derive(Clone)]
 struct CapturedInner {
     capability: CoveringIndexCapability,
+    schema: arrow_schema::SchemaRef,
     filters: Vec<PhysicalExprRef>,
 }
 
@@ -211,6 +212,7 @@ fn rewrite_join(join: &HashJoinExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let replacement = CayenneIndexJoinExec::try_new_with_inner_filters(
         candidate.outer,
         candidate.inner.capability,
+        candidate.inner.schema,
         &candidate.definition,
         &candidate.outer_keys,
         candidate.mapping,
@@ -261,6 +263,7 @@ fn captured_inner(plan: &Arc<dyn ExecutionPlan>) -> Option<CapturedInner> {
             .matches_output_schema(&scan.schema())
             .then_some(CapturedInner {
                 capability,
+                schema: scan.schema(),
                 filters: Vec::new(),
             });
     }
@@ -280,11 +283,16 @@ fn captured_inner(plan: &Arc<dyn ExecutionPlan>) -> Option<CapturedInner> {
             .capability
             .matches_output_schema(&projection.schema())
             .then_some(captured)
-    } else if plan.is::<RepartitionExec>()
-        || plan.is::<CoalescePartitionsExec>()
-        || (plan.is::<SchemaCastScanExec>() && schema_cast_is_identity(plan))
-    {
+    } else if plan.is::<RepartitionExec>() || plan.is::<CoalescePartitionsExec>() {
         only_child(plan).and_then(captured_inner)
+    } else if plan.is::<SchemaCastScanExec>() && schema_cast_is_identity(plan) {
+        let mut captured = only_child(plan).and_then(captured_inner)?;
+        // A schema cast can only differ in nullability here. Preserve that
+        // contract for the replacement join: it must expose exactly the same
+        // fields as the HashJoin it replaces, even though the covered payload
+        // was captured before this relabeling wrapper.
+        captured.schema = plan.schema();
+        Some(captured)
     } else {
         None
     }
@@ -393,16 +401,16 @@ fn schema_cast_is_identity(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let input_schema = input.schema();
     let output_schema = plan.schema();
     // `SchemaCastScanExec` may replace schema or field metadata without
-    // changing Arrow values. Metadata is not consumed by index key mapping or
-    // execution; position, name, type, and nullability are the value contract.
+    // changing the represented Arrow values. Metadata and nullability are not
+    // consumed by index key mapping; the replacement preserves the wrapper's
+    // output nullability separately. Position, name, and type remain the value
+    // contract, so reordering or a value cast remains ineligible.
     input_schema.fields().len() == output_schema.fields().len()
         && input_schema
             .fields()
             .iter()
             .zip(output_schema.fields())
             .all(|(input, output)| {
-                input.name() == output.name()
-                    && input.data_type() == output.data_type()
-                    && input.is_nullable() == output.is_nullable()
+                input.name() == output.name() && input.data_type() == output.data_type()
             })
 }
