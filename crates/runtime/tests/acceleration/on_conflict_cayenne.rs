@@ -1832,13 +1832,18 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].num_rows(), 1);
 
-            // Verify zero handling
+            // Zero handling: four rows carry a zero, because `-0.0 = 0.0` is true.
+            // Row 7's `-0.0` is a distinct bit pattern but an equal value, and
+            // DataFusion's comparison follows IEEE 754 (and PostgreSQL) rather than
+            // the bitwise ordering Arrow uses for sorting. Measured against a
+            // `MemTable` holding the same rows, which answers identically, so this
+            // pins agreement with local evaluation rather than a Cayenne quirk.
             let result = ctx
                 .sql("SELECT COUNT(*) as cnt FROM boundary_test WHERE float_val = 0.0")
                 .await?
                 .collect()
                 .await?;
-            let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
+            let expected = ["+-----+", "| cnt |", "+-----+", "| 4   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
             Ok(())
