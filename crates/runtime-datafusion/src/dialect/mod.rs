@@ -30,10 +30,6 @@ mod re2;
 
 pub use bigquery::SpiceBigQueryDialect;
 
-const REGEXP_LIKE_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_like function calls
-const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
-const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
-
 pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
 const CONCAT_NAME: &str = "concat";
@@ -75,28 +71,22 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             // DuckDB dialect: regexp_matches(string, pattern[, options])
             // DataFusion dialect: regexp_like(str, regexp[, flags])
             REGEXP_LIKE_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Like
-                    .to_datafusion_function(REGEXP_LIKE_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
+            Box::new(duckdb::DuckDBRegexpFunction::Like.to_datafusion_function())
+                as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: regexp_replace(string, pattern, replacement[, options])
             // DataFusion dialect: regexp_replace(str, regexp, replacement[, flags])
             REGEXP_REPLACE_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Replace
-                    .to_datafusion_function(REGEXP_REPLACE_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
+            Box::new(duckdb::DuckDBRegexpFunction::Replace.to_datafusion_function())
+                as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern)), 0)
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Count
-                    .to_datafusion_function(REGEXP_COUNT_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
+            Box::new(duckdb::DuckDBRegexpFunction::Count.to_datafusion_function())
+                as ScalarFnToSqlHandler,
         ),
     ]
 }
@@ -526,9 +516,14 @@ mod tests {
     /// the dialect's regex handler refuses to render the call. Before this
     /// check the refusal surfaced as a planning error for the whole query;
     /// declining to federate leaves the call for `DataFusion` to evaluate.
+    ///
+    /// `i` joined the refused set for #14148: the two engines case-fold by
+    /// their own Unicode tables, so `regexp_like(s, '\x{1C89}', 'i')` over `ᲊ`
+    /// is `true` locally and `false` federated (measured on the bundled
+    /// `DuckDB`). `g` stays, measured to agree row for row.
     #[test]
-    fn duckdb_declines_a_regex_flag_duckdb_has_no_equivalent_of() {
-        for flag in ["U", "R", "gU", "iR"] {
+    fn duckdb_declines_every_regexp_flag_but_the_global_replace() {
+        for flag in ["U", "R", "gU", "iR", "i", "gi", "m", "s"] {
             assert!(
                 !duckdb_can_translate(
                     &call_of(regexp_replace(
@@ -550,21 +545,22 @@ mod tests {
             );
         }
 
-        // The flags DuckDB does have keep federating.
-        for flag in ["g", "i", "gi"] {
-            assert!(
-                duckdb_can_translate(
-                    &call_of(regexp_replace(
-                        col("s"),
-                        lit("a"),
-                        lit("X"),
-                        Some(lit(flag)),
-                    )),
-                    None
-                ),
-                "regexp_replace with flags `{flag}` renders as DuckDB SQL"
-            );
-        }
+        // The one flag both engines were measured to act on alike keeps
+        // federating, and only for the function that takes it.
+        assert!(
+            duckdb_can_translate(
+                &call_of(regexp_replace(col("s"), lit("a"), lit("X"), Some(lit("g")),)),
+                None
+            ),
+            "regexp_replace with flags `g` renders as DuckDB SQL"
+        );
+        assert!(
+            !duckdb_can_translate(
+                &call_of(regexp_like(col("s"), lit("a"), Some(lit("g")))),
+                None
+            ),
+            "regexp_like takes no `g`, so the flag has no DuckDB rendering there"
+        );
 
         // No flags argument at all is the common shape and must federate.
         assert!(duckdb_can_translate(
