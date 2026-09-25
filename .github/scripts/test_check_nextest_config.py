@@ -532,11 +532,18 @@ class RepositoryTest(unittest.TestCase):
             )
         }
         self.assertEqual(set(triggers), {"pull_request", "push"}, guard)
+        # ...and only the `paths:` list inside it, not `paths-ignore:` or
+        # `branches:`, which would carry the same spelling and mean the opposite.
+        path_lists = {}
+        for trigger, block in triggers.items():
+            match = re.search(r"^    paths:\n((?:      .*\n)*)", block, re.M)
+            self.assertIsNotNone(match, f"{trigger} has no paths: list:\n{block}")
+            path_lists[trigger] = match.group(1)
         for binary, (workflow, _step) in check_nextest_config.STEP_BUDGETS.items():
-            for trigger, block in sorted(triggers.items()):
+            for trigger, paths in sorted(path_lists.items()):
                 with self.subTest(binary=binary, trigger=trigger):
                     self.assertEqual(
-                        block.count(f"      - '{workflow}'\n"),
+                        paths.count(f"      - '{workflow}'\n"),
                         1,
                         f"{workflow} must be listed exactly once under the {trigger} "
                         "path filter of nextest_config_check.yml",
