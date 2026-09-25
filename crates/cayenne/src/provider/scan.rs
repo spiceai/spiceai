@@ -1189,13 +1189,14 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-    #[expect(
-        deprecated,
-        reason = "kept for direct callers of the deprecated method; statistics_from_inputs is the modern path"
-    )]
+    /// Resolves the input's statistics through `StatisticsContext`: `DataFusion`'s
+    /// built-in scans answer only [`ExecutionPlan::statistics_from_inputs`], so
+    /// asking the input's `partition_statistics` directly would report nothing.
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let child_stats = self.inner.partition_statistics(partition)?;
-        Ok(self.overlay_column_statistics(child_stats, partition))
+        datafusion::physical_plan::StatisticsContext::new().compute(
+            self,
+            &datafusion::physical_plan::StatisticsArgs::new().with_partition(partition),
+        )
     }
 
     fn statistics_from_inputs(
@@ -2325,10 +2326,6 @@ mod tests {
     /// selection / pruning signal that the deletion-filter path deliberately
     /// relaxes to `Inexact` only when deletions are present.
     #[test]
-    #[expect(
-        deprecated,
-        reason = "exercises the still-required deprecated partition_statistics override directly"
-    )]
     fn cayenne_exec_passes_through_exact_partition_statistics() {
         use datafusion_common::stats::Precision;
 
