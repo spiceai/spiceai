@@ -1,0 +1,13 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&batches)?
+---
++----+--------+
+| id | status |
++----+--------+
+| 1  | green  |
+| 2  | green  |
+| 3  |        |
+| 4  | amber  |
+| 5  | amber  |
++----+--------+

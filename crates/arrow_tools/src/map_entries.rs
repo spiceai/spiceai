@@ -18,21 +18,30 @@ limitations under the License.
 //!
 //! The Arrow specification requires a map's `entries` field to be non-nullable, and
 //! `MapArray::try_new` enforces both halves of that: it rejects an `entries` field
-//! declared nullable *and* an entries array that carries nulls. Nothing enforces it on
-//! the way in — the IPC reader builds a `MapArray` straight from `ArrayData` without
-//! either check — so a producer that declares `entries` nullable hands us a column that
-//! decodes cleanly and then fails in whichever kernel first rebuilds it. Every such
-//! failure reports the same message, `MapArray entries cannot contain nulls`, whether or
-//! not a null is involved.
+//! declared nullable *and* an entries array that carries nulls. A producer that builds its
+//! arrays itself is held to neither — `MapArray::from(ArrayData)` performs no check — so it
+//! hands us a column that arrives intact and then fails in whichever kernel first rebuilds
+//! it. Every such failure reports the same message, `MapArray entries cannot contain nulls`,
+//! whether or not a null is involved.
 //!
 //! [`MapEntriesNormalizer`] relabels the declaration (metadata only — no buffer is touched)
 //! and refuses the one shape that cannot be relabelled without inventing an answer: entries
 //! that actually contain nulls.
+//!
+//! Arrow IPC is the one arrival that cannot be repaired after the fact: `ArrayData`
+//! validation runs inside the decode, so a stream carrying the forbidden declaration yields
+//! an error instead of the batches whose buffers are all well formed. [`read_ipc_stream`]
+//! repairs that stream's schema message on the way in, which is what keeps data written
+//! under the older declaration readable.
 
+use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayData, ArrayRef, RecordBatch, make_array};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::error::ArrowError;
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message};
 use snafu::prelude::*;
 
 use crate::type_rewrite::{MapEntriesNonNullable, apply_rules, relabel_array_data};
@@ -189,6 +198,88 @@ pub fn conforming_schema(schema: SchemaRef) -> SchemaRef {
     }
 }
 
+/// The four bytes every message of an Arrow IPC stream begins with. `arrow-ipc` keeps its own
+/// copy private.
+const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
+
+/// Decodes an Arrow IPC stream, repairing a `Map` declaration the Arrow layout forbids.
+///
+/// A stream declaring its map `entries` nullable can be written but not read back: the decode
+/// builds each column against the schema the stream carries, and `ArrayData` validation rejects
+/// that declaration — so the batches are refused over the one part of them that holds no data,
+/// while every buffer in the stream is well formed. Bytes already at rest were written before
+/// the declaration was corrected, so the repair belongs on the way in: the stream's schema
+/// message is replaced by its conforming form ([`conforming_schema`]) and the batch messages,
+/// which carry no declaration of their own, are decoded untouched against it.
+///
+/// The returned batches carry the conforming schema. A stream that already conforms is decoded
+/// directly and pays nothing for this.
+///
+/// # Errors
+///
+/// Propagates the IPC decode failure, and reports a stream too short to hold the schema message
+/// it claims.
+pub fn read_ipc_stream(bytes: &[u8]) -> std::result::Result<Vec<RecordBatch>, ArrowError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)?;
+    let declared = reader.schema();
+    let conforming = conforming_schema(Arc::clone(&declared));
+    if Arc::ptr_eq(&conforming, &declared) {
+        return reader.collect();
+    }
+    drop(reader);
+
+    let repaired = with_schema_message(bytes, &conforming)?;
+    StreamReader::try_new(Cursor::new(repaired), None)?.collect()
+}
+
+/// `bytes` with its leading schema message replaced by one declaring `schema`.
+fn with_schema_message(bytes: &[u8], schema: &Schema) -> std::result::Result<Vec<u8>, ArrowError> {
+    let rest = bytes.get(schema_message_len(bytes)?..).ok_or_else(|| {
+        ArrowError::ParseError(
+            "Arrow IPC stream ends inside the schema message it declares".to_string(),
+        )
+    })?;
+
+    let options = IpcWriteOptions::default();
+    let encoded = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        schema,
+        &mut DictionaryTracker::new(false),
+        &options,
+    );
+
+    // The message is the flatbuffer plus its continuation marker and length prefix.
+    let mut repaired =
+        Vec::with_capacity(encoded.ipc_message.len() + CONTINUATION_MARKER.len() + 4 + rest.len());
+    write_message(&mut repaired, encoded, &options)?;
+    repaired.extend_from_slice(rest);
+    Ok(repaired)
+}
+
+/// How many bytes the stream's leading schema message occupies, which — a schema message
+/// having no body — is where the next message begins.
+fn schema_message_len(bytes: &[u8]) -> std::result::Result<usize, ArrowError> {
+    // The continuation marker is absent only in the pre-0.15 framing, which writes the
+    // metadata length first and nothing else.
+    let prefix = if bytes.starts_with(&CONTINUATION_MARKER) {
+        CONTINUATION_MARKER.len()
+    } else {
+        0
+    };
+    let declared: [u8; 4] = bytes
+        .get(prefix..prefix + 4)
+        .and_then(|length| length.try_into().ok())
+        .ok_or_else(|| {
+            ArrowError::ParseError(
+                "Arrow IPC stream is too short to carry a schema message".to_string(),
+            )
+        })?;
+    let metadata_len = usize::try_from(u32::from_le_bytes(declared)).map_err(|_| {
+        ArrowError::ParseError("Arrow IPC schema message length does not fit in memory".to_string())
+    })?;
+
+    Ok(prefix + 4 + metadata_len)
+}
+
 /// Normalizes the batches of a decode point that learns its schema only from the batches
 /// themselves.
 ///
@@ -284,9 +375,11 @@ fn refuse_entry_nulls_in(data: &ArrayData, column: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, ListArray, MapArray, StringArray, StructArray};
+    use arrow::array::{
+        DictionaryArray, Int32Array, ListArray, MapArray, StringArray, StructArray,
+    };
     use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
-    use arrow::datatypes::{Field, Fields, Schema};
+    use arrow::datatypes::{Field, Fields, Int32Type, Schema};
     use arrow::error::ArrowError;
 
     /// Every batch of a stream is normalized against that stream's schema; a test holds one
@@ -364,6 +457,138 @@ mod tests {
     fn rebuild_through_public_constructor(map: &MapArray) -> Result<MapArray, ArrowError> {
         let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
         MapArray::try_new(field, offsets, entries, nulls, ordered)
+    }
+
+    /// Writes `batches` as an Arrow IPC stream under `schema`, the way a producer that
+    /// declared its map entries nullable already wrote the bytes now at rest.
+    fn ipc_stream(schema: &SchemaRef, batches: &[RecordBatch]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema)
+            .expect("ipc stream writer");
+        for batch in batches {
+            writer.write(batch).expect("write a batch");
+        }
+        writer.finish().expect("finish the stream");
+        bytes
+    }
+
+    /// A stream written under the forbidden declaration is refused by the decode itself, so
+    /// nothing downstream ever gets to relabel it: `ArrayData` validation runs inside the IPC
+    /// reader. The rows are still all there, which is why the repair is worth making.
+    #[test]
+    fn an_ipc_stream_declaring_nullable_entries_is_read_back_conforming() {
+        let map = map_from_parts(
+            true,
+            None,
+            &[0, 1, 2],
+            vec!["k0", "k1"],
+            vec![Some("v0"), None],
+        );
+        let batch = batch_of(Arc::new(map) as ArrayRef);
+        let bytes = ipc_stream(&batch.schema(), std::slice::from_ref(&batch));
+
+        let err = StreamReader::try_new(Cursor::new(&bytes), None)
+            .expect("the schema message itself is readable")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect_err("arrow refuses the declaration while decoding");
+        assert!(
+            err.to_string()
+                .contains("The nullable should be set to false for the map entries field"),
+            "unexpected error: {err}"
+        );
+
+        let read_back = read_ipc_stream(&bytes).expect("the repaired stream decodes");
+        assert_eq!(read_back.len(), 1);
+        let repaired = &read_back[0];
+        match repaired.schema().field(0).data_type() {
+            DataType::Map(entries, _) => assert!(
+                !entries.is_nullable(),
+                "entries must be read back relabelled non-nullable"
+            ),
+            other => panic!("expected a Map, got {other}"),
+        }
+        let map = repaired
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map after");
+        rebuild_through_public_constructor(map)
+            .expect("a spec-conforming map rebuilds through the public constructor");
+        assert_eq!(map.offsets(), &OffsetBuffer::new(vec![0, 1, 2].into()));
+        assert_eq!(
+            map.entries()
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("keys")
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("k0"), Some("k1")],
+            "every key survives the repair"
+        );
+    }
+
+    /// Replacing the schema message shifts every message after it, so the repair is only
+    /// sound if the rest of the stream is position-independent. A dictionary-encoded column
+    /// and a second batch are what test that: the dictionary message is decoded against the
+    /// replacement schema, and the second batch refers back to it.
+    #[test]
+    fn repairing_the_schema_message_leaves_the_rest_of_the_stream_readable() {
+        let map = map_from_parts(
+            true,
+            None,
+            &[0, 1, 2],
+            vec!["k0", "k1"],
+            vec![Some("v0"), None],
+        );
+        let labels: DictionaryArray<Int32Type> = ["north", "south"].into_iter().collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_map", map.data_type().clone(), true),
+            Field::new("label", labels.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(map) as ArrayRef, Arc::new(labels) as ArrayRef],
+        )
+        .expect("batch");
+        let bytes = ipc_stream(&schema, &[batch.clone(), batch]);
+
+        let read_back = read_ipc_stream(&bytes).expect("the repaired stream decodes");
+        assert_eq!(read_back.len(), 2, "both batches are still there");
+        for batch in &read_back {
+            assert_eq!(batch.num_rows(), 2);
+            let labels = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .expect("dictionary column");
+            assert_eq!(
+                labels
+                    .downcast_dict::<StringArray>()
+                    .expect("string values")
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec![Some("north"), Some("south")],
+                "the dictionary message decodes against the replacement schema"
+            );
+        }
+    }
+
+    /// A stream that already conforms is handed back exactly as it decoded, schema included.
+    #[test]
+    fn a_conforming_ipc_stream_is_read_back_unchanged() {
+        let map = map_from_parts(
+            false,
+            None,
+            &[0, 1, 2],
+            vec!["k0", "k1"],
+            vec![Some("v0"), None],
+        );
+        let batch = batch_of(Arc::new(map) as ArrayRef);
+        let bytes = ipc_stream(&batch.schema(), std::slice::from_ref(&batch));
+
+        let read_back = read_ipc_stream(&bytes).expect("a conforming stream decodes");
+        assert_eq!(read_back, vec![batch]);
     }
 
     /// Regression test for #7307: a `MAP` column whose `entries` field arrives declared

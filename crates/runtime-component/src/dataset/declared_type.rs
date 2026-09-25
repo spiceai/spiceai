@@ -566,7 +566,8 @@ fn parse_arrow_decimal_display(s: &str) -> Option<Result<DataType, ParseTypeErro
     let precision = precision.trim().parse::<u8>().ok()?;
     let scale = scale.trim().parse::<i8>().ok()?;
 
-    if let Err(e) = ensure_decimal_in_range(s, name.trim(), precision, scale, max_precision, max_scale)
+    if let Err(e) =
+        ensure_decimal_in_range(s, name.trim(), precision, scale, max_precision, max_scale)
     {
         return Some(Err(e));
     }

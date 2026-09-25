@@ -2031,6 +2031,123 @@ mod tests {
         );
     }
 
+    /// A `RunEndEncoded` column has to survive create, insert, read, flush and read again
+    /// on a real Cayenne table.
+    ///
+    /// `is_vortex_supported_type` accepts the type, which is only safe if the whole write
+    /// path stores it: run-end encoding is an encoding rather than a dtype in Vortex, so
+    /// the file records the values' own type and the read side rebuilds the runs from the
+    /// table's schema. A type accepted at creation whose write half is missing is the shape
+    /// of spiceai/spiceai#13524 - a table that reports itself created and then fails every
+    /// flush - so the inline corpus and the Vortex file are both read back here.
+    #[tokio::test]
+    async fn run_end_encoded_column_round_trips_through_a_cayenne_table() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_run_end_data.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        // Three runs over five rows, the middle one null: the run boundaries and the null
+        // are what a decode that loses the encoding gets wrong.
+        let runs = arrow::array::RunArray::try_new(
+            &Int32Array::from(vec![2, 3, 5]),
+            &StringArray::from(vec![Some("green"), None, Some("amber")]),
+        )
+        .expect("run-end encoded array");
+        let run_end_type = arrow::array::Array::data_type(&runs).clone();
+
+        let declared = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("status", run_end_type.clone(), true),
+        ]);
+        let schema = Arc::new(
+            crate::transform_schema_for_vortex(
+                &declared,
+                datafusion_table_providers::UnsupportedTypeAction::Error,
+            )
+            .expect("a run-end encoded column must be storable"),
+        );
+        assert_eq!(
+            schema.field(1).data_type(),
+            &run_end_type,
+            "the stored declaration must keep the run-end encoding"
+        );
+
+        let table_name = "run_end_data";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("register");
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(runs),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+
+        let read_back = |ctx: SessionContext| async move {
+            let batches = ctx
+                .sql("SELECT id, status FROM run_end_data ORDER BY id")
+                .await
+                .expect("plan the scan")
+                .collect()
+                .await
+                .expect("a run-end encoded column must be readable");
+            pretty_format_batches(&batches).expect("format").to_string()
+        };
+
+        let expected = "\
++----+--------+
+| id | status |
++----+--------+
+| 1  | green  |
+| 2  | green  |
+| 3  |        |
+| 4  | amber  |
+| 5  | amber  |
++----+--------+";
+        assert_eq!(
+            read_back(ctx.clone()).await,
+            expected,
+            "served from the inline corpus"
+        );
+
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush the inline corpus to a Vortex file");
+        assert_eq!(
+            read_back(ctx).await,
+            expected,
+            "served from a Vortex file, where the runs are rebuilt from the table's schema"
+        );
+    }
+
     /// A widening plan is built from a source schema, and a source is free to declare a `MAP`'s
     /// `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
     /// refuses. Adding such a column under `append_new_columns` must not leave a column no

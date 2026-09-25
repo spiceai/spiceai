@@ -881,10 +881,11 @@ Some Arrow data types cannot be stored in the Vortex format, and are rejected at
 - `Duration`
 - `FixedSizeBinary`
 - `Union`
-- `RunEndEncoded`
 
-`Map` is storable: Vortex has no map type but stores one as `List<Struct<keys, values>>` and
-restores it on read, so a map column round-trips.
+`Map` and `RunEndEncoded` are storable, and both are restored on read from the table's schema:
+Vortex stores a map under a type of its own that carries no Arrow field names (and an older
+file stores it as `List<Struct<keys, values>>`), and stores a run-end encoded column under its
+values' own type, run-end encoding being an encoding rather than a type there.
 
 One type is rewritten rather than rejected:
 

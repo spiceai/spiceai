@@ -2546,8 +2546,9 @@ mod tests {
             &self,
             _f: &mut dyn FnMut(
                 &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-            )
-                -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+            ) -> datafusion::common::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
         ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }

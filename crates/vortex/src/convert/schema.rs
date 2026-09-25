@@ -10,6 +10,7 @@ use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
 use vortex::arrow::ArrowSession;
 use vortex::dtype::DType;
+use vortex::dtype::Nullability;
 
 /// Calculate the physical Arrow schema for a Vortex file given its `DType` and the expected logical schema.
 ///
@@ -18,7 +19,8 @@ use vortex::dtype::DType;
 /// - Utf8/LargeUtf8 become `Utf8View`
 /// - Binary/LargeBinary become `BinaryView`
 /// - `RunEndEncoded` loses its encoding
-/// - `Map` has no `DType` and is stored as `List<Struct<keys, values>>`
+/// - `Map` keeps its key and value types but loses Arrow's names for the entries field and
+///   its two children (and an older file stores it as `List<Struct<keys, values>>`)
 /// - Lists are even more complex, with various sizes and physical layouts that are lost
 ///
 /// For these types, we use the logical schema's type instead of the `DType`'s natural Arrow
@@ -184,24 +186,53 @@ fn calculate_physical_field_type(
 
         // The map identity - the entries field name, the key and value names, and the
         // `ordered` flag - survives only in the logical schema, so it is re-applied here or
-        // the column reads back as the list it is stored as.
+        // the column reads back as whatever it is stored as. Vortex's own map dtype carries
+        // the key and value dtypes under fixed names of its own, and a file written before
+        // Vortex had that dtype stores the entries under the `List<Struct>` alias; both are
+        // resolved to the entries struct the logical schema declares.
         DataType::Map(logical_entries, ordered) => {
-            if let DType::List(entries_dtype, _) = dtype {
-                let physical_entries_type = calculate_physical_field_type(
-                    entries_dtype,
-                    logical_entries.data_type(),
-                    arrow_session,
-                )?;
-                let physical_entries = logical_entries
-                    .as_ref()
-                    .clone()
-                    .with_data_type(physical_entries_type);
-                DataType::Map(physical_entries.into(), *ordered)
-            } else {
-                return Err(exec_datafusion_err!(
-                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
-                ));
-            }
+            let entries_dtype = match dtype {
+                DType::Map(map_dtype, _) => {
+                    let DataType::Struct(logical_pair) = logical_entries.data_type() else {
+                        return Err(exec_datafusion_err!(
+                            "Failed to convert dtype to arrow: map entries field '{}' is {} rather than a struct of keys and values",
+                            logical_entries.name(),
+                            logical_entries.data_type()
+                        ));
+                    };
+                    let [keys, values] = logical_pair.as_ref() else {
+                        return Err(exec_datafusion_err!(
+                            "Failed to convert dtype to arrow: map entries field '{}' declares {} fields rather than keys and values",
+                            logical_entries.name(),
+                            logical_pair.len()
+                        ));
+                    };
+                    DType::struct_(
+                        [
+                            (keys.name().as_str(), map_dtype.key_dtype()),
+                            (values.name().as_str(), map_dtype.value_dtype()),
+                        ],
+                        Nullability::NonNullable,
+                    )
+                }
+                DType::List(entries_dtype, _) => entries_dtype.as_ref().clone(),
+                _ => {
+                    return Err(exec_datafusion_err!(
+                        "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                    ));
+                }
+            };
+
+            let physical_entries_type = calculate_physical_field_type(
+                &entries_dtype,
+                logical_entries.data_type(),
+                arrow_session,
+            )?;
+            let physical_entries = logical_entries
+                .as_ref()
+                .clone()
+                .with_data_type(physical_entries_type);
+            DataType::Map(physical_entries.into(), *ordered)
         }
 
         // For fixed-size list types, recursively check the element type
@@ -262,6 +293,7 @@ mod tests {
 
     use arrow_schema::Fields;
     use vortex::arrow::ArrowSession;
+    use vortex::dtype::MapDType;
     use vortex::dtype::Nullability;
     use vortex::dtype::PType;
     use vortex::dtype::StructFields;
@@ -295,12 +327,13 @@ mod tests {
         );
     }
 
-    /// Arrow's `Map` is stored as `List<Struct<keys, values>>`, so the file's `DType` alone
-    /// reads back as a list. The reference schema is the only place the map identity
-    /// survives, and reconciliation has to re-apply it or a map column comes back as a list
-    /// and no longer matches the table it was written from.
+    /// A file written before Vortex had a map dtype stores an Arrow `Map` as
+    /// `List<Struct<keys, values>>`, so its `DType` alone reads back as a list. The
+    /// reference schema is the only place the map identity survives, and reconciliation has
+    /// to re-apply it or such a column comes back as a list and no longer matches the table
+    /// it was written from.
     #[test]
-    fn test_map_type_is_restored_from_the_reference_schema() {
+    fn test_map_type_is_restored_from_the_reference_schema_over_the_list_alias() {
         let entries = Field::new(
             "entries",
             DataType::Struct(Fields::from(vec![
@@ -324,6 +357,48 @@ mod tests {
                         ]),
                         Nullability::NonNullable,
                     )),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("map physical schema should be calculated");
+
+        assert_eq!(physical_schema.field(0).data_type(), &map_type);
+    }
+
+    /// Vortex's own map dtype carries the key and value dtypes, but names them `key` and
+    /// `value` regardless of what Arrow called them, and carries no name for the entries
+    /// field at all. Reconciliation has to take all three names from the reference schema:
+    /// a column whose entries are named anything else reads back as a type the table it was
+    /// written from no longer matches.
+    #[test]
+    fn test_map_type_is_restored_from_the_reference_schema_over_the_map_dtype() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let logical_schema = Schema::new(vec![Field::new("headers", map_type.clone(), true)]);
+
+        // What the file holds: Vortex's map dtype, under its own field names.
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "headers",
+                DType::Map(
+                    MapDType::try_new(
+                        DType::Utf8(Nullability::NonNullable),
+                        DType::Utf8(Nullability::Nullable),
+                        false,
+                    )
+                    .expect("map dtype"),
                     Nullability::Nullable,
                 ),
             )]),

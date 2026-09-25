@@ -845,11 +845,16 @@ pub(super) fn serialize_batches_to_ipc(
 }
 
 /// Deserialize Arrow IPC bytes back to a `RecordBatch`.
+///
+/// Read through `arrow_tools` rather than the IPC reader directly: a blob holding a `Map`
+/// column may have been written under the declaration the Arrow map layout forbids
+/// (`entries` nullable), which the decode now refuses outright. `get_table` repairs the
+/// table's stored declaration, but not the blob's own, so the inline corpus of such a table
+/// is readable only if the stream is repaired on the way in.
 fn deserialize_ipc_to_batch(
     ipc_bytes: &[u8],
 ) -> std::result::Result<Vec<RecordBatch>, arrow::error::ArrowError> {
-    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None)?;
-    reader.collect()
+    arrow_tools::map_entries::read_ipc_stream(ipc_bytes)
 }
 
 /// Tombstone payload format discriminator (cycle-5 TASK 2a).
@@ -47849,8 +47854,11 @@ mod tests {
             .create_physical_plan()
             .await
             .expect("selective physical plan");
+        // The control has to reach the files: a bare `sum(value)` is answered from the
+        // scan's exact column statistics and plans as a `PlaceholderRowExec`, which has
+        // no file group to split. Summing an expression keeps the full scan.
         let after_nonsel = ctx
-            .sql("SELECT sum(value) FROM t")
+            .sql("SELECT sum(value + 1) FROM t")
             .await
             .expect("non-selective sql")
             .create_physical_plan()

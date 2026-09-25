@@ -275,7 +275,6 @@ mod null_aware_anti_join {
     }
 }
 
-
 /// Guards the stale-status rejection the `spiceai/datafusion-ballista` fork
 /// carries (fork PR #53).
 ///
@@ -435,10 +434,8 @@ mod stale_status_for_a_reset_task {
             .global_input_partition_ids
             .clone();
 
-        let accepted = stage.update_task_info(
-            lost_task,
-            completed(lost_task, &partitions, LOST_EXECUTOR),
-        );
+        let accepted =
+            stage.update_task_info(lost_task, completed(lost_task, &partitions, LOST_EXECUTOR));
 
         assert!(
             !accepted,
@@ -475,10 +472,8 @@ mod stale_status_for_a_reset_task {
             .global_input_partition_ids
             .clone();
 
-        let accepted = stage.update_task_info(
-            live_task,
-            completed(live_task, &partitions, LIVE_EXECUTOR),
-        );
+        let accepted =
+            stage.update_task_info(live_task, completed(live_task, &partitions, LIVE_EXECUTOR));
 
         assert!(
             accepted,

@@ -2426,10 +2426,7 @@ mod tests {
     /// nodes no longer answer it — they implement `statistics_from_inputs`, which
     /// only `StatisticsContext` drives. Reading a child directly would report
     /// `Statistics::new_unknown` and make any comparison against it vacuous.
-    fn stats_of(
-        plan: &dyn ExecutionPlan,
-        partition: Option<usize>,
-    ) -> Result<Arc<Statistics>> {
+    fn stats_of(plan: &dyn ExecutionPlan, partition: Option<usize>) -> Result<Arc<Statistics>> {
         datafusion::physical_plan::StatisticsContext::new().compute(
             plan,
             &datafusion::physical_plan::StatisticsArgs::new().with_partition(partition),
@@ -2450,7 +2447,8 @@ mod tests {
             UnionExec::try_new(vec![memory, empty]).expect("union exec should be created");
 
         // Sanity: the union poisons min/max + distinct_count to Absent.
-        let poisoned = stats_of(union.as_ref(), None).expect("union statistics should be available");
+        let poisoned =
+            stats_of(union.as_ref(), None).expect("union statistics should be available");
         assert!(matches!(
             poisoned.column_statistics[0].min_value,
             Precision::Absent
@@ -2509,8 +2507,8 @@ mod tests {
         // The overlay is a per-table (global) aggregate, so it must NOT be
         // applied to per-partition stats: `partition_statistics(Some(_))` must
         // return the child's partition stats untouched.
-        let per_partition =
-            stats_of(&restored_exec, Some(0)).expect("per-partition statistics should be available");
+        let per_partition = stats_of(&restored_exec, Some(0))
+            .expect("per-partition statistics should be available");
         let child_partition = stats_of(union.as_ref(), Some(0))
             .expect("child per-partition statistics should be available");
         assert_eq!(

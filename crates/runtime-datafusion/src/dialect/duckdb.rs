@@ -34,7 +34,6 @@ pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 /// count the matches `regexp_count` asks for.
 const LEN_NAME: &str = "len";
 
-
 /// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
 pub(crate) const TRIM_NAME: &str = "trim";
 

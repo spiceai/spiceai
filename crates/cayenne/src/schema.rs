@@ -74,7 +74,6 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::Duration(_)
             | DataType::FixedSizeBinary(_)
             | DataType::Union(..)
-            | DataType::RunEndEncoded(..)
     )
 }
 
@@ -140,6 +139,19 @@ fn transform_data_type_for_vortex(
             )?;
             Some(DataType::Dictionary(key_type.clone(), Box::new(value_type)))
         }
+        // Run-end encoding is an encoding, not a logical type: Vortex stores the column
+        // under the values' own dtype and rebuilds the runs on read, so the values field
+        // is what has to be storable and is walked the way `Dictionary`'s is. `run_ends`
+        // is Int16/Int32/Int64 by construction and has nothing to rewrite.
+        DataType::RunEndEncoded(run_ends, values) => Some(DataType::RunEndEncoded(
+            Arc::clone(run_ends),
+            transform_nested_field(
+                values,
+                &format!("{path}.{}", values.name()),
+                unsupported_type_action,
+                unsupported_fields,
+            ),
+        )),
         DataType::List(field) => Some(DataType::List(transform_nested_field(
             field,
             &format!("{path}[]"),
@@ -267,7 +279,7 @@ fn handle_unsupported_type(
 /// table stores the precision its source reports.
 ///
 /// Types Vortex has no encoding for (`Interval`, `Duration`, `FixedSizeBinary`,
-/// `Union`, `RunEndEncoded`) are handled according to `unsupported_type_action`
+/// `Union`) are handled according to `unsupported_type_action`
 /// at the top level. Nested unsupported types error unless the action is `warn`,
 /// because schema-only string conversion or field removal would not preserve
 /// nested data correctly.
@@ -817,19 +829,49 @@ mod tests {
         );
     }
 
-    /// Vortex cannot encode `Union` or `RunEndEncoded` at all, so a column of either type
-    /// has to be refused while the table is being created. Accepting it produces a table
-    /// that reports itself created and then fails every write to it - the shape of
-    /// spiceai/spiceai#13524.
+    /// A run-end encoded column is stored under its values' dtype, so the values are what
+    /// the rewrite rules and the supported-type check apply to - the same treatment
+    /// `Dictionary` gets. Without the walk, a `Float16` inside would be stored unrewritten
+    /// and an unsupported type inside would be accepted at creation and fail every write.
+    #[test]
+    fn run_end_encoded_values_are_transformed_like_any_other_nested_field() {
+        let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+        let run_end_of = |values: DataType| {
+            DataType::RunEndEncoded(
+                Arc::clone(&run_ends),
+                Arc::new(Field::new("values", values, true)),
+            )
+        };
+
+        let schema = Schema::new(vec![Field::new(
+            "score",
+            run_end_of(DataType::Float16),
+            true,
+        )]);
+        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("run-end encoded Float16 values should be rewritten, not refused");
+        assert_eq!(out.field(0).data_type(), &run_end_of(DataType::Float32));
+
+        let schema = Schema::new(vec![Field::new(
+            "elapsed",
+            run_end_of(DataType::Duration(TimeUnit::Second)),
+            true,
+        )]);
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("run-end encoded values Vortex cannot store should be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("elapsed.values"),
+            "error should include the run-end values field path, got: {message}"
+        );
+    }
+
+    /// Vortex cannot encode `Union` at all, so a column of that type has to be refused
+    /// while the table is being created. Accepting it produces a table that reports itself
+    /// created and then fails every write to it - the shape of spiceai/spiceai#13524.
     #[test]
     fn types_vortex_cannot_encode_are_refused_by_name_and_type() {
-        for data_type in [
-            DataType::RunEndEncoded(
-                Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                Arc::new(Field::new("values", DataType::Utf8, true)),
-            ),
-            DataType::Union(union_fields(), UnionMode::Sparse),
-        ] {
+        for data_type in [DataType::Union(union_fields(), UnionMode::Sparse)] {
             let schema = Schema::new(vec![Field::new("encoded", data_type.clone(), true)]);
             let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
                 .expect_err("a type Vortex cannot encode should be refused at creation");

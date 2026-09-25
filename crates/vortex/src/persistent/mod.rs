@@ -106,12 +106,14 @@ mod tests {
 
     /// A `Map` column has to survive a full write/read cycle through a Vortex file.
     ///
-    /// Vortex has no `Map` dtype: it aliases the type to `List<Struct<keys, values>>` on
-    /// write and rebuilds the map on read from the table's declared schema. Both halves of
-    /// that alias live in the `spiceai/vortex` fork, and half of it has been lost across a
-    /// fork re-cut once already (spiceai/spiceai#13524), which is only observable at
-    /// runtime: the dtype conversion still accepts `Map`, so a table is created happily and
-    /// then every write fails with "Array encoding not implemented for Arrow data type
+    /// Vortex's map dtype carries the key and value dtypes but none of Arrow's names, and a
+    /// file written before it had that dtype holds the entries under the
+    /// `List<Struct<keys, values>>` alias, so the map is rebuilt on read from the table's
+    /// declared schema either way. Both halves - the write encoding and the rebuild - live
+    /// in the `spiceai/vortex` fork and the glue around it, and half of it has been lost
+    /// across a fork re-cut once already (spiceai/spiceai#13524), which is only observable
+    /// at runtime: the dtype conversion still accepts `Map`, so a table is created happily
+    /// and then every write fails with "Array encoding not implemented for Arrow data type
     /// Map(...)". This test fails in Spice if either half goes missing again.
     #[tokio::test]
     async fn map_column_roundtrips_through_a_vortex_file() -> anyhow::Result<()> {
@@ -196,6 +198,90 @@ mod tests {
         let batches = read_back.collect().await?;
         assert_snapshot!(
             "map_column_roundtrip_result",
+            pretty_format_batches(&batches)?
+        );
+
+        Ok(())
+    }
+
+    /// A `RunEndEncoded` column has to survive a full write/read cycle through a Vortex
+    /// file.
+    ///
+    /// Run-end encoding is an encoding rather than a type in Vortex: the `DType` is the
+    /// values' own, so the file does not record that the column was run-end encoded and the
+    /// read side rebuilds it from the table's declared schema
+    /// (`calculate_physical_field_type`). Both halves live in the `spiceai/vortex` fork,
+    /// and a type whose write half is missing is only observable at runtime - the table is
+    /// created happily and then every write fails with "Array encoding not implemented"
+    /// (spiceai/spiceai#13524, the same shape for `Map`). Cayenne's
+    /// `is_vortex_supported_type` accepts the type on the strength of this round trip.
+    #[tokio::test]
+    async fn run_end_encoded_column_roundtrips_through_a_vortex_file() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::Array;
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::array::RunArray;
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion::datasource::listing::ListingOptions;
+        use datafusion::datasource::listing::ListingTable;
+        use datafusion::datasource::listing::ListingTableConfig;
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        use crate::VortexFormat;
+
+        let ctx = TestSessionContext::default();
+
+        // Three runs over five rows, the middle one null: the run boundaries and the null
+        // are what a decode that loses the encoding gets wrong.
+        let run_ends = Int32Array::from(vec![2, 3, 5]);
+        let values = StringArray::from(vec![Some("green"), None, Some("amber")]);
+        let runs = RunArray::try_new(&run_ends, &values)?;
+        let run_end_type = runs.data_type().clone();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("status", run_end_type.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(runs),
+            ],
+        )?;
+
+        let format = Arc::new(VortexFormat::new(VortexSession::default()));
+        let config = ListingTableConfig::new(ListingTableUrl::parse("file:///runs/")?)
+            .with_listing_options(ListingOptions::new(format))
+            .with_schema(Arc::clone(&schema));
+        ctx.session
+            .register_table("runs", Arc::new(ListingTable::try_new(config)?))?;
+
+        ctx.session
+            .read_batch(batch)?
+            .write_table("runs", DataFrameWriteOptions::new())
+            .await?;
+
+        let read_back = ctx
+            .session
+            .sql("SELECT id, status FROM runs ORDER BY id")
+            .await?;
+        assert_eq!(
+            read_back.schema().field(1).data_type(),
+            &run_end_type,
+            "a run-end encoded column must not read back as its decoded values"
+        );
+
+        // The snapshot pins every row, the null run included.
+        let batches = read_back.collect().await?;
+        assert_snapshot!(
+            "run_end_encoded_column_roundtrip_result",
             pretty_format_batches(&batches)?
         );
 
