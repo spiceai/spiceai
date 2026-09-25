@@ -510,6 +510,16 @@ impl std::fmt::Debug for Caching {
     }
 }
 
+/// Reports the first failure among invalidations that have all already run.
+///
+/// The caches invalidated for one table are independent of each other — each keeps
+/// its own change clock — so a `?` between them would leave the later ones serving
+/// the table that the earlier one was told had gone. Every arm is therefore awaited
+/// before any error is returned, and the caller still sees a failure.
+fn first_error<const N: usize>(outcomes: [Result<()>; N]) -> Result<()> {
+    outcomes.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+}
+
 impl Caching {
     #[must_use]
     pub fn new() -> Self {
@@ -561,12 +571,11 @@ impl Caching {
     ///
     /// If the cache invalidation fails for any of the caches.
     pub async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        if let Some(results_cache) = &self.results {
-            results_cache
-                .invalidate_for_table(table_ref.clone())
-                .await?;
-        }
-        self.invalidate_derived_for_table(table_ref).await
+        let results = match &self.results {
+            Some(results_cache) => results_cache.invalidate_for_table(table_ref.clone()).await,
+            None => Ok(()),
+        };
+        first_error([results, self.invalidate_derived_for_table(table_ref).await])
     }
 
     /// [`Self::invalidate_for_table`], for a table that is going away rather than
@@ -576,22 +585,25 @@ impl Caching {
     ///
     /// If the cache invalidation fails for any of the caches.
     pub async fn evict_for_table(&self, table_ref: TableReference) -> Result<()> {
-        if let Some(results_cache) = &self.results {
-            results_cache.evict_for_table(table_ref.clone()).await?;
-        }
-        self.invalidate_derived_for_table(table_ref).await
+        let results = match &self.results {
+            Some(results_cache) => results_cache.evict_for_table(table_ref.clone()).await,
+            None => Ok(()),
+        };
+        first_error([results, self.invalidate_derived_for_table(table_ref).await])
     }
 
     /// The plan and search caches, which both paths above invalidate identically —
     /// neither has a stale-serving mode to choose between.
     async fn invalidate_derived_for_table(&self, table_ref: TableReference) -> Result<()> {
-        if let Some(plans_cache) = &self.plans {
-            plans_cache.invalidate_for_table(table_ref.clone()).await?;
-        }
-        if let Some(search_cache) = &self.search {
-            search_cache.invalidate_for_table(table_ref).await?;
-        }
-        Ok(())
+        let plans = match &self.plans {
+            Some(plans_cache) => plans_cache.invalidate_for_table(table_ref.clone()).await,
+            None => Ok(()),
+        };
+        let search = match &self.search {
+            Some(search_cache) => search_cache.invalidate_for_table(table_ref).await,
+            None => Ok(()),
+        };
+        first_error([plans, search])
     }
 
     /// Drives housekeeping on every configured cache. SQL results expire stale
@@ -2471,6 +2483,145 @@ mod tests {
             .await
             .expect("invalidation should succeed");
         caching.run_pending_maintenance().await;
+    }
+
+    /// A cache that fails every table invalidation, and one that records whether
+    /// it was asked — enough to tell "the later cache was skipped" from "the
+    /// later cache ran and the earlier failure was still reported".
+    struct RecordingCache<V> {
+        fails: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        _marker: std::marker::PhantomData<fn() -> V>,
+    }
+
+    impl<V> RecordingCache<V> {
+        fn new(fails: bool) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    fails,
+                    calls: Arc::clone(&calls),
+                    _marker: std::marker::PhantomData,
+                }),
+                calls,
+            )
+        }
+    }
+
+    impl<V> std::fmt::Debug for RecordingCache<V> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingCache")
+                .field("fails", &self.fails)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<V> std::fmt::Display for RecordingCache<V> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingCache")
+        }
+    }
+
+    impl<V> HashProvider for RecordingCache<V> {
+        fn hasher(&self) -> Box<dyn Hasher> {
+            Box::new(std::collections::hash_map::DefaultHasher::new())
+        }
+    }
+
+    #[async_trait]
+    impl<V: AsTableRefs + Clone + Send + Sync + 'static> CacheProvider<V>
+        for RecordingCache<V>
+    {
+        async fn get_raw_key(&self, _key: &u64) -> Option<Arc<V>> {
+            None
+        }
+        async fn get_raw_key_validated(
+            &self,
+            _key: &u64,
+            _is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+        ) -> Option<Arc<V>> {
+            None
+        }
+        async fn put_raw_key(&self, _key: &u64, _value: V) {}
+        async fn replace_if(
+            &self,
+            _key: &u64,
+            _value: V,
+            _should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+        ) -> bool {
+            false
+        }
+        async fn invalidate_all(&self) {}
+        async fn size_bytes(&self) -> u64 {
+            0
+        }
+        async fn item_count(&self) -> u64 {
+            0
+        }
+        fn max_size(&self) -> usize {
+            0
+        }
+        async fn checkpoint(&self) {}
+    }
+
+    #[async_trait]
+    impl<V: AsTableRefs + Clone + Send + Sync + 'static> TabledCacheProvider<V>
+        for RecordingCache<V>
+    {
+        async fn invalidate_for_table(&self, _table_ref: TableReference) -> Result<()> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fails {
+                Err(Error::FailedToInvalidateCacheGeneric {
+                    source: moka::PredicateError::InvalidationClosuresDisabled,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        fn tables_changed_since(
+            &self,
+            _tables: &HashSet<TableReference>,
+            _since: Instant,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// spiceai/spiceai#14251 review: the caches invalidated for one table each keep
+    /// their own change clock, so a `?` between them left the later ones serving a
+    /// table the earlier one had been told was gone. Every arm must run, and the
+    /// failure must still reach the caller.
+    ///
+    /// Before the fix the search cache saw no call at all: the plans failure
+    /// returned from `invalidate_derived_for_table` first.
+    #[tokio::test]
+    async fn a_failing_cache_does_not_skip_the_ones_after_it() {
+        let (plans, plans_calls) = RecordingCache::<LogicalPlan>::new(true);
+        let (search, search_calls) = RecordingCache::<CachedSearchResult>::new(false);
+
+        let caching = Caching::new()
+            .with_plans_cache(plans)
+            .with_search_cache(search);
+
+        let outcome = caching
+            .invalidate_for_table(TableReference::bare("unloaded"))
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "the plans failure must still be reported to the caller"
+        );
+        assert_eq!(
+            plans_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failing cache is the one that ran first"
+        );
+        assert_eq!(
+            search_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the search cache must be invalidated even though the plans cache failed"
+        );
     }
 
     #[tokio::test]

@@ -4586,9 +4586,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     /// #14251: deregistering the table is not what stops it being read. A cached logical
     /// plan holds the `TableSource` it was planned against, so a query executed before the
-    /// removal keeps answering from the retired provider — and keeps that provider's memory
-    /// reservations charged to the query pool — while a *new* query correctly fails to plan
-    /// and `information_schema.tables` no longer lists the dataset.
+    /// removal keeps answering from the retired provider, while a *new* query correctly
+    /// fails to plan and `information_schema.tables` no longer lists the dataset.
+    ///
+    /// Scope: this asserts the cached plan, and nothing about memory. The reproduction on
+    /// #14251 shows a query-pool reservation still held after both caches are cleared, so
+    /// some other holder keeps it; this test's empty `MemTable` reserves nothing and could
+    /// not tell either way.
     ///
     /// Before the fix this read `Some(1)`: `update_dataset` and `remove_view` both discard
     /// cached plans, and the removal arm was the one that did not.
