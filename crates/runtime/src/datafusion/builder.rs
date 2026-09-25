@@ -1117,24 +1117,19 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc` and
-        // `date_trunc` (scalar) and `avg` (aggregate): `register_all` would register
-        // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
-        // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
-        // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
-        // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
-        // plans — the scheduler bakes the shuffle/stage schema from Spark `avg`'s
-        // `state_fields` while executors run the built-in `avg`, so the coalescing
-        // shuffle reader downcasts the wrong primitive type and panics ("primitive
-        // array"). Keep the built-ins; register every other Spark function (mirrors
-        // `datafusion_spark::register_all`).
+        // Register the Spark-compatible functions (mirrors
+        // `datafusion_spark::register_all`), deciding every collision with a
+        // function the session already holds by name: `SPARK_SCALAR_COLLISIONS`
+        // says which side each keeps and why, and a collision it does not name
+        // is refused right here, so a fork repin that adds one fails the build
+        // instead of shadowing a built-in silently (spiceai/spiceai#14361).
         for udf in datafusion_spark::all_default_scalar_functions() {
-            // Spark `date_trunc` accepts only a string as the value to truncate,
-            // where the built-in also accepts a date. Registering it over the
-            // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
-            // federated filter comparing a timestamp against one loses the type
-            // its comparison needs and is pushed down as a pair BigQuery refuses.
-            if matches!(udf.name(), "trunc" | "date_trunc") {
+            let taken =
+                names_already_registered(state.scalar_functions(), udf.name(), udf.aliases());
+            if !taken.is_empty()
+                && decide_spark_collision("scalar", udf.name(), &taken, SPARK_SCALAR_COLLISIONS)
+                    == Keep::BuiltIn
+            {
                 continue;
             }
             let name = udf.name().to_string();
@@ -1143,7 +1138,16 @@ impl DataFusionBuilder {
             }
         }
         for udaf in datafusion_spark::all_default_aggregate_functions() {
-            if udaf.name() == "avg" {
+            let taken =
+                names_already_registered(state.aggregate_functions(), udaf.name(), udaf.aliases());
+            if !taken.is_empty()
+                && decide_spark_collision(
+                    "aggregate",
+                    udaf.name(),
+                    &taken,
+                    SPARK_AGGREGATE_COLLISIONS,
+                ) == Keep::BuiltIn
+            {
                 continue;
             }
             let name = udaf.name().to_string();
@@ -1152,6 +1156,14 @@ impl DataFusionBuilder {
             }
         }
         for udwf in datafusion_spark::all_default_window_functions() {
+            let taken =
+                names_already_registered(state.window_functions(), udwf.name(), udwf.aliases());
+            if !taken.is_empty()
+                && decide_spark_collision("window", udwf.name(), &taken, SPARK_WINDOW_COLLISIONS)
+                    == Keep::BuiltIn
+            {
+                continue;
+            }
             let name = udwf.name().to_string();
             if let Err(e) = state.register_udwf(udwf) {
                 panic!("Unable to register Spark window function `{name}`: {e}");
@@ -2045,6 +2057,142 @@ pub(crate) fn default_extension_planners(
     planners
 }
 
+/// Which side of a name collision the built session keeps when a
+/// `datafusion_spark` function's name, or one of its aliases, is a name the
+/// session already holds — a `DataFusion` built-in, or a function registered
+/// earlier in [`DataFusionBuilder::build`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keep {
+    /// The function already registered stays; the Spark one is not registered.
+    BuiltIn,
+    /// The Spark function is registered over the existing one, under every
+    /// name it declares.
+    Spark,
+}
+
+/// Every Spark scalar function that collides with a name the session already
+/// holds, and which side is kept. The session refuses to build on a collision
+/// this table does not name (see [`decide_spark_collision`]), and a test pins
+/// that every name here still collides, so the table is the collision set at
+/// the pinned fork revision — neither wider nor narrower.
+///
+/// `datafusion_spark::register_all` would register every one of these *over*
+/// the built-in, and `register_udf` writes a function under each of its aliases
+/// too, so a collision on an alias replaces a built-in with a different primary
+/// name (Spark `length` is also `character_length`, `char_length` and `len`).
+/// The SQL reference documents the built-ins, and a shadowed one surfaced in
+/// production four times, one name at a time — `trunc` (spiceai/spiceai#11415),
+/// `date_trunc` (#13882), `date_part` (#13920), `factorial` (#14361) — which a
+/// skip list could not prevent because a repin adds a collision with no signal.
+///
+/// Why each side, for whoever changes an entry:
+/// - `abs`, `ascii`, `array_contains` (the built-in `array_has`'s alias) and
+///   `array_repeat` agree with the built-in on their documented inputs; the
+///   built-in is kept because it is the documented one and the one a
+///   federated rendering pushes down unchanged.
+/// - `ceil` and `floor`: Spark's return `Int64` for a float argument where the
+///   built-in returns the float's type — the return-type class, which a
+///   federated rendering surfaces as a schema assertion, not a function error.
+///   Spark's `ceil` alias `ceiling`, a name no built-in has, goes with it.
+/// - `round`: Spark's returns the argument's type; the built-in returns
+///   `Float64` for an integer argument.
+/// - `concat` is **Spark's on purpose**: it answers NULL when any argument is
+///   NULL where the built-in skips the argument, and the accelerator dialects
+///   render the call to match that — `DuckDB`'s as `||`
+///   (`concat_to_string_concat`, #13849), with `SQLite` and `PostgreSQL` in
+///   #13875 — so flipping it would invert every one of those renderings.
+///   The fork patch it carries (fork PR #217, `docs/dev/fork_patches.md`) is
+///   guarded by `the_built_session_concatenates_an_untyped_null`.
+/// - `date_part` (also `datepart`): Spark's counts `dow` from Sunday = 1
+///   where the built-in and `EXTRACT(DOW FROM …)` count from 0, and Spark's
+///   does not accept a time (#13920).
+/// - `date_trunc`: Spark's accepts only a string as the
+///   value to truncate, so `date_trunc(<unit>, <date>)` stops planning, and a
+///   federated filter comparing a timestamp against one is pushed down as a
+///   pair `BigQuery` refuses (#13882).
+/// - `factorial`: Spark's signature is `Exact(Int32)`, so `factorial(5)` — an
+///   `Int64` literal — does not plan at all (#14361).
+/// - `length` (also `character_length`, `char_length`, `len`): Spark's always
+///   answers `Int32`, and its aliases would replace the built-in
+///   `character_length` under every name it has; the built-in is the
+///   documented one. Spark's `len`, a name no built-in has, goes with it.
+/// - `substring` (also `substr`): Spark's answers NULL when any argument is
+///   NULL; the built-in `substr` is the documented one.
+/// - `trunc`: Spark's is date truncation and shadows the numeric
+///   `trunc(<float>, <int>)` (#11415).
+const SPARK_SCALAR_COLLISIONS: &[(&str, Keep)] = &[
+    ("abs", Keep::BuiltIn),
+    ("array_contains", Keep::BuiltIn),
+    ("array_repeat", Keep::BuiltIn),
+    ("ascii", Keep::BuiltIn),
+    ("ceil", Keep::BuiltIn),
+    ("concat", Keep::Spark),
+    ("date_part", Keep::BuiltIn),
+    ("date_trunc", Keep::BuiltIn),
+    ("factorial", Keep::BuiltIn),
+    ("floor", Keep::BuiltIn),
+    ("length", Keep::BuiltIn),
+    ("round", Keep::BuiltIn),
+    ("substring", Keep::BuiltIn),
+    ("trunc", Keep::BuiltIn),
+];
+
+/// Every Spark aggregate function that collides with a name the session
+/// already holds; see [`SPARK_SCALAR_COLLISIONS`].
+///
+/// - `avg`: Spark's uses a different partial-aggregate state layout
+///   (`[sum, count:Int64]`) than the built-in (`[count:UInt64, sum]`). Harmless
+///   single-node, but it corrupts DISTRIBUTED plans — the scheduler bakes the
+///   shuffle/stage schema from Spark `avg`'s `state_fields` while executors run
+///   the built-in `avg`, so the coalescing shuffle reader downcasts the wrong
+///   primitive type and panics ("primitive array").
+const SPARK_AGGREGATE_COLLISIONS: &[(&str, Keep)] = &[("avg", Keep::BuiltIn)];
+
+/// Every Spark window function that collides with a name the session already
+/// holds; see [`SPARK_SCALAR_COLLISIONS`]. None at the pinned fork revision.
+const SPARK_WINDOW_COLLISIONS: &[(&str, Keep)] = &[];
+
+/// The registry names a function would take that `registered` already holds:
+/// its name and every alias, since `register_udf` and its siblings write all
+/// of them.
+fn names_already_registered<'a, T>(
+    registered: &HashMap<String, T>,
+    name: &'a str,
+    aliases: &'a [String],
+) -> Vec<&'a str> {
+    std::iter::once(name)
+        .chain(aliases.iter().map(String::as_str))
+        .filter(|candidate| registered.contains_key(*candidate))
+        .collect()
+}
+
+/// Which side to keep for the Spark `kind` function `name`, which would
+/// register over `taken` — names the session already holds. Refuses, naming
+/// the collision, when `decisions` has no entry: an undecided collision is a
+/// built-in silently replaced (spiceai/spiceai#14361).
+fn decide_spark_collision(
+    kind: &str,
+    name: &str,
+    taken: &[&str],
+    decisions: &[(&str, Keep)],
+) -> Keep {
+    decisions
+        .iter()
+        .find(|(decided, _)| *decided == name)
+        .map_or_else(
+            || {
+                panic!(
+                    "Spark {kind} function `{name}` would register over {taken:?}, which the \
+                     session already holds, and SPARK_{}_COLLISIONS does not decide it. Add \
+                     an entry: `Keep::BuiltIn` keeps what is registered, `Keep::Spark` \
+                     registers Spark's over it (spiceai/spiceai#14361)",
+                    kind.to_ascii_uppercase()
+                )
+            },
+            |(_, keep)| *keep,
+        )
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(windows))]
@@ -2076,12 +2224,17 @@ mod tests {
     use super::CteMaterialization;
     use super::{
         CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
-        DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
+        DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, Keep, MEM_TIER_CEILING_FRACTION,
         MEM_TIER_FLOAT_CEILING_FRACTION, MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION,
         build_compaction_runtime_env, configure_hash_join_memory_limits,
-        coordinated_mem_tier_budget, effective_query_memory_limit,
+        coordinated_mem_tier_budget, decide_spark_collision, effective_query_memory_limit,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
+    };
+    #[cfg(not(windows))]
+    use super::{
+        SPARK_AGGREGATE_COLLISIONS, SPARK_SCALAR_COLLISIONS, SPARK_WINDOW_COLLISIONS,
+        names_already_registered,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
@@ -2640,15 +2793,15 @@ mod tests {
             "date_trunc must truncate to the month, got {rendered}"
         );
 
-        // Spark's *other* functions must still be there — the skip is meant to
-        // be two names, not a disabled registration.
+        // Spark's *other* functions must still be there — deciding the
+        // collisions is not a disabled registration.
         assert!(
             df.ctx
                 .state()
                 .scalar_functions()
                 .contains_key("array_append"),
-            "only `trunc` and `date_trunc` are skipped; the rest of the Spark \
-             functions must still register"
+            "only a colliding Spark function decided `Keep::BuiltIn` is kept out; the rest \
+             of the Spark functions must still register"
         );
     }
 
@@ -2689,15 +2842,15 @@ mod tests {
         );
     }
 
-    /// The built session keeps the **built-in** `concat`, not Spark's.
-    ///
-    /// The built-in ignores a NULL argument, as the SQL reference documents
-    /// and as `PostgreSQL`, `DuckDB`, `MySQL` and `SQLite` answer, so
-    /// `concat('a', NULL, 'b')` is `'ab'`. Spark's, registered over it,
-    /// propagated the NULL and answered NULL (regression test for #14361).
+    /// The built session registers **Spark's** `concat` over the built-in, on
+    /// purpose: it answers NULL when any argument is NULL, and the accelerator
+    /// dialects render the call to match (`DuckDB`'s `||`, #13849). This pins
+    /// the `Keep::Spark` entry in `SPARK_SCALAR_COLLISIONS`: were it flipped,
+    /// `concat('a', NULL, 'b')` would answer `'ab'` locally and NULL once
+    /// accelerated.
     #[tokio::test]
     #[cfg(not(windows))]
-    async fn the_built_session_keeps_the_built_in_concat() {
+    async fn the_built_session_keeps_spark_concat_over_the_built_in() {
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
@@ -2713,12 +2866,12 @@ mod tests {
             .collect()
             .await
             .expect("run concat over a NULL argument");
-        let rendered = arrow::util::pretty::pretty_format_batches(&batches)
-            .expect("format concat")
-            .to_string();
-        assert!(
-            rendered.contains("| ab |"),
-            "concat must ignore the NULL argument and answer 'ab', got {rendered}"
+        let batch = batches.first().expect("one batch");
+        assert_eq!(
+            batch.column(0).null_count(),
+            1,
+            "Spark's concat answers NULL for a NULL argument, as the dialects render it; got {}",
+            arrow::util::pretty::pretty_format_batches(&batches).expect("format concat")
         );
     }
 
@@ -2787,6 +2940,121 @@ mod tests {
         for batch in batches {
             assert_eq!(batch.column(0).null_count(), batch.num_rows());
         }
+    }
+
+    /// The collision tables are exactly the collision set: every Spark
+    /// function whose name or alias the session already holds has an entry,
+    /// and every entry still collides.
+    ///
+    /// The first direction is what `decide_spark_collision` enforces at
+    /// startup; this pins it against the pinned fork revision without a
+    /// runtime. The second is the stale-entry case — a repin that renames or
+    /// drops a built-in leaves an entry deciding nothing, and the table must
+    /// say so rather than carry a decision no collision reaches.
+    #[test]
+    #[cfg(not(windows))]
+    fn the_spark_collision_tables_are_exactly_the_collision_set() {
+        use std::collections::BTreeSet;
+
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        datafusion_functions_json::register_all(&mut state).expect("register JSON functions");
+
+        let colliding_scalars: BTreeSet<String> = datafusion_spark::all_default_scalar_functions()
+            .iter()
+            .filter(|udf| {
+                !names_already_registered(state.scalar_functions(), udf.name(), udf.aliases())
+                    .is_empty()
+            })
+            .map(|udf| udf.name().to_string())
+            .collect();
+        let decided_scalars: BTreeSet<String> = SPARK_SCALAR_COLLISIONS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            colliding_scalars, decided_scalars,
+            "SPARK_SCALAR_COLLISIONS must name exactly the Spark scalar functions that collide \
+             with a registered one"
+        );
+
+        let colliding_aggregates: BTreeSet<String> =
+            datafusion_spark::all_default_aggregate_functions()
+                .iter()
+                .filter(|udaf| {
+                    !names_already_registered(
+                        state.aggregate_functions(),
+                        udaf.name(),
+                        udaf.aliases(),
+                    )
+                    .is_empty()
+                })
+                .map(|udaf| udaf.name().to_string())
+                .collect();
+        let decided_aggregates: BTreeSet<String> = SPARK_AGGREGATE_COLLISIONS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            colliding_aggregates, decided_aggregates,
+            "SPARK_AGGREGATE_COLLISIONS must name exactly the Spark aggregate functions that \
+             collide with a registered one"
+        );
+
+        let colliding_windows: BTreeSet<String> = datafusion_spark::all_default_window_functions()
+            .iter()
+            .filter(|udwf| {
+                !names_already_registered(state.window_functions(), udwf.name(), udwf.aliases())
+                    .is_empty()
+            })
+            .map(|udwf| udwf.name().to_string())
+            .collect();
+        let decided_windows: BTreeSet<String> = SPARK_WINDOW_COLLISIONS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            colliding_windows, decided_windows,
+            "SPARK_WINDOW_COLLISIONS must name exactly the Spark window functions that collide \
+             with a registered one"
+        );
+    }
+
+    /// An undecided collision is refused, naming the Spark function and the
+    /// registered names it would have replaced; a decided one answers its side.
+    #[test]
+    fn an_undecided_spark_collision_is_refused_by_name() {
+        let refusal = std::panic::catch_unwind(|| {
+            decide_spark_collision(
+                "scalar",
+                "factorial",
+                &["factorial"],
+                &[("trunc", Keep::BuiltIn)],
+            );
+        })
+        .expect_err("an unlisted collision must be refused");
+        let message = refusal
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                refusal
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+            })
+            .expect("the refusal carries a message");
+        assert!(
+            message.contains("`factorial`") && message.contains("[\"factorial\"]"),
+            "the refusal must name the function and the names it would take: {message}"
+        );
+
+        let decisions = &[("factorial", Keep::BuiltIn), ("concat", Keep::Spark)];
+        assert_eq!(
+            decide_spark_collision("scalar", "factorial", &["factorial"], decisions),
+            Keep::BuiltIn
+        );
+        assert_eq!(
+            decide_spark_collision("scalar", "concat", &["concat"], decisions),
+            Keep::Spark
+        );
     }
 
     #[test]
