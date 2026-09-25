@@ -265,6 +265,7 @@ runtime-checkpoint-api = "foundation"
 # `embed-api` is assigned explicitly rather than left to `default_tier`, so that
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
+evaluate-api = "foundation"
 embed-api = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
@@ -284,6 +285,7 @@ runtime-rate-control = "foundation"
 # silently place it in shared-utility.
 runtime-resources = "foundation"
 runtime-status = "foundation"
+sharded-cache = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"
 scheduler = "foundation"

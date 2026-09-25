@@ -18,9 +18,14 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::compute::filter_record_batch;
+use arrow_tools::metadata_keys::{
+    HTTP_RESPONSE_STATUS_METADATA_KEY, HTTP_TRANSIENT_FAILURE_METRIC_NAME,
+};
 use datafusion::{
-    common::tree_node::TreeNodeRecursion, execution::SendableRecordBatchStream,
-    logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter,
+    common::tree_node::TreeNodeRecursion,
+    execution::SendableRecordBatchStream,
+    logical_expr::LogicalPlan,
+    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     sql::TableReference,
 };
 
@@ -32,45 +37,43 @@ use futures::StreamExt;
 
 pub const RESPONSE_STATUS_COLUMN: &str = "response_status";
 
-const HTTP_RESULT_COLUMNS: [&str; 7] = [
-    "request_path",
-    "request_query",
-    "request_body",
-    "content",
-    RESPONSE_STATUS_COLUMN,
-    "response_headers",
-    "_fetched_at",
-];
-
 /// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
 /// from record batches before caching.
 ///
-/// If the batches don't contain a `response_status` column (i.e., not from an HTTP connector),
-/// returns the batches unchanged.
+/// A batch is only ever filtered on the HTTP connector's own provenance
+/// marker ([`HTTP_RESPONSE_STATUS_METADATA_KEY`], read via
+/// [`http_fetch_status`]) — never merely because it happens to have a
+/// same-named, same-typed `response_status` column. A non-HTTP dataset's own
+/// business column named `response_status` (e.g. an order's status code)
+/// would otherwise have rows carrying a value like `503` silently dropped,
+/// exactly the class of data loss `batches_cacheable`'s own provenance check
+/// (`has_transient_http_error_responses`) guards against. Returned unchanged
+/// whenever that marker is absent, regardless of what the column holds.
 #[must_use]
 pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBatch> {
     if batches.is_empty() {
         return Vec::new();
     }
 
-    // If schema doesn't have response_status column, this isn't an HTTP result — return as-is
-    if batches[0]
-        .schema()
-        .column_with_name(RESPONSE_STATUS_COLUMN)
-        .is_none()
-    {
-        return batches.to_vec();
-    }
-
     let mut result = Vec::with_capacity(batches.len());
 
     for batch in batches {
-        let Some(col_idx) = batch
-            .schema()
-            .column_with_name(RESPONSE_STATUS_COLUMN)
-            .map(|(idx, _)| idx)
-        else {
+        let schema = batch.schema();
+        let Some(fetch_status) = http_fetch_status(&schema) else {
+            // No HTTP-connector provenance marker: not an HTTP-connector
+            // result (or its schema lost the marker upstream) — pass
+            // through unchanged, whatever a same-named column might hold.
             result.push(batch.clone());
+            continue;
+        };
+
+        let Some((col_idx, _)) = schema.column_with_name(RESPONSE_STATUS_COLUMN) else {
+            // Decomposed HTTP dataset with no materialized column: fall back
+            // to the schema-metadata status, which applies to every row in
+            // this batch (a single HTTP response never mixes statuses).
+            if !is_retryable_status(fetch_status) {
+                result.push(batch.clone());
+            }
             continue;
         };
 
@@ -87,7 +90,7 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
         // (exclude 5xx server errors and 429 Too Many Requests)
         let mask: arrow::array::BooleanArray = status_array
             .iter()
-            .map(|status| status.map(|s| !(500..600).contains(&s) && s != 429))
+            .map(|status| status.map(|s| !is_retryable_status(s)))
             .collect();
 
         match filter_record_batch(batch, &mask) {
@@ -105,56 +108,98 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
     result
 }
 
-fn is_http_result_batch(batch: &RecordBatch) -> bool {
-    let schema = batch.schema();
-
-    schema.column_with_name(RESPONSE_STATUS_COLUMN).is_some()
-        && schema
-            .fields()
-            .iter()
-            .all(|field| HTTP_RESULT_COLUMNS.contains(&field.name().as_str()))
-        && schema
-            .fields()
-            .iter()
-            .any(|field| field.name() != RESPONSE_STATUS_COLUMN)
+/// Whether a status code is a transient failure worth `stale_if_error`
+/// falling back on, rather than real data: a 5xx server error or 429 Too
+/// Many Requests.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
 }
 
+/// The HTTP status this batch's fetch actually returned, read from schema
+/// metadata rather than a `response_status` column: every batch this
+/// connector returns carries [`HTTP_RESPONSE_STATUS_METADATA_KEY`] set to
+/// the real per-fetch status (see `HttpTableProvider::schema_with_fetch_status`),
+/// whether or not `response_status` is one of the declared columns for this
+/// dataset's schema. Only the HTTP connector ever sets this key, so its mere
+/// presence is also the provenance signal that lets callers tell a real
+/// HTTP-connector batch apart from an unrelated dataset that
+/// happens to have its own same-named, same-typed `response_status` column
+/// (where a value of `503` would be real data, not an origin failure).
+fn http_fetch_status(schema: &arrow::datatypes::Schema) -> Option<u16> {
+    schema
+        .metadata()
+        .get(HTTP_RESPONSE_STATUS_METADATA_KEY)
+        .and_then(|v| v.parse().ok())
+}
+
+/// `response_status` is force-included as a real column for every HTTP
+/// dataset, decomposed or not (see `parse_http_json_nesting` in
+/// `runtime::dataconnector::https`) — the schema-metadata status alone isn't
+/// reliable once a query plan wraps the scan in another physical operator
+/// (a `FilterExec` rebuilds its output against the plan's own, plan-time
+/// schema, discarding the per-fetch metadata). The metadata check below is
+/// a fallback for the rare batch that reaches this function without the
+/// column at all; every row in a batch shares one fetch's status regardless
+/// — a single HTTP response never contains a per-row mix of status codes —
+/// so the schema-metadata value alone, without a column to scan, is still
+/// enough to classify the whole batch in that case.
 fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
     let Some(first_batch) = batches.first() else {
         return false;
     };
 
-    if !is_http_result_batch(first_batch) {
+    if http_fetch_status(&first_batch.schema()).is_none() {
         return false;
     }
 
     for batch in batches {
-        let Some(col_idx) = batch
-            .schema()
-            .column_with_name(RESPONSE_STATUS_COLUMN)
-            .map(|(idx, _)| idx)
-        else {
-            return false;
-        };
+        let schema = batch.schema();
+        if let Some((col_idx, _)) = schema.column_with_name(RESPONSE_STATUS_COLUMN) {
+            let Some(status_array) = batch.column(col_idx).as_any().downcast_ref::<UInt16Array>()
+            else {
+                tracing::warn!(
+                    "'{RESPONSE_STATUS_COLUMN}' column is not UInt16Array, skipping transient HTTP cache validation"
+                );
+                return false;
+            };
+            if status_array.iter().flatten().any(is_retryable_status) {
+                return true;
+            }
+            continue;
+        }
 
-        let Some(status_array) = batch.column(col_idx).as_any().downcast_ref::<UInt16Array>()
-        else {
-            tracing::warn!(
-                "'{RESPONSE_STATUS_COLUMN}' column is not UInt16Array, skipping transient HTTP cache validation"
-            );
-            return false;
-        };
-
-        if status_array
-            .iter()
-            .flatten()
-            .any(|status| status == 429 || (500..600).contains(&status))
-        {
-            return true;
+        // No materialized column (a decomposed dataset): fall back to the
+        // schema-metadata status, which applies to every row in this batch.
+        match http_fetch_status(&schema) {
+            Some(status) if is_retryable_status(status) => return true,
+            Some(_) => {}
+            None => return false,
         }
     }
 
     false
+}
+
+/// Walks `plan` and its children for `HttpExec`'s
+/// [`HTTP_TRANSIENT_FAILURE_METRIC_NAME`] counter, summed across every node.
+///
+/// `has_transient_http_error_responses` catches a retryable status through
+/// the `response_status` column or the schema-metadata fallback, but a user
+/// projection (e.g. `SELECT rank FROM http_data`) can prune `response_status`
+/// out of the batch entirely before it ever reaches that check.
+/// `ExecutionPlan::metrics()` lives on the plan tree, not the batch schema,
+/// so no column pruning can remove it — this is the fallback for that case.
+pub fn plan_saw_transient_http_failure(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(metrics) = plan.metrics()
+        && let Some(value) = metrics.sum_by_name(HTTP_TRANSIENT_FAILURE_METRIC_NAME)
+        && value.as_usize() > 0
+    {
+        return true;
+    }
+
+    plan.children()
+        .into_iter()
+        .any(plan_saw_transient_http_failure)
 }
 
 /// Returns whether the batches should be written to cache.
@@ -221,6 +266,7 @@ pub fn to_cached_record_batch_stream(
     raw_cache_key: RawCacheKey,
     input_tables: Arc<HashSet<TableReference>>,
     read_started_at: std::time::Instant,
+    physical_plan: Option<Arc<dyn ExecutionPlan>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let cache_schema = Arc::clone(&schema);
@@ -228,6 +274,14 @@ pub fn to_cached_record_batch_stream(
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
         let mut records_size: usize = 0;
+        // Set on any `Err` the stream yields, at any position. A prefix of
+        // successful batches read before the error (or none at all) must
+        // never be admitted to the cache — an empty `records` from a
+        // first-page failure would otherwise be indistinguishable from a
+        // genuine empty result, which `batches_cacheable` (schema/column
+        // based) and `plan_saw_transient_http_failure` (paginated case: a
+        // later page's failure, not the first) cannot see on their own.
+        let mut stream_failed = false;
         let has_encoder = cache_provider.encoder().is_some();
         // moka-rs operates by `u32` for records size, so max single record size is `u32::MAX` / 4 GB
         let cache_max_size = usize::try_from(cache_provider.max_size().min(u64::from(u32::MAX))).unwrap_or_default();
@@ -243,6 +297,9 @@ pub fn to_cached_record_batch_stream(
         };
 
         while let Some(batch_result) = stream.next().await {
+            if batch_result.is_err() {
+                stream_failed = true;
+            }
             if records_size < raw_size_limit && let Ok(batch) = &batch_result {
                 // Accumulate compacted batches, not the batches as they arrive.
                 // A `LIMIT`/`OFFSET` plan yields zero-copy slices, so holding
@@ -279,7 +336,11 @@ pub fn to_cached_record_batch_stream(
             // result set — skip the write to avoid caching a partial result.
             // `batches_boundable` is the separate question of whether the entry
             // could be billed for what it would hold.
-            if cache_provider.tables_changed_since(&input_tables, read_started_at) {
+            if stream_failed {
+                tracing::debug!(
+                    "The query stream yielded an error, skipping cache storage"
+                );
+            } else if cache_provider.tables_changed_since(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
                 // already known to be unservable.
@@ -289,6 +350,13 @@ pub fn to_cached_record_batch_stream(
             } else if !batches_cacheable(&records) {
                 tracing::debug!(
                     "The result carried transient HTTP error responses (5xx/429), skipping cache storage"
+                );
+            } else if physical_plan
+                .as_ref()
+                .is_some_and(plan_saw_transient_http_failure)
+            {
+                tracing::debug!(
+                    "The result's execution plan recorded a transient HTTP error response (5xx/429) that a projection excluded from the output columns, skipping cache storage"
                 );
             } else if !has_encoder && !batches_boundable(&records) {
                 // Only a raw entry can be pinned by what its batches rested on.
@@ -803,6 +871,7 @@ pub(crate) mod tests {
             key,
             Arc::new(input_tables),
             read_started_at,
+            None,
         );
         while wrapped.next().await.is_some() {}
 
@@ -958,10 +1027,44 @@ pub(crate) mod tests {
     use arrow::array::{StringArray, UInt16Array};
 
     fn create_http_response_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
-            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
-        ]))
+        Arc::new(
+            Schema::new(vec![
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            ])
+            .with_metadata(http_provenance_metadata()),
+        )
+    }
+
+    /// The `HTTP_RESPONSE_STATUS_METADATA_KEY` marker the real HTTP
+    /// connector's `base_table_schema` sets, for tagging a test schema the
+    /// same way. It lives on the *schema*, not the `response_status` field
+    /// — see [`http_fetch_status`].
+    fn http_provenance_metadata() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([(
+            HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+            "1".to_string(),
+        )])
+    }
+
+    /// Like [`create_http_response_schema`] (both now carry the provenance
+    /// marker), plus `_fetched_at` for tests exercising
+    /// `batches_cacheable`/`has_transient_http_error_responses`, which read
+    /// it via `time_column`/TTL logic that the plain schema above doesn't
+    /// need.
+    fn create_http_response_schema_with_fetched_at() -> Arc<Schema> {
+        Arc::new(
+            Schema::new(vec![
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new(
+                    "_fetched_at",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])
+            .with_metadata(http_provenance_metadata()),
+        )
     }
 
     #[tokio::test]
@@ -1009,6 +1112,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1056,12 +1160,16 @@ pub(crate) mod tests {
             .expect("valid cache provider"),
         );
 
-        let schema = create_http_response_schema();
+        let schema = create_http_response_schema_with_fetched_at();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec!["ok", "server error"])),
                 Arc::new(UInt16Array::from(vec![200, 500])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![
+                    Some(0),
+                    Some(0),
+                ])),
             ],
         )
         .expect("to create batch");
@@ -1079,6 +1187,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["http_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1117,12 +1226,13 @@ pub(crate) mod tests {
             .expect("valid cache provider"),
         );
 
-        let schema = create_http_response_schema();
+        let schema = create_http_response_schema_with_fetched_at();
         let ok_batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec!["ok"])),
                 Arc::new(UInt16Array::from(vec![200])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
             ],
         )
         .expect("to create ok batch");
@@ -1131,6 +1241,7 @@ pub(crate) mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["rate limited"])),
                 Arc::new(UInt16Array::from(vec![429])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
             ],
         )
         .expect("to create error batch");
@@ -1151,6 +1262,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["http_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1168,6 +1280,201 @@ pub(crate) mod tests {
         assert!(
             cached.is_none(),
             "HTTP results should not be cached if any batch contains only transient errors"
+        );
+    }
+
+    /// Every real consumer of this stream (`QueryResult::collect_batches`'s
+    /// `try_collect`, the HTTP JSON writer's `?`-propagating loop in
+    /// `json_array_body_from_batches`, and the Flight encoder's `return` on
+    /// `Err` in `crates/runtime/src/flight/mod.rs`) stops polling on the
+    /// first `Err` item. `stream!` compiles to a generator that only
+    /// advances past a `yield` when polled again, so with every caller
+    /// stopping there, the cache-admission code after the loop is never
+    /// reached at all once a stream errors — proven by running this exact
+    /// reproduction: identical `cached.is_none()` result with the
+    /// `stream_failed` guard removed. This test documents that
+    /// non-reproduction under real drainage; the guard and
+    /// [`Self::test_to_cached_record_batch_stream_skips_caching_when_stream_errors_under_full_drain`]
+    /// below are defense-in-depth against a future caller that does fully
+    /// drain the stream.
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_skips_caching_when_stream_errors() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Err::<RecordBatch, DataFusionError>(
+                DataFusionError::Execution("origin fetch failed".to_string()),
+            )]),
+        ));
+
+        let raw_cache_key = crate::key::CacheKey::Query("stream-error-not-cached", None)
+            .as_raw_key(cache_provider.hasher());
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["some_table".into()])),
+            std::time::Instant::now(),
+            None,
+        );
+
+        let result = cached_stream.try_collect::<Vec<_>>().await;
+        assert!(
+            result.is_err(),
+            "the stream's own error must still reach the caller"
+        );
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "a stream that errored must never be cached as an empty result, \
+            regardless of position (first item or a later page)"
+        );
+    }
+
+    /// The `stream_failed` guard's actual regression coverage: a stream that
+    /// fully drains (an `Ok` page followed by an `Err` page, polled to
+    /// completion via a manual loop rather than `try_collect`, which no real
+    /// caller does today — see the sibling test above) must still not admit
+    /// the earlier `Ok` page to the cache as if it were the complete result.
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_skips_caching_when_stream_errors_under_full_drain()
+    {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::StreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let ok_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1_i64]))],
+        )
+        .expect("valid record batch");
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![
+                Ok::<RecordBatch, DataFusionError>(ok_batch),
+                Err::<RecordBatch, DataFusionError>(DataFusionError::Execution(
+                    "origin fetch failed on a later page".to_string(),
+                )),
+            ]),
+        ));
+
+        let raw_cache_key = crate::key::CacheKey::Query("stream-error-full-drain-not-cached", None)
+            .as_raw_key(cache_provider.hasher());
+        let mut cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["some_table".into()])),
+            std::time::Instant::now(),
+            None,
+        );
+
+        // Poll to completion regardless of the `Err` in the middle — unlike
+        // `try_collect`, which every real caller uses and which would stop
+        // here instead.
+        let mut saw_ok = false;
+        let mut saw_err = false;
+        while let Some(item) = cached_stream.next().await {
+            match item {
+                Ok(_) => saw_ok = true,
+                Err(_) => saw_err = true,
+            }
+        }
+        assert!(saw_ok && saw_err, "the drain must observe both items");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "the successful page must not be cached as a complete result once a later \
+            page in the same stream errored"
+        );
+    }
+
+    /// Mirrors `HttpTableProviderBuilder::base_table_schema()` in
+    /// `data_components::http::provider` field-for-field, including
+    /// `request_headers` — regression test for #14156, where an allowlist
+    /// requiring every column to be a known HTTP metadata field rejected
+    /// this real 8-column schema outright, so a transient 5xx/429 was never
+    /// detected and `caching_stale_if_error` could never fall back to the
+    /// cache.
+    fn create_real_http_connector_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, false),
+                Field::new("request_query", DataType::Utf8, true),
+                Field::new("request_body", DataType::Utf8, true),
+                Field::new("request_headers", DataType::Utf8, true),
+                Field::new("content", DataType::Utf8, false),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new("response_headers", DataType::Utf8, true),
+                Field::new(
+                    "_fetched_at",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])
+            .with_metadata(http_provenance_metadata()),
+        )
+    }
+
+    #[test]
+    fn test_batches_cacheable_detects_transient_error_on_real_http_connector_schema() {
+        let schema = create_real_http_connector_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api/users"])),
+                Arc::new(StringArray::from(vec![Some("id=1")])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec!["service unavailable"])),
+                Arc::new(UInt16Array::from(vec![503])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with the real 8-column HTTP connector schema");
+
+        assert!(
+            !batches_cacheable(&[batch]),
+            "a transient 5xx on the real HTTP-connector schema (including request_headers) \
+            must be recognized so caching_stale_if_error can fall back to the cache"
         );
     }
 
@@ -1193,6 +1500,151 @@ pub(crate) mod tests {
             2,
             "Non-HTTP batches pass through unchanged"
         );
+    }
+
+    /// A non-HTTP source (e.g. `localpod`) can have its own business column
+    /// literally named `response_status` — an order's status code, say —
+    /// with no connection to an HTTP fetch. Filtering on the column's mere
+    /// name/type, without checking the HTTP connector's own provenance
+    /// marker first, would silently drop a legitimate row whose business
+    /// value happens to be `503`. Regression test for the finding on
+    /// `filter_transient_error_responses`: this function must gate on
+    /// `http_fetch_status` the same way `has_transient_http_error_responses`
+    /// already does.
+    #[test]
+    fn test_filter_preserves_non_http_business_row_with_503_value() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(UInt16Array::from(vec![503, 200])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1, "the batch must pass through, not vanish");
+        assert_eq!(
+            result[0].num_rows(),
+            2,
+            "a non-HTTP batch's own business `response_status` value of 503 is real data, \
+            not an origin failure, and must not be filtered out absent the HTTP \
+            connector's own provenance marker"
+        );
+    }
+
+    /// A batch shaped like what a narrow `SELECT` (one that doesn't
+    /// reference `response_status`) leaves after `DataFusion`'s projection
+    /// pushdown prunes that column away — carrying only the schema-level
+    /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker, no materialized column.
+    /// `batches_cacheable` and `filter_transient_error_responses` must still
+    /// detect a transient origin failure from that marker alone in this
+    /// shape, which is the metadata-only fallback path in
+    /// `has_transient_http_error_responses`.
+    fn create_projected_http_batch_schema_with_status(status: u16) -> Arc<Schema> {
+        Arc::new(
+            Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new(
+                    "_fetched_at",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])
+            .with_metadata(std::collections::HashMap::from([(
+                HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                status.to_string(),
+            )])),
+        )
+    }
+
+    #[test]
+    fn test_projected_http_batch_schema_has_no_response_status_column() {
+        let schema = create_projected_http_batch_schema_with_status(200);
+        assert!(
+            schema.column_with_name(RESPONSE_STATUS_COLUMN).is_none(),
+            "a projected-away response_status column must not reappear on the schema"
+        );
+    }
+
+    #[test]
+    fn test_batches_cacheable_detects_transient_error_on_a_projected_http_batch() {
+        let schema = create_projected_http_batch_schema_with_status(503);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with a projected HTTP batch schema");
+
+        assert!(
+            !batches_cacheable(&[batch]),
+            "a transient 503 must be detected from schema metadata even without a \
+            response_status column"
+        );
+    }
+
+    #[test]
+    fn test_batches_cacheable_accepts_ok_status_on_a_projected_http_batch() {
+        let schema = create_projected_http_batch_schema_with_status(200);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("row-1")])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with a projected HTTP batch schema");
+
+        assert!(
+            batches_cacheable(&[batch]),
+            "a 200 status on a projected HTTP batch should be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_filter_drops_whole_batch_on_a_projected_http_batch_transient_error() {
+        let schema = create_projected_http_batch_schema_with_status(500);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("to create batch with a projected HTTP batch schema");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert!(
+            result.is_empty(),
+            "a batch carrying a transient 500 status must be dropped entirely"
+        );
+    }
+
+    #[test]
+    fn test_filter_keeps_whole_batch_on_a_projected_http_batch_ok_status() {
+        let schema = create_projected_http_batch_schema_with_status(200);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("row-1"), Some("row-2")])),
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![
+                    Some(0),
+                    Some(0),
+                ])),
+            ],
+        )
+        .expect("to create batch with a decomposed HTTP schema");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2);
     }
 
     #[test]
@@ -1429,6 +1881,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         // Consume the stream to trigger caching.
@@ -1521,6 +1974,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -1602,6 +2056,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -1616,7 +2071,7 @@ pub(crate) mod tests {
             .expect("compressed multi-batch result should be cached");
 
         let cached_batches = cached.records().await.expect("cached result should decode");
-        let cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
+        let cached_rows: usize = cached_batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
             cached_rows,
             2 * n,
@@ -1672,6 +2127,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output = cached_stream
@@ -1728,6 +2184,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output_batches = cached_stream
@@ -1792,6 +2249,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["local_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -1854,6 +2312,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["test_table".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let _output = cached_stream
@@ -1931,6 +2390,7 @@ pub(crate) mod tests {
             raw_cache_key,
             Arc::new(HashSet::from(["docs".into()])),
             std::time::Instant::now(),
+            None,
         );
 
         let output = cached_stream

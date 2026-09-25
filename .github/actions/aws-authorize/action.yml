@@ -35,7 +35,7 @@ runs:
         echo "ROLE_SESSION_NAME=gha-${{ inputs.environment }}-${{ github.run_id }}" >> $GITHUB_ENV
 
     - name: Acquire role
-      uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
       with:
         role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
         role-session-name: ${{ env.ROLE_SESSION_NAME }}

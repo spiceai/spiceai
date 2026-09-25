@@ -4,8 +4,10 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use datafusion_common::Statistics;
 use datafusion_datasource::PartitionedFile;
+use datafusion_physical_expr::PhysicalExprRef;
 use object_store::ObjectMeta;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::scan::selection::Selection;
@@ -41,6 +43,26 @@ pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
     }
 }
 
+/// Provides access plans that depend on the scan's runtime predicate.
+///
+/// Unlike a [`VortexAccessPlanProvider`], which plans every file before the scan
+/// starts, this is consulted as each file opens, after dynamic expressions such
+/// as hash-join filters may have been populated. A scan registers one only when
+/// it has something to plan from such a predicate; every other scan opens its
+/// files exactly as before. The opener intersects a returned plan with the plan
+/// attached during physical planning, so a runtime plan can only narrow the rows
+/// read.
+#[async_trait]
+pub trait VortexRuntimeAccessPlanProvider: Debug + Send + Sync + 'static {
+    /// Returns an access plan for `file` derived from the scan's `predicate`, or
+    /// `None` to read the file as planned.
+    async fn runtime_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        predicate: Option<&PhysicalExprRef>,
+    ) -> Option<Arc<VortexAccessPlan>>;
+}
+
 impl VortexAccessPlan {
     /// Sets a [`Selection`] for this plan.
     #[must_use]
@@ -56,6 +78,31 @@ impl VortexAccessPlan {
         self.selection.as_ref()
     }
 
+    /// Returns whether this plan proves that the file contributes no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self.selection.as_ref() {
+            Some(Selection::IncludeByIndex(rows)) => rows.is_empty(),
+            Some(Selection::IncludeRoaring(rows)) => rows.is_empty(),
+            None
+            | Some(Selection::All | Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_)) => {
+                false
+            }
+        }
+    }
+
+    /// The plan that reads only the rows both plans read.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        let selection = match (self.selection.as_ref(), other.selection.as_ref()) {
+            (None | Some(Selection::All), selection) | (selection, None | Some(Selection::All)) => {
+                selection.cloned()
+            }
+            (Some(left), Some(right)) => Some(intersect_selections(left, right)),
+        };
+        Self { selection }
+    }
+
     /// Apply the plan to the scan's builder.
     pub fn apply_to_builder<A>(&self, mut scan_builder: ScanBuilder<A>) -> ScanBuilder<A>
     where
@@ -68,5 +115,119 @@ impl VortexAccessPlan {
         }
 
         scan_builder
+    }
+}
+
+/// Whether `selection` reads the row at `position`.
+fn selection_keeps(selection: &Selection, position: u64) -> bool {
+    match selection {
+        Selection::All => true,
+        Selection::IncludeByIndex(rows) => rows.binary_search(&position).is_ok(),
+        Selection::ExcludeByIndex(rows) => rows.binary_search(&position).is_err(),
+        Selection::IncludeRoaring(rows) => rows.contains(position),
+        Selection::ExcludeRoaring(rows) => !rows.contains(position),
+    }
+}
+
+/// Intersects two selections. An include list is filtered by the other side,
+/// so it stays sorted; two exclude lists become their sorted union.
+fn intersect_selections(left: &Selection, right: &Selection) -> Selection {
+    match (left, right) {
+        (Selection::All, other) | (other, Selection::All) => other.clone(),
+        (Selection::IncludeByIndex(rows), other) | (other, Selection::IncludeByIndex(rows)) => {
+            Selection::IncludeByIndex(
+                rows.iter()
+                    .copied()
+                    .filter(|&position| selection_keeps(other, position))
+                    .collect(),
+            )
+        }
+        (Selection::IncludeRoaring(rows), other) | (other, Selection::IncludeRoaring(rows)) => {
+            Selection::IncludeByIndex(
+                rows.iter()
+                    .filter(|&position| selection_keeps(other, position))
+                    .collect(),
+            )
+        }
+        (
+            Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_),
+            Selection::ExcludeByIndex(_) | Selection::ExcludeRoaring(_),
+        ) => {
+            let mut excluded: Vec<u64> = excluded_rows(left).chain(excluded_rows(right)).collect();
+            excluded.sort_unstable();
+            excluded.dedup();
+            Selection::ExcludeByIndex(excluded.into_iter().collect())
+        }
+    }
+}
+
+fn excluded_rows(selection: &Selection) -> Box<dyn Iterator<Item = u64> + '_> {
+    match selection {
+        Selection::ExcludeByIndex(rows) => Box::new(rows.iter().copied()),
+        Selection::ExcludeRoaring(rows) => Box::new(rows.iter()),
+        Selection::All | Selection::IncludeByIndex(_) | Selection::IncludeRoaring(_) => {
+            Box::new(std::iter::empty())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex::buffer::Buffer;
+
+    use super::*;
+
+    fn plan(selection: Option<Selection>) -> VortexAccessPlan {
+        VortexAccessPlan { selection }
+    }
+
+    fn rows_read(plan: &VortexAccessPlan, total: u64) -> Vec<u64> {
+        (0..total)
+            .filter(|&position| {
+                plan.selection()
+                    .is_none_or(|selection| selection_keeps(selection, position))
+            })
+            .collect()
+    }
+
+    /// Every pair of selection kinds intersects to exactly the rows both read.
+    #[test]
+    fn intersection_reads_only_rows_both_plans_read() {
+        let total = 16;
+        let include: Buffer<u64> = [1u64, 3, 5, 7, 9].into_iter().collect();
+        let exclude: Buffer<u64> = [3u64, 4, 9, 12].into_iter().collect();
+        let exclude_other: Buffer<u64> = [0u64, 4, 5, 15].into_iter().collect();
+        let roaring_rows = [2u64, 3, 7, 11];
+        let selections = [
+            None,
+            Some(Selection::All),
+            Some(Selection::IncludeByIndex(include)),
+            Some(Selection::IncludeByIndex(Buffer::empty())),
+            Some(Selection::ExcludeByIndex(exclude)),
+            Some(Selection::ExcludeByIndex(exclude_other)),
+            Some(Selection::IncludeRoaring(
+                roaring_rows.into_iter().collect(),
+            )),
+            Some(Selection::ExcludeRoaring(
+                roaring_rows.into_iter().collect(),
+            )),
+        ];
+        for left in &selections {
+            for right in &selections {
+                let left = plan(left.clone());
+                let right = plan(right.clone());
+                let expected: Vec<u64> = rows_read(&left, total)
+                    .into_iter()
+                    .filter(|position| rows_read(&right, total).contains(position))
+                    .collect();
+                let intersection = left.intersect(&right);
+                assert_eq!(rows_read(&intersection, total), expected);
+                if let Some(Selection::IncludeByIndex(rows) | Selection::ExcludeByIndex(rows)) =
+                    intersection.selection()
+                {
+                    assert!(rows.is_sorted(), "a by-index selection must stay sorted");
+                }
+            }
+        }
     }
 }
