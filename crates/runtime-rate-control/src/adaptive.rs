@@ -32,12 +32,12 @@ limitations under the License.
 //!   with this half-life, so a shorter window reacts and recovers faster.
 //!
 //! On each new request:
-//! ```
+//! ```text
 //!   count <- count · 0.5^(Δt / half_life)
 //! ```
 //!
 //! And define the admission coefficient:
-//! ```
+//! ```text
 //!                   ┌                          ┐
 //!  admission        │   K · accepts  +  1      │
 //! coefficient = min │ ─────────────────── ,  1 │

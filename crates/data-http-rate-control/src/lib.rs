@@ -358,7 +358,7 @@ impl HttpRateControlMetrics {
     /// 0 when adaptive rate control is disabled for this origin. Read live from
     /// the controller, so it reflects window decay between scrapes.
     #[must_use]
-    pub fn adaptive_admission_coefficient_permille(&self) -> u64 {
+    pub fn adaptive_admission_coefficient_permille(&self) -> Option<u64> {
         self.rate_controller
             .read()
             .ok()
@@ -368,7 +368,25 @@ impl HttpRateControlMetrics {
                     .and_then(|controller| controller.admission_coefficient())
             })
             .map(|coefficient| f64_round_to_u64(coefficient.clamp(0.0, 1.0) * 1000.0))
-            .unwrap_or_default()
+    }
+
+    /// Requests adaptive rate control has throttled, or `None` when adaptive
+    /// rate control is disabled for this origin — a throttle that cannot happen
+    /// reports no series rather than a `0` that reads as a healthy origin.
+    #[must_use]
+    pub fn adaptive_throttled_total(&self) -> Option<u64> {
+        let adaptive_enabled = self
+            .rate_controller
+            .read()
+            .ok()
+            .and_then(|controller| {
+                controller
+                    .as_ref()
+                    .map(|controller| controller.admission_coefficient().is_some())
+            })
+            .unwrap_or(false);
+        adaptive_enabled
+            .then(|| self.rate_controller_metric(RateControllerMetrics::adaptive_throttled_total))
     }
 
     fn rate_controller_metric(
@@ -487,13 +505,13 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
         "adaptive_rate_control_admission_coefficient_permille",
         MetricType::ObservableGaugeU64,
     )
-    .description("Current adaptive admission coefficient for this upstream origin, in parts-per-thousand (1000 = admit all); 0 when adaptive rate control is disabled")
+    .description("Current adaptive admission coefficient for this upstream origin, in parts-per-thousand (1000 = admit all); absent when adaptive rate control is disabled")
     .auto_register(),
     MetricSpec::new(
         "adaptive_rate_control_throttled_total",
         MetricType::ObservableCounterU64,
     )
-    .description("Total HTTP requests adaptive rate control throttled for this upstream origin (charged an above-normal weight because the origin was failing); 0 when adaptive rate control is disabled or the origin has stayed healthy")
+    .description("Total HTTP requests adaptive rate control throttled for this upstream origin (charged an above-normal weight because the origin was failing); 0 while the origin has stayed healthy, absent when adaptive rate control is disabled")
     .auto_register(),
 ];
 
@@ -567,6 +585,20 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             }};
         }
 
+        // For a metric that does not apply to this origin: observe nothing, so
+        // the series is absent rather than a constant `0`.
+        macro_rules! observe_optional_metric {
+            ($value:expr) => {{
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    if should_observe_metrics(metric_source.as_ref())
+                        && let Some(value) = $value
+                    {
+                        observer.observe(value, &attributes);
+                    }
+                })))
+            }};
+        }
+
         match metric.name {
             "inflight_operations" => observe_metric!(
                 metrics.rate_controller_metric(RateControllerMetrics::inflight_permits)
@@ -611,11 +643,11 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
                 metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_remaining_ms)
             ),
             "adaptive_rate_control_admission_coefficient_permille" => {
-                observe_metric!(metrics.adaptive_admission_coefficient_permille())
+                observe_optional_metric!(metrics.adaptive_admission_coefficient_permille())
             }
-            "adaptive_rate_control_throttled_total" => observe_metric!(
-                metrics.rate_controller_metric(RateControllerMetrics::adaptive_throttled_total)
-            ),
+            "adaptive_rate_control_throttled_total" => {
+                observe_optional_metric!(metrics.adaptive_throttled_total())
+            }
             _ => None,
         }
     }
@@ -650,12 +682,56 @@ pub fn parameter_specs() -> [ParameterSpec; 8] {
 /// Resolve a component's rate-control configuration from its own parameters,
 /// falling back to the matching `runtime.params` key.
 ///
+/// For connectors that declare [`parameter_specs`] and report request outcomes,
+/// so adaptive rate control can take effect.
+///
+/// # Errors
+/// Returns an invalid-configuration error when a `max_concurrent_requests`,
+/// `requests_per_second_limit` or `requests_per_minute_limit` value does not
+/// parse as a non-zero integer, a `rate_control_jitter_min` /
+/// `rate_control_jitter_max` value does not parse as a duration, an
+/// `adaptive_rate_control*` value is invalid, or adaptive rate control is
+/// enabled without a static limit to scale.
+pub fn resolve_config_for_component<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<HttpRateControlConfig> {
+    let config = HttpRateControlConfig {
+        adaptive_rate_control: parse_adaptive_rate_control_param(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+        )?,
+        ..resolve_static_config_for_component(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+        )?
+    };
+
+    ensure_adaptive_has_static_limit(&config, connector_component, dataconnector)?;
+    Ok(config)
+}
+
+/// Resolve only the static limits (concurrency, request rate, jitter) of a
+/// component's rate-control configuration; adaptive rate control stays disabled.
+///
+/// For connectors that cannot observe per-request outcomes and so do not declare
+/// the `adaptive_rate_control*` parameters: their clients never report whether
+/// a request failed, so adaptive control could not take effect, and the
+/// runtime-wide `runtime.params.http_adaptive_rate_control` default does not
+/// apply to them.
+///
 /// # Errors
 /// Returns an invalid-configuration error when a `max_concurrent_requests`,
 /// `requests_per_second_limit` or `requests_per_minute_limit` value does not
 /// parse as a non-zero integer, or a `rate_control_jitter_min` /
 /// `rate_control_jitter_max` value does not parse as a duration.
-pub fn resolve_config_for_component<S: BuildHasher>(
+pub fn resolve_static_config_for_component<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
     connector_component: &ConnectorComponent,
@@ -688,24 +764,16 @@ pub fn resolve_config_for_component<S: BuildHasher>(
         )?,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
-        adaptive_rate_control: parse_adaptive_rate_control_param(
-            params,
-            runtime_params,
-            connector_component,
-            dataconnector,
-        )?,
+        adaptive_rate_control: None,
     };
 
-    let config = with_jitter(
+    with_jitter(
         params,
         runtime_params,
         connector_component,
         dataconnector,
         config,
-    )?;
-
-    ensure_adaptive_has_static_limit(&config, connector_component, dataconnector)?;
-    Ok(config)
+    )
 }
 
 /// Reject an origin that enables adaptive rate control but defines no static
@@ -746,7 +814,7 @@ pub fn ensure_adaptive_has_static_limit(
 ///
 /// The on/off switch is `adaptive_rate_control`; the two hyperparameters are
 /// `adaptive_rate_control_failure_threshold` (the error rate above which
-/// throttling begins, as a percentage or fraction, default 50%) and
+/// throttling begins, as a percentage or fraction, default 10%) and
 /// `adaptive_rate_control_window` (the reaction/recovery decay half-life, default
 /// 10s). The two hyperparameters are inert when adaptive control is disabled, so
 /// a runtime-wide default applies only to the datasets that enable adaptive
@@ -1592,7 +1660,7 @@ fn conflicting_config_error<T>(
         dataconnector: dataconnector.to_string(),
         connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max and adaptive_rate_control values for components sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, adaptive_rate_control, adaptive_rate_control_failure_threshold and adaptive_rate_control_window values for components sharing an origin."
         ),
     })
 }
@@ -1683,6 +1751,36 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
         assert!(!object_key.contains("https"));
+    }
+
+    /// The adaptive metrics report no value (so no series) for an origin without
+    /// adaptive rate control, and real values — `0` throttled up front — for one
+    /// with it.
+    #[test]
+    fn adaptive_metrics_are_absent_when_adaptive_is_disabled() {
+        let quota = Quota::per_second(NonZeroU32::new(10).expect("non-zero test quota"));
+        let metrics = HttpRateControlMetrics::default();
+        assert_eq!(metrics.adaptive_admission_coefficient_permille(), None);
+        assert_eq!(metrics.adaptive_throttled_total(), None);
+
+        let static_controller = RateController::builder().add_quota(quota).build();
+        metrics.set_rate_controller(Some(&static_controller));
+        assert_eq!(metrics.adaptive_admission_coefficient_permille(), None);
+        assert_eq!(metrics.adaptive_throttled_total(), None);
+
+        let adaptive_controller = RateController::builder()
+            .add_quota(quota)
+            .with_adaptive(
+                AdaptiveRateControl::new(0.1, runtime_rate_control::DEFAULT_ADAPTIVE_WINDOW)
+                    .expect("valid adaptive control"),
+            )
+            .build();
+        metrics.set_rate_controller(Some(&adaptive_controller));
+        assert_eq!(
+            metrics.adaptive_admission_coefficient_permille(),
+            Some(1000)
+        );
+        assert_eq!(metrics.adaptive_throttled_total(), Some(0));
     }
 
     #[test]
