@@ -38,7 +38,7 @@ use std::{
     collections::HashMap,
     fmt::Write,
     ops::Not,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -725,6 +725,83 @@ impl Not for &ForceCreate {
 
     fn not(self) -> Self::Output {
         !self.0
+    }
+}
+
+/// Renames a downloaded snapshot file over the accelerator's file.
+///
+/// [`SnapshotEngine::prepare_file_restore`] runs first. If the rename does not
+/// replace the live file, [`SnapshotEngine::abort_file_restore`] puts back
+/// whatever that call moved aside before this returns the rename error.
+pub(crate) async fn replace_downloaded_file(
+    engine: &dyn SnapshotEngine,
+    temp_path: &Path,
+    local_path: &Path,
+    dataset_name: &str,
+) -> Result<(), SnapshotDownloadError> {
+    if let Err(source) = engine.prepare_file_restore(local_path, dataset_name).await {
+        let _ = fs::remove_file(temp_path).await;
+        return Err(SnapshotDownloadError::FinalizeFile {
+            path: local_path.to_path_buf(),
+            source: Box::new(source),
+        });
+    }
+
+    if let Err(source) = fs::rename(temp_path, local_path).await {
+        if source.kind() == std::io::ErrorKind::AlreadyExists {
+            let aside = local_path.with_extension(format!("old.{}", std::process::id()));
+            if let Err(swap_err) = fs::rename(local_path, &aside).await {
+                let _ = fs::remove_file(temp_path).await;
+                return Err(
+                    rollback_failed_rename(engine, local_path, dataset_name, swap_err).await,
+                );
+            }
+            if let Err(retry_err) = fs::rename(temp_path, local_path).await {
+                // The original file was moved aside. Put it back before restoring
+                // the state `prepare_file_restore` parked beside it.
+                let _ = fs::rename(&aside, local_path).await;
+                let _ = fs::remove_file(temp_path).await;
+                return Err(
+                    rollback_failed_rename(engine, local_path, dataset_name, retry_err).await,
+                );
+            }
+            // Best-effort cleanup; the aside file is reaped on next restart if
+            // this fails (another process may still have it open on Windows).
+            let _ = fs::remove_file(&aside).await;
+        } else {
+            let _ = fs::remove_file(temp_path).await;
+            return Err(rollback_failed_rename(engine, local_path, dataset_name, source).await);
+        }
+    }
+
+    engine
+        .finalize_file_snapshot(local_path, dataset_name)
+        .await
+        .map_err(|source| SnapshotDownloadError::FinalizeFile {
+            path: local_path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+    Ok(())
+}
+
+/// Puts back sidecars parked by `prepare_file_restore` after the rename left
+/// the original database file in place. When putting them back fails, that
+/// error is what the caller sees: the live database is then missing its log.
+async fn rollback_failed_rename(
+    engine: &dyn SnapshotEngine,
+    local_path: &Path,
+    dataset_name: &str,
+    source: std::io::Error,
+) -> SnapshotDownloadError {
+    if let Err(abort) = engine.abort_file_restore(local_path, dataset_name).await {
+        return SnapshotDownloadError::FinalizeFile {
+            path: local_path.to_path_buf(),
+            source: Box::new(abort),
+        };
+    }
+    SnapshotDownloadError::WriteLocal {
+        path: local_path.to_path_buf(),
+        source,
     }
 }
 
@@ -2254,62 +2331,16 @@ impl SnapshotManager {
         // because the accelerator's pool may still be holding readers open
         // against `local_path` in the gap before `reload_from_snapshot`
         // evicts them.
-        // Clear what the live file keeps beside it before the restored file
-        // takes its place; see `SnapshotEngine::prepare_file_restore`.
-        if let Err(source) = self
-            .snapshot_engine
-            .prepare_file_restore(local_path, &self.dataset_name)
-            .await
-        {
-            let _ = fs::remove_file(&temp_path).await;
-            return Err(SnapshotDownloadError::FinalizeFile {
-                path: local_path.clone(),
-                source: Box::new(source),
-            });
-        }
-
-        if let Err(source) = fs::rename(&temp_path, local_path).await {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                let sidecar_path = local_path.with_extension(format!("old.{}", std::process::id()));
-                if let Err(swap_err) = fs::rename(local_path, &sidecar_path).await {
-                    let _ = fs::remove_file(&temp_path).await;
-                    return Err(SnapshotDownloadError::WriteLocal {
-                        path: local_path.clone(),
-                        source: swap_err,
-                    });
-                }
-                if let Err(retry_err) = fs::rename(&temp_path, local_path).await {
-                    // Restore the original to avoid leaving the dataset
-                    // pointing at a missing file.
-                    let _ = fs::rename(&sidecar_path, local_path).await;
-                    let _ = fs::remove_file(&temp_path).await;
-                    return Err(SnapshotDownloadError::WriteLocal {
-                        path: local_path.clone(),
-                        source: retry_err,
-                    });
-                }
-                // Best-effort cleanup; the sidecar will be reaped on next
-                // restart if this fails (e.g. another process still has it
-                // open on Windows).
-                let _ = fs::remove_file(&sidecar_path).await;
-            } else {
-                let _ = fs::remove_file(&temp_path).await;
-                return Err(SnapshotDownloadError::WriteLocal {
-                    path: local_path.clone(),
-                    source,
-                });
-            }
-        }
-
-        // Remove what a connection to the replaced file created beside it since;
-        // see `SnapshotEngine::finalize_file_snapshot`.
-        self.snapshot_engine
-            .finalize_file_snapshot(local_path, &self.dataset_name)
-            .await
-            .map_err(|source| SnapshotDownloadError::FinalizeFile {
-                path: local_path.clone(),
-                source: Box::new(source),
-            })?;
+        // Moves aside what the live file keeps beside it, renames the download
+        // into place, and puts that state back when the rename does not replace
+        // the file. See `replace_downloaded_file`.
+        replace_downloaded_file(
+            self.snapshot_engine.as_ref(),
+            &temp_path,
+            local_path,
+            &self.dataset_name,
+        )
+        .await?;
 
         // Best-effort fsync of the parent directory so the rename's directory
         // entry update is durable across a crash. POSIX requires this in

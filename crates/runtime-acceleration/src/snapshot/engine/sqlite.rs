@@ -30,11 +30,13 @@ limitations under the License.
 //!      to `journal_mode=DELETE` so the uploaded snapshot has no `-wal`
 //!      sidecar at all and is fully self-contained.
 //!   3. **`prepare_file_restore`** — right before a download is renamed over
-//!      the live file, removes the live database's `-wal`/`-shm`/`-journal`,
-//!      so no connection that opens the path once the restored file is in
-//!      place can apply them to it.
-//!   4. **`finalize_file_snapshot`** — after the rename, removes any that a
-//!      connection to the replaced database created in between.
+//!      the live file, moves the live database's `-wal`/`-shm`/`-journal`
+//!      aside, so no connection that opens the path once the restored file is
+//!      in place can apply them to it. **`abort_file_restore`** moves them
+//!      back when that rename does not replace the file.
+//!   4. **`finalize_file_snapshot`** — after the rename, deletes the sidecars
+//!      that were set aside and any that a connection to the replaced database
+//!      created in between.
 
 use async_trait::async_trait;
 use snafu::prelude::*;
@@ -82,6 +84,22 @@ pub enum SqliteSnapshotError {
         "Failed to remove the stale SQLite sidecar {path:?} after restoring the snapshot of dataset '{dataset}': {source}"
     ))]
     RemoveSidecar {
+        dataset: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display(
+        "Failed to move aside the SQLite sidecar {path:?} before restoring the snapshot of dataset '{dataset}': {source}"
+    ))]
+    ParkSidecar {
+        dataset: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display(
+        "Failed to put back the SQLite sidecar {path:?} after the snapshot restore of dataset '{dataset}' did not replace the database: {source}"
+    ))]
+    RestoreSidecar {
         dataset: String,
         path: PathBuf,
         source: std::io::Error,
@@ -210,13 +228,23 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
         // The rename replaces the database file but not the sidecars kept
-        // beside it, so they are removed first. A connection opening the path
-        // once the restored file is in place would otherwise take the stale
-        // `-wal` as the restored database's and apply it, and a checkpoint
-        // would then write the old pages into the restored file. Connections
-        // already open on the live file hold their own handles to the removed
+        // beside it, so they are moved aside first. A connection opening the
+        // path once the restored file is in place would otherwise take the
+        // stale `-wal` as the restored database's and apply it, and a
+        // checkpoint would then write the old pages into the restored file.
+        // Moving them, rather than deleting them, lets `abort_file_restore`
+        // put them back when the rename does not replace the file. Connections
+        // already open on the live file hold their own handles to the moved
         // sidecars, so reads in flight are unaffected.
-        remove_sidecars(live_path, dataset_name).await
+        park_sidecars(live_path, dataset_name).await
+    }
+
+    async fn abort_file_restore(
+        &self,
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), super::SnapshotEngineError> {
+        unpark_sidecars(live_path, dataset_name).await
     }
 
     async fn finalize_file_snapshot(
@@ -224,9 +252,109 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         restored_path: &Path,
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
+        // Drop the parked originals before removing anything a connection
+        // created at the live names. A later abort must not be able to put
+        // the replaced database's log beside the restored file.
+        discard_parked_sidecars(restored_path, dataset_name).await?;
         // A connection to the replaced database opened after the sidecars were
-        // removed may have created new ones.
+        // moved aside may have created new ones at the live names.
         remove_sidecars(restored_path, dataset_name).await
+    }
+}
+
+const SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+/// Not a suffix `SQLite` looks up, so a connection that opens the database
+/// while a restore is in progress cannot apply the parked log.
+const PARKED_SIDECAR_MARK: &str = ".spice-aside";
+
+fn parked_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = sidecar_path(database, suffix).into_os_string();
+    path.push(PARKED_SIDECAR_MARK);
+    PathBuf::from(path)
+}
+
+async fn park_sidecars(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    for suffix in SIDECAR_SUFFIXES {
+        let from = sidecar_path(database, suffix);
+        let to = parked_sidecar_path(database, suffix);
+        match rename_over(&from, &to).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                unpark_sidecars(database, dataset_name).await?;
+                return Err(super::SnapshotEngineError::Sqlite {
+                    source: SqliteSnapshotError::ParkSidecar {
+                        dataset: dataset_name.to_string(),
+                        path: from,
+                        source,
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn unpark_sidecars(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    for suffix in SIDECAR_SUFFIXES {
+        let from = parked_sidecar_path(database, suffix);
+        let to = sidecar_path(database, suffix);
+        match rename_over(&from, &to).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(super::SnapshotEngineError::Sqlite {
+                    source: SqliteSnapshotError::RestoreSidecar {
+                        dataset: dataset_name.to_string(),
+                        path: to,
+                        source,
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn discard_parked_sidecars(
+    database: &Path,
+    dataset_name: &str,
+) -> Result<(), super::SnapshotEngineError> {
+    for suffix in SIDECAR_SUFFIXES {
+        let path = parked_sidecar_path(database, suffix);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(super::SnapshotEngineError::Sqlite {
+                    source: SqliteSnapshotError::RemoveSidecar {
+                        dataset: dataset_name.to_string(),
+                        path,
+                        source,
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Renames `from` onto `to`. On Windows, replacing an existing file can fail
+/// with [`std::io::ErrorKind::AlreadyExists`]; remove that file and retry once.
+async fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(from, to).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            tokio::fs::remove_file(to).await?;
+            tokio::fs::rename(from, to).await
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -234,7 +362,7 @@ async fn remove_sidecars(
     database: &Path,
     dataset_name: &str,
 ) -> Result<(), super::SnapshotEngineError> {
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for suffix in SIDECAR_SUFFIXES {
         let sidecar = sidecar_path(database, suffix);
         match tokio::fs::remove_file(&sidecar).await {
             Ok(()) => {}
@@ -411,6 +539,84 @@ mod tests {
         // Closing the replaced database's connection afterwards changes nothing.
         drop(live);
         assert_eq!(count_rows_in_wal_mode(&live_path), 3);
+    }
+
+    /// Opens a fresh connection. Returns the row count, or the error `SQLite`
+    /// raises when the database's WAL was removed out from under it.
+    fn fresh_row_count(path: &Path) -> Result<i64, rusqlite::Error> {
+        let conn = Connection::open(path)?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_after_prepare_file_restore_keeps_the_live_rows() {
+        let tmp = TempDir::new().expect("tmp");
+        let live_path = tmp.path().join("orders.sqlite");
+        let live = Connection::open(&live_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO t(id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        )
+        .expect("write live rows into the wal");
+        assert!(sidecar_path(&live_path, "-wal").exists());
+        assert_eq!(fresh_row_count(&live_path).expect("read before prepare"), 3);
+
+        let engine = SqliteSnapshotEngine::new();
+        let missing = tmp.path().join("missing-download.sqlite");
+        let error =
+            crate::snapshot::replace_downloaded_file(&engine, &missing, &live_path, "orders")
+                .await
+                .expect_err("a missing download cannot replace the live database");
+        assert!(
+            matches!(
+                error,
+                crate::snapshot::SnapshotDownloadError::WriteLocal { .. }
+            ),
+            "the rename failure is reported once the wal is back: {error}"
+        );
+        // The original connection is still open, which is the pool's state when
+        // a restore fails. A connection opened now must still read the rows.
+        assert_eq!(
+            fresh_row_count(&live_path).expect("read while the original connection is open"),
+            3
+        );
+        assert!(
+            sidecar_path(&live_path, "-wal").exists(),
+            "the live wal is back beside the database"
+        );
+        assert!(
+            !parked_sidecar_path(&live_path, "-wal").exists(),
+            "the parked copy was moved back, not left aside"
+        );
+        drop(live);
+        assert_eq!(fresh_row_count(&live_path).expect("read after close"), 3);
+    }
+
+    #[tokio::test]
+    async fn replace_downloaded_file_keeps_the_snapshot_rows_and_drops_the_parked_wal() {
+        let tmp = TempDir::new().expect("tmp");
+        let (live_path, download, live) = live_wal_database_and_download(&tmp);
+        let engine = SqliteSnapshotEngine::new();
+        crate::snapshot::replace_downloaded_file(&engine, &download, &live_path, "orders")
+            .await
+            .expect("replace");
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
+        drop(live);
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
+        for suffix in SIDECAR_SUFFIXES {
+            assert!(
+                !sidecar_path(&live_path, suffix).exists(),
+                "{suffix} still beside the restored file"
+            );
+            assert!(
+                !parked_sidecar_path(&live_path, suffix).exists(),
+                "{suffix} still parked"
+            );
+        }
     }
 
     #[tokio::test]

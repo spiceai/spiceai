@@ -136,16 +136,40 @@ pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked by `SnapshotManager` right before a downloaded single-file
     /// snapshot is renamed over the accelerator's file.
     ///
-    /// Engines that keep state beside the primary file must remove it here: a
-    /// connection that opens the path once the restored file is in place would
-    /// otherwise pair it with the *replaced* file's state. `SQLite` in WAL mode
-    /// is the case: the old database's `-wal` and `-shm` would stay beside the
-    /// restored file, and a connection opening it applies that stale
+    /// Engines that keep state beside the primary file must move it out of the
+    /// way here: a connection that opens the path once the restored file is in
+    /// place would otherwise pair it with the *replaced* file's state. `SQLite`
+    /// in WAL mode is the case: the old database's `-wal` and `-shm` would stay
+    /// beside the restored file, and a connection opening it applies that stale
     /// write-ahead log, losing the restored rows for good. Removing them only
     /// after the rename leaves a window for exactly that connection.
     ///
-    /// Default implementation is a no-op.
+    /// The move has to be reversible. When the rename does not replace the live
+    /// file, `SnapshotManager` calls [`Self::abort_file_restore`] so the engine
+    /// can put that state back. Deleting it instead leaves the live database
+    /// damaged for every connection that opens it afterwards.
+    ///
+    /// Default implementation is a no-op. An engine that moves state aside must
+    /// override [`Self::abort_file_restore`] too, and a wrapper must forward both.
     async fn prepare_file_restore(
+        &self,
+        live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (live_path, dataset_name);
+        Ok(())
+    }
+
+    /// Puts back whatever [`Self::prepare_file_restore`] moved aside, when the
+    /// rename that was about to replace the live file did not do so.
+    ///
+    /// Calling this after that rename has succeeded reattaches the replaced
+    /// file's state to the restored file. `SnapshotManager` calls it only on
+    /// the paths that leave the original file in place.
+    ///
+    /// Default implementation is a no-op. A wrapper must forward it: an inner
+    /// engine may have parked state the default would leave where it is.
+    async fn abort_file_restore(
         &self,
         live_path: &Path,
         dataset_name: &str,
