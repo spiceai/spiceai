@@ -121,6 +121,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -788,6 +789,17 @@ fn try_rewrite_oversized_join(
     // cannot be rewritten without changing the output schema; leave it to the
     // deterministic `runtime.query.prefer_hash_join` knob.
     if hash_join.contains_projection() || hash_join.on().is_empty() {
+        return Ok(None);
+    }
+
+    // This rule runs AFTER `EnforceDistribution`. A `mode=Partitioned`
+    // `HashJoinExec` already has both inputs hash-partitioned into the same N.
+    // `CollectLeft` (a 1-partition build against an N-partition probe) is
+    // valid for hash join, but `SortMergeJoinExec` requires equal partition
+    // counts and fails at execute if they differ (left 1, right N).
+    let left_partitions = hash_join.left().output_partitioning().partition_count();
+    let right_partitions = hash_join.right().output_partitioning().partition_count();
+    if left_partitions != right_partitions {
         return Ok(None);
     }
 
@@ -1673,6 +1685,7 @@ mod tests {
     use datafusion::physical_plan::Partitioning;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
@@ -2874,6 +2887,61 @@ mod tests {
             RepartitionExec::try_new(input, Partitioning::Hash(vec![expr], partitions))
                 .expect("repartition should be valid"),
         )
+    }
+
+    /// `CollectLeft` hash join of a 1-partition build (a multi-snapshot Cayenne
+    /// scan coalesced by `EnforceDistribution`) against an N-partition
+    /// round-robin probe. The memory gate would otherwise rewrite this to
+    /// `SortMergeJoinExec`, which then fails at execute with
+    /// `partition count mismatch 1!=N`. A CDC-fed table reports an inexact row
+    /// count, so both precisions are covered.
+    #[test]
+    fn does_not_rewrite_collect_left_hash_join_to_mismatched_sort_merge() {
+        let schema = order_line_schema();
+        for build_rows in [Precision::Exact(10_000_000), Precision::Inexact(10_000_000)] {
+            let snapshots = UnionExec::try_new(vec![
+                cayenne_file_exec_with_num_rows(&schema, "order_line_1.vortex", build_rows),
+                cayenne_file_exec_with_num_rows(&schema, "order_line_2.vortex", build_rows),
+            ])
+            .expect("union of same-schema snapshot scans should be valid");
+            let left = Arc::new(CoalescePartitionsExec::new(snapshots)) as Arc<dyn ExecutionPlan>;
+            let right = Arc::new(
+                RepartitionExec::try_new(
+                    large_exact_cayenne_file_exec(&schema, "order_line.vortex"),
+                    Partitioning::RoundRobinBatch(4),
+                )
+                .expect("round-robin repartition should be valid"),
+            ) as Arc<dyn ExecutionPlan>;
+            assert_eq!(left.output_partitioning().partition_count(), 1);
+            assert_eq!(right.output_partitioning().partition_count(), 4);
+
+            let on = vec![(
+                col("order_id", left.schema().as_ref()).expect("left join key should exist"),
+                col("order_id", right.schema().as_ref()).expect("right join key should exist"),
+            )];
+            let join = Arc::new(
+                HashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .expect("collect-left hash join should be valid"),
+            );
+
+            let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024));
+            let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+            assert!(
+                optimized.is::<HashJoinExec>(),
+                "CollectLeft 1-vs-N hash join ({build_rows:?} build rows) must stay a hash join; SortMergeJoinExec requires equal partition counts"
+            );
+        }
     }
 
     /// When the rewriter replaces an inner semi/anti join that sits
