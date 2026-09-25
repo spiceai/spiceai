@@ -40,7 +40,11 @@ use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
+pub use runtime_rate_control::AdaptiveRateControl;
+use runtime_rate_control::{
+    AdaptiveRateControlError, DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW,
+    JitterConfig, RateController, RateControllerMetrics,
+};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -51,6 +55,10 @@ const RUNTIME_REQUESTS_PER_SECOND_LIMIT: &str = "http_requests_per_second_limit"
 const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit";
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
+const RUNTIME_ADAPTIVE_RATE_CONTROL: &str = "http_adaptive_rate_control";
+const RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD: &str =
+    "http_adaptive_rate_control_failure_threshold";
+const RUNTIME_ADAPTIVE_RATE_CONTROL_WINDOW: &str = "http_adaptive_rate_control_window";
 
 /// Every `http_*` rate-control key this module reads from `runtime.params`.
 /// Exposed as the authoritative list for this family; the startup unknown-param
@@ -63,6 +71,9 @@ pub const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
     RUNTIME_REQUESTS_PER_MINUTE_LIMIT,
     RUNTIME_RATE_CONTROL_JITTER_MIN,
     RUNTIME_RATE_CONTROL_JITTER_MAX,
+    RUNTIME_ADAPTIVE_RATE_CONTROL,
+    RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD,
+    RUNTIME_ADAPTIVE_RATE_CONTROL_WINDOW,
 ];
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
@@ -132,16 +143,34 @@ pub fn global_registry() -> Arc<HttpRateControlRegistry> {
     Arc::clone(&GLOBAL_HTTP_RATE_CONTROL_REGISTRY)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HttpRateControlConfig {
     pub max_concurrent_requests: Option<usize>,
     pub requests_per_second: Option<NonZeroU32>,
     pub requests_per_minute: Option<NonZeroU32>,
     pub jitter_min: Duration,
     pub jitter_max: Duration,
+    /// The adaptive control for this origin, or `None` when disabled — a disabled
+    /// origin keeps the plain static rate limiter with no adaptive controller.
+    pub adaptive_rate_control: Option<AdaptiveRateControl>,
 }
 
 impl HttpRateControlConfig {
+    /// A config with no rate control of any kind — no static limits, no jitter,
+    /// no adaptive control. The state a limiter starts in before any parameter
+    /// is applied.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            max_concurrent_requests: None,
+            requests_per_second: None,
+            requests_per_minute: None,
+            jitter_min: Duration::ZERO,
+            jitter_max: Duration::ZERO,
+            adaptive_rate_control: None,
+        }
+    }
+
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.max_concurrent_requests.is_some()
@@ -149,6 +178,23 @@ impl HttpRateControlConfig {
             || self.requests_per_minute.is_some()
             || !self.jitter_min.is_zero()
             || !self.jitter_max.is_zero()
+    }
+
+    /// Whether the origin defines any static rate limit for adaptive control to
+    /// scale. Adaptive control is a modifier on a defined limit, so this being
+    /// `false` while adaptive control is enabled is a configuration error (see
+    /// [`ensure_adaptive_has_static_limit`]).
+    #[must_use]
+    pub fn has_static_limit(&self) -> bool {
+        self.max_concurrent_requests.is_some()
+            || self.requests_per_second.is_some()
+            || self.requests_per_minute.is_some()
+    }
+
+    /// Whether adaptive control is enabled for this origin.
+    #[must_use]
+    pub fn adaptive_enabled(&self) -> bool {
+        self.adaptive_rate_control.is_some()
     }
 }
 
@@ -307,6 +353,24 @@ impl HttpRateControlMetrics {
             .unwrap_or_default()
     }
 
+    /// Current adaptive admission coefficient in parts-per-thousand (0..=1000):
+    /// 1000 means "admit everything", lower means the origin is being throttled.
+    /// 0 when adaptive rate control is disabled for this origin. Read live from
+    /// the controller, so it reflects window decay between scrapes.
+    #[must_use]
+    pub fn adaptive_admission_coefficient_permille(&self) -> u64 {
+        self.rate_controller
+            .read()
+            .ok()
+            .and_then(|controller| {
+                controller
+                    .as_ref()
+                    .and_then(|controller| controller.admission_coefficient())
+            })
+            .map(|coefficient| f64_round_to_u64(coefficient.clamp(0.0, 1.0) * 1000.0))
+            .unwrap_or_default()
+    }
+
     fn rate_controller_metric(
         &self,
         observe_metric: impl FnOnce(&RateControllerMetrics) -> u64,
@@ -415,6 +479,21 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     )
     .description("Current remaining HTTP Retry-After or RateLimit reset cooldown for this upstream origin")
     .unit("ms")
+    .auto_register(),
+    // TODO(#14136): honor server-advertised RateLimit/RateLimit-Policy headers
+    // (the IETF advertised-quota headers) here, alongside the reset-hint metrics
+    // above, once that separate work lands.
+    MetricSpec::new(
+        "adaptive_rate_control_admission_coefficient_permille",
+        MetricType::ObservableGaugeU64,
+    )
+    .description("Current adaptive admission coefficient for this upstream origin, in parts-per-thousand (1000 = admit all); 0 when adaptive rate control is disabled")
+    .auto_register(),
+    MetricSpec::new(
+        "adaptive_rate_control_throttled_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total HTTP requests adaptive rate control throttled for this upstream origin (charged an above-normal weight because the origin was failing); 0 when adaptive rate control is disabled or the origin has stayed healthy")
     .auto_register(),
 ];
 
@@ -531,6 +610,12 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             "rate_limit_retry_after_remaining_ms" => observe_metric!(
                 metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_remaining_ms)
             ),
+            "adaptive_rate_control_admission_coefficient_permille" => {
+                observe_metric!(metrics.adaptive_admission_coefficient_permille())
+            }
+            "adaptive_rate_control_throttled_total" => observe_metric!(
+                metrics.rate_controller_metric(RateControllerMetrics::adaptive_throttled_total)
+            ),
             _ => None,
         }
     }
@@ -541,7 +626,7 @@ fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -
 }
 
 #[must_use]
-pub fn parameter_specs() -> [ParameterSpec; 5] {
+pub fn parameter_specs() -> [ParameterSpec; 8] {
     [
         ParameterSpec::runtime("max_concurrent_requests")
             .description("Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled."),
@@ -553,6 +638,12 @@ pub fn parameter_specs() -> [ParameterSpec; 5] {
             .description("Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
         ParameterSpec::runtime("rate_control_jitter_max")
             .description("Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+        ParameterSpec::runtime("adaptive_rate_control")
+            .description("Client-side adaptive throttling that lowers the effective HTTP request rate when the upstream origin fails or times out, then raises it again as the origin recovers, scaling within the configured static rate limits. Overrides runtime.params.http_adaptive_rate_control when set. Values: 'disabled' (default) or 'enabled'."),
+        ParameterSpec::runtime("adaptive_rate_control_failure_threshold")
+            .description("The upstream error rate above which adaptive rate control begins throttling, as a percentage like '50%' or a fraction like '0.5'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate. Overrides runtime.params.http_adaptive_rate_control_failure_threshold when set. Applies only when adaptive_rate_control is enabled. Defaults to 10%."),
+        ParameterSpec::runtime("adaptive_rate_control_window")
+            .description("The reaction and recovery window for adaptive rate control, as a duration such as '10s' — the half-life over which request outcomes decay. A shorter window reacts to and recovers from failures faster; a longer one is smoother and slower. Overrides runtime.params.http_adaptive_rate_control_window when set. Applies only when adaptive_rate_control is enabled. Defaults to 10s."),
     ]
 }
 
@@ -597,15 +688,192 @@ pub fn resolve_config_for_component<S: BuildHasher>(
         )?,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
+        adaptive_rate_control: parse_adaptive_rate_control_param(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+        )?,
     };
 
-    with_jitter(
+    let config = with_jitter(
         params,
         runtime_params,
         connector_component,
         dataconnector,
         config,
-    )
+    )?;
+
+    ensure_adaptive_has_static_limit(&config, connector_component, dataconnector)?;
+    Ok(config)
+}
+
+/// Reject an origin that enables adaptive rate control but defines no static
+/// rate limit for it to adjust.
+///
+/// Adaptive control is a modifier on a defined limit, never a limiter of its
+/// own, so there must be at least one of `requests_per_second_limit`,
+/// `requests_per_minute_limit`, or `max_concurrent_requests` (in either the
+/// dataset-level or `runtime.params.http_*` form) for it to scale.
+///
+/// # Errors
+/// Returns an invalid-configuration error when adaptive control is enabled and
+/// the origin has no static rate limit configured.
+pub fn ensure_adaptive_has_static_limit(
+    config: &HttpRateControlConfig,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<()> {
+    if config.adaptive_enabled() && !config.has_static_limit() {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            connector_component: connector_component.clone(),
+            message:
+                "`adaptive_rate_control` adjusts a defined rate limit, but no rate limit is set for this origin. \
+                Set at least one of `requests_per_second_limit`, `requests_per_minute_limit`, or `max_concurrent_requests` \
+                (as a dataset parameter or the matching `runtime.params.http_*` value), or remove `adaptive_rate_control`. \
+                See: https://spiceai.org/docs/components/data-connectors/http"
+                    .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Resolve the three `adaptive_rate_control*` parameters (each falling back to
+/// its matching `runtime.params.http_*` default) into an optional
+/// [`AdaptiveRateControl`] — `None` when adaptive control is disabled.
+///
+/// The on/off switch is `adaptive_rate_control`; the two hyperparameters are
+/// `adaptive_rate_control_failure_threshold` (the error rate above which
+/// throttling begins, as a percentage or fraction, default 50%) and
+/// `adaptive_rate_control_window` (the reaction/recovery decay half-life, default
+/// 10s). The two hyperparameters are inert when adaptive control is disabled, so
+/// a runtime-wide default applies only to the datasets that enable adaptive
+/// control.
+///
+/// # Errors
+/// Returns an invalid-configuration error for an `adaptive_rate_control` value
+/// other than `disabled`/`enabled`, a failure threshold that is not an error rate
+/// between 0 and 1, or a window that is not a positive, finite duration.
+fn parse_adaptive_rate_control_param<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<Option<AdaptiveRateControl>> {
+    let mode = resolve_adaptive_mode(params, runtime_params, connector_component, dataconnector)?;
+    if mode == AdaptiveMode::Disabled {
+        // The failure-threshold/window knobs are meaningless without the feature
+        // on, so they stay inert here rather than erroring — a runtime-wide
+        // default must not fail every dataset that leaves adaptive control off.
+        return Ok(None);
+    }
+
+    let failure_threshold = parse_optional_failure_threshold_param(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+    )?
+    .unwrap_or(DEFAULT_ADAPTIVE_FAILURE_THRESHOLD);
+    let window = parse_optional_duration_param(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+        "adaptive_rate_control_window",
+        RUNTIME_ADAPTIVE_RATE_CONTROL_WINDOW,
+    )?
+    .unwrap_or(DEFAULT_ADAPTIVE_WINDOW);
+
+    AdaptiveRateControl::new(failure_threshold, window).map(Some).map_err(|error| {
+        let (param_name, runtime_param_name, detail) = match error {
+            AdaptiveRateControlError::FailureThresholdInvalid { failure_threshold } => (
+                "adaptive_rate_control_failure_threshold",
+                RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD,
+                format!(
+                    "the failure threshold must be an error rate above 0% and below 100%, but got {:.0}%. It is the error rate above which throttling begins. Use a value such as '50%' or '0.5'.",
+                    failure_threshold * 100.0
+                ),
+            ),
+            AdaptiveRateControlError::WindowInvalid { .. } => (
+                "adaptive_rate_control_window",
+                RUNTIME_ADAPTIVE_RATE_CONTROL_WINDOW,
+                "the window must be a positive, finite duration such as '10s'. A shorter window reacts and recovers faster.".to_string(),
+            ),
+        };
+        let display_name = runtime_or_dataset_param_name(
+            params,
+            runtime_params,
+            param_name,
+            runtime_param_name,
+        );
+        DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            connector_component: connector_component.clone(),
+            message: format!(
+                "The '{display_name}' parameter is invalid: {detail} See: https://spiceai.org/docs/components/data-connectors/http"
+            ),
+        }
+    })
+}
+
+/// Resolve the `adaptive_rate_control` on/off switch, falling back to
+/// `runtime.params.http_adaptive_rate_control`, defaulting to disabled.
+fn resolve_adaptive_mode<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<AdaptiveMode> {
+    let (raw_value, display_name) =
+        if let Some(raw_value) = params.get("adaptive_rate_control").expose().ok() {
+            (
+                raw_value,
+                params.user_param("adaptive_rate_control").to_string(),
+            )
+        } else if let Some(raw_value) = runtime_params
+            .and_then(|runtime_params| runtime_params.get(RUNTIME_ADAPTIVE_RATE_CONTROL))
+            .map(String::as_str)
+        {
+            (
+                raw_value,
+                format!("runtime.params.{RUNTIME_ADAPTIVE_RATE_CONTROL}"),
+            )
+        } else {
+            return Ok(AdaptiveMode::Disabled);
+        };
+
+    parse_adaptive_mode(raw_value).ok_or_else(|| DataConnectorError::InvalidConfigurationNoSource {
+        dataconnector: dataconnector.to_string(),
+        connector_component: connector_component.clone(),
+        message: format!(
+            "The '{display_name}' parameter is invalid: '{}' is not a valid value. Use 'disabled' or 'enabled'. See: https://spiceai.org/docs/components/data-connectors/http",
+            raw_value.trim()
+        ),
+    })
+}
+
+/// The parsed value of the `adaptive_rate_control` on/off switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptiveMode {
+    Disabled,
+    Enabled,
+}
+
+/// Parse the `adaptive_rate_control` on/off switch.
+///
+/// * absent / empty / `disabled` -> [`AdaptiveMode::Disabled`]
+/// * `enabled` -> [`AdaptiveMode::Enabled`]
+/// * anything else -> `None` (the caller reports the offending value)
+#[must_use]
+pub fn parse_adaptive_mode(value: &str) -> Option<AdaptiveMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "disabled" => Some(AdaptiveMode::Disabled),
+        "enabled" => Some(AdaptiveMode::Enabled),
+        _ => None,
+    }
 }
 
 impl HttpRateControlRegistry {
@@ -691,6 +959,22 @@ impl HttpRateControlRegistry {
     }
 
     pub async fn shared_rate_limiter(&self, base_url: &Url) -> Arc<HttpRateLimiter> {
+        self.shared_rate_limiter_for_config(base_url, &HttpRateControlConfig::disabled())
+            .await
+    }
+
+    /// The per-origin rate limiter, built on first use. This limiter handles only
+    /// server-advertised cooldowns (`Retry-After` / `RateLimit` reset headers);
+    /// the origin's configured static limits and any adaptive scaling are enforced
+    /// by the separate [`RateController`]. One origin gets one limiter.
+    ///
+    /// `_config` is retained for call-site symmetry with the controller
+    /// reservation path; the limiter itself no longer depends on it.
+    pub async fn shared_rate_limiter_for_config(
+        &self,
+        base_url: &Url,
+        _config: &HttpRateControlConfig,
+    ) -> Arc<HttpRateLimiter> {
         let key = rate_control_key(base_url);
         let rate_limiters = self.rate_limiters.read().await;
         if let Some(rate_limiter) = rate_limiters.get(&key) {
@@ -702,7 +986,7 @@ impl HttpRateControlRegistry {
         Arc::clone(
             rate_limiters
                 .entry(key)
-                .or_insert_with(|| Arc::new(HttpRateLimiter::new())),
+                .or_insert_with(|| Arc::new(HttpRateLimiter::default())),
         )
     }
 
@@ -949,6 +1233,9 @@ fn build_shared_rate_controller(
             Quota::per_minute(requests_per_minute),
         );
     }
+    if let Some(control) = config.adaptive_rate_control {
+        builder = builder.with_adaptive(control);
+    }
 
     SharedRateController {
         config: config.clone(),
@@ -1064,6 +1351,61 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
     }
 
     Ok(Some(value))
+}
+
+/// Parse the optional `adaptive_rate_control_failure_threshold` (an error rate),
+/// falling back to its `runtime.params.http_*` default, into a fraction.
+///
+/// Accepts either a percentage like `50%` or a bare fraction like `0.5`. Range
+/// validation (`(0, 1)`) is left to [`AdaptiveRateControl::new`]; this only
+/// rejects a value that is neither a percentage nor a number.
+fn parse_optional_failure_threshold_param<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<Option<f64>> {
+    let parameter_name = "adaptive_rate_control_failure_threshold";
+    let (raw_value, display_name) =
+        if let Some(raw_value) = params.get(parameter_name).expose().ok() {
+            (raw_value, params.user_param(parameter_name).to_string())
+        } else if let Some(raw_value) = runtime_params
+            .and_then(|runtime_params| {
+                runtime_params.get(RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD)
+            })
+            .map(String::as_str)
+        {
+            (
+                raw_value,
+                format!("runtime.params.{RUNTIME_ADAPTIVE_RATE_CONTROL_FAILURE_THRESHOLD}"),
+            )
+        } else {
+            return Ok(None);
+        };
+
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // `50%` -> 0.5; a bare `0.5` -> 0.5. A bare `50` parses to 50.0 and is
+    // rejected downstream as out of range, guiding the user to `50%`.
+    let parsed = if let Some(percent) = trimmed.strip_suffix('%') {
+        percent.trim().parse::<f64>().map(|value| value / 100.0)
+    } else {
+        trimmed.parse::<f64>()
+    };
+
+    parsed
+        .map(Some)
+        .map_err(|source| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataconnector.to_string(),
+            message: format!(
+                "The '{display_name}' parameter must be an error rate as a percentage like '50%' or a fraction like '0.5'."
+            ),
+            connector_component: connector_component.clone(),
+            source: source.into(),
+        })
 }
 
 fn parse_optional_duration_param<S: BuildHasher>(
@@ -1250,7 +1592,7 @@ fn conflicting_config_error<T>(
         dataconnector: dataconnector.to_string(),
         connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max values for components sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max and adaptive_rate_control values for components sharing an origin."
         ),
     })
 }
@@ -1263,6 +1605,25 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// Round a non-negative, finite `f64` to the nearest `u64`, saturating. Negative
+/// or non-finite inputs map to 0. Used only for metric gauges, where an
+/// approximate whole number is all that is reported.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "input is guarded finite and non-negative, and clamped below u64::MAX before the cast; the ceiling's imprecision is intentional"
+)]
+fn f64_round_to_u64(value: f64) -> u64 {
+    // u64::MAX is not exactly representable as f64; this bound is a safe
+    // saturating ceiling well above any rate limit or per-mille value.
+    const SATURATING_CEILING: f64 = u64::MAX as f64;
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    value.round().min(SATURATING_CEILING) as u64
+}
+
 fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
     refresh_interval
         .saturating_mul(3)
@@ -1272,6 +1633,42 @@ fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    // The `ensure_adaptive_has_static_limit` tests live in
+    // `crates/runtime/tests/rate_control/mod.rs`: they need a `ConnectorComponent`,
+    // which requires `runtime-component`, and this crate must not depend on it.
+
+    #[test]
+    fn parse_adaptive_mode_accepts_switch_values() {
+        assert_eq!(parse_adaptive_mode(""), Some(AdaptiveMode::Disabled));
+        assert_eq!(
+            parse_adaptive_mode("disabled"),
+            Some(AdaptiveMode::Disabled)
+        );
+        assert_eq!(
+            parse_adaptive_mode("DISABLED"),
+            Some(AdaptiveMode::Disabled)
+        );
+        assert_eq!(parse_adaptive_mode("enabled"), Some(AdaptiveMode::Enabled));
+        assert_eq!(
+            parse_adaptive_mode(" Enabled "),
+            Some(AdaptiveMode::Enabled)
+        );
+        // A bare number is not a switch value: the threshold is its own parameter.
+        assert_eq!(parse_adaptive_mode("2.0"), None);
+        assert_eq!(parse_adaptive_mode("sometimes"), None);
+    }
+
+    #[test]
+    fn has_static_limit_reflects_any_configured_limit() {
+        let mut config = HttpRateControlConfig::disabled();
+        assert!(!config.has_static_limit());
+
+        config.requests_per_second = NonZeroU32::new(5);
+        assert!(config.has_static_limit());
+    }
 
     #[test]
     fn rate_control_state_object_key_uses_spicepod_and_origin_without_scheme() {

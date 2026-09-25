@@ -17939,6 +17939,7 @@ dependencies = [
  "governor",
  "object_store 0.13.2",
  "object_store_occ",
+ "parking_lot",
  "rand 0.10.1",
  "serde",
  "snafu",
