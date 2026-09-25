@@ -50,6 +50,7 @@ use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
 use datafusion::catalog::TableProvider;
+use datafusion::logical_expr::ScalarUDF;
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -1130,6 +1131,7 @@ impl DataFusionBuilder {
                 && decide_spark_collision("scalar", udf.name(), &taken, SPARK_SCALAR_COLLISIONS)
                     == Keep::BuiltIn
             {
+                lend_spark_names_to_built_in(&mut state, &udf, &taken);
                 continue;
             }
             let name = udf.name().to_string();
@@ -2093,7 +2095,8 @@ enum Keep {
 /// - `ceil` and `floor`: Spark's return `Int64` for a float argument where the
 ///   built-in returns the float's type — the return-type class, which a
 ///   federated rendering surfaces as a schema assertion, not a function error.
-///   Spark's `ceil` alias `ceiling`, a name no built-in has, goes with it.
+///   Spark's `ceil` alias `ceiling`, a name no built-in has, is lent to the
+///   built-in (`SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN`).
 /// - `round`: Spark's returns the argument's type; the built-in returns
 ///   `Float64` for an integer argument.
 /// - `concat` is **Spark's on purpose**: it answers NULL when any argument is
@@ -2115,7 +2118,8 @@ enum Keep {
 /// - `length` (also `character_length`, `char_length`, `len`): Spark's always
 ///   answers `Int32`, and its aliases would replace the built-in
 ///   `character_length` under every name it has; the built-in is the
-///   documented one. Spark's `len`, a name no built-in has, goes with it.
+///   documented one. Spark's `len`, a name no built-in has, is lent to it
+///   (`SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN`).
 /// - `substring` (also `substr`): Spark's answers NULL when any argument is
 ///   NULL; the built-in `substr` is the documented one.
 /// - `trunc`: Spark's is date truncation and shadows the numeric
@@ -2151,6 +2155,44 @@ const SPARK_AGGREGATE_COLLISIONS: &[(&str, Keep)] = &[("avg", Keep::BuiltIn)];
 /// Every Spark window function that collides with a name the session already
 /// holds; see [`SPARK_SCALAR_COLLISIONS`]. None at the pinned fork revision.
 const SPARK_WINDOW_COLLISIONS: &[(&str, Keep)] = &[];
+
+/// The names a kept-out Spark scalar function declares that no built-in
+/// holds, lent to the built-in it yields to: a call by that name resolved
+/// before the collision was decided, and keeps resolving — to the documented
+/// function. A test pins that this is exactly the set of such names, and that
+/// no kept-out aggregate or window function has one, since nothing lends
+/// theirs.
+const SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN: &[(&str, &[&str])] =
+    &[("ceil", &["ceiling"]), ("length", &["len"])];
+
+/// Registers the built-in that `spark` yields to (the function the session
+/// holds under `spark`'s own name, or else under the first of its names in
+/// `taken`) under the names [`SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN`] lends it.
+fn lend_spark_names_to_built_in(
+    state: &mut datafusion::execution::SessionState,
+    spark: &ScalarUDF,
+    taken: &[&str],
+) {
+    let Some((_, lent)) = SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN
+        .iter()
+        .find(|(name, _)| *name == spark.name())
+    else {
+        return;
+    };
+    let extended = {
+        let Some(kept) = std::iter::once(spark.name())
+            .chain(taken.iter().copied())
+            .find_map(|name| state.scalar_functions().get(name))
+        else {
+            return;
+        };
+        Arc::new(kept.as_ref().clone().with_aliases(lent.iter().copied()))
+    };
+    let kept_name = extended.name().to_string();
+    if let Err(e) = state.register_udf(extended) {
+        panic!("Unable to register the built-in `{kept_name}` under Spark's names {lent:?}: {e}");
+    }
+}
 
 /// The registry names a function would take that `registered` already holds:
 /// its name and every alias, since `register_udf` and its siblings write all
@@ -2233,8 +2275,8 @@ mod tests {
     };
     #[cfg(not(windows))]
     use super::{
-        SPARK_AGGREGATE_COLLISIONS, SPARK_SCALAR_COLLISIONS, SPARK_WINDOW_COLLISIONS,
-        names_already_registered,
+        SPARK_AGGREGATE_COLLISIONS, SPARK_SCALAR_COLLISIONS, SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN,
+        SPARK_WINDOW_COLLISIONS, names_already_registered,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
@@ -2842,6 +2884,52 @@ mod tests {
         );
     }
 
+    /// A name only Spark declared keeps resolving once its function is kept
+    /// out — to the built-in that was kept: `len` is `character_length` and
+    /// `ceiling` is `ceil`, so `ceiling(1.5)` answers the built-in's `Float64`.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn a_spark_only_name_resolves_to_the_kept_built_in() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let state = df.ctx.state();
+        for (lent, built_in) in [("len", "character_length"), ("ceiling", "ceil")] {
+            let resolved = state
+                .scalar_functions()
+                .get(lent)
+                .unwrap_or_else(|| panic!("`{lent}` must still resolve"));
+            assert_eq!(
+                resolved.name(),
+                built_in,
+                "`{lent}` must resolve to the built-in `{built_in}`, not to Spark's"
+            );
+        }
+        drop(state);
+
+        let batches = df
+            .ctx
+            .sql("SELECT len('abc') AS n, ceiling(1.5) AS c")
+            .await
+            .expect("plan the lent names")
+            .collect()
+            .await
+            .expect("run the lent names");
+        let batch = batches.first().expect("one batch");
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Float64);
+        let rendered = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format the lent names")
+            .to_string();
+        assert!(
+            rendered.contains("| 3 | 2.0 |"),
+            "len('abc') must be 3 and ceiling(1.5) the built-in's 2.0, got {rendered}"
+        );
+    }
+
     /// The built session registers **Spark's** `concat` over the built-in, on
     /// purpose: it answers NULL when any argument is NULL, and the accelerator
     /// dialects render the call to match (`DuckDB`'s `||`, #13849). This pins
@@ -3017,6 +3105,66 @@ mod tests {
             "SPARK_WINDOW_COLLISIONS must name exactly the Spark window functions that collide \
              with a registered one"
         );
+
+        // A kept-out Spark scalar function's names that nothing holds are lent
+        // to the built-in, and only those; a kept-out aggregate or window
+        // function has none, since nothing lends theirs.
+        let spark_scalars = datafusion_spark::all_default_scalar_functions();
+        for udf in &spark_scalars {
+            let taken =
+                names_already_registered(state.scalar_functions(), udf.name(), udf.aliases());
+            if taken.is_empty()
+                || decide_spark_collision("scalar", udf.name(), &taken, SPARK_SCALAR_COLLISIONS)
+                    == Keep::Spark
+            {
+                continue;
+            }
+            let spare: BTreeSet<&str> = std::iter::once(udf.name())
+                .chain(udf.aliases().iter().map(String::as_str))
+                .filter(|name| !state.scalar_functions().contains_key(*name))
+                .collect();
+            let lent: BTreeSet<&str> = SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN
+                .iter()
+                .find(|(name, _)| *name == udf.name())
+                .map(|(_, lent)| lent.iter().copied().collect())
+                .unwrap_or_default();
+            assert_eq!(
+                spare,
+                lent,
+                "SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN must lend exactly the names of `{}` that no \
+                 built-in holds",
+                udf.name()
+            );
+        }
+        let spark_aggregates = datafusion_spark::all_default_aggregate_functions();
+        for udaf in &spark_aggregates {
+            let taken =
+                names_already_registered(state.aggregate_functions(), udaf.name(), udaf.aliases());
+            if taken.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                taken.len(),
+                1 + udaf.aliases().len(),
+                "a kept-out Spark aggregate `{}` declares a name nothing holds, and nothing lends it",
+                udaf.name()
+            );
+        }
+        let spark_windows = datafusion_spark::all_default_window_functions();
+        for udwf in &spark_windows {
+            let taken =
+                names_already_registered(state.window_functions(), udwf.name(), udwf.aliases());
+            if taken.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                taken.len(),
+                1 + udwf.aliases().len(),
+                "a kept-out Spark window function `{}` declares a name nothing holds, and nothing \
+                 lends it",
+                udwf.name()
+            );
+        }
     }
 
     /// An undecided collision is refused, naming the Spark function and the
