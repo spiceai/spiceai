@@ -756,14 +756,13 @@ impl Session {
     }
 }
 
-/// Whether a statement issued through a query method writes, judged by its
-/// leading keyword: `reserve_sequence_numbers` runs `UPDATE … RETURNING`
-/// through `query_row`, and that write must run on the [`Writer`] like any
-/// other. Everything else runs on a pooled connection, since queueing a read
-/// there would make a read nested inside a transaction wait for the
-/// transaction it is part of. A debug assertion checks such a statement is
-/// read-only, so a write this misses fails tests rather than silently skipping
-/// the queue.
+/// Whether a statement issued through a query method starts with a write
+/// keyword, which sends it straight to the [`Writer`]: `reserve_sequence_numbers`
+/// runs `UPDATE … RETURNING` through `query_row`. Any other statement is
+/// prepared on a pooled read connection first, and handed to the writer if
+/// `SQLite` reports that it writes (a `WITH … UPDATE`, say). A read stays on
+/// the pool, since queueing it on the writer would make a read nested inside a
+/// transaction wait for the transaction it is part of.
 fn statement_writes(sql: &str) -> bool {
     let keyword = sql
         .trim_start()
@@ -773,6 +772,44 @@ fn statement_writes(sql: &str) -> bool {
     ["INSERT", "UPDATE", "DELETE", "REPLACE"]
         .iter()
         .any(|write| keyword.eq_ignore_ascii_case(write))
+}
+
+/// A statement issued through a query method, as its read connection found it:
+/// run there, or a write, handed back with its SQL and parameters to run on
+/// the [`Writer`].
+enum ReadAttempt<T> {
+    Ran(T),
+    Writes(String, Vec<rusqlite::types::Value>),
+}
+
+fn row_values(row: &rusqlite::Row<'_>) -> Result<Vec<MetastoreValue>, rusqlite::Error> {
+    let column_count = row.as_ref().column_count();
+    let mut values = Vec::with_capacity(column_count);
+    for i in 0..column_count {
+        values.push(convert_sqlite_value(row.get_ref(i)?));
+    }
+    Ok(values)
+}
+
+/// The values of the one row `sql` returns.
+fn fetch_row(
+    conn: &mut rusqlite::Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+) -> Result<Vec<MetastoreValue>, rusqlite::Error> {
+    conn.prepare_cached(sql)?
+        .query_row(rusqlite::params_from_iter(params), row_values)
+}
+
+/// The values of every row `sql` returns.
+fn fetch_rows(
+    conn: &mut rusqlite::Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+) -> Result<Vec<Vec<MetastoreValue>>, rusqlite::Error> {
+    conn.prepare_cached(sql)?
+        .query_map(rusqlite::params_from_iter(params), row_values)?
+        .collect()
 }
 
 /// Round-robin connection pool for the [`SqliteMetastore`]'s reads, beside the
@@ -1816,41 +1853,36 @@ impl MetastoreBackend for SqliteMetastore {
             message: format!("Failed to query row: {e}"),
         };
         let pool = self.pool().await?;
-        let writes = statement_writes(params.sql);
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
-        // Execute query and extract row values inside the closure
-        let query = move |conn: &mut rusqlite::Connection| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
-
-            let mut stmt = conn.prepare_cached(&sql)?;
-            debug_assert!(
-                writes || stmt.readonly(),
-                "a writing statement reached a metastore read connection: {sql}"
-            );
-            stmt.query_row(params_refs.as_slice(), |row| {
-                let column_count = row.as_ref().column_count();
-                let mut values = Vec::with_capacity(column_count);
-
-                for i in 0..column_count {
-                    let value = row.get_ref(i)?;
-                    values.push(convert_sqlite_value(value));
-                }
-
-                Ok(values)
-            })
-        };
         // A write runs on the writer connection in its turn; a read on a pooled
-        // connection.
-        let row_values = if writes {
-            pool.writer.run(query).await
+        // connection. See `statement_writes`.
+        let row_values = if statement_writes(&sql) {
+            pool.writer
+                .run(move |conn| fetch_row(conn, &sql, &param_values))
+                .await
         } else {
-            pool.acquire().await.call(query).await
+            let attempt = pool
+                .acquire()
+                .await
+                .call(move |conn| {
+                    if !conn.prepare_cached(&sql)?.readonly() {
+                        return Ok(ReadAttempt::Writes(sql, param_values));
+                    }
+                    fetch_row(conn, &sql, &param_values).map(ReadAttempt::Ran)
+                })
+                .await;
+            match attempt {
+                Ok(ReadAttempt::Ran(values)) => Ok(values),
+                Ok(ReadAttempt::Writes(sql, param_values)) => {
+                    pool.writer
+                        .run(move |conn| fetch_row(conn, &sql, &param_values))
+                        .await
+                }
+                Err(e) => Err(e),
+            }
         }
         .map_err(query_error)?;
 
@@ -1868,48 +1900,36 @@ impl MetastoreBackend for SqliteMetastore {
             message: format!("Failed to query rows: {e}"),
         };
         let pool = self.pool().await?;
-        let writes = statement_writes(params.sql);
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
-        // Execute query and collect all row values inside the closure
-        let query = move |conn: &mut rusqlite::Connection| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
-
-            let mut stmt = conn.prepare_cached(&sql)?;
-            debug_assert!(
-                writes || stmt.readonly(),
-                "a writing statement reached a metastore read connection: {sql}"
-            );
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                let column_count = row.as_ref().column_count();
-                let mut values = Vec::with_capacity(column_count);
-
-                for i in 0..column_count {
-                    let value = row.get_ref(i)?;
-                    values.push(convert_sqlite_value(value));
-                }
-
-                Ok(values)
-            })?;
-
-            let mut collected_rows = Vec::new();
-            for row_result in rows {
-                collected_rows.push(row_result?);
-            }
-
-            Ok::<Vec<Vec<MetastoreValue>>, rusqlite::Error>(collected_rows)
-        };
         // A write runs on the writer connection in its turn; a read on a pooled
-        // connection.
-        let all_row_values = if writes {
-            pool.writer.run(query).await
+        // connection. See `statement_writes`.
+        let all_row_values = if statement_writes(&sql) {
+            pool.writer
+                .run(move |conn| fetch_rows(conn, &sql, &param_values))
+                .await
         } else {
-            pool.acquire().await.call(query).await
+            let attempt = pool
+                .acquire()
+                .await
+                .call(move |conn| {
+                    if !conn.prepare_cached(&sql)?.readonly() {
+                        return Ok(ReadAttempt::Writes(sql, param_values));
+                    }
+                    fetch_rows(conn, &sql, &param_values).map(ReadAttempt::Ran)
+                })
+                .await;
+            match attempt {
+                Ok(ReadAttempt::Ran(rows)) => Ok(rows),
+                Ok(ReadAttempt::Writes(sql, param_values)) => {
+                    pool.writer
+                        .run(move |conn| fetch_rows(conn, &sql, &param_values))
+                        .await
+                }
+                Err(e) => Err(e),
+            }
         }
         .map_err(query_error)?;
 
@@ -2841,6 +2861,82 @@ mod tests {
         assert!(
             held >= IN_FLIGHT,
             "the dropped transaction held the lock through its {IN_FLIGHT:?} statement but was timed at {held:?} (its caller let go after {dropped_after:?})"
+        );
+    }
+
+    /// A write that does not start with a write keyword, here a CTE-prefixed
+    /// `UPDATE … RETURNING` issued through `query_row`, still waits its turn on
+    /// the writer connection, so it runs before a write queued after it.
+    #[tokio::test]
+    async fn test_a_cte_write_through_a_query_waits_its_turn_on_the_writer() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        let metastore = Arc::new(metastore);
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .await
+            .expect("create table");
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id, n) VALUES (1, 1)",
+                params: vec![],
+            })
+            .await
+            .expect("seed row");
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+        let multiply = {
+            let metastore = Arc::clone(&metastore);
+            tokio::spawn(async move {
+                metastore
+                    .query_row(
+                        QueryRowParams {
+                            sql: "WITH factor(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM factor) WHERE id = 1 RETURNING n",
+                            params: vec![],
+                        },
+                        |row| row.get_i64(0),
+                    )
+                    .await
+            })
+        };
+        // Arrival order is what is under test: the CTE write must be queued
+        // before the next write, and reaching the queue takes microseconds.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let add = {
+            let metastore = Arc::clone(&metastore);
+            tokio::spawn(async move {
+                metastore
+                    .execute(ExecuteParams {
+                        sql: "UPDATE t SET n = n + 1 WHERE id = 1",
+                        params: vec![],
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        holder.commit().await.expect("commit the holder");
+        multiply
+            .await
+            .expect("CTE write task")
+            .expect("the CTE write");
+        add.await
+            .expect("write task")
+            .expect("the write queued after it");
+
+        let n = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT n FROM t WHERE id = 1",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read n");
+        assert_eq!(
+            n, 11,
+            "the CTE write must run in its turn on the writer, before the write queued after it (1 × 10 + 1)"
         );
     }
 
