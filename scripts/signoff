@@ -1475,9 +1475,9 @@ describe_check_failure() {
       #
       # "stale" covers both readings the preflight returns this kind for: an
       # absent Cargo.lock is a `--locked` violation in cargo's own terms, not an
-      # absence of one, and the two share a remedy. The status names the
-      # command; the summary and message spell out the commit that follows it.
-      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Cargo.lock stale after ${elapsed}s — checks did not run; cargo update --workspace" "$user")"
+      # absence of one, and the two share a remedy. Both halves of that remedy
+      # are in the status — regenerating the lockfile is not enough on its own.
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Cargo.lock stale after ${elapsed}s — checks not run; run cargo update --workspace and commit" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — \`Cargo.lock\` is missing, or cargo would have to rewrite it to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run \`cargo update --workspace\` on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock is missing or does not match the workspace manifests (the checks did not run) — run 'cargo update --workspace', commit it, then sign off again"
       ;;

@@ -1824,10 +1824,10 @@ assert_describe "declines the missing-target verdict for a signalled run" 71 "" 
 # as a check failure it sends them looking for a lint denial in a log containing
 # no compilation. The remedy has to be in the description itself.
 assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
-  "Cargo.lock stale after 21195s — checks did not run; cargo update --workspace (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; run cargo update --workspace and commit (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "names the command that regenerates the lockfile" 72 \
-  "Cargo.lock stale after 21195s — checks did not run; cargo update --workspace (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; run cargo update --workspace and commit (triggered by someone)" \
   "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # And, as for missing-target, "no verdict" outranks naming a cause.
 assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
