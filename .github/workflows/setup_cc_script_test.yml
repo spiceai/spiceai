@@ -1,0 +1,39 @@
+---
+name: setup-cc Script Tests
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - '.github/actions/setup-cc/**'
+      - '.github/workflows/setup_cc_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/setup-cc/**'
+      - '.github/workflows/setup_cc_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-macos-toolchain-script:
+    name: Unit tests for macos_toolchain.sh
+    # The script is bash over a fake Homebrew prefix, so it needs no macOS to
+    # test; a Linux runner is both cheaper and not part of the pool the script
+    # exists to keep unblocked.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: bash .github/actions/setup-cc/test_macos_toolchain.sh
