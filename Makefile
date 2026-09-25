@@ -187,8 +187,19 @@ endif
 # target whose required-features are unmet *without saying so* — the very way
 # three lanes once went unbuilt — the `nextest` target says out loud that this
 # one did not run.
+#
+# `snapshots` is here because `lint-rust` compiles with it and the unit tests
+# it gates (`runtime`'s `build_snapshot_creation_config_tests`) exist only
+# under it: a feature that clippy type-checks but nextest never enables leaves
+# a module that compiles in CI and never executes. The bare name enables the
+# feature on every member that defines it (`runtime`, `runtime-acceleration`,
+# `spiced`), exactly as `lint-rust`'s own `--features` list does. The trade is
+# `runtime`'s `http::v1::snapshots` test, which asserts the enterprise-only
+# response a `not(feature = "snapshots")` build returns: one build cannot carry
+# both sides of a cfg, and the module behind the feature guards behaviour the
+# feature-off path never reaches.
 NEXTEST_SELECTION := --all --exclude libnfs \
-	--features cayenne/result-correctness-duckdb
+	--features cayenne/result-correctness-duckdb,snapshots
 # `spice-substrait-compliance` is a binary crate: its unit tests, including the
 # fork-ledger guards (docs/dev/fork_patches.md), live in its bin target, which
 # `kind(=lib)` does not select. `testoperator` is the same: the dispatch-file
