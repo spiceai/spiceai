@@ -187,3 +187,28 @@ filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctnes
 test-group = "result-correctness"
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
+
+# `retention_oom` runs as its own step in `integration.yml` (`Run retention OOM
+# regression test`, `timeout-minutes: 25`), so its whole retry budget has to
+# fit inside that step: attempts that cannot finish before the step's bound
+# are never reported, the step times out with no verdict, and the failure
+# names the action rather than the test (#13512). Nothing held the two numbers
+# together before this: the test inherited the default six attempts at the
+# 360s ceiling — 36 minutes — inside a 20-minute step, and between 2026-08-25
+# and 2026-09-18 that step timed out 14 times in the merge queue, each time
+# with attempts 1 and 2 killed at 360s and attempt 3 killed by the step.
+#
+# Measured on the step (run 34948795744, job 104347595558, and 33854254348):
+# nextest spends ~3.2 min before the first attempt starts (archive extraction
+# and listing), a run that reaches the ceiling is killed at 360s, and on the
+# passes that followed two kills the test itself took 180-220s. Two retries —
+# three attempts — is what fits: 3 x 360s plus that startup is 22 minutes,
+# inside the 25 the step now allows, and it is the number of attempts the
+# three-attempt passes needed. The ceiling stays the global 360s: the kills are
+# hangs rather than slow runs (a pass takes a third of the ceiling), so raising
+# it would only spend longer per hang. `.github/scripts/check_nextest_config.py`
+# holds `(retries + 1) x ceiling + startup` inside the step's bound, so a change
+# to either file that reopens the gap fails there rather than in the queue.
+[[profile.default.overrides]]
+filter = 'binary(=retention_oom)'
+retries = { backoff = "exponential", count = 2, delay = "2s", max-delay = "30s", jitter = true }
