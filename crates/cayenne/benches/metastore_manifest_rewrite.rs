@@ -53,7 +53,8 @@ limitations under the License.
 //!
 //! Run: `cargo bench -p cayenne --bench metastore_manifest_rewrite [-- <lane>]`, where
 //! `<lane>` is an exact lane name or a substring of the lanes to run.
-//! `METASTORE_BENCH_CLIENTS=1,8,64` restricts the client counts;
+//! `METASTORE_BENCH_CLIENTS=1,8,64` restricts the client counts
+//! (`METASTORE_BENCH_THREADS` is the same list);
 //! `METASTORE_BENCH_RAW_DIR=<dir>` writes every sample, one latency in µs per
 //! line, to `<dir>/<lane>_c<clients>.csv`.
 
@@ -431,14 +432,18 @@ fn main() {
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .unwrap_or_default();
-    let clients: Vec<usize> = std::env::var("METASTORE_BENCH_CLIENTS").map_or_else(
-        |_| CLIENTS.to_vec(),
-        |list| {
-            list.split(',')
-                .map(|c| c.trim().parse().expect("client count"))
-                .collect()
-        },
-    );
+    // The harness varies client count, not worker threads. Both names select
+    // that list so a run instruction that says `THREADS` still restricts it.
+    let clients: Vec<usize> = match (
+        std::env::var("METASTORE_BENCH_CLIENTS"),
+        std::env::var("METASTORE_BENCH_THREADS"),
+    ) {
+        (Ok(list), _) | (Err(_), Ok(list)) => list
+            .split(',')
+            .map(|c| c.trim().parse().expect("client count"))
+            .collect(),
+        (Err(_), Err(_)) => CLIENTS.to_vec(),
+    };
     let raw_dir = std::env::var_os("METASTORE_BENCH_RAW_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = &raw_dir {
         std::fs::create_dir_all(dir).expect("create raw sample directory");
