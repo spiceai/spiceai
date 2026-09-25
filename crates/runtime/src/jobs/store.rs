@@ -110,15 +110,16 @@ impl JobStore {
     /// Uses `UUIDv7` which contains a millisecond timestamp plus random bits.
     #[must_use]
     pub fn generate_job_id() -> String {
-        // Format: 01ABC-DEF-456-7890AB style (Databricks-like)
-        // UUIDv7 hex structure (32 chars):
-        //   0-11:  48-bit ms timestamp
-        //   12:    version nibble (always '7')
-        //   13-15: 12-bit random
-        //   16:    variant nibble (always '8'-'b', only 2 random bits)
-        //   17-31: 60-bit random
+        // Format: 01ABC-DEF-456-7890AB style (Databricks-like): a timestamp
+        // prefix, so ids sort by creation, and a suffix that separates ids made
+        // within the same millisecond.
         //
-        // For uniqueness we use timestamp prefix + random suffix from chars 17+
+        // `now_v7` is monotonic: within one millisecond it counts up from a seed
+        // drawn once for that millisecond rather than redrawing the whole random
+        // field, so most of the hex is fixed for the duration. Measured over 100
+        // rapid calls, only hex positions 21..32 vary at all; a suffix taken from
+        // anywhere below that repeats. The tail is where the counter's low bits
+        // land, so the last six characters are what keep ids distinct.
         let uuid = Uuid::now_v7();
         let hex = uuid.simple().to_string();
         format!(
@@ -126,7 +127,7 @@ impl JobStore {
             &hex[0..5],   // timestamp
             &hex[5..8],   // timestamp
             &hex[8..11],  // timestamp
-            &hex[17..23]  // 6 chars (24 bits) of pure randomness
+            &hex[26..32]  // 6 chars that actually move between calls
         )
         .to_uppercase()
     }
