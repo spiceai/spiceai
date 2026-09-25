@@ -2124,11 +2124,8 @@ async fn create_scheduler_server(
             .with_option_extension(SpiceRequestContextConfig::default())
             .with_ballista_shuffle_format(ballista_shuffle_format)
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
-            // An adaptive execution graph cannot be serialized — Ballista's
-            // `execution_graph_to_bytes` accepts only the static graph — and the job
-            // state below is persisted so an in-flight job survives scheduler loss.
-            // Planning adaptively would fail every job the moment its graph is
-            // written out, so the scheduler plans statically.
+            // Static planning, for the same reason as in
+            // `apply_distributed_execution_config`: this graph gets persisted.
             .with_ballista_adaptive_query_planner(false)
     });
 
@@ -2542,6 +2539,16 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     // (whose left child must be a single partition, invalid once the input is a
     // multi-partition shuffle) and round-robin repartition.
     let mut cfg = cfg.ballista_restricted_configuration();
+
+    // An adaptive execution graph cannot be serialized — `execution_graph_to_bytes`
+    // downcasts to the static graph and errors otherwise — and the scheduler persists
+    // job state so an in-flight job survives scheduler loss. Ballista plans adaptively
+    // by default, so without this every job fails at the point its graph is written
+    // out. This config is serialized into the executor task props, so it has to be set
+    // on the session the job is planned with, not only on sessions the scheduler builds
+    // for itself.
+    let cfg = cfg.with_ballista_adaptive_query_planner(false);
+    let mut cfg = cfg;
 
     // These optimizations rely on shared mutable state within a single process and are
     // incorrect (or fatal) once a plan is split into stages that run in separate
