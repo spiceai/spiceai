@@ -527,18 +527,16 @@ class RepositoryTest(unittest.TestCase):
         # trigger and not at all under the other cannot pass.
         triggers = {
             name: block
-            for name, block in re.findall(r"^  (pull_request|push):
-((?:    .*
-|
-)*)", guard, re.M)
+            for name, block in re.findall(
+                r"^  (pull_request|push):\n((?:    .*\n|\n)*)", guard, re.M
+            )
         }
         self.assertEqual(set(triggers), {"pull_request", "push"}, guard)
         for binary, (workflow, _step) in check_nextest_config.STEP_BUDGETS.items():
             for trigger, block in sorted(triggers.items()):
                 with self.subTest(binary=binary, trigger=trigger):
                     self.assertEqual(
-                        block.count(f"      - '{workflow}'
-"),
+                        block.count(f"      - '{workflow}'\n"),
                         1,
                         f"{workflow} must be listed exactly once under the {trigger} "
                         "path filter of nextest_config_check.yml",
