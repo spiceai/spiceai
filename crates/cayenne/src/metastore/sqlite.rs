@@ -61,6 +61,25 @@ fn checkpoint_wal_file(
     Ok(())
 }
 
+/// How long a background TRUNCATE checkpoint waits for readers still on an
+/// older snapshot. A TRUNCATE holds the write lock while it waits, so every
+/// write queued behind it on the writer connection waits too. One that gives up
+/// has still copied what it could (`busy=1`), and the next maintenance tick
+/// tries again.
+const TRUNCATE_CHECKPOINT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A background TRUNCATE checkpoint on the writer connection that waits at most
+/// [`TRUNCATE_CHECKPOINT_BUSY_TIMEOUT`] for readers, then restores the
+/// connection's configured busy timeout.
+fn truncate_wal(conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.busy_timeout(TRUNCATE_CHECKPOINT_BUSY_TIMEOUT)?;
+    let checkpointed = checkpoint_wal_file(conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+    conn.busy_timeout(std::time::Duration::from_millis(
+        sqlite_metastore_config().busy_timeout_ms,
+    ))?;
+    checkpointed
+}
+
 /// Boundedly reclaim freelist pages on a connection already known to be in
 /// INCREMENTAL auto-vacuum mode.
 ///
@@ -1982,14 +2001,15 @@ impl MetastoreBackend for SqliteMetastore {
         // any wait for the write lock.
         let checkpoint_start = std::time::Instant::now();
         // TRUNCATE holds the write lock while it waits out readers and resets the
-        // file, so it runs on the writer connection in its turn like a write. If
-        // its turn does not come within the busy timeout, this tick drains
+        // file, so it runs on the writer connection in its turn like a write, and
+        // waits only briefly for readers (see `TRUNCATE_CHECKPOINT_BUSY_TIMEOUT`).
+        // If its turn does not come within the busy timeout, this tick drains
         // PASSIVE instead — the partial drain a TRUNCATE that finds the WAL busy
         // does — and the next tick tries again.
         let truncated = truncate_due
             && pool
                 .writer
-                .try_run(|conn| checkpoint_wal_file(conn, "PRAGMA wal_checkpoint(TRUNCATE)"))
+                .try_run(truncate_wal)
                 .await
                 .map_err(checkpoint_error)?
                 .is_some();
@@ -2863,6 +2883,64 @@ mod tests {
             ids(&metastore).await,
             vec![2],
             "a write whose caller went away before its turn must never run"
+        );
+    }
+
+    /// A TRUNCATE checkpoint waits only briefly for a reader still on an older
+    /// snapshot. It holds the write lock while it waits, so the write queued
+    /// behind it would otherwise wait out the whole read, for up to the busy
+    /// timeout.
+    #[tokio::test]
+    async fn test_a_truncate_waiting_on_a_reader_holds_writes_only_briefly() {
+        // How long the reader holds its snapshot: the duration the write behind
+        // the TRUNCATE must not have to wait out.
+        const READ_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        insert_id(&metastore, 1).await.expect("seed row");
+
+        let path = metastore.db_path().to_string();
+        let (snapshot_taken, reader_ready) = tokio::sync::oneshot::channel();
+        let reader = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(path).expect("open the reader");
+            conn.execute_batch("BEGIN").expect("begin the read");
+            conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+                .expect("read");
+            snapshot_taken.send(()).expect("signal the snapshot");
+            // Time is what is under test: the reader keeps its snapshot open.
+            std::thread::sleep(READ_HOLD);
+            conn.execute_batch("COMMIT").expect("end the read");
+        });
+        reader_ready.await.expect("the reader took its snapshot");
+        insert_id(&metastore, 2)
+            .await
+            .expect("a write past the reader's snapshot");
+
+        // Polled in order, so the TRUNCATE is queued on the writer before the
+        // write.
+        let pool = metastore.pool().await.expect("pool");
+        let started = std::time::Instant::now();
+        let (truncate, write) = tokio::join!(pool.writer.try_run(truncate_wal), async {
+            insert_id(&metastore, 3).await.map(|()| started.elapsed())
+        });
+        tokio::task::spawn_blocking(move || reader.join())
+            .await
+            .expect("join the reader")
+            .expect("reader thread");
+
+        assert!(
+            truncate.expect("truncate checkpoint").is_some(),
+            "the TRUNCATE must have had its turn"
+        );
+        let waited = write.expect("the write behind the TRUNCATE");
+        assert!(
+            waited < READ_HOLD / 2,
+            "the write behind a TRUNCATE waited {waited:?}, as long as the reader held its snapshot"
         );
     }
 
