@@ -38,7 +38,8 @@ use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec,
 };
 
 /// The schema a `sink` source advertises when it has no acceleration to inherit from.
@@ -51,6 +52,15 @@ fn placeholder_schema() -> SchemaRef {
         DataType::Utf8,
         false,
     )]))
+}
+
+/// Why a snapshot-only dataset (no `from:`, `refresh_mode: snapshot`) cannot be registered
+/// when no snapshot was restored: without a source or a snapshot there is no schema.
+fn snapshot_only_without_snapshot_message() -> String {
+    "It has no `from:` source and no snapshot was restored from `snapshots.location`, so its schema is unknown and it cannot be registered. \
+    Publish a snapshot for this dataset to the snapshot location and restart, or add a `from:` source. \
+    See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        .to_string()
 }
 
 /// The schema an accelerated `sink` dataset should advertise as its (no-op) source.
@@ -148,13 +158,27 @@ impl DataConnectorFactory for SinkConnectorFactory {
             // Reading the checkpoint needs the accelerator engine registry and the secrets, so
             // the spec is rebound to the runtime handles from the connector context; without a
             // context (connector unit tests) there is no accelerator to inherit from.
-            let schema = match &params.component {
-                ConnectorComponent::Dataset(spec) => {
-                    context.accelerated_checkpoint_schema(spec).await
+            let (schema, snapshot_only) = match &params.component {
+                ConnectorComponent::Dataset(spec) => (
+                    context.accelerated_checkpoint_schema(spec).await,
+                    spec.is_snapshot_only(),
+                ),
+                ConnectorComponent::Catalog(_) => (None, false),
+            };
+
+            // A snapshot-only dataset has no source and no writes to learn its schema from:
+            // the restored snapshot is the only place it can come from.
+            let schema = match schema {
+                Some(schema) => schema,
+                None if snapshot_only => {
+                    return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: SINK_DATACONNECTOR.to_string(),
+                        connector_component: params.component.clone(),
+                        message: snapshot_only_without_snapshot_message(),
+                    }) as Box<dyn std::error::Error + Send + Sync>);
                 }
-                ConnectorComponent::Catalog(_) => None,
-            }
-            .unwrap_or_else(placeholder_schema);
+                None => placeholder_schema(),
+            };
 
             Ok(Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>)
         })
