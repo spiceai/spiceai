@@ -17,17 +17,47 @@ limitations under the License.
 use std::process::Command;
 
 fn main() {
-    let git_hash: String = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        );
+    track_git_head();
+    let git_hash =
+        git_output(["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
+}
+
+/// Make the embedded commit hash an actual Cargo input. Changes in a dependency
+/// such as `cayenne` relink `spiced` without changing files under this package,
+/// so tracking only `build.rs` leaves `--version` reporting the prior commit.
+fn track_git_head() {
+    let Some(git_dir) = git_output(["rev-parse", "--git-dir"]) else {
+        return;
+    };
+    let git_dir = std::path::PathBuf::from(git_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(".git"));
+    for path in [git_dir.join("HEAD"), git_dir.join("packed-refs")] {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    if let Some(reference) = git_output(["symbolic-ref", "-q", "HEAD"]) {
+        println!(
+            "cargo:rerun-if-changed={}",
+            git_dir.join(reference).display()
+        );
+    }
+}
+
+fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
 }
 
 /// The cargo profile the binary is being built with.

@@ -271,24 +271,51 @@ impl CoveringIndexState {
         *self.pending.lock() = None;
         let source = SourceId::inline(Arc::clone(&self.table_id), inlined_id, sequence);
         let source_manifest = vec![source.clone()];
-        let catalog = match build_sources(
-            source,
-            self.definitions.to_vec(),
-            batches,
-            Arc::clone(&self.account),
-        )
-        .await
-        .and_then(|sources| {
-            self.definitions
-                .iter()
-                .cloned()
-                .zip(sources)
-                .map(|(definition, source)| {
-                    IndexCatalog::from_built_sources(definition, vec![source]).map(Arc::new)
+        let Some(definition) = self.definitions.first() else {
+            self.stage_uncovered(snapshot_id);
+            return;
+        };
+        // Full-refresh inline batches retain the source's Arrow schema metadata,
+        // while the covering definition is resolved from the table schema. The
+        // payload builder requires the latter's exact schema identity; relabeling
+        // compatible batches preserves their values and makes the catalog match
+        // the scan view that will later gather it.
+        let batches = batches
+            .into_iter()
+            .map(|batch| {
+                arrow_tools::record_batch::try_cast_to(
+                    batch,
+                    Arc::clone(definition.schema().schema()),
+                )
+                .map_err(|error| Error::InvalidContract {
+                    message: format!("inline batch cannot match covering schema: {error}"),
                 })
-                .collect::<Result<Vec<_>>>()
-                .and_then(|catalogs| CoveringIndexCatalog::new(snapshot_id.to_string(), catalogs))
-        }) {
+            })
+            .collect::<Result<Vec<_>>>();
+        let catalog = match batches {
+            Ok(batches) => build_sources(
+                source,
+                self.definitions.to_vec(),
+                batches,
+                Arc::clone(&self.account),
+            )
+            .await
+            .and_then(|sources| {
+                self.definitions
+                    .iter()
+                    .cloned()
+                    .zip(sources)
+                    .map(|(definition, source)| {
+                        IndexCatalog::from_built_sources(definition, vec![source]).map(Arc::new)
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|catalogs| {
+                        CoveringIndexCatalog::new(snapshot_id.to_string(), catalogs)
+                    })
+            }),
+            Err(error) => Err(error),
+        };
+        let catalog = match catalog {
             Ok(catalog) => {
                 *self.rejection.lock() = None;
                 Some(Arc::new(catalog))
@@ -1219,6 +1246,7 @@ fn account_buffer_bytes(buffer: &Buffer, total: &mut usize) -> Result<()> {
 
 #[cfg(test)]
 mod publication_tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -1304,13 +1332,14 @@ mod publication_tests {
     #[tokio::test]
     async fn publication_builds_catalog_for_inline_overwrite() {
         let state = state(8 * 1024 * 1024);
+        let batch = batch(vec![Some(1), Some(2)], vec!["one", "two"])
+            .with_schema(Arc::new(Schema::new_with_metadata(
+                schema().fields().clone(),
+                HashMap::from([(String::from("source"), String::from("parquet"))]),
+            )))
+            .expect("inline batch schema metadata");
         state
-            .stage_inline(
-                "snapshot-inline",
-                "inline-entry",
-                7,
-                vec![batch(vec![Some(1), Some(2)], vec!["one", "two"])],
-            )
+            .stage_inline("snapshot-inline", "inline-entry", 7, vec![batch])
             .await;
         state.promote_staged("snapshot-inline");
 
