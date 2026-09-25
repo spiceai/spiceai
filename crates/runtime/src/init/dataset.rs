@@ -3431,12 +3431,12 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     /// A connector whose construction waits until its test opens `gate`, and then
     /// returns a table with a `stale` column. Each test uses its own prefix and
     /// gate, because the connector registry is process-wide.
-    struct GatedConnectorFactory {
+    struct GatedStaleConnectorFactory {
         prefix: &'static str,
         gate: &'static Semaphore,
     }
 
-    impl DataConnectorFactory for GatedConnectorFactory {
+    impl DataConnectorFactory for GatedStaleConnectorFactory {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -3500,7 +3500,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         static GATE: Semaphore = Semaphore::const_new(0);
         register_connector_factory(
             "gated",
-            Arc::new(GatedConnectorFactory {
+            Arc::new(GatedStaleConnectorFactory {
                 prefix: "gated",
                 gate: &GATE,
             }),
@@ -3678,7 +3678,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         static GATE: Semaphore = Semaphore::const_new(0);
         register_connector_factory(
             "gated_parent",
-            Arc::new(GatedConnectorFactory {
+            Arc::new(GatedStaleConnectorFactory {
                 prefix: "gated_parent",
                 gate: &GATE,
             }),
