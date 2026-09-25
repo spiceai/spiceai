@@ -188,16 +188,12 @@ endif
 # three lanes once went unbuilt — the `nextest` target says out loud that this
 # one did not run.
 #
-# `snapshots` is here because `lint-rust` compiles with it and the unit tests
-# it gates (`runtime`'s `build_snapshot_creation_config_tests`) exist only
-# under it: a feature that clippy type-checks but nextest never enables leaves
-# a module that compiles in CI and never executes. The bare name enables the
-# feature on every member that defines it (`runtime`, `runtime-acceleration`,
-# `spiced`), exactly as `lint-rust`'s own `--features` list does. The trade is
-# `runtime`'s `http::v1::snapshots` test, which asserts the enterprise-only
-# response a `not(feature = "snapshots")` build returns: one build cannot carry
-# both sides of a cfg, and the module behind the feature guards behaviour the
-# feature-off path never reaches.
+# `snapshots` is here because the unit tests it gates (`runtime`'s
+# `build_snapshot_creation_config_tests`) exist only under it: a feature that
+# clippy type-checks but nextest never enables leaves a module that compiles
+# in CI and never executes. Trade-off: `runtime`'s `http::v1::snapshots` test,
+# which asserts the enterprise-only response of a `not(feature = "snapshots")`
+# build, cannot run in the same build.
 NEXTEST_SELECTION := --all --exclude libnfs \
 	--features cayenne/result-correctness-duckdb,snapshots
 # `spice-substrait-compliance` is a binary crate: its unit tests, including the
