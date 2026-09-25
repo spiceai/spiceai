@@ -26514,28 +26514,13 @@ impl CayenneTableProvider {
             .await;
     }
 
-    /// Replace the aggregate with a full live-row rewrite (compaction).
-    ///
-    /// Compaction materializes exactly the live rows, so its accumulator's
-    /// min/max + NDV are the authoritative *live* aggregate. Replacing (rather
-    /// than merging) resets any superset drift accumulated incrementally — e.g.
-    /// min/max widened by since-deleted rows, or an NDV sketch inflated by
-    /// superseded keys — back to the live set, and `Set`s the live count.
-    pub(crate) async fn replace_table_stats_after_rewrite(
-        &self,
-        accumulator: &ColumnStatsAccumulator,
-    ) {
-        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-        let new_rows = accumulator.row_count();
-        self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
-            .await;
-    }
-
     /// Persist a full current-snapshot rewrite's statistics.
     ///
     /// A rewrite that folded every protected snapshot materialized exactly the
-    /// live rows, so its accumulator replaces the aggregate and `Set`s the count
-    /// (see [`Self::replace_table_stats_after_rewrite`]). One whose commit retained
+    /// live rows, so its min/max + NDV are the authoritative *live* aggregate:
+    /// replacing (rather than merging) resets any superset drift accumulated
+    /// incrementally — min/max widened by since-deleted rows, an NDV sketch
+    /// inflated by superseded keys — and the count is `Set`. One whose commit retained
     /// a protected snapshot — published during the re-encode, after the scan
     /// captured what to fold — did not: that snapshot's rows are live but absent
     /// from the accumulator, and its commit's delta was already folded into the
@@ -49510,7 +49495,7 @@ mod tests {
         // A full rewrite materializes exactly the live rows, so it — and only it —
         // may re-baseline.
         reopened
-            .replace_table_stats_after_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator)
             .await;
         assert!(
             reopened.table_statistics.read().count_exact,
@@ -49605,7 +49590,7 @@ mod tests {
         let accumulator = ColumnStatsAccumulator::new(&schema);
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
         provider
-            .replace_table_stats_after_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator)
             .await;
         assert!(
             provider
