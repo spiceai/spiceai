@@ -279,14 +279,20 @@ mod tests {
         deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
+        deny_spice_functions_for_mysql_table_providers,
+        deny_spice_functions_for_postgres_table_providers,
+        deny_spice_functions_for_sqlite_table_providers,
     };
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions::core::expr_fn::{
+        arrow_field, arrow_metadata, arrow_typeof, with_metadata,
+    };
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
     use datafusion::prelude::{Expr, col, lit};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
-    use runtime_udfs_api::{add_user_function, remove_user_function};
+    use runtime_udfs_api::{add_user_function, function_support, remove_user_function};
 
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
@@ -324,6 +330,54 @@ mod tests {
             !federates(regexp_count(col("s"), lit("a"), Some(col("start")), None)),
             "a column start position has no DuckDB rendering, so this plan must stay local"
         );
+    }
+
+    /// Regression test for #14334. `arrow_typeof` must not be unparsed into the
+    /// SQL sent to a `DuckDB` accelerator, which has no function of that name;
+    /// the call describes the `DataFusion` plan's type, so no backend can
+    /// answer it and every policy must keep it local. The three siblings from
+    /// the same `DataFusion` module are the same class, and the plain policy
+    /// every catalog connector takes is covered alongside the backend ones.
+    #[test]
+    fn a_plan_introspection_builtin_stays_local_on_every_backend() {
+        let calls = [
+            ("arrow_typeof", arrow_typeof(col("s"))),
+            ("arrow_field", arrow_field(col("s"))),
+            ("arrow_metadata", arrow_metadata(vec![col("s")])),
+            (
+                "with_metadata",
+                with_metadata(vec![col("s"), lit("k"), lit("v")]),
+            ),
+        ];
+        let policies = [
+            ("plain", function_support()),
+            ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "DuckLake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ];
+
+        for (policy, support) in &policies {
+            for (name, call) in &calls {
+                assert!(
+                    contains_unsupported_functions(&plan_projecting(call.clone()), support)
+                        .expect("the support check must not error"),
+                    "{name} answers about the DataFusion plan, not the data, so the {policy} \
+                     policy must evaluate it locally rather than federate it"
+                );
+            }
+        }
     }
 
     /// The complement: the per-call check must not cost a pushdown that works.
