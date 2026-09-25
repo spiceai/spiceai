@@ -1107,12 +1107,15 @@ mod tests {
             )),
             false,
         );
-        let map = ArrayData::builder(map_type)
+        let map_builder = ArrayData::builder(map_type)
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0i32, 2]))
-            .add_child_data(entries)
-            .build()
-            .expect("a map with nullable entries decodes even though Arrow forbids it");
+            .add_child_data(entries);
+        // SAFETY: the offsets, buffers and child data are all well formed. The only
+        // thing `ArrayData::validate` objects to is the `entries` nullability
+        // declaration, which is exactly what this fixture exists to reproduce — the
+        // IPC reader builds such a map without either check.
+        let map = unsafe { map_builder.build_unchecked() };
         let target = DataType::Map(
             Arc::new(Field::new(
                 "entries",

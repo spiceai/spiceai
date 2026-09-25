@@ -334,12 +334,15 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(map_type(entries_nullable))
+        let builder = ArrayData::builder(map_type(entries_nullable))
             .len(offsets.len() - 1)
             .add_buffer(Buffer::from_slice_ref(offsets))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are all well formed. The only
+        // thing `ArrayData::validate` objects to is the `entries` nullability
+        // declaration, which is exactly what this fixture exists to reproduce — the
+        // IPC reader builds such a map without either check.
+        let data = unsafe { builder.build_unchecked() };
 
         MapArray::from(data)
     }
@@ -433,13 +436,16 @@ mod tests {
             None,
         )
         .expect("entries");
-        let data = ArrayData::builder(map_type(true))
+        let builder = ArrayData::builder(map_type(true))
             .len(2)
             .add_buffer(Buffer::from_slice_ref([0i32, 1, 1]))
             .nulls(Some(NullBuffer::from(vec![true, false])))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are all well formed. The only
+        // thing `ArrayData::validate` objects to is the `entries` nullability
+        // declaration, which is exactly what this fixture exists to reproduce — the
+        // IPC reader builds such a map without either check.
+        let data = unsafe { builder.build_unchecked() };
         let batch = batch_of(Arc::new(MapArray::from(data)) as ArrayRef);
 
         let normalized = normalize(batch).expect("normalization");
