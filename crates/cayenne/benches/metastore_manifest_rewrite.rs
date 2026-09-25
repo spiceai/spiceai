@@ -51,7 +51,8 @@ limitations under the License.
 //! threshold), standing in for the per-table maintenance ticks that drain the
 //! WAL in production (`wal_autocheckpoint = 0`).
 //!
-//! Run: `cargo bench -p cayenne --bench metastore_manifest_rewrite [-- <lane filter>]`.
+//! Run: `cargo bench -p cayenne --bench metastore_manifest_rewrite [-- <lane>]`, where
+//! `<lane>` is an exact lane name or a substring of the lanes to run.
 //! `METASTORE_BENCH_CLIENTS=1,8,64` restricts the client counts;
 //! `METASTORE_BENCH_RAW_DIR=<dir>` writes every sample, one latency in µs per
 //! line, to `<dir>/<lane>_c<clients>.csv`.
@@ -442,7 +443,16 @@ fn main() {
     if let Some(dir) = &raw_dir {
         std::fs::create_dir_all(dir).expect("create raw sample directory");
     }
-    for spec in LANES.iter().filter(|spec| spec.name.contains(&filter)) {
+    // An exact lane name selects that lane alone (`n=100` is also a prefix of
+    // `n=1000`); anything else selects every lane containing it.
+    let exact = LANES.iter().any(|spec| spec.name == filter);
+    for spec in LANES.iter().filter(|spec| {
+        if exact {
+            spec.name == filter
+        } else {
+            spec.name.contains(&filter)
+        }
+    }) {
         for &c in &clients {
             report(spec.name, c, run_lane(spec, c), raw_dir.as_deref());
         }
