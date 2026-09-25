@@ -34,10 +34,6 @@ pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 /// count the matches `regexp_count` asks for.
 const LEN_NAME: &str = "len";
 
-/// `DuckDB`'s NULL-defaulting function, applied over that count so a NULL
-/// input answers `0` as the kernel does — see
-/// [`DuckDBRegexpFunction::postprocess_function`].
-const COALESCE_NAME: &str = "coalesce";
 
 /// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
 pub(crate) const TRIM_NAME: &str = "trim";
@@ -764,21 +760,17 @@ impl DuckDBRegexpFunction {
         Ok(())
     }
 
-    /// `regexp_count` counts zero matches in a NULL input and answers `0`,
-    /// where `regexp_extract_all(NULL, p)` is NULL and so is `len(NULL)`. A
-    /// count that is NULL rather than `0` propagates differently through
-    /// `SUM`, through `= 0` and through a `WHERE` built on it, so an
-    /// accelerated dataset gained or lost rows against an unaccelerated one
-    /// (issue #13870). The count is therefore
-    /// `coalesce(len(regexp_extract_all(..)), 0)`, which is `0` exactly where
-    /// the kernel is. The other two regexp functions propagate NULL in both
-    /// engines and are left alone.
+    /// `regexp_count` has no `DuckDB` equivalent, so the count is the length of
+    /// the match list: `len(regexp_extract_all(..))`. Both sides propagate NULL
+    /// — `regexp_count` is NULL for a NULL input or pattern, and so are
+    /// `regexp_extract_all(NULL, p)` and `len(NULL)` — so the length is the
+    /// whole rendering. A count that was `0` where the kernel is NULL would
+    /// propagate differently through `SUM`, through `= 0` and through a `WHERE`
+    /// built on it, gaining or losing rows against an unaccelerated dataset.
+    /// The other two regexp functions need no postprocessing at all.
     fn postprocess_function(&self, ast_fn: ast::Expr) -> ast::Expr {
         match self {
-            DuckDBRegexpFunction::Count => call_ast_fn(
-                COALESCE_NAME,
-                vec![wrap_in_call(ast_fn, LEN_NAME), number_literal("0")],
-            ),
+            DuckDBRegexpFunction::Count => wrap_in_call(ast_fn, LEN_NAME),
             DuckDBRegexpFunction::Like | DuckDBRegexpFunction::Replace => ast_fn,
         }
     }
@@ -1241,12 +1233,13 @@ mod tests {
     }
 
     /// Every shape of `regexp_count` the dialect renders, pinned as the SQL
-    /// `DuckDB` is sent (issue #13870).
+    /// `DuckDB` is sent.
     ///
-    /// The `coalesce(.., 0)` is the point: `regexp_extract_all` is NULL for a
-    /// NULL input and `len(NULL)` is NULL, where the kernel counts zero
-    /// matches and answers `0`. The `SUBSTRING` offset is the kernel's 1-based
-    /// start passed through unchanged.
+    /// NULL handling is the point: `regexp_count` answers NULL for a NULL input
+    /// or pattern, and `len(regexp_extract_all(NULL, p))` is NULL too, so the
+    /// bare length matches the kernel on every row. Wrapping it to default a
+    /// NULL to `0` is what would diverge (issue #13870). The `SUBSTRING` offset
+    /// is the kernel's 1-based start passed through unchanged.
     #[test]
     fn regexp_count_unparses_to_a_null_preserving_match_count() {
         let dialect = new_duckdb_dialect();
@@ -1266,16 +1259,16 @@ mod tests {
 
         assert_eq!(
             render(regexp_count(s.clone(), lit("a"), None, None)),
-            r#"coalesce(len(regexp_extract_all("t"."s", 'a')), 0)"#
+            r#"len(regexp_extract_all("t"."s", 'a'))"#
         );
         assert_eq!(
             render(regexp_count(s.clone(), lit("a"), Some(lit(2)), None)),
-            r#"coalesce(len(regexp_extract_all(SUBSTRING("t"."s", 2), 'a')), 0)"#,
+            r#"len(regexp_extract_all(SUBSTRING("t"."s", 2), 'a'))"#,
             "SUBSTRING is 1-based in both engines, so the start is passed through"
         );
         assert_eq!(
             render(regexp_count(s, lit("^a+$"), None, None)),
-            r#"coalesce(len(regexp_extract_all("t"."s", '^a+$')), 0)"#,
+            r#"len(regexp_extract_all("t"."s", '^a+$'))"#,
             "anchors are zero-width but the match itself is not empty, so the call renders"
         );
     }
