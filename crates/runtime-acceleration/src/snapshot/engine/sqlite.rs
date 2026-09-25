@@ -42,8 +42,11 @@ limitations under the License.
 //!      created in between.
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use snafu::prelude::*;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use super::SnapshotEngine;
 
@@ -505,6 +508,34 @@ async fn remove_restore_journal(
     }
 }
 
+fn restore_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Restores whose journal belongs to this process. A pool open during one of
+/// them must not treat that journal as a crash and move the WAL back.
+static ACTIVE_SQLITE_RESTORES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Held from before a restore parks `SQLite` sidecars until the attempt has
+/// put them back or deleted them.
+#[must_use = "dropping the guard marks the restore finished"]
+pub(crate) struct ActiveSqliteRestore {
+    path: PathBuf,
+}
+
+impl Drop for ActiveSqliteRestore {
+    fn drop(&mut self) {
+        ACTIVE_SQLITE_RESTORES.lock().remove(&self.path);
+    }
+}
+
+pub(crate) fn begin_sqlite_restore(path: &Path) -> ActiveSqliteRestore {
+    let path = restore_key(path);
+    ACTIVE_SQLITE_RESTORES.lock().insert(path.clone());
+    ActiveSqliteRestore { path }
+}
+
 /// Puts parked `SQLite` sidecars back, or deletes them, after a restore was
 /// interrupted before it could finish.
 ///
@@ -512,7 +543,8 @@ async fn remove_restore_journal(
 /// rename. The same file means the replacement never landed, so the parked
 /// `-wal`/`-shm`/`-journal` are moved back. A different file means the
 /// replacement landed, so those sidecars are deleted rather than applied to it.
-/// No journal means there is nothing to finish.
+/// No journal means there is nothing to finish. A restore this process still
+/// has in progress is left alone.
 ///
 /// Call this before opening the database. A connection opened while the log is
 /// still parked does not see the rows that exist only in that log.
@@ -527,6 +559,15 @@ pub async fn recover_interrupted_sqlite_restore(
     database: &Path,
     dataset_name: &str,
 ) -> Result<(), super::SnapshotEngineError> {
+    // This process still owns the journal. The attempt that parked the WAL
+    // will put it back, or delete it, itself. Treating the journal as a crash
+    // here moves the WAL back beside the file the rename is about to replace.
+    if ACTIVE_SQLITE_RESTORES
+        .lock()
+        .contains(&restore_key(database))
+    {
+        return Ok(());
+    }
     let journal = restore_journal_path(database);
     let recorded = match tokio::fs::read_to_string(&journal).await {
         Ok(text) => text,
@@ -850,6 +891,27 @@ mod tests {
         assert!(sidecar_path(&live_path, "-wal").exists());
         assert!(!parked_sidecar_path(&live_path, "-wal").exists());
         assert!(!restore_journal_path(&live_path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_pool_open_during_restore_does_not_put_the_wal_back() {
+        let tmp = TempDir::new().expect("tmp");
+        let (live_path, download, live) = live_wal_database_and_download(&tmp);
+        // `replace_downloaded_file` holds this for the whole attempt.
+        let _active = begin_sqlite_restore(&live_path);
+        let engine = SqliteSnapshotEngine::new();
+        engine
+            .prepare_file_restore(&live_path, "orders")
+            .await
+            .expect("park the wal");
+        // `get_shared_pool` recovers before it opens the file. During a live
+        // restore that recovery must not move the parked WAL back.
+        recover_interrupted_sqlite_restore(&live_path, "orders")
+            .await
+            .expect("recover");
+        std::fs::rename(&download, &live_path).expect("replacement landed");
+        drop(live);
+        assert_eq!(count_rows_in_wal_mode(&live_path), 3);
     }
 
     #[tokio::test]

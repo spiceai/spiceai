@@ -739,6 +739,21 @@ pub(crate) async fn replace_downloaded_file(
     local_path: &Path,
     dataset_name: &str,
 ) -> Result<(), SnapshotDownloadError> {
+    // Finish a previous process's interrupted restore before this attempt
+    // takes the journal. The guard then keeps a pool open in this process
+    // from putting the parked WAL back while the rename is still in progress.
+    #[cfg(feature = "sqlite")]
+    {
+        engine::recover_interrupted_sqlite_restore(local_path, dataset_name)
+            .await
+            .map_err(|source| SnapshotDownloadError::FinalizeFile {
+                path: local_path.to_path_buf(),
+                source: Box::new(source),
+            })?;
+    }
+    #[cfg(feature = "sqlite")]
+    let _active_sqlite_restore = engine::begin_sqlite_restore(local_path);
+
     if let Err(source) = engine.prepare_file_restore(local_path, dataset_name).await {
         let _ = fs::remove_file(temp_path).await;
         return Err(SnapshotDownloadError::FinalizeFile {
