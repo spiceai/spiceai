@@ -78,6 +78,13 @@ pub(crate) enum RowCountUpdate {
     /// the incremental deltas might accumulate. Re-establishes
     /// `num_rows_exact = true`.
     Set(i64),
+    /// Replace with a count that measured only part of the live rows, and record
+    /// it as not exact. Used by a full rewrite whose commit retained a protected
+    /// snapshot it never read (one published during its re-encode): the rewrite
+    /// counted what it materialized, but the retained snapshot's rows are live
+    /// too, and their commit's delta was already folded into the count this
+    /// replaces. Served `Inexact` until a later rewrite folds every snapshot.
+    Estimate(i64),
     /// Leave the count unchanged — rows moved, not added (e.g. the inline-data
     /// checkpoint flush, whose rows were already counted on insert). Preserves the
     /// existing `num_rows_exact`.
