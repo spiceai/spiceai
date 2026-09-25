@@ -92,20 +92,15 @@ pub(crate) async fn post(
     Json(req): Json<CreateEmbeddingRequest>,
 ) -> Response {
     let model_id = req.model.clone();
-    match embeddings.read().await.get(&model_id) {
-        Some(model) => {
-            let resp: Response = match model.embed_request(req).await {
-                Ok(response) => Json(response).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            };
+    let Some(model) = embeddings.read().await.get(&model_id).cloned() else {
+        let message = status
+            .unavailable_embedding_reason(&model_id)
+            .unwrap_or_else(|| "model not found".to_string());
+        return (StatusCode::NOT_FOUND, message).into_response();
+    };
 
-            resp
-        }
-        None => {
-            let message = status
-                .unavailable_embedding_reason(&model_id)
-                .unwrap_or_else(|| "model not found".to_string());
-            (StatusCode::NOT_FOUND, message).into_response()
-        }
+    match model.embed_request(req).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
