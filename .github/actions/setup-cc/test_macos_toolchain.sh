@@ -23,6 +23,10 @@ subject="${SUBJECT:-$script_dir/macos_toolchain.sh}"
 # Made absolute up front: run_subject changes into the fake prefix before it
 # invokes the subject, so a relative SUBJECT would be looked up there.
 subject="$(cd "$(dirname "$subject")" && pwd)/$(basename "$subject")"
+if [ ! -f "$subject" ]; then
+  echo "SUBJECT does not exist: ${SUBJECT:-$subject}" >&2
+  exit 2
+fi
 
 # Tools the subject itself needs (dirname, wc, tr, printf, command). Resolved
 # once so the fake PATH can be built from them instead of the host's PATH.
