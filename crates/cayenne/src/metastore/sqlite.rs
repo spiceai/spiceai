@@ -439,7 +439,8 @@ struct Writer {
 /// open on that file in this process. Each file has its own slot, held while
 /// its writer connection opens, so a file whose open waits out another
 /// process's lock holds up only metastores on that same file. Weak, so a
-/// file's writer connection closes with the last metastore open on it.
+/// file's writer connection closes once no metastore is open on it and no
+/// write or session queued there is left to run.
 type WriterSlot = Arc<Mutex<std::sync::Weak<Writer>>>;
 static WRITERS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, WriterSlot>>,
@@ -596,7 +597,7 @@ impl Writer {
     /// Run `job` once every write queued before it has run. `Ok(None)` means
     /// its turn did not come within the busy timeout, and it never runs.
     async fn try_run<F, R>(
-        &self,
+        self: &Arc<Self>,
         job: F,
     ) -> Result<Option<R>, tokio_rusqlite::Error<rusqlite::Error>>
     where
@@ -605,12 +606,21 @@ impl Writer {
     {
         let turn = Turn::new();
         let claimant = turn.claimant();
+        // A started write runs to its end even when its caller stops waiting,
+        // so the write holds the writer until then: the file's writer
+        // connection stays registered, and a metastore opened on the file
+        // meanwhile queues behind the write instead of opening a second one.
+        let writer = Arc::clone(self);
         let call = self.conn.call(move |conn| {
-            if !Turn::claim(&claimant) {
-                return Ok(None);
-            }
-            end_leftover_transaction(conn)?;
-            job(conn).map(Some)
+            let ran = if Turn::claim(&claimant) {
+                end_leftover_transaction(conn)
+                    .and_then(|()| job(conn))
+                    .map(Some)
+            } else {
+                Ok(None)
+            };
+            drop(writer);
+            ran
         });
         tokio::pin!(call);
         match tokio::time::timeout(Self::busy_timeout(), &mut call).await {
@@ -623,7 +633,10 @@ impl Writer {
 
     /// [`Self::try_run`], failing with [`writer_timeout`] when the write's
     /// turn does not come within the busy timeout.
-    async fn run<F, R>(&self, job: F) -> Result<R, tokio_rusqlite::Error<rusqlite::Error>>
+    async fn run<F, R>(
+        self: &Arc<Self>,
+        job: F,
+    ) -> Result<R, tokio_rusqlite::Error<rusqlite::Error>>
     where
         F: FnOnce(&mut rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
@@ -650,33 +663,17 @@ impl Writer {
         let (jobs, next_job) = std::sync::mpsc::channel::<SessionJob>();
         let conn = self.conn.clone();
         // The session runs on the writer's thread until it ends, however long
-        // its caller takes; this task only queues it there.
+        // its caller takes; this task only queues it there. It holds the writer
+        // throughout, `abort` included, so the file's writer connection stays
+        // registered past the metastore that began the session and past a
+        // caller that drops it, and a metastore opened on the file meanwhile
+        // queues its writes on this connection instead of opening a second one.
+        let writer = Arc::clone(self);
         tokio::spawn(async move {
             let _ = conn
                 .call_raw(move |conn| {
-                    if !Turn::claim(&claimant) {
-                        return;
-                    }
-                    if let Err(e) = end_leftover_transaction(conn).and_then(|()| start(conn)) {
-                        let _ = started_tx.send(Err(e));
-                        return;
-                    }
-                    let began = std::time::Instant::now();
-                    if started_tx.send(Ok(())).is_err() {
-                        // Its caller went away as its turn came.
-                        abort(conn, began);
-                        return;
-                    }
-                    while let Ok(job) = next_job.recv() {
-                        match job(conn) {
-                            SessionStep::Continue => {}
-                            SessionStep::End => return,
-                            SessionStep::Abort => break,
-                        }
-                    }
-                    // Dropped without being finished, or finished by a caller
-                    // that went away before its last statement ran.
-                    abort(conn, began);
+                    run_session(conn, &claimant, start, abort, started_tx, &next_job);
+                    drop(writer);
                 })
                 .await;
         });
@@ -687,25 +684,53 @@ impl Writer {
             Err(_) => started.await,
         };
         match started {
-            Ok(Ok(())) => Ok(Session {
-                jobs,
-                _writer: Arc::clone(self),
-            }),
+            Ok(Ok(())) => Ok(Session { jobs }),
             Ok(Err(e)) => Err(tokio_rusqlite::Error::Error(e)),
             Err(_) => Err(tokio_rusqlite::Error::ConnectionClosed),
         }
     }
 }
 
+/// A [`Writer::session`] on the writer's thread once its turn comes: `start`,
+/// then each statement its caller sends until one ends the session, and
+/// `abort` when it ends any other way.
+fn run_session(
+    conn: &mut rusqlite::Connection,
+    claimant: &AtomicU8,
+    start: fn(&mut rusqlite::Connection) -> Result<(), rusqlite::Error>,
+    abort: fn(&mut rusqlite::Connection, std::time::Instant),
+    started_tx: tokio::sync::oneshot::Sender<Result<(), rusqlite::Error>>,
+    next_job: &std::sync::mpsc::Receiver<SessionJob>,
+) {
+    if !Turn::claim(claimant) {
+        return;
+    }
+    if let Err(e) = end_leftover_transaction(conn).and_then(|()| start(conn)) {
+        let _ = started_tx.send(Err(e));
+        return;
+    }
+    let began = std::time::Instant::now();
+    if started_tx.send(Ok(())).is_err() {
+        // Its caller went away as its turn came.
+        abort(conn, began);
+        return;
+    }
+    while let Ok(job) = next_job.recv() {
+        match job(conn) {
+            SessionStep::Continue => {}
+            SessionStep::End => return,
+            SessionStep::Abort => break,
+        }
+    }
+    // Dropped without being finished, or finished by a caller that went away
+    // before its last statement ran.
+    abort(conn, began);
+}
+
 /// A caller's hold on the [`Writer`] for statements it issues one at a time.
 /// Dropping it ends the session with the `abort` it was started with.
 struct Session {
     jobs: std::sync::mpsc::Sender<SessionJob>,
-    /// Keeps the writer connection registered for as long as the session
-    /// runs, even past the metastore that began it, so a metastore opened on
-    /// the same file meanwhile queues its writes on this connection instead of
-    /// opening a second one.
-    _writer: Arc<Writer>,
 }
 
 impl Session {
@@ -3297,6 +3322,104 @@ mod tests {
             "the file's slot must still hand out the open transaction's writer connection"
         );
         drop(session);
+    }
+
+    /// The writer connection a file's slot hands out now, if it is still open.
+    async fn registered_writer(path: &std::path::Path) -> Option<Arc<Writer>> {
+        let key = writer_key(path.to_str().expect("utf-8 path")).await;
+        let slot = Arc::clone(WRITERS.lock().get(&key).expect("the file's writer slot"));
+        slot.lock().await.upgrade()
+    }
+
+    /// A write whose caller stops waiting once it has started runs to its end,
+    /// and keeps its writer connection registered until then, even past the
+    /// last metastore open on the file: a metastore opened meanwhile is handed
+    /// that connection rather than a second one.
+    #[tokio::test]
+    async fn test_a_started_write_keeps_its_writer_registered_past_its_caller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cayenne.db");
+        let first = SqliteMetastore::new(format!("sqlite://{}", path.display()));
+        let writer = Arc::clone(&first.pool().await.expect("pool").writer);
+        let registered = Arc::downgrade(&writer);
+        let (running_tx, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let write = tokio::spawn(async move {
+            writer
+                .run(move |conn| {
+                    let _ = running_tx.send(());
+                    // Still running once its caller and the metastore are gone.
+                    let _ = released.recv();
+                    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                })
+                .await
+        });
+        running.await.expect("the write starts");
+        write.abort();
+        assert!(
+            write.await.is_err_and(|e| e.is_cancelled()),
+            "the write's caller must have stopped waiting"
+        );
+        drop(first);
+
+        let handed_out = registered_writer(&path).await;
+        let still_registered = registered.upgrade();
+        release.send(()).expect("the write is still running");
+        let still_registered =
+            still_registered.expect("a started write must keep its writer connection alive");
+        assert!(
+            handed_out.is_some_and(|writer| Arc::ptr_eq(&writer, &still_registered)),
+            "the file's slot must still hand out the running write's writer connection"
+        );
+    }
+
+    /// A transaction dropped while one of its statements runs is rolled back on
+    /// the writer connection once the statement ends, and keeps the connection
+    /// registered until that rollback has run, even past the last metastore
+    /// open on the file.
+    #[tokio::test]
+    async fn test_a_dropped_transaction_keeps_its_writer_registered_until_its_rollback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cayenne.db");
+        let first = SqliteMetastore::new(format!("sqlite://{}", path.display()));
+        let writer = Arc::clone(&first.pool().await.expect("pool").writer);
+        let registered = Arc::downgrade(&writer);
+        let session = writer
+            .session(begin_immediate, roll_back)
+            .await
+            .expect("begin");
+        drop(writer);
+        let (running_tx, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let statement = tokio::spawn(async move {
+            session
+                .call(move |_conn| {
+                    let _ = running_tx.send(());
+                    // Still running once the transaction and the metastore are
+                    // gone, so the rollback is still to come.
+                    let _ = released.recv();
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await
+        });
+        running.await.expect("the statement starts");
+        statement.abort();
+        assert!(
+            statement.await.is_err_and(|e| e.is_cancelled()),
+            "the transaction must have been dropped"
+        );
+        drop(first);
+
+        let handed_out = registered_writer(&path).await;
+        let still_registered = registered.upgrade();
+        release.send(()).expect("the statement is still running");
+        let still_registered = still_registered.expect(
+            "a dropped transaction must keep its writer connection alive until its rollback",
+        );
+        assert!(
+            handed_out.is_some_and(|writer| Arc::ptr_eq(&writer, &still_registered)),
+            "the file's slot must still hand out the dropped transaction's writer connection"
+        );
     }
 
     /// A symlink to a metastore file shares its target's writer connection, so
