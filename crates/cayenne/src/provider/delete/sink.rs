@@ -939,7 +939,15 @@ impl CayenneDeletionSink {
             }
         }
 
-        let physical_filters = self.build_physical_filters(&coerced_filters)?;
+        // Read only the key and filter columns. Filters are pushed to the scan for
+        // pruning only and are re-applied exactly below.
+        let (scan_projection, scan_schema) = self.filtered_delete_projection(&coerced_filters)?;
+        let physical_filters = Self::build_physical_filters(&coerced_filters, &scan_schema)?;
+        // Key columns lead the projected batch.
+        let projected = Self {
+            pk_column_indices: (0..self.pk_column_indices.len()).collect(),
+            ..self.clone()
+        };
 
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
@@ -949,7 +957,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -966,7 +977,8 @@ impl CayenneDeletionSink {
                         // One bloom-prefiltered probe per row: no second scan, and nothing
                         // held that the raw scan did not already hold.
                         pending_pk_values.extend(
-                            self.extract_int64_pk_values(&batch)?
+                            projected
+                                .extract_int64_pk_values(&batch)?
                                 .into_iter()
                                 .filter(|pk| self.is_live_int64_pk(*pk, source)),
                         );
@@ -1021,7 +1033,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -1034,7 +1049,8 @@ impl CayenneDeletionSink {
                         // See the Int64 branch: this snapshot's threshold is what tells
                         // a superseded version from the row that replaced it.
                         pending_row_keys.extend(
-                            self.extract_row_keys(&batch, row_converter)?
+                            projected
+                                .extract_row_keys(&batch, row_converter)?
                                 .into_iter()
                                 .filter(|key| self.is_live_row_key(key, source)),
                         );
@@ -1195,11 +1211,30 @@ impl CayenneDeletionSink {
         Ok(coerced_filters)
     }
 
-    fn build_physical_filters(
+    /// Projection for a filtered delete scan: key columns first, then any other
+    /// column the filters reference.
+    fn filtered_delete_projection(
         &self,
         filters: &[Expr],
+    ) -> super::super::Result<(Vec<usize>, SchemaRef)> {
+        let mut projection = self.pk_column_indices.clone();
+        for filter in filters {
+            for column in filter.column_refs() {
+                let index = self.schema.index_of(&column.name)?;
+                if !projection.contains(&index) {
+                    projection.push(index);
+                }
+            }
+        }
+        let schema = Arc::new(self.schema.project(&projection)?);
+        Ok((projection, schema))
+    }
+
+    fn build_physical_filters(
+        filters: &[Expr],
+        schema: &SchemaRef,
     ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
-        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let execution_props = ExecutionProps::new();
 
         let physical_filters = filters
