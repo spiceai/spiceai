@@ -2118,13 +2118,17 @@ enum Keep {
 ///   pair `BigQuery` refuses (#13882).
 /// - `factorial`: Spark's signature is `Exact(Int32)`, so `factorial(5)` — an
 ///   `Int64` literal — does not plan at all (#14361).
-/// - `length` (also `character_length`, `char_length`, `len`): Spark's always
-///   answers `Int32`, and its aliases would replace the built-in
-///   `character_length` under every name it has; the built-in is the
-///   documented one. Spark's `len`, a name no built-in has, is lent to it
-///   (`SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN`).
+/// - `length` (also `character_length`, `char_length`, `len`) is **Spark's on
+///   purpose**: it accepts a binary argument and counts its bytes, where the
+///   built-in `character_length` accepts only string types and coerces a
+///   binary value to UTF-8 — `length(X'C3A9')` measured 2 under Spark's and 1
+///   under the built-in, and `length(X'FF00')` failed under the built-in. On
+///   string arguments the two agree on type (`Int32`) and on every value
+///   probed, so the built-in would gain nothing visible and lose the overload.
 /// - `substring` (also `substr`): Spark's answers NULL when any argument is
-///   NULL; the built-in `substr` is the documented one.
+///   NULL; the built-in `substr` is the documented one. Neither takes a binary
+///   argument through SQL — `substring(<binary>, 1, 2)` fails to plan under
+///   both — so no overload is lost.
 /// - `trunc`: Spark's is date truncation and shadows the numeric
 ///   `trunc(<float>, <int>)` (#11415).
 const SPARK_SCALAR_COLLISIONS: &[(&str, Keep)] = &[
@@ -2138,7 +2142,7 @@ const SPARK_SCALAR_COLLISIONS: &[(&str, Keep)] = &[
     ("date_trunc", Keep::BuiltIn),
     ("factorial", Keep::BuiltIn),
     ("floor", Keep::BuiltIn),
-    ("length", Keep::BuiltIn),
+    ("length", Keep::Spark),
     ("round", Keep::BuiltIn),
     ("substring", Keep::BuiltIn),
     ("trunc", Keep::BuiltIn),
@@ -2160,13 +2164,12 @@ const SPARK_AGGREGATE_COLLISIONS: &[(&str, Keep)] = &[("avg", Keep::BuiltIn)];
 const SPARK_WINDOW_COLLISIONS: &[(&str, Keep)] = &[];
 
 /// The names a kept-out Spark scalar function declares that no built-in
-/// holds, lent to the built-in it yields to: a call by that name resolved
-/// before the collision was decided, and keeps resolving — to the documented
-/// function. A test pins that this is exactly the set of such names, and that
-/// no kept-out aggregate or window function has one, since nothing lends
-/// theirs.
-const SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN: &[(&str, &[&str])] =
-    &[("ceil", &["ceiling"]), ("length", &["len"])];
+/// holds, lent to the built-in it yields to: a call by that name (`ceiling`)
+/// resolved before the collision was decided, and keeps resolving — to the
+/// documented function. A test pins that this is exactly the set of such
+/// names, and that no kept-out aggregate or window function has one, since
+/// nothing lends theirs.
+const SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN: &[(&str, &[&str])] = &[("ceil", &["ceiling"])];
 
 /// The names a Spark `kind` function `name` would take that `registered`
 /// already holds, when the collision is decided `Keep::BuiltIn` and the
@@ -2905,8 +2908,9 @@ mod tests {
     }
 
     /// A name only Spark declared keeps resolving once its function is kept
-    /// out — to the built-in that was kept: `len` is `character_length` and
-    /// `ceiling` is `ceil`, so `ceiling(1.5)` answers the built-in's `Float64`.
+    /// out — to the built-in that was kept: `ceiling` is `ceil`, so
+    /// `ceiling(1.5)` answers the built-in's `Float64`. (`len` is not lent:
+    /// Spark's `length` is kept, and registers it itself.)
     #[tokio::test]
     #[cfg(not(windows))]
     async fn a_spark_only_name_resolves_to_the_kept_built_in() {
@@ -2918,22 +2922,20 @@ mod tests {
         .build();
 
         let state = df.ctx.state();
-        for (lent, built_in) in [("len", "character_length"), ("ceiling", "ceil")] {
-            let resolved = state
-                .scalar_functions()
-                .get(lent)
-                .unwrap_or_else(|| panic!("`{lent}` must still resolve"));
-            assert_eq!(
-                resolved.name(),
-                built_in,
-                "`{lent}` must resolve to the built-in `{built_in}`, not to Spark's"
-            );
-        }
+        let resolved = state
+            .scalar_functions()
+            .get("ceiling")
+            .expect("`ceiling` must still resolve");
+        assert_eq!(
+            resolved.name(),
+            "ceil",
+            "`ceiling` must resolve to the built-in `ceil`, not to Spark's"
+        );
         drop(state);
 
         let batches = df
             .ctx
-            .sql("SELECT len('abc') AS n, ceiling(1.5) AS c")
+            .sql("SELECT character_length('abc') AS n, ceiling(1.5) AS c")
             .await
             .expect("plan the lent names")
             .collect()
@@ -2946,7 +2948,46 @@ mod tests {
             .to_string();
         assert!(
             rendered.contains("| 3 | 2.0 |"),
-            "len('abc') must be 3 and ceiling(1.5) the built-in's 2.0, got {rendered}"
+            "character_length('abc') must be 3 and ceiling(1.5) the built-in's 2.0, got {rendered}"
+        );
+    }
+
+    /// The built session keeps **Spark's** `length`: it takes a binary
+    /// argument and counts bytes, which the built-in `character_length` does
+    /// not — it coerces the value to UTF-8 and counts characters, so the two
+    /// bytes `C3 A9` (one character) answer 2 under Spark's and 1 under the
+    /// built-in. This pins the `Keep::Spark` entry in `SPARK_SCALAR_COLLISIONS`.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_spark_length_for_binary() {
+        use arrow::array::Int32Array;
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let batches = df
+            .ctx
+            .sql("SELECT length(arrow_cast(X'C3A9', 'Binary')) AS bytes")
+            .await
+            .expect("plan length over a binary value")
+            .collect()
+            .await
+            .expect("run length over a binary value");
+        let bytes = batches
+            .first()
+            .expect("one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("length answers Int32");
+        assert_eq!(
+            bytes.value(0),
+            2,
+            "length over the two bytes C3 A9 must count bytes, not the one character they encode"
         );
     }
 
