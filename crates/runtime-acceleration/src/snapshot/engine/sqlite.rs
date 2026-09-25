@@ -668,10 +668,24 @@ pub async fn recover_interrupted_sqlite_restore(
     {
         return Ok(());
     }
+    // `rename_over` deletes the installed journal before renaming the
+    // temporary file onto it. A crash in between leaves only the temporary
+    // file, which already holds the identity and the aside name.
     let journal = restore_journal_path(database);
+    let mut temporary = journal.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
     let text = match tokio::fs::read_to_string(&journal).await {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::read_to_string(&temporary).await {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(source) => {
+                    return Err(journal_error(dataset_name, temporary, source, false));
+                }
+            }
+        }
         Err(source) => return Err(journal_error(dataset_name, journal, source, false)),
     };
     let Some(parsed) = parse_restore_journal(&text) else {
@@ -744,7 +758,12 @@ pub async fn recover_interrupted_sqlite_restore(
             }
         }
     }
-    remove_restore_journal(database, dataset_name).await
+    remove_restore_journal(database, dataset_name).await?;
+    match tokio::fs::remove_file(&temporary).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(journal_error(dataset_name, temporary, source, false)),
+    }
 }
 
 async fn remove_sidecars(
@@ -1060,6 +1079,46 @@ mod tests {
         assert!(live_path.exists());
         assert!(!aside.exists());
         assert!(!restore_journal_path(&live_path).exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_reads_a_journal_left_in_the_temporary_file() {
+        let tmp = TempDir::new().expect("tmp");
+        let live_path = tmp.path().join("orders.sqlite");
+        let live = Connection::open(&live_path).expect("open live");
+        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .expect("wal");
+        live.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO t(id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        )
+        .expect("write live rows into the wal");
+        let engine = SqliteSnapshotEngine::new();
+        engine
+            .prepare_file_restore(&live_path, "orders")
+            .await
+            .expect("park the wal");
+        let aside = live_path.with_extension(format!("old.{}", std::process::id()));
+        record_sqlite_restore_aside(&live_path, &aside, "orders")
+            .await
+            .expect("record aside");
+        let journal = restore_journal_path(&live_path);
+        let text = std::fs::read_to_string(&journal).expect("read journal");
+        let mut temporary = journal.as_os_str().to_owned();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+        std::fs::write(&temporary, text).expect("write the temporary journal");
+        std::fs::remove_file(&journal).expect("journal deleted before the rename finished");
+        std::fs::rename(&live_path, &aside).expect("move the live database aside");
+        std::mem::forget(live);
+
+        recover_interrupted_sqlite_restore(&live_path, "orders")
+            .await
+            .expect("recover from the temporary journal");
+        assert_eq!(fresh_row_count(&live_path).expect("rows are back"), 3);
+        assert!(!temporary.exists());
+        assert!(!journal.exists());
     }
 
     #[tokio::test]
