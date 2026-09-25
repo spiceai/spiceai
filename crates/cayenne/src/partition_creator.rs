@@ -442,7 +442,7 @@ impl PartitionCreator for CayennePartitionCreator {
         Ok(result)
     }
 
-    /// Every filter is `Inexact`: DataFusion re-applies it above the scan, and
+    /// Every filter is `Inexact`: `DataFusion` re-applies it above the scan, and
     /// the partition providers use it to prune files, the mem-tier, and to
     /// detect primary-key point lookups. `Unsupported` would withhold the
     /// filter from `scan()` entirely and buy no extra safety.
