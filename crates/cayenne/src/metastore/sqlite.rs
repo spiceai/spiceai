@@ -436,11 +436,14 @@ struct Writer {
 }
 
 /// Writer connections by metastore file, shared by every [`SqliteMetastore`]
-/// open on that file in this process. Weak, so a file's writer connection
-/// closes with the last metastore open on it.
+/// open on that file in this process. Each file has its own slot, held while
+/// its writer connection opens, so a file whose open waits out another
+/// process's lock holds up only metastores on that same file. Weak, so a
+/// file's writer connection closes with the last metastore open on it.
+type WriterSlot = Arc<Mutex<std::sync::Weak<Writer>>>;
 static WRITERS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<String, std::sync::Weak<Writer>>>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    parking_lot::Mutex<std::collections::HashMap<String, WriterSlot>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// Names a metastore file so every spelling of one path shares a writer
 /// connection: the canonical parent directory joined with the file name, since
@@ -540,19 +543,21 @@ type SessionJob = Box<dyn FnOnce(&mut rusqlite::Connection) -> SessionStep + Sen
 enum SessionStep {
     Continue,
     End,
+    /// The session ends with its `abort`: the caller of its last statement
+    /// went away before the statement ran.
+    Abort,
 }
 
 /// Every write on the writer connection ends its own transaction, so the next
-/// one never starts inside one. Should one ever be left open, roll it back
-/// rather than let the next write join a transaction nothing will commit.
-fn end_leftover_transaction(conn: &mut rusqlite::Connection) {
-    debug_assert!(
-        conn.is_autocommit(),
-        "a write found a transaction left open on the metastore writer connection"
-    );
-    if !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
+/// one should never start inside one. Should one be left open, by a `ROLLBACK`
+/// that failed, roll it back before the write runs; if that fails too, the
+/// write fails with its error rather than run inside a transaction nothing
+/// will commit.
+fn end_leftover_transaction(conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    if conn.is_autocommit() {
+        return Ok(());
     }
+    conn.execute_batch("ROLLBACK")
 }
 
 /// A transaction's start on the writer connection. `IMMEDIATE` takes the write
@@ -591,7 +596,7 @@ impl Writer {
             if !Turn::claim(&claimant) {
                 return Ok(None);
             }
-            end_leftover_transaction(conn);
+            end_leftover_transaction(conn)?;
             job(conn).map(Some)
         });
         tokio::pin!(call);
@@ -638,8 +643,7 @@ impl Writer {
                     if !Turn::claim(&claimant) {
                         return;
                     }
-                    end_leftover_transaction(conn);
-                    if let Err(e) = start(conn) {
+                    if let Err(e) = end_leftover_transaction(conn).and_then(|()| start(conn)) {
                         let _ = started_tx.send(Err(e));
                         return;
                     }
@@ -649,11 +653,14 @@ impl Writer {
                         return;
                     }
                     while let Ok(job) = next_job.recv() {
-                        if matches!(job(conn), SessionStep::End) {
-                            return;
+                        match job(conn) {
+                            SessionStep::Continue => {}
+                            SessionStep::End => return,
+                            SessionStep::Abort => break,
                         }
                     }
-                    // Dropped without being finished.
+                    // Dropped without being finished, or finished by a caller
+                    // that went away before its last statement ran.
                     abort(conn);
                 })
                 .await;
@@ -714,6 +721,15 @@ impl Session {
         let (result_tx, result) = tokio::sync::oneshot::channel();
         self.jobs
             .send(Box::new(move |conn: &mut rusqlite::Connection| {
+                // A last statement, a transaction's COMMIT, whose caller has
+                // gone away does not run: the session ends with its abort (a
+                // ROLLBACK) instead, so a transaction whose commit was cancelled
+                // before it began never commits behind its caller's back. Other
+                // statements run regardless, since skipping one in a
+                // transaction that goes on could commit part of it.
+                if matches!(step, SessionStep::End) && result_tx.is_closed() {
+                    return SessionStep::Abort;
+                }
                 let _ = result_tx.send(function(conn));
                 step
             }))
@@ -953,18 +969,27 @@ impl SqliteMetastore {
     /// file, opened by the first of them.
     async fn shared_writer(&self) -> CatalogResult<Arc<Writer>> {
         let key = writer_key(self.db_path()).await;
+        let slot = {
+            let mut writers = WRITERS.lock();
+            // A slot nobody is opening through, whose writer connection has
+            // closed, can go.
+            writers.retain(|_, slot| {
+                Arc::strong_count(slot) > 1
+                    || !matches!(slot.try_lock(), Ok(writer) if writer.strong_count() == 0)
+            });
+            Arc::clone(writers.entry(key).or_default())
+        };
         // Held across the open, so metastores opening one file at once share
         // one writer connection.
-        let mut writers = WRITERS.lock().await;
-        writers.retain(|_, writer| writer.strong_count() > 0);
-        if let Some(writer) = writers.get(&key).and_then(std::sync::Weak::upgrade) {
-            return Ok(writer);
+        let mut writer = slot.lock().await;
+        if let Some(open) = writer.upgrade() {
+            return Ok(open);
         }
-        let writer = Arc::new(Writer {
+        let opened = Arc::new(Writer {
             conn: self.open_connection().await?,
         });
-        writers.insert(key, Arc::downgrade(&writer));
-        Ok(writer)
+        *writer = Arc::downgrade(&opened);
+        Ok(opened)
     }
 
     /// Return the connection pool, initialising it lazily on first call.
@@ -2884,6 +2909,88 @@ mod tests {
             vec![2],
             "a write whose caller went away before its turn must never run"
         );
+    }
+
+    /// A transaction whose commit is cancelled while the COMMIT is still queued
+    /// on the writer connection is rolled back, not committed behind its
+    /// caller's back.
+    #[tokio::test]
+    async fn test_a_commit_cancelled_before_it_runs_rolls_back() {
+        // A statement the writer is still running when the COMMIT is queued
+        // behind it.
+        const SLOW_COUNT: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000000) SELECT count(*) FROM c";
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let pool = metastore.pool().await.expect("pool");
+        let session = pool
+            .writer
+            .session(begin_immediate, roll_back)
+            .await
+            .expect("begin");
+        session
+            .call(|conn| {
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map(|_| ())
+            })
+            .await
+            .expect("write inside the transaction");
+        let (slow_started, slow_running) = tokio::sync::oneshot::channel();
+        session
+            .jobs
+            .send(Box::new(move |conn: &mut rusqlite::Connection| {
+                let _ = slow_started.send(());
+                let _ = conn.query_row(SLOW_COUNT, [], |row| row.get::<_, i64>(0));
+                SessionStep::Continue
+            }))
+            .expect("queue a slow statement");
+        slow_running.await.expect("the slow statement started");
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            session.finish(|conn| conn.execute_batch("COMMIT")),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the COMMIT must still have been queued when its caller left"
+        );
+        insert_id(&metastore, 2)
+            .await
+            .expect("a write after the transaction ends");
+
+        assert_eq!(
+            ids(&metastore).await,
+            vec![2],
+            "a transaction whose commit was cancelled before it ran must roll back"
+        );
+    }
+
+    /// Opening one file's writer connection never waits for another file's:
+    /// a file whose open is stuck behind another process's lock holds up only
+    /// metastores on that same file.
+    #[tokio::test]
+    async fn test_a_stuck_writer_open_holds_up_only_its_own_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stuck = dir.path().join("stuck.db");
+        let key = writer_key(stuck.to_str().expect("utf-8 path")).await;
+        // Hold the stuck file's slot, as an open waiting out a lock would.
+        let slot = Arc::clone(WRITERS.lock().entry(key).or_default());
+        let _opening = slot.lock().await;
+
+        let other = SqliteMetastore::new(format!(
+            "sqlite://{}",
+            dir.path().join("other.db").display()
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), other.pool())
+            .await
+            .expect("another file's writer connection must not wait for a stuck open")
+            .expect("pool");
     }
 
     /// A TRUNCATE checkpoint waits only briefly for a reader still on an older
