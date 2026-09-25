@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
+use crate::http::v1::unavailable_model_message;
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::traits::EventType;
 use async_openai::types::responses::{
@@ -206,7 +207,12 @@ pub(crate) async fn post(
         }
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
-            return (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response();
+            let message = unavailable_model_message(
+                &model_id,
+                rt.status().get_component_status(&format!("model:{model_id}")).as_ref(),
+            )
+            .unwrap_or_else(|| format!("model '{model_id}' not found"));
+            return (StatusCode::NOT_FOUND, message).into_response();
         };
 
         if stream {

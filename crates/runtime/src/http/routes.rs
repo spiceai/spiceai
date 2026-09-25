@@ -581,6 +581,7 @@ pub(crate) fn routes(
 
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(rt)))
+        .layer(Extension(rt.status()))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(v1::status::MetricsTlsEnabled(metrics_tls)))
         .layer(Extension(config));

@@ -132,6 +132,34 @@ pub(crate) async fn require_write_access() -> Option<Response> {
     }
 }
 
+/// Explains why a configured model is absent from the store serving a request.
+///
+/// A model that failed to load, or has not finished loading, is never inserted into its serving
+/// store, so a lookup miss alone reads as "no such model" and sends the user to check a name that
+/// is correct. `status` is the model's entry in the runtime status (`model:<name>` or
+/// `embedding:<name>`). Returns `None` when the status gives no better explanation, and the caller
+/// keeps its own "not found" message.
+pub(crate) fn unavailable_model_message(
+    model_id: &str,
+    status: Option<&ComponentStatus>,
+) -> Option<String> {
+    match status? {
+        ComponentStatus::Error(Some(cause)) => Some(format!(
+            "Model '{model_id}' failed to load, so it cannot serve requests. Cause: {cause}"
+        )),
+        ComponentStatus::Error(None) => Some(format!(
+            "Model '{model_id}' failed to load, so it cannot serve requests. Check the Spice runtime logs for the cause."
+        )),
+        // `Refreshing` here is a reload: the model leaves its store before it is loaded again.
+        ComponentStatus::Initializing
+        | ComponentStatus::NotLoaded
+        | ComponentStatus::Refreshing => Some(format!(
+            "Model '{model_id}' is still loading. Retry once `GET /v1/models?status=true` reports it as ready."
+        )),
+        ComponentStatus::Ready | ComponentStatus::Disabled | ComponentStatus::ShuttingDown => None,
+    }
+}
+
 fn status_for_sql_error(message: &str) -> StatusCode {
     if message.contains("read-only SQL context") {
         StatusCode::FORBIDDEN
@@ -1281,6 +1309,50 @@ mod tests {
                     "{format:?}: body bytes must match the owned-stream path"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unavailable_model_message_explains_each_absent_state() {
+        let failed = ComponentStatus::error_with_message("Insufficient Balance");
+        assert_eq!(
+            unavailable_model_message("m", Some(&failed)).as_deref(),
+            Some(
+                "Model 'm' failed to load, so it cannot serve requests. Cause: Insufficient Balance"
+            )
+        );
+        assert_eq!(
+            unavailable_model_message("m", Some(&ComponentStatus::error())).as_deref(),
+            Some(
+                "Model 'm' failed to load, so it cannot serve requests. Check the Spice runtime logs for the cause."
+            )
+        );
+        for loading in [
+            ComponentStatus::Initializing,
+            ComponentStatus::NotLoaded,
+            ComponentStatus::Refreshing,
+        ] {
+            assert_eq!(
+                unavailable_model_message("m", Some(&loading)).as_deref(),
+                Some(
+                    "Model 'm' is still loading. Retry once `GET /v1/models?status=true` reports it as ready."
+                ),
+                "{loading:?}"
+            );
+        }
+        // No status, or one that does not explain the absence (a removed model is `Disabled`),
+        // leaves the caller's own "not found" message in place.
+        for unexplained in [
+            None,
+            Some(ComponentStatus::Ready),
+            Some(ComponentStatus::Disabled),
+            Some(ComponentStatus::ShuttingDown),
+        ] {
+            assert_eq!(
+                unavailable_model_message("m", unexplained.as_ref()),
+                None,
+                "{unexplained:?}"
+            );
         }
     }
 }

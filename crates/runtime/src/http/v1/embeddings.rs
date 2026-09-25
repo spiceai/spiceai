@@ -16,7 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::http::v1::unavailable_model_message;
 use crate::model::EmbeddingModelStore;
+use crate::status::RuntimeStatus;
 use async_openai::types::embeddings::CreateEmbeddingRequest;
 #[cfg(feature = "openapi")]
 use async_openai::types::embeddings::CreateEmbeddingResponse;
@@ -87,6 +89,7 @@ use tokio::sync::RwLock;
 ))]
 pub(crate) async fn post(
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
+    Extension(status): Extension<Arc<RuntimeStatus>>,
     Json(req): Json<CreateEmbeddingRequest>,
 ) -> Response {
     let model_id = req.model.clone();
@@ -99,6 +102,15 @@ pub(crate) async fn post(
 
             resp
         }
-        None => (StatusCode::NOT_FOUND, "model not found").into_response(),
+        None => {
+            let message = unavailable_model_message(
+                &model_id,
+                status
+                    .get_component_status(&format!("embedding:{model_id}"))
+                    .as_ref(),
+            )
+            .unwrap_or_else(|| "model not found".to_string());
+            (StatusCode::NOT_FOUND, message).into_response()
+        }
     }
 }
