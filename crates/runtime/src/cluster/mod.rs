@@ -2124,6 +2124,12 @@ async fn create_scheduler_server(
             .with_option_extension(SpiceRequestContextConfig::default())
             .with_ballista_shuffle_format(ballista_shuffle_format)
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
+            // An adaptive execution graph cannot be serialized — Ballista's
+            // `execution_graph_to_bytes` accepts only the static graph — and the job
+            // state below is persisted so an in-flight job survives scheduler loss.
+            // Planning adaptively would fail every job the moment its graph is
+            // written out, so the scheduler plans statically.
+            .with_ballista_adaptive_query_planner(false)
     });
 
     // Back job state with shared object storage when a scheduler state location is
