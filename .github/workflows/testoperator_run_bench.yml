@@ -68,7 +68,7 @@ on:
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
-        default: '30'
+        default: '300'
         type: string
       runner_type:
         description: 'Runner type'

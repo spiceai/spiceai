@@ -104,8 +104,10 @@ pub struct CommonArgs {
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: String,
 
-    /// The number of seconds to wait for the spiced instance to become ready
-    #[arg(long, default_value = "30")]
+    /// The number of seconds to wait for the spiced instance to become ready.
+    /// An upper bound only: readiness is polled and returns as soon as the
+    /// instance answers, so a generous default costs a healthy run nothing.
+    #[arg(long, default_value = "300")]
     pub(crate) ready_wait: u64,
 
     /// The duration of the test in seconds
