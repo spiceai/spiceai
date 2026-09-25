@@ -446,14 +446,14 @@ fn try_partition_values_memory_source(
 /// anything. A static predicate, and a dynamic filter already narrowed past
 /// `lit(true)`, both return `false` and must bail the fast path.
 fn is_unresolved_dynamic_filter(filter: &Arc<dyn PhysicalExpr>) -> bool {
-    let Some(dynamic_filter) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() else {
+    let Some(dynamic_filter) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() else {
         return false;
     };
     let Ok(current) = dynamic_filter.current() else {
         return false;
     };
     matches!(
-        current.as_any().downcast_ref::<Literal>(),
+        current.downcast_ref::<Literal>(),
         Some(literal) if matches!(literal.value(), ScalarValue::Boolean(Some(true)))
     )
 }
