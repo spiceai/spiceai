@@ -1078,7 +1078,6 @@ impl Runtime {
         // (cold-bootstrap) generation. See #7557.
         let mut index_restore_failure: Option<String> = None;
         if let BootstrapStatus::Bootstrapped(info) = &bootstrap_status
-            && !info.index_snapshots.is_empty()
             && let Some(table_provider) = federated_table.try_table_provider_sync()
             && let Some(acceleration_settings) = ds.acceleration.as_ref()
         {
@@ -1096,7 +1095,14 @@ impl Runtime {
                     .cloned()
                     .collect()
             };
-            if !indexes.is_empty()
+            // A configured snapshotable index (today: file-backed FTS) must be installed here even
+            // when the snapshot carried no artifact for it — a legacy snapshot predating index
+            // snapshots, or an index added after it was taken — by rebuilding it from the
+            // bootstrapped acceleration, so the dataset never goes Ready with an empty FTS index.
+            let has_snapshotable_index = indexes
+                .iter()
+                .any(|index| index.snapshot_identity().is_some());
+            if (has_snapshotable_index || !info.index_snapshots.is_empty())
                 && let Ok(layout) = data_accelerator_api::get_acceleration_layout(
                     ds.as_ref(),
                     &self.accelerator_engine_registry,
@@ -1114,7 +1120,7 @@ impl Runtime {
             {
                 manager.set_indexes(indexes).await;
                 if let Err(error) = manager
-                    .restore_indexes_from_snapshot(&info.index_snapshots)
+                    .restore_indexes_from_snapshot(&info.index_snapshots, &table_provider)
                     .await
                 {
                     // A restored dataset with `refresh_mode: full` and no `refresh_check_interval`

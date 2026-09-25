@@ -424,6 +424,52 @@ impl Index for FullTextDatabaseIndex {
         .map_err(|error| DataFusionError::External(Box::new(error)))
     }
 
+    async fn new_staging_from_source(
+        &self,
+        base: Arc<dyn TableProvider>,
+        staging_dir: &Path,
+    ) -> Result<Arc<dyn Index + Send + Sync>, DataFusionError> {
+        if self.directory.is_none() {
+            return Err(DataFusionError::NotImplemented(
+                "In-memory full-text indexes cannot be rebuilt from a snapshot".to_string(),
+            ));
+        }
+
+        // Reuse the live index's tantivy schema so the rebuilt index is field-for-field
+        // identical — this is what lets `restore_from` install the staging directory
+        // (`ensure_persisted_schema_matches`) and what makes populating from full source batches
+        // reproduce every field, STORED columns included.
+        let schema = self.reader.searcher().schema().clone();
+        let search_fields = self.search_fields.clone();
+        let primary_key = self.primary_key.clone();
+        let staging = staging_dir.to_path_buf();
+
+        let (writer, reader) = tokio::task::spawn_blocking(move || -> Result<_, super::Error> {
+            let index =
+                tantivy::Index::create_in_dir(&staging, schema).context(TextSearchIndexingSnafu)?;
+            let reader = index.reader().context(TextSearchIndexingSnafu)?;
+            let writer = index
+                .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+                .context(IndexCreationSnafu)?;
+            writer.set_merge_policy(Box::new(index_merge_policy()));
+            Ok((writer, reader))
+        })
+        .await
+        .map_err(|error| DataFusionError::External(Box::new(error)))?
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+
+        Ok(Arc::new(FullTextDatabaseIndex {
+            base_table: base,
+            search_fields,
+            primary_key,
+            writer: Arc::new(Mutex::new(writer)),
+            reader,
+            defer_commit: Arc::new(AtomicBool::new(false)),
+            stream_attached: Arc::new(AtomicBool::new(false)),
+            directory: Some(staging_dir.to_path_buf()),
+        }))
+    }
+
     async fn compute_index(
         &self,
         batches: Vec<RecordBatch>,
@@ -1545,6 +1591,72 @@ mod tests {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// A file-backed index with no snapshot artifact is rebuilt from the new-generation source and
+    /// installed via `restore_from`, so a search returns the NEW rows and never the stale ones.
+    /// This is the missing-artifact recovery path (#13608): `new_staging_from_source` builds a
+    /// fresh index into staging, it is populated through the ordinary write primitives, then the
+    /// live index adopts it atomically.
+    #[tokio::test]
+    async fn rebuild_from_source_replaces_stale_rows_with_new_generation() {
+        let live_dir = tempfile::tempdir().expect("live index dir");
+        let live = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            Some(live_dir.path().to_path_buf()),
+            &["content".to_string()],
+            false,
+        )
+        .expect("live index");
+
+        // The old generation the live index still holds.
+        live.compute_index(vec![batch(&[1], &["stale apple"])])
+            .await
+            .expect("seed stale row");
+        assert_eq!(search_ids(&live, "apple").await, vec![1]);
+
+        // The new generation to rebuild from.
+        let new_rows = batch(&[1, 2], &["fresh orange", "fresh grape"]);
+        let new_provider: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(new_rows.schema(), vec![vec![new_rows.clone()]])
+                .expect("new-generation provider"),
+        );
+
+        let staging = tempfile::tempdir().expect("staging dir");
+        let fresh = live
+            .new_staging_from_source(Arc::clone(&new_provider), staging.path())
+            .await
+            .expect("build fresh staging index");
+        fresh
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("start replace window");
+        fresh
+            .compute_index(vec![new_rows])
+            .await
+            .expect("populate fresh index");
+        fresh
+            .on_write_complete()
+            .await
+            .expect("commit fresh index");
+        drop(fresh);
+
+        live.restore_from(staging.path())
+            .await
+            .expect("install rebuilt index");
+
+        assert_eq!(
+            search_ids(&live, "orange").await,
+            vec![1],
+            "the rebuilt index must return the new-generation row"
+        );
+        assert_eq!(search_ids(&live, "grape").await, vec![2]);
+        assert!(
+            search_ids(&live, "apple").await.is_empty(),
+            "the stale pre-rebuild row must be gone"
+        );
     }
 
     /// A direct `delete_by_keys` removes the matching documents from the tantivy index — the

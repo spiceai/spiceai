@@ -1548,7 +1548,7 @@ impl RefreshTask {
         // don't correspond to the visible data.
         if let Err(error) = state
             .manager
-            .restore_indexes_from_snapshot(&info.index_snapshots)
+            .restore_indexes_from_snapshot(&info.index_snapshots, &new_provider)
             .await
         {
             tracing::error!(
