@@ -16,8 +16,8 @@ description: "Query: tpch_q4"
 |               |           SubqueryAlias: __correlated_sq_1                                                                                                                                            |
 |               |             TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_ORDERKEY], full_filters=[oracle_tpch.TPCH_SF1.LINEITEM.L_RECEIPTDATE > oracle_tpch.TPCH_SF1.LINEITEM.L_COMMITDATE] |
 | physical_plan | SortPreservingMergeExec: [O_ORDERPRIORITY@0 ASC NULLS LAST]                                                                                                                           |
-|               |   SortExec: expr=[O_ORDERPRIORITY@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                     |
-|               |     ProjectionExec: expr=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY, count(Int64(1))@1 as ORDER_COUNT]                                                                                     |
+|               |   ProjectionExec: expr=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY, count(Int64(1))@1 as ORDER_COUNT]                                                                                       |
+|               |     SortExec: expr=[O_ORDERPRIORITY@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                   |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                                                                        |
 |               |         RepartitionExec: partitioning=Hash([O_ORDERPRIORITY@0], 32), input_partitions=32                                                                                              |
 |               |           AggregateExec: mode=Partial, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                                                                             |
