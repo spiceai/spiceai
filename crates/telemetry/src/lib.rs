@@ -1963,7 +1963,8 @@ pub mod cayenne {
     static METASTORE_WRITER_WAIT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
     /// Records the time a metastore writer spent waiting to acquire the write
-    /// transaction (pool-slot acquire + `BEGIN IMMEDIATE`) or a bare write statement.
+    /// lock: its wait for a turn on the metastore's writer connection, plus
+    /// `BEGIN IMMEDIATE` for a transaction.
     /// `dimensions` should carry a `txn` stage label (`stage_a_fold` / `seq_reserve`
     /// / `flip` / `checkpoint` / `other`).
     pub fn track_metastore_writer_wait(duration: Duration, dimensions: &[KeyValue]) {
@@ -1972,7 +1973,7 @@ pub mod cayenne {
             operational_meter()
                 .f64_histogram("cayenne_metastore_writer_wait_ms")
                 .with_description(
-                    "Time a Cayenne metastore writer spent waiting to acquire the write transaction (pool-slot acquire + BEGIN IMMEDIATE) or a bare write statement.",
+                    "Time a Cayenne metastore writer spent waiting to acquire the write lock: its turn on the metastore's writer connection, plus BEGIN IMMEDIATE for a transaction.",
                 )
                 .with_unit("ms")
                 .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())

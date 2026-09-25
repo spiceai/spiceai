@@ -573,9 +573,17 @@ fn begin_immediate(conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Erro
     conn.execute_batch("BEGIN IMMEDIATE")
 }
 
-/// A transaction's end when it is dropped without a commit or rollback.
-fn roll_back(conn: &mut rusqlite::Connection) {
+/// A transaction's end when it is dropped without a commit or rollback, or
+/// when its commit's caller went away before the `COMMIT` ran: roll it back,
+/// then record how long it held the write lock. That is known only here, on
+/// the writer's thread, once any statement still running and the rollback
+/// are done.
+fn roll_back(conn: &mut rusqlite::Connection, began: std::time::Instant) {
     let _ = conn.execute_batch("ROLLBACK");
+    telemetry::cayenne::track_metastore_writer_held(
+        began.elapsed(),
+        &[telemetry::KeyValue::new("txn", "other")],
+    );
 }
 
 impl Writer {
@@ -628,11 +636,12 @@ impl Writer {
     /// and waiting at most the busy timeout for it. `start` runs first (a
     /// transaction's `BEGIN IMMEDIATE`). The session then runs each statement
     /// sent to it, in order, until [`Session::finish`] or until it is dropped,
-    /// when `abort` runs (a transaction's `ROLLBACK`).
+    /// when `abort` runs (a transaction's `ROLLBACK`) with the instant `start`
+    /// returned.
     async fn session(
         &self,
         start: fn(&mut rusqlite::Connection) -> Result<(), rusqlite::Error>,
-        abort: fn(&mut rusqlite::Connection),
+        abort: fn(&mut rusqlite::Connection, std::time::Instant),
     ) -> Result<Session, tokio_rusqlite::Error<rusqlite::Error>> {
         let turn = Turn::new();
         let claimant = turn.claimant();
@@ -652,9 +661,10 @@ impl Writer {
                         let _ = started_tx.send(Err(e));
                         return;
                     }
+                    let began = std::time::Instant::now();
                     if started_tx.send(Ok(())).is_err() {
                         // Its caller went away as its turn came.
-                        abort(conn);
+                        abort(conn, began);
                         return;
                     }
                     while let Ok(job) = next_job.recv() {
@@ -666,7 +676,7 @@ impl Writer {
                     }
                     // Dropped without being finished, or finished by a caller
                     // that went away before its last statement ran.
-                    abort(conn);
+                    abort(conn, began);
                 })
                 .await;
         });
@@ -1465,7 +1475,7 @@ impl MetastoreBackend for SqliteMetastore {
         let pool = self.pool().await?;
         let session = pool
             .writer
-            .session(|_| Ok(()), |_| {})
+            .session(|_| Ok(()), |_, _| {})
             .await
             .map_err(schema_error)?;
 
@@ -2231,13 +2241,13 @@ fn measure_file_footprint(db_path: &str, wal_path: &str) -> (Option<u64>, Option
 /// `BEGIN IMMEDIATE` until [`commit`](MetastoreTransaction::commit) or
 /// [`rollback`](MetastoreTransaction::rollback), while the writes queued behind
 /// it wait. Dropped without either, it is rolled back on the writer's thread as
-/// its session ends.
+/// its session ends. METRIC 1 `cayenne_metastore_writer_held_ms` is recorded on
+/// the writer's thread on every path, once the write lock is released.
 pub struct SqliteTransaction {
     /// The transaction's session. `None` after commit/rollback.
     session: Option<Session>,
-    /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned), used
-    /// to record METRIC 1 `cayenne_metastore_writer_held_ms` on
-    /// commit/rollback/drop.
+    /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned),
+    /// for the hold commit and rollback record.
     held_start: std::time::Instant,
 }
 
@@ -2252,20 +2262,6 @@ impl SqliteTransaction {
         self.session.take().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
         })
-    }
-}
-
-impl Drop for SqliteTransaction {
-    fn drop(&mut self) {
-        if self.session.take().is_some() {
-            // Dropped without a commit or rollback: ending its session rolls the
-            // transaction back on the writer's thread, before the next write
-            // runs. The hold is recorded as ending now, when its caller let go.
-            telemetry::cayenne::track_metastore_writer_held(
-                self.held_start.elapsed(),
-                &[telemetry::KeyValue::new("txn", "other")],
-            );
-        }
     }
 }
 
@@ -2390,24 +2386,26 @@ impl MetastoreTransaction for SqliteTransaction {
         // COMMIT, and on a failed COMMIT the best-effort ROLLBACK that leaves the
         // writer connection clean, run as the session's last statement: the
         // next write starts only once both are done.
+        let held_start = self.held_start;
         let commit_result = session
-            .finish(|conn| {
-                conn.execute_batch("COMMIT").inspect_err(|_| {
+            .finish(move |conn| {
+                let committed = conn.execute_batch("COMMIT").inspect_err(|_| {
                     let _ = conn.execute_batch("ROLLBACK");
-                })
+                });
+                // METRIC 1 (writer held): record AFTER the write lock is actually
+                // released, on the writer's thread: when COMMIT returns (the
+                // BEGIN IMMEDIATE lock is held through COMMIT's fsync, so a
+                // contending writer blocks until then), or on a failed COMMIT
+                // once its ROLLBACK has run. Recording any earlier under-reports
+                // the hold window the next writer queues behind (PR #11206
+                // review).
+                telemetry::cayenne::track_metastore_writer_held(
+                    held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                committed
             })
             .await;
-
-        // METRIC 1 (writer held): record AFTER the write lock is actually
-        // released: when COMMIT returns (the BEGIN IMMEDIATE lock is held through
-        // COMMIT's fsync, so a contending writer blocks until then), or on a
-        // failed COMMIT once its ROLLBACK has run. Recording any earlier
-        // under-reports the hold window the next writer queues behind (PR #11206
-        // review).
-        telemetry::cayenne::track_metastore_writer_held(
-            self.held_start.elapsed(),
-            &[telemetry::KeyValue::new("txn", "other")],
-        );
 
         commit_result.map_err(
             |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
@@ -2419,14 +2417,20 @@ impl MetastoreTransaction for SqliteTransaction {
     async fn rollback(mut self: Box<Self>) -> CatalogResult<()> {
         let session = self.take_session()?;
 
-        let rollback_result = session.finish(|conn| conn.execute_batch("ROLLBACK")).await;
-
-        // METRIC 1 (writer held): record AFTER ROLLBACK — the write lock is held
-        // through the rollback statement, so include its duration (PR #11206).
-        telemetry::cayenne::track_metastore_writer_held(
-            self.held_start.elapsed(),
-            &[telemetry::KeyValue::new("txn", "other")],
-        );
+        let held_start = self.held_start;
+        let rollback_result = session
+            .finish(move |conn| {
+                let rolled_back = conn.execute_batch("ROLLBACK");
+                // METRIC 1 (writer held): record AFTER ROLLBACK, on the writer's
+                // thread — the write lock is held through the rollback
+                // statement, so include its duration (PR #11206).
+                telemetry::cayenne::track_metastore_writer_held(
+                    held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                rolled_back
+            })
+            .await;
 
         rollback_result.map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| {
             CatalogError::Database {
@@ -2781,6 +2785,59 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&direct_writer, &other_writer),
             "different metastore files must not share a writer connection"
+        );
+    }
+
+    /// How long the last session aborted by `record_abort` had held the writer
+    /// connection, in microseconds.
+    static ABORTED_HOLD_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn record_abort(conn: &mut rusqlite::Connection, began: std::time::Instant) {
+        roll_back(conn, began);
+        let held = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
+        ABORTED_HOLD_MICROS.store(held, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A dropped transaction's hold is measured once its rollback has run on
+    /// the writer's thread, not when its caller let go: a statement still
+    /// running there keeps the write lock until it ends.
+    #[tokio::test]
+    async fn test_a_dropped_transaction_is_timed_until_its_rollback() {
+        // How long the statement still running when the transaction is dropped
+        // takes; time is what is under test.
+        const IN_FLIGHT: std::time::Duration = std::time::Duration::from_millis(200);
+        let (_dir, metastore) = temp_metastore();
+        let pool = metastore.pool().await.expect("pool");
+        let session = pool
+            .writer
+            .session(begin_immediate, record_abort)
+            .await
+            .expect("begin");
+        let began = std::time::Instant::now();
+        let (running_tx, running) = tokio::sync::oneshot::channel();
+        session
+            .jobs
+            .send(Box::new(move |_: &mut rusqlite::Connection| {
+                let _ = running_tx.send(());
+                std::thread::sleep(IN_FLIGHT);
+                SessionStep::Continue
+            }))
+            .expect("queue a statement");
+        running.await.expect("the statement started");
+        drop(session);
+        let dropped_after = began.elapsed();
+
+        // The writer takes its next write only once the dropped session ends.
+        metastore
+            .execute_batch("SELECT 1")
+            .await
+            .expect("a write after the dropped transaction");
+        let held = std::time::Duration::from_micros(
+            ABORTED_HOLD_MICROS.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        assert!(
+            held >= IN_FLIGHT,
+            "the dropped transaction held the lock through its {IN_FLIGHT:?} statement but was timed at {held:?} (its caller let go after {dropped_after:?})"
         );
     }
 
