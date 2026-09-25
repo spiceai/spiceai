@@ -525,7 +525,7 @@ mod tests {
     /// A `TopK` dynamic filter still at its initial `lit(true)` placeholder has
     /// excluded nothing, so the fast path may proceed as if no filter were
     /// present — this is the regression case for
-    /// `SELECT p FROM t GROUP BY p ORDER BY p DESC LIMIT 1`, where DataFusion
+    /// `SELECT p FROM t GROUP BY p ORDER BY p DESC LIMIT 1`, where `DataFusion`
     /// attaches a not-yet-resolved dynamic filter to the scan.
     #[test]
     fn unresolved_dynamic_filter_is_exempted() {
