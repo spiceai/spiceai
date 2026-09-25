@@ -23,8 +23,8 @@ limitations under the License.
 //! the flip that makes the snapshot visible, so there is no window in which
 //! lookups lose the index. Anything else that changes the files — an append, a
 //! compaction, a restart — leaves the index stale; it is dropped, and a later
-//! lookup rebuilds it in the background, paced so rebuilding takes a bounded
-//! share of a core. Nothing is persisted.
+//! literal lookup or supported runtime join lookup rebuilds it in the background,
+//! paced so rebuilding takes a bounded share of a core. Nothing is persisted.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -61,6 +61,9 @@ limitations under the License.
 //! * A key is matched by its stored value. A predicate that casts the COLUMN can
 //!   hold for stored values other than the literal (`CAST(score AS BIGINT) = 5`
 //!   holds for 5.2), so such predicates must never reach [`LookupIndexState::probe`].
+//! * A runtime key set is usable only after its dynamic filter is complete and
+//!   only through conjunctions. A list nested under `OR` or `CASE` is not a
+//!   complete necessary condition and must not become a row selection.
 //! * The build sorts with Arrow's lexicographic sort and a lookup compares
 //!   `RowConverter` bytes. Those orders agree for every type the converter
 //!   supports, and the build re-checks them while it records block heads: a block
@@ -82,9 +85,15 @@ use arrow::compute::SortColumn;
 use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, FieldRef};
+use async_trait::async_trait;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_common::{ScalarValue, Statistics};
 use datafusion_datasource::{PartitionedFile, file_groups::FileGroup};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
+use datafusion_physical_expr::utils::split_conjunction;
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore};
 use parking_lot::Mutex;
@@ -97,7 +106,9 @@ use vortex::compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder};
 use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
-use vortex_datafusion::{VortexAccessPlan, VortexAccessPlanProvider};
+use vortex_datafusion::{
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
+};
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
@@ -106,6 +117,12 @@ const POSITION_BITS: u32 = 40;
 const POSITION_MASK: u64 = (1u64 << POSITION_BITS) - 1;
 /// File ids above this would not survive the shift into a packed posting.
 const MAX_FILE_ID: u32 = (1u32 << (u64::BITS - POSITION_BITS)) - 1;
+
+/// Runtime index scans accept only small exact build-side key sets.
+const RUNTIME_INDEX_MAX_KEYS: usize = 2_048;
+/// Candidate rows may scale with the table, but stay within a fixed memory bound.
+const RUNTIME_INDEX_MIN_ROWS: usize = 2_048;
+const RUNTIME_INDEX_MAX_ROWS: usize = 1_000_000;
 
 /// Sorted entries per block. A lookup decodes the block(s) its key can fall in,
 /// and one row-encoded key is retained per block to find them, so this trades
@@ -424,7 +441,8 @@ pub(crate) struct BuildStats {
 enum ShapeProbe {
     /// Every packed posting of the key, sorted; empty when no row holds it.
     Postings(Vec<u64>),
-    /// The key could not be resolved against this index, so it proves nothing.
+    /// The key could not be resolved against this index, or its postings
+    /// exceed the caller's candidate-row budget, so it proves nothing.
     Unanswerable,
 }
 
@@ -482,8 +500,13 @@ impl ShapeIndex {
     }
 
     /// The packed postings of the key whose column values are `values`, in
-    /// `columns` order.
-    fn probe(&self, session: &VortexSession, values: &[ScalarValue]) -> ShapeProbe {
+    /// `columns` order, refusing to decode more than `max_rows` when given.
+    fn probe(
+        &self,
+        session: &VortexSession,
+        values: &[ScalarValue],
+        max_rows: Option<usize>,
+    ) -> ShapeProbe {
         if values.len() != self.columns.len() {
             return ShapeProbe::Unanswerable;
         }
@@ -510,8 +533,9 @@ impl ShapeIndex {
         if range.is_empty() {
             return ShapeProbe::Postings(Vec::new());
         }
-        match self.postings_in(session, range, key.as_ref()) {
-            Ok(postings) => ShapeProbe::Postings(postings),
+        match self.postings_in(session, range, key.as_ref(), max_rows) {
+            Ok(Some(postings)) => ShapeProbe::Postings(postings),
+            Ok(None) => ShapeProbe::Unanswerable,
             Err(error) => {
                 tracing::debug!(shape = %self.label, %error, "Point-lookup index block could not be read; scanning instead");
                 ShapeProbe::Unanswerable
@@ -554,7 +578,8 @@ impl ShapeIndex {
         session: &VortexSession,
         range: Range<usize>,
         key: &[u8],
-    ) -> Result<Vec<u64>, String> {
+        max_rows: Option<usize>,
+    ) -> Result<Option<Vec<u64>>, String> {
         let mut ctx = session.create_execution_ctx();
         let rows = self
             .converter
@@ -563,11 +588,14 @@ impl ShapeIndex {
         let lo = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() < key);
         let hi = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() <= key);
         if lo == hi {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
+        }
+        if max_rows.is_some_and(|limit| hi - lo > limit) {
+            return Ok(None);
         }
         let postings =
             self.decode_postings(session, range.start + lo..range.start + hi, &mut ctx)?;
-        Ok(postings.values().to_vec())
+        Ok(Some(postings.values().to_vec()))
     }
 
     /// Every entry as `(row-encoded key, file path, position)`, sorted.
@@ -635,41 +663,93 @@ impl SnapshotLookupIndex {
             else {
                 continue;
             };
-            let postings = match shape.probe(&self.session, &values) {
+            let postings = match shape.probe(&self.session, &values, None) {
                 ShapeProbe::Postings(postings) => postings,
                 ShapeProbe::Unanswerable => continue,
             };
-
-            // Grouped under the index's own path strings, so each candidate
-            // file's path is copied once rather than once per posting.
-            let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
-            for &packed in &postings {
-                let (file_id, position) = unpack(packed);
-                // A posting that cannot be resolved to a file means the index is
-                // not internally consistent; refuse the probe rather than
-                // returning a partial selection.
-                let file = self.files.get(file_id)?;
-                by_file
-                    .entry(file.path.as_str())
-                    .or_default()
-                    .push(position);
-            }
-            let per_file = by_file
-                .into_iter()
-                .map(|(path, mut positions)| {
-                    positions.sort_unstable();
-                    positions.dedup();
-                    (path.to_string(), positions)
-                })
-                .collect();
-
+            let (per_file, rows) = self.group_by_file(&postings)?;
             return Some(ProbeHit {
                 shape: shape.label.clone(),
                 per_file,
-                rows: postings.len(),
+                rows,
             });
         }
         None
+    }
+
+    /// Resolves a batch of correlated keys and groups all of the resulting
+    /// postings by file. Returning `None` declines the index entirely; callers
+    /// must never use a partial batch.
+    fn probe_keys(
+        &self,
+        columns: &[String],
+        keys: &[Vec<ScalarValue>],
+        max_rows: usize,
+    ) -> Option<ProbeHit> {
+        let shape = self.shapes.iter().find(|shape| {
+            shape.columns.len() == columns.len()
+                && shape
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|(indexed, requested)| indexed.name == *requested)
+        })?;
+        let mut postings = Vec::new();
+        for key in keys {
+            let remaining = max_rows.saturating_sub(postings.len());
+            match shape.probe(&self.session, key, Some(remaining)) {
+                ShapeProbe::Postings(key_postings) => postings.extend(key_postings),
+                ShapeProbe::Unanswerable => return None,
+            }
+        }
+        let (per_file, rows) = self.group_by_file(&postings)?;
+        Some(ProbeHit {
+            shape: shape.label.clone(),
+            per_file,
+            rows,
+        })
+    }
+
+    /// Groups packed postings by file path, each file's positions sorted and
+    /// distinct, with the total row count. `None` when a posting names a file
+    /// the index does not have: the index is not internally consistent, so the
+    /// probe is refused rather than answered with a partial selection.
+    fn group_by_file(&self, postings: &[u64]) -> Option<(HashMap<String, Vec<u64>>, usize)> {
+        // Grouped under the index's own path strings, so each candidate file's
+        // path is copied once rather than once per posting.
+        let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
+        for &packed in postings {
+            let (file_id, position) = unpack(packed);
+            let file = self.files.get(file_id)?;
+            by_file
+                .entry(file.path.as_str())
+                .or_default()
+                .push(position);
+        }
+        let mut rows = 0;
+        let per_file = by_file
+            .into_iter()
+            .map(|(path, mut positions)| {
+                positions.sort_unstable();
+                positions.dedup();
+                rows += positions.len();
+                (path.to_string(), positions)
+            })
+            .collect();
+        Some((per_file, rows))
+    }
+
+    /// Whether `file` is, byte for byte, one of the files this index was built
+    /// from.
+    fn indexes_file(&self, file: &ObjectMeta) -> bool {
+        let path: &str = file.location.as_ref();
+        self.file_ids
+            .get(path)
+            .and_then(|&id| self.files.get(id as usize))
+            .is_some_and(|indexed| {
+                indexed.size == file.size
+                    && indexed.last_modified_ms == file.last_modified.timestamp_millis()
+            })
     }
 }
 
@@ -793,26 +873,10 @@ impl LookupSelection {
     fn validate<'a>(
         &self,
         snapshot_id: &str,
-        files: impl Iterator<Item = &'a PartitionedFile>,
+        mut files: impl Iterator<Item = &'a PartitionedFile>,
     ) -> bool {
-        if self.index.snapshot_id != snapshot_id {
-            return false;
-        }
-        for file in files {
-            let path: &str = file.object_meta.location.as_ref();
-            let Some(&id) = self.index.file_ids.get(path) else {
-                return false;
-            };
-            let Some(indexed) = self.index.files.get(id as usize) else {
-                return false;
-            };
-            if indexed.size != file.object_meta.size
-                || indexed.last_modified_ms != file.object_meta.last_modified.timestamp_millis()
-            {
-                return false;
-            }
-        }
-        true
+        self.index.snapshot_id == snapshot_id
+            && files.all(|file| self.index.indexes_file(&file.object_meta))
     }
 }
 
@@ -829,6 +893,208 @@ struct LookupAccessPlanProvider {
     table: Arc<dyn VortexAccessPlanProvider>,
 }
 
+/// Runtime row selection derived from a completed hash-join dynamic filter,
+/// already validated against every file of the scan.
+struct RuntimeLookupSelection {
+    index: Arc<SnapshotLookupIndex>,
+    /// The ready-made plan for each file holding a candidate row, so a file open
+    /// shares it instead of copying the positions.
+    plans: HashMap<String, Arc<VortexAccessPlan>>,
+    /// The plan for an indexed file that holds no candidate row.
+    empty: Arc<VortexAccessPlan>,
+}
+
+impl RuntimeLookupSelection {
+    fn new(index: Arc<SnapshotLookupIndex>, per_file: HashMap<String, Vec<u64>>) -> Self {
+        let plans = per_file
+            .into_iter()
+            .map(|(path, positions)| {
+                let plan = VortexAccessPlan::default()
+                    .with_selection(Selection::IncludeByIndex(Buffer::from(positions)));
+                (path, Arc::new(plan))
+            })
+            .collect();
+        Self {
+            index,
+            plans,
+            empty: Arc::new(
+                VortexAccessPlan::default()
+                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+            ),
+        }
+    }
+}
+
+/// Which dynamic-filter state a cached runtime selection answers: the filter
+/// expression, its generation, and the index entry it matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeLookupFilterIdentity {
+    expression_id: u64,
+    generation: u64,
+    spec: usize,
+}
+
+/// What a runtime probe decided.
+enum RuntimeProbe {
+    Selection(RuntimeLookupSelection),
+    /// The index is current but cannot answer these keys within its bounds.
+    Declined,
+    /// No index covers the scan's files; a rebuild may make the next one usable.
+    IndexUnusable,
+}
+
+/// The runtime selection for one filter identity. The first file opener
+/// resolves the cell; the others await it rather than probing again.
+type RuntimeLookupCell = Arc<tokio::sync::OnceCell<Option<Arc<RuntimeLookupSelection>>>>;
+
+/// Adds exact dynamic-filter keys to the table's ordinary per-file access plan.
+///
+/// The provider is installed while the physical scan is built, but probes the
+/// lookup index only when Vortex opens a file. At that point a collect-left hash
+/// join may have populated its `DynamicFilterPhysicalExpr` with an exact `IN`
+/// list. The expression generation prevents an early, unresolved filter from
+/// becoming a permanent decision for later file openers.
+///
+/// The index is the one the scan's view pinned, captured in the same fenced
+/// instant as its snapshot and files. A join can run long after it was planned,
+/// and a refresh may publish a newer index meanwhile; the scan still probes the
+/// index that matches what it reads, and never judges the newer one.
+pub(crate) struct DynamicLookupAccessPlanProvider {
+    state: Arc<LookupIndexState>,
+    /// The index published when the scan's view was captured, if any.
+    index: Option<Arc<SnapshotLookupIndex>>,
+    /// The snapshot and file set the scan's view captured.
+    visible_snapshot: String,
+    visible_file_set: FileSetVersion,
+    /// Every file the scan reads. A selection is used only when the index covers
+    /// all of them, so the probe's outcome is decided once, before any file opens.
+    scan_files: Arc<[ObjectMeta]>,
+    request_build: Option<Arc<dyn Fn() + Send + Sync>>,
+    selection: Mutex<Option<(RuntimeLookupFilterIdentity, RuntimeLookupCell)>>,
+}
+
+impl DynamicLookupAccessPlanProvider {
+    pub(crate) fn new(
+        state: Arc<LookupIndexState>,
+        index: Option<Arc<SnapshotLookupIndex>>,
+        visible_snapshot: String,
+        visible_file_set: FileSetVersion,
+        scan_files: Arc<[ObjectMeta]>,
+        request_build: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        Self {
+            state,
+            index,
+            visible_snapshot,
+            visible_file_set,
+            scan_files,
+            request_build,
+            selection: Mutex::default(),
+        }
+    }
+
+    /// The selection for the scan's completed dynamic filter, probed at most
+    /// once per filter generation.
+    ///
+    /// Every file open calls this, so the cache is keyed on the filter's identity
+    /// alone and checked before any key is read. The lock is held only to find
+    /// or install the cell; the probe itself runs on the blocking pool.
+    async fn resolve(
+        &self,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<RuntimeLookupSelection>> {
+        let predicate = predicate?;
+        let (spec, dynamic) = self
+            .state
+            .specs
+            .iter()
+            .enumerate()
+            .find_map(|(spec, key)| {
+                dynamic_in_list_expr(predicate, &key.columns).map(|dynamic| (spec, dynamic))
+            })?;
+        dynamic.wait_complete().await;
+        let identity = RuntimeLookupFilterIdentity {
+            expression_id: dynamic.expression_id()?,
+            generation: dynamic.snapshot_generation(),
+            spec,
+        };
+        let cell = {
+            let mut cache = self.selection.lock();
+            match cache.as_ref() {
+                Some((cached, cell)) if *cached == identity => Arc::clone(cell),
+                _ => {
+                    let cell = RuntimeLookupCell::default();
+                    *cache = Some((identity, Arc::clone(&cell)));
+                    cell
+                }
+            }
+        };
+        cell.get_or_init(|| self.probe(dynamic, identity))
+            .await
+            .clone()
+    }
+
+    async fn probe(
+        &self,
+        dynamic: &DynamicFilterPhysicalExpr,
+        identity: RuntimeLookupFilterIdentity,
+    ) -> Option<Arc<RuntimeLookupSelection>> {
+        let current = dynamic.current().ok()?;
+        // Keys read from a newer generation than the identity would be cached
+        // under the wrong one.
+        if dynamic.snapshot_generation() != identity.generation {
+            return None;
+        }
+        let state = Arc::clone(&self.state);
+        let index = self.index.clone();
+        let visible_snapshot = self.visible_snapshot.clone();
+        let visible_file_set = self.visible_file_set;
+        let scan_files = Arc::clone(&self.scan_files);
+        let probed = tokio::task::spawn_blocking(move || {
+            let spec = &state.specs[identity.spec];
+            let Some(keys) = in_list_keys(&current, &spec.columns) else {
+                // Non-literal or more than `RUNTIME_INDEX_MAX_KEYS` keys: no
+                // index could answer it.
+                state.record_runtime_fallback();
+                return RuntimeProbe::Declined;
+            };
+            state.probe_runtime_filter(
+                spec,
+                index.as_ref(),
+                &visible_snapshot,
+                visible_file_set,
+                &scan_files,
+                &keys,
+            )
+        })
+        .await;
+        match probed {
+            Ok(RuntimeProbe::Selection(selection)) => Some(Arc::new(selection)),
+            Ok(RuntimeProbe::Declined) => None,
+            Ok(RuntimeProbe::IndexUnusable) => {
+                if let Some(request_build) = &self.request_build {
+                    request_build();
+                }
+                None
+            }
+            Err(error) => {
+                tracing::debug!(%error, "Runtime secondary index probe did not complete; scanning instead");
+                None
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DynamicLookupAccessPlanProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicLookupAccessPlanProvider")
+            .field("visible_snapshot", &self.visible_snapshot)
+            .field("files", &self.scan_files.len())
+            .field("resolved", &self.selection.lock().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for LookupAccessPlanProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LookupAccessPlanProvider")
@@ -838,14 +1104,103 @@ impl std::fmt::Debug for LookupAccessPlanProvider {
     }
 }
 
-/// Whether `selection` keeps the row at `position`.
-fn selection_keeps(selection: &Selection, position: u64) -> bool {
-    match selection {
-        Selection::All => true,
-        Selection::IncludeByIndex(rows) => rows.binary_search(&position).is_ok(),
-        Selection::ExcludeByIndex(rows) => rows.binary_search(&position).is_err(),
-        Selection::IncludeRoaring(rows) => rows.contains(position),
-        Selection::ExcludeRoaring(rows) => !rows.contains(position),
+/// Finds a dynamic filter with a matching `IN` shape without materializing keys.
+/// Bounds and hash-membership expressions deliberately decline: only an
+/// `InListExpr` is an enumerable key set for the lookup index. Traversal is
+/// limited to conjunctions, where selecting candidates for one conjunct is
+/// conservative; extracting a list from `OR`, `CASE`, or another expression
+/// could omit rows.
+///
+/// `DataFusion` represents a multi-column join key as one `struct(...) IN`
+/// expression. Extracting each struct literal preserves the build rows' tuple
+/// correlation; independent per-column lists must never be combined here.
+fn dynamic_in_list_expr<'a>(
+    expr: &'a Arc<dyn PhysicalExpr>,
+    columns: &[String],
+) -> Option<&'a DynamicFilterPhysicalExpr> {
+    split_conjunction(expr).into_iter().find_map(|conjunct| {
+        let dynamic = conjunct.downcast_ref::<DynamicFilterPhysicalExpr>()?;
+        let current = dynamic.current().ok()?;
+        matching_in_list(&current, columns)?;
+        Some(dynamic)
+    })
+}
+
+fn matching_in_list<'a>(
+    expr: &'a Arc<dyn PhysicalExpr>,
+    columns: &[String],
+) -> Option<&'a InListExpr> {
+    split_conjunction(expr).into_iter().find_map(|conjunct| {
+        conjunct
+            .downcast_ref::<InListExpr>()
+            .filter(|in_list| !in_list.negated() && in_list_matches_columns(in_list, columns))
+    })
+}
+
+fn in_list_keys(expr: &Arc<dyn PhysicalExpr>, columns: &[String]) -> Option<Vec<Vec<ScalarValue>>> {
+    let in_list = matching_in_list(expr, columns)?;
+    collect_runtime_keys(in_list.list(), columns.len())
+}
+
+/// Retains only bounded distinct keys. An oversized list declines the entire
+/// lookup without reading the remaining literals or exposing a partial selection.
+fn collect_runtime_keys<'a>(
+    values: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>>,
+    num_columns: usize,
+) -> Option<Vec<Vec<ScalarValue>>> {
+    let mut keys = HashSet::new();
+    for value in values {
+        let scalar = value.downcast_ref::<Literal>()?.value();
+        let key = if num_columns == 1 {
+            if scalar.is_null() {
+                continue;
+            }
+            vec![scalar.clone()]
+        } else {
+            let ScalarValue::Struct(struct_array) = scalar else {
+                return None;
+            };
+            if struct_array.len() != 1 || struct_array.num_columns() != num_columns {
+                return None;
+            }
+            if struct_array.is_null(0) {
+                continue;
+            }
+            let key = struct_array
+                .columns()
+                .iter()
+                .map(|array| ScalarValue::try_from_array(array, 0).ok())
+                .collect::<Option<Vec<_>>>()?;
+            if key.iter().any(ScalarValue::is_null) {
+                continue;
+            }
+            key
+        };
+        if keys.insert(key) && keys.len() > RUNTIME_INDEX_MAX_KEYS {
+            return None;
+        }
+    }
+    Some(keys.into_iter().collect())
+}
+
+fn in_list_matches_columns(in_list: &InListExpr, columns: &[String]) -> bool {
+    match columns {
+        [column] => in_list
+            .expr()
+            .downcast_ref::<Column>()
+            .is_some_and(|candidate| candidate.name() == column),
+        [] => false,
+        columns => in_list
+            .expr()
+            .downcast_ref::<ScalarFunctionExpr>()
+            .filter(|function| function.name().eq_ignore_ascii_case("struct"))
+            .is_some_and(|function| {
+                function.args().len() == columns.len()
+                    && function.args().iter().zip(columns).all(|(arg, column)| {
+                        arg.downcast_ref::<Column>()
+                            .is_some_and(|candidate| candidate.name() == column)
+                    })
+            }),
     }
 }
 
@@ -858,25 +1213,47 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
             // would read it.
             return table_plan;
         };
-        let positions = match table_plan.as_deref().and_then(VortexAccessPlan::selection) {
-            None | Some(Selection::All) => Buffer::copy_from(candidates.as_slice()),
-            Some(table_selection) => candidates
-                .iter()
-                .copied()
-                .filter(|&position| selection_keeps(table_selection, position))
-                .collect::<Buffer<u64>>(),
-        };
+        let selected = VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
+            Buffer::copy_from(candidates.as_slice()),
+        ));
         self.state
             .counters
             .access_plans_attached
             .fetch_add(1, Ordering::Relaxed);
-        Some(Arc::new(
-            VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions)),
-        ))
+        Some(Arc::new(match table_plan {
+            Some(table_plan) => selected.intersect(&table_plan),
+            None => selected,
+        }))
     }
 
     fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
         self.table.adjust_statistics(object, statistics)
+    }
+}
+
+#[async_trait]
+impl VortexRuntimeAccessPlanProvider for DynamicLookupAccessPlanProvider {
+    /// The opener intersects this with the file's planning-time plan, which
+    /// carries its position-delete vectors, so a deleted row is never selected.
+    async fn runtime_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<VortexAccessPlan>> {
+        let selection = self.resolve(predicate).await?;
+        // `resolve` validated every scan file; a file outside that list is read
+        // as planned.
+        if !selection.index.indexes_file(&file.object_meta) {
+            return None;
+        }
+        self.state
+            .counters
+            .access_plans_attached
+            .fetch_add(1, Ordering::Relaxed);
+        let path: &str = file.object_meta.location.as_ref();
+        Some(Arc::clone(
+            selection.plans.get(path).unwrap_or(&selection.empty),
+        ))
     }
 }
 
@@ -894,6 +1271,8 @@ pub struct LookupIndexCounters {
     pub unbuilt: u64,
     /// Probes refused because the scan's files are not the indexed ones.
     pub snapshot_mismatch: u64,
+    /// Runtime key sets declined because their shape or cost cannot be bounded.
+    pub runtime_fallback: u64,
     /// Candidate files summed over selected probes.
     pub candidate_files: u64,
     /// Candidate row positions summed over selected probes.
@@ -918,6 +1297,7 @@ pub(crate) struct Counters {
     empty: AtomicU64,
     unbuilt: AtomicU64,
     snapshot_mismatch: AtomicU64,
+    runtime_fallback: AtomicU64,
     candidate_files: AtomicU64,
     pub(crate) candidate_rows: AtomicU64,
     access_plans_attached: AtomicU64,
@@ -933,6 +1313,7 @@ impl Counters {
             empty: self.empty.load(Ordering::Relaxed),
             unbuilt: self.unbuilt.load(Ordering::Relaxed),
             snapshot_mismatch: self.snapshot_mismatch.load(Ordering::Relaxed),
+            runtime_fallback: self.runtime_fallback.load(Ordering::Relaxed),
             candidate_files: self.candidate_files.load(Ordering::Relaxed),
             candidate_rows: self.candidate_rows.load(Ordering::Relaxed),
             access_plans_attached: self.access_plans_attached.load(Ordering::Relaxed),
@@ -1031,6 +1412,10 @@ pub(crate) struct LookupIndexState {
     /// `info`.
     published_once: AtomicBool,
     counters: Counters,
+    /// The table's scan-input version. Scan views pin the published index, so
+    /// every change to it must invalidate the cached views, or scans keep
+    /// serving a view that pinned the previous index (or none).
+    scan_input_version: Arc<AtomicU64>,
 }
 
 impl LookupIndexState {
@@ -1040,6 +1425,7 @@ impl LookupIndexState {
         specs: Vec<KeySpec>,
         pool: Arc<dyn MemoryPool>,
         account: Arc<CayenneMemoryAccount>,
+        scan_input_version: Arc<AtomicU64>,
     ) -> Option<Arc<Self>> {
         if specs.is_empty() {
             return None;
@@ -1063,6 +1449,7 @@ impl LookupIndexState {
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
             counters: Counters::default(),
+            scan_input_version,
         }))
     }
 
@@ -1114,6 +1501,7 @@ impl LookupIndexState {
     fn store_index(&self, index: Option<Arc<SnapshotLookupIndex>>) {
         self.index.store(index);
         self.generation.fetch_add(1, Ordering::Release);
+        self.scan_input_version.fetch_add(1, Ordering::Release);
     }
 
     /// Makes `index` the published index if `expected` still is. Returns whether
@@ -1351,28 +1739,22 @@ impl LookupIndexState {
     /// with a value: see the module's note on column-side casts.
     pub(crate) fn probe(
         self: &Arc<Self>,
+        index: Option<&Arc<SnapshotLookupIndex>>,
         visible_snapshot: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
     ) -> LookupProbe {
         let Some(shape) = self.matched_shape(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
         };
-        let Some(index) = self.published() else {
-            self.record_probe(shape, ProbeOutcome::Unbuilt);
-            return LookupProbe::Fallback(LookupIndexExplain::fallback(
-                shape.to_string(),
-                LookupIndexExplainOutcome::Unbuilt,
-            ));
+        let index = match self.index_for_scan(shape, index, visible_snapshot) {
+            Ok(index) => index,
+            Err(outcome) => {
+                return LookupProbe::Fallback(LookupIndexExplain::fallback(
+                    shape.to_string(),
+                    outcome,
+                ));
+            }
         };
-        if index.snapshot_id != visible_snapshot {
-            self.record_probe(shape, ProbeOutcome::SnapshotMismatch);
-            self.discard_stale(&index);
-            return LookupProbe::Fallback(LookupIndexExplain::fallback(
-                shape.to_string(),
-                LookupIndexExplainOutcome::SnapshotMismatch,
-            ));
-        }
-
         let Some(hit) = index.probe(scalar_for) else {
             return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(
                 shape.to_string(),
@@ -1387,6 +1769,75 @@ impl LookupIndexState {
         })
     }
 
+    /// `index`, the index the scan's view pinned, when it was built for the
+    /// scan's `visible_snapshot`. Otherwise records why there is none as
+    /// `shape`'s probe outcome. A pinned index for another snapshot is older than
+    /// the view that captured it, so it is dropped, unless something newer
+    /// already replaced it, so a rebuild can take its place.
+    fn index_for_scan(
+        &self,
+        shape: &str,
+        index: Option<&Arc<SnapshotLookupIndex>>,
+        visible_snapshot: &str,
+    ) -> Result<Arc<SnapshotLookupIndex>, LookupIndexExplainOutcome> {
+        let Some(index) = index else {
+            self.record_probe(shape, ProbeOutcome::Unbuilt);
+            return Err(LookupIndexExplainOutcome::Unbuilt);
+        };
+        if index.snapshot_id != visible_snapshot {
+            self.record_probe(shape, ProbeOutcome::SnapshotMismatch);
+            self.discard_stale(index);
+            return Err(LookupIndexExplainOutcome::SnapshotMismatch);
+        }
+        Ok(Arc::clone(index))
+    }
+
+    /// Probes a completed hash-join dynamic filter's `keys` for `spec` as one
+    /// batched lookup, recording exactly one outcome.
+    ///
+    /// Single-column membership arrives as `column IN (...)`; composite
+    /// membership arrives as `struct(columns...) IN (struct literals...)`, so
+    /// tuple correlation is preserved without a Cartesian product. `index` is
+    /// the one the scan's view pinned; it answers only when it covers every one
+    /// of `scan_files`, checked before any key is probed. As in
+    /// [`LookupSelection::restrict`], a file it lacks while the view's file set
+    /// has moved on since the index was listed proves the index stale.
+    fn probe_runtime_filter(
+        &self,
+        spec: &KeySpec,
+        index: Option<&Arc<SnapshotLookupIndex>>,
+        visible_snapshot: &str,
+        visible_file_set: FileSetVersion,
+        scan_files: &[ObjectMeta],
+        keys: &[Vec<ScalarValue>],
+    ) -> RuntimeProbe {
+        let Ok(index) = self.index_for_scan(&spec.label, index, visible_snapshot) else {
+            return RuntimeProbe::IndexUnusable;
+        };
+        if !scan_files.iter().all(|file| index.indexes_file(file)) {
+            self.record_probe(&spec.label, ProbeOutcome::SnapshotMismatch);
+            if index.file_set != visible_file_set {
+                self.discard_stale(&index);
+            }
+            return RuntimeProbe::IndexUnusable;
+        }
+
+        let max_rows = RUNTIME_INDEX_MIN_ROWS
+            .max(usize_of(index.stats.rows) / 1_000)
+            .min(RUNTIME_INDEX_MAX_ROWS);
+        let Some(hit) = index.probe_keys(&spec.columns, keys, max_rows) else {
+            self.record_runtime_fallback();
+            return RuntimeProbe::Declined;
+        };
+
+        if hit.rows == 0 {
+            self.record_probe(&hit.shape, ProbeOutcome::Empty);
+        } else {
+            self.record_selection(&hit.shape, hit.per_file.len() as u64, hit.rows as u64);
+        }
+        RuntimeProbe::Selection(RuntimeLookupSelection::new(index, hit.per_file))
+    }
+
     fn record_probe(&self, shape: &str, outcome: ProbeOutcome) {
         record_probe_outcome(&self.table_name, &self.counters, shape, outcome);
     }
@@ -1399,6 +1850,12 @@ impl LookupIndexState {
             .candidate_rows
             .fetch_add(rows, Ordering::Relaxed);
         self.record_probe(shape, ProbeOutcome::Selected);
+    }
+
+    fn record_runtime_fallback(&self) {
+        self.counters
+            .runtime_fallback
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2510,6 +2967,65 @@ mod tests {
         KeySpec::new(columns.iter().map(|c| (*c).to_string()).collect()).expect("columns")
     }
 
+    /// Counts the build requests a runtime lookup makes.
+    #[derive(Default)]
+    struct BuildRequests(Arc<AtomicU64>);
+
+    impl BuildRequests {
+        fn callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+            let count = Arc::clone(&self.0);
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        }
+
+        fn count(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    /// A scan's view of an indexed test file: size 1, modified at the epoch.
+    fn scan_file(path: &str) -> ObjectMeta {
+        let mut file = PartitionedFile::new(path.to_string(), 1).object_meta;
+        file.last_modified = chrono::DateTime::from_timestamp_millis(0).expect("epoch");
+        file
+    }
+
+    /// A hash join's dynamic filter after its build side completed with `values`.
+    fn completed_dynamic_filter(
+        column: &Arc<dyn PhysicalExpr>,
+        values: &[i64],
+    ) -> Arc<dyn PhysicalExpr> {
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic
+            .update(tenant_in_list(column, values))
+            .expect("runtime filter");
+        dynamic.mark_complete();
+        dynamic
+    }
+
+    fn tenant_in_list(column: &Arc<dyn PhysicalExpr>, values: &[i64]) -> Arc<dyn PhysicalExpr> {
+        let schema = arrow_schema::Schema::new(vec![Field::new("tenant", DataType::Int64, true)]);
+        Arc::new(
+            InListExpr::try_new(
+                Arc::clone(column),
+                values
+                    .iter()
+                    .map(|value| {
+                        Arc::new(Literal::new(ScalarValue::Int64(Some(*value))))
+                            as Arc<dyn PhysicalExpr>
+                    })
+                    .collect(),
+                false,
+                &schema,
+            )
+            .expect("IN list"),
+        )
+    }
+
     #[test]
     fn keys_are_labelled_by_their_columns_and_deduplicated() {
         assert!(KeySpec::new(Vec::new()).is_none());
@@ -2527,6 +3043,263 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_filter_cache_tracks_expression_generation() {
+        let pool = unbounded_pool();
+        let state = LookupIndexState::new(
+            "dynamic_generation",
+            vec![spec(&["tenant"])],
+            Arc::clone(&pool),
+            account(&pool),
+            Arc::default(),
+        )
+        .expect("state");
+        let builds = BuildRequests::default();
+        let provider = DynamicLookupAccessPlanProvider::new(
+            Arc::clone(&state),
+            state.published(),
+            "snapshot".to_string(),
+            FileSetVersion::default(),
+            Arc::new([]),
+            Some(builds.callback()),
+        );
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
+
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(
+            state.counters().unbuilt,
+            0,
+            "an unresolved filter is not probed"
+        );
+        assert_eq!(builds.count(), 0);
+
+        dynamic
+            .update(tenant_in_list(&column, &[1, 2]))
+            .expect("first update");
+        dynamic.mark_complete();
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(state.counters().unbuilt, 1);
+        assert_eq!(builds.count(), 1);
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(
+            state.counters().unbuilt,
+            1,
+            "one generation is probed only once"
+        );
+        assert_eq!(builds.count(), 1);
+
+        dynamic
+            .update(tenant_in_list(&column, &[3]))
+            .expect("second update");
+        assert!(provider.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(
+            state.counters().unbuilt,
+            2,
+            "a later generation is resolved independently"
+        );
+        assert_eq!(builds.count(), 2);
+    }
+
+    #[test]
+    fn runtime_filter_refuses_in_lists_nested_in_case() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = tenant_in_list(&column, &[1, 2]);
+        let case = Arc::new(
+            datafusion_physical_expr::expressions::CaseExpr::try_new(
+                None,
+                vec![(
+                    Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
+                        as Arc<dyn PhysicalExpr>,
+                    in_list,
+                )],
+                Some(Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))),
+            )
+            .expect("CASE"),
+        ) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic.update(case).expect("update");
+        dynamic.mark_complete();
+        let predicate = dynamic as Arc<dyn PhysicalExpr>;
+
+        assert!(dynamic_in_list_expr(&predicate, &["tenant".to_string()]).is_none());
+    }
+
+    #[test]
+    fn runtime_filter_column_names_are_case_sensitive() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = tenant_in_list(&column, &[1, 2]);
+        let in_list = in_list.downcast_ref::<InListExpr>().expect("IN list");
+
+        assert!(in_list_matches_columns(in_list, &["tenant".to_string()]));
+        assert!(!in_list_matches_columns(in_list, &["Tenant".to_string()]));
+    }
+
+    #[test]
+    fn runtime_key_extraction_refuses_too_many_distinct_keys() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let values = (0..=RUNTIME_INDEX_MAX_KEYS)
+            .map(|value| i64::try_from(value).expect("small key"))
+            .collect::<Vec<_>>();
+        let in_list = tenant_in_list(&column, &values);
+        let keys = in_list_keys(&in_list, &["tenant".to_string()]);
+        assert!(
+            keys.is_none(),
+            "extraction materialized {} keys instead of declining at the distinct-key bound",
+            keys.as_ref().map_or(0, Vec::len)
+        );
+    }
+
+    #[test]
+    fn runtime_key_extraction_deduplicates_before_applying_the_bound() {
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let values = (0..RUNTIME_INDEX_MAX_KEYS)
+            .cycle()
+            .take(RUNTIME_INDEX_MAX_KEYS * 3)
+            .map(|value| i64::try_from(value).expect("small key"))
+            .collect::<Vec<_>>();
+        let in_list = tenant_in_list(&column, &values);
+        let keys = in_list_keys(&in_list, &["tenant".to_string()]).expect("bounded distinct keys");
+        assert_eq!(keys.len(), RUNTIME_INDEX_MAX_KEYS);
+        let expected: HashSet<_> = (0..RUNTIME_INDEX_MAX_KEYS)
+            .map(|value| {
+                vec![ScalarValue::Int64(Some(
+                    i64::try_from(value).expect("small key"),
+                ))]
+            })
+            .collect();
+        assert_eq!(keys.into_iter().collect::<HashSet<_>>(), expected);
+    }
+
+    #[test]
+    fn runtime_key_extraction_stops_at_the_first_excess_distinct_key() {
+        let visited = std::cell::Cell::new(0);
+        let values = (0..RUNTIME_INDEX_MAX_KEYS * 2)
+            .map(|value| {
+                Arc::new(Literal::new(ScalarValue::Int64(Some(
+                    i64::try_from(value).expect("small key"),
+                )))) as Arc<dyn PhysicalExpr>
+            })
+            .collect::<Vec<_>>();
+        let keys =
+            collect_runtime_keys(values.iter().inspect(|_| visited.set(visited.get() + 1)), 1);
+        assert!(
+            keys.is_none(),
+            "an oversized list must not return partial keys"
+        );
+        assert_eq!(visited.get(), RUNTIME_INDEX_MAX_KEYS + 1);
+    }
+
+    #[test]
+    fn runtime_key_extraction_preserves_correlated_non_null_tuples() {
+        let fields = vec![
+            Arc::new(Field::new("tenant", DataType::Int64, true)),
+            Arc::new(Field::new("service", DataType::Utf8, true)),
+        ];
+        let literal = |tenant: Option<i64>, service: Option<&str>| {
+            Arc::new(Literal::new(ScalarValue::Struct(Arc::new(
+                arrow::array::StructArray::new(
+                    fields.clone().into(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![tenant])),
+                        Arc::new(StringArray::from(vec![service])),
+                    ],
+                    None,
+                ),
+            )))) as Arc<dyn PhysicalExpr>
+        };
+        let mut values = vec![literal(Some(1), Some("a")); RUNTIME_INDEX_MAX_KEYS * 2];
+        values.extend([
+            literal(Some(2), Some("b")),
+            literal(None, Some("a")),
+            literal(Some(1), None),
+        ]);
+        let keys = collect_runtime_keys(&values, 2).expect("two distinct non-null tuples");
+        assert_eq!(
+            keys.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::from("a")],
+                vec![ScalarValue::Int64(Some(2)), ScalarValue::from("b")],
+            ])
+        );
+        let oversized = (0..RUNTIME_INDEX_MAX_KEYS * 2)
+            .map(|value| literal(Some(i64::try_from(value).expect("small key")), Some("a")))
+            .collect::<Vec<_>>();
+        let visited = std::cell::Cell::new(0);
+        assert!(
+            collect_runtime_keys(
+                oversized.iter().inspect(|_| visited.set(visited.get() + 1)),
+                2,
+            )
+            .is_none()
+        );
+        assert_eq!(visited.get(), RUNTIME_INDEX_MAX_KEYS + 1);
+    }
+
+    #[test]
+    fn runtime_probe_keeps_case_distinct_index_shapes_separate() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("Foo", DataType::Int64, false),
+            Field::new("foo", DataType::Int64, false),
+        ]);
+        let files = vec![IndexedFile {
+            path: "snapshot/file.vortex".to_string(),
+            size: 1,
+            last_modified_ms: 0,
+        }];
+        let mut build = BuildState::new(
+            &[spec(&["Foo"]), spec(&["foo"])],
+            build_reservation(&pool),
+            &schema,
+        )
+        .expect("build state");
+        let file_id = build.file_id(&files[0].path).expect("file id");
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .expect("case-distinct batch");
+        build
+            .ingest(file_id, RowPositions::Contiguous(0), &batch, &files[0].path)
+            .expect("ingest");
+        let index = build
+            .into_index(
+                "snapshot".to_string(),
+                &files,
+                Instant::now(),
+                None,
+                VortexSession::default(),
+                &table,
+                FileSetVersion::default(),
+            )
+            .expect("finish")
+            .expect("fits");
+
+        for (column, value) in [("Foo", 1), ("foo", 2)] {
+            let hit = index
+                .probe_keys(
+                    &[column.to_string()],
+                    &[vec![ScalarValue::Int64(Some(value))]],
+                    1,
+                )
+                .expect("matching case-distinct shape");
+            assert_eq!(hit.shape, column);
+            assert_eq!(hit.rows, 1);
+        }
+    }
+
     #[test]
     fn packed_postings_round_trip_file_and_position() {
         let packed = (u64::from(MAX_FILE_ID) << POSITION_BITS) | POSITION_MASK;
@@ -2537,16 +3310,17 @@ mod tests {
     #[test]
     fn a_table_selection_removes_deleted_candidates() {
         let deleted: roaring::RoaringTreemap = [3u64, 9].into_iter().collect();
-        let exclude = Selection::ExcludeRoaring(deleted);
-        let kept: Vec<u64> = [1u64, 3, 5, 9]
-            .into_iter()
-            .filter(|&p| selection_keeps(&exclude, p))
-            .collect();
-        assert_eq!(kept, vec![1, 5]);
-        let include = Selection::IncludeByIndex(Buffer::from_iter([5u64, 9]));
-        assert!(selection_keeps(&include, 9));
-        assert!(!selection_keeps(&include, 1));
-        assert!(selection_keeps(&Selection::All, 1));
+        let table_plan =
+            VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(deleted));
+        let candidates = VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
+            Buffer::from_iter([1u64, 3, 5, 9]),
+        ));
+        let Some(Selection::IncludeByIndex(kept)) =
+            candidates.intersect(&table_plan).selection().cloned()
+        else {
+            panic!("candidates stay an include list");
+        };
+        assert_eq!(kept.as_slice(), &[1, 5]);
     }
 
     #[test]
@@ -2746,6 +3520,226 @@ mod tests {
                 "a key with an unpinned column must not be answered"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_declines_inputs_over_its_bounds_and_rebuilds_stale_indexes() {
+        let rows = 4_096usize;
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let files = vec![IndexedFile {
+            path: "snapshot/file.vortex".to_string(),
+            size: 1,
+            last_modified_ms: 0,
+        }];
+        let mut build = BuildState::new(
+            &[spec(&["tenant"])],
+            build_reservation(&pool),
+            &keyed_schema(),
+        )
+        .expect("build state");
+        let file_id = build.file_id(&files[0].path).expect("file id");
+        build
+            .ingest(
+                file_id,
+                RowPositions::Contiguous(0),
+                &keyed_batch(
+                    vec![Some(7); rows],
+                    vec![Some("service".to_string()); rows],
+                    vec![None; rows],
+                ),
+                &files[0].path,
+            )
+            .expect("ingest");
+        let index = Arc::new(
+            build
+                .into_index(
+                    "snapshot".to_string(),
+                    &files,
+                    Instant::now(),
+                    None,
+                    VortexSession::default(),
+                    &table,
+                    FileSetVersion::default(),
+                )
+                .expect("finish")
+                .expect("fits"),
+        );
+        let columns = vec!["tenant".to_string()];
+        let keys = vec![vec![ScalarValue::Int64(Some(7))]];
+
+        assert!(
+            index.probe_keys(&columns, &keys, 100).is_none(),
+            "the probe must fall back before materializing an oversized posting list"
+        );
+        assert_eq!(
+            index
+                .probe_keys(&columns, &keys, rows)
+                .expect("bounded hit")
+                .rows,
+            rows
+        );
+
+        let state = LookupIndexState::new(
+            "bounded_runtime_probe",
+            vec![spec(&["tenant"])],
+            Arc::clone(&pool),
+            Arc::clone(&table),
+            Arc::default(),
+        )
+        .expect("state");
+        state.store_index(Some(index));
+        let indexed = scan_file(&files[0].path);
+        assert!(matches!(
+            state.probe_runtime_filter(
+                &spec(&["tenant"]),
+                state.published().as_ref(),
+                "snapshot",
+                FileSetVersion::default(),
+                std::slice::from_ref(&indexed),
+                &keys,
+            ),
+            RuntimeProbe::Declined
+        ));
+        assert_eq!(state.counters().runtime_fallback, 1);
+
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let builds = BuildRequests::default();
+        let provider = |scan_files: Vec<ObjectMeta>, visible_file_set| {
+            Arc::new(DynamicLookupAccessPlanProvider::new(
+                Arc::clone(&state),
+                state.published(),
+                "snapshot".to_string(),
+                visible_file_set,
+                scan_files.into(),
+                Some(builds.callback()),
+            ))
+        };
+
+        // An oversized key set is declined once per filter, not once per file
+        // open, and no index build could help it.
+        let too_many_keys: Vec<i64> = (0..=RUNTIME_INDEX_MAX_KEYS)
+            .map(|value| i64::try_from(value).expect("small"))
+            .collect();
+        let oversized = completed_dynamic_filter(&column, &too_many_keys);
+        let scan = provider(vec![indexed.clone()], FileSetVersion::default());
+        for _ in 0..3 {
+            assert!(scan.resolve(Some(&oversized)).await.is_none());
+        }
+        assert_eq!(state.counters().runtime_fallback, 2);
+        assert_eq!(builds.count(), 0);
+
+        // A scan file the index lacks, while the file set has not moved, means
+        // the scan predates the index: every concurrent opener sees one
+        // `snapshot_mismatch` outcome, and nothing is discarded.
+        let appended = scan_file("snapshot/appended.vortex");
+        let predicate = completed_dynamic_filter(&column, &[8]);
+        let scan = provider(
+            vec![indexed.clone(), appended.clone()],
+            FileSetVersion::default(),
+        );
+        let resolved =
+            futures::future::join_all((0..8).map(|_| scan.resolve(Some(&predicate)))).await;
+        assert!(resolved.iter().all(Option::is_none));
+        let counters = state.counters();
+        assert_eq!(counters.snapshot_mismatch, 1);
+        assert_eq!(
+            counters.empty + counters.selected,
+            0,
+            "a probe the file set refuses must not also count as answered"
+        );
+        assert!(state.published().is_some());
+
+        // The same missing file in a view whose file set moved on since the index
+        // was listed proves the index stale: it is discarded and one replacement
+        // build is requested.
+        let scan = provider(
+            vec![indexed, appended],
+            FileSetVersion {
+                dir_generation: 1,
+                listing_epoch: 0,
+            },
+        );
+        assert!(scan.resolve(Some(&predicate)).await.is_none());
+        assert_eq!(state.counters().snapshot_mismatch, 2);
+        assert!(state.published().is_none(), "the stale index is discarded");
+        assert_eq!(
+            builds.count(),
+            2,
+            "each refused scan requests a build; the schedule decides whether one runs"
+        );
+    }
+
+    /// A full refresh can publish the next snapshot's index while a join that
+    /// was planned against the previous snapshot is still building its hash
+    /// table. The join probes the index its view pinned, which matches what it
+    /// reads, and leaves the newer index alone.
+    #[tokio::test]
+    async fn a_runtime_probe_planned_before_a_refresh_keeps_the_newer_index() {
+        let pool = unbounded_pool();
+        let table = account(&pool);
+        let state = LookupIndexState::new(
+            "refreshed_during_join",
+            vec![spec(&["tenant"])],
+            Arc::clone(&pool),
+            Arc::clone(&table),
+            Arc::default(),
+        )
+        .expect("state");
+        let scan = |pinned: &Arc<SnapshotLookupIndex>, snapshot: &str| {
+            DynamicLookupAccessPlanProvider::new(
+                Arc::clone(&state),
+                Some(Arc::clone(pinned)),
+                snapshot.to_string(),
+                FileSetVersion::default(),
+                vec![scan_file(&format!("{snapshot}/file.vortex"))].into(),
+                None,
+            )
+        };
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = completed_dynamic_filter(&column, &[1]);
+
+        let planned = tiny_index(&pool, &table, "s1");
+        state.store_index(Some(Arc::clone(&planned)));
+        let join = scan(&planned, "s1");
+        let refreshed = tiny_index(&pool, &table, "s2");
+        state.store_index(Some(Arc::clone(&refreshed)));
+
+        assert!(
+            join.resolve(Some(&predicate)).await.is_some(),
+            "the join still answers from the index its view pinned"
+        );
+        assert_eq!(state.counters().snapshot_mismatch, 0);
+        assert!(
+            state
+                .published()
+                .is_some_and(|index| Arc::ptr_eq(&index, &refreshed)),
+            "the refreshed snapshot's index stays published"
+        );
+
+        // A view that pinned an index older than its own snapshot refuses it,
+        // and discards it only while it is still the published one.
+        assert!(
+            scan(&planned, "s2")
+                .resolve(Some(&predicate))
+                .await
+                .is_none()
+        );
+        assert!(
+            state
+                .published()
+                .is_some_and(|index| Arc::ptr_eq(&index, &refreshed)),
+            "a newer index is never discarded in place of a stale one"
+        );
+        state.store_index(Some(Arc::clone(&planned)));
+        assert!(
+            scan(&planned, "s2")
+                .resolve(Some(&predicate))
+                .await
+                .is_none()
+        );
+        assert!(state.published().is_none(), "the stale index is discarded");
+        assert_eq!(state.counters().snapshot_mismatch, 2);
     }
 
     /// A single shifted address is reported, so the read-back verification can
@@ -2967,6 +3961,7 @@ mod tests {
             vec![spec(&["tenant"])],
             Arc::clone(&pool),
             Arc::clone(&table),
+            Arc::default(),
         )
         .expect("state");
         let old = tiny_index(&pool, &table, "s1");
@@ -3010,6 +4005,7 @@ mod tests {
             vec![spec(&["tenant"])],
             Arc::clone(&pool),
             account(&pool),
+            Arc::default(),
         )
         .expect("state");
         let claim = state.claim_build("snapshot").expect("first claim");

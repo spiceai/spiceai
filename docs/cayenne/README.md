@@ -1,8 +1,9 @@
 # Cayenne doc
 
 A breadth-first technical reference for the `cayenne` crate
-([`crates/cayenne`](../../crates/cayenne)) — a Vortex-native lakehouse table
-format / high-rate-CDC accelerator — rendered to a grayscale-printable PDF.
+([`crates/cayenne`](../../crates/cayenne)) — the Vortex-native engine that
+powers Spice.ai, built for high-rate CDC ingestion and low-latency queries on the
+same table — rendered to a grayscale-printable PDF.
 
 This doc lives in-tree so it is versioned alongside the code it describes.
 Because the crate is now in the same repository, source-ground every claim
@@ -19,7 +20,7 @@ the top of `cayenne.md`.
 | `package.json` / `package-lock.json` | Pins the mermaid-cli version diagrams render with. Pinned exactly: mermaid reflows diagrams between releases, so an unpinned bump would silently change every figure. |
 | `gen_waterfall.py` | Generator for the committed `waterfall.svg` landscape "life of a change" waterfall figure. |
 | `waterfall.svg` | The waterfall figure, **committed** and referenced from `cayenne.md` as `<img src="waterfall.svg">` so it renders in both the GitHub markdown view and the PDF. Regenerate with `gen_waterfall.py`. |
-| `Cayenne.pdf` | Built output. **Not committed** (git-ignored) — CI builds it as a linkable artifact off `trunk`; build it locally to preview. |
+| `Cayenne.pdf` | Built output. **Not committed** (git-ignored) — CI builds it as a linkable artifact off `trunk` and release branches; build it locally to preview. |
 
 Committed figures are referenced as separate `.svg` files (currently `waterfall.svg`)
 rather than pasted inline, because GitHub's markdown renderer strips inline
@@ -35,24 +36,26 @@ builds the PDF:
 - **On pull requests** that touch `docs/cayenne/**`, it renders the PDF to
   verify the document still builds (every mermaid block parses, WeasyPrint
   succeeds) and uploads the result as a run artifact for review.
-- **On push to `trunk` that touches `docs/cayenne/**`** (or the workflow file
-  itself), and on manual dispatch, it builds and uploads `Cayenne.pdf` as a
-  downloadable, linkable artifact of the current `trunk`.
+- **On push to `trunk` or a release branch (`release/**`) that touches
+  `docs/cayenne/**`** (or the workflow file itself), and on manual dispatch, it
+  builds and uploads `Cayenne.pdf` as a downloadable, linkable artifact of that
+  branch.
 
 ## Prerequisites
 
 - Python 3 with `markdown` and `weasyprint`
   (`pip install markdown weasyprint` — add `--break-system-packages`
   on Debian/Ubuntu system Pythons).
-- WeasyPrint's native deps (Pango/Cairo/…):
-  - **macOS**: `brew install pango` (pulls in cairo, gdk-pixbuf, libffi). If the
+- WeasyPrint's native deps (Pango/HarfBuzz/…):
+  - **macOS**: `brew install pango` (pulls in cairo, glib, harfbuzz, fontconfig). If the
     import still can't find the libs on Apple Silicon, export
     `DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix)/lib"`.
   - **Debian/Ubuntu**: `sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0`
     (see the CI workflow for the exact package list).
 - Node.js, for the pinned mermaid-cli that renders the diagrams. Install it
   with `npm ci` in this directory; the first install also downloads the
-  headless browser mermaid renders in (~150 MB, cached in `~/.cache/puppeteer`).
+  headless browser mermaid renders in (Chrome plus chrome-headless-shell, several
+  hundred MB on disk, cached in `~/.cache/puppeteer`).
 - Optional, for visual verification: `pdftoppm` (poppler-utils) to rasterize
   pages, e.g. `pdftoppm -png -r 100 -f 12 -l 12 Cayenne.pdf page`.
 
@@ -62,8 +65,8 @@ builds the PDF:
 python3 build_pdf.py
 ```
 
-Produces `cayenne.html` (intermediate) and `Cayenne.pdf` in the working
-directory. The script renders every Mermaid block in a single mermaid-cli run
+Produces `cayenne.html` (intermediate) and `Cayenne.pdf` in `docs/cayenne` (the
+script `chdir`s there first), whatever the working directory. The script renders every Mermaid block in a single mermaid-cli run
 (one browser launch for the whole document rather than one per diagram) and
 injects a high-contrast override stylesheet into every SVG so diagrams stay
 legible in grayscale print.
@@ -96,7 +99,8 @@ rebuild the PDF (and commit the regenerated `waterfall.svg`).
   code does" where they differ.
 - **Grayscale-safe diagrams**: white node fills, dark solid borders
   (`#312e81`), near-black edges (`#1e293b`), dashed cluster/optional outlines
-  (`#6366f1`), neutral-gray notes/brackets/axes (`#94a3b8`). Mermaid is
+  (`#6366f1`), gray notes (`#e2e8f0` fill, `#475569` border), neutral-gray brackets/axes
+  (`#94a3b8`). Mermaid is
   rendered by mermaid-cli with `htmlLabels:false` — plain text + `<br/>` only, no
   `<b>`/`<i>`, and commas rather than semicolons in sequence-diagram text.
 - **Prose style**: minimal formatting, no over-bolding; breadth-first; honest

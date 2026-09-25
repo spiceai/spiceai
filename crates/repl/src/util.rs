@@ -75,6 +75,21 @@ impl std::fmt::Display for UtilError {
 
 impl std::error::Error for UtilError {}
 
+/// Render an error together with its full `source()` chain, since
+/// `reqwest::Error`'s own `Display` stops at "error sending request for url
+/// (...)" and drops the underlying connect/DNS/TLS cause.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        let _ = write!(msg, ": {s}");
+        source = s.source();
+    }
+    msg
+}
+
 /// A spinner that shows activity while waiting for an async operation.
 pub struct Spinner {
     running: Arc<AtomicBool>,
@@ -150,7 +165,7 @@ pub async fn get_available_models(
         .await
         .map_err(|e| UtilError::ConnectionFailed {
             endpoint: url.clone(),
-            source: e.to_string(),
+            source: error_chain(&e),
         })?;
 
     if !response.status().is_success() {
@@ -288,6 +303,37 @@ pub fn save_history(rl: &mut DefaultEditor, history_path: Option<&PathBuf>) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[derive(Debug)]
+    struct Inner;
+    impl std::fmt::Display for Inner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dns error: no such host")
+        }
+    }
+    impl std::error::Error for Inner {}
+
+    #[derive(Debug)]
+    struct Outer(Inner);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error sending request for url (https://data.spicea)")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn test_error_chain_includes_source() {
+        let err = Outer(Inner);
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (https://data.spicea): dns error: no such host"
+        );
+    }
 
     #[test]
     fn test_util_error_display_connection_failed() {
