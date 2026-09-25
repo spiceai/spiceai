@@ -84,6 +84,7 @@ use datafusion_physical_plan::filter_pushdown::{FilterDescription, FilterPushdow
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion_physical_plan::{ChildStats, StatisticsArgs, StatisticsContext};
 use std::sync::Arc;
 
 /// Per-partition metrics for a deletion-filter exec.
@@ -470,14 +471,28 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         vec![true]
     }
 
-    #[expect(
-        deprecated,
-        reason = "kept for direct callers of the deprecated method; this impl predates statistics_from_inputs"
-    )]
+    /// Resolves the input's statistics through [`StatisticsContext`]: `DataFusion`'s
+    /// built-in scans answer only [`ExecutionPlan::statistics_from_inputs`], so
+    /// asking the input's `partition_statistics` directly would report nothing.
     fn partition_statistics(
         &self,
         partition: Option<usize>,
     ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<datafusion_common::Statistics>],
+        args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        let partition = args.partition();
+        let input_statistics = input_stats.first().cloned().ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "{} requires exactly one input",
+                self.name()
+            ))
+        })?;
         // Only the whole-table aggregate (`partition == None`) is delete-aware, and
         // only outside a protected-snapshot cutoff — see `net_table_deletions`. Both
         // gates short-circuit here so the per-partition path skips the scan-subtree
@@ -493,9 +508,13 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             0
         };
         Ok(Arc::new(deletion_filtered_statistics(
-            self.input.partition_statistics(partition)?.as_ref().clone(),
+            Arc::unwrap_or_clone(input_statistics),
             net_deletions,
         )))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -999,14 +1018,28 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         vec![true]
     }
 
-    #[expect(
-        deprecated,
-        reason = "kept for direct callers of the deprecated method; this impl predates statistics_from_inputs"
-    )]
+    /// Resolves the input's statistics through [`StatisticsContext`]: `DataFusion`'s
+    /// built-in scans answer only [`ExecutionPlan::statistics_from_inputs`], so
+    /// asking the input's `partition_statistics` directly would report nothing.
     fn partition_statistics(
         &self,
         partition: Option<usize>,
     ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<datafusion_common::Statistics>],
+        args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        let partition = args.partition();
+        let input_statistics = input_stats.first().cloned().ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "{} requires exactly one input",
+                self.name()
+            ))
+        })?;
         // Only the whole-table aggregate (`partition == None`) is delete-aware, and
         // only outside a protected-snapshot cutoff — see `net_table_deletions`. Both
         // gates short-circuit here so the per-partition path skips the scan-subtree
@@ -1022,9 +1055,13 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
             0
         };
         Ok(Arc::new(deletion_filtered_statistics(
-            self.input.partition_statistics(partition)?.as_ref().clone(),
+            Arc::unwrap_or_clone(input_statistics),
             net_deletions,
         )))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1858,14 +1895,13 @@ mod tests {
     /// deletions exist, so a clean scan keeps its `Exact` per-partition stats.
     /// This asserts the precondition the deletion-filter downgrade relaxes from.
     #[test]
-    #[expect(
-        deprecated,
-        reason = "exercises the still-required deprecated partition_statistics method directly"
-    )]
     fn clean_scan_reports_exact_partition_statistics() {
         let scan = exact_int64_scan();
-        let stats = scan
-            .partition_statistics(Some(0))
+        let stats = StatisticsContext::new()
+            .compute(
+                scan.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
             .expect("partition statistics");
         assert_eq!(stats.num_rows, Precision::Exact(3));
     }
