@@ -34,6 +34,8 @@ pub use sqlite::SqliteSnapshotEngine;
 pub(crate) use sqlite::begin_sqlite_restore;
 #[cfg(feature = "sqlite")]
 pub use sqlite::recover_interrupted_sqlite_restore;
+#[cfg(feature = "sqlite")]
+pub use sqlite::wait_for_sqlite_restore;
 
 #[cfg(feature = "turso")]
 mod turso;

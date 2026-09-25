@@ -47,6 +47,7 @@ use snafu::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use tokio::sync::Notify;
 
 use super::SnapshotEngine;
 
@@ -516,6 +517,7 @@ fn restore_key(path: &Path) -> PathBuf {
 /// them must not treat that journal as a crash and move the WAL back.
 static ACTIVE_SQLITE_RESTORES: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static SQLITE_RESTORE_FINISHED: Notify = Notify::const_new();
 
 /// Held from before a restore parks `SQLite` sidecars until the attempt has
 /// put them back or deleted them.
@@ -527,6 +529,27 @@ pub(crate) struct ActiveSqliteRestore {
 impl Drop for ActiveSqliteRestore {
     fn drop(&mut self) {
         ACTIVE_SQLITE_RESTORES.lock().remove(&self.path);
+        SQLITE_RESTORE_FINISHED.notify_waiters();
+    }
+}
+
+/// Waits until this process is not between parking a `SQLite` database's
+/// sidecars and putting them back or deleting them.
+///
+/// A connection opened in that interval can create a new `-wal` for the file
+/// the rename just installed. The cleanup that follows deletes that `-wal`,
+/// and the next connection then fails with a disk I/O error.
+pub async fn wait_for_sqlite_restore(path: &Path) {
+    let key = restore_key(path);
+    loop {
+        // Subscribe before the check so a finish that lands between them is
+        // not missed.
+        let notified = SQLITE_RESTORE_FINISHED.notified();
+        tokio::pin!(notified);
+        if !ACTIVE_SQLITE_RESTORES.lock().contains(&key) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -891,6 +914,31 @@ mod tests {
         assert!(sidecar_path(&live_path, "-wal").exists());
         assert!(!parked_sidecar_path(&live_path, "-wal").exists());
         assert!(!restore_journal_path(&live_path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_pool_open_waits_until_the_restore_finishes() {
+        let tmp = TempDir::new().expect("tmp");
+        let live_path = tmp.path().join("orders.sqlite");
+        std::fs::write(&live_path, b"sqlite").expect("write");
+        let active = begin_sqlite_restore(&live_path);
+        let wait_path = live_path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            wait_for_sqlite_restore(&wait_path).await;
+        });
+        started_rx.await.expect("wait task started");
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "a pool open must wait while the restore holds the database"
+        );
+        drop(active);
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("pool open was not released when the restore finished")
+            .expect("wait task");
     }
 
     #[tokio::test]

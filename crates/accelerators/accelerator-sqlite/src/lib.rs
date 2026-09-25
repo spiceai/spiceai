@@ -280,8 +280,13 @@ impl SqliteAccelerator {
             datafusion_table_providers::sql::db_connection_pool::Mode::File
         ) {
             let dataset_name = source.name().to_string();
+            let database = std::path::Path::new(file_path.as_ref());
+            // Do not open the file while a restore has its WAL parked. A
+            // connection in that interval creates a `-wal` that the restore
+            // then deletes, and the next connection fails to open the file.
+            runtime_acceleration::snapshot::engine::wait_for_sqlite_restore(database).await;
             runtime_acceleration::snapshot::engine::recover_interrupted_sqlite_restore(
-                std::path::Path::new(file_path.as_ref()),
+                database,
                 &dataset_name,
             )
             .await
