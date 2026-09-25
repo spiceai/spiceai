@@ -39,6 +39,19 @@ limitations under the License.
 //!   every client's table while one more table rewrites a 1,000-file manifest
 //!   in a loop: what a commit on one table waits for while another table
 //!   compacts. Only the upserts are reported.
+//! - `get_snapshot_files n=100 while writers upsert` — a scan's manifest read
+//!   of a 100-file snapshot on 4 reader tasks, while every client upserts its
+//!   own table's statistics in a loop: what planning a query waits for while
+//!   commits contend for the write lock. Reads take no write lock, but they
+//!   share the metastore's connection pool with the writers. Only the reads
+//!   are reported, so here the client count is the number of writers.
+//! - `upsert_table_statistics at 2,000/s` — the per-commit upsert offered open
+//!   loop: 2,000 commits a second in all, arriving as a Poisson process, each
+//!   handed to a random client and timed from its arrival, so a commit that
+//!   waits for its client to finish the one before counts that wait. Every
+//!   other lane runs its clients flat out, where a fair lock makes each call
+//!   wait for every other client; this one is a partial load, where a commit
+//!   waits only when commits overlap.
 //!
 //! Criterion reports central estimates; the write-lock question is about the
 //! tail, so this harness records every call and prints p50/p99/p99.9/max per
@@ -80,6 +93,10 @@ use cayenne::{CayenneCatalog, MetadataCatalog};
 const CLIENTS: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
 const FILE_STATS_PER_TABLE: usize = 100;
 const REWRITE_BEHIND_FILES: usize = 1_000;
+/// The timed readers of `get_snapshot_files n=100 while writers upsert`, and
+/// the size of the manifest they read.
+const READERS: usize = 4;
+const READ_FILES: usize = 100;
 
 #[derive(Clone, Copy)]
 enum Lane {
@@ -87,6 +104,8 @@ enum Lane {
     TableStats,
     FileStats,
     TableStatsBehindRewrite,
+    ReadWhileWriting,
+    TableStatsAtRate { per_s: u32 },
 }
 
 struct LaneSpec {
@@ -129,6 +148,18 @@ const LANES: &[LaneSpec] = &[
         lane: Lane::TableStatsBehindRewrite,
         target_calls: 200,
         min_calls_per_client: 4,
+    },
+    LaneSpec {
+        name: "get_snapshot_files n=100 while writers upsert",
+        lane: Lane::ReadWhileWriting,
+        target_calls: 400,
+        min_calls_per_client: 20,
+    },
+    LaneSpec {
+        name: "upsert_table_statistics at 2,000/s",
+        lane: Lane::TableStatsAtRate { per_s: 2_000 },
+        target_calls: 4_000,
+        min_calls_per_client: 0,
     },
 ];
 
@@ -252,14 +283,16 @@ enum Op {
     Replace,
     TableStats(TableStatistics),
     FileStats(SnapshotFileStatistics),
+    ReadManifest,
 }
 
 fn prepare(lane: Lane, table: &Table, i: usize) -> Op {
     match lane {
         Lane::Replace { .. } => Op::Replace,
-        Lane::TableStats | Lane::TableStatsBehindRewrite => {
+        Lane::TableStats | Lane::TableStatsBehindRewrite | Lane::TableStatsAtRate { .. } => {
             Op::TableStats(table_stats(&table.id, i as i64 + 1))
         }
+        Lane::ReadWhileWriting => Op::ReadManifest,
         Lane::FileStats => {
             // A changed blob every call, so each upsert rewrites the row.
             let mut stats = table.file_stats[i % table.file_stats.len()].clone();
@@ -270,16 +303,33 @@ fn prepare(lane: Lane, table: &Table, i: usize) -> Op {
 }
 
 async fn run(catalog: &Arc<dyn MetadataCatalog>, table: &Table, op: &Op) -> Result<(), String> {
-    let result = match op {
-        Op::Replace => {
-            catalog
-                .replace_snapshot_files(&table.id, &table.snapshot_id, &table.files)
-                .await
-        }
-        Op::TableStats(stats) => catalog.upsert_table_statistics(stats).await,
-        Op::FileStats(stats) => catalog.upsert_snapshot_file_statistics(stats).await,
-    };
-    result.map_err(|e| e.to_string())
+    match op {
+        Op::Replace => catalog
+            .replace_snapshot_files(&table.id, &table.snapshot_id, &table.files)
+            .await
+            .map_err(|e| e.to_string()),
+        Op::TableStats(stats) => catalog
+            .upsert_table_statistics(stats)
+            .await
+            .map_err(|e| e.to_string()),
+        Op::FileStats(stats) => catalog
+            .upsert_snapshot_file_statistics(stats)
+            .await
+            .map_err(|e| e.to_string()),
+        // A read that returns less than the whole manifest counts as failed.
+        Op::ReadManifest => match catalog
+            .get_snapshot_files(&table.id, &table.snapshot_id)
+            .await
+        {
+            Ok(files) if files.len() == table.files.len() => Ok(()),
+            Ok(files) => Err(format!(
+                "read {} of {} manifest files",
+                files.len(),
+                table.files.len()
+            )),
+            Err(e) => Err(e.to_string()),
+        },
+    }
 }
 
 struct LaneRun {
@@ -287,6 +337,9 @@ struct LaneRun {
     /// Time to failure and message of every call that failed.
     errors: Vec<(Duration, String)>,
     wall: Duration,
+    /// How long each background WAL checkpoint took. One that escalates to
+    /// TRUNCATE blocks every writer while it runs.
+    checkpoints: Vec<Duration>,
 }
 
 /// Run `spec` with `clients` concurrent clients on a runtime sized like spiced's.
@@ -297,74 +350,89 @@ fn run_lane(spec: &LaneSpec, clients: usize) -> LaneRun {
         .build()
         .expect("tokio runtime");
     let lane = spec.lane;
-    let calls_per_client = spec
-        .target_calls
-        .div_ceil(clients)
-        .max(spec.min_calls_per_client);
+    // Every lane times one task per client on its own table, except the read
+    // lane: it times `READERS` readers of one table and runs the clients as
+    // background writers. The rewrite lane adds one background rewriter.
+    let (timed, timed_tables, background) = match lane {
+        Lane::Replace { .. }
+        | Lane::TableStats
+        | Lane::FileStats
+        | Lane::TableStatsAtRate { .. } => (clients, clients, 0),
+        Lane::TableStatsBehindRewrite => (clients, clients, 1),
+        Lane::ReadWhileWriting => (READERS, 1, clients),
+    };
+    let target_calls = spec.target_calls;
+    let calls_per_client = target_calls.div_ceil(timed).max(spec.min_calls_per_client);
     runtime.block_on(async move {
-        let (files, file_stats, rewriters) = match lane {
-            Lane::Replace { files } => (files, 0, 0),
-            Lane::TableStats => (0, 0, 0),
-            Lane::FileStats => (0, FILE_STATS_PER_TABLE, 0),
-            Lane::TableStatsBehindRewrite => (REWRITE_BEHIND_FILES, 0, 1),
+        let (files, file_stats) = match lane {
+            Lane::Replace { files } => (files, 0),
+            Lane::TableStats | Lane::TableStatsAtRate { .. } => (0, 0),
+            Lane::FileStats => (0, FILE_STATS_PER_TABLE),
+            Lane::TableStatsBehindRewrite => (REWRITE_BEHIND_FILES, 0),
+            Lane::ReadWhileWriting => (READ_FILES, 0),
         };
-        let fixture = fixture(clients + rewriters, files, file_stats).await;
+        let fixture = fixture(timed_tables + background, files, file_stats).await;
         fixture.catalog.checkpoint_wal().await.expect("checkpoint");
         let catalog = Arc::clone(&fixture.catalog);
-        let mut tables = fixture.tables.into_iter();
-        let rewrite_table = (rewriters > 0).then(|| tables.next().expect("rewrite table"));
-        let client_tables: Vec<Table> = tables.collect();
+        let mut tables = fixture.tables.into_iter().map(Arc::new);
+        let background_tables: Vec<Arc<Table>> = tables.by_ref().take(background).collect();
+        let client_tables: Vec<Arc<Table>> = match lane {
+            Lane::ReadWhileWriting => vec![tables.next().expect("read table"); READERS],
+            _ => tables.collect(),
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let checkpointer = {
             let catalog = Arc::clone(&catalog);
             let stop = Arc::clone(&stop);
             tokio::spawn(async move {
+                let mut checkpoints = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                    let t0 = Instant::now();
                     catalog
                         .checkpoint_wal()
                         .await
                         .expect("background checkpoint");
+                    checkpoints.push(t0.elapsed());
                 }
+                checkpoints
             })
         };
-        let rewriter = rewrite_table.map(|table| {
-            let catalog = Arc::clone(&catalog);
-            let stop = Arc::clone(&stop);
-            tokio::spawn(async move {
-                // The rewriter's own outcome is not what this lane measures; a
-                // rewrite that fails is simply the next one's turn.
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = run(&catalog, &table, &Op::Replace).await;
-                }
-            })
-        });
-
-        let barrier = Arc::new(tokio::sync::Barrier::new(client_tables.len()));
-        let started = Instant::now();
-        let tasks: Vec<_> = client_tables
+        let background_tasks: Vec<_> = background_tables
             .into_iter()
             .map(|table| {
                 let catalog = Arc::clone(&catalog);
-                let barrier = Arc::clone(&barrier);
+                let stop = Arc::clone(&stop);
                 tokio::spawn(async move {
-                    barrier.wait().await;
-                    let mut samples = Vec::with_capacity(calls_per_client);
-                    let mut errors = Vec::new();
-                    for i in 0..calls_per_client {
-                        let op = prepare(lane, &table, i);
-                        let t0 = Instant::now();
-                        match run(&catalog, &table, &op).await {
-                            Ok(()) => samples.push(t0.elapsed()),
-                            Err(e) => errors.push((t0.elapsed(), e)),
-                        }
+                    // A background writer's own outcome is not what the lane
+                    // measures; a write that fails is simply the next one's turn.
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let op = match lane {
+                            Lane::ReadWhileWriting => prepare(Lane::TableStats, &table, i),
+                            _ => Op::Replace,
+                        };
+                        let _ = run(&catalog, &table, &op).await;
+                        i += 1;
                     }
-                    (samples, errors)
                 })
             })
             .collect();
-        let mut samples = Vec::with_capacity(clients * calls_per_client);
+
+        let started = Instant::now();
+        let (tasks, pacer) = match lane {
+            Lane::TableStatsAtRate { per_s } => {
+                let (tasks, pacer) =
+                    open_loop_clients(&catalog, client_tables, lane, per_s, target_calls);
+                (tasks, Some(pacer))
+            }
+            _ => (
+                closed_loop_clients(&catalog, client_tables, lane, calls_per_client),
+                None,
+            ),
+        };
+        let mut samples = Vec::with_capacity(timed * calls_per_client);
         let mut errors = Vec::new();
         for task in tasks {
             let (task_samples, task_errors) = task.await.expect("client task");
@@ -372,18 +440,135 @@ fn run_lane(spec: &LaneSpec, clients: usize) -> LaneRun {
             errors.extend(task_errors);
         }
         let wall = started.elapsed();
+        // The clients ran until the pacer dropped their channels, so it is done.
+        if let Some(pacer) = pacer {
+            pacer.join().expect("arrival pacer");
+        }
 
         stop.store(true, Ordering::Relaxed);
-        if let Some(rewriter) = rewriter {
-            rewriter.await.expect("rewriter task");
+        for task in background_tasks {
+            task.await.expect("background writer task");
         }
-        checkpointer.await.expect("checkpointer task");
+        let checkpoints = checkpointer.await.expect("checkpointer task");
         LaneRun {
             samples,
             errors,
             wall,
+            checkpoints,
         }
     })
+}
+
+/// Every sample and every failure of one client.
+type ClientRun = (Vec<Duration>, Vec<(Duration, String)>);
+
+/// Every client makes `calls` calls back to back, all starting together.
+fn closed_loop_clients(
+    catalog: &Arc<dyn MetadataCatalog>,
+    tables: Vec<Arc<Table>>,
+    lane: Lane,
+    calls: usize,
+) -> Vec<tokio::task::JoinHandle<ClientRun>> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(tables.len()));
+    tables
+        .into_iter()
+        .map(|table| {
+            let catalog = Arc::clone(catalog);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let mut samples = Vec::with_capacity(calls);
+                let mut errors = Vec::new();
+                for i in 0..calls {
+                    let op = prepare(lane, &table, i);
+                    let t0 = Instant::now();
+                    match run(&catalog, &table, &op).await {
+                        Ok(()) => samples.push(t0.elapsed()),
+                        Err(e) => errors.push((t0.elapsed(), e)),
+                    }
+                }
+                (samples, errors)
+            })
+        })
+        .collect()
+}
+
+/// `calls` arrivals offered at `per_s` a second in all, as a Poisson process
+/// paced by its own thread, each handed to a random client and timed from its
+/// arrival. A client runs its arrivals one at a time, so an arrival that finds
+/// its client busy waits for it, and that wait is part of its sample.
+fn open_loop_clients(
+    catalog: &Arc<dyn MetadataCatalog>,
+    tables: Vec<Arc<Table>>,
+    lane: Lane,
+    per_s: u32,
+    calls: usize,
+) -> (
+    Vec<tokio::task::JoinHandle<ClientRun>>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut senders = Vec::with_capacity(tables.len());
+    let tasks = tables
+        .into_iter()
+        .map(|table| {
+            let (sender, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+            senders.push(sender);
+            let catalog = Arc::clone(catalog);
+            tokio::spawn(async move {
+                let mut samples = Vec::new();
+                let mut errors = Vec::new();
+                let mut i = 0;
+                let mut op = prepare(lane, &table, i);
+                while let Some(arrival) = arrivals.recv().await {
+                    match run(&catalog, &table, &op).await {
+                        Ok(()) => samples.push(arrival.elapsed()),
+                        Err(e) => errors.push((arrival.elapsed(), e)),
+                    }
+                    i += 1;
+                    op = prepare(lane, &table, i);
+                }
+                (samples, errors)
+            })
+        })
+        .collect();
+    let pacer = std::thread::spawn(move || {
+        let mut rng = XorShift64(0x9e37_79b9_7f4a_7c15 ^ senders.len() as u64);
+        let mean_gap_s = 1.0 / f64::from(per_s);
+        let mut due = Instant::now();
+        for _ in 0..calls {
+            due += Duration::from_secs_f64(-rng.unit().ln() * mean_gap_s);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            let client = rng.below(senders.len());
+            senders[client]
+                .send(Instant::now())
+                .expect("a running client to hand the arrival to");
+        }
+    });
+    (tasks, pacer)
+}
+
+/// xorshift64*: the open-loop arrivals need a reproducible stream, not a
+/// cryptographic one.
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in (0, 1].
+    fn unit(&mut self) -> f64 {
+        ((self.next_u64() >> 11) + 1) as f64 / (1_u64 << 53) as f64
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
 }
 
 fn pct(sorted: &[Duration], p: f64) -> Duration {
@@ -419,10 +604,18 @@ fn report(name: &str, clients: usize, mut run: LaneRun, raw_dir: Option<&std::pa
             us(*run.samples.last().expect("samples")),
         )
     };
+    let max_checkpoint = run.checkpoints.iter().max().copied().unwrap_or_default();
+    let slow_checkpoints = run
+        .checkpoints
+        .iter()
+        .filter(|d| **d > Duration::from_millis(10))
+        .count();
     println!(
-        "RESULT lane=\"{name}\" clients={clients} calls={n} errors={errors} p50_us={p50:.1} p99_us={p99:.1} p999_us={p999:.1} max_us={max:.1} calls_per_s={:.0} max_error_wait_us={:.1} first_error=\"{first_error}\"",
+        "RESULT lane=\"{name}\" clients={clients} calls={n} errors={errors} p50_us={p50:.1} p99_us={p99:.1} p999_us={p999:.1} max_us={max:.1} calls_per_s={:.0} max_error_wait_us={:.1} checkpoints={} checkpoints_over_10ms={slow_checkpoints} max_checkpoint_us={:.1} first_error=\"{first_error}\"",
         n as f64 / run.wall.as_secs_f64(),
         us(error_wait),
+        run.checkpoints.len(),
+        us(max_checkpoint),
     );
 }
 
