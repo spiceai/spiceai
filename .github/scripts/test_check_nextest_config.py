@@ -1,5 +1,6 @@
 """Unit tests for check_nextest_config.py."""
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -522,14 +523,26 @@ class RepositoryTest(unittest.TestCase):
         guard = (
             Path(__file__).resolve().parents[1] / "workflows" / "nextest_config_check.yml"
         ).read_text(encoding="utf-8")
+        # Each trigger's own `paths:` list, so a workflow listed twice under one
+        # trigger and not at all under the other cannot pass.
+        triggers = {
+            name: block
+            for name, block in re.findall(r"^  (pull_request|push):
+((?:    .*
+|
+)*)", guard, re.M)
+        }
+        self.assertEqual(set(triggers), {"pull_request", "push"}, guard)
         for binary, (workflow, _step) in check_nextest_config.STEP_BUDGETS.items():
-            with self.subTest(binary=binary):
-                self.assertEqual(
-                    guard.count(f"      - '{workflow}'"),
-                    2,
-                    f"{workflow} must be in both the pull_request and push path filters "
-                    "of nextest_config_check.yml",
-                )
+            for trigger, block in sorted(triggers.items()):
+                with self.subTest(binary=binary, trigger=trigger):
+                    self.assertEqual(
+                        block.count(f"      - '{workflow}'
+"),
+                        1,
+                        f"{workflow} must be listed exactly once under the {trigger} "
+                        "path filter of nextest_config_check.yml",
+                    )
 
     def test_this_repositorys_nextest_config_holds(self):
         """Regression test for #12336 / #12434 against the real .config/nextest.toml."""
