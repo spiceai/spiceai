@@ -1318,6 +1318,8 @@ impl DataFusionBuilder {
             drasi_forwarders: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+            snapshot_notifications:
+                runtime_acceleration::snapshot::notifications::SnapshotNotifications::default(),
             dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,

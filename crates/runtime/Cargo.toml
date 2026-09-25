@@ -171,6 +171,7 @@ rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
+s3-event-notifications = { path = "../s3-event-notifications" }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true

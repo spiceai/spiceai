@@ -21,10 +21,7 @@ limitations under the License.
 //! change streams). A manual `Stream` impl would split that state machine
 //! across poll/yield points without changing behavior.
 
-use super::event::{
-    ObjectEventKind, S3ObjectEvent, decode_from_path_key, matches_dataset, parse_notification_body,
-    s3_object_from,
-};
+use super::object_key::{decode_from_path_key, s3_object_from};
 use super::{S3, S3_DOCS};
 use crate::dataconnector::federated::FederatedTableProvider;
 use crate::dataconnector::listing::{
@@ -49,15 +46,18 @@ use parking_lot::Mutex;
 use runtime_component::dataset::DatasetSpec;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_parameters::Parameters;
+use s3_event_notifications::client::SqsCredentials;
+use s3_event_notifications::event::{
+    ObjectEventKind, S3ObjectEvent, matches_prefix, parse_notification_body, prefix_display,
+};
+use s3_event_notifications::queue::{MessageQueue, QueueMessage, SqsQueue};
+use s3_event_notifications::queue_url::{is_sqs_queue_url, region_from_queue_url};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-const SQS_LONG_POLL_SECONDS: i32 = 20;
-const SQS_MAX_MESSAGES: i32 = 10;
-const SQS_VISIBILITY_TIMEOUT_SECONDS: i32 = 300;
 const RECEIVE_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(30);
 const LISTING_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 const LISTING_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -182,30 +182,6 @@ pub struct S3ChangesConfig {
     /// SQS / listing-backfill filter. Equal to or nested under `dataset_prefix`.
     pub key_prefix: String,
     pub backfill_interval: Duration,
-}
-
-#[async_trait]
-pub trait MessageQueue: Send + Sync {
-    async fn receive(&self) -> std::result::Result<Vec<QueueMessage>, QueueError>;
-    async fn delete(&self, receipt_handle: &str) -> std::result::Result<(), QueueError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct QueueMessage {
-    pub body: String,
-    pub receipt_handle: String,
-}
-
-#[derive(Debug, Snafu)]
-pub enum QueueError {
-    #[snafu(display("Failed to receive messages from the configured SQS queue: {source}"))]
-    Receive {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[snafu(display("Failed to delete an SQS message from the configured SQS queue: {source}"))]
-    Delete {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 #[async_trait]
@@ -338,54 +314,6 @@ impl Drop for AppliedKeysCommitter {
         self.applied
             .lock()
             .abort_in_flight(self.generation, &self.keys);
-    }
-}
-
-struct SqsQueue {
-    client: aws_sdk_sqs::Client,
-    queue_url: String,
-}
-
-#[async_trait]
-impl MessageQueue for SqsQueue {
-    async fn receive(&self) -> std::result::Result<Vec<QueueMessage>, QueueError> {
-        let output = self
-            .client
-            .receive_message()
-            .queue_url(&self.queue_url)
-            .max_number_of_messages(SQS_MAX_MESSAGES)
-            .wait_time_seconds(SQS_LONG_POLL_SECONDS)
-            .visibility_timeout(SQS_VISIBILITY_TIMEOUT_SECONDS)
-            .send()
-            .await
-            .map_err(|source| QueueError::Receive {
-                source: Box::new(source),
-            })?;
-
-        Ok(output
-            .messages
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|message| {
-                Some(QueueMessage {
-                    body: message.body?,
-                    receipt_handle: message.receipt_handle?,
-                })
-            })
-            .collect())
-    }
-
-    async fn delete(&self, receipt_handle: &str) -> std::result::Result<(), QueueError> {
-        self.client
-            .delete_message()
-            .queue_url(&self.queue_url)
-            .receipt_handle(receipt_handle)
-            .send()
-            .await
-            .map_err(|source| QueueError::Delete {
-                source: Box::new(source),
-            })?;
-        Ok(())
     }
 }
 
@@ -842,82 +770,6 @@ fn resolve_region(params: &Parameters, queue_url: &str) -> Option<String> {
         .or_else(|| params.get("region").expose().ok().map(ToString::to_string))
 }
 
-#[must_use]
-pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
-    let parsed = url::Url::parse(queue_url).ok()?;
-    region_from_sqs_host(parsed.host_str()?)
-}
-
-/// Region embedded in an SQS queue-URL host, including FIPS and VPC endpoints.
-fn region_from_sqs_host(host: &str) -> Option<String> {
-    let host = host.to_ascii_lowercase();
-    let labels: Vec<&str> = host.split('.').collect();
-    let region = match labels.as_slice() {
-        ["sqs" | "sqs-fips", region, "amazonaws", "com"]
-        | ["sqs", region, "amazonaws", "com", "cn"]
-        | ["sqs", region, "vpce", "amazonaws", "com"]
-        | [_, "sqs", region, "vpce", "amazonaws", "com"] => *region,
-        _ => return None,
-    };
-    is_aws_region(region).then(|| region.to_string())
-}
-
-/// An HTTPS SQS queue URL: AWS partition host and `/account/queue` path.
-///
-/// Loopback and instance-metadata URLs are not SQS queues and must fail at
-/// registration. Custom SQS endpoints are not a parameter.
-#[must_use]
-fn is_sqs_queue_url(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    if parsed.scheme() != "https" {
-        return false;
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return false;
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return false;
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    region_from_sqs_host(host).is_some() && sqs_queue_path_is_allowed(parsed.path())
-}
-
-fn is_aws_region(region: &str) -> bool {
-    let bytes = region.as_bytes();
-    (2..=32).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
-        && bytes.contains(&b'-')
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
-        && !region.starts_with('-')
-        && !region.ends_with('-')
-        && !region.contains("--")
-}
-
-fn sqs_queue_path_is_allowed(path: &str) -> bool {
-    let path = path.trim_end_matches('/');
-    let Some((account, queue)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
-        return false;
-    };
-    account.len() == 12
-        && account.bytes().all(|b| b.is_ascii_digit())
-        && !queue.is_empty()
-        && !queue.contains('/')
-        && queue.len() <= 80
-        && {
-            let name = queue.strip_suffix(".fifo").unwrap_or(queue);
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        }
-}
-
 fn applied_keys_committer(
     applied: &Arc<Mutex<AppliedKeySet>>,
     generation: u64,
@@ -930,14 +782,6 @@ fn applied_keys_committer(
         keys,
         inner,
     })
-}
-
-fn prefix_display(bucket: &str, key_prefix: &str) -> String {
-    if key_prefix.is_empty() {
-        format!("s3://{bucket}")
-    } else {
-        format!("s3://{bucket}/{}", key_prefix.trim_end_matches('/'))
-    }
 }
 
 /// Snapshot and non-empty restart list `dataset_prefix` (`from:`), not a
@@ -967,14 +811,7 @@ fn nonempty_restart_starting_log(
 /// How SQS credentials are selected — the same rules as the S3 object store
 /// (`determine_s3_credential_config`): explicit `s3_key`/`s3_secret` win even
 /// without `s3_auth: key`; `s3_iam_role_source: metadata|env` restricts the chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SqsAuth {
-    ExplicitKeys,
-    RestrictedIam { source: String },
-    DefaultChain,
-}
-
-fn sqs_auth_from_params(params: &Parameters, dataset_name: &str) -> Result<SqsAuth> {
+fn sqs_credentials_from_params(params: &Parameters, dataset_name: &str) -> Result<SqsCredentials> {
     let key = params.get("key").expose().ok();
     let secret = params.get("secret").expose().ok();
     let auth = params.get("auth").expose().ok();
@@ -1005,15 +842,23 @@ fn sqs_auth_from_params(params: &Parameters, dataset_name: &str) -> Result<SqsAu
         });
     }
 
-    if key.is_some() && secret.is_some() {
-        return Ok(SqsAuth::ExplicitKeys);
+    if let (Some(access_key), Some(secret_key)) = (key, secret) {
+        return Ok(SqsCredentials::Static {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token: params
+                .get("session_token")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+        });
     }
 
     match cred_config.iam_role_source.as_deref() {
-        Some(source @ ("metadata" | "env")) => Ok(SqsAuth::RestrictedIam {
+        Some(source @ ("metadata" | "env")) => Ok(SqsCredentials::RestrictedIam {
             source: source.to_string(),
         }),
-        _ => Ok(SqsAuth::DefaultChain),
+        _ => Ok(SqsCredentials::DefaultChain),
     }
 }
 
@@ -1022,77 +867,13 @@ async fn build_sqs_client(
     region: &str,
     dataset_name: &str,
 ) -> Result<aws_sdk_sqs::Client> {
-    match sqs_auth_from_params(params, dataset_name)? {
-        SqsAuth::ExplicitKeys => {
-            let access_key = params
-                .get("key")
-                .expose()
-                .ok()
-                .ok_or_else(|| Error::SqsClient {
-                    dataset_name: dataset_name.to_string(),
-                    source: "explicit S3 key credentials were selected but `s3_key` is not set"
-                        .into(),
-                })?;
-            let secret_key =
-                params
-                    .get("secret")
-                    .expose()
-                    .ok()
-                    .ok_or_else(|| Error::SqsClient {
-                        dataset_name: dataset_name.to_string(),
-                        source:
-                            "explicit S3 key credentials were selected but `s3_secret` is not set"
-                                .into(),
-                    })?;
-            let session_token = params
-                .get("session_token")
-                .expose()
-                .ok()
-                .map(ToString::to_string);
-            let credentials = aws_credential_types::Credentials::new(
-                access_key,
-                secret_key,
-                session_token,
-                None,
-                "spice-s3-changes",
-            );
-            let sdk_config = aws_sdk_credential_bridge::default_aws_config()
-                .region(aws_config::Region::new(region.to_string()))
-                .credentials_provider(credentials)
-                .load()
-                .await;
-            Ok(aws_sdk_sqs::Client::new(&sdk_config))
-        }
-        SqsAuth::RestrictedIam { source } => {
-            let sdk_config = aws_sdk_credential_bridge::build_restricted_sdk_config(
-                &source,
-                Some(region.to_string()),
-            )
-            .await
-            .map_err(|error| Error::SqsClient {
-                dataset_name: dataset_name.to_string(),
-                source: Box::new(error),
-            })?;
-            Ok(aws_sdk_sqs::Client::new(&sdk_config))
-        }
-        SqsAuth::DefaultChain => {
-            let sdk_config =
-                aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(Some(region))
-                    .await
-                    .map_err(|source| Error::SqsClient {
-                        dataset_name: dataset_name.to_string(),
-                        source: Box::new(source),
-                    })?
-                    .ok_or_else(|| Error::SqsClient {
-                        dataset_name: dataset_name.to_string(),
-                        source: "no AWS credentials were resolved for SQS".into(),
-                    })?;
-            let sqs_config = aws_sdk_sqs::config::Builder::from(sdk_config.as_ref())
-                .region(aws_config::Region::new(region.to_string()))
-                .build();
-            Ok(aws_sdk_sqs::Client::from_conf(sqs_config))
-        }
-    }
+    let credentials = sqs_credentials_from_params(params, dataset_name)?;
+    s3_event_notifications::client::build_sqs_client(&credentials, region)
+        .await
+        .map_err(|source| Error::SqsClient {
+            dataset_name: dataset_name.to_string(),
+            source: Box::new(source),
+        })
 }
 
 fn error_stream(error: impl std::error::Error + Send + Sync + 'static) -> ChangesStream {
@@ -1150,10 +931,7 @@ pub async fn s3_changes_stream(
         Ok(client) => client,
         Err(error) => return Some(error_stream(error)),
     };
-    let queue = Arc::new(SqsQueue {
-        client,
-        queue_url: config.queue_url.clone(),
-    });
+    let queue = Arc::new(SqsQueue::new(client, config.queue_url.clone()));
     let object_reader = Arc::new(ListingObjectReader {
         connector: connector.clone(),
         dataset: dataset.clone(),
@@ -1230,13 +1008,13 @@ async fn process_message(
 
     let matching: Vec<&S3ObjectEvent> = events
         .iter()
-        .filter(|event| matches_dataset(event, &config.bucket, &config.key_prefix))
+        .filter(|event| matches_prefix(event, &config.bucket, &config.key_prefix))
         .collect();
 
     if matching.len() != events.len() {
         let sample = events
             .iter()
-            .find(|event| !matches_dataset(event, &config.bucket, &config.key_prefix))
+            .find(|event| !matches_prefix(event, &config.bucket, &config.key_prefix))
             .unwrap_or(&events[0]);
         tracing::error!(
             "Dataset '{}' received an S3 notification for s3://{}/{} that is outside this dataset's prefix {}, so the entire SQS message was left on the queue (not deleted) and will become visible again after each visibility timeout until it is deleted or the queue retention period expires. The queue must be exclusive to this dataset — fan out with SNS to a per-dataset queue, or set a bucket notification prefix filter. Sharing one queue across datasets is not supported. See: {S3_DOCS}",
@@ -1474,7 +1252,7 @@ async fn apply_unapplied_objects(
             bucket: config.bucket.clone(),
             key: key.clone(),
         };
-        if !matches_dataset(&event, &config.bucket, scope_prefix) || !listing_files.matches(&key) {
+        if !matches_prefix(&event, &config.bucket, scope_prefix) || !listing_files.matches(&key) {
             continue;
         }
         if skip_known && applied_keys.lock().is_known(&key) {
@@ -1981,6 +1759,7 @@ mod tests {
     use datafusion::datasource::memory::MemTable;
     use runtime_component::dataset::acceleration::Acceleration;
     use runtime_secrets::Secrets;
+    use s3_event_notifications::queue::QueueError;
     use std::collections::HashMap;
     use tokio::sync::{Mutex, RwLock};
 
@@ -2304,43 +2083,6 @@ mod tests {
         envelopes
     }
 
-    #[test]
-    fn region_from_standard_and_china_queue_urls() {
-        assert_eq!(
-            region_from_queue_url(QUEUE_URL).as_deref(),
-            Some("us-east-1")
-        );
-        assert_eq!(
-            region_from_queue_url("https://sqs.cn-north-1.amazonaws.com.cn/123/queue").as_deref(),
-            Some("cn-north-1")
-        );
-        assert_eq!(
-            region_from_queue_url("https://localhost:4566/000000000000/queue"),
-            None
-        );
-        assert_eq!(
-            region_from_queue_url(
-                "https://sqs-fips.us-east-1.amazonaws.com/123456789012/s3-events"
-            )
-            .as_deref(),
-            Some("us-east-1")
-        );
-        assert_eq!(
-            region_from_queue_url(
-                "https://sqs.us-west-2.vpce.amazonaws.com/123456789012/s3-events"
-            )
-            .as_deref(),
-            Some("us-west-2")
-        );
-        assert_eq!(
-            region_from_queue_url(
-                "https://vpce-abc.sqs.us-west-2.vpce.amazonaws.com/123456789012/s3-events"
-            )
-            .as_deref(),
-            Some("us-west-2")
-        );
-    }
-
     #[tokio::test]
     async fn validate_accepts_queue_url_with_changes() {
         let params = test_params(vec![
@@ -2470,46 +2212,6 @@ mod tests {
                 && !message.contains("sqs://"),
             "must not interpolate the configured queue value, got: {message}"
         );
-    }
-
-    #[test]
-    fn is_sqs_queue_url_accepts_aws_partition_urls() {
-        assert!(is_sqs_queue_url(QUEUE_URL));
-        assert!(is_sqs_queue_url(
-            "https://sqs.cn-north-1.amazonaws.com.cn/123456789012/s3-events"
-        ));
-        assert!(is_sqs_queue_url(
-            "https://sqs-fips.us-east-1.amazonaws.com/123456789012/s3-events"
-        ));
-        assert!(is_sqs_queue_url(
-            "https://sqs.us-east-1.vpce.amazonaws.com/123456789012/s3-events"
-        ));
-        assert!(is_sqs_queue_url(
-            "https://vpce-abc.sqs.us-east-1.vpce.amazonaws.com/123456789012/s3-events"
-        ));
-        assert!(is_sqs_queue_url(
-            "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events.fifo"
-        ));
-    }
-
-    /// Scheme-only validation accepted loopback and instance-metadata URLs
-    /// (Copilot reproduction on #14121). Those must fail closed at registration.
-    #[test]
-    fn is_sqs_queue_url_rejects_non_sqs_hosts() {
-        assert!(!is_sqs_queue_url("https://127.0.0.1/admin"));
-        assert!(!is_sqs_queue_url("http://169.254.169.254/latest/meta-data"));
-        assert!(!is_sqs_queue_url(
-            "https://localhost:4566/000000000000/queue"
-        ));
-        assert!(!is_sqs_queue_url(
-            "http://sqs.us-east-1.amazonaws.com/123456789012/s3-events"
-        ));
-        assert!(!is_sqs_queue_url(
-            "https://example.com/123456789012/s3-events"
-        ));
-        assert!(!is_sqs_queue_url(
-            "https://sqs.us-east-1.amazonaws.com/123/s3-events"
-        ));
     }
 
     #[tokio::test]
@@ -2878,7 +2580,7 @@ mod tests {
             .expect("valid notification");
         assert_eq!(events[0].key, "events/data files/part.parquet");
         assert!(
-            matches_dataset(&events[0], &bucket, &dataset_prefix),
+            matches_prefix(&events[0], &bucket, &dataset_prefix),
             "decoded notification key must match the decoded from prefix, prefix={dataset_prefix:?} key={:?}",
             events[0].key
         );
@@ -2913,12 +2615,12 @@ mod tests {
             .expect("valid notification");
         assert_eq!(events[0].key, " events/part.parquet");
         assert!(
-            matches_dataset(&events[0], &bucket, &dataset_prefix),
+            matches_prefix(&events[0], &bucket, &dataset_prefix),
             "leading-space notification key must match the decoded from prefix, prefix={dataset_prefix:?} key={:?}",
             events[0].key
         );
         assert!(
-            !matches_dataset(&events[0], &bucket, "events/"),
+            !matches_prefix(&events[0], &bucket, "events/"),
             "stripping the leading space would leave this notification unmatched"
         );
     }
@@ -4342,24 +4044,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn queue_errors_do_not_include_the_secret_queue_url() {
-        let receive = QueueError::Receive {
-            source: "access denied".into(),
-        };
-        let delete = QueueError::Delete {
-            source: "access denied".into(),
-        };
-        for message in [receive.to_string(), delete.to_string()] {
-            assert!(
-                !message.contains("amazonaws")
-                    && !message.contains("123456789012")
-                    && !message.contains(QUEUE_URL),
-                "SQS errors must not interpolate the queue URL, got: {message}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn sqs_auth_uses_explicit_keys_without_auth_key_and_restricts_iam_source() {
         let explicit = test_params(vec![
@@ -4369,8 +4053,12 @@ mod tests {
         ])
         .await;
         assert_eq!(
-            sqs_auth_from_params(&explicit, "events").expect("explicit keys"),
-            SqsAuth::ExplicitKeys
+            sqs_credentials_from_params(&explicit, "events").expect("explicit keys"),
+            SqsCredentials::Static {
+                access_key: "AKIAEXAMPLE".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+            }
         );
 
         let metadata = test_params(vec![
@@ -4380,8 +4068,8 @@ mod tests {
         ])
         .await;
         assert_eq!(
-            sqs_auth_from_params(&metadata, "events").expect("metadata"),
-            SqsAuth::RestrictedIam {
+            sqs_credentials_from_params(&metadata, "events").expect("metadata"),
+            SqsCredentials::RestrictedIam {
                 source: "metadata".into(),
             }
         );
@@ -4393,8 +4081,8 @@ mod tests {
         ])
         .await;
         assert_eq!(
-            sqs_auth_from_params(&env, "events").expect("env"),
-            SqsAuth::RestrictedIam {
+            sqs_credentials_from_params(&env, "events").expect("env"),
+            SqsCredentials::RestrictedIam {
                 source: "env".into(),
             }
         );
@@ -4405,8 +4093,8 @@ mod tests {
         ])
         .await;
         assert_eq!(
-            sqs_auth_from_params(&default_chain, "events").expect("default chain"),
-            SqsAuth::DefaultChain
+            sqs_credentials_from_params(&default_chain, "events").expect("default chain"),
+            SqsCredentials::DefaultChain
         );
     }
 
