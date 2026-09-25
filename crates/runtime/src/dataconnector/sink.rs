@@ -21,7 +21,10 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
+use crate::component::dataset::{
+    Dataset, DatasetSpec,
+    acceleration::{Engine, RefreshMode},
+};
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use datafusion::{
     catalog::Session,
@@ -199,9 +202,20 @@ impl DataConnectorFactory for SinkConnectorFactory {
 }
 
 /// The configured snapshot location for a snapshot-only dataset that the snapshot path
-/// can serve: a file acceleration with snapshots enabled. `None` for every other dataset.
+/// can serve: a snapshot-capable file engine that bootstraps from snapshots, with snapshots
+/// enabled. `None` for every other dataset, so its misconfiguration is reported by the
+/// acceleration validation instead.
 fn snapshot_only_location(spec: &DatasetSpec, context: &dyn ConnectorContext) -> Option<String> {
-    if !spec.is_snapshot_only() || !spec.is_file_accelerated() {
+    let acceleration = spec.acceleration.as_ref()?;
+    let snapshot_capable_engine = matches!(
+        acceleration.engine,
+        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne
+    );
+    if !spec.is_snapshot_only()
+        || !spec.is_file_accelerated()
+        || !snapshot_capable_engine
+        || !acceleration.snapshot_behavior.bootstrap_enabled()
+    {
         return None;
     }
     context
