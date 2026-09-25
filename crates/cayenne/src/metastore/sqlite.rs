@@ -1739,37 +1739,40 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        // METRIC 1: a bare autocommit write statement, run on the writer
-        // connection. Wait = the wait for its turn there; held = the statement's
-        // run (the WAL writer lock is taken by the statement itself). Labeled
-        // `txn="other"` — this generic path cannot cheaply know the originating
-        // catalog stage.
+        // METRIC 1: a bare autocommit write statement. Wait = until the
+        // statement is handed to a connection (the writer connection, which a
+        // bare write never waits to be handed to); held = the statement's run
+        // from there, including its wait for its turn, since the WAL writer
+        // lock is taken by the statement itself. Labeled `txn="other"` — this
+        // generic path cannot cheaply know the originating catalog stage.
         let wait_start = std::time::Instant::now();
         let pool = self.pool().await?;
+        telemetry::cayenne::track_metastore_writer_wait(
+            wait_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
+        let held_start = std::time::Instant::now();
         pool.writer
             .run(move |conn| {
-                telemetry::cayenne::track_metastore_writer_wait(
-                    wait_start.elapsed(),
-                    &[telemetry::KeyValue::new("txn", "other")],
-                );
-                let held_start = std::time::Instant::now();
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
                     .iter()
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
                 conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
-                telemetry::cayenne::track_metastore_writer_held(
-                    held_start.elapsed(),
-                    &[telemetry::KeyValue::new("txn", "other")],
-                );
                 Ok(())
             })
             .await
-            .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))
+            .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+        telemetry::cayenne::track_metastore_writer_held(
+            held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
+
+        Ok(())
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
