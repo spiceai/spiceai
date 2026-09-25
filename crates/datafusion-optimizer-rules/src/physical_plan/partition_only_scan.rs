@@ -94,7 +94,7 @@ use arrow::compute::cast;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{DynamicFilterPhysicalExpr, Literal};
@@ -204,10 +204,13 @@ fn rewrite_partition_only_scan(
 /// collapsed to one row per file without changing the result.
 ///
 /// - Repartition / coalesce operators only reshuffle or merge rows.
-/// - A `FilterExec` beneath a constant-only scan can only reference the
-///   projected (per-file-constant) columns, so its predicate is constant across
-///   a file and keeps or drops all of a file's rows together — the surviving set
-///   is the same whether the file is one row or many.
+/// - A *deterministic* `FilterExec` beneath a constant-only scan can only
+///   reference the projected (per-file-constant) columns, so its predicate is
+///   constant across a file and keeps or drops all of a file's rows together —
+///   the surviving set is the same whether the file is one row or many. A
+///   *volatile* predicate (e.g. `random() < 0.5`) references no data column yet
+///   is re-evaluated per row, so collapsing a file to one row changes how many
+///   of its rows survive; such a filter is not set-preserving.
 /// - A nested duplicate-insensitive `AggregateExec` (a partial `DISTINCT` or
 ///   partial `MAX`/`MIN`) only removes duplicates or keeps an extremum.
 #[expect(
@@ -219,9 +222,11 @@ fn is_set_preserving(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if plan.downcast_ref::<RepartitionExec>().is_some()
         || plan.downcast_ref::<CoalesceBatchesExec>().is_some()
         || plan.downcast_ref::<CoalescePartitionsExec>().is_some()
-        || plan.downcast_ref::<FilterExec>().is_some()
     {
         return true;
+    }
+    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        return !predicate_is_volatile(filter.predicate());
     }
     if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
         // A partial `DISTINCT` or partial `MAX`/`MIN` (the first phase of a
@@ -230,6 +235,28 @@ fn is_set_preserving(plan: &Arc<dyn ExecutionPlan>) -> bool {
         return is_duplicate_insensitive_aggregate(aggregate);
     }
     false
+}
+
+/// Whether `predicate` contains any volatile sub-expression (e.g. `random()`).
+///
+/// Volatility must be checked over the whole expression tree, not just the root
+/// node: `random() < 0.5` is a non-volatile comparison whose left operand is the
+/// volatile call, so `PhysicalExpr::is_volatile_node` on the root returns
+/// `false`. `datafusion_physical_expr_common::is_volatile` does this recursive
+/// walk but is not reachable through the `datafusion` facade, so replicate it
+/// with the already-imported `TreeNode::apply`.
+fn predicate_is_volatile(predicate: &Arc<dyn PhysicalExpr>) -> bool {
+    let mut volatile = false;
+    // The closure is infallible, so the walk cannot error.
+    let _ = predicate.apply(|expr| {
+        if expr.is_volatile_node() {
+            volatile = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    volatile
 }
 
 /// Whether `aggregate`'s result is unchanged by duplicating input rows. A pure
@@ -462,8 +489,29 @@ mod tests {
 
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions::math::random;
     use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+
+    /// Build the predicate `random() < 0.5`: a non-volatile comparison whose
+    /// left operand is the volatile `random()` call. Its root node is the `<`
+    /// `BinaryExpr`, so `is_volatile_node` on the root alone reports it as
+    /// non-volatile — the recursive walk is what makes the difference.
+    fn random_lt_half() -> Arc<dyn PhysicalExpr> {
+        let random_call: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "random",
+            random(),
+            vec![],
+            Arc::new(Field::new("random()", DataType::Float64, false)),
+            Arc::new(ConfigOptions::default()),
+        ));
+        Arc::new(BinaryExpr::new(
+            random_call,
+            Operator::Lt,
+            Arc::new(Literal::new(ScalarValue::Float64(Some(0.5)))),
+        ))
+    }
 
     /// A static predicate (not a `DynamicFilterPhysicalExpr`) always decides
     /// which rows count, so the fast path must bail regardless of its value.
@@ -508,6 +556,65 @@ mod tests {
             .expect("dynamic filter update succeeds");
         let filter = dynamic_filter as Arc<dyn PhysicalExpr>;
         assert!(!is_unresolved_dynamic_filter(&filter));
+    }
+
+    /// Volatility is a property of the whole predicate tree: `random() < 0.5`
+    /// is a non-volatile comparison over a volatile call, so the root's
+    /// `is_volatile_node` is `false` while the predicate is volatile overall.
+    #[test]
+    fn nested_volatile_call_is_detected() {
+        let predicate = random_lt_half();
+        assert!(
+            !predicate.is_volatile_node(),
+            "the root `<` node alone is not volatile"
+        );
+        assert!(
+            predicate_is_volatile(&predicate),
+            "the recursive walk must find the `random()` call"
+        );
+    }
+
+    /// A deterministic predicate references no volatile function.
+    #[test]
+    fn deterministic_predicate_is_not_volatile() {
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("p", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+        ));
+        assert!(!predicate_is_volatile(&predicate));
+    }
+
+    /// A `FilterExec` with a volatile predicate re-evaluates per row, so
+    /// collapsing a file to one row would change how many rows survive: it must
+    /// not be treated as set-preserving, which stops the rewrite from descending
+    /// through it. A deterministic filter stays set-preserving.
+    #[test]
+    fn volatile_filter_is_not_set_preserving() {
+        let schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Int32, false)]));
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+                .expect("valid memory exec");
+
+        let volatile_filter: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(random_lt_half(), Arc::clone(&input)).expect("valid filter exec"),
+        );
+        assert!(
+            !is_set_preserving(&volatile_filter),
+            "a volatile filter must not be set-preserving"
+        );
+
+        let deterministic: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("p", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+        ));
+        let deterministic_filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(deterministic, input).expect("valid filter exec"));
+        assert!(
+            is_set_preserving(&deterministic_filter),
+            "a deterministic filter stays set-preserving"
+        );
     }
 
     /// The rule must leave a plan without a partition-only file-scan aggregate
