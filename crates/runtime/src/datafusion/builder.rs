@@ -1017,7 +1017,7 @@ impl DataFusionBuilder {
             ))
             .with_runtime_env(Arc::clone(&query_runtime_env));
 
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(feature = "duckdb")))]
         if self.cayenne_optimizer_rules.index_join() {
             state = with_cayenne_index_join_rewriter(state);
         }
@@ -1037,6 +1037,11 @@ impl DataFusionBuilder {
                     .clone()
                     .unwrap_or_else(|| PhysicalOptimizer::new().rules),
             );
+
+            #[cfg(not(windows))]
+            if self.cayenne_optimizer_rules.index_join() {
+                insert_cayenne_index_join_rewriter(&mut physical_optimizers_with_duckdb);
+            }
 
             state = state
                 .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
@@ -1872,12 +1877,20 @@ pub(crate) fn coordinated_mem_tier_budget(
 /// Insert the covering-index join rule between DataFusion's join selection and
 /// its first filter-pushdown pass. Later distribution, sort, and filter phases
 /// must still see the replacement plan.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(feature = "duckdb")))]
 fn with_cayenne_index_join_rewriter(mut state: SessionStateBuilder) -> SessionStateBuilder {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = state
         .physical_optimizer_rules()
         .clone()
         .unwrap_or_else(|| PhysicalOptimizer::new().rules);
+    insert_cayenne_index_join_rewriter(&mut rules);
+    state.with_physical_optimizer_rules(rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_index_join_rewriter(
+    rules: &mut Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
+) {
     let join_selection = rules
         .iter()
         .position(|rule| rule.name() == "join_selection")
@@ -1894,7 +1907,6 @@ fn with_cayenne_index_join_rewriter(mut state: SessionStateBuilder) -> SessionSt
         join_selection + 1,
         Arc::new(CayenneIndexJoinRewriter::new()),
     );
-    state.with_physical_optimizer_rules(rules)
 }
 
 fn cayenne_optimizer_config(
