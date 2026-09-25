@@ -445,13 +445,18 @@ static WRITERS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, WriterSlot>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-/// Names a metastore file so every spelling of one path shares a writer
-/// connection: the canonical parent directory joined with the file name, since
-/// the file itself may not exist yet. A memory-mode URI already names its
+/// Names a metastore file so every path to it shares a writer connection: its
+/// canonical path, with every symlink resolved, the file's own included, so a
+/// symlink to a metastore file shares its target's writer. A file that does
+/// not exist yet has no path to resolve, and is named by its canonical parent
+/// directory joined with its file name. A memory-mode URI already names its
 /// database.
 async fn writer_key(db_path: &str) -> String {
     if is_memory_db_path(db_path) {
         return db_path.to_string();
+    }
+    if let Ok(file) = tokio::fs::canonicalize(db_path).await {
+        return file.to_string_lossy().into_owned();
     }
     let path = Path::new(db_path);
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
@@ -1010,8 +1015,8 @@ impl SqliteMetastore {
                 // background WAL drain so it never lands on a `conns` slot a
                 // read is waiting for.
                 let checkpoint_conn = Arc::new(Mutex::new(self.open_connection().await?));
-                // After the opens, so a file-mode parent directory exists to be
-                // canonicalized into the writer's key.
+                // After the opens, so a file-mode database exists and its
+                // canonical path names the writer.
                 let writer = self.shared_writer().await?;
                 Ok(Arc::new(SqliteConnectionPool {
                     conns,
@@ -2776,6 +2781,25 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&direct_writer, &other_writer),
             "different metastore files must not share a writer connection"
+        );
+    }
+
+    /// A symlink to a metastore file shares its target's writer connection, so
+    /// writes through either path are ordered together.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_symlink_to_a_metastore_file_shares_its_writer_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_path = dir.path().join("cayenne.db");
+        let target = SqliteMetastore::new(format!("sqlite://{}", target_path.display()));
+        let target_writer = Arc::clone(&target.pool().await.expect("pool").writer);
+        let alias_path = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&target_path, &alias_path).expect("symlink the metastore file");
+        let alias = SqliteMetastore::new(format!("sqlite://{}", alias_path.display()));
+        let alias_writer = Arc::clone(&alias.pool().await.expect("pool").writer);
+        assert!(
+            Arc::ptr_eq(&target_writer, &alias_writer),
+            "a symlink to a metastore file must share its target's writer connection"
         );
     }
 
