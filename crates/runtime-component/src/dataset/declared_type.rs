@@ -392,18 +392,28 @@ impl<'a> TokenParser<'a> {
             if name.eq_ignore_ascii_case("map") {
                 self.advance(); // map
                 self.advance(); // <
-                let key = self.parse_type().map_err(|e| ParseTypeError::InvalidMap {
-                    input: self.original.to_string(),
-                    reason: format!("invalid key type: {e}"),
+                // As in the list arm: an out-of-range width already names the
+                // precision and its maximum, so it is not wrapped.
+                let key = self.parse_type().map_err(|e| match e {
+                    out_of_range @ ParseTypeError::OutOfRange { .. } => out_of_range,
+                    e => ParseTypeError::InvalidMap {
+                        input: self.original.to_string(),
+                        reason: format!("invalid key type: {e}"),
+                    },
                 })?;
                 self.expect(&TypeToken::Comma)
                     .map_err(|_| ParseTypeError::InvalidMap {
                         input: self.original.to_string(),
                         reason: "expected `,` between key and value types".to_string(),
                     })?;
-                let value = self.parse_type().map_err(|e| ParseTypeError::InvalidMap {
-                    input: self.original.to_string(),
-                    reason: format!("invalid value type: {e}"),
+                // As in the list arm: an out-of-range width already names the
+                // precision and its maximum, so it is not wrapped.
+                let value = self.parse_type().map_err(|e| match e {
+                    out_of_range @ ParseTypeError::OutOfRange { .. } => out_of_range,
+                    e => ParseTypeError::InvalidMap {
+                        input: self.original.to_string(),
+                        reason: format!("invalid value type: {e}"),
+                    },
                 })?;
                 self.expect(&TypeToken::RAngle)
                     .map_err(|_| ParseTypeError::InvalidMap {
@@ -415,12 +425,16 @@ impl<'a> TokenParser<'a> {
             if name.eq_ignore_ascii_case("list") {
                 self.advance(); // list
                 self.advance(); // <
-                let element =
-                    self.parse_type()
-                        .map_err(|e| ParseTypeError::InvalidArrayElement {
-                            input: self.original.to_string(),
-                            source: Box::new(e),
-                        })?;
+                // An out-of-range width is already a complete sentence naming the
+                // precision and its maximum, so it travels up unwrapped; wrapping it
+                // would bury the fix behind "could not parse element type".
+                let element = self.parse_type().map_err(|e| match e {
+                    out_of_range @ ParseTypeError::OutOfRange { .. } => out_of_range,
+                    e => ParseTypeError::InvalidArrayElement {
+                        input: self.original.to_string(),
+                        source: Box::new(e),
+                    },
+                })?;
                 self.expect(&TypeToken::RAngle)?;
                 return Ok(list_of(element));
             }
@@ -518,10 +532,50 @@ fn leaf_lookup(s: &str) -> Result<DataType, ParseTypeError> {
     if let Some(dt) = parse_arrow_timestamp_display(s) {
         return Ok(dt);
     }
+    if let Some(result) = parse_arrow_decimal_display(s) {
+        return result;
+    }
     if let Ok(dt) = DataType::from_str(s) {
         return Ok(dt);
     }
     parse_via_sqlparser(s)
+}
+
+/// Parse Arrow's `Display` form for `Decimal32|64|128|256(p, s)`.
+///
+/// Arrow refuses to build a decimal whose width it cannot represent, so
+/// `DataType::from_str` fails on `Decimal128(50, 2)` before the width can be
+/// reported. Going through it would leave the user with "could not parse column
+/// type" and a list of accepted forms, naming neither the precision nor its
+/// limit. Recognising the shape here keeps [`ensure_decimal_in_range`]'s reason,
+/// which says what the maximum is.
+///
+/// `None` means the input is not a decimal display form at all, so the remaining
+/// lookups still get their turn.
+fn parse_arrow_decimal_display(s: &str) -> Option<Result<DataType, ParseTypeError>> {
+    let (name, args) = s.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    let (max_precision, max_scale) = match name.trim() {
+        "Decimal32" => (DECIMAL32_MAX_PRECISION, DECIMAL32_MAX_SCALE),
+        "Decimal64" => (DECIMAL64_MAX_PRECISION, DECIMAL64_MAX_SCALE),
+        "Decimal128" => (DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE),
+        "Decimal256" => (DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE),
+        _ => return None,
+    };
+    let (precision, scale) = args.split_once(',')?;
+    let precision = precision.trim().parse::<u8>().ok()?;
+    let scale = scale.trim().parse::<i8>().ok()?;
+
+    if let Err(e) = ensure_decimal_in_range(s, name.trim(), precision, scale, max_precision, max_scale)
+    {
+        return Some(Err(e));
+    }
+    Some(Ok(match name.trim() {
+        "Decimal32" => DataType::Decimal32(precision, scale),
+        "Decimal64" => DataType::Decimal64(precision, scale),
+        "Decimal128" => DataType::Decimal128(precision, scale),
+        _ => DataType::Decimal256(precision, scale),
+    }))
 }
 
 /// Parse Arrow's `Display` form for `Timestamp(<unit>[, <tz>])` and
