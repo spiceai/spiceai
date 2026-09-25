@@ -345,9 +345,10 @@ mysql-load:
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
-		spec=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;" | $(MYSQL_NULL_SPEC)); \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
 		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-init' first so the tables exist." >&2; exit 1; }; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;"; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
@@ -383,9 +384,10 @@ mysql-tpcds-load:
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
-		spec=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;" | $(MYSQL_NULL_SPEC)); \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
 		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-tpcds-init' first so the tables exist." >&2; exit 1; }; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;"; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
