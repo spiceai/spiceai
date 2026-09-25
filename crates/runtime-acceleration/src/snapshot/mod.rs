@@ -21,6 +21,8 @@ use aws_sdk_credential_bridge::object_store_builder::{
 };
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
+use datafusion::catalog::TableProvider;
+use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use object_store::{
     GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
@@ -33,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
+use spice_table::WriteWindow;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use std::{
     collections::HashMap,
@@ -360,6 +363,13 @@ pub enum SnapshotDownloadError {
         "Index {index} not found in snapshot's index artifacts. Likely the snapshot was created without this index. Partial index snapshotting is not supported."
     ))]
     IndexNotFound { index: String },
+    #[snafu(display(
+        "Failed to rebuild index {index} from the restored acceleration data: {source}"
+    ))]
+    IndexRebuild {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
     #[snafu(display("Dataset checkpointer factory not set for snapshot manager"))]
     CheckpointerFactoryNotSet,
     #[snafu(display("Failed to read snapshot metadata at {path}: {source}"))]
@@ -961,23 +971,25 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// Restores every configured index with a matching artifact from a downloaded snapshot.
+    /// Restores every configured index from a downloaded snapshot, using its matching artifact
+    /// when present and otherwise rebuilding it from the just-restored acceleration data.
     ///
-    /// This is used by snapshot replicas after the database artifact is verified but before its
-    /// provider is made visible. Partial index snapshotting is not supported: a configured index
-    /// with no matching artifact in `artifacts` is a hard failure ([`IndexNotFoundSnafu`]), the
-    /// same as a matching artifact which cannot be restored, so the caller never publishes a
-    /// DB/index generation mismatch.
+    /// This is used after the database artifact is verified but before its provider is made
+    /// visible. A configured index with a matching artifact is installed from it; one with no
+    /// matching artifact — a legacy snapshot written before index snapshots, or an index added
+    /// after the snapshot was taken — is reconstructed from `new_provider` (the new-generation
+    /// acceleration source) at the same generation, then installed through the same atomic path.
+    /// Either way the caller never publishes a DB/index generation mismatch.
     ///
     /// # Errors
     ///
     /// Returns an error if a local staging directory cannot be created, downloading or verifying
-    /// a matching artifact fails (see [`Self::download_index_artifact_to_staging`]), the index
-    /// fails to restore from the downloaded artifact, or a configured index has no matching
-    /// artifact in `artifacts`.
+    /// a matching artifact fails (see [`Self::download_index_artifact_to_staging`]), an index
+    /// fails to restore from its artifact, or an index cannot be rebuilt from `new_provider`.
     pub async fn restore_indexes_from_snapshot(
         &self,
         artifacts: &[IndexSnapshotRef],
+        new_provider: &Arc<dyn TableProvider>,
     ) -> Result<(), SnapshotDownloadError> {
         let indexes = self.indexes.read().await.clone();
         for index in indexes {
@@ -989,11 +1001,9 @@ impl SnapshotManager {
                     && artifact.columns == identity.columns
                     && artifact.discriminator == identity.discriminator
             }) else {
-                // Handle new indexes not in snapshot by hydrating from acceleration snapshot. Tracked #13608
-                IndexNotFoundSnafu {
-                    index: identity.kind.to_string(),
-                }
-                .fail()?
+                self.rebuild_index_from_source(&index, &identity, new_provider)
+                    .await?;
+                continue;
             };
             let staging =
                 tempfile::tempdir().map_err(|source| SnapshotDownloadError::CreateLocalDir {
@@ -1008,6 +1018,77 @@ impl SnapshotManager {
                     source,
                 }
             })?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds `index` from `new_provider` into a staging directory and installs it into the live
+    /// index, converging on the same atomic `restore_from` path the artifact case uses.
+    ///
+    /// A fresh, empty sibling index is built into staging and populated by streaming every row of
+    /// `new_provider` through the ordinary write primitives — full batches, so STORED columns are
+    /// reproduced exactly as a first-time build produces them. All mutation stays on the sibling
+    /// until the final `restore_from`, so the live index is never left half-built before the swap.
+    async fn rebuild_index_from_source(
+        &self,
+        index: &Arc<dyn spice_table::Index + Send + Sync>,
+        identity: &spice_table::SnapshotIndexIdentity,
+        new_provider: &Arc<dyn TableProvider>,
+    ) -> Result<(), SnapshotDownloadError> {
+        let index_name = identity.kind.to_string();
+        let rebuild = |source| SnapshotDownloadError::IndexRebuild {
+            index: index_name.clone(),
+            source,
+        };
+
+        let staging =
+            tempfile::tempdir().map_err(|source| SnapshotDownloadError::CreateLocalDir {
+                path: std::env::temp_dir(),
+                source,
+            })?;
+
+        let fresh = index
+            .new_staging_from_source(Arc::clone(new_provider), staging.path())
+            .await
+            .map_err(&rebuild)?;
+
+        fresh
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .map_err(&rebuild)?;
+
+        if let Err(error) = Self::populate_index_from_provider(&fresh, new_provider).await {
+            let _ = fresh.on_write_failed().await;
+            return Err(rebuild(error));
+        }
+
+        fresh.on_write_complete().await.map_err(&rebuild)?;
+        drop(fresh);
+
+        index.restore_from(staging.path()).await.map_err(|source| {
+            SnapshotDownloadError::IndexRestore {
+                index: index_name.clone(),
+                source,
+            }
+        })
+    }
+
+    /// Streams every row of `provider` through `index`'s `compute_index`, one batch at a time.
+    async fn populate_index_from_provider(
+        index: &Arc<dyn spice_table::Index + Send + Sync>,
+        provider: &Arc<dyn TableProvider>,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        // No projection: the sink write path feeds full batches to `compute_index`, so a faithful
+        // rebuild must too — projecting to `required_columns()` would drop STORED-only columns.
+        let plan = provider.scan(&state, None, &[], None).await?;
+        let task_ctx = ctx.task_ctx();
+        for partition in 0..plan.properties().output_partitioning().partition_count() {
+            let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
+            while let Some(batch) = stream.next().await {
+                index.compute_index(vec![batch?]).await?;
+            }
         }
         Ok(())
     }
@@ -7414,6 +7495,18 @@ mod tests {
         identity: spice_table::SnapshotIndexIdentity,
         should_fail: bool,
         restored_from: Arc<Mutex<Option<PathBuf>>>,
+        rebuilt: Arc<Mutex<bool>>,
+    }
+
+    impl MockSnapshotIndex {
+        fn new(identity: spice_table::SnapshotIndexIdentity, should_fail: bool) -> Self {
+            Self {
+                identity,
+                should_fail,
+                restored_from: Arc::new(Mutex::new(None)),
+                rebuilt: Arc::new(Mutex::new(false)),
+            }
+        }
     }
 
     #[async_trait]
@@ -7443,9 +7536,28 @@ mod tests {
             Ok(())
         }
 
+        async fn new_staging_from_source(
+            &self,
+            _base: Arc<dyn TableProvider>,
+            _staging_dir: &std::path::Path,
+        ) -> datafusion::error::Result<Arc<dyn spice_table::Index + Send + Sync>> {
+            *self.rebuilt.lock().await = true;
+            Ok(Arc::new(MockSnapshotIndex::new(
+                self.identity.clone(),
+                false,
+            )))
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    fn empty_provider(schema: &SchemaRef) -> Arc<dyn TableProvider> {
+        Arc::new(
+            datafusion::datasource::MemTable::try_new(Arc::clone(schema), vec![vec![]])
+                .expect("build empty MemTable provider"),
+        )
     }
 
     /// Builds a valid, extractable index artifact in `store` for `identity` and returns the
@@ -7531,16 +7643,16 @@ mod tests {
         let other_artifact =
             write_index_artifact(&store, &manager, &other_identity, "other", b"non-matching").await;
 
-        let restored_from = Arc::new(Mutex::new(None));
-        let index = Arc::new(MockSnapshotIndex {
-            identity,
-            should_fail: false,
-            restored_from: Arc::clone(&restored_from),
-        });
+        let index = Arc::new(MockSnapshotIndex::new(identity, false));
+        let restored_from = Arc::clone(&index.restored_from);
+        let rebuilt = Arc::clone(&index.rebuilt);
         manager.set_indexes(vec![index]).await;
 
         manager
-            .restore_indexes_from_snapshot(&[other_artifact, matching_artifact])
+            .restore_indexes_from_snapshot(
+                &[other_artifact, matching_artifact],
+                &empty_provider(&schema),
+            )
             .await
             .expect("restore should succeed using the matching artifact");
 
@@ -7548,11 +7660,15 @@ mod tests {
             restored_from.lock().await.is_some(),
             "restore_from should have been called with the matching artifact's extracted directory"
         );
+        assert!(
+            !*rebuilt.lock().await,
+            "a matching artifact must be installed, not rebuilt from source"
+        );
     }
 
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn restore_indexes_from_snapshot_fails_hard_on_missing_artifact() {
+    async fn restore_indexes_from_snapshot_rebuilds_missing_artifact() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
         let manager = build_manager(
@@ -7568,20 +7684,25 @@ mod tests {
             columns: vec!["body".to_string()],
             discriminator: None,
         };
-        let index = Arc::new(MockSnapshotIndex {
-            identity,
-            should_fail: false,
-            restored_from: Arc::new(Mutex::new(None)),
-        });
+        let index = Arc::new(MockSnapshotIndex::new(identity, false));
+        let restored_from = Arc::clone(&index.restored_from);
+        let rebuilt = Arc::clone(&index.rebuilt);
         manager.set_indexes(vec![index]).await;
 
-        // No artifacts at all: the configured index has nothing to match, which must be a hard
-        // failure (partial index snapshotting is not supported), not a silently-ignored gap.
-        let result = manager.restore_indexes_from_snapshot(&[]).await;
+        // No matching artifact: the configured index is rebuilt from the restored acceleration
+        // data and installed through the same `restore_from` path, rather than hard-failing.
+        manager
+            .restore_indexes_from_snapshot(&[], &empty_provider(&schema))
+            .await
+            .expect("a configured index with no artifact should rebuild from source");
 
         assert!(
-            matches!(result, Err(SnapshotDownloadError::IndexNotFound { .. })),
-            "expected IndexNotFound for a configured index with no matching artifact, got {result:?}"
+            *rebuilt.lock().await,
+            "new_staging_from_source should have been called to rebuild the missing index"
+        );
+        assert!(
+            restored_from.lock().await.is_some(),
+            "restore_from should have installed the rebuilt staging directory"
         );
     }
 
@@ -7605,14 +7726,12 @@ mod tests {
         };
         let artifact =
             write_index_artifact(&store, &manager, &identity, "content", b"content").await;
-        let index = Arc::new(MockSnapshotIndex {
-            identity,
-            should_fail: true,
-            restored_from: Arc::new(Mutex::new(None)),
-        });
+        let index = Arc::new(MockSnapshotIndex::new(identity, true));
         manager.set_indexes(vec![index]).await;
 
-        let result = manager.restore_indexes_from_snapshot(&[artifact]).await;
+        let result = manager
+            .restore_indexes_from_snapshot(&[artifact], &empty_provider(&schema))
+            .await;
 
         assert!(
             matches!(result, Err(SnapshotDownloadError::IndexRestore { .. })),
