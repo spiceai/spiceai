@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{EngineKind, run_bootstrap_then_refresh_cycle};
+use super::{
+    EngineKind, Reader, run_bootstrap_then_refresh_cycle, run_reader_without_source_or_snapshot,
+    run_scenario,
+};
 
 // Cayenne snapshot refresh exercises the per-dataset metastore-slice format
 // shipped by `CayenneSnapshotEngine`: the writer's snapshot tar contains
@@ -29,4 +32,27 @@ use super::{EngineKind, run_bootstrap_then_refresh_cycle};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_refresh_cayenne_bootstrap_then_refresh() -> Result<(), anyhow::Error> {
     run_bootstrap_then_refresh_cycle("snapshot_refresh_cayenne", EngineKind::Cayenne).await
+}
+
+// regression test for #14402: a reader that omits `from:` bootstraps from the
+// snapshot and follows newer ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_refresh_cayenne_reader_without_source() -> Result<(), anyhow::Error> {
+    run_scenario(
+        "snapshot_refresh_cayenne_no_source",
+        EngineKind::Cayenne,
+        Reader::WithoutSource,
+    )
+    .await
+}
+
+// regression test for #14402: with no snapshot to take a schema from, the reader
+// fails to load instead of reporting ready with no table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_refresh_cayenne_reader_without_source_or_snapshot() -> Result<(), anyhow::Error> {
+    run_reader_without_source_or_snapshot(
+        "snapshot_refresh_cayenne_no_source_no_snapshot",
+        EngineKind::Cayenne,
+    )
+    .await
 }

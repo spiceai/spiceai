@@ -61,7 +61,9 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
+use crate::utils::{
+    register_test_connectors, runtime_ready_check, test_request_context, wait_until_true,
+};
 use crate::{init_tracing, run_query};
 
 #[cfg(not(windows))]
@@ -342,6 +344,15 @@ impl SnapshotRefreshFixture {
         dataset
     }
 
+    /// The regular reader with `from:` omitted: its schema can only come from the
+    /// restored snapshot.
+    fn reader_dataset_without_source(&self) -> Dataset {
+        let mut dataset = self.reader_dataset();
+        dataset.from = String::new();
+        dataset.params = None;
+        dataset
+    }
+
     fn snapshots_config(&self) -> Snapshots {
         let mut params = HashMap::from([("s3_region".to_string(), SNAPSHOT_REGION.to_string())]);
         if env::var("AWS_PROFILE").is_ok() {
@@ -447,9 +458,27 @@ id,name,score
 5,echo,50
 ";
 
+/// Which reader configuration a scenario runs.
+#[derive(Clone, Copy)]
+pub(crate) enum Reader {
+    /// The reader declares the writer's `from:` source.
+    WithSource,
+    /// The reader omits `from:`.
+    WithoutSource,
+}
+
 /// End-to-end scenario: writer creates snapshots; reader bootstraps and
 /// follows. Each per-engine `#[tokio::test]` calls this with its engine.
 async fn run_bootstrap_then_refresh_cycle(test_name: &str, engine: EngineKind) -> Result<()> {
+    run_scenario(test_name, engine, Reader::WithSource).await
+}
+
+/// Runs the writer/reader scenario with the given reader configuration.
+pub(crate) async fn run_scenario(
+    test_name: &str,
+    engine: EngineKind,
+    reader: Reader,
+) -> Result<()> {
     init_tracing(None);
     register_test_connectors().await;
 
@@ -457,7 +486,7 @@ async fn run_bootstrap_then_refresh_cycle(test_name: &str, engine: EngineKind) -
         .scope(async move {
             let fixture = SnapshotRefreshFixture::new(test_name, engine).await?;
             // Always attempt cleanup, even on test failure.
-            let result = run_inner(&fixture).await;
+            let result = run_inner(&fixture, reader).await;
             if let Err(cleanup_err) = fixture.s3.cleanup().await {
                 tracing::warn!(
                     test = test_name,
@@ -470,7 +499,57 @@ async fn run_bootstrap_then_refresh_cycle(test_name: &str, engine: EngineKind) -
         .await
 }
 
-async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
+/// A reader that omits `from:` and finds no snapshot must fail to load with an
+/// error naming the snapshot location, instead of reporting ready with no table.
+pub(crate) async fn run_reader_without_source_or_snapshot(
+    test_name: &str,
+    engine: EngineKind,
+) -> Result<()> {
+    init_tracing(None);
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async move {
+            let fixture = SnapshotRefreshFixture::new(test_name, engine).await?;
+            let reader_app = AppBuilder::new(format!("snapshot_reader_{}", engine.engine_name()))
+                .with_snapshots(fixture.snapshots_config())
+                .with_dataset(fixture.reader_dataset_without_source())
+                .build();
+            let reader = Arc::new(Runtime::builder().with_app(reader_app).build().await);
+            let loading = tokio::spawn(Arc::clone(&reader).load_components());
+
+            let table = datafusion::sql::TableReference::bare(DATASET_NAME);
+            let status = reader.datafusion().runtime_status();
+            let failed = wait_until_true(Duration::from_mins(1), || {
+                let status = Arc::clone(&status);
+                let table = table.clone();
+                async move { status.get_dataset_status(&table).is_some_and(|s| s.is_error()) }
+            })
+            .await;
+            let observed = status.get_dataset_status(&table);
+            loading.abort();
+
+            if !failed {
+                return Err(anyhow!(
+                    "a reader without `from:` and without a snapshot must fail to load, but its status is {observed:?}"
+                ));
+            }
+            let message = match observed {
+                Some(runtime::status::ComponentStatus::Error(Some(message))) => message,
+                other => format!("{other:?}"),
+            };
+            let location = fixture.s3.location_uri();
+            if !message.contains("no `from:` source") || !message.contains(&location) {
+                return Err(anyhow!(
+                    "the load error must name the missing source and the snapshot location '{location}', got: {message}"
+                ));
+            }
+            Ok(())
+        })
+        .await
+}
+
+async fn run_inner(fixture: &SnapshotRefreshFixture, reader: Reader) -> Result<()> {
     // Drive the in-process variant by calling the writer phase up to the
     // first snapshot, then starting the reader and letting the writer
     // publish the mutated snapshot. The two helpers below are also called
@@ -504,7 +583,10 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
     // ---------------------- start reader ----------------------
     let reader_app = AppBuilder::new(format!("snapshot_reader_{}", fixture.engine.engine_name()))
         .with_snapshots(fixture.snapshots_config())
-        .with_dataset(fixture.reader_dataset())
+        .with_dataset(match reader {
+            Reader::WithSource => fixture.reader_dataset(),
+            Reader::WithoutSource => fixture.reader_dataset_without_source(),
+        })
         .build();
     let reader = Arc::new(Runtime::builder().with_app(reader_app).build().await);
     load_runtime(Arc::clone(&reader)).await?;

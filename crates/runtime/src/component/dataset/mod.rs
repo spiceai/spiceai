@@ -659,7 +659,7 @@ mod tests {
 
         let cases = [
             ("", Some(RefreshMode::Snapshot), true, true),
-            ("sink", Some(RefreshMode::Snapshot), true, true),
+            ("sink", Some(RefreshMode::Snapshot), true, false),
             ("", Some(RefreshMode::Snapshot), false, false),
             ("", Some(RefreshMode::Full), true, false),
             ("", None, true, false),
