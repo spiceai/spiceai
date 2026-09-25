@@ -380,6 +380,19 @@ fn run_lane(spec: &LaneSpec, clients: usize) -> LaneRun {
             Lane::ReadWhileWriting => vec![tables.next().expect("read table"); READERS],
             _ => tables.collect(),
         };
+        if std::env::var_os("METASTORE_BENCH_WARM_WAL").is_some() {
+            // Make every timed call once, untimed, so the WAL grows to the size
+            // the timed calls need, then drain it: the timed calls overwrite
+            // frames already on disk instead of growing a fresh WAL.
+            for task in closed_loop_clients(&catalog, client_tables.clone(), lane, calls_per_client)
+            {
+                task.await.expect("warm-up client");
+            }
+            catalog
+                .checkpoint_wal()
+                .await
+                .expect("checkpoint after warm-up");
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let checkpointer = {

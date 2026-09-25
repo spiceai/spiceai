@@ -28,7 +28,7 @@ use super::{
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
@@ -41,6 +41,24 @@ const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
 /// the process lifetime of a given file.
 fn read_auto_vacuum_mode(conn: &mut rusqlite::Connection) -> Result<i64, rusqlite::Error> {
     conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+}
+
+/// Checkpoint the WAL with `pragma` when the database is in WAL mode.
+/// `wal_checkpoint` returns (busy, log, checkpointed). TRUNCATE reclaims the
+/// file once frames are copied; PASSIVE leaves the file in place for reuse. A
+/// TRUNCATE that finds the WAL busy returns busy=1 and does partial work —
+/// never an error, so the next tick retries (the cap re-trips).
+fn checkpoint_wal_file(
+    conn: &mut rusqlite::Connection,
+    pragma: &str,
+) -> Result<(), rusqlite::Error> {
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        let _: (i32, i32, i32) = conn.query_row(pragma, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    }
+    Ok(())
 }
 
 /// Boundedly reclaim freelist pages on a connection already known to be in
@@ -374,51 +392,42 @@ async fn configure_sqlite_connection(
     }
 }
 
-/// The FIFO queue every in-process writer of one metastore file waits in before
-/// it asks `SQLite` for the write lock.
+/// The connection every in-process write to one metastore file runs on, one at
+/// a time, in the order the writes arrive.
 ///
 /// `SQLite` admits one writer at a time and parks the rest in its busy handler,
 /// which retries on a sleep backoff of up to 100 ms and grants no order: a
 /// writer that re-takes the lock back to back can starve the others until they
 /// fail with `database is locked`, and under a few dozen writers every write's
-/// tail is the backoff rather than the work. A writer holds this gate for
-/// exactly as long as it holds the write lock, so in-process writers take the
-/// lock in arrival order — `tokio::sync::Mutex` grants waiters in FIFO order —
-/// and the next one starts the moment the previous one releases. The busy
-/// handler then only arbitrates between processes.
+/// tail is the backoff rather than the work. A writer parked there also holds a
+/// pooled connection while it sleeps, so enough of them leave none for a read.
 ///
-/// Reads never take the gate: in WAL mode they neither wait for nor block a
-/// writer.
+/// Instead every write, whether an autocommit statement or a transaction from
+/// `BEGIN IMMEDIATE` through `COMMIT` or `ROLLBACK`, is queued on this one
+/// connection, and its thread runs them in arrival order. Consecutive writes run
+/// back to back, with no handoff between their callers; the write lock is free
+/// the moment a write commits; and a queued write holds no pooled connection. A
+/// transaction is a [`Session`], which occupies the thread from its `BEGIN` to
+/// its end while the writes queued behind it wait. `SQLite`'s busy handler only
+/// arbitrates between processes.
 ///
-/// Lock order: the dedicated checkpoint connection before the gate (the WAL
-/// checkpoint and the incremental vacuum), and the gate before a pool slot
-/// (every other writer), so a writer waiting its turn holds no connection.
-type WriterGate = Mutex<()>;
-
-/// Writer gates by metastore file, shared by every [`SqliteMetastore`] open on
-/// that file in this process. Weak, so a file's gate goes away with the last
-/// metastore open on it.
-static WRITER_GATES: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<WriterGate>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-/// The writer gate shared by every metastore open on `db_path` in this process.
-async fn shared_writer_gate(db_path: &str) -> Arc<WriterGate> {
-    let key = writer_gate_key(db_path).await;
-    let mut gates = WRITER_GATES.lock();
-    gates.retain(|_, gate| gate.strong_count() > 0);
-    if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
-        return gate;
-    }
-    let gate = Arc::new(Mutex::new(()));
-    gates.insert(key, Arc::downgrade(&gate));
-    gate
+/// Reads never queue here: in WAL mode they neither wait for nor block a writer.
+struct Writer {
+    conn: tokio_rusqlite::Connection,
 }
 
-/// Names a metastore file so every spelling of one path shares a gate: the
-/// canonical parent directory joined with the file name, since the file itself
-/// may not exist yet. A memory-mode URI already names its database.
-async fn writer_gate_key(db_path: &str) -> String {
+/// Writer connections by metastore file, shared by every [`SqliteMetastore`]
+/// open on that file in this process. Weak, so a file's writer connection
+/// closes with the last metastore open on it.
+static WRITERS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, std::sync::Weak<Writer>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Names a metastore file so every spelling of one path shares a writer
+/// connection: the canonical parent directory joined with the file name, since
+/// the file itself may not exist yet. A memory-mode URI already names its
+/// database.
+async fn writer_key(db_path: &str) -> String {
     if is_memory_db_path(db_path) {
         return db_path.to_string();
     }
@@ -437,26 +446,274 @@ async fn writer_gate_key(db_path: &str) -> String {
     )
 }
 
-/// What a writer gets when it waits out the busy timeout for the writer gate:
-/// the `SQLITE_BUSY` a contended write gets from `SQLite` itself, in the form a
+/// What a write gets when its turn does not come within the busy timeout: the
+/// `SQLITE_BUSY` a contended write gets from `SQLite` itself, in the form a
 /// connection call returns it. Each write path maps it with the same closure
-/// as its own call's error, so a gate timeout surfaces as exactly the error —
-/// text and retryable conflict (`is_retryable_write_conflict`) — the path
-/// returns when `SQLite`'s busy handler times out.
-fn writer_gate_timeout() -> tokio_rusqlite::Error<rusqlite::Error> {
+/// as its own call's error, so a write that waits out its turn fails with
+/// exactly the error, text and retryable conflict (`is_retryable_write_conflict`)
+/// alike, that it gets when `SQLite`'s busy handler times out.
+fn writer_timeout() -> tokio_rusqlite::Error<rusqlite::Error> {
     tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
         Some("database is locked".to_string()),
     ))
 }
 
+/// A queued write's claim on its turn on the [`Writer`]. The writer's thread
+/// claims it when the write's turn comes; a caller that stops waiting first,
+/// because its wait ran out or its future was dropped, withdraws it, and a
+/// withdrawn write never runs. So a caller that got `database is locked` can
+/// retry without the write having happened behind its back.
+struct Turn(Arc<AtomicU8>);
+
+impl Turn {
+    const WAITING: u8 = 0;
+    const CLAIMED: u8 = 1;
+    const WITHDRAWN: u8 = 2;
+
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::WAITING)))
+    }
+
+    /// The handle the writer's thread claims the turn through.
+    fn claimant(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.0)
+    }
+
+    /// On the writer's thread, when the write's turn comes: whether it runs.
+    fn claim(state: &AtomicU8) -> bool {
+        state
+            .compare_exchange(
+                Self::WAITING,
+                Self::CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// By the caller: whether the write was withdrawn before its turn came. A
+    /// claimed write runs to its end, so its caller has to wait for it.
+    fn withdraw(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::WITHDRAWN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        // A caller that goes away before its write's turn withdraws it; once
+        // the write has been claimed this does nothing.
+        self.withdraw();
+    }
+}
+
+/// A statement a [`Session`] runs on the writer's thread, and whether the
+/// session ends with it.
+type SessionJob = Box<dyn FnOnce(&mut rusqlite::Connection) -> SessionStep + Send>;
+
+enum SessionStep {
+    Continue,
+    End,
+}
+
+/// Every write on the writer connection ends its own transaction, so the next
+/// one never starts inside one. Should one ever be left open, roll it back
+/// rather than let the next write join a transaction nothing will commit.
+fn end_leftover_transaction(conn: &mut rusqlite::Connection) {
+    debug_assert!(
+        conn.is_autocommit(),
+        "a write found a transaction left open on the metastore writer connection"
+    );
+    if !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+}
+
+/// A transaction's start on the writer connection. `IMMEDIATE` takes the write
+/// lock up front, so a transaction contending with another process waits in
+/// `SQLite`'s busy handler instead of failing later, while upgrading a deferred
+/// transaction after its reads have run.
+fn begin_immediate(conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+}
+
+/// A transaction's end when it is dropped without a commit or rollback.
+fn roll_back(conn: &mut rusqlite::Connection) {
+    let _ = conn.execute_batch("ROLLBACK");
+}
+
+impl Writer {
+    /// How long a write waits for its turn: the busy timeout a writer already
+    /// had waiting on `SQLite`.
+    fn busy_timeout() -> std::time::Duration {
+        std::time::Duration::from_millis(sqlite_metastore_config().busy_timeout_ms)
+    }
+
+    /// Run `job` once every write queued before it has run. `Ok(None)` means
+    /// its turn did not come within the busy timeout, and it never runs.
+    async fn try_run<F, R>(
+        &self,
+        job: F,
+    ) -> Result<Option<R>, tokio_rusqlite::Error<rusqlite::Error>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let turn = Turn::new();
+        let claimant = turn.claimant();
+        let call = self.conn.call(move |conn| {
+            if !Turn::claim(&claimant) {
+                return Ok(None);
+            }
+            end_leftover_transaction(conn);
+            job(conn).map(Some)
+        });
+        tokio::pin!(call);
+        match tokio::time::timeout(Self::busy_timeout(), &mut call).await {
+            Ok(result) => result,
+            Err(_) if turn.withdraw() => Ok(None),
+            // Its turn came as the wait ran out: it is running, so wait for it.
+            Err(_) => call.await,
+        }
+    }
+
+    /// [`Self::try_run`], failing with [`writer_timeout`] when the write's
+    /// turn does not come within the busy timeout.
+    async fn run<F, R>(&self, job: F) -> Result<R, tokio_rusqlite::Error<rusqlite::Error>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.try_run(job).await?.ok_or_else(writer_timeout)
+    }
+
+    /// Take the writer connection for statements its caller issues one at a
+    /// time, such as a transaction or schema setup, in its turn like any write
+    /// and waiting at most the busy timeout for it. `start` runs first (a
+    /// transaction's `BEGIN IMMEDIATE`). The session then runs each statement
+    /// sent to it, in order, until [`Session::finish`] or until it is dropped,
+    /// when `abort` runs (a transaction's `ROLLBACK`).
+    async fn session(
+        &self,
+        start: fn(&mut rusqlite::Connection) -> Result<(), rusqlite::Error>,
+        abort: fn(&mut rusqlite::Connection),
+    ) -> Result<Session, tokio_rusqlite::Error<rusqlite::Error>> {
+        let turn = Turn::new();
+        let claimant = turn.claimant();
+        let (started_tx, mut started) =
+            tokio::sync::oneshot::channel::<Result<(), rusqlite::Error>>();
+        let (jobs, next_job) = std::sync::mpsc::channel::<SessionJob>();
+        let conn = self.conn.clone();
+        // The session runs on the writer's thread until it ends, however long
+        // its caller takes; this task only queues it there.
+        tokio::spawn(async move {
+            let _ = conn
+                .call_raw(move |conn| {
+                    if !Turn::claim(&claimant) {
+                        return;
+                    }
+                    end_leftover_transaction(conn);
+                    if let Err(e) = start(conn) {
+                        let _ = started_tx.send(Err(e));
+                        return;
+                    }
+                    if started_tx.send(Ok(())).is_err() {
+                        // Its caller went away as its turn came.
+                        abort(conn);
+                        return;
+                    }
+                    while let Ok(job) = next_job.recv() {
+                        if matches!(job(conn), SessionStep::End) {
+                            return;
+                        }
+                    }
+                    // Dropped without being finished.
+                    abort(conn);
+                })
+                .await;
+        });
+        let started = match tokio::time::timeout(Self::busy_timeout(), &mut started).await {
+            Ok(started) => started,
+            Err(_) if turn.withdraw() => return Err(writer_timeout()),
+            // Its turn came as the wait ran out: it is starting, so wait for it.
+            Err(_) => started.await,
+        };
+        match started {
+            Ok(Ok(())) => Ok(Session { jobs }),
+            Ok(Err(e)) => Err(tokio_rusqlite::Error::Error(e)),
+            Err(_) => Err(tokio_rusqlite::Error::ConnectionClosed),
+        }
+    }
+}
+
+/// A caller's hold on the [`Writer`] for statements it issues one at a time.
+/// Dropping it ends the session with the `abort` it was started with.
+struct Session {
+    jobs: std::sync::mpsc::Sender<SessionJob>,
+}
+
+impl Session {
+    /// Run `function` in the session, as [`tokio_rusqlite::Connection::call`]
+    /// runs it on a connection.
+    async fn call<F, R, E>(&self, function: F) -> Result<R, tokio_rusqlite::Error<E>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, E> + Send + 'static,
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.send(function, SessionStep::Continue).await
+    }
+
+    /// Run `function`, a `COMMIT` or `ROLLBACK`, as the session's last
+    /// statement, and end the session.
+    async fn finish<F, R, E>(self, function: F) -> Result<R, tokio_rusqlite::Error<E>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, E> + Send + 'static,
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.send(function, SessionStep::End).await
+    }
+
+    async fn send<F, R, E>(
+        &self,
+        function: F,
+        step: SessionStep,
+    ) -> Result<R, tokio_rusqlite::Error<E>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, E> + Send + 'static,
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        let (result_tx, result) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(Box::new(move |conn: &mut rusqlite::Connection| {
+                let _ = result_tx.send(function(conn));
+                step
+            }))
+            .map_err(|_| tokio_rusqlite::Error::ConnectionClosed)?;
+        result
+            .await
+            .map_err(|_| tokio_rusqlite::Error::ConnectionClosed)?
+            .map_err(tokio_rusqlite::Error::Error)
+    }
+}
+
 /// Whether a statement issued through a query method writes, judged by its
 /// leading keyword: `reserve_sequence_numbers` runs `UPDATE … RETURNING`
-/// through `query_row`, and that write must queue on the writer gate like any
-/// other. Everything else runs ungated — gating a read would make a read nested
-/// inside a transaction wait on the gate its own transaction holds — and a
-/// debug assertion checks the statement is read-only, so a write this misses
-/// fails tests rather than silently skipping the queue.
+/// through `query_row`, and that write must run on the [`Writer`] like any
+/// other. Everything else runs on a pooled connection, since queueing a read
+/// there would make a read nested inside a transaction wait for the
+/// transaction it is part of. A debug assertion checks such a statement is
+/// read-only, so a write this misses fails tests rather than silently skipping
+/// the queue.
 fn statement_writes(sql: &str) -> bool {
     let keyword = sql
         .trim_start()
@@ -468,12 +725,13 @@ fn statement_writes(sql: &str) -> bool {
         .any(|write| keyword.eq_ignore_ascii_case(write))
 }
 
-/// Round-robin connection pool for the [`SqliteMetastore`].
+/// Round-robin connection pool for the [`SqliteMetastore`]'s reads, beside the
+/// [`Writer`] every write runs on.
 ///
 /// `SQLite` WAL mode allows concurrent readers and serializes writers at the
-/// engine level. Having K independent connections means N concurrent callers
-/// spread across K slots: for N ≤ K every caller finds a free slot immediately;
-/// for N > K callers share proportionally, reducing the per-table wait from
+/// engine level. Having K independent connections means N concurrent readers
+/// spread across K slots: for N ≤ K every reader finds a free slot immediately;
+/// for N > K readers share proportionally, reducing the per-table wait from
 /// O(N·RTT) to O(⌈N/K⌉·RTT).
 ///
 /// Pool size is `min(cpu_budget().cores(), 32)` (minimum 2) — the runtime's
@@ -491,32 +749,18 @@ fn statement_writes(sql: &str) -> bool {
 struct SqliteConnectionPool {
     conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
     next: AtomicUsize,
-    /// Connection used ONLY by [`SqliteMetastore::checkpoint_wal`] (cycle-8 TASK
-    /// A2). The background maintenance-tick checkpoint runs here so it never
-    /// contends a `conns` slot — a writer that finds every `conns` slot busy
-    /// falls back to `lock_owned()` on `conns[0]`, so reusing `conns[0]` for the
-    /// checkpoint could (rarely) serialize a hot writer behind it. A dedicated
-    /// connection guarantees the off-hot-path drain stays off the hot path even
-    /// under full pool saturation. It still targets the same shared `-wal` file,
-    /// so a single checkpoint here covers the catalog's tables.
+    /// Connection used ONLY by [`SqliteMetastore::checkpoint_wal`]'s PASSIVE
+    /// drain (cycle-8 TASK A2). The background maintenance-tick checkpoint runs
+    /// here so it never contends a `conns` slot a read is waiting for, even under
+    /// full pool saturation; a PASSIVE checkpoint takes no write lock, so it does
+    /// not queue on the [`Writer`] either. It still targets the same shared
+    /// `-wal` file, so a single checkpoint here covers the catalog's tables.
     checkpoint_conn: Arc<Mutex<tokio_rusqlite::Connection>>,
-    /// This file's [`WriterGate`], shared with every other metastore open on it.
-    writer_gate: Arc<WriterGate>,
+    /// This file's [`Writer`], shared with every other metastore open on it.
+    writer: Arc<Writer>,
 }
 
 impl SqliteConnectionPool {
-    /// Wait for this metastore file's [`WriterGate`], at most the configured
-    /// busy timeout — the bound a writer already had waiting on `SQLite` — after
-    /// which the wait fails with [`writer_gate_timeout`].
-    async fn acquire_writer(
-        &self,
-    ) -> Result<OwnedMutexGuard<()>, tokio_rusqlite::Error<rusqlite::Error>> {
-        let timeout = std::time::Duration::from_millis(sqlite_metastore_config().busy_timeout_ms);
-        tokio::time::timeout(timeout, Arc::clone(&self.writer_gate).lock_owned())
-            .await
-            .map_err(|_| writer_gate_timeout())
-    }
-
     /// Acquire a connection using round-robin with try-first heuristic.
     ///
     /// Tries each slot starting from the round-robin index; returns the first
@@ -542,22 +786,21 @@ impl SqliteConnectionPool {
 /// throughput at one commit per RTT regardless of table count.
 pub struct SqliteMetastore {
     connection_string: String,
-    /// Round-robin pool of K independent connections shared across all
-    /// operations (reads, writes, and transactions).
+    /// Round-robin pool of K independent connections for reads, and the
+    /// [`Writer`] every write runs on.
     ///
     /// K = `min(cpu_budget().cores(), 32)`, with a minimum of 2 — see the
     /// [`SqliteConnectionPool`] doc comment for the rationale. Lazily
-    /// initialised on first use. `begin_transaction` holds an
-    /// [`OwnedMutexGuard`] on one pool slot for the full transaction
-    /// lifetime.
+    /// initialised on first use. A transaction runs on the writer connection
+    /// for its full lifetime.
     pool: OnceCell<Arc<SqliteConnectionPool>>,
     /// Whether this DB file's *actual* `auto_vacuum` mode is INCREMENTAL.
     ///
     /// The mode is fixed at file creation (a config flip over an existing file
-    /// is a no-op without a full VACUUM), so one probe under the checkpoint
-    /// lock is enough for the process lifetime. Cached so the maintenance tick
-    /// does not re-issue `PRAGMA auto_vacuum` (or take the checkpoint lock at
-    /// all, when the answer is no) on every pass.
+    /// is a no-op without a full VACUUM), so one probe is enough for the
+    /// process lifetime. Cached so the maintenance tick does not re-issue
+    /// `PRAGMA auto_vacuum` (or queue on the writer connection at all, when the
+    /// answer is no) on every pass.
     db_auto_vacuum_is_incremental: OnceLock<bool>,
 }
 
@@ -687,14 +930,29 @@ impl SqliteMetastore {
         Ok(conn)
     }
 
+    /// The writer connection shared by every metastore open on this one's
+    /// file, opened by the first of them.
+    async fn shared_writer(&self) -> CatalogResult<Arc<Writer>> {
+        let key = writer_key(self.db_path()).await;
+        // Held across the open, so metastores opening one file at once share
+        // one writer connection.
+        let mut writers = WRITERS.lock().await;
+        writers.retain(|_, writer| writer.strong_count() > 0);
+        if let Some(writer) = writers.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(writer);
+        }
+        let writer = Arc::new(Writer {
+            conn: self.open_connection().await?,
+        });
+        writers.insert(key, Arc::downgrade(&writer));
+        Ok(writer)
+    }
+
     /// Return the connection pool, initialising it lazily on first call.
     ///
-    /// Opens K = `min(cpu_budget().cores(), 32)` connections once and reuses
-    /// them for the lifetime of the metastore. K is clamped to a minimum of 2
-    /// so single-core systems still have one slot reserved for
-    /// read-while-write. All operations draw from
-    /// the same pool; `begin_transaction` holds an [`OwnedMutexGuard`] on
-    /// the acquired slot for the full transaction lifetime.
+    /// Opens K = `min(cpu_budget().cores(), 32)` read connections once and
+    /// reuses them for the lifetime of the metastore, beside the shared writer
+    /// connection. K is clamped to a minimum of 2.
     async fn pool(&self) -> CatalogResult<&Arc<SqliteConnectionPool>> {
         self.pool
             .get_or_try_init(|| async {
@@ -705,17 +963,17 @@ impl SqliteMetastore {
                 }
                 // cycle-8 TASK A2: dedicated checkpoint connection (see the field
                 // doc). One extra connection per metastore DB, used only by the
-                // background WAL drain so it never lands on a `conns` slot a hot
-                // writer could fall back to.
+                // background WAL drain so it never lands on a `conns` slot a
+                // read is waiting for.
                 let checkpoint_conn = Arc::new(Mutex::new(self.open_connection().await?));
                 // After the opens, so a file-mode parent directory exists to be
-                // canonicalized into the gate's key.
-                let writer_gate = shared_writer_gate(self.db_path()).await;
+                // canonicalized into the writer's key.
+                let writer = self.shared_writer().await?;
                 Ok(Arc::new(SqliteConnectionPool {
                     conns,
                     next: AtomicUsize::new(0),
                     checkpoint_conn,
-                    writer_gate,
+                    writer,
                 }))
             })
             .await
@@ -1148,19 +1406,23 @@ fn to_sqlite_value(value: MetastoreValue) -> rusqlite::types::Value {
 #[async_trait]
 impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
-        // Schema creation and the migrations below write, so they queue on the
-        // writer gate like any other writer. A gate timeout reads as the busy
-        // timeout the schema creation's first write would have hit.
+        // Schema creation and the migrations below write, so they run on the
+        // writer connection as one session, in its turn like any write. A write
+        // that waits out its turn reads as the busy timeout the schema
+        // creation's first write would have hit.
         let schema_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
             message: format!("Failed to initialize schema: {e}"),
         };
         let pool = self.pool().await?;
-        let writer = pool.acquire_writer().await.map_err(schema_error)?;
-        let guard = pool.acquire().await;
+        let session = pool
+            .writer
+            .session(|_| Ok(()), |_| {})
+            .await
+            .map_err(schema_error)?;
 
         // Refuse to open a catalog written by a newer, incompatible Spice build
         // BEFORE running any migration against it (a fresh/legacy DB reads 0).
-        let stored_version = guard
+        let stored_version = session
             .call(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))
             .await
             .map_err(
@@ -1170,7 +1432,7 @@ impl MetastoreBackend for SqliteMetastore {
             )?;
         super::ensure_supported_schema_version(stored_version)?;
 
-        guard
+        session
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
@@ -1343,7 +1605,7 @@ impl MetastoreBackend for SqliteMetastore {
             .await
             .map_err(schema_error)?;
 
-        guard
+        session
             .call(|conn| {
                 conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
@@ -1360,7 +1622,7 @@ impl MetastoreBackend for SqliteMetastore {
 
         // Kept out of the block above: that one reports every failure as duplicate
         // `cayenne_delete_file` paths, with remediation against that table.
-        guard
+        session
             .call(|conn| conn.execute(Self::PENDING_WRITE_BACK_INDEX_DDL, []))
             .await
             .map_err(
@@ -1372,7 +1634,7 @@ impl MetastoreBackend for SqliteMetastore {
         // Stamp the current schema version now that all migrations have succeeded,
         // so a later downgrade to a build with a lower max version fails loudly at
         // the gate above instead of returning silently wrong results.
-        guard
+        session
             .call(|conn| {
                 conn.pragma_update(
                     None,
@@ -1389,10 +1651,9 @@ impl MetastoreBackend for SqliteMetastore {
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
-        // Drop the guard before validation — the callback acquires it per-table —
-        // and the writer gate with it: validation only reads.
-        drop(guard);
-        drop(writer);
+        // End the session before validation, which only reads, on pooled
+        // connections.
+        drop(session);
         let pool_ref = Arc::clone(self.pool().await?);
         super::validate_existing_schema(|table_name| {
             let pool = Arc::clone(&pool_ref);
@@ -1419,87 +1680,69 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        // METRIC 1: a bare autocommit write statement. Wait = the writer gate
-        // plus the pool-slot acquire (the WAL writer lock is then taken implicitly
-        // by the statement itself); held = the statement's run. Labeled
+        // METRIC 1: a bare autocommit write statement, run on the writer
+        // connection. Wait = the wait for its turn there; held = the statement's
+        // run (the WAL writer lock is taken by the statement itself). Labeled
         // `txn="other"` — this generic path cannot cheaply know the originating
         // catalog stage.
         let wait_start = std::time::Instant::now();
-        let execute_error = |e: tokio_rusqlite::Error<rusqlite::Error>| {
-            convert_tokio_rusqlite_error(e, "Failed to execute statement")
-        };
         let pool = self.pool().await?;
-        let writer = pool.acquire_writer().await.map_err(execute_error)?;
-        let guard = pool.acquire().await;
-        telemetry::cayenne::track_metastore_writer_wait(
-            wait_start.elapsed(),
-            &[telemetry::KeyValue::new("txn", "other")],
-        );
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
-        let held_start = std::time::Instant::now();
-        guard
-            .call(move |conn| {
+        pool.writer
+            .run(move |conn| {
+                telemetry::cayenne::track_metastore_writer_wait(
+                    wait_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                let held_start = std::time::Instant::now();
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
                     .iter()
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
                 conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
-                Ok::<_, rusqlite::Error>(())
+                telemetry::cayenne::track_metastore_writer_held(
+                    held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                Ok(())
             })
             .await
-            .map_err(execute_error)?;
-        drop(writer);
-        telemetry::cayenne::track_metastore_writer_held(
-            held_start.elapsed(),
-            &[telemetry::KeyValue::new("txn", "other")],
-        );
-
-        Ok(())
+            .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let batch_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to execute batch: {e}"),
-        };
         let pool = self.pool().await?;
-        let _writer = pool.acquire_writer().await.map_err(batch_error)?;
-        let guard = pool.acquire().await;
         let sql_owned = sql.to_string();
 
-        guard
-            .call(move |conn| {
-                conn.execute_batch(&sql_owned)?;
-                Ok::<_, rusqlite::Error>(())
-            })
+        pool.writer
+            .run(move |conn| conn.execute_batch(&sql_owned))
             .await
-            .map_err(batch_error)?;
-
-        Ok(())
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to execute batch: {e}"),
+                },
+            )
     }
 
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
-        let batch_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to execute transaction batch: {e}"),
-        };
         let pool = self.pool().await?;
-        let _writer = pool.acquire_writer().await.map_err(batch_error)?;
-        let guard = pool.acquire().await;
         let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
 
-        guard
-            .call(move |conn| {
+        pool.writer
+            .run(move |conn| {
                 conn.execute_batch(&batch_sql).inspect_err(|_| {
                     let _ = conn.execute_batch("ROLLBACK");
-                })?;
-                Ok::<_, rusqlite::Error>(())
+                })
             })
             .await
-            .map_err(batch_error)?;
-
-        Ok(())
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to execute transaction batch: {e}"),
+                },
+            )
     }
 
     async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
@@ -1512,43 +1755,42 @@ impl MetastoreBackend for SqliteMetastore {
         };
         let pool = self.pool().await?;
         let writes = statement_writes(params.sql);
-        let _writer = if writes {
-            Some(pool.acquire_writer().await.map_err(query_error)?)
-        } else {
-            None
-        };
-        let guard = pool.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
         // Execute query and extract row values inside the closure
-        let row_values = guard
-            .call(move |conn| {
-                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                    .iter()
-                    .map(|v| v as &dyn rusqlite::ToSql)
-                    .collect();
+        let query = move |conn: &mut rusqlite::Connection| {
+            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                .iter()
+                .map(|v| v as &dyn rusqlite::ToSql)
+                .collect();
 
-                let mut stmt = conn.prepare_cached(&sql)?;
-                debug_assert!(
-                    writes || stmt.readonly(),
-                    "a writing statement reached the metastore without the writer gate: {sql}"
-                );
-                stmt.query_row(params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+            let mut stmt = conn.prepare_cached(&sql)?;
+            debug_assert!(
+                writes || stmt.readonly(),
+                "a writing statement reached a metastore read connection: {sql}"
+            );
+            stmt.query_row(params_refs.as_slice(), |row| {
+                let column_count = row.as_ref().column_count();
+                let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
+                for i in 0..column_count {
+                    let value = row.get_ref(i)?;
+                    values.push(convert_sqlite_value(value));
+                }
 
-                    Ok(values)
-                })
+                Ok(values)
             })
-            .await
-            .map_err(query_error)?;
+        };
+        // A write runs on the writer connection in its turn; a read on a pooled
+        // connection.
+        let row_values = if writes {
+            pool.writer.run(query).await
+        } else {
+            pool.acquire().await.call(query).await
+        }
+        .map_err(query_error)?;
 
         // Apply the callback outside the rusqlite closure to preserve CatalogError
         let sqlite_row = SqliteRow { values: row_values };
@@ -1565,50 +1807,49 @@ impl MetastoreBackend for SqliteMetastore {
         };
         let pool = self.pool().await?;
         let writes = statement_writes(params.sql);
-        let _writer = if writes {
-            Some(pool.acquire_writer().await.map_err(query_error)?)
-        } else {
-            None
-        };
-        let guard = pool.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
         // Execute query and collect all row values inside the closure
-        let all_row_values = guard
-            .call(move |conn| {
-                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                    .iter()
-                    .map(|v| v as &dyn rusqlite::ToSql)
-                    .collect();
+        let query = move |conn: &mut rusqlite::Connection| {
+            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                .iter()
+                .map(|v| v as &dyn rusqlite::ToSql)
+                .collect();
 
-                let mut stmt = conn.prepare_cached(&sql)?;
-                debug_assert!(
-                    writes || stmt.readonly(),
-                    "a writing statement reached the metastore without the writer gate: {sql}"
-                );
-                let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+            let mut stmt = conn.prepare_cached(&sql)?;
+            debug_assert!(
+                writes || stmt.readonly(),
+                "a writing statement reached a metastore read connection: {sql}"
+            );
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                let column_count = row.as_ref().column_count();
+                let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
-
-                    Ok(values)
-                })?;
-
-                let mut collected_rows = Vec::new();
-                for row_result in rows {
-                    collected_rows.push(row_result?);
+                for i in 0..column_count {
+                    let value = row.get_ref(i)?;
+                    values.push(convert_sqlite_value(value));
                 }
 
-                Ok::<Vec<Vec<MetastoreValue>>, rusqlite::Error>(collected_rows)
-            })
-            .await
-            .map_err(query_error)?;
+                Ok(values)
+            })?;
+
+            let mut collected_rows = Vec::new();
+            for row_result in rows {
+                collected_rows.push(row_result?);
+            }
+
+            Ok::<Vec<Vec<MetastoreValue>>, rusqlite::Error>(collected_rows)
+        };
+        // A write runs on the writer connection in its turn; a read on a pooled
+        // connection.
+        let all_row_values = if writes {
+            pool.writer.run(query).await
+        } else {
+            pool.acquire().await.call(query).await
+        }
+        .map_err(query_error)?;
 
         // Apply the callback outside the rusqlite closure to preserve CatalogError
         let mut results = Vec::with_capacity(all_row_values.len());
@@ -1621,44 +1862,24 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
-        // METRIC 1 (writer wait): wall-clock from the start of acquisition through
-        // a held BEGIN IMMEDIATE. This is the WAL-serialized writer queueing cost —
-        // the writer gate, the pool-slot lock, and SQLite's reserved-lock acquire
-        // (the busy-timeout wait when another process holds the lock). No `txn`
-        // stage label here: the generic backend `begin_transaction` cannot cheaply
-        // know which catalog stage opened it without threading a parameter through
-        // every call site, so it records `"other"`.
+        // METRIC 1 (writer wait): wall-clock from the call until BEGIN IMMEDIATE
+        // has returned on the writer connection — the wait for its turn there
+        // plus SQLite's reserved-lock acquire (the busy-timeout wait when another
+        // process holds the lock). No `txn` stage label here: the generic
+        // backend `begin_transaction` cannot cheaply know which catalog stage
+        // opened it without threading a parameter through every call site, so it
+        // records `"other"`.
         let wait_start = std::time::Instant::now();
-        let begin_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to begin transaction: {e}"),
-        };
         let pool = self.pool().await?;
-        // The writer gate first, then a pool slot: a writer waiting its turn must
-        // not hold a connection the readers could use.
-        let writer = pool.acquire_writer().await.map_err(begin_error)?;
-        let guard = pool.acquire().await;
-
-        // Defensively clear any leftover transaction state before BEGIN. A
-        // prior `SqliteTransaction` whose `Drop` fired-and-forgot a ROLLBACK
-        // via `tokio::spawn` can lose the rollback under runtime shutdown,
-        // returning the connection to the pool inside an open transaction.
-        // SQLite's `autocommit` flag tells us if a txn is pending; rolling
-        // back only when needed avoids the noisy "no transaction is active"
-        // error on clean connections.
-        guard
-            .call(|conn| {
-                if !conn.is_autocommit() {
-                    let _ = conn.execute_batch("ROLLBACK");
-                }
-                // Metastore transactions are write transactions. Acquiring the
-                // reserved lock up front lets SQLite's busy timeout serialize
-                // contending writers instead of failing later while upgrading a
-                // deferred transaction after reads have already run.
-                conn.execute_batch("BEGIN IMMEDIATE")?;
-                Ok::<_, rusqlite::Error>(())
-            })
+        let session = pool
+            .writer
+            .session(begin_immediate, roll_back)
             .await
-            .map_err(begin_error)?;
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to begin transaction: {e}"),
+                },
+            )?;
         telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
@@ -1666,31 +1887,20 @@ impl MetastoreBackend for SqliteMetastore {
 
         // METRIC 1 (writer held): the reserved write lock is held from this BEGIN
         // until commit/rollback/drop. Stamp the start so `SqliteTransaction` can
-        // record the hold duration when it releases the guard.
+        // record the hold duration when it ends.
         Ok(Box::new(SqliteTransaction {
-            conn: Some(guard),
-            writer: Some(writer),
+            session: Some(session),
             held_start: std::time::Instant::now(),
         }))
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
-        // WAL checkpoint and optimize on the first connection only.
-        // Multiple concurrent checkpoints on the same WAL would conflict;
-        // a single checkpoint covers the shared file.
-        if let Some(pool) = self.pool.get()
-            && let Some(conn) = pool.conns.first()
-        {
-            // The TRUNCATE checkpoint and `PRAGMA optimize` below write, so they
-            // queue on the writer gate like any writer.
-            let shutdown_error =
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to shutdown catalog: {e}"),
-                };
-            let _writer = pool.acquire_writer().await.map_err(shutdown_error)?;
-            let guard = conn.lock().await;
-            guard
-                .call(|conn| {
+        // WAL checkpoint and optimize on the writer connection, in its turn like
+        // any write: the TRUNCATE checkpoint and `PRAGMA optimize` write, and a
+        // single checkpoint covers the shared file.
+        if let Some(pool) = self.pool.get() {
+            pool.writer
+                .run(|conn| {
                     // Check if WAL mode is enabled
                     let journal_mode: String =
                         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
@@ -1712,10 +1922,14 @@ impl MetastoreBackend for SqliteMetastore {
                     let mut rows = stmt.query([])?;
                     while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
 
-                    Ok::<_, rusqlite::Error>(())
+                    Ok(())
                 })
                 .await
-                .map_err(shutdown_error)?;
+                .map_err(
+                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                        message: format!("Failed to shutdown catalog: {e}"),
+                    },
+                )?;
             // Note: We intentionally do not explicitly close the connections here.
             // Closing pool connections while other pool slots remain open would be
             // inconsistent; instead we rely on normal drop semantics to clean up
@@ -1729,9 +1943,9 @@ impl MetastoreBackend for SqliteMetastore {
         // cycle-8 TASK A2: the SOLE WAL drain. With the inline auto-checkpoint
         // disabled (`wal_autocheckpoint_pages = 0`) no checkpoint ever fires from
         // a hot CDC COMMIT; this background-tick checkpoint is now the only thing
-        // that copies committed frames into the main DB. It runs on a DEDICATED
-        // connection (never a `conns` writer slot — see the field doc) so it can
-        // never serialize a hot writer.
+        // that copies committed frames into the main DB. The PASSIVE drain runs
+        // on a DEDICATED connection (never a `conns` slot — see the field doc),
+        // so it never delays a read.
         //
         // Mode: PASSIVE by default (never blocks writers, never waits for
         // readers; a busy WAL just leaves frames for the next tick). A PASSIVE
@@ -1745,8 +1959,6 @@ impl MetastoreBackend for SqliteMetastore {
         let Some(pool) = self.pool.get() else {
             return Ok(());
         };
-        let conn = &pool.checkpoint_conn;
-        let guard = conn.lock().await;
 
         // Sample the -wal size BEFORE the checkpoint to pick the mode (cheap
         // stat()). Past the cap we TRUNCATE to reclaim the file; otherwise
@@ -1761,50 +1973,33 @@ impl MetastoreBackend for SqliteMetastore {
         } else {
             "passive_background"
         };
+        let checkpoint_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to checkpoint catalog WAL: {e}"),
+        };
 
         // METRIC 2 (checkpoint duration): time the checkpoint with the chosen
         // background mode (this IS the off-hot-path background drain), including
         // any wait for the write lock.
         let checkpoint_start = std::time::Instant::now();
         // TRUNCATE holds the write lock while it waits out readers and resets the
-        // file, so it queues on the writer gate like a writer. If the gate stays
-        // busy for the whole busy timeout this tick drains PASSIVE instead — the
-        // partial drain a TRUNCATE that finds the WAL busy does — and the next
-        // tick tries again.
-        let writer = if truncate_due {
-            pool.acquire_writer().await.ok()
-        } else {
-            None
-        };
-        let truncate = writer.is_some();
-        guard
-            .call(move |conn| {
-                let journal_mode: String =
-                    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-                if journal_mode.eq_ignore_ascii_case("wal") {
-                    // wal_checkpoint returns (busy, log, checkpointed). TRUNCATE
-                    // reclaims the file once frames are copied; PASSIVE leaves the
-                    // file in place for reuse. A TRUNCATE that finds the WAL busy
-                    // returns busy=1 and does partial work — never an error, so
-                    // the next tick retries (the cap re-trips).
-                    let pragma = if truncate {
-                        "PRAGMA wal_checkpoint(TRUNCATE)"
-                    } else {
-                        "PRAGMA wal_checkpoint(PASSIVE)"
-                    };
-                    let _: (i32, i32, i32) = conn.query_row(pragma, [], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })?;
-                }
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to checkpoint catalog WAL: {e}"),
-                },
-            )?;
-        drop(writer);
+        // file, so it runs on the writer connection in its turn like a write. If
+        // its turn does not come within the busy timeout, this tick drains
+        // PASSIVE instead — the partial drain a TRUNCATE that finds the WAL busy
+        // does — and the next tick tries again.
+        let truncated = truncate_due
+            && pool
+                .writer
+                .try_run(|conn| checkpoint_wal_file(conn, "PRAGMA wal_checkpoint(TRUNCATE)"))
+                .await
+                .map_err(checkpoint_error)?
+                .is_some();
+        if !truncated {
+            let guard = pool.checkpoint_conn.lock().await;
+            guard
+                .call(|conn| checkpoint_wal_file(conn, "PRAGMA wal_checkpoint(PASSIVE)"))
+                .await
+                .map_err(checkpoint_error)?;
+        }
         telemetry::cayenne::track_metastore_checkpoint(
             checkpoint_start.elapsed(),
             &[telemetry::KeyValue::new("mode", mode_label)],
@@ -1817,10 +2012,8 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        // Runs on the SAME dedicated connection as the background checkpoint,
-        // for the same reason: `PRAGMA incremental_vacuum` takes the write lock
-        // while it relocates pages, and taking a pool writer slot to do that
-        // would serialize a hot writer behind footprint housekeeping.
+        // `PRAGMA incremental_vacuum` takes the write lock while it relocates
+        // pages, so it runs on the writer connection in its turn like any write.
         //
         // Ordering note for the caller: this belongs BEFORE the checkpoint in a
         // maintenance pass. In WAL mode the relocation is written as WAL frames
@@ -1828,7 +2021,7 @@ impl MetastoreBackend for SqliteMetastore {
         // so vacuuming after the checkpoint would defer the actual truncation by
         // a whole tick.
         let cfg = sqlite_metastore_config();
-        // Skip the dedicated-connection lock when reclamation is not configured.
+        // Skip the writer connection when reclamation is not configured.
         // The DB's *actual* mode is still gated below (and cached) — config only
         // takes effect on a fresh file, so a later flip to Incremental must not
         // pretend an existing NONE/FULL database is reclaimable.
@@ -1836,7 +2029,7 @@ impl MetastoreBackend for SqliteMetastore {
             return Ok(0);
         }
         // Cached live-mode probe: once we know the file is not INCREMENTAL, skip
-        // the checkpoint lock entirely on every subsequent tick. The mode is
+        // the writer connection entirely on every subsequent tick. The mode is
         // fixed at file creation, so the answer never changes for this handle.
         if matches!(self.db_auto_vacuum_is_incremental.get(), Some(false)) {
             return Ok(0);
@@ -1845,26 +2038,23 @@ impl MetastoreBackend for SqliteMetastore {
         let Some(pool) = self.pool.get() else {
             return Ok(0);
         };
-        let conn = &pool.checkpoint_conn;
-        let guard = conn.lock().await;
 
         let start = std::time::Instant::now();
         let map_err = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
             message: format!("Failed to incrementally vacuum the catalog: {e}"),
         };
-        // `PRAGMA incremental_vacuum` writes, so it queues on the writer gate.
-        let _writer = pool.acquire_writer().await.map_err(map_err)?;
         // Once the live mode is known INCREMENTAL, each tick is a single
         // freelist reclaim call. The first tick also probes the mode in that
         // same call so we never pay two round-trips to the connection thread.
         let reclaimed = if self.db_auto_vacuum_is_incremental.get() == Some(&true) {
-            guard
-                .call(move |conn| reclaim_freelist_pages(conn, max_pages))
+            pool.writer
+                .run(move |conn| reclaim_freelist_pages(conn, max_pages))
                 .await
                 .map_err(map_err)?
         } else {
-            let (mode, reclaimed) = guard
-                .call(move |conn| {
+            let (mode, reclaimed) = pool
+                .writer
+                .run(move |conn| {
                     // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL already reclaims
                     // at commit time, so it needs nothing here either. The mode
                     // itself is returned, not just "is it INCREMENTAL", so the
@@ -1987,79 +2177,44 @@ fn measure_file_footprint(db_path: &str, wal_path: &str) -> (Option<u64>, Option
     (db, wal)
 }
 
-/// A transaction on a `SQLite` metastore connection.
-///
-/// Holds an [`OwnedMutexGuard`] on the underlying connection, ensuring
-/// exclusive access for the lifetime of the transaction. The guard is
-/// released when the transaction is committed, rolled back, or dropped.
-///
-/// If neither [`commit`](MetastoreTransaction::commit) nor
-/// [`rollback`](MetastoreTransaction::rollback) is called, the transaction
-/// is automatically rolled back on drop via a best-effort `ROLLBACK`.
+/// A transaction on the metastore's [`Writer`] connection: a [`Session`] from
+/// `BEGIN IMMEDIATE` until [`commit`](MetastoreTransaction::commit) or
+/// [`rollback`](MetastoreTransaction::rollback), while the writes queued behind
+/// it wait. Dropped without either, it is rolled back on the writer's thread as
+/// its session ends.
 pub struct SqliteTransaction {
-    /// Exclusive lock on the connection. `None` after commit/rollback.
-    conn: Option<OwnedMutexGuard<tokio_rusqlite::Connection>>,
-    /// This file's [`WriterGate`], held for as long as the write lock: released
-    /// after `COMMIT` or `ROLLBACK` has run, so the next writer's
-    /// `BEGIN IMMEDIATE` finds the lock free.
-    writer: Option<OwnedMutexGuard<()>>,
+    /// The transaction's session. `None` after commit/rollback.
+    session: Option<Session>,
     /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned), used
     /// to record METRIC 1 `cayenne_metastore_writer_held_ms` on
     /// commit/rollback/drop.
     held_start: std::time::Instant,
 }
 
+impl SqliteTransaction {
+    fn session(&self) -> CatalogResult<&Session> {
+        self.session.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })
+    }
+
+    fn take_session(&mut self) -> CatalogResult<Session> {
+        self.session.take().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })
+    }
+}
+
 impl Drop for SqliteTransaction {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            // A drop without an explicit commit/rollback still held the write
-            // lock for this long. Recording the held duration HERE (before the
-            // rollback) is correct on this path — unlike the commit/rollback
-            // paths where the metric was moved AFTER the awaited rollback — because
-            // the rollback below is SPAWNED detached (fire-and-forget on the
-            // bg connection thread): this Drop returns immediately and the
-            // synchronous writer-held window genuinely ends now, not when the
-            // detached rollback later completes.
+        if self.session.take().is_some() {
+            // Dropped without a commit or rollback: ending its session rolls the
+            // transaction back on the writer's thread, before the next write
+            // runs. The hold is recorded as ending now, when its caller let go.
             telemetry::cayenne::track_metastore_writer_held(
                 self.held_start.elapsed(),
                 &[telemetry::KeyValue::new("txn", "other")],
             );
-            // Best-effort rollback — fire and forget since we're in drop.
-            // tokio_rusqlite::Connection::call sends a closure to the bg
-            // thread; it will execute even after this Drop returns.
-            // We spawn a task to await the future properly. The writer gate
-            // goes with it and is released only once the ROLLBACK has run.
-            let writer = self.writer.take();
-            let rollback = async move {
-                let _ = conn
-                    .call(|conn| {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        Ok::<_, rusqlite::Error>(())
-                    })
-                    .await;
-                drop(writer);
-            };
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(rollback);
-            } else {
-                // No ambient Tokio runtime (dropped from a non-Tokio thread).
-                // `tokio_rusqlite::Connection::call` awaits the background
-                // connection thread over a Tokio channel, so drive the
-                // best-effort rollback on a small current-thread runtime instead
-                // of a bare `futures::executor::block_on` (mirrors the Turso
-                // metastore transaction Drop). Log if the runtime cannot be built.
-                std::thread::spawn(move || {
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt.block_on(rollback),
-                        Err(err) => tracing::error!(
-                            "Failed to build fallback Tokio runtime to auto-rollback SqliteTransaction on drop: {err}"
-                        ),
-                    }
-                });
-            }
         }
     }
 }
@@ -2067,37 +2222,34 @@ impl Drop for SqliteTransaction {
 #[async_trait]
 impl MetastoreTransaction for SqliteTransaction {
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
-            message: "Transaction already completed".to_string(),
-        })?;
+        let session = self.session()?;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
-        conn.call(move |conn| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
-            conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(|e| {
-            convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
-        })?;
+        session
+            .call(move |conn| {
+                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::ToSql)
+                    .collect();
+                conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(|e| {
+                convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
+            })?;
 
         Ok(())
     }
 
     async fn execute_many(&self, sql: &str, params: Vec<Vec<MetastoreValue>>) -> CatalogResult<()> {
-        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
-            message: "Transaction already completed".to_string(),
-        })?;
+        let session = self.session()?;
         let sql: Arc<str> = Arc::from(sql);
 
         // One `call` per chunk of rows: the statement is prepared once and each
-        // row is a step on the connection thread, not a channel round trip. A
+        // row is a step on the writer's thread, not a channel round trip. A
         // `call` runs to completion even if its caller stops waiting, so the
         // chunk bounds what a cancelled batch still executes under the write
         // lock before the transaction's `Drop` can roll it back.
@@ -2109,17 +2261,18 @@ impl MetastoreTransaction for SqliteTransaction {
                 .map(|row| row.into_iter().map(to_sqlite_value).collect())
                 .collect();
             let sql = Arc::clone(&sql);
-            conn.call(move |conn| {
-                let mut stmt = conn.prepare_cached(&sql)?;
-                for row in &chunk {
-                    stmt.execute(rusqlite::params_from_iter(row))?;
-                }
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await
-            .map_err(|e| {
-                convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
-            })?;
+            session
+                .call(move |conn| {
+                    let mut stmt = conn.prepare_cached(&sql)?;
+                    for row in &chunk {
+                        stmt.execute(rusqlite::params_from_iter(row))?;
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await
+                .map_err(|e| {
+                    convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
+                })?;
         }
 
         Ok(())
@@ -2129,119 +2282,94 @@ impl MetastoreTransaction for SqliteTransaction {
         &self,
         params: QueryRowParams<'_>,
     ) -> CatalogResult<Vec<MetastoreValue>> {
-        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
-            message: "Transaction already completed".to_string(),
-        })?;
+        let session = self.session()?;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
-        conn.call(move |conn| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
+        session
+            .call(move |conn| {
+                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::ToSql)
+                    .collect();
 
-            conn.prepare_cached(&sql)?
-                .query_row(params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+                conn.prepare_cached(&sql)?
+                    .query_row(params_refs.as_slice(), |row| {
+                        let column_count = row.as_ref().column_count();
+                        let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
+                        for i in 0..column_count {
+                            let value = row.get_ref(i)?;
+                            values.push(convert_sqlite_value(value));
+                        }
 
-                    Ok(values)
-                })
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to query row in transaction: {e}"),
-            },
-        )
+                        Ok(values)
+                    })
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to query row in transaction: {e}"),
+                },
+            )
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
-            message: "Transaction already completed".to_string(),
-        })?;
+        let session = self.session()?;
         let sql_owned = sql.to_string();
 
-        conn.call(move |conn| {
-            conn.execute_batch(&sql_owned)?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to execute batch in transaction: {e}"),
-            },
-        )?;
+        session
+            .call(move |conn| {
+                conn.execute_batch(&sql_owned)?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to execute batch in transaction: {e}"),
+                },
+            )?;
 
         Ok(())
     }
 
     async fn commit(mut self: Box<Self>) -> CatalogResult<()> {
-        let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
-            message: "Transaction already completed".to_string(),
-        })?;
+        let session = self.take_session()?;
 
-        let commit_result = conn
-            .call(|conn| {
-                conn.execute_batch("COMMIT")?;
-                Ok::<_, rusqlite::Error>(())
+        // COMMIT, and on a failed COMMIT the best-effort ROLLBACK that leaves the
+        // writer connection clean, run as the session's last statement: the
+        // next write starts only once both are done.
+        let commit_result = session
+            .finish(|conn| {
+                conn.execute_batch("COMMIT").inspect_err(|_| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                })
             })
             .await;
 
         // METRIC 1 (writer held): record AFTER the write lock is actually
-        // released. On success that is when COMMIT returns (the BEGIN IMMEDIATE
-        // lock is held through COMMIT's fsync, so a contending writer blocks
-        // until then). On a failed COMMIT the lock persists until the
-        // best-effort ROLLBACK below completes, so that path records after the
-        // rollback instead — recording any earlier under-reports the hold
-        // window the next writer queues behind (PR #11206 review).
-        match commit_result {
-            Ok(()) => {
-                telemetry::cayenne::track_metastore_writer_held(
-                    self.held_start.elapsed(),
-                    &[telemetry::KeyValue::new("txn", "other")],
-                );
-                Ok(())
-            }
-            Err(e) => {
-                // Best-effort rollback to leave the connection in a clean state.
-                let _ = conn
-                    .call(|conn| {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        Ok::<_, rusqlite::Error>(())
-                    })
-                    .await;
+        // released: when COMMIT returns (the BEGIN IMMEDIATE lock is held through
+        // COMMIT's fsync, so a contending writer blocks until then), or on a
+        // failed COMMIT once its ROLLBACK has run. Recording any earlier
+        // under-reports the hold window the next writer queues behind (PR #11206
+        // review).
+        telemetry::cayenne::track_metastore_writer_held(
+            self.held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
-                telemetry::cayenne::track_metastore_writer_held(
-                    self.held_start.elapsed(),
-                    &[telemetry::KeyValue::new("txn", "other")],
-                );
-
-                Err(CatalogError::Database {
-                    message: format!("Failed to commit transaction: {e}"),
-                })
-            }
-        }
+        commit_result.map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to commit transaction: {e}"),
+            },
+        )
     }
 
     async fn rollback(mut self: Box<Self>) -> CatalogResult<()> {
-        let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
-            message: "Transaction already completed".to_string(),
-        })?;
+        let session = self.take_session()?;
 
-        let rollback_result = conn
-            .call(|conn| {
-                conn.execute_batch("ROLLBACK")?;
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await;
+        let rollback_result = session.finish(|conn| conn.execute_batch("ROLLBACK")).await;
 
         // METRIC 1 (writer held): record AFTER ROLLBACK — the write lock is held
         // through the rollback statement, so include its duration (PR #11206).
@@ -2380,8 +2508,8 @@ mod tests {
 
     /// Writers queued behind a held write lock are granted it in the order they
     /// arrived. `SQLite`'s busy handler grants no order — each waiter wakes on its
-    /// own backoff and whoever retries first wins — so without the writer gate
-    /// this order is effectively random.
+    /// own backoff and whoever retries first wins — so without the writer
+    /// connection this order is effectively random.
     #[tokio::test]
     async fn test_writers_are_granted_the_write_lock_in_arrival_order() {
         const WRITERS: i64 = 16;
@@ -2508,14 +2636,13 @@ mod tests {
         ]
     }
 
-    /// A writer that waits out the busy timeout on the writer gate gets exactly
-    /// the error it gets when `SQLite`'s busy handler times out on a lock held
-    /// outside the gate — by another process — on every write path, including an
-    /// `UPDATE … RETURNING` issued as a query: the same message and the same
-    /// retryable `database is locked`. A read runs regardless of who holds the
-    /// gate.
+    /// A write that waits out its turn on the writer connection gets exactly the
+    /// error it gets when `SQLite`'s busy handler times out on a lock held by
+    /// another process, on every write path, including an `UPDATE … RETURNING`
+    /// issued as a query: the same message and the same retryable `database is
+    /// locked`. A read runs regardless of who holds the writer connection.
     #[tokio::test]
-    async fn test_a_writer_gate_timeout_reads_like_a_busy_timeout() {
+    async fn test_a_write_that_waits_out_its_turn_reads_like_a_busy_timeout() {
         let _guard = CONFIG_LOCK.lock().await;
         set_sqlite_metastore_config(SqliteMetastoreConfig {
             busy_timeout_ms: 200,
@@ -2534,21 +2661,22 @@ mod tests {
             .await
             .expect("seed row");
 
-        // Another process holds the write lock: every writer passes the gate
-        // and SQLite's busy handler times out.
+        // Another process holds the write lock: every write gets its turn on the
+        // writer connection, and SQLite's busy handler times out.
         let other_process =
             rusqlite::Connection::open(metastore.db_path()).expect("open a second connection");
         other_process
             .execute_batch("BEGIN IMMEDIATE")
-            .expect("take the write lock outside the gate");
+            .expect("take the write lock from another connection");
         let busy_timeouts = contended_write_errors(&metastore).await;
         other_process
             .execute_batch("ROLLBACK")
             .expect("release the write lock");
 
-        // An in-process writer holds it: every writer times out on the gate.
+        // An in-process transaction holds the writer connection: every write's
+        // turn fails to come in time.
         let holder = metastore.begin_transaction().await.expect("begin");
-        let gate_timeouts = contended_write_errors(&metastore).await;
+        let turn_timeouts = contended_write_errors(&metastore).await;
         let n = metastore
             .query_row(
                 QueryRowParams {
@@ -2558,15 +2686,15 @@ mod tests {
                 |row| row.get_i64(0),
             )
             .await
-            .expect("a read must not wait for the writer gate");
+            .expect("a read must not wait for the writer connection");
         holder.rollback().await.expect("rollback the holder");
         set_sqlite_metastore_config(SqliteMetastoreConfig::default());
 
         assert_eq!(
-            gate_timeouts, busy_timeouts,
-            "a writer gate timeout must read exactly like SQLite's busy timeout"
+            turn_timeouts, busy_timeouts,
+            "a write that waits out its turn must fail exactly like SQLite's busy timeout"
         );
-        for (path, message, retryable) in &gate_timeouts {
+        for (path, message, retryable) in &turn_timeouts {
             assert!(
                 *retryable && message.contains("database is locked"),
                 "{path}: a writer that waited out the busy timeout must see a retryable database is locked: {message}"
@@ -2575,10 +2703,11 @@ mod tests {
         assert_eq!(n, 0, "no contended write may have applied");
     }
 
-    /// Every metastore open on one file shares its writer gate, however the path
-    /// is spelled, so two catalogs on the same file queue their writers together.
+    /// Every metastore open on one file shares its writer connection, however
+    /// the path is spelled, so two catalogs on the same file queue their writes
+    /// together.
     #[tokio::test]
-    async fn test_metastores_on_one_file_share_the_writer_gate() {
+    async fn test_metastores_on_one_file_share_the_writer_connection() {
         let dir = tempfile::tempdir().expect("tempdir");
         let direct = SqliteMetastore::new(format!(
             "sqlite://{}",
@@ -2592,23 +2721,23 @@ mod tests {
             "sqlite://{}",
             dir.path().join("other.db").display()
         ));
-        let direct_gate = Arc::clone(&direct.pool().await.expect("pool").writer_gate);
-        let dotted_gate = Arc::clone(&dotted.pool().await.expect("pool").writer_gate);
-        let other_gate = Arc::clone(&other.pool().await.expect("pool").writer_gate);
+        let direct_writer = Arc::clone(&direct.pool().await.expect("pool").writer);
+        let dotted_writer = Arc::clone(&dotted.pool().await.expect("pool").writer);
+        let other_writer = Arc::clone(&other.pool().await.expect("pool").writer);
         assert!(
-            Arc::ptr_eq(&direct_gate, &dotted_gate),
-            "two spellings of one metastore file must share its writer gate"
+            Arc::ptr_eq(&direct_writer, &dotted_writer),
+            "two spellings of one metastore file must share its writer connection"
         );
         assert!(
-            !Arc::ptr_eq(&direct_gate, &other_gate),
-            "different metastore files must not share a writer gate"
+            !Arc::ptr_eq(&direct_writer, &other_writer),
+            "different metastore files must not share a writer connection"
         );
     }
 
-    /// A transaction dropped without commit or rollback releases the writer gate
-    /// once its rollback has run, so the next writer proceeds.
+    /// A transaction dropped without commit or rollback is rolled back on the
+    /// writer connection as its session ends, and the next writer proceeds.
     #[tokio::test]
-    async fn test_a_dropped_transaction_releases_the_writer_gate() {
+    async fn test_a_dropped_transaction_releases_the_writer_connection() {
         let (_dir, metastore) = temp_metastore();
         metastore
             .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -2640,6 +2769,150 @@ mod tests {
             "the dropped transaction's write must have been rolled back: {rows:?}"
         );
         next.rollback().await.expect("rollback");
+    }
+
+    async fn insert_id(metastore: &SqliteMetastore, id: i64) -> CatalogResult<()> {
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id) VALUES (?1)",
+                params: vec![MetastoreValue::Integer(id)],
+            })
+            .await
+    }
+
+    async fn ids(metastore: &SqliteMetastore) -> Vec<i64> {
+        metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT id FROM t ORDER BY id",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read ids")
+    }
+
+    /// A write whose turn does not come within the busy timeout fails with the
+    /// retryable `database is locked` and never runs, even once the writer
+    /// connection frees up, so a caller that retries it cannot apply it twice.
+    #[tokio::test]
+    async fn test_a_write_that_waits_out_its_turn_never_runs() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            busy_timeout_ms: 200,
+            ..SqliteMetastoreConfig::default()
+        });
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+        let error = insert_id(&metastore, 1)
+            .await
+            .expect_err("the write must not get its turn while a transaction holds the writer");
+        assert!(
+            crate::cayenne_catalog::is_retryable_write_conflict(&error),
+            "a write that waited out its turn must fail retryably: {error}"
+        );
+        holder.rollback().await.expect("rollback the holder");
+        // Queued after the timed-out write, so once it has run the writer
+        // connection has reached, and skipped, the timed-out one.
+        insert_id(&metastore, 2)
+            .await
+            .expect("a write after the holder ends");
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        assert_eq!(
+            ids(&metastore).await,
+            vec![2],
+            "the write that waited out its turn must never have run"
+        );
+    }
+
+    /// A write whose caller stops waiting before its turn, its future dropped,
+    /// never runs.
+    #[tokio::test]
+    async fn test_a_cancelled_write_never_runs() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            insert_id(&metastore, 1),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the write must still have been waiting for its turn when its caller left"
+        );
+        holder.rollback().await.expect("rollback the holder");
+        insert_id(&metastore, 2)
+            .await
+            .expect("a write after the holder ends");
+
+        assert_eq!(
+            ids(&metastore).await,
+            vec![2],
+            "a write whose caller went away before its turn must never run"
+        );
+    }
+
+    /// Writes waiting for their turn hold no pooled connection, so reads run
+    /// while more writes are queued than the pool has connections.
+    #[tokio::test]
+    async fn test_queued_writes_leave_the_pool_to_reads() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        let metastore = Arc::new(metastore);
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        let queued_writes = 2 * metastore.pool().await.expect("pool").conns.len();
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+        let writes: Vec<_> = (0..queued_writes)
+            .map(|id| {
+                let metastore = Arc::clone(&metastore);
+                let id = i64::try_from(id).expect("write id fits in i64");
+                tokio::spawn(async move { insert_id(&metastore, id).await })
+            })
+            .collect();
+        // On this current-thread runtime a yield lets every spawned write run up
+        // to its wait for a turn before the reads below start.
+        tokio::task::yield_now().await;
+        for _ in 0..queued_writes {
+            let read = tokio::time::timeout(std::time::Duration::from_secs(5), ids(&metastore))
+                .await
+                .expect("a read must not wait behind queued writes");
+            assert!(
+                read.is_empty(),
+                "no queued write may have run yet: {read:?}"
+            );
+        }
+        assert!(
+            writes.iter().all(|write| !write.is_finished()),
+            "every write must still be queued behind the transaction"
+        );
+
+        holder.rollback().await.expect("rollback the holder");
+        for write in writes {
+            write
+                .await
+                .expect("write task")
+                .expect("a queued write must run once the transaction ends");
+        }
+        assert_eq!(ids(&metastore).await.len(), queued_writes);
     }
 
     /// Cayenne memory mode: an in-memory (memdb) metastore must be usable and,
