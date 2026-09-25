@@ -35441,12 +35441,19 @@ impl TableProvider for CayenneTableProvider {
             )
             .await;
 
-        // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
-        // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT
-        // byte-range-split the matching file across N file_groups. The fan-out
-        // pays per-group Vortex footer-open cost (~50 µs each) without speeding
-        // up the lookup because only one chunk in one file_group actually
-        // contains K. See `pk_lookup_file_group_fanout` bench.
+        // A PK point lookup (e.g. `WHERE pk_col = K`) must not be byte-range-split
+        // across N file_groups: only one chunk of one file can contain K, so each
+        // extra split pays a Vortex footer-open for nothing. `disable_repartition`
+        // below suppresses exactly that, by reporting
+        // `supports_repartitioning() == false` on the Vortex source - the gate the
+        // physical optimizer honours. See the `pk_lookup_file_group_fanout` bench.
+        //
+        // The listing keeps the session's `target_partitions`, so `split_files` gives
+        // each matching file its own group. Byte-range splitting and file-level
+        // distribution are separate concerns: a lookup whose key is not pruned down
+        // to a single file still has one open per surviving file to perform, and
+        // listing them as one group leaves a single partition to do all of them in
+        // series.
         let index_selected = lookup_resolution
             .as_ref()
             .is_some_and(|(selection, _)| selection.is_some());
@@ -35455,13 +35462,7 @@ impl TableProvider for CayenneTableProvider {
             .map_or((None, None), |(selection, explain)| {
                 (selection, Some(explain))
             });
-        let scan_listing_config_override;
-        let scan_listing_config = if is_pk_selective_scan {
-            scan_listing_config_override = state.config().clone().with_target_partitions(1);
-            &scan_listing_config_override
-        } else {
-            state.config()
-        };
+        let scan_listing_config = state.config();
 
         // `current_snapshot_id` was captured under the read fence in
         // `capture_raw_scan_input` (#10125 §6.4) and pinned by `scan_guard`, so the
@@ -48080,6 +48081,124 @@ mod tests {
              byte-range-splitting the selective scan"
         );
     }
+
+    /// REGRESSION — a PK point lookup across several surviving files must open
+    /// them in parallel. Suppressing the byte-range split is right: only one chunk
+    /// of one file can hold the key. Listing those files as a single group is not,
+    /// because it leaves one partition to open every one of them in series, which
+    /// costs more than the fan-out it avoids.
+    ///
+    /// The ids are strided across files, so every file's min/max spans the probe
+    /// and file-level statistics prune none of them — the case a table sorted by
+    /// its key would not hit, and a freshly ingested one does.
+    #[tokio::test]
+    async fn pk_point_lookup_opens_surviving_files_in_parallel() {
+        fn max_leaf_partitions(plan: &dyn ExecutionPlan) -> usize {
+            let children = plan.children();
+            if children.is_empty() {
+                return plan.properties().output_partitioning().partition_count();
+            }
+            children
+                .into_iter()
+                .map(|c| max_leaf_partitions(&**c))
+                .max()
+                .unwrap_or(0)
+        }
+
+        const FILES: i64 = 6;
+        const ROWS_PER_FILE: i64 = 5_000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let mut config = SessionConfig::new().with_target_partitions(16);
+        config.options_mut().optimizer.repartition_file_min_size = 1;
+        let ctx = SessionContext::new_with_config(config);
+
+        // inline_max_rows = 0 ⇒ every insert lands as an on-disk Vortex file.
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_multifile_regression",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for file in 0..FILES {
+            let ids: Vec<i64> = (0..ROWS_PER_FILE).map(|i| i * FILES + file).collect();
+            let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ids)),
+                    Arc::new(Int64Array::from_iter_values(values)),
+                ],
+            )
+            .expect("batch built");
+            insert_batch_with_context(&ctx, &provider, batch).await;
+        }
+
+        let target_id = (ROWS_PER_FILE / 2) * FILES + 3;
+        let sel_filter = Expr::Column(datafusion_common::Column::new_unqualified("id")).eq(
+            Expr::Literal(datafusion_common::ScalarValue::Int64(Some(target_id)), None),
+        );
+        assert!(
+            provider.is_pk_selective_scan(std::slice::from_ref(&sel_filter)),
+            "the probe must take the PK-selective path for this test to mean anything"
+        );
+
+        let provider = Arc::new(provider);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register table");
+        let plan = ctx
+            .sql(&format!("SELECT value FROM t WHERE id = {target_id}"))
+            .await
+            .expect("selective sql")
+            .create_physical_plan()
+            .await
+            .expect("selective physical plan");
+        let groups = max_leaf_partitions(plan.as_ref());
+
+        assert!(
+            groups > 1,
+            "a point lookup over {FILES} files that statistics cannot prune planned \
+             {groups} scan partition(s): every file is opened in series on one partition"
+        );
+        assert!(
+            groups <= usize::try_from(FILES).expect("file count fits usize"),
+            "a point lookup planned {groups} scan partitions for {FILES} files, so the \
+             file groups were byte-range-split after all"
+        );
+
+        // The rows themselves must not change with the partitioning.
+        let rows = ctx
+            .sql(&format!("SELECT value FROM t WHERE id = {target_id}"))
+            .await
+            .expect("selective sql")
+            .collect()
+            .await
+            .expect("selective collect");
+        let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 1, "the probe matches exactly one row");
+        let value = rows
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .expect("a batch with the row")
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column is Int64")
+            .value(0);
+        assert_eq!(value, target_id * 10, "the row must carry its own value");
+    }
+
 
     /// Small file groups opt the Vortex source out of `repartition_file_scans`
     /// on internal/protected-snapshot scan plans: byte-range-splitting a small
