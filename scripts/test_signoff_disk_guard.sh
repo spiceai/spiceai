@@ -1720,6 +1720,21 @@ assert_describe_fits() {
     fail_test "$name: the verdict must carry the whole login: '${output}'"
     return
   fi
+  # Fitting is not enough: the helper cuts an over-long message at a word
+  # boundary, which keeps the verdict inside the cap while silently dropping
+  # its tail — the remedy. The verdict at the longest login has to be the
+  # short-login verdict with only the login swapped.
+  local short
+  short="$(call_subject \
+    "describe_check_failure ${check_status} 999999 someone
+     printf '%s' \"\$SIGNOFF_FAILURE_STATUS_DESC\"" \
+    "$@")"
+  short="${short#*|}"
+  local desc="${output#*DESC[}"; desc="${desc%]*}"
+  if [[ "$desc" != "${short/(triggered by someone)/(triggered by ${login})}" ]]; then
+    fail_test "$name: the verdict is cut at the longest login — its message must fit whole: '${desc}' vs '${short}'"
+    return
+  fi
   echo "  ok: $name"
 }
 readonly LONGEST_LOGIN_LEN=39
@@ -1824,10 +1839,10 @@ assert_describe "declines the missing-target verdict for a signalled run" 71 "" 
 # as a check failure it sends them looking for a lint denial in a log containing
 # no compilation. The remedy has to be in the description itself.
 assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
-  "Cargo.lock stale after 21195s — checks not run; run cargo update --workspace and commit (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; cargo update --workspace, commit (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "names the command that regenerates the lockfile" 72 \
-  "Cargo.lock stale after 21195s — checks not run; run cargo update --workspace and commit (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; cargo update --workspace, commit (triggered by someone)" \
   "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # And, as for missing-target, "no verdict" outranks naming a cause.
 assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
