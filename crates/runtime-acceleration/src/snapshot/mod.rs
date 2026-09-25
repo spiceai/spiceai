@@ -2238,7 +2238,7 @@ impl SnapshotManager {
     /// Downloads a snapshot directly to a single file (for file-based accelerators).
     async fn download_to_file(
         &self,
-        local_path: &PathBuf,
+        local_path: &Path,
         get_result: GetResult,
         entry: &SnapshotEntry,
         path_display: &str,
