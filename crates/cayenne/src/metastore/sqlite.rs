@@ -639,7 +639,7 @@ impl Writer {
     /// when `abort` runs (a transaction's `ROLLBACK`) with the instant `start`
     /// returned.
     async fn session(
-        &self,
+        self: &Arc<Self>,
         start: fn(&mut rusqlite::Connection) -> Result<(), rusqlite::Error>,
         abort: fn(&mut rusqlite::Connection, std::time::Instant),
     ) -> Result<Session, tokio_rusqlite::Error<rusqlite::Error>> {
@@ -687,7 +687,10 @@ impl Writer {
             Err(_) => started.await,
         };
         match started {
-            Ok(Ok(())) => Ok(Session { jobs }),
+            Ok(Ok(())) => Ok(Session {
+                jobs,
+                _writer: Arc::clone(self),
+            }),
             Ok(Err(e)) => Err(tokio_rusqlite::Error::Error(e)),
             Err(_) => Err(tokio_rusqlite::Error::ConnectionClosed),
         }
@@ -698,6 +701,11 @@ impl Writer {
 /// Dropping it ends the session with the `abort` it was started with.
 struct Session {
     jobs: std::sync::mpsc::Sender<SessionJob>,
+    /// Keeps the writer connection registered for as long as the session
+    /// runs, even past the metastore that began it, so a metastore opened on
+    /// the same file meanwhile queues its writes on this connection instead of
+    /// opening a second one.
+    _writer: Arc<Writer>,
 }
 
 impl Session {
@@ -2938,6 +2946,36 @@ mod tests {
             n, 11,
             "the CTE write must run in its turn on the writer, before the write queued after it (1 × 10 + 1)"
         );
+    }
+
+    /// A transaction keeps its writer connection registered after the metastore
+    /// that began it is dropped, so the next metastore opened on the file is
+    /// handed that same connection rather than a second one.
+    #[tokio::test]
+    async fn test_a_transaction_keeps_its_writer_registered_past_its_metastore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cayenne.db");
+        let first = SqliteMetastore::new(format!("sqlite://{}", path.display()));
+        let writer = Arc::clone(&first.pool().await.expect("pool").writer);
+        let session = writer
+            .session(begin_immediate, roll_back)
+            .await
+            .expect("begin");
+        let registered = Arc::downgrade(&writer);
+        drop(writer);
+        drop(first);
+
+        let key = writer_key(path.to_str().expect("utf-8 path")).await;
+        let slot = Arc::clone(WRITERS.lock().get(&key).expect("the file's writer slot"));
+        let handed_out = slot.lock().await.upgrade();
+        let registered = registered
+            .upgrade()
+            .expect("an open transaction must keep its writer connection alive");
+        assert!(
+            handed_out.is_some_and(|writer| Arc::ptr_eq(&writer, &registered)),
+            "the file's slot must still hand out the open transaction's writer connection"
+        );
+        drop(session);
     }
 
     /// A symlink to a metastore file shares its target's writer connection, so
