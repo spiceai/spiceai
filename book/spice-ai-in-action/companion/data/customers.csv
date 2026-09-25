@@ -1,0 +1,6 @@
+customer_id,tenant_id,customer_name,region
+1,north,Ada Outfitters,west
+2,north,Birch Books,east
+3,south,Cedar Cycles,west
+4,south,Dune Design,east
+5,north,Elm Studio,west
