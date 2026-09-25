@@ -21587,9 +21587,7 @@ impl CayenneTableProvider {
             }
 
             // Persist accumulated stats from the rewrite — keeps DataFusion's
-            // synchronous statistics path consistent with the new snapshot. The
-            // rewrite's count is authoritative only if it folded every protected
-            // snapshot; one published during the re-encode was retained above.
+            // synchronous statistics path consistent with the new snapshot.
             self.persist_table_stats_after_snapshot_rewrite(&stats_acc)
                 .await;
         };
@@ -26541,13 +26539,14 @@ impl CayenneTableProvider {
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         let new_rows = accumulator.row_count();
-        if self.protected_snapshots.load().is_empty() {
-            self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
-                .await;
+        let folded_every_snapshot = self.protected_snapshots.load().is_empty();
+        let num_rows_update = if folded_every_snapshot {
+            RowCountUpdate::Set(new_rows)
         } else {
-            self.persist_table_stats_locked(accumulator, RowCountUpdate::Estimate(new_rows), false)
-                .await;
-        }
+            RowCountUpdate::Estimate(new_rows)
+        };
+        self.persist_table_stats_locked(accumulator, num_rows_update, folded_every_snapshot)
+            .await;
     }
 
     /// Abandon a statistics update, arming the row-count taint on the way out.
@@ -39827,30 +39826,18 @@ mod tests {
         }
     }
 
-    /// A full rewrite that retains a protected snapshot published during its
-    /// re-encode must not re-declare the count `Exact`.
-    ///
-    /// The rewrite counts only the rows it materialized. The late snapshot's rows
-    /// are live too, and its commit's live-rows delta was already folded into the
-    /// count the rewrite then replaced — so `Set`ting the rewrite's count serves a
-    /// number short by that snapshot's rows as `Exact`, which a distributed
-    /// `COUNT(*)` folds. Found by `prop_concurrent_mixed_key_sqlite`, which served
-    /// `Exact(15)` with 16 rows live.
-    ///
-    /// Driven in key mode, where an insert can publish inside the window. A
-    /// position-delete rewrite holds `write_lock` throughout, so there only a
-    /// mem-tier checkpoint can publish mid-rewrite (#11477); the fix does not
-    /// depend on the rewrite scope, so it covers that publisher too.
-    #[tokio::test]
-    async fn key_rewrite_retaining_a_late_snapshot_serves_no_short_exact_count() {
-        let table_name = "key_rewrite_late_snapshot_count";
-        let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+    /// A key-deletion CDC upsert table holding three rows, each written into its
+    /// own file-backed protected snapshot, with its statistics persisted and the
+    /// background compactor pinned out so only explicit rewrites run.
+    async fn seeded_key_rewrite_table(
+        table_name: &str,
+        ctx: &SessionContext,
+    ) -> (CayenneTableProvider, TempDir) {
+        let (provider, _catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
             table_name,
             ctx.runtime_env(),
             VortexConfig {
                 deletion_mode: crate::metadata::DeletionMode::Key,
-                // Every write lands in a file-backed protected snapshot.
                 inline_max_rows: 0,
                 compaction_background_interval_ms: 3_600_000,
                 ..VortexConfig::default()
@@ -39869,6 +39856,28 @@ mod tests {
             .flush_pending_maintenance()
             .await
             .expect("persist the baseline statistics");
+        (provider, tmp)
+    }
+
+    /// A full rewrite that retains a protected snapshot published during its
+    /// re-encode must not re-declare the count `Exact`.
+    ///
+    /// The rewrite counts only the rows it materialized. The late snapshot's rows
+    /// are live too, and its commit's live-rows delta was already folded into the
+    /// count the rewrite then replaced — so `Set`ting the rewrite's count serves a
+    /// number short by that snapshot's rows as `Exact`, which a distributed
+    /// `COUNT(*)` folds. Found by `prop_concurrent_mixed_key_sqlite`, which served
+    /// `Exact(15)` with 16 rows live.
+    ///
+    /// Driven in key mode, where an insert can publish inside the window. A
+    /// position-delete rewrite holds `write_lock` throughout, so there only a
+    /// mem-tier checkpoint can publish mid-rewrite (#11477); the fix does not
+    /// depend on the rewrite scope, so it covers that publisher too.
+    #[tokio::test]
+    async fn key_rewrite_retaining_a_late_snapshot_serves_no_short_exact_count() {
+        let table_name = "key_rewrite_late_snapshot_count";
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table(table_name, &ctx).await;
 
         // Mid-rewrite: publish one more protected snapshot and fold its delta into
         // the persisted count, as the post-write maintenance loop does
@@ -39935,29 +39944,7 @@ mod tests {
     async fn key_rewrite_folding_every_snapshot_restores_an_exact_count() {
         let table_name = "key_rewrite_no_late_snapshot_count";
         let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            table_name,
-            ctx.runtime_env(),
-            VortexConfig {
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 0,
-                compaction_background_interval_ms: 3_600_000,
-                ..VortexConfig::default()
-            },
-        )
-        .await;
-        let schema = provider.table_schema();
-        for i in 0..3i64 {
-            insert_batch(
-                &provider,
-                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
-            )
-            .await;
-        }
-        provider
-            .flush_pending_maintenance()
-            .await
-            .expect("persist the baseline statistics");
+        let (provider, _tmp) = seeded_key_rewrite_table(table_name, &ctx).await;
 
         let rewrote = provider
             .rewrite_current_snapshot_for_compaction()
