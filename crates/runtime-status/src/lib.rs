@@ -359,6 +359,18 @@ impl RuntimeStatus {
         self.get_component_status(&format!("dataset:{dataset}"))
     }
 
+    /// Returns the current status of a single model, if registered.
+    #[must_use]
+    pub fn get_model_status(&self, model_name: &str) -> Option<ComponentStatus> {
+        self.get_component_status(&format!("model:{model_name}"))
+    }
+
+    /// Returns the current status of a single embedding model, if registered.
+    #[must_use]
+    pub fn get_embedding_status(&self, model_name: &str) -> Option<ComponentStatus> {
+        self.get_component_status(&format!("embedding:{model_name}"))
+    }
+
     /// Returns `true` if the dataset has reported `Ready` at least once since it was
     /// registered. A refresh task reports `Refreshing` from the moment a load starts,
     /// including the first one, so this is what tells a refresh of loaded data apart

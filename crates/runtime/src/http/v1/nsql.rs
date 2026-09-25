@@ -597,13 +597,9 @@ pub(crate) async fn handle_nsql_query(
     let nql_model = {
         let models = llms.read().await;
         let Some(nql_model) = models.get(&model) else {
-            let message = unavailable_model_message(
-                &model,
-                rt.status()
-                    .get_component_status(&format!("model:{model}"))
-                    .as_ref(),
-            )
-            .unwrap_or_else(|| format!("Model {model} not found"));
+            let message =
+                unavailable_model_message(&model, rt.status().get_model_status(&model).as_ref())
+                    .unwrap_or_else(|| format!("Model {model} not found"));
             return (StatusCode::BAD_REQUEST, headers, message);
         };
         Arc::clone(nql_model)

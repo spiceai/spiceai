@@ -209,7 +209,7 @@ pub(crate) async fn post(
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
             let message = unavailable_model_message(
                 &model_id,
-                rt.status().get_component_status(&format!("model:{model_id}")).as_ref(),
+                rt.status().get_model_status(&model_id).as_ref(),
             )
             .unwrap_or_else(|| format!("model '{model_id}' not found"));
             return (StatusCode::NOT_FOUND, message).into_response();

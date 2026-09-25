@@ -105,9 +105,7 @@ pub(crate) async fn post(
         None => {
             let message = unavailable_model_message(
                 &model_id,
-                status
-                    .get_component_status(&format!("embedding:{model_id}"))
-                    .as_ref(),
+                status.get_embedding_status(&model_id).as_ref(),
             )
             .unwrap_or_else(|| "model not found".to_string());
             (StatusCode::NOT_FOUND, message).into_response()

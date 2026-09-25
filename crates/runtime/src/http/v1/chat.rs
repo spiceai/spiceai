@@ -178,7 +178,7 @@ pub(crate) async fn post(
                 } else {
                     let message = unavailable_model_message(
                         &model_id,
-                        status.get_component_status(&format!("model:{model_id}")).as_ref(),
+                        status.get_model_status(&model_id).as_ref(),
                     )
                     .unwrap_or_else(|| format!("model '{model_id}' not found"));
                     (StatusCode::NOT_FOUND, message).into_response()

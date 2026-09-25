@@ -136,9 +136,8 @@ pub(crate) async fn require_write_access() -> Option<Response> {
 ///
 /// A model that failed to load, or has not finished loading, is never inserted into its serving
 /// store, so a lookup miss alone reads as "no such model" and sends the user to check a name that
-/// is correct. `status` is the model's entry in the runtime status (`model:<name>` or
-/// `embedding:<name>`). Returns `None` when the status gives no better explanation, and the caller
-/// keeps its own "not found" message.
+/// is correct. `status` is the model's runtime status. Returns `None` when the status gives no
+/// better explanation, and the caller keeps its own "not found" message.
 pub(crate) fn unavailable_model_message(
     model_id: &str,
     status: Option<&ComponentStatus>,
@@ -154,7 +153,7 @@ pub(crate) fn unavailable_model_message(
         ComponentStatus::Initializing
         | ComponentStatus::NotLoaded
         | ComponentStatus::Refreshing => Some(format!(
-            "Model '{model_id}' is still loading. Retry once `GET /v1/models?status=true` reports it as ready."
+            "Model '{model_id}' is still loading. Retry once it is ready."
         )),
         ComponentStatus::Ready | ComponentStatus::Disabled | ComponentStatus::ShuttingDown => None,
     }
@@ -1334,9 +1333,7 @@ mod tests {
         ] {
             assert_eq!(
                 unavailable_model_message("m", Some(&loading)).as_deref(),
-                Some(
-                    "Model 'm' is still loading. Retry once `GET /v1/models?status=true` reports it as ready."
-                ),
+                Some("Model 'm' is still loading. Retry once it is ready."),
                 "{loading:?}"
             );
         }
