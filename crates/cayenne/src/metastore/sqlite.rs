@@ -27,7 +27,7 @@ use super::{
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
@@ -443,34 +443,44 @@ struct Writer {
 /// write or session queued there is left to run.
 type WriterSlot = Arc<Mutex<std::sync::Weak<Writer>>>;
 static WRITERS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, WriterSlot>>,
+    parking_lot::Mutex<std::collections::HashMap<WriterKey, WriterSlot>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// The database a writer connection is for.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum WriterKey {
+    /// A memory-mode URI, which already names its database.
+    Memory(String),
+    /// A file, by its canonical path, kept as a path: a path need not be UTF-8,
+    /// and converting it to a string loses the bytes that tell two files apart.
+    File(PathBuf),
+}
 
 /// Names a metastore file so every path to it shares a writer connection: its
 /// canonical path, with every symlink resolved, the file's own included, so a
 /// symlink to a metastore file shares its target's writer. A file that does
 /// not exist yet has no path to resolve, and is named by its canonical parent
-/// directory joined with its file name. A memory-mode URI already names its
-/// database.
-async fn writer_key(db_path: &str) -> String {
+/// directory joined with its file name.
+async fn writer_key(db_path: &str) -> WriterKey {
     if is_memory_db_path(db_path) {
-        return db_path.to_string();
+        return WriterKey::Memory(db_path.to_string());
     }
     if let Ok(file) = tokio::fs::canonicalize(db_path).await {
-        return file.to_string_lossy().into_owned();
+        return WriterKey::File(file);
     }
     let path = Path::new(db_path);
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return db_path.to_string();
+        return WriterKey::File(path.to_path_buf());
     };
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
         parent
     };
-    tokio::fs::canonicalize(parent).await.map_or_else(
-        |_| db_path.to_string(),
-        |dir| dir.join(name).to_string_lossy().into_owned(),
+    WriterKey::File(
+        tokio::fs::canonicalize(parent)
+            .await
+            .map_or_else(|_| path.to_path_buf(), |dir| dir.join(name)),
     )
 }
 
@@ -3438,6 +3448,28 @@ mod tests {
         assert!(
             Arc::ptr_eq(&target_writer, &alias_writer),
             "a symlink to a metastore file must share its target's writer connection"
+        );
+    }
+
+    /// Two files whose canonical paths differ only in bytes that are not UTF-8
+    /// are two databases, so they get two writer keys. As strings the paths
+    /// read alike, which would hand the second file's writes to the first
+    /// file's writer connection.
+    #[cfg(unix)]
+    #[test]
+    fn test_writer_keys_keep_paths_that_are_not_utf8_apart() {
+        use std::os::unix::ffi::OsStrExt;
+        let first = PathBuf::from(std::ffi::OsStr::from_bytes(b"/metastore/\xff.db"));
+        let second = PathBuf::from(std::ffi::OsStr::from_bytes(b"/metastore/\xfe.db"));
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "the two paths must read alike as strings for this test to mean anything"
+        );
+        assert_ne!(
+            WriterKey::File(first),
+            WriterKey::File(second),
+            "two files must never share a writer key"
         );
     }
 

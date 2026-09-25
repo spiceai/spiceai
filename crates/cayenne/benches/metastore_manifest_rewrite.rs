@@ -42,9 +42,12 @@ limitations under the License.
 //! - `get_snapshot_files n=100 while writers upsert` — a scan's manifest read
 //!   of a 100-file snapshot on 4 reader tasks, while every client upserts its
 //!   own table's statistics in a loop: what planning a query waits for while
-//!   commits contend for the write lock. Reads take no write lock, but they
-//!   share the metastore's connection pool with the writers. Only the reads
-//!   are reported, so here the client count is the number of writers.
+//!   commits contend for the write lock. Reads take no write lock and run on
+//!   the metastore's read connections, while writes queue on its writer
+//!   connection, so the lane shows what writers still cost a read; a build
+//!   whose writers wait for the lock on pooled connections makes each waiting
+//!   writer hold a connection a read needs. Only the reads are reported, so
+//!   here the client count is the number of writers.
 //! - `upsert_table_statistics at 2,000/s` — the per-commit upsert offered open
 //!   loop: 2,000 commits a second in all, arriving as a Poisson process, each
 //!   handed to a random client and timed from its arrival, so a commit that
