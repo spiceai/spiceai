@@ -2997,13 +2997,15 @@ mod tests {
             .collect()
             .await
             .expect("run the weekday extraction");
-        let rendered = arrow::util::pretty::pretty_format_batches(&batches)
-            .expect("format the weekday extraction")
-            .to_string();
-        assert!(
-            rendered.contains("| 0            | 0           |"),
-            "date_part('dow') and EXTRACT(DOW) must both count Sunday as 0, got {rendered}"
-        );
+        // Both spellings must count Sunday as 0.
+        let expected = [
+            "+---------------+-------------+",
+            "| via_date_part | via_extract |",
+            "+---------------+-------------+",
+            "| 0             | 0           |",
+            "+---------------+-------------+",
+        ];
+        datafusion::assert_batches_eq!(&expected, &batches);
 
         // A time argument is what Spark's signature cannot take.
         let over_a_time = df
