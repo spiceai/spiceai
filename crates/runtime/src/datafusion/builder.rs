@@ -2652,6 +2652,110 @@ mod tests {
         );
     }
 
+    /// The built session keeps the **built-in** `factorial`, not Spark's.
+    ///
+    /// Spark's signature is `Exact(Int32)` and an integer literal is `Int64`,
+    /// so once Spark's was registered over the built-in, `factorial(5)` — the
+    /// documented spelling — did not plan at all; only
+    /// `factorial(CAST(5 AS INT))` did (regression test for #14361).
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_factorial() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let planned = df.ctx.sql("SELECT factorial(5) AS v").await;
+        assert!(
+            planned.is_ok(),
+            "factorial over an integer literal must plan; Spark's Exact(Int32) \
+             signature refuses the Int64 literal: {:?}",
+            planned.err()
+        );
+        let batches = planned
+            .expect("planned above")
+            .collect()
+            .await
+            .expect("run factorial");
+        let rendered = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format factorial")
+            .to_string();
+        assert!(
+            rendered.contains("| 120 |"),
+            "factorial(5) must be 120, got {rendered}"
+        );
+    }
+
+    /// The built session keeps the **built-in** `concat`, not Spark's.
+    ///
+    /// The built-in ignores a NULL argument, as the SQL reference documents
+    /// and as `PostgreSQL`, `DuckDB`, `MySQL` and `SQLite` answer, so
+    /// `concat('a', NULL, 'b')` is `'ab'`. Spark's, registered over it,
+    /// propagated the NULL and answered NULL (regression test for #14361).
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_concat() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let batches = df
+            .ctx
+            .sql("SELECT concat('a', NULL, 'b') AS v")
+            .await
+            .expect("plan concat over a NULL argument")
+            .collect()
+            .await
+            .expect("run concat over a NULL argument");
+        let rendered = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format concat")
+            .to_string();
+        assert!(
+            rendered.contains("| ab |"),
+            "concat must ignore the NULL argument and answer 'ab', got {rendered}"
+        );
+    }
+
+    /// The built session keeps the **built-in** `ceil`, whose result over a
+    /// float is a float.
+    ///
+    /// Spark's `ceil` returns `Int64` for a `Float64` argument. That is the
+    /// return-type class of collision: a local kernel whose type differs from
+    /// the built-in's is not a wrong value but a schema the federated
+    /// rendering does not produce, which surfaces as an internal assertion
+    /// rather than a function error (regression test for #14361).
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_ceil_type() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let batches = df
+            .ctx
+            .sql("SELECT ceil(1.5) AS c")
+            .await
+            .expect("plan ceil over a float")
+            .collect()
+            .await
+            .expect("run ceil over a float");
+        let batch = batches.first().expect("one batch");
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Float64,
+            "ceil over a Float64 must stay Float64, as the built-in answers"
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(windows))]
     async fn the_built_session_concatenates_an_untyped_null() {
