@@ -1990,7 +1990,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .run()
             .await
             .map_err(|source| query_error(&source))?;
-        bounded_arrow_ipc(result.data, effective_max_rows(max_rows)).await
+        // Cloud Connect encodes owned batches to Arrow IPC. Match Stream vs
+        // CachedRaw the same way QueryEngine does (via `into_source` inside
+        // `into_record_batch_stream`); HTTP/Flight keep the Arc path with
+        // `into_source` directly.
+        bounded_arrow_ipc(
+            result.into_record_batch_stream(),
+            effective_max_rows(max_rows),
+        )
+        .await
     }
 }
 

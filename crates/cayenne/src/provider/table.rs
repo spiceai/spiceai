@@ -38,7 +38,7 @@ use super::delete::{
     DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling,
     Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
-use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
+use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
     OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
     PostWriteMaintenanceState, PublishedLiveRowsDelta, RetentionFailureAction, RetentionPass,
@@ -162,6 +162,7 @@ use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use vortex_datafusion::VortexAccessPlanProvider;
+use vortex_datafusion::VortexRuntimeAccessPlanProvider;
 use vortex_datafusion::VortexWriteObserver;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -1231,6 +1232,13 @@ struct RawScanInput {
     /// Current snapshot id captured under the read fence and pinned against GC
     /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
+    /// The secondary index published when this view was captured. A full
+    /// refresh publishes its index inside the same fenced flip that makes its
+    /// snapshot visible, so this is never an index for a newer snapshot than
+    /// [`Self::current_snapshot_id`]. Every lookup this view plans, including one
+    /// probed by a join long after planning, uses this index, so an index a
+    /// refresh publishes mid-query is never mistaken for a stale one.
+    lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
     /// Warm files captured under the same fence as the inline and deletion views.
     /// A checkpoint may add files to the same directory after capture; those files
     /// must not be unioned with this view's pre-checkpoint inline rows.
@@ -1293,6 +1301,10 @@ impl RawScanInput {
             deletion_index_ptr: self.deletion_snapshot.index_ptr(),
             protected_map_ptr: Arc::as_ptr(&self.protected_map).addr(),
             inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
+            lookup_index_ptr: self
+                .lookup_index
+                .as_ref()
+                .map(|index| Arc::as_ptr(index).addr()),
         }
     }
 }
@@ -1356,6 +1368,9 @@ struct ScanViewKey {
     deletion_index_ptr: Option<usize>,
     protected_map_ptr: usize,
     inlined_view_ptr: usize,
+    /// A background build publishing for the same snapshot must mint a new
+    /// view, or cached views would keep scanning without it.
+    lookup_index_ptr: Option<usize>,
 }
 
 /// A scan-ready, internally-consistent view of the table: a [`RawScanInput`]
@@ -3191,10 +3206,11 @@ const FOOTPRINT_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Floor on how often the cheap in-memory gauges are sampled.
 ///
-/// They cost atomic loads and one `try_lock`, so the compaction tick (30 s by
-/// default) never trips this. It bounds the OTHER driver: the post-write
-/// maintenance loop fires on a ~100 ms debounce, and without a floor these would
-/// re-emit ~20 gauges — and re-walk the inline cache — on every write burst, for
+/// All but one cost atomic loads and one `try_lock`, so the compaction tick
+/// (30 s by default) never trips this. It bounds the OTHER driver: the
+/// post-write maintenance loop fires on a ~100 ms debounce, and without a floor
+/// these would re-emit ~20 gauges — and re-walk the inline cache, the one
+/// sample heavy enough to run on the blocking pool — on every write burst, for
 /// values a scrape reads at most once a second.
 const IN_MEMORY_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -8501,6 +8517,9 @@ impl CayenneTableProvider {
         // table, which writes no files — over its rows where they live.
         let index_keys =
             validated_lookup_index_keys(table_name, &table_metadata.schema, &secondary_indexes)?;
+        // Shared with the lookup index, which invalidates cached scan views when
+        // its published index changes.
+        let scan_input_version = Arc::new(AtomicU64::new(0));
         let (lookup_index, mem_tier_index) = if table_metadata.vortex_config.memory_mode {
             (
                 None,
@@ -8518,6 +8537,7 @@ impl CayenneTableProvider {
                     index_keys,
                     Arc::clone(&context.runtime_env().memory_pool),
                     Arc::clone(&table_memory),
+                    Arc::clone(&scan_input_version),
                 ),
                 None,
             )
@@ -8624,7 +8644,7 @@ impl CayenneTableProvider {
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             scan_view_cache: Arc::new(ScanViewCache::default()),
             weak_self: Arc::new(std::sync::OnceLock::new()),
-            scan_input_version: Arc::new(AtomicU64::new(0)),
+            scan_input_version,
             structural_version: Arc::new(
                 crate::provider::structural_version::StructuralVersion::new(),
             ),
@@ -9825,7 +9845,7 @@ impl CayenneTableProvider {
             self.sample_pk_index_metrics();
             self.sample_write_shape_metrics();
             self.sample_memory_account_metrics();
-            self.sample_inline_cache_metrics();
+            self.sample_inline_cache_metrics().await;
             self.sample_in_memory_tier_metrics();
             guard.succeeded();
         }
@@ -9920,23 +9940,52 @@ impl CayenneTableProvider {
     ///
     /// An off-pool derived cache: no budget bounds it and nothing registered it
     /// against the query pool, so it was resident memory with no gauge at all.
-    /// `get_array_memory_size` is per batch, not per row, so this is cheap even
-    /// on a large inline corpus.
-    fn sample_inline_cache_metrics(&self) {
-        let cache = self.inlined_cache.load();
-        let bytes: usize = cache
-            .batches
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .fold(0, usize::saturating_add);
+    async fn sample_inline_cache_metrics(&self) {
+        // One `Arc`, so the byte figure and the batch count cannot come from
+        // either side of a concurrent cache swap and manufacture a per-batch
+        // size that no cache ever held. Cloning it is a refcount bump — which
+        // is what `InlinedCache::batches` is `Arc`'d for — so handing the
+        // corpus to another thread costs nothing.
+        let batches = Arc::clone(&self.inlined_cache.load().batches);
+        let count = u64::try_from(batches.len()).unwrap_or(u64::MAX);
+        // Off the runtime. The walk is O(buffers in the corpus) — 477 µs over a
+        // 57-batch corpus, and the corpus reaches `INLINE_FLUSH_MAX_ROWS` — well
+        // past the ~100 µs an async task may hold a worker before it starves
+        // `/health`, and paid per table on every tick.
+        let Ok(bytes) =
+            tokio::task::spawn_blocking(move || inlined_cache::resident_bytes(&batches)).await
+        else {
+            // The blocking pool is gone (shutdown). Publish nothing rather than
+            // a figure for a cache that was never walked.
+            return;
+        };
         telemetry::cayenne::track_inline_cache(
             u64::try_from(bytes).unwrap_or(u64::MAX),
-            u64::try_from(cache.batches.len()).unwrap_or(u64::MAX),
+            count,
             &[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
             )],
         );
+    }
+
+    /// The figure `cayenne_inline_cache_bytes` publishes for this table: the
+    /// decoded inline view cache's resident Arrow bytes, each physical
+    /// allocation counted once.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` for the integration test that weighs the
+    /// published figure against the memory the process actually gives up to the
+    /// cache (`crates/cayenne/tests/inline_cache_gauge_test.rs`) — not a stable
+    /// API. Synchronous, and the sampler deliberately does not call it: on the
+    /// runtime this walk belongs on the blocking pool (see
+    /// [`Self::sample_inline_cache_metrics`]).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inline_cache_resident_bytes(&self) -> u64 {
+        u64::try_from(inlined_cache::resident_bytes(
+            &self.inlined_cache.load().batches,
+        ))
+        .unwrap_or(u64::MAX)
     }
 
     /// Publish the primary-key index gauges, one series per cache.
@@ -15083,7 +15132,8 @@ impl CayenneTableProvider {
 
     /// After `checkpoint_inlined_data` flushes inline rows to a Vortex file at
     /// `flush_sequence`, walk the supplied PKs and upgrade any pre-existing
-    /// delete-only tombstone (`insert_seq=None`) to record `insert_seq=flush_sequence`.
+    /// tombstone that still hides them (`insert_seq` absent or older than
+    /// `delete_seq`) to record `insert_seq=flush_sequence`.
     ///
     /// Without this upgrade, listing-time pruning via
     /// `vortex_key_delete_pushdown_filter` and the runtime
@@ -15106,14 +15156,17 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // Scan the LIVE in-memory index for flushed PKs that still carry a
-        // delete-only tombstone (its `insert_sequence` must be stamped so scans
-        // see the re-insert). Grouped by `delete_sequence` for a single rcu fold.
+        // Scan the LIVE in-memory index for flushed PKs whose tombstone still
+        // hides them: delete-only, or carrying an insert older than its delete
+        // (a key re-inserted, deleted, then re-inserted again). Its
+        // `insert_sequence` must be stamped so scans see the re-insert. Grouped
+        // by `delete_sequence` for a single rcu fold.
         let current = deletion_snapshot.load_full();
         let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
         for &pk in flushed_pks {
             if let Some(t) = current.tombstones.get(pk)
-                && t.insert_sequence.is_none()
+                && t.insert_sequence
+                    .is_none_or(|insert| insert < t.delete_sequence)
             {
                 by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
             }
@@ -26840,8 +26893,20 @@ impl CayenneTableProvider {
         if inline_max_rows == 0 || inline_max_bytes == 0 || total_rows > inline_max_rows {
             return Ok(false);
         }
-        let ipc_bytes =
-            serialize_batches_to_ipc(batches).map_err(|e| Error::Arrow { source: e })?;
+        // Coalesce before serializing. A CDC write arrives as one RecordBatch per
+        // row, and both the IPC stream and the decode are structure-preserving, so
+        // without this the entry is stored, decoded and cached as N single-row
+        // batches -- paying one schema header and a 64-byte-padded buffer per leaf
+        // once per ROW instead of once per write. Scoped so the coalesced copy is
+        // dropped before the awaits below.
+        let ipc_bytes = if batches.len() > 1 {
+            let coalesced = arrow::compute::concat_batches(batches[0].schema_ref(), batches)
+                .map_err(|e| Error::Arrow { source: e })?;
+            serialize_batches_to_ipc(std::slice::from_ref(&coalesced))
+        } else {
+            serialize_batches_to_ipc(batches)
+        }
+        .map_err(|e| Error::Arrow { source: e })?;
         if ipc_bytes.len() > inline_max_bytes {
             return Ok(false);
         }
@@ -28006,6 +28071,10 @@ impl CayenneTableProvider {
         // Capture the complete warm file set under the fence. Pinning a snapshot
         // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
+        let lookup_index = self
+            .lookup_index
+            .as_ref()
+            .and_then(|state| state.published());
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
@@ -28051,6 +28120,7 @@ impl CayenneTableProvider {
             protected_map,
             inlined_view,
             current_snapshot_id,
+            lookup_index,
             warm_files,
             cold_files,
             structural_epoch,
@@ -32769,6 +32839,7 @@ impl CayenneTableProvider {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await?;
 
@@ -32940,6 +33011,7 @@ impl CayenneTableProvider {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -32981,10 +33053,14 @@ impl CayenneTableProvider {
         // validated against the file list resolved below. Only the main `scan()`
         // path ever supplies one.
         lookup_selection: Option<super::lookup_index::LookupSelection>,
+        // The secondary index the scan's view pinned with its snapshot. A join's
+        // runtime lookup probes this one, never whatever is published by then.
+        pinned_lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
         // Scan-local lookup-index evidence. The file listing below finalizes a
         // provisional selection as selected, empty, or snapshot_mismatch.
         lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let allow_runtime_lookup = lookup_index_explain.is_some();
         // The reference schema the Vortex decode targets. Internal reads
         // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
         // keeping re-encoded files unchanged. The query path passes the
@@ -33074,13 +33150,22 @@ impl CayenneTableProvider {
         // it, so the selection is composed with the provider this scan would
         // otherwise attach: deleted candidates are removed from the selection,
         // never resurrected.
+        // The file set the scan's files were listed at: the captured one when the
+        // caller captured its files with the snapshot.
+        let scan_file_set = captured_files.map_or_else(
+            || self.file_set_version(),
+            |files| super::lookup_index::FileSetVersion {
+                dir_generation: files.dir_generation,
+                listing_epoch: files.listing_epoch,
+            },
+        );
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
         if let Some(selection) = lookup_selection {
             let (restricted_files, provider, explain) = selection.restrict(
                 snapshot_id,
                 partitioned_file_lists,
                 Self::position_deletion_plans(&self.pk_deletion_strategy),
-                self.file_set_version(),
+                scan_file_set,
             );
             partitioned_file_lists = restricted_files;
             lookup_plan_provider = provider;
@@ -33194,16 +33279,61 @@ impl CayenneTableProvider {
         }
 
         // The per-file access plan is the only way a row selection reaches the
-        // Vortex scan, and a format carries exactly one provider. Swapping it
-        // here (after listing and footer-statistics collection) keeps the
-        // selection out of the shared file-statistics cache.
-        let plan_format: Arc<dyn FileFormat> = match lookup_plan_provider {
-            Some(provider) => Arc::new(
+        // Vortex scan, and a format carries exactly one provider. A static
+        // literal lookup has already resolved its positions above. Otherwise an
+        // indexed table retains a runtime provider: when Vortex opens a file it
+        // can inspect a completed hash-join dynamic filter and batch-probe the
+        // same snapshot index. Unsupported or oversized filters simply return no
+        // runtime plan and keep the ordinary scan path.
+        let runtime_lookup_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>> = self
+            .lookup_index
+            .as_ref()
+            .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
+            .map(|index| {
+                let request_build = self.weak_self.get().cloned().map(|weak| {
+                    Arc::new(move || {
+                        if let Some(provider) = weak.upgrade() {
+                            provider.request_runtime_lookup_index_build();
+                        }
+                    }) as Arc<dyn Fn() + Send + Sync>
+                });
+                Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
+                    Arc::clone(index),
+                    pinned_lookup_index.clone(),
+                    snapshot_id.to_string(),
+                    scan_file_set,
+                    partitioned_file_lists
+                        .iter()
+                        .flat_map(FileGroup::iter)
+                        .map(|file| file.object_meta.clone())
+                        .collect(),
+                    request_build,
+                )) as Arc<dyn VortexRuntimeAccessPlanProvider>
+            });
+        // Runtime lookup filters are populated only while a hash join executes.
+        // Preserve the base scan's exact statistics here so an indexed table can
+        // still use metadata-only aggregates when no runtime filter is present.
+        // Static lookup selections above already make their restricted scan
+        // statistics inexact.
+        //
+        // Only such a scan registers a runtime provider; every other scan opens
+        // its files exactly as it is planned.
+        let plan_format: Arc<dyn FileFormat> = match (lookup_plan_provider, runtime_lookup_provider)
+        {
+            (Some(provider), _) => Arc::new(
                 self.context
                     .file_format()
                     .with_access_plan_provider(provider),
             ),
-            None => Arc::clone(&options.format),
+            (None, Some(runtime)) => Arc::new(
+                self.context
+                    .file_format()
+                    .with_access_plan_provider(Self::position_deletion_plans(
+                        &self.pk_deletion_strategy,
+                    ))
+                    .with_runtime_access_plan_provider(runtime),
+            ),
+            (None, None) => Arc::clone(&options.format),
         };
 
         plan_format
@@ -34442,6 +34572,57 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Starts a read-back build requested by an exact runtime join filter.
+    ///
+    /// The first dynamic lookup after a restart or file-set change scans normally
+    /// while this detached task lists and builds the visible snapshot. The claim
+    /// keeps concurrent file openers and queries from starting duplicate builds.
+    fn request_runtime_lookup_index_build(self: &Arc<Self>) {
+        let Some(index_state) = &self.lookup_index else {
+            return;
+        };
+        let visible_snapshot = self.get_current_snapshot_id();
+        let Some(claim) = index_state.claim_build(&visible_snapshot) else {
+            return;
+        };
+        let provider = Arc::clone(self);
+        tokio::spawn(async move {
+            let read_schema = provider.read_schema();
+            let ctx = provider.create_session_context();
+            provider
+                .start_lookup_index_build(claim, visible_snapshot, &ctx.state(), &read_schema)
+                .await;
+        });
+    }
+
+    /// Lists `snapshot_id`'s files and starts the background build `claim`
+    /// holds, or frees the claim when the files cannot be listed.
+    async fn start_lookup_index_build(
+        &self,
+        claim: super::lookup_index::BuildClaim,
+        snapshot_id: String,
+        state: &dyn Session,
+        read_schema: &SchemaRef,
+    ) {
+        // Sampled before listing, so a file added while listing makes the
+        // index's file set older than the table's, never newer.
+        let file_set = self.file_set_version();
+        match self
+            .lookup_index_snapshot_files(state, &snapshot_id, read_schema)
+            .await
+        {
+            Some((store, files)) => super::lookup_index::spawn_build(
+                claim,
+                snapshot_id,
+                store,
+                files,
+                self.table_schema(),
+                file_set,
+            ),
+            None => claim.unpublished(),
+        }
+    }
+
     /// Resolves the secondary index for this scan.
     ///
     /// Only a query whose filters pin every column of an indexed key to an
@@ -34457,6 +34638,8 @@ impl CayenneTableProvider {
         state: &dyn Session,
         filters: &[Expr],
         read_schema: &SchemaRef,
+        pinned_index: Option<&Arc<super::lookup_index::SnapshotLookupIndex>>,
+        visible_snapshot: &str,
     ) -> Option<(
         Option<super::lookup_index::LookupSelection>,
         super::lookup_index::LookupIndexExplain,
@@ -34474,43 +34657,31 @@ impl CayenneTableProvider {
             ));
         };
 
-        let visible_snapshot = self.get_current_snapshot_id();
         // Probe first: a stale index is dropped here, so a build claimed below
-        // replaces nothing rather than an index that is already gone.
-        let (selection, explain, should_build) = match index_state
-            .probe(&visible_snapshot, &scalar_for)
-        {
-            super::lookup_index::LookupProbe::Selection(selection) => (
-                Some(selection),
-                super::lookup_index::LookupIndexExplain::not_applicable(Some(shape.to_string())),
-                false,
-            ),
-            super::lookup_index::LookupProbe::Fallback(explain) => {
-                let should_build = matches!(
-                    explain.outcome,
-                    super::lookup_index::LookupIndexExplainOutcome::Unbuilt
-                        | super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
-                );
-                (None, explain, should_build)
-            }
-        };
-        if should_build && let Some(claim) = index_state.claim_build(&visible_snapshot) {
-            // The claim frees its slot if this scan is dropped while listing.
-            let file_set = self.file_set_version();
-            match self
-                .lookup_index_snapshot_files(state, &visible_snapshot, read_schema)
-                .await
-            {
-                Some((store, files)) => super::lookup_index::spawn_build(
-                    claim,
-                    visible_snapshot.clone(),
-                    store,
-                    files,
-                    self.table_schema(),
-                    file_set,
+        // replaces nothing rather than an index that is already gone. The probe
+        // uses the index and snapshot the scan's view captured together.
+        let (selection, explain, should_build) =
+            match index_state.probe(pinned_index, visible_snapshot, &scalar_for) {
+                super::lookup_index::LookupProbe::Selection(selection) => (
+                    Some(selection),
+                    super::lookup_index::LookupIndexExplain::not_applicable(Some(
+                        shape.to_string(),
+                    )),
+                    false,
                 ),
-                None => claim.unpublished(),
-            }
+                super::lookup_index::LookupProbe::Fallback(explain) => {
+                    let should_build = matches!(
+                        explain.outcome,
+                        super::lookup_index::LookupIndexExplainOutcome::Unbuilt
+                            | super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
+                    );
+                    (None, explain, should_build)
+                }
+            };
+        if should_build && let Some(claim) = index_state.claim_build(visible_snapshot) {
+            // The claim frees its slot if this scan is dropped while listing.
+            self.start_lookup_index_build(claim, visible_snapshot.to_string(), state, read_schema)
+                .await;
         }
         Some((selection, explain))
     }
@@ -35108,6 +35279,7 @@ impl TableProvider for CayenneTableProvider {
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
         let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
         let current_snapshot_id = scan_view.raw.current_snapshot_id.clone();
+        let pinned_lookup_index = scan_view.raw.lookup_index.clone();
         // The cold file set captured in the SAME fenced instant as
         // `current_snapshot_id`, so the cross-tier union cannot straddle a promotion.
         let cold_files = scan_view.raw.cold_files.as_ref().map(Arc::clone);
@@ -35260,7 +35432,13 @@ impl TableProvider for CayenneTableProvider {
         // over indexed columns. `None` keeps the ordinary scan, which is what a
         // table without `indexes` and every other predicate shape resolve to.
         let lookup_resolution = self
-            .resolve_lookup_index_selection(state, scan_filters, &read_schema)
+            .resolve_lookup_index_selection(
+                state,
+                scan_filters,
+                &read_schema,
+                pinned_lookup_index.as_ref(),
+                &current_snapshot_id,
+            )
             .await;
 
         // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
@@ -35333,6 +35511,7 @@ impl TableProvider for CayenneTableProvider {
                 0,
                 Some(&warm_files),
                 lookup_selection,
+                pinned_lookup_index,
                 lookup_index_explain.as_mut(),
             )
             .await;
@@ -42768,6 +42947,264 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// A key re-inserted after its delete was checkpointed must stay visible even
+    /// when its tombstone still carries an older insert: the upgrade must stamp
+    /// every delete-dominated tombstone, not only delete-only ones.
+    #[tokio::test]
+    async fn mem_tier_reinsert_over_stale_insert_tombstone_stays_visible() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("reinsert_stale_insert", Arc::clone(&runtime_env))
+                .await;
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+        let append = |ids: &'static [i64]| {
+            let batch = int64_id_batch(ids);
+            let bytes = batch.get_array_memory_size() as u64;
+            (batch, bytes)
+        };
+
+        let (batch, bytes) = append(&[1, 2]);
+        provider
+            .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+            .await
+            .expect("seed append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
+
+        // Delete key 2 and re-insert it twice, checkpointing each step so every
+        // delete is absorbed before the next insert. The first re-insert leaves
+        // the tombstone with an insert sequence that the second delete outdates.
+        for round in 0..2 {
+            provider
+                .write_cdc_delete_keys_in_memory(&int64_id_batch(&[2]))
+                .await
+                .expect("absorb delete")
+                .expect("the delete is absorbed, not routed durable");
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("delete checkpoint");
+            assert_eq!(
+                scan_sorted_ids(&provider).await,
+                vec![1],
+                "round {round}: deleted"
+            );
+
+            let (batch, bytes) = append(&[2]);
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("re-insert");
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("re-insert checkpoint");
+            assert_eq!(
+                scan_sorted_ids(&provider).await,
+                vec![1, 2],
+                "round {round}: the re-inserted key must be visible after its checkpoint"
+            );
+        }
+
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("reinsert_stale_insert")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2],
+            "the re-insert is durable across restart"
+        );
+    }
+
+    /// Composite-key twin of `mem_tier_reinsert_over_stale_insert_tombstone_stays_visible`.
+    /// Composite keys have no sequence-blind pushdown, so the re-inserted key must
+    /// stay visible through checkpoints, a subset merge, the full rewrite that
+    /// folds protected snapshots into the current snapshot, and a restart.
+    #[tokio::test]
+    async fn composite_mem_tier_reinsert_over_stale_insert_tombstone_stays_visible() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        async fn pairs(provider: &CayenneTableProvider) -> Vec<(i64, i64)> {
+            let ctx = SessionContext::new();
+            let plan = provider
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan");
+            let mut out = Vec::new();
+            for batch in &collect(plan, ctx.task_ctx()).await.expect("collect") {
+                let a = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("a");
+                let b = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("b");
+                out.extend((0..batch.num_rows()).map(|row| (a.value(row), b.value(row))));
+            }
+            out.sort_unstable();
+            out
+        }
+        async fn append(provider: &CayenneTableProvider, batch: RecordBatch) {
+            let bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch], &OnConflictDeletions::default(), bytes, 0)
+                .await
+                .expect("append");
+        }
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let key = vec!["a".to_string(), "b".to_string()];
+        let options = CreateTableOptions {
+            table_name: "composite_reinsert".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: key.clone(),
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(key),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                compaction_trigger_protected_snapshots: 2,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let provider =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .create(options)
+                .await
+                .expect("table created");
+        assert!(
+            matches!(
+                provider.pk_deletion_snapshot(),
+                PkDeletionSnapshot::RowConverterBased { .. }
+            ),
+            "a composite key must take the row-key deletion strategy"
+        );
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let batch = |rows: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                ],
+            )
+            .expect("batch")
+        };
+
+        // Seed the current snapshot through an overwrite, as a CDC bootstrap does,
+        // so the full rewrite below has a current snapshot to fold into.
+        let ctx = SessionContext::new();
+        let seed = MemorySourceConfig::try_new_exec(
+            &[vec![batch(&[(1, 1), (2, 2)])]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("seed source");
+        let plan = provider
+            .insert_into(&ctx.state(), seed, InsertOp::Overwrite)
+            .await
+            .expect("overwrite plan");
+        collect(plan, ctx.task_ctx()).await.expect("overwrite");
+
+        for round in 0..2 {
+            provider
+                .write_cdc_delete_keys_in_memory(&batch(&[(2, 2)]))
+                .await
+                .expect("absorb delete")
+                .expect("the delete is absorbed, not routed durable");
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("delete checkpoint");
+            assert_eq!(
+                pairs(&provider).await,
+                vec![(1, 1)],
+                "round {round}: deleted"
+            );
+
+            append(&provider, batch(&[(2, 2)])).await;
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("re-insert checkpoint");
+            assert_eq!(
+                pairs(&provider).await,
+                vec![(1, 1), (2, 2)],
+                "round {round}: visible after the re-insert checkpoint"
+            );
+        }
+
+        assert!(
+            provider
+                .compact_protected_snapshots_subset(usize::MAX)
+                .await
+                .expect("subset merge"),
+            "the subset merge must run"
+        );
+        assert_eq!(
+            pairs(&provider).await,
+            vec![(1, 1), (2, 2)],
+            "visible after subset merge"
+        );
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction_tracked()
+                .await
+                .expect("full rewrite"),
+            "the full rewrite must run"
+        );
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "the full rewrite folds every protected snapshot into the current snapshot"
+        );
+        assert_eq!(
+            pairs(&provider).await,
+            vec![(1, 1), (2, 2)],
+            "visible after the full rewrite"
+        );
+
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("composite_reinsert")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            pairs(&reopened).await,
+            vec![(1, 1), (2, 2)],
+            "visible after restart"
+        );
     }
 
     /// Fix B (i) — a delete-only burst absorbed into the mem tier: the

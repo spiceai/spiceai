@@ -16,7 +16,7 @@ while the parent is open, (2) what changes when the parent squash-merges, (3) th
 ways to restack and how to choose, and (4) the audit that catches the one failure mode
 that is otherwise silent.
 
-> **The rule stacking interacts with:** never force-push (see `CLAUDE.md`). Rebasing
+> **The rule stacking interacts with:** never force-push (see `AGENTS.md`). Rebasing
 > is not itself forbidden — `git pull --rebase` is the recommended way to take
 > upstream commits. What is forbidden is *rewriting history you have already pushed*,
 > because that requires a force push. That distinction decides which restack
@@ -208,7 +208,7 @@ before the script existed:
 - **A mode disagreement.** Copying content leaves the destination's mode alone, so a
   `100644` vs `100755` conflict resolved to your mode and quietly dropped an executable
   bit `trunk` added — and a symlink destination is *followed*, so resolving a conflicted
-  `CLAUDE.md` that way overwrote `.github/copilot-instructions.md` while the link itself
+  former alias such as `CLAUDE.md` that way overwrote `AGENTS.md` while the link itself
   still looked untouched.
 - **A missing side.** The parent rewrites a file, the child deletes it, `trunk` squashes
   the parent: there is then no stage 2 while stage 3 matches `$STACKBASE` exactly, so a

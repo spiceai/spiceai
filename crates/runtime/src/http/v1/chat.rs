@@ -21,7 +21,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::model::LLMChatCompletionsModelStore;
+use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
@@ -109,6 +109,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
                 }
             })
         ))),
+        (status = 400, description = "The specified model is an evaluation model; use POST /v1/evaluate"),
         (status = 404, description = "The specified model was not found"),
         (status = 500, description = "An internal server error occurred while processing the chat completion", content((
             serde_json::Value = "application/json",
@@ -120,6 +121,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
+    Extension(evaluate_models): Extension<Arc<RwLock<EvaluateModelStore>>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
@@ -167,7 +169,13 @@ pub(crate) async fn post(
                     }
                 }
             }
-            None => (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response(),
+            None => {
+                if evaluate_models.read().await.contains_key(&model_id) {
+                    evaluate_only_chat_response(&model_id)
+                } else {
+                    (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response()
+                }
+            }
         }
     }
     .instrument(span)
@@ -350,6 +358,21 @@ impl OpenaiErrorEvent {
     }
 }
 
+/// Chat rejection for an evaluate-only model, in the same `OpenAI` JSON envelope
+/// as `/v1/responses`.
+fn evaluate_only_chat_response(model_id: &str) -> Response {
+    let message = llms::chat::Error::EvaluateOnlyModel {
+        model: model_id.to_string(),
+    }
+    .to_string();
+    openai_error_to_response(OpenAIError::ApiError(async_openai::error::ApiError {
+        message,
+        r#type: Some("invalid_request_error".to_string()),
+        param: Some("model".to_string()),
+        code: Some("invalid_request_error".to_string()),
+    }))
+}
+
 /// Converts `OpenAI` errors to HTTP responses
 /// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
 #[must_use]
@@ -384,7 +407,7 @@ mod tests {
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::LLMChatCompletionsModelStore,
+        model::{EvaluateModelStore, LLMChatCompletionsModelStore},
     };
     use async_openai::{
         error::OpenAIError,
@@ -438,6 +461,7 @@ mod tests {
         let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
+        let evaluate_models = Arc::new(RwLock::new(EvaluateModelStore::new()));
 
         let mut headers = HeaderMap::new();
         if let Some(v) = progress_header {
@@ -463,9 +487,14 @@ mod tests {
 
         let _enter = span.enter();
 
-        let response = post(Extension(llms), headers, Json(req_payload))
-            .instrument(span.clone())
-            .await;
+        let response = post(
+            Extension(llms),
+            Extension(evaluate_models),
+            headers,
+            Json(req_payload),
+        )
+        .instrument(span.clone())
+        .await;
 
         let body_bytes = response
             .into_body()
@@ -519,6 +548,69 @@ mod tests {
             vec![
                 "payload".to_string() // From the LLM stream.
             ]
+        );
+    }
+
+    #[derive(Debug)]
+    struct DummyEvaluate;
+
+    #[async_trait::async_trait]
+    impl evaluate_api::Evaluate for DummyEvaluate {
+        async fn evaluate(
+            &self,
+            _request: evaluate_api::EvaluateRequest,
+        ) -> evaluate_api::Result<evaluate_api::EvaluateResponse> {
+            evaluate_api::InvalidRequestSnafu {
+                model: "jev",
+                message: "unused",
+            }
+            .fail()
+        }
+    }
+
+    /// Evaluate-only models return the `OpenAI` JSON error envelope, not plain text.
+    #[tokio::test]
+    async fn evaluate_only_model_returns_openai_json_400() {
+        let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
+        let mut store = EvaluateModelStore::new();
+        store.insert("jev".into(), Arc::new(DummyEvaluate));
+        let evaluate_models = Arc::new(RwLock::new(store));
+
+        let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "jev",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(llms),
+            Extension(evaluate_models),
+            HeaderMap::new(),
+            Json(req_payload),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("OpenAI JSON envelope");
+        assert_eq!(
+            body_json["type"].as_str(),
+            Some("invalid_request_error"),
+            "{body_json}"
+        );
+        assert_eq!(body_json["param"].as_str(), Some("model"), "{body_json}");
+        let message = body_json["message"].as_str().expect("message");
+        assert!(
+            message.contains("/v1/evaluate"),
+            "message should direct callers to /v1/evaluate: {message}"
         );
     }
 }
