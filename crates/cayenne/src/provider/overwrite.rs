@@ -239,7 +239,7 @@ impl PreparedOverwrite {
         // it together with the snapshot. Finishing it after the flip would leave
         // a window in which every lookup falls back to a full scan.
         self.table
-            .stage_lookup_index_for_snapshot(&self.new_snapshot_id)
+            .stage_lookup_index_for_snapshot(&self.new_snapshot_id, self.inlined.as_ref())
             .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a

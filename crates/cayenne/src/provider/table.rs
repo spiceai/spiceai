@@ -35097,8 +35097,43 @@ impl CayenneTableProvider {
     /// Best-effort by construction: a refused or failed build leaves the refreshed
     /// table to a background build, and the snapshot publishes regardless. Data
     /// availability must never depend on this index.
-    pub(crate) async fn stage_lookup_index_for_snapshot(&self, snapshot_id: &str) {
+    pub(crate) async fn stage_lookup_index_for_snapshot(
+        &self,
+        snapshot_id: &str,
+        inlined_overwrite: Option<&InlinedData>,
+    ) {
         if self.lookup_index.is_none() && self.covering_index.is_none() {
+            return;
+        }
+        if let Some(inlined) = inlined_overwrite {
+            if let Some(state) = &self.lookup_index {
+                state.discard_pending();
+            }
+            if let Some(state) = &self.covering_index {
+                match deserialize_ipc_to_batch(&inlined.data_ipc)
+                    .map_err(|error| super::Error::Arrow { source: error })
+                    .and_then(|batches| self.adapt_inlined_batches_to_live_schema(batches))
+                {
+                    Ok(batches) => {
+                        state
+                            .stage_inline(
+                                snapshot_id,
+                                &inlined.inlined_id,
+                                inlined.sequence_number,
+                                batches,
+                            )
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            table = self.table_metadata.table_name.as_str(),
+                            %error,
+                            "Could not build a covering index for an inline overwrite"
+                        );
+                        state.stage_uncovered(snapshot_id);
+                    }
+                }
+            }
             return;
         }
         let file_set = self.file_set_version();

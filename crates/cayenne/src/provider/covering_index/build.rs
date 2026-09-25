@@ -258,6 +258,55 @@ impl CoveringIndexState {
         });
     }
 
+    /// Build and stage a complete catalog for an overwrite that remains in the
+    /// inline tier. Inline overwrites do not create Vortex files, so they never
+    /// reach the write observer used by [`Self::stage_pending`].
+    pub(crate) async fn stage_inline(
+        &self,
+        snapshot_id: &str,
+        inlined_id: &str,
+        sequence: i64,
+        batches: Vec<RecordBatch>,
+    ) {
+        *self.pending.lock() = None;
+        let source = SourceId::inline(Arc::clone(&self.table_id), inlined_id, sequence);
+        let source_manifest = vec![source.clone()];
+        let catalog = match build_sources(
+            source,
+            self.definitions.to_vec(),
+            batches,
+            Arc::clone(&self.account),
+        )
+        .await
+        .and_then(|sources| {
+            self.definitions
+                .iter()
+                .cloned()
+                .zip(sources)
+                .map(|(definition, source)| {
+                    IndexCatalog::from_built_sources(definition, vec![source]).map(Arc::new)
+                })
+                .collect::<Result<Vec<_>>>()
+                .and_then(|catalogs| CoveringIndexCatalog::new(snapshot_id.to_string(), catalogs))
+        }) {
+            Ok(catalog) => {
+                *self.rejection.lock() = None;
+                Some(Arc::new(catalog))
+            }
+            Err(error) => {
+                *self.rejection.lock() = Some(error);
+                Some(Arc::new(CoveringIndexCatalog::uncovered(
+                    snapshot_id,
+                    source_manifest,
+                )))
+            }
+        };
+        *self.staged.lock() = Some(StagedCatalog {
+            snapshot_id: snapshot_id.to_string(),
+            catalog,
+        });
+    }
+
     /// Stage explicit uncovered state when the final manifest cannot be read.
     /// The data writer still commits; the optional catalog simply cannot make a
     /// completeness claim for an unknown source set.
@@ -1250,6 +1299,26 @@ mod publication_tests {
             "only the one NULL key is omitted from an otherwise complete physical source"
         );
         assert_eq!(state.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn publication_builds_catalog_for_inline_overwrite() {
+        let state = state(8 * 1024 * 1024);
+        state
+            .stage_inline(
+                "snapshot-inline",
+                "inline-entry",
+                7,
+                vec![batch(vec![Some(1), Some(2)], vec!["one", "two"])],
+            )
+            .await;
+        state.promote_staged("snapshot-inline");
+
+        let catalog = state.published().expect("inline catalog published");
+        assert_eq!(catalog.snapshot_id(), "snapshot-inline");
+        assert_eq!(catalog.source_manifest().len(), 1);
+        assert_eq!(catalog.catalogs()[0].sources().len(), 1);
+        assert!(catalog.is_complete());
     }
 
     #[tokio::test]

@@ -38,6 +38,16 @@ fn cayenne_dataset(
     index: &str,
     root: &std::path::Path,
 ) -> Dataset {
+    cayenne_dataset_with_inline_max_rows(source, name, index, root, 0)
+}
+
+fn cayenne_dataset_with_inline_max_rows(
+    source: &std::path::Path,
+    name: &str,
+    index: &str,
+    root: &std::path::Path,
+    inline_max_rows: usize,
+) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", source.display()), name);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
@@ -54,7 +64,10 @@ fn cayenne_dataset(
                 "cayenne_metadata_dir".to_string(),
                 root.join("metadata").to_string_lossy().to_string(),
             ),
-            ("cayenne_inline_max_rows".to_string(), "0".to_string()),
+            (
+                "cayenne_inline_max_rows".to_string(),
+                inline_max_rows.to_string(),
+            ),
         ]))),
         ..Acceleration::default()
     });
@@ -208,6 +221,121 @@ async fn runtime_uses_covering_indexes_for_chained_joins() -> Result<(), anyhow:
                     "+--------------------+---------------+---------+",
                     "| Customer#000030003 | needle street | AMERICA |",
                     "+--------------------+---------------+---------+",
+                ],
+                &batches
+            );
+            Ok(())
+        })
+        .await
+}
+
+/// Small full-refresh tables are stored inline by default. Their indexes must
+/// still form a complete multi-way chain rather than falling back to Vortex.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_uses_covering_indexes_for_inline_multiway_joins() -> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async {
+            let temp = tempfile::tempdir()?;
+            let customer = temp.path().join("customer.csv");
+            let nation = temp.path().join("nation.csv");
+            let region = temp.path().join("region.csv");
+            let orders = temp.path().join("orders.csv");
+            let lineitem = temp.path().join("lineitem.csv");
+            tokio::fs::write(
+                &customer,
+                "c_custkey,c_name,c_address,c_nationkey\n1,Customer#000030003,needle street,7\n2,Customer#000030004,other street,8\n",
+            )
+            .await?;
+            tokio::fs::write(
+                &nation,
+                "n_nationkey,n_regionkey\n7,3\n8,4\n",
+            )
+            .await?;
+            tokio::fs::write(&region, "r_regionkey,r_name\n3,AMERICA\n4,EUROPE\n").await?;
+            tokio::fs::write(&orders, "o_orderkey,o_custkey\n101,1\n102,1\n103,2\n").await?;
+            tokio::fs::write(
+                &lineitem,
+                "l_orderkey,l_quantity,l_extendedprice\n101,2,5\n101,1,4\n102,3,6\n",
+            )
+            .await?;
+            crate::configure_test_datafusion();
+
+            let app = AppBuilder::new("cayenne_covering_index_inline_chained_runtime")
+                .with_dataset(cayenne_dataset_with_inline_max_rows(
+                    &customer,
+                    "customer",
+                    "c_name",
+                    temp.path(),
+                    4,
+                ))
+                .with_dataset(cayenne_dataset_with_inline_max_rows(
+                    &nation,
+                    "nation",
+                    "n_nationkey",
+                    temp.path(),
+                    4,
+                ))
+                .with_dataset(cayenne_dataset_with_inline_max_rows(
+                    &region,
+                    "region",
+                    "r_regionkey",
+                    temp.path(),
+                    4,
+                ))
+                .with_dataset(cayenne_dataset_with_inline_max_rows(
+                    &orders,
+                    "orders",
+                    "o_custkey",
+                    temp.path(),
+                    4,
+                ))
+                .with_dataset(cayenne_dataset_with_inline_max_rows(
+                    &lineitem,
+                    "lineitem",
+                    "l_orderkey",
+                    temp.path(),
+                    4,
+                ))
+                .build();
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("timed out loading inline Cayenne covering-index datasets"));
+                }
+                () = Arc::clone(&runtime).load_components() => {}
+            }
+            runtime_ready_check(&runtime).await;
+
+            let sql = "SELECT l_quantity * l_extendedprice AS revenue, r_name FROM lineitem JOIN orders ON o_orderkey = l_orderkey JOIN customer ON c_custkey = o_custkey JOIN nation ON n_nationkey = c_nationkey JOIN region ON r_regionkey = n_regionkey WHERE c_name = 'Customer#000030003'";
+            let mut plan_text = String::new();
+            for _ in 0..50 {
+                let dataframe = runtime.datafusion().ctx.sql(sql).await?;
+                let plan = dataframe.create_physical_plan().await?;
+                plan_text = displayable(plan.as_ref()).indent(true).to_string();
+                if plan_text.matches("CayenneIndexJoinExec").count() == 4 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            ensure!(
+                plan_text.contains("CayenneIndexScanExec")
+                    && plan_text.matches("CayenneIndexJoinExec").count() == 4
+                    && !plan_text.contains("HashJoinExec")
+                    && !plan_text.contains("DataSourceExec"),
+                "runtime did not select covering indexes for inline multi-way joins:\n{plan_text}"
+            );
+
+            let batches = runtime.datafusion().ctx.sql(sql).await?.collect().await?;
+            assert_batches_sorted_eq!(
+                [
+                    "+---------+---------+",
+                    "| revenue | r_name  |",
+                    "+---------+---------+",
+                    "| 10      | AMERICA |",
+                    "| 18      | AMERICA |",
+                    "| 4       | AMERICA |",
+                    "+---------+---------+",
                 ],
                 &batches
             );
