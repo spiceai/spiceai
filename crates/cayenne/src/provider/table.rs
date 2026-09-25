@@ -26530,10 +26530,11 @@ impl CayenneTableProvider {
     /// covers the retained rows, and the count is recorded as a
     /// [`RowCountUpdate::Estimate`].
     ///
-    /// The retained-snapshot check runs under the persistence lock. A snapshot
-    /// published before it is seen here; one published after it is also after
-    /// this commit, so its delta — which must take this lock — lands on top of
-    /// the count persisted here rather than being overwritten by it.
+    /// The caller still holds the listing fence it committed under, and every
+    /// protected-snapshot publish takes that fence, so the map read here is
+    /// exactly what the commit left. A publisher's delta is persisted under the
+    /// same persistence lock this takes, after its publish, so it lands on top of
+    /// the count written here rather than being overwritten by it.
     pub(crate) async fn persist_table_stats_after_snapshot_rewrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
@@ -39836,8 +39837,10 @@ mod tests {
     /// `COUNT(*)` folds. Found by `prop_concurrent_mixed_key_sqlite`, which served
     /// `Exact(15)` with 16 rows live.
     ///
-    /// Key mode only: a position-delete rewrite holds `write_lock` throughout, so
-    /// no insert can publish inside its window.
+    /// Driven in key mode, where an insert can publish inside the window. A
+    /// position-delete rewrite holds `write_lock` throughout, so there only a
+    /// mem-tier checkpoint can publish mid-rewrite (#11477); the fix does not
+    /// depend on the rewrite scope, so it covers that publisher too.
     #[tokio::test]
     async fn key_rewrite_retaining_a_late_snapshot_serves_no_short_exact_count() {
         let table_name = "key_rewrite_late_snapshot_count";
@@ -39914,16 +39917,73 @@ mod tests {
         let stats = provider
             .optimizer_table_statistics()
             .expect("the table serves statistics");
-        if let DFPrecision::Exact(n) = stats.num_rows {
-            assert_eq!(
-                n,
-                live.len(),
-                "WRONG COUNT(*): the rewrite served Exact({n}) with {} rows live — it \
-                 overwrote the late snapshot's already-folded delta with a count that \
-                 excludes those rows",
-                live.len()
-            );
+        assert!(
+            !matches!(stats.num_rows, DFPrecision::Exact(_)),
+            "WRONG COUNT(*): the rewrite served {:?} as Exact with {} rows live — it \
+             overwrote the late snapshot's already-folded delta with a count that \
+             excludes those rows",
+            stats.num_rows,
+            live.len()
+        );
+    }
+
+    /// The control for the test above: the same rewrite with no snapshot
+    /// published inside its window folds everything, so its count is
+    /// authoritative and must come back `Exact` — the fix demotes only the
+    /// retained-snapshot case, not every rewrite.
+    #[tokio::test]
+    async fn key_rewrite_folding_every_snapshot_restores_an_exact_count() {
+        let table_name = "key_rewrite_no_late_snapshot_count";
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = provider.table_schema();
+        for i in 0..3i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
         }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+
+        let rewrote = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("full rewrite");
+        assert!(rewrote, "the rewrite must commit");
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "precondition: the rewrite folded every protected snapshot"
+        );
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-rewrite maintenance");
+
+        let live = collect_id_value_pairs(&ctx, &provider, table_name).await;
+        assert_eq!(live.len(), 3);
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("the table serves statistics");
+        assert_eq!(
+            stats.num_rows,
+            DFPrecision::Exact(live.len()),
+            "a rewrite that folded everything materialized exactly the live rows, so its \
+             count must be served Exact"
+        );
     }
 
     /// The contrast that makes the test above load-bearing: [`RewriteScope::All`]
