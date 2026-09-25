@@ -45,7 +45,8 @@ use datafusion::{
     },
 };
 use datafusion_federation::{
-    FederationAnalyzerRule, FederationProviderRef, get_table_source,
+    FederationAnalyzerForLogicalPlan, FederationAnalyzerRule, FederationProviderRef,
+    get_table_source,
     sql::optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation},
 };
 
@@ -164,12 +165,12 @@ fn split_held_predicates(plan: &LogicalPlan) -> Result<Option<SplitFilter>> {
         }
     }
 
-    // One source executes the whole join as one statement, where the pushed
-    // placement is unparsed back into a single scope.
+    // When one source accepts the whole filtered join it is unparsed into one
+    // statement, where the pushed placement lands back in a single scope.
     let Some(held) = conjunction(held) else {
         return Ok(None);
     };
-    if has_single_federation_provider(plan)? {
+    if federates_whole(plan)? {
         return Ok(None);
     }
 
@@ -238,10 +239,16 @@ fn collect_outer_references(subquery: &Subquery, columns: &mut HashSet<Column>) 
     Ok(())
 }
 
-/// Whether every table the plan reads, subqueries included, belongs to one
-/// federation provider.
-fn has_single_federation_provider(plan: &LogicalPlan) -> Result<bool> {
+/// Whether one federation provider owns every table the plan reads,
+/// subqueries included, and accepts the plan whole.
+///
+/// Sharing a provider is not enough: a provider that refuses the plan (for
+/// example over a function the source cannot run) has the analyzer federate
+/// each side separately, and the pushed predicate then reaches the source
+/// without the table it references.
+fn federates_whole(plan: &LogicalPlan) -> Result<bool> {
     let mut sole: Option<FederationProviderRef> = None;
+    let mut single = true;
     plan.apply_with_subqueries(|node| {
         let LogicalPlan::TableScan(scan) = node else {
             return Ok(TreeNodeRecursion::Continue);
@@ -251,13 +258,19 @@ fn has_single_federation_provider(plan: &LogicalPlan) -> Result<bool> {
             (None, Some(provider)) => sole = Some(provider),
             (Some(existing), Some(provider)) if existing.as_ref() == provider.as_ref() => {}
             _ => {
-                sole = None;
+                single = false;
                 return Ok(TreeNodeRecursion::Stop);
             }
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok(sole.is_some())
+    Ok(single
+        && sole.is_some_and(|provider| {
+            matches!(
+                provider.analyzer(plan),
+                Some(FederationAnalyzerForLogicalPlan::With(_))
+            )
+        }))
 }
 
 #[cfg(test)]
@@ -266,22 +279,24 @@ mod tests {
         arrow::datatypes::{DataType, Field, Schema, SchemaRef},
         execution::SessionStateBuilder,
         logical_expr::TableSource,
-        optimizer::AnalyzerRule,
+        optimizer::{Analyzer, AnalyzerRule},
         prelude::SessionContext,
     };
     use datafusion_federation::{
-        FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
-        FederationProvider,
+        FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
     };
 
     use super::*;
     use crate::analyzer_rule::AnalyzerRulesBuilder;
 
-    /// A provider that is recognised as federated but federates nothing, so
-    /// the analyzer's filter pushdown runs and the plan stays inspectable.
+    /// A provider that is recognised as federated. One that `accepts` claims
+    /// every plan (its analyzer has no rules, so nothing is rewritten and the
+    /// plan stays inspectable); one that does not refuses every plan, as a source does over a
+    /// function it cannot run, and the analyzer falls back to its children.
     #[derive(Debug)]
     struct StubProvider {
         compute_context: &'static str,
+        accepts: bool,
     }
 
     impl FederationProvider for StubProvider {
@@ -294,7 +309,11 @@ mod tests {
         }
 
         fn analyzer(&self, _plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
-            Some(FederationAnalyzerForLogicalPlan::Unable)
+            Some(if self.accepts {
+                FederationAnalyzerForLogicalPlan::With(Arc::new(Analyzer::with_rules(vec![])))
+            } else {
+                FederationAnalyzerForLogicalPlan::Unable
+            })
         }
     }
 
@@ -325,10 +344,14 @@ mod tests {
         ctx: &SessionContext,
         name: &str,
         compute_context: &'static str,
+        accepts: bool,
         fields: Vec<Field>,
     ) {
         let source = Arc::new(StubSource {
-            provider: Arc::new(StubProvider { compute_context }),
+            provider: Arc::new(StubProvider {
+                compute_context,
+                accepts,
+            }),
             schema: Arc::new(Schema::new(fields)),
         });
         ctx.register_table(name, Arc::new(FederatedTableProviderAdaptor::new(source)))
@@ -339,6 +362,7 @@ mod tests {
         analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
         lineitem_source: &'static str,
         part_source: &'static str,
+        accepts: bool,
     ) -> SessionContext {
         let state = SessionStateBuilder::new()
             .with_default_features()
@@ -349,6 +373,7 @@ mod tests {
             &ctx,
             "lineitem",
             lineitem_source,
+            accepts,
             vec![
                 Field::new("l_partkey", DataType::Int64, false),
                 Field::new("l_quantity", DataType::Float64, false),
@@ -359,6 +384,7 @@ mod tests {
             &ctx,
             "part",
             part_source,
+            accepts,
             vec![
                 Field::new("p_partkey", DataType::Int64, false),
                 Field::new("p_brand", DataType::Utf8, false),
@@ -409,19 +435,17 @@ mod tests {
             .into_optimized_plan()
     }
 
-    /// Regression test for #8220: TPC-H Q17 over two tables from different
-    /// sources decorrelated into a join that reads `part.p_partkey` without
-    /// `part` beneath it, which `spiced` reports as
-    /// `No field named part.p_partkey`.
-    #[tokio::test]
-    async fn a_correlated_predicate_over_two_sources_still_binds() {
-        let control = context(
-            vec![Arc::new(
-                datafusion_federation::sql::federation_analyzer_rule(),
-            )],
-            "lineitem_source",
-            "part_source",
-        );
+    fn unguarded_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+        vec![Arc::new(
+            datafusion_federation::sql::federation_analyzer_rule(),
+        )]
+    }
+
+    /// Q17 whose sides the analyzer federates separately: the unguarded
+    /// pushdown has to leave a join that reads `part.p_partkey` without `part`
+    /// beneath it (the control), and the guarded one must not.
+    async fn assert_split_join_binds(lineitem_source: &'static str, part_source: &'static str) {
+        let control = context(unguarded_rules(), lineitem_source, part_source, false);
         let control_plan = optimized_plan(&control)
             .await
             .expect("the unguarded pushdown still returns a plan");
@@ -434,14 +458,15 @@ mod tests {
 
         let ctx = context(
             AnalyzerRulesBuilder::new().build(),
-            "lineitem_source",
-            "part_source",
+            lineitem_source,
+            part_source,
+            false,
         );
         let plan = optimized_plan(&ctx).await.expect("optimize the query");
         assert_eq!(
             unbound_join_column(&plan),
             None,
-            "a correlated predicate spanning two sources has to stay where it binds:\n{}",
+            "a correlated predicate over a split join has to stay where it binds:\n{}",
             plan.display_indent()
         );
 
@@ -452,22 +477,39 @@ mod tests {
         );
     }
 
-    /// A join that one source executes whole is unparsed into one statement,
-    /// so its plan has to stay exactly what the unguarded pushdown produces.
+    /// Regression test for #8220: TPC-H Q17 over two tables from different
+    /// sources decorrelated into a join that reads `part.p_partkey` without
+    /// `part` beneath it, which `spiced` reports as
+    /// `No field named part.p_partkey`.
     #[tokio::test]
-    async fn a_single_source_join_is_left_to_the_inner_rule() {
+    async fn a_correlated_predicate_over_two_sources_still_binds() {
+        assert_split_join_binds("lineitem_source", "part_source").await;
+    }
+
+    /// One source that refuses the whole plan is federated side by side, which
+    /// is the two-source case again: `SQLite` over a Spice-only function sent
+    /// `lineitem` alone with a predicate on `part_sqlite.p_partkey`.
+    #[tokio::test]
+    async fn a_correlated_predicate_over_a_refused_single_source_still_binds() {
+        assert_split_join_binds("one_source", "one_source").await;
+    }
+
+    /// A join that one source accepts whole is unparsed into one statement, so
+    /// its plan has to stay exactly what the unguarded pushdown produces.
+    #[tokio::test]
+    async fn a_single_source_join_it_accepts_is_left_to_the_inner_rule() {
         let unguarded = analyzed_plan(&context(
-            vec![Arc::new(
-                datafusion_federation::sql::federation_analyzer_rule(),
-            )],
+            unguarded_rules(),
             "one_source",
             "one_source",
+            true,
         ))
         .await;
         let guarded = analyzed_plan(&context(
             AnalyzerRulesBuilder::new().build(),
             "one_source",
             "one_source",
+            true,
         ))
         .await;
         assert_eq!(
