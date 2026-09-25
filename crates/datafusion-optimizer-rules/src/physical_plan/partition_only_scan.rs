@@ -77,6 +77,15 @@ limitations under the License.
 //! *unfiltered* file, so the fast path cannot evaluate it. Such a scan always
 //! takes the first-record probe instead, which decides whether a file yields a
 //! row through the same filtered decode path a full scan would use.
+//!
+//! An unresolved [`DynamicFilterPhysicalExpr`] (e.g. a `TopK` pruning filter
+//! pushed below a `Sort`/`Limit`) is not such a predicate: at plan time it is
+//! still a `lit(true)` placeholder that has not excluded anything, and it never
+//! excludes a row this rewrite's output aggregate would otherwise have kept — a
+//! `TopK` filter only prunes values that also lose to the final `Sort`/`Limit`.
+//! Only its *current* resolved expression is checked against `lit(true)`; a
+//! static predicate, or a dynamic filter already narrowed to something else,
+//! still bails to the probe.
 
 use std::sync::Arc;
 
@@ -87,6 +96,8 @@ use datafusion::common::Result;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::config::ConfigOptions;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{DynamicFilterPhysicalExpr, Literal};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::AggregateExec;
@@ -319,7 +330,14 @@ fn try_partition_values_memory_source(
     // that predicate. Bail to the first-record probe instead, which decides
     // whether a file yields a row by decoding through the identical filtered
     // path a full scan would use.
-    if config.file_source().filter().is_some() {
+    //
+    // An unresolved `TopK` dynamic filter is exempted: it starts (and, until a
+    // downstream `Sort`/`Limit` has seen enough rows to narrow it, remains) a
+    // `lit(true)` placeholder that excludes nothing, so it carries no
+    // information this fast path would need to ignore.
+    if let Some(filter) = config.file_source().filter()
+        && !is_unresolved_dynamic_filter(&filter)
+    {
         return Ok(None);
     }
 
@@ -396,6 +414,23 @@ fn try_partition_values_memory_source(
     Ok(Some(source as Arc<dyn ExecutionPlan>))
 }
 
+/// Whether `filter` is a [`DynamicFilterPhysicalExpr`] still at its initial
+/// `lit(true)` state — a `TopK` pruning filter that has not (yet) excluded
+/// anything. A static predicate, and a dynamic filter already narrowed past
+/// `lit(true)`, both return `false` and must bail the fast path.
+fn is_unresolved_dynamic_filter(filter: &Arc<dyn PhysicalExpr>) -> bool {
+    let Some(dynamic_filter) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() else {
+        return false;
+    };
+    let Ok(current) = dynamic_filter.current() else {
+        return false;
+    };
+    matches!(
+        current.as_any().downcast_ref::<Literal>(),
+        Some(literal) if matches!(literal.value(), ScalarValue::Boolean(Some(true)))
+    )
+}
+
 /// First-record probe fallback: rebuild the scan with a [`FirstRecordProbeSource`]
 /// so each file yields at most its first record. Reuses the scan's own file
 /// groups, projection, compression, and object store; only the file source (and
@@ -427,6 +462,53 @@ mod tests {
 
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+
+    /// A static predicate (not a `DynamicFilterPhysicalExpr`) always decides
+    /// which rows count, so the fast path must bail regardless of its value.
+    #[test]
+    fn static_predicate_is_not_an_unresolved_dynamic_filter() {
+        let filter: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        assert!(!is_unresolved_dynamic_filter(&filter));
+    }
+
+    /// A `TopK` dynamic filter still at its initial `lit(true)` placeholder has
+    /// excluded nothing, so the fast path may proceed as if no filter were
+    /// present — this is the regression case for
+    /// `SELECT p FROM t GROUP BY p ORDER BY p DESC LIMIT 1`, where DataFusion
+    /// attaches a not-yet-resolved dynamic filter to the scan.
+    #[test]
+    fn unresolved_dynamic_filter_is_exempted() {
+        let column = Arc::new(Column::new("p", 0)) as Arc<dyn PhysicalExpr>;
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        assert!(is_unresolved_dynamic_filter(&filter));
+    }
+
+    /// Once a `TopK` dynamic filter has been narrowed by the operator that owns
+    /// it, it may exclude real rows — the same risk a static predicate poses —
+    /// so the fast path must bail.
+    #[test]
+    fn resolved_dynamic_filter_is_not_exempted() {
+        let column = Arc::new(Column::new("p", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(Arc::new(BinaryExpr::new(
+                column,
+                Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            )))
+            .expect("dynamic filter update succeeds");
+        let filter = dynamic_filter as Arc<dyn PhysicalExpr>;
+        assert!(!is_unresolved_dynamic_filter(&filter));
+    }
 
     /// The rule must leave a plan without a partition-only file-scan aggregate
     /// untouched — here a bare in-memory scan, which is not a file scan and has
