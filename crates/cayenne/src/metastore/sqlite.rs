@@ -764,22 +764,172 @@ impl Session {
     }
 }
 
-/// Whether a statement issued through a query method starts with a write
-/// keyword, which sends it straight to the [`Writer`]: `reserve_sequence_numbers`
-/// runs `UPDATE … RETURNING` through `query_row`. Any other statement is
-/// prepared on a pooled read connection first, and handed to the writer if
-/// `SQLite` reports that it writes (a `WITH … UPDATE`, say). A read stays on
-/// the pool, since queueing it on the writer would make a read nested inside a
-/// transaction wait for the transaction it is part of.
+/// Whether a statement issued through a query method is an `INSERT`, `UPDATE`,
+/// `DELETE` or `REPLACE`, with or without a `WITH` clause before it, which
+/// sends it straight to the [`Writer`] to wait its turn from the moment it
+/// arrives: `reserve_sequence_numbers` runs `UPDATE … RETURNING` through
+/// `query_row`. Any other statement is prepared on a pooled read connection
+/// first, and handed to the writer if `SQLite` reports that it writes (DDL,
+/// say); such a write joins the writer's queue only once a read connection has
+/// prepared it. A read stays on the pool, since queueing it on the writer would
+/// make a read nested inside a transaction wait for the transaction it is part
+/// of.
 fn statement_writes(sql: &str) -> bool {
-    let keyword = sql
-        .trim_start()
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .next()
-        .unwrap_or("");
-    ["INSERT", "UPDATE", "DELETE", "REPLACE"]
-        .iter()
-        .any(|write| keyword.eq_ignore_ascii_case(write))
+    statement_keyword(sql).is_some_and(|keyword| {
+        ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+            .iter()
+            .any(|write| keyword.eq_ignore_ascii_case(write))
+    })
+}
+
+/// The keyword that says what a statement does: its first word, or, when that
+/// is `WITH`, the first word after the clause's common table expressions, so
+/// `WITH a AS (…), b(x) AS MATERIALIZED (…) UPDATE …` gives `UPDATE`. `None`
+/// when the text does not follow `SQLite`'s grammar for the clause.
+fn statement_keyword(sql: &str) -> Option<&str> {
+    let mut tokens = SqlTokens(sql);
+    let SqlToken::Word(first) = tokens.next()? else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("WITH") {
+        return Some(first);
+    }
+    let mut token = tokens.next()?;
+    if token.is_keyword("RECURSIVE") {
+        token = tokens.next()?;
+    }
+    // Each common table expression is
+    // `name [(column, …)] AS [[NOT] MATERIALIZED] (select)`.
+    loop {
+        if !matches!(token, SqlToken::Word(_) | SqlToken::Quoted) {
+            return None;
+        }
+        token = tokens.next()?;
+        if token == SqlToken::Open {
+            tokens.skip_group()?;
+            token = tokens.next()?;
+        }
+        if !token.is_keyword("AS") {
+            return None;
+        }
+        token = tokens.next()?;
+        if token.is_keyword("NOT") {
+            token = tokens.next()?;
+            if !token.is_keyword("MATERIALIZED") {
+                return None;
+            }
+            token = tokens.next()?;
+        } else if token.is_keyword("MATERIALIZED") {
+            token = tokens.next()?;
+        }
+        if token != SqlToken::Open {
+            return None;
+        }
+        tokens.skip_group()?;
+        match tokens.next()? {
+            SqlToken::Comma => token = tokens.next()?,
+            SqlToken::Word(keyword) => return Some(keyword),
+            _ => return None,
+        }
+    }
+}
+
+/// A token of `SQLite`'s SQL, as far as [`statement_keyword`] tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlToken<'a> {
+    /// A keyword or an unquoted identifier.
+    Word(&'a str),
+    /// A string literal or a quoted identifier.
+    Quoted,
+    Open,
+    Close,
+    Comma,
+    /// Any other character: an operator, a digit, a parameter's sigil.
+    Other,
+}
+
+impl SqlToken<'_> {
+    fn is_keyword(self, keyword: &str) -> bool {
+        matches!(self, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
+    }
+}
+
+/// The tokens of a statement's text, skipping whitespace and comments the way
+/// `SQLite` does.
+struct SqlTokens<'a>(&'a str);
+
+impl SqlTokens<'_> {
+    /// Skip past the `)` that closes the group whose `(` was just read.
+    fn skip_group(&mut self) -> Option<()> {
+        let mut depth = 1_usize;
+        while depth > 0 {
+            match self.next()? {
+                SqlToken::Open => depth += 1,
+                SqlToken::Close => depth -= 1,
+                _ => {}
+            }
+        }
+        Some(())
+    }
+}
+
+impl<'a> Iterator for SqlTokens<'a> {
+    type Item = SqlToken<'a>;
+
+    fn next(&mut self) -> Option<SqlToken<'a>> {
+        loop {
+            self.0 = self.0.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            if let Some(rest) = self.0.strip_prefix("--") {
+                self.0 = rest.split_once('\n').map_or("", |(_, rest)| rest);
+            } else if let Some(rest) = self.0.strip_prefix("/*") {
+                // An unterminated comment runs to the end of the text.
+                self.0 = rest.split_once("*/").map_or("", |(_, rest)| rest);
+            } else {
+                break;
+            }
+        }
+        let first = self.0.chars().next()?;
+        let (token, len) = match first {
+            '(' => (SqlToken::Open, 1),
+            ')' => (SqlToken::Close, 1),
+            ',' => (SqlToken::Comma, 1),
+            '\'' | '"' | '`' => (SqlToken::Quoted, quoted_len(self.0, first)?),
+            '[' => (SqlToken::Quoted, self.0.find(']')? + 1),
+            c if is_identifier_char(c) && !c.is_ascii_digit() && c != '$' => {
+                let len = self
+                    .0
+                    .find(|c: char| !is_identifier_char(c))
+                    .unwrap_or(self.0.len());
+                (SqlToken::Word(&self.0[..len]), len)
+            }
+            c => (SqlToken::Other, c.len_utf8()),
+        };
+        self.0 = &self.0[len..];
+        Some(token)
+    }
+}
+
+/// A character `SQLite` allows in an unquoted identifier: an ASCII letter or
+/// digit, `_`, `$`, or any character outside ASCII.
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
+}
+
+/// The length of the string or quoted identifier at the start of `text`,
+/// through the closing `quote`; a doubled quote inside it is an escaped one.
+/// `None` when it is never closed.
+fn quoted_len(text: &str, quote: char) -> Option<usize> {
+    let mut chars = text.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        if c == quote {
+            if text[i + 1..].starts_with(quote) {
+                chars.next();
+            } else {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
 }
 
 /// A statement issued through a query method, as its read connection found it:
@@ -2946,6 +3096,177 @@ mod tests {
             n, 11,
             "the CTE write must run in its turn on the writer, before the write queued after it (1 × 10 + 1)"
         );
+    }
+
+    /// The query methods' keyword check calls a statement a write exactly when
+    /// `SQLite` says it writes, however its `WITH` clause, comments and quoting
+    /// are spelled, and leaves any text it cannot follow to `SQLite`'s check.
+    #[test]
+    fn test_statement_writes_agrees_with_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory SQLite");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .expect("create table");
+        for sql in [
+            "SELECT n FROM t",
+            "  select n from t",
+            "VALUES (1)",
+            "UPDATE t SET n = 1",
+            "insert into t (id, n) values (1, 1)",
+            "REPLACE INTO t (id, n) VALUES (1, 1)",
+            "DELETE FROM t",
+            "-- a comment ) (\nUPDATE t SET n = 1",
+            "/* a comment */ SELECT 1",
+            "WITH f(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM f) WHERE id = 1 RETURNING n",
+            "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 3) INSERT INTO t (id, n) SELECT i, i FROM r",
+            "WITH a AS MATERIALIZED (SELECT 1 AS x), b AS NOT MATERIALIZED (SELECT 2 AS y) DELETE FROM t WHERE id IN (SELECT x FROM a UNION SELECT y FROM b)",
+            "WITH a AS (SELECT ')' AS p /* ) */ -- )\n FROM t) SELECT p FROM a",
+            "WITH \"a)\" AS (SELECT 1 AS x) REPLACE INTO t (id, n) SELECT x, x FROM \"a)\"",
+            "WITH [a b] AS (SELECT 'it''s' AS x) SELECT x FROM [a b]",
+            "WITH replace AS (SELECT 1 AS x) SELECT x FROM replace",
+            "WITH faktör(v) AS (VALUES (2)) UPDATE t SET n = n * (SELECT v FROM faktör)",
+            "WITH a AS (SELECT 1 AS x) SELECT x FROM a",
+        ] {
+            let sqlite_writes = !conn
+                .prepare(sql)
+                .unwrap_or_else(|e| panic!("SQLite must accept {sql:?}: {e}"))
+                .readonly();
+            assert_eq!(statement_writes(sql), sqlite_writes, "{sql:?}");
+        }
+        for sql in [
+            "WITH a AS (SELECT 'unterminated",
+            "WITH a (SELECT 1) UPDATE t SET n = 1",
+            "WITH",
+            "",
+        ] {
+            assert!(
+                !statement_writes(sql),
+                "{sql:?} does not follow the grammar, so it is left to SQLite's check"
+            );
+        }
+    }
+
+    /// A CTE-prefixed write issued through a query method is recognized by the
+    /// statement its `WITH` clause leads into, so it queues on the writer
+    /// connection the moment it arrives: it waits for no read connection, and a
+    /// write that arrives after it cannot run first.
+    #[tokio::test]
+    async fn test_a_cte_write_through_a_query_does_not_wait_for_a_read_connection() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        let metastore = Arc::new(metastore);
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .await
+            .expect("create table");
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id, n) VALUES (1, 1)",
+                params: vec![],
+            })
+            .await
+            .expect("seed row");
+
+        // Every read connection taken, as by a burst of reads.
+        let pool = metastore.pool().await.expect("pool");
+        let mut reads = Vec::with_capacity(pool.conns.len());
+        for conn in &pool.conns {
+            reads.push(Arc::clone(conn).lock_owned().await);
+        }
+        let multiply = {
+            let metastore = Arc::clone(&metastore);
+            tokio::spawn(async move {
+                metastore
+                    .query_row(
+                        QueryRowParams {
+                            sql: "WITH factor(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM factor) WHERE id = 1 RETURNING n",
+                            params: vec![],
+                        },
+                        |row| row.get_i64(0),
+                    )
+                    .await
+            })
+        };
+        // Arrival order is what is under test: the CTE write arrives first.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        metastore
+            .execute(ExecuteParams {
+                sql: "UPDATE t SET n = n + 1 WHERE id = 1",
+                params: vec![],
+            })
+            .await
+            .expect("the write that arrived after the CTE write");
+        drop(reads);
+        multiply
+            .await
+            .expect("CTE write task")
+            .expect("the CTE write");
+
+        let n = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT n FROM t WHERE id = 1",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read n");
+        assert_eq!(
+            n, 11,
+            "the CTE write must run before the write that arrived after it: 1 × 10 + 1, not (1 + 1) × 10"
+        );
+    }
+
+    /// A write the keyword check leaves to `SQLite`, here a `CREATE TABLE`
+    /// issued through `query`, still runs on the writer connection once a read
+    /// connection has prepared it, so it runs before a write queued after it.
+    #[tokio::test]
+    async fn test_a_write_only_sqlite_recognizes_waits_its_turn_on_the_writer() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        let metastore = Arc::new(metastore);
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+        let create = {
+            let metastore = Arc::clone(&metastore);
+            tokio::spawn(async move {
+                metastore
+                    .query(
+                        QueryParams {
+                            sql: "CREATE TABLE later (id INTEGER PRIMARY KEY)",
+                            params: vec![],
+                        },
+                        |_| Ok(()),
+                    )
+                    .await
+            })
+        };
+        // Arrival order is what is under test: the CREATE TABLE must be queued
+        // before the INSERT, and reaching the queue takes well under this.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let insert = {
+            let metastore = Arc::clone(&metastore);
+            tokio::spawn(async move {
+                metastore
+                    .execute(ExecuteParams {
+                        sql: "INSERT INTO later (id) VALUES (1)",
+                        params: vec![],
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        holder.commit().await.expect("commit the holder");
+        create
+            .await
+            .expect("CREATE TABLE task")
+            .expect("the CREATE TABLE");
+        insert
+            .await
+            .expect("INSERT task")
+            .expect("the INSERT queued after the CREATE TABLE must find its table");
     }
 
     /// A transaction keeps its writer connection registered after the metastore
