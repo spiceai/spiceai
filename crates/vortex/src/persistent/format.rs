@@ -1859,7 +1859,7 @@ mod tests {
                 );
                 let names: String = hash_exprs.iter().map(ToString::to_string).collect();
                 assert!(
-                    names.contains("k") && names.contains("j"),
+                    names.contains('k') && names.contains('j'),
                     "hash exprs must reference both key columns, got: {names}"
                 );
             }
