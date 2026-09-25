@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 //! Key-based deletes served by the filtered scan, which reads only the key and
-//! filter columns (#14364).
+//! filter columns (#14364). Key columns are placed after other columns so the
+//! scan projection reorders them.
 
 #![allow(clippy::expect_used)]
 
@@ -113,20 +114,20 @@ async fn payloads(ctx: &SessionContext, table: &str) -> TestResult<Vec<String>> 
 /// across files, and the reported count is exact.
 async fn composite_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("code", DataType::Utf8, false),
         Field::new("tag", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
+        Field::new("code", DataType::Utf8, false),
     ]));
     let (table, ctx) = setup(&fixture, "composite", &schema, &["region", "code"]).await?;
     insert_file(
         &table,
         &schema,
         vec![
-            strings(&["us", "us", "eu"]),
-            strings(&["a", "b", "a"]),
             strings(&["x", "y", "x"]),
+            strings(&["us", "us", "eu"]),
             strings(&["us-a", "us-b", "eu-a"]),
+            strings(&["a", "b", "a"]),
         ],
     )
     .await?;
@@ -134,10 +135,10 @@ async fn composite_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<
         &table,
         &schema,
         vec![
-            strings(&["us", "eu"]),
-            strings(&["c", "b"]),
             strings(&["x", "y"]),
+            strings(&["us", "eu"]),
             strings(&["us-c", "eu-b"]),
+            strings(&["c", "b"]),
         ],
     )
     .await?;
@@ -164,8 +165,8 @@ test_with_backends!(composite_key_filtered_delete_impl);
 /// `Int64` key: same, through its own key strategy.
 async fn int64_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
         Field::new("tag", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
         Field::new("payload", DataType::Utf8, false),
     ]));
     let (table, ctx) = setup(&fixture, "int64", &schema, &["id"]).await?;
@@ -173,8 +174,8 @@ async fn int64_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<()> 
         &table,
         &schema,
         vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
             strings(&["x", "y", "x"]),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
             strings(&["p1", "p2", "p3"]),
         ],
     )
@@ -183,8 +184,8 @@ async fn int64_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<()> 
         &table,
         &schema,
         vec![
-            Arc::new(Int64Array::from(vec![4, 5])),
             strings(&["x", "y"]),
+            Arc::new(Int64Array::from(vec![4, 5])),
             strings(&["p4", "p5"]),
         ],
     )
