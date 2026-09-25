@@ -1189,12 +1189,15 @@ mod tests {
         .expect("entries struct");
 
         let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
-        let data = ArrayData::builder(data_type.clone())
+        let builder = ArrayData::builder(data_type.clone())
             .len(rows)
             .add_buffer(Buffer::from_slice_ref(&offsets))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),

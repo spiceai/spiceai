@@ -648,7 +648,7 @@ mod tests {
     /// declared nullable.
     fn wrapped_maps() -> Vec<(&'static str, ArrayRef)> {
         use arrow::array::{
-            DictionaryArray, FixedSizeListArray, Int32Array, ListViewArray, RunArray, UnionArray,
+            DictionaryArray, FixedSizeListArray, Int32Array, ListViewArray, UnionArray,
         };
         use arrow::buffer::ScalarBuffer;
         use arrow::datatypes::{Int32Type, UnionFields};
@@ -697,12 +697,21 @@ mod tests {
         ));
 
         let m = map() as ArrayRef;
+        // `RunArray::try_new` validates its values child, which rejects the `entries`
+        // declaration under test, so the run-end array is assembled from its parts.
+        let ree_type = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", m.data_type().clone(), true)),
+        );
+        let ree_builder = ArrayData::builder(ree_type)
+            .len(1)
+            .add_child_data(Int32Array::from(vec![1]).to_data())
+            .add_child_data(m.to_data());
+        // SAFETY: run ends and values are well formed; only the nested `entries`
+        // declaration is what validation rejects, and that is the shape under test.
         out.push((
             "RunEndEncoded",
-            Arc::new(
-                RunArray::try_new(&Int32Array::from(vec![1]), m.as_ref())
-                    .expect("run-end encoded maps"),
-            ),
+            make_array(unsafe { ree_builder.build_unchecked() }),
         ));
 
         let m = map() as ArrayRef;

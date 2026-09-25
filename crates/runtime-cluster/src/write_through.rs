@@ -1276,12 +1276,15 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(map_type(entries_nullable))
+        let builder = ArrayData::builder(map_type(entries_nullable))
             .len(2)
             .add_buffer(Buffer::from_slice_ref([0i32, 1, 2]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             map_schema(entries_nullable),

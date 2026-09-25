@@ -1898,14 +1898,15 @@ mod tests {
                 ),
             ]);
             let offsets = arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
-            let map = arrow::array::make_array(
-                arrow::array::ArrayData::builder(map_of(entries_nullable))
-                    .len(2)
-                    .add_buffer(offsets.into_inner().into_inner())
-                    .add_child_data(entries.to_data())
-                    .build()
-                    .expect("build the map array"),
-            );
+            let builder = arrow::array::ArrayData::builder(map_of(entries_nullable))
+                .len(2)
+                .add_buffer(offsets.into_inner().into_inner())
+                .add_child_data(entries.to_data());
+            // SAFETY: the offsets, buffers and child data are well formed. Only the
+            // `entries` nullability declaration is what `ArrayData::validate` rejects,
+            // and reproducing it is the point of the fixture — legacy inline data on
+            // disk carries exactly this declaration.
+            let map = arrow::array::make_array(unsafe { builder.build_unchecked() });
             RecordBatch::try_new(
                 schema_with(entries_nullable),
                 vec![Arc::new(Int32Array::from(vec![1, 2])), map],

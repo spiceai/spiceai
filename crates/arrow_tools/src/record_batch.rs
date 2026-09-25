@@ -2836,25 +2836,15 @@ mod nullability_alignment_tests {
             vec![Some("1"), None],
         )) as ArrayRef;
 
-        let aligned = try_cast_to(
+        let err = try_cast_to(
             batch_of("col_map", column),
             schema_of("col_map", map_type(true)),
         )
-        .expect("a nested nullability flag is a declaration, not a value");
+        .expect_err("a target declaring nullable map entries cannot be delivered");
 
-        assert_eq!(
-            aligned.schema().field(0).data_type(),
-            aligned.column(0).data_type(),
-            "the batch must not advertise a type none of its columns carries"
-        );
-        assert_eq!(aligned.schema().field(0).data_type(), &map_type(true));
-        assert_eq!(
-            map_pairs(&aligned),
-            vec![
-                ("a".to_string(), Some("1".to_string())),
-                ("b".to_string(), None),
-            ],
-            "relabelling shares the buffers, so every key and value survives it unchanged"
+        assert!(
+            err.to_string().contains("map entries"),
+            "the error must name the entries declaration it refused, got: {err}"
         );
     }
 
@@ -2875,7 +2865,6 @@ mod nullability_alignment_tests {
             vec!["a"],
             vec![Some("1")],
         )) as ArrayRef;
-        let keys_before = keys_buffer_ptr(&map_column);
         let source = Schema::new(vec![
             Field::new("col_map", map_type(false), true),
             Field::new("n", DataType::Int32, true),
@@ -2890,22 +2879,12 @@ mod nullability_alignment_tests {
             Field::new("n", DataType::Int64, true),
         ]));
 
-        let aligned =
-            try_cast_to(batch, target).expect("one column needing a cast must not fail the other");
+        let err = try_cast_to(batch, target)
+            .expect_err("a target declaring nullable map entries cannot be delivered");
 
-        assert_eq!(
-            aligned.schema().field(0).data_type(),
-            aligned.column(0).data_type()
-        );
-        assert_eq!(
-            map_pairs(&aligned),
-            vec![("a".to_string(), Some("1".to_string()))]
-        );
-        assert_eq!(aligned.column(1).data_type(), &DataType::Int64);
-        assert_eq!(
-            keys_buffer_ptr(aligned.column(0)),
-            keys_before,
-            "the relabel carries the values across by reference rather than rebuilding them"
+        assert!(
+            err.to_string().contains("map entries"),
+            "the error must name the entries declaration it refused, got: {err}"
         );
     }
 
@@ -2943,19 +2922,16 @@ mod nullability_alignment_tests {
             .expect("struct"),
         ) as ArrayRef;
 
-        let aligned = try_cast_to(
+        let err = try_cast_to(
             batch_of("col_struct", column),
             schema_of("col_struct", struct_of(true)),
         )
-        .expect("a nested map's declaration is still only a declaration");
+        .expect_err("a nested target declaring nullable map entries cannot be delivered");
 
-        assert_eq!(
-            aligned.schema().field(0).data_type(),
-            aligned.column(0).data_type(),
-            "the batch must not advertise a type none of its columns carries"
+        assert!(
+            err.to_string().contains("map entries"),
+            "the error must name the entries declaration it refused, got: {err}"
         );
-        assert_eq!(aligned.schema().field(0).data_type(), &struct_of(true));
-        assert_eq!(aligned.num_rows(), 1);
     }
 
     /// Narrowing is not a relabel, and the boundary is load-bearing rather than tidy. Whether a

@@ -1696,8 +1696,7 @@ mod tests {
 
     /// Answering a question about a `Dictionary` means materializing it, and `make_array` recurses
     /// into its values — so a map still awaiting the [`MapEntriesNonNullable`] correction ends up
-    /// there too. That is safe: `MapArray::try_new` refuses a nullable `entries` field, but
-    /// `make_array` goes through `MapArray::from`, which does not.
+    /// there too.
     ///
     /// This pins the fact rather than the reasoning. The dictionary holds no null, so the narrowing
     /// is admitted; if a future arrow-rs made `MapArray::from` validate, this would abort instead —
@@ -1708,28 +1707,39 @@ mod tests {
         let (map, _) = map_with_nullable_entries();
         let dictionary_type =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(map.data_type().clone()));
-        let dictionary = ArrayData::builder(dictionary_type.clone())
+        let dictionary_builder = ArrayData::builder(dictionary_type.clone())
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0_i32]))
-            .add_child_data(map)
-            .build()
-            .expect("one key over a one-entry dictionary of maps");
-        let source = ArrayData::builder(DataType::List(Arc::new(Field::new(
+            .add_child_data(map);
+        // SAFETY: validation recurses into the map child, whose `entries` declaration
+        // is the shape under test; the dictionary itself is well formed.
+        let dictionary = unsafe { dictionary_builder.build_unchecked() };
+        let source_builder = ArrayData::builder(DataType::List(Arc::new(Field::new(
             "item",
             dictionary_type.clone(),
             true,
         ))))
         .len(1)
         .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
-        .add_child_data(dictionary)
-        .build()
-        .expect("a list of one dictionary");
+        .add_child_data(dictionary);
+        // SAFETY: validation recurses to the map at the bottom of the chain, whose
+        // `entries` declaration is the shape under test; the list is well formed.
+        let source = unsafe { source_builder.build_unchecked() };
         let target = DataType::List(Arc::new(Field::new("item", dictionary_type, false)));
 
-        let relabelled = relabel_array_data(source, &target)
-            .expect("the dictionary holds no null, so narrowing the item is admitted");
+        // Arrow validates a map's `entries` declaration in `ArrayData::validate`, which
+        // `relabel_validated_array_data` builds through. Relabelling anything above a map
+        // that still declares `entries` nullable is therefore refused, whatever the
+        // relabel itself asks for — the narrowing of the list item here is admissible on
+        // its own. `MapEntriesNonNullable` has to have corrected the map first, which is
+        // why `MapEntriesNormalizer` runs at ingress rather than on demand.
+        let err = relabel_array_data(source, &target)
+            .expect_err("a map still declaring nullable entries cannot be rebuilt");
 
-        assert_eq!(relabelled.data_type(), &target);
+        assert!(
+            err.to_string().contains("map entries"),
+            "the error must name the entries declaration it refused, got: {err}"
+        );
     }
 
     /// `UnionArray::logical_nulls` reports its values' whole buffer rather than the union's own
@@ -1870,11 +1880,10 @@ mod tests {
             .null_bit_buffer(Some(Buffer::from([0b0000_0001])))
             .build()
             .expect("a struct may carry a null bitmap");
-        let malformed = map
-            .into_builder()
-            .child_data(vec![nulled_entries])
-            .build()
-            .expect("the map shape is unchanged");
+        let malformed_builder = map.into_builder().child_data(vec![nulled_entries]);
+        // SAFETY: the shape is unchanged from the map above; the entries declaration
+        // and the entry-level nulls are what this fixture exists to present.
+        let malformed = unsafe { malformed_builder.build_unchecked() };
 
         let err = relabel_array_data(malformed, &target).expect_err(
             "entries holding a null cannot be republished as the non-nullable field Arrow requires",
