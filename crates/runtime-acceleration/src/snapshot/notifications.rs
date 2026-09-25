@@ -641,7 +641,28 @@ fn invalid_notification_warning(
     )
 }
 
+/// An S3 key is percent-decoded before it is logged, so a `%0A` in the
+/// notification is a real newline. Keep the log line one line.
+fn log_single_line(value: &str) -> String {
+    use std::fmt::Write;
+    let mut single = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => single.push_str("\\n"),
+            '\r' => single.push_str("\\r"),
+            '\t' => single.push_str("\\t"),
+            control if control.is_control() => {
+                let _ = write!(single, "\\u{{{:x}}}", u32::from(control));
+            }
+            other => single.push(other),
+        }
+    }
+    single
+}
+
 fn outside_location_error(location: &NotificationLocation, bucket: &str, key: &str) -> String {
+    let bucket = log_single_line(bucket);
+    let key = log_single_line(key);
     format!(
         "Snapshot location '{location}' received an S3 event notification for 's3://{bucket}/{key}', which is outside the location, so the SQS message was left on the queue (not deleted) and will be delivered again after each visibility timeout until it expires. The queue in `s3_queue_url` must receive only this location's notifications: filter the bucket notification by the location's prefix, or fan out through SNS to a queue per consumer. See: {SNAPSHOTS_DOCS}"
     )
@@ -1074,6 +1095,21 @@ mod tests {
         assert!(outside.contains("'s3://my-bucket/events/a.parquet'"));
         assert!(outside.contains("left on the queue (not deleted)"));
         assert!(outside.contains(SNAPSHOTS_DOCS));
+
+        let encoded = "events%2Fok%0AFORGED%3A+entry.parquet";
+        let parsed = parse_notification_body(&s3_body("ObjectCreated:Put", "my-bucket", encoded))
+            .expect("encoded key parses");
+        let injected_key = &parsed[0].key;
+        assert!(
+            injected_key.contains('\n'),
+            "the parser decodes %0A before the key is logged"
+        );
+        let injected = outside_location_error(&location, &parsed[0].bucket, injected_key);
+        assert!(
+            injected.contains("events/ok\\nFORGED: entry.parquet"),
+            "{injected}"
+        );
+        assert!(!injected.contains('\n'), "a decoded newline stays escaped");
 
         for line in [
             listening,
