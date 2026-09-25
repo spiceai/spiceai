@@ -3526,6 +3526,7 @@ mod tests {
         schema: SchemaRef,
         /// Data to return from scan (should include `response_status` column)
         data: Vec<RecordBatch>,
+        delay: Duration,
     }
 
     impl MockHttpTableProvider {
@@ -3573,7 +3574,13 @@ mod tests {
             Self {
                 schema,
                 data: vec![batch],
+                delay: Duration::ZERO,
             }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
         }
     }
 
@@ -3594,6 +3601,9 @@ mod tests {
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             Ok(Arc::new(DataSourceExec::new(Arc::new(
                 MemorySourceConfig::try_new(
                     std::slice::from_ref(&self.data),
@@ -4971,12 +4981,26 @@ mod tests {
         stale_if_error: StaleIfError,
         max_age: Duration,
     ) -> String {
-        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        transient_5xx_outcome_with_delay(stale, stale_if_error, max_age, Duration::ZERO).await
+    }
+
+    async fn transient_5xx_outcome_with_delay(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+        delay: Duration,
+    ) -> String {
+        let http_source =
+            Arc::new(MockHttpTableProvider::with_status(503, "upstream down").with_delay(delay));
         let schema = http_source.schema();
         let accelerator = Arc::new(MockAcceleratorTableProvider::new(
             Arc::clone(&schema),
             vec![],
         ));
+        let stale_schema = stale.schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![stale]], stale_schema, None).expect("cache input"),
+        )));
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
@@ -4991,7 +5015,11 @@ mod tests {
             true,
             stale_if_error,
             max_age,
-            Some(CacheFallback::Loaded(vec![stale])),
+            Some(CacheFallback::Deferred {
+                input,
+                partition: 0,
+                context: Arc::new(TaskContext::default()),
+            }),
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
@@ -5211,6 +5239,37 @@ mod tests {
             "an entry inside the window when the fetch was attempted must be served \
              stale, even though the fetch's own {fetch_delay:?} delay would have pushed \
              a post-fetch staleness measurement past the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finite_window_is_measured_before_a_delayed_http_503() {
+        let max_age = Duration::from_millis(100);
+        let window = StaleIfError::For(Duration::from_millis(150));
+        let fetch_delay = Duration::from_millis(200);
+        let schema = MockHttpTableProvider::with_status(503, "upstream down").schema();
+        assert_eq!(
+            schema
+                .metadata()
+                .get(HTTP_RESPONSE_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "the origin batch must take the HTTP transient-status path"
+        );
+        let stale = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(
+                now_nanos()
+                    - i64::try_from((max_age + Duration::from_millis(50)).as_nanos())
+                        .expect("age fits in nanoseconds"),
+            ),
+        );
+
+        let outcome = transient_5xx_outcome_with_delay(stale, window, max_age, fetch_delay).await;
+        assert_eq!(
+            outcome, "cached response",
+            "the delayed 503 must use staleness at fetch start, before its delay expires the window"
         );
     }
 
