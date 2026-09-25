@@ -99,12 +99,9 @@ serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
-# LOCAL ONLY: branch arrow-59 not pushed yet. Replace with
-# `git = "https://github.com/spiceai/spark-connect-rs.git", rev = "31bbcd13ea38d1da60ce57156a180cf11bb61a22"` # branch: arrow-59
-# once pushed.
-spark-connect-rs = { path = "/Users/viktor/workspace/df55-prep/spark-connect-rs/rust", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "9d452dc9015cf11d096dd49a6d7dda94e8b28ede", features = [
     "tls",
-], optional = true }
+], optional = true } # branch: viktor/df-55-upgrade
 telemetry = { path = "../telemetry" }
 tempfile.workspace = true
 tiberius = { workspace = true, optional = true }

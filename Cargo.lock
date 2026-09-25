@@ -20336,6 +20336,7 @@ checksum = "45e14297decde697ddf377c25752aead0927d5cfc89c2684d2af96901a4ceeea"
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=9d452dc9015cf11d096dd49a6d7dda94e8b28ede#9d452dc9015cf11d096dd49a6d7dda94e8b28ede"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -20357,6 +20358,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=9d452dc9015cf11d096dd49a6d7dda94e8b28ede#9d452dc9015cf11d096dd49a6d7dda94e8b28ede"
 dependencies = [
  "spark-connect-core",
 ]
