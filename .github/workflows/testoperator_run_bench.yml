@@ -409,12 +409,19 @@ jobs:
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
-          docker run -d --name minio \
+          # MinIO no longer publishes images or binaries: quay.io/minio/minio and minio/minio refuse
+          # anonymous pulls and dl.min.io answers 410. Chainguard builds the same server from the
+          # upstream source; it runs as a non-root user that cannot create /data, hence --user.
+          image=cgr.dev/chainguard/minio:latest
+          if ! docker run -d --name minio --user 0:0 \
             -p 9000:9000 \
             -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data --console-address ':9001'
+            "$image" server /data --console-address ':9001'; then
+            echo "::error::Could not start MinIO from $image. If the pull was refused, the image is no longer published there; point this step at a registry that still serves MinIO."
+            exit 1
+          fi
 
       - name: Wait for local MinIO
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
