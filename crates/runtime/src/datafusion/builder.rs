@@ -2969,6 +2969,55 @@ mod tests {
         );
     }
 
+    /// The built session keeps the **built-in** `date_part`, not Spark's, so
+    /// both spellings of a weekday agree: `date_part('dow', …)` and
+    /// `EXTRACT(DOW FROM …)` count Sunday as 0, as the SQL reference documents.
+    /// Spark's counts Sunday as 1 and the two answered a day apart (#13920);
+    /// Spark's also takes only a date or a timestamp, so `date_part` over a
+    /// time did not plan. This pins the `Keep::BuiltIn` entry in
+    /// `SPARK_SCALAR_COLLISIONS`, which the collision-set test does not read.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_date_part() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        // 2026-01-04 is a Sunday: 0 under the built-in, 1 under Spark's.
+        let batches = df
+            .ctx
+            .sql(
+                "SELECT date_part('dow', DATE '2026-01-04') AS via_date_part,                  EXTRACT(DOW FROM DATE '2026-01-04') AS via_extract",
+            )
+            .await
+            .expect("plan the weekday extraction")
+            .collect()
+            .await
+            .expect("run the weekday extraction");
+        let rendered = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format the weekday extraction")
+            .to_string();
+        assert!(
+            rendered.contains("| 0            | 0           |"),
+            "date_part('dow') and EXTRACT(DOW) must both count Sunday as 0, got {rendered}"
+        );
+
+        // A time argument is what Spark's signature cannot take.
+        let over_a_time = df
+            .ctx
+            .sql("SELECT date_part('hour', TIME '12:34:56') AS h")
+            .await
+            .and_then(datafusion::dataframe::DataFrame::into_optimized_plan);
+        assert!(
+            over_a_time.is_ok(),
+            "date_part over a time must stay plannable under the built-in: {:?}",
+            over_a_time.err()
+        );
+    }
+
     /// The built session keeps **Spark's** `length`: it takes a binary
     /// argument and counts bytes, which the built-in `character_length` does
     /// not — it coerces the value to UTF-8 and counts characters, so the two
