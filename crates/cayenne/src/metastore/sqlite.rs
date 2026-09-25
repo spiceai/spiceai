@@ -374,6 +374,93 @@ async fn configure_sqlite_connection(
     }
 }
 
+/// The FIFO queue every in-process writer of one metastore file waits in before
+/// it asks `SQLite` for the write lock.
+///
+/// `SQLite` admits one writer at a time and parks the rest in its busy handler,
+/// which retries on a sleep backoff of up to 100 ms and grants no order: a
+/// writer that re-takes the lock back to back can starve the others until they
+/// fail with `database is locked`, and under a few dozen writers every write's
+/// tail is the backoff rather than the work. A writer holds this gate for
+/// exactly as long as it holds the write lock, so in-process writers take the
+/// lock in arrival order — `tokio::sync::Mutex` grants waiters in FIFO order —
+/// and the next one starts the moment the previous one releases. The busy
+/// handler then only arbitrates between processes.
+///
+/// Reads never take the gate: in WAL mode they neither wait for nor block a
+/// writer.
+type WriterGate = Mutex<()>;
+
+/// Writer gates by metastore file, shared by every [`SqliteMetastore`] open on
+/// that file in this process. Weak, so a file's gate goes away with the last
+/// metastore open on it.
+static WRITER_GATES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<WriterGate>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// The writer gate shared by every metastore open on `db_path` in this process.
+async fn shared_writer_gate(db_path: &str) -> Arc<WriterGate> {
+    let key = writer_gate_key(db_path).await;
+    let mut gates = WRITER_GATES.lock();
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+/// Names a metastore file so every spelling of one path shares a gate: the
+/// canonical parent directory joined with the file name, since the file itself
+/// may not exist yet. A memory-mode URI already names its database.
+async fn writer_gate_key(db_path: &str) -> String {
+    if is_memory_db_path(db_path) {
+        return db_path.to_string();
+    }
+    let path = Path::new(db_path);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return db_path.to_string();
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    tokio::fs::canonicalize(parent).await.map_or_else(
+        |_| db_path.to_string(),
+        |dir| dir.join(name).to_string_lossy().into_owned(),
+    )
+}
+
+/// What a writer gets when it waits out the busy timeout for the writer gate:
+/// the `SQLITE_BUSY` a contended write gets from `SQLite` itself, so every
+/// caller's conflict handling (`is_retryable_write_conflict`) applies unchanged.
+fn writer_gate_timeout() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("database is locked".to_string()),
+    )
+}
+
+/// Whether a statement issued through a query method writes, judged by its
+/// leading keyword: `reserve_sequence_numbers` runs `UPDATE … RETURNING`
+/// through `query_row`, and that write must queue on the writer gate like any
+/// other. Everything else runs ungated — gating a read would make a read nested
+/// inside a transaction wait on the gate its own transaction holds — and a
+/// debug assertion checks the statement is read-only, so a write this misses
+/// fails tests rather than silently skipping the queue.
+fn statement_writes(sql: &str) -> bool {
+    let keyword = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+    ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+        .iter()
+        .any(|write| keyword.eq_ignore_ascii_case(write))
+}
+
 /// Round-robin connection pool for the [`SqliteMetastore`].
 ///
 /// `SQLite` WAL mode allows concurrent readers and serializes writers at the
@@ -406,9 +493,21 @@ struct SqliteConnectionPool {
     /// under full pool saturation. It still targets the same shared `-wal` file,
     /// so a single checkpoint here covers the catalog's tables.
     checkpoint_conn: Arc<Mutex<tokio_rusqlite::Connection>>,
+    /// This file's [`WriterGate`], shared with every other metastore open on it.
+    writer_gate: Arc<WriterGate>,
 }
 
 impl SqliteConnectionPool {
+    /// Wait for this metastore file's [`WriterGate`], at most the configured
+    /// busy timeout — the bound a writer already had waiting on `SQLite` — after
+    /// which the wait fails with [`writer_gate_timeout`].
+    async fn acquire_writer(&self) -> Result<OwnedMutexGuard<()>, rusqlite::Error> {
+        let timeout = std::time::Duration::from_millis(sqlite_metastore_config().busy_timeout_ms);
+        tokio::time::timeout(timeout, Arc::clone(&self.writer_gate).lock_owned())
+            .await
+            .map_err(|_| writer_gate_timeout())
+    }
+
     /// Acquire a connection using round-robin with try-first heuristic.
     ///
     /// Tries each slot starting from the round-robin index; returns the first
@@ -600,10 +699,14 @@ impl SqliteMetastore {
                 // background WAL drain so it never lands on a `conns` slot a hot
                 // writer could fall back to.
                 let checkpoint_conn = Arc::new(Mutex::new(self.open_connection().await?));
+                // After the opens, so a file-mode parent directory exists to be
+                // canonicalized into the gate's key.
+                let writer_gate = shared_writer_gate(self.db_path()).await;
                 Ok(Arc::new(SqliteConnectionPool {
                     conns,
                     next: AtomicUsize::new(0),
                     checkpoint_conn,
+                    writer_gate,
                 }))
             })
             .await
@@ -1036,7 +1139,16 @@ fn to_sqlite_value(value: MetastoreValue) -> rusqlite::types::Value {
 #[async_trait]
 impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
-        let guard = self.pool().await?.acquire().await;
+        // Schema creation and the migrations below write, so they queue on the
+        // writer gate like any other writer.
+        let pool = self.pool().await?;
+        let writer = pool
+            .acquire_writer()
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to initialize the metastore schema: {e}"),
+            })?;
+        let guard = pool.acquire().await;
 
         // Refuse to open a catalog written by a newer, incompatible Spice build
         // BEFORE running any migration against it (a fresh/legacy DB reads 0).
@@ -1273,8 +1385,10 @@ impl MetastoreBackend for SqliteMetastore {
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
-        // Drop the guard before validation — the callback acquires it per-table.
+        // Drop the guard before validation — the callback acquires it per-table —
+        // and the writer gate with it: validation only reads.
         drop(guard);
+        drop(writer);
         let pool_ref = Arc::clone(self.pool().await?);
         super::validate_existing_schema(|table_name| {
             let pool = Arc::clone(&pool_ref);
@@ -1301,12 +1415,18 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        // METRIC 1: a bare autocommit write statement. Wait = pool-slot acquire
-        // (the WAL writer lock is taken implicitly by the statement itself); held
-        // = the statement's run. Labeled `txn="other"` — this generic path cannot
-        // cheaply know the originating catalog stage.
+        // METRIC 1: a bare autocommit write statement. Wait = the writer gate
+        // plus the pool-slot acquire (the WAL writer lock is then taken implicitly
+        // by the statement itself); held = the statement's run. Labeled
+        // `txn="other"` — this generic path cannot cheaply know the originating
+        // catalog stage.
         let wait_start = std::time::Instant::now();
-        let guard = self.pool().await?.acquire().await;
+        let pool = self.pool().await?;
+        let writer = pool
+            .acquire_writer()
+            .await
+            .map_err(|source| CatalogError::Sqlite { source })?;
+        let guard = pool.acquire().await;
         telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
@@ -1327,6 +1447,7 @@ impl MetastoreBackend for SqliteMetastore {
             })
             .await
             .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+        drop(writer);
         telemetry::cayenne::track_metastore_writer_held(
             held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
@@ -1336,7 +1457,14 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let guard = self.pool().await?.acquire().await;
+        let pool = self.pool().await?;
+        let _writer = pool
+            .acquire_writer()
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to execute batch: {e}"),
+            })?;
+        let guard = pool.acquire().await;
         let sql_owned = sql.to_string();
 
         guard
@@ -1355,7 +1483,14 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
-        let guard = self.pool().await?.acquire().await;
+        let pool = self.pool().await?;
+        let _writer = pool
+            .acquire_writer()
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to execute transaction batch: {e}"),
+            })?;
+        let guard = pool.acquire().await;
         let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
 
         guard
@@ -1380,7 +1515,20 @@ impl MetastoreBackend for SqliteMetastore {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let guard = self.pool().await?.acquire().await;
+        let pool = self.pool().await?;
+        let writes = statement_writes(params.sql);
+        let _writer = if writes {
+            Some(
+                pool.acquire_writer()
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to query row: {e}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let guard = pool.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
@@ -1393,18 +1541,22 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                conn.prepare_cached(&sql)?
-                    .query_row(params_refs.as_slice(), |row| {
-                        let column_count = row.as_ref().column_count();
-                        let mut values = Vec::with_capacity(column_count);
+                let mut stmt = conn.prepare_cached(&sql)?;
+                debug_assert!(
+                    writes || stmt.readonly(),
+                    "a writing statement reached the metastore without the writer gate: {sql}"
+                );
+                stmt.query_row(params_refs.as_slice(), |row| {
+                    let column_count = row.as_ref().column_count();
+                    let mut values = Vec::with_capacity(column_count);
 
-                        for i in 0..column_count {
-                            let value = row.get_ref(i)?;
-                            values.push(convert_sqlite_value(value));
-                        }
+                    for i in 0..column_count {
+                        let value = row.get_ref(i)?;
+                        values.push(convert_sqlite_value(value));
+                    }
 
-                        Ok(values)
-                    })
+                    Ok(values)
+                })
             })
             .await
             .map_err(
@@ -1423,7 +1575,20 @@ impl MetastoreBackend for SqliteMetastore {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let guard = self.pool().await?.acquire().await;
+        let pool = self.pool().await?;
+        let writes = statement_writes(params.sql);
+        let _writer = if writes {
+            Some(
+                pool.acquire_writer()
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to query rows: {e}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let guard = pool.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
@@ -1437,6 +1602,10 @@ impl MetastoreBackend for SqliteMetastore {
                     .collect();
 
                 let mut stmt = conn.prepare_cached(&sql)?;
+                debug_assert!(
+                    writes || stmt.readonly(),
+                    "a writing statement reached the metastore without the writer gate: {sql}"
+                );
                 let rows = stmt.query_map(params_refs.as_slice(), |row| {
                     let column_count = row.as_ref().column_count();
                     let mut values = Vec::with_capacity(column_count);
@@ -1482,7 +1651,16 @@ impl MetastoreBackend for SqliteMetastore {
         // stage opened it without threading a parameter through every call site,
         // so it records `"other"`.
         let wait_start = std::time::Instant::now();
-        let guard = self.pool().await?.acquire().await;
+        let pool = self.pool().await?;
+        // The writer gate first, then a pool slot: a writer waiting its turn must
+        // not hold a connection the readers could use.
+        let writer = pool
+            .acquire_writer()
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to begin transaction: {e}"),
+            })?;
+        let guard = pool.acquire().await;
 
         // Defensively clear any leftover transaction state before BEGIN. A
         // prior `SqliteTransaction` whose `Drop` fired-and-forgot a ROLLBACK
@@ -1519,6 +1697,7 @@ impl MetastoreBackend for SqliteMetastore {
         // record the hold duration when it releases the guard.
         Ok(Box::new(SqliteTransaction {
             conn: Some(guard),
+            writer: Some(writer),
             held_start: std::time::Instant::now(),
         }))
     }
@@ -1530,6 +1709,14 @@ impl MetastoreBackend for SqliteMetastore {
         if let Some(pool) = self.pool.get()
             && let Some(conn) = pool.conns.first()
         {
+            // The TRUNCATE checkpoint and `PRAGMA optimize` below write, so they
+            // queue on the writer gate like any writer.
+            let _writer = pool
+                .acquire_writer()
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to shutdown catalog: {e}"),
+                })?;
             let guard = conn.lock().await;
             guard
                 .call(|conn| {
@@ -1600,7 +1787,16 @@ impl MetastoreBackend for SqliteMetastore {
         // the truncate decision must be based on (the post-checkpoint sample
         // below is the resulting drained size for the gauge).
         let wal_bytes_before = self.read_wal_bytes().await;
-        let truncate = wal_bytes_before > sqlite_metastore_config().wal_truncate_threshold_bytes;
+        // TRUNCATE holds the write lock while it waits out readers and resets the
+        // file, so it queues on the writer gate like a writer. If the gate stays
+        // busy for the whole busy timeout this tick drains PASSIVE instead, and the
+        // next tick tries again.
+        let writer = if wal_bytes_before > sqlite_metastore_config().wal_truncate_threshold_bytes {
+            pool.acquire_writer().await.ok()
+        } else {
+            None
+        };
+        let truncate = writer.is_some();
         let mode_label = if truncate {
             "truncate_background"
         } else {
@@ -1637,6 +1833,7 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to checkpoint catalog WAL: {e}"),
                 },
             )?;
+        drop(writer);
         telemetry::cayenne::track_metastore_checkpoint(
             checkpoint_start.elapsed(),
             &[telemetry::KeyValue::new("mode", mode_label)],
@@ -1679,6 +1876,13 @@ impl MetastoreBackend for SqliteMetastore {
         };
         let conn = &pool.checkpoint_conn;
         let guard = conn.lock().await;
+        // `PRAGMA incremental_vacuum` writes, so it queues on the writer gate.
+        let _writer = pool
+            .acquire_writer()
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to incrementally vacuum the catalog: {e}"),
+            })?;
 
         let start = std::time::Instant::now();
         let map_err = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
@@ -1829,6 +2033,10 @@ fn measure_file_footprint(db_path: &str, wal_path: &str) -> (Option<u64>, Option
 pub struct SqliteTransaction {
     /// Exclusive lock on the connection. `None` after commit/rollback.
     conn: Option<OwnedMutexGuard<tokio_rusqlite::Connection>>,
+    /// This file's [`WriterGate`], held for as long as the write lock: released
+    /// after `COMMIT` or `ROLLBACK` has run, so the next writer's
+    /// `BEGIN IMMEDIATE` finds the lock free.
+    writer: Option<OwnedMutexGuard<()>>,
     /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned), used
     /// to record METRIC 1 `cayenne_metastore_writer_held_ms` on
     /// commit/rollback/drop.
@@ -1853,7 +2061,9 @@ impl Drop for SqliteTransaction {
             // Best-effort rollback — fire and forget since we're in drop.
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
-            // We spawn a task to await the future properly.
+            // We spawn a task to await the future properly. The writer gate
+            // goes with it and is released only once the ROLLBACK has run.
+            let writer = self.writer.take();
             let rollback = async move {
                 let _ = conn
                     .call(|conn| {
@@ -1861,6 +2071,7 @@ impl Drop for SqliteTransaction {
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
+                drop(writer);
             };
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(rollback);
@@ -2199,6 +2410,206 @@ mod tests {
             "rolling back drops the partially applied batch"
         );
         tx.rollback().await.expect("rollback");
+    }
+
+    /// Writers queued behind a held write lock are granted it in the order they
+    /// arrived. `SQLite`'s busy handler grants no order — each waiter wakes on its
+    /// own backoff and whoever retries first wins — so without the writer gate
+    /// this order is effectively random.
+    #[tokio::test]
+    async fn test_writers_are_granted_the_write_lock_in_arrival_order() {
+        const WRITERS: i64 = 16;
+        let (_dir, metastore) = temp_metastore();
+        let metastore = Arc::new(metastore);
+        metastore
+            .execute_batch(
+                "CREATE TABLE t (seq INTEGER PRIMARY KEY AUTOINCREMENT, writer INTEGER NOT NULL)",
+            )
+            .await
+            .expect("create table");
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+        let mut writers = Vec::new();
+        for writer in 0..WRITERS {
+            let metastore = Arc::clone(&metastore);
+            writers.push(tokio::spawn(async move {
+                metastore
+                    .execute(ExecuteParams {
+                        sql: "INSERT INTO t (writer) VALUES (?1)",
+                        params: vec![MetastoreValue::Integer(writer)],
+                    })
+                    .await
+            }));
+            // Arrival order is what is under test: each writer must be queued
+            // before the next one starts, and reaching the queue takes
+            // microseconds.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        holder.commit().await.expect("commit the holder");
+        for writer in writers {
+            writer
+                .await
+                .expect("writer task")
+                .expect("a queued writer must get the lock, not time out");
+        }
+
+        let order: Vec<i64> = metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT writer FROM t ORDER BY seq",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read commit order");
+        assert_eq!(
+            order,
+            (0..WRITERS).collect::<Vec<_>>(),
+            "writers must commit in the order they queued for the write lock"
+        );
+    }
+
+    /// A writer that waits out the busy timeout on the writer gate fails with the
+    /// retryable `database is locked` a contended `SQLite` write returns — through
+    /// every write path, including an `UPDATE … RETURNING` issued as a query —
+    /// while a read runs regardless of who holds the gate.
+    #[tokio::test]
+    async fn test_a_writer_that_waits_out_the_busy_timeout_gets_database_busy() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            busy_timeout_ms: 200,
+            ..SqliteMetastoreConfig::default()
+        });
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .await
+            .expect("create table");
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id, n) VALUES (1, 0)",
+                params: vec![],
+            })
+            .await
+            .expect("seed row");
+
+        let holder = metastore.begin_transaction().await.expect("begin");
+
+        let insert = metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id, n) VALUES (2, 0)",
+                params: vec![],
+            })
+            .await
+            .expect_err("an autocommit write must not get the lock while it is held");
+        let begin = metastore
+            .begin_transaction()
+            .await
+            .err()
+            .expect("a second transaction must not begin while the lock is held");
+        let returning = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "UPDATE t SET n = n + 1 WHERE id = 1 RETURNING n",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect_err("a write issued as a query must queue on the writer gate too");
+        for error in [&insert, &begin, &returning] {
+            assert!(
+                crate::cayenne_catalog::is_retryable_write_conflict(error),
+                "a writer that waited out the busy timeout must see a retryable conflict: {error}"
+            );
+            assert!(
+                error.to_string().contains("database is locked"),
+                "a writer that waited out the busy timeout must see database is locked: {error}"
+            );
+        }
+
+        let n = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT n FROM t WHERE id = 1",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("a read must not wait for the writer gate");
+        assert_eq!(n, 0);
+
+        holder.rollback().await.expect("rollback the holder");
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+    }
+
+    /// Every metastore open on one file shares its writer gate, however the path
+    /// is spelled, so two catalogs on the same file queue their writers together.
+    #[tokio::test]
+    async fn test_metastores_on_one_file_share_the_writer_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let direct = SqliteMetastore::new(format!(
+            "sqlite://{}",
+            dir.path().join("cayenne.db").display()
+        ));
+        let dotted = SqliteMetastore::new(format!(
+            "sqlite://{}",
+            dir.path().join(".").join("cayenne.db").display()
+        ));
+        let other = SqliteMetastore::new(format!(
+            "sqlite://{}",
+            dir.path().join("other.db").display()
+        ));
+        let direct_gate = Arc::clone(&direct.pool().await.expect("pool").writer_gate);
+        let dotted_gate = Arc::clone(&dotted.pool().await.expect("pool").writer_gate);
+        let other_gate = Arc::clone(&other.pool().await.expect("pool").writer_gate);
+        assert!(
+            Arc::ptr_eq(&direct_gate, &dotted_gate),
+            "two spellings of one metastore file must share its writer gate"
+        );
+        assert!(
+            !Arc::ptr_eq(&direct_gate, &other_gate),
+            "different metastore files must not share a writer gate"
+        );
+    }
+
+    /// A transaction dropped without commit or rollback releases the writer gate
+    /// once its rollback has run, so the next writer proceeds.
+    #[tokio::test]
+    async fn test_a_dropped_transaction_releases_the_writer_gate() {
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        let abandoned = metastore.begin_transaction().await.expect("begin");
+        abandoned
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id) VALUES (1)",
+                params: vec![],
+            })
+            .await
+            .expect("write inside the abandoned transaction");
+        drop(abandoned);
+
+        let next = metastore
+            .begin_transaction()
+            .await
+            .expect("the next writer must get the lock once the dropped one rolls back");
+        let rows = next
+            .query_row_values(QueryRowParams {
+                sql: "SELECT COUNT(*) FROM t",
+                params: vec![],
+            })
+            .await
+            .expect("count");
+        assert!(
+            matches!(rows.first(), Some(MetastoreValue::Integer(0))),
+            "the dropped transaction's write must have been rolled back: {rows:?}"
+        );
+        next.rollback().await.expect("rollback");
     }
 
     /// Cayenne memory mode: an in-memory (memdb) metastore must be usable and,
