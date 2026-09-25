@@ -2420,13 +2420,25 @@ mod tests {
     /// `Precision::Absent` (an empty delta branch poisons `col_stats_union`).
     /// With an optimizer overlay attached, the wrapper refills the Absent NDV
     /// while preserving the child's (filter-aware) `num_rows`; min/max are
+    /// A plan's statistics as the optimizer reads them.
+    ///
+    /// `ExecutionPlan::partition_statistics` is deprecated and `DataFusion`'s own
+    /// nodes no longer answer it — they implement `statistics_from_inputs`, which
+    /// only `StatisticsContext` drives. Reading a child directly would report
+    /// `Statistics::new_unknown` and make any comparison against it vacuous.
+    fn stats_of(
+        plan: &dyn ExecutionPlan,
+        partition: Option<usize>,
+    ) -> Result<Arc<Statistics>> {
+        datafusion::physical_plan::StatisticsContext::new().compute(
+            plan,
+            &datafusion::physical_plan::StatisticsArgs::new().with_partition(partition),
+        )
+    }
+
     /// intentionally left Absent (they trip `DataFusion`'s empty-interval assertion
     /// on range filters and aren't needed by build-side selection / cardinality).
     #[test]
-    #[expect(
-        deprecated,
-        reason = "exercises the still-required deprecated partition_statistics override directly"
-    )]
     fn overlay_refills_union_wiped_join_key_statistics() {
         use datafusion_common::{ColumnStatistics, ScalarValue};
         use datafusion_physical_plan::empty::EmptyExec;
@@ -2438,9 +2450,7 @@ mod tests {
             UnionExec::try_new(vec![memory, empty]).expect("union exec should be created");
 
         // Sanity: the union poisons min/max + distinct_count to Absent.
-        let poisoned = union
-            .partition_statistics(None)
-            .expect("union statistics should be available");
+        let poisoned = stats_of(union.as_ref(), None).expect("union statistics should be available");
         assert!(matches!(
             poisoned.column_statistics[0].min_value,
             Precision::Absent
@@ -2471,9 +2481,7 @@ mod tests {
 
         // Without an overlay: poisoned stats pass through unchanged.
         let plain = CayenneAccelerationExec::new(Arc::clone(&union));
-        let plain_stats = plain
-            .partition_statistics(None)
-            .expect("statistics should be available");
+        let plain_stats = stats_of(&plain, None).expect("statistics should be available");
         assert!(matches!(
             plain_stats.column_statistics[0].min_value,
             Precision::Absent
@@ -2488,9 +2496,7 @@ mod tests {
         // `col > max` range filter and aren't needed downstream).
         let restored_exec = CayenneAccelerationExec::new(Arc::clone(&union))
             .with_optimizer_column_overlay(Some(overlay));
-        let restored = restored_exec
-            .partition_statistics(None)
-            .expect("statistics should be available");
+        let restored = stats_of(&restored_exec, None).expect("statistics should be available");
         let col = &restored.column_statistics[0];
         assert!(matches!(col.min_value, Precision::Absent));
         assert!(matches!(col.max_value, Precision::Absent));
@@ -2503,11 +2509,9 @@ mod tests {
         // The overlay is a per-table (global) aggregate, so it must NOT be
         // applied to per-partition stats: `partition_statistics(Some(_))` must
         // return the child's partition stats untouched.
-        let per_partition = restored_exec
-            .partition_statistics(Some(0))
-            .expect("per-partition statistics should be available");
-        let child_partition = union
-            .partition_statistics(Some(0))
+        let per_partition =
+            stats_of(&restored_exec, Some(0)).expect("per-partition statistics should be available");
+        let child_partition = stats_of(union.as_ref(), Some(0))
             .expect("child per-partition statistics should be available");
         assert_eq!(
             per_partition.column_statistics[0].min_value,
