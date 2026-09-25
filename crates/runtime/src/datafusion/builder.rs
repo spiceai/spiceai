@@ -1125,12 +1125,13 @@ impl DataFusionBuilder {
         // is refused right here, so a fork repin that adds one fails the build
         // instead of shadowing a built-in silently (spiceai/spiceai#14361).
         for udf in datafusion_spark::all_default_scalar_functions() {
-            let taken =
-                names_already_registered(state.scalar_functions(), udf.name(), udf.aliases());
-            if !taken.is_empty()
-                && decide_spark_collision("scalar", udf.name(), &taken, SPARK_SCALAR_COLLISIONS)
-                    == Keep::BuiltIn
-            {
+            if let Some(taken) = kept_out(
+                "scalar",
+                state.scalar_functions(),
+                udf.name(),
+                udf.aliases(),
+                SPARK_SCALAR_COLLISIONS,
+            ) {
                 lend_spark_names_to_built_in(&mut state, &udf, &taken);
                 continue;
             }
@@ -1140,15 +1141,14 @@ impl DataFusionBuilder {
             }
         }
         for udaf in datafusion_spark::all_default_aggregate_functions() {
-            let taken =
-                names_already_registered(state.aggregate_functions(), udaf.name(), udaf.aliases());
-            if !taken.is_empty()
-                && decide_spark_collision(
-                    "aggregate",
-                    udaf.name(),
-                    &taken,
-                    SPARK_AGGREGATE_COLLISIONS,
-                ) == Keep::BuiltIn
+            if kept_out(
+                "aggregate",
+                state.aggregate_functions(),
+                udaf.name(),
+                udaf.aliases(),
+                SPARK_AGGREGATE_COLLISIONS,
+            )
+            .is_some()
             {
                 continue;
             }
@@ -1158,11 +1158,14 @@ impl DataFusionBuilder {
             }
         }
         for udwf in datafusion_spark::all_default_window_functions() {
-            let taken =
-                names_already_registered(state.window_functions(), udwf.name(), udwf.aliases());
-            if !taken.is_empty()
-                && decide_spark_collision("window", udwf.name(), &taken, SPARK_WINDOW_COLLISIONS)
-                    == Keep::BuiltIn
+            if kept_out(
+                "window",
+                state.window_functions(),
+                udwf.name(),
+                udwf.aliases(),
+                SPARK_WINDOW_COLLISIONS,
+            )
+            .is_some()
             {
                 continue;
             }
@@ -2164,6 +2167,23 @@ const SPARK_WINDOW_COLLISIONS: &[(&str, Keep)] = &[];
 /// theirs.
 const SPARK_SCALAR_NAMES_LENT_TO_BUILT_IN: &[(&str, &[&str])] =
     &[("ceil", &["ceiling"]), ("length", &["len"])];
+
+/// The names a Spark `kind` function `name` would take that `registered`
+/// already holds, when the collision is decided `Keep::BuiltIn` and the
+/// function is therefore kept out; `None` when it registers (no collision,
+/// or `Keep::Spark`). Refuses an undecided collision like
+/// [`decide_spark_collision`].
+fn kept_out<'a, T>(
+    kind: &str,
+    registered: &HashMap<String, T>,
+    name: &'a str,
+    aliases: &'a [String],
+    decisions: &[(&str, Keep)],
+) -> Option<Vec<&'a str>> {
+    let taken = names_already_registered(registered, name, aliases);
+    (!taken.is_empty() && decide_spark_collision(kind, name, &taken, decisions) == Keep::BuiltIn)
+        .then_some(taken)
+}
 
 /// Registers the built-in that `spark` yields to (the function the session
 /// holds under `spark`'s own name, or else under the first of its names in
