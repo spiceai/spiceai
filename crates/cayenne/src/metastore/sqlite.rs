@@ -389,6 +389,10 @@ async fn configure_sqlite_connection(
 ///
 /// Reads never take the gate: in WAL mode they neither wait for nor block a
 /// writer.
+///
+/// Lock order: the dedicated checkpoint connection before the gate (the WAL
+/// checkpoint and the incremental vacuum), and the gate before a pool slot
+/// (every other writer), so a writer waiting its turn holds no connection.
 type WriterGate = Mutex<()>;
 
 /// Writer gates by metastore file, shared by every [`SqliteMetastore`] open on
@@ -434,13 +438,16 @@ async fn writer_gate_key(db_path: &str) -> String {
 }
 
 /// What a writer gets when it waits out the busy timeout for the writer gate:
-/// the `SQLITE_BUSY` a contended write gets from `SQLite` itself, so every
-/// caller's conflict handling (`is_retryable_write_conflict`) applies unchanged.
-fn writer_gate_timeout() -> rusqlite::Error {
-    rusqlite::Error::SqliteFailure(
+/// the `SQLITE_BUSY` a contended write gets from `SQLite` itself, in the form a
+/// connection call returns it. Each write path maps it with the same closure
+/// as its own call's error, so a gate timeout surfaces as exactly the error —
+/// text and retryable conflict (`is_retryable_write_conflict`) — the path
+/// returns when `SQLite`'s busy handler times out.
+fn writer_gate_timeout() -> tokio_rusqlite::Error<rusqlite::Error> {
+    tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
         Some("database is locked".to_string()),
-    )
+    ))
 }
 
 /// Whether a statement issued through a query method writes, judged by its
@@ -501,7 +508,9 @@ impl SqliteConnectionPool {
     /// Wait for this metastore file's [`WriterGate`], at most the configured
     /// busy timeout — the bound a writer already had waiting on `SQLite` — after
     /// which the wait fails with [`writer_gate_timeout`].
-    async fn acquire_writer(&self) -> Result<OwnedMutexGuard<()>, rusqlite::Error> {
+    async fn acquire_writer(
+        &self,
+    ) -> Result<OwnedMutexGuard<()>, tokio_rusqlite::Error<rusqlite::Error>> {
         let timeout = std::time::Duration::from_millis(sqlite_metastore_config().busy_timeout_ms);
         tokio::time::timeout(timeout, Arc::clone(&self.writer_gate).lock_owned())
             .await
@@ -1140,14 +1149,13 @@ fn to_sqlite_value(value: MetastoreValue) -> rusqlite::types::Value {
 impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         // Schema creation and the migrations below write, so they queue on the
-        // writer gate like any other writer.
+        // writer gate like any other writer. A gate timeout reads as the busy
+        // timeout the schema creation's first write would have hit.
+        let schema_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to initialize schema: {e}"),
+        };
         let pool = self.pool().await?;
-        let writer = pool
-            .acquire_writer()
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to initialize the metastore schema: {e}"),
-            })?;
+        let writer = pool.acquire_writer().await.map_err(schema_error)?;
         let guard = pool.acquire().await;
 
         // Refuse to open a catalog written by a newer, incompatible Spice build
@@ -1333,11 +1341,7 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<_, rusqlite::Error>(())
             })
             .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to initialize schema: {e}"),
-                },
-            )?;
+            .map_err(schema_error)?;
 
         guard
             .call(|conn| {
@@ -1421,11 +1425,11 @@ impl MetastoreBackend for SqliteMetastore {
         // `txn="other"` — this generic path cannot cheaply know the originating
         // catalog stage.
         let wait_start = std::time::Instant::now();
+        let execute_error = |e: tokio_rusqlite::Error<rusqlite::Error>| {
+            convert_tokio_rusqlite_error(e, "Failed to execute statement")
+        };
         let pool = self.pool().await?;
-        let writer = pool
-            .acquire_writer()
-            .await
-            .map_err(|source| CatalogError::Sqlite { source })?;
+        let writer = pool.acquire_writer().await.map_err(execute_error)?;
         let guard = pool.acquire().await;
         telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
@@ -1446,7 +1450,7 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<_, rusqlite::Error>(())
             })
             .await
-            .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+            .map_err(execute_error)?;
         drop(writer);
         telemetry::cayenne::track_metastore_writer_held(
             held_start.elapsed(),
@@ -1457,13 +1461,11 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
+        let batch_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to execute batch: {e}"),
+        };
         let pool = self.pool().await?;
-        let _writer = pool
-            .acquire_writer()
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to execute batch: {e}"),
-            })?;
+        let _writer = pool.acquire_writer().await.map_err(batch_error)?;
         let guard = pool.acquire().await;
         let sql_owned = sql.to_string();
 
@@ -1473,23 +1475,17 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<_, rusqlite::Error>(())
             })
             .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to execute batch: {e}"),
-                },
-            )?;
+            .map_err(batch_error)?;
 
         Ok(())
     }
 
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
+        let batch_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to execute transaction batch: {e}"),
+        };
         let pool = self.pool().await?;
-        let _writer = pool
-            .acquire_writer()
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to execute transaction batch: {e}"),
-            })?;
+        let _writer = pool.acquire_writer().await.map_err(batch_error)?;
         let guard = pool.acquire().await;
         let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
 
@@ -1501,11 +1497,7 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<_, rusqlite::Error>(())
             })
             .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to execute transaction batch: {e}"),
-                },
-            )?;
+            .map_err(batch_error)?;
 
         Ok(())
     }
@@ -1515,16 +1507,13 @@ impl MetastoreBackend for SqliteMetastore {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
+        let query_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to query row: {e}"),
+        };
         let pool = self.pool().await?;
         let writes = statement_writes(params.sql);
         let _writer = if writes {
-            Some(
-                pool.acquire_writer()
-                    .await
-                    .map_err(|e| CatalogError::Database {
-                        message: format!("Failed to query row: {e}"),
-                    })?,
-            )
+            Some(pool.acquire_writer().await.map_err(query_error)?)
         } else {
             None
         };
@@ -1559,11 +1548,7 @@ impl MetastoreBackend for SqliteMetastore {
                 })
             })
             .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to query row: {e}"),
-                },
-            )?;
+            .map_err(query_error)?;
 
         // Apply the callback outside the rusqlite closure to preserve CatalogError
         let sqlite_row = SqliteRow { values: row_values };
@@ -1575,16 +1560,13 @@ impl MetastoreBackend for SqliteMetastore {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
+        let query_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to query rows: {e}"),
+        };
         let pool = self.pool().await?;
         let writes = statement_writes(params.sql);
         let _writer = if writes {
-            Some(
-                pool.acquire_writer()
-                    .await
-                    .map_err(|e| CatalogError::Database {
-                        message: format!("Failed to query rows: {e}"),
-                    })?,
-            )
+            Some(pool.acquire_writer().await.map_err(query_error)?)
         } else {
             None
         };
@@ -1626,11 +1608,7 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<Vec<Vec<MetastoreValue>>, rusqlite::Error>(collected_rows)
             })
             .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to query rows: {e}"),
-                },
-            )?;
+            .map_err(query_error)?;
 
         // Apply the callback outside the rusqlite closure to preserve CatalogError
         let mut results = Vec::with_capacity(all_row_values.len());
@@ -1645,21 +1623,19 @@ impl MetastoreBackend for SqliteMetastore {
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         // METRIC 1 (writer wait): wall-clock from the start of acquisition through
         // a held BEGIN IMMEDIATE. This is the WAL-serialized writer queueing cost —
-        // the pool-slot lock plus SQLite's reserved-lock acquire (the busy-timeout
-        // wait when another writer holds the lock). No `txn` stage label here: the
-        // generic backend `begin_transaction` cannot cheaply know which catalog
-        // stage opened it without threading a parameter through every call site,
-        // so it records `"other"`.
+        // the writer gate, the pool-slot lock, and SQLite's reserved-lock acquire
+        // (the busy-timeout wait when another process holds the lock). No `txn`
+        // stage label here: the generic backend `begin_transaction` cannot cheaply
+        // know which catalog stage opened it without threading a parameter through
+        // every call site, so it records `"other"`.
         let wait_start = std::time::Instant::now();
+        let begin_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to begin transaction: {e}"),
+        };
         let pool = self.pool().await?;
         // The writer gate first, then a pool slot: a writer waiting its turn must
         // not hold a connection the readers could use.
-        let writer = pool
-            .acquire_writer()
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to begin transaction: {e}"),
-            })?;
+        let writer = pool.acquire_writer().await.map_err(begin_error)?;
         let guard = pool.acquire().await;
 
         // Defensively clear any leftover transaction state before BEGIN. A
@@ -1682,11 +1658,7 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<_, rusqlite::Error>(())
             })
             .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to begin transaction: {e}"),
-                },
-            )?;
+            .map_err(begin_error)?;
         telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
@@ -1711,12 +1683,11 @@ impl MetastoreBackend for SqliteMetastore {
         {
             // The TRUNCATE checkpoint and `PRAGMA optimize` below write, so they
             // queue on the writer gate like any writer.
-            let _writer = pool
-                .acquire_writer()
-                .await
-                .map_err(|e| CatalogError::Database {
+            let shutdown_error =
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                     message: format!("Failed to shutdown catalog: {e}"),
-                })?;
+                };
+            let _writer = pool.acquire_writer().await.map_err(shutdown_error)?;
             let guard = conn.lock().await;
             guard
                 .call(|conn| {
@@ -1744,11 +1715,7 @@ impl MetastoreBackend for SqliteMetastore {
                     Ok::<_, rusqlite::Error>(())
                 })
                 .await
-                .map_err(
-                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                        message: format!("Failed to shutdown catalog: {e}"),
-                    },
-                )?;
+                .map_err(shutdown_error)?;
             // Note: We intentionally do not explicitly close the connections here.
             // Closing pool connections while other pool slots remain open would be
             // inconsistent; instead we rely on normal drop semantics to clean up
@@ -1787,25 +1754,29 @@ impl MetastoreBackend for SqliteMetastore {
         // the truncate decision must be based on (the post-checkpoint sample
         // below is the resulting drained size for the gauge).
         let wal_bytes_before = self.read_wal_bytes().await;
-        // TRUNCATE holds the write lock while it waits out readers and resets the
-        // file, so it queues on the writer gate like a writer. If the gate stays
-        // busy for the whole busy timeout this tick drains PASSIVE instead, and the
-        // next tick tries again.
-        let writer = if wal_bytes_before > sqlite_metastore_config().wal_truncate_threshold_bytes {
-            pool.acquire_writer().await.ok()
-        } else {
-            None
-        };
-        let truncate = writer.is_some();
-        let mode_label = if truncate {
+        let truncate_due =
+            wal_bytes_before > sqlite_metastore_config().wal_truncate_threshold_bytes;
+        let mode_label = if truncate_due {
             "truncate_background"
         } else {
             "passive_background"
         };
 
         // METRIC 2 (checkpoint duration): time the checkpoint with the chosen
-        // background mode (this IS the off-hot-path background drain).
+        // background mode (this IS the off-hot-path background drain), including
+        // any wait for the write lock.
         let checkpoint_start = std::time::Instant::now();
+        // TRUNCATE holds the write lock while it waits out readers and resets the
+        // file, so it queues on the writer gate like a writer. If the gate stays
+        // busy for the whole busy timeout this tick drains PASSIVE instead — the
+        // partial drain a TRUNCATE that finds the WAL busy does — and the next
+        // tick tries again.
+        let writer = if truncate_due {
+            pool.acquire_writer().await.ok()
+        } else {
+            None
+        };
+        let truncate = writer.is_some();
         guard
             .call(move |conn| {
                 let journal_mode: String =
@@ -1876,18 +1847,13 @@ impl MetastoreBackend for SqliteMetastore {
         };
         let conn = &pool.checkpoint_conn;
         let guard = conn.lock().await;
-        // `PRAGMA incremental_vacuum` writes, so it queues on the writer gate.
-        let _writer = pool
-            .acquire_writer()
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to incrementally vacuum the catalog: {e}"),
-            })?;
 
         let start = std::time::Instant::now();
         let map_err = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
             message: format!("Failed to incrementally vacuum the catalog: {e}"),
         };
+        // `PRAGMA incremental_vacuum` writes, so it queues on the writer gate.
+        let _writer = pool.acquire_writer().await.map_err(map_err)?;
         // Once the live mode is known INCREMENTAL, each tick is a single
         // freelist reclaim call. The first tick also probes the mode in that
         // same call so we never pay two round-trips to the connection thread.
@@ -2470,12 +2436,86 @@ mod tests {
         );
     }
 
-    /// A writer that waits out the busy timeout on the writer gate fails with the
-    /// retryable `database is locked` a contended `SQLite` write returns — through
-    /// every write path, including an `UPDATE … RETURNING` issued as a query —
-    /// while a read runs regardless of who holds the gate.
+    /// The error each write path returns while another writer holds the write
+    /// lock, as `(path, message, retryable)`.
+    async fn contended_write_errors(
+        metastore: &SqliteMetastore,
+    ) -> Vec<(&'static str, String, bool)> {
+        let describe = |path: &'static str, error: CatalogError| {
+            let retryable = crate::cayenne_catalog::is_retryable_write_conflict(&error);
+            (path, error.to_string(), retryable)
+        };
+        let returning = "UPDATE t SET n = n + 1 WHERE id = 1 RETURNING n";
+        vec![
+            describe(
+                "execute",
+                metastore
+                    .execute(ExecuteParams {
+                        sql: "INSERT INTO t (id, n) VALUES (2, 0)",
+                        params: vec![],
+                    })
+                    .await
+                    .expect_err("an autocommit write must not get the held lock"),
+            ),
+            describe(
+                "execute_batch",
+                metastore
+                    .execute_batch("INSERT INTO t (id, n) VALUES (3, 0)")
+                    .await
+                    .expect_err("a batch must not get the held lock"),
+            ),
+            describe(
+                "execute_transaction_batch",
+                metastore
+                    .execute_transaction_batch("INSERT INTO t (id, n) VALUES (4, 0)")
+                    .await
+                    .expect_err("a transaction batch must not get the held lock"),
+            ),
+            describe(
+                "begin_transaction",
+                metastore
+                    .begin_transaction()
+                    .await
+                    .err()
+                    .expect("a transaction must not begin while the lock is held"),
+            ),
+            describe(
+                "query_row",
+                metastore
+                    .query_row(
+                        QueryRowParams {
+                            sql: returning,
+                            params: vec![],
+                        },
+                        |row| row.get_i64(0),
+                    )
+                    .await
+                    .expect_err("a write issued through query_row must not get the held lock"),
+            ),
+            describe(
+                "query",
+                metastore
+                    .query(
+                        QueryParams {
+                            sql: returning,
+                            params: vec![],
+                        },
+                        |row| row.get_i64(0),
+                    )
+                    .await
+                    .expect_err("a write issued through query must not get the held lock"),
+            ),
+        ]
+    }
+
+    /// A writer that waits out the busy timeout on the writer gate gets exactly
+    /// the error it gets when `SQLite`'s busy handler times out on a lock held
+    /// outside the gate — by another process — on every write path, including an
+    /// `UPDATE … RETURNING` issued as a query: the same message and the same
+    /// retryable `database is locked`. A read runs regardless of who holds the
+    /// gate.
     #[tokio::test]
-    async fn test_a_writer_that_waits_out_the_busy_timeout_gets_database_busy() {
+    async fn test_a_writer_gate_timeout_reads_like_a_busy_timeout() {
         let _guard = CONFIG_LOCK.lock().await;
         set_sqlite_metastore_config(SqliteMetastoreConfig {
             busy_timeout_ms: 200,
@@ -2494,41 +2534,21 @@ mod tests {
             .await
             .expect("seed row");
 
+        // Another process holds the write lock: every writer passes the gate
+        // and SQLite's busy handler times out.
+        let other_process =
+            rusqlite::Connection::open(metastore.db_path()).expect("open a second connection");
+        other_process
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take the write lock outside the gate");
+        let busy_timeouts = contended_write_errors(&metastore).await;
+        other_process
+            .execute_batch("ROLLBACK")
+            .expect("release the write lock");
+
+        // An in-process writer holds it: every writer times out on the gate.
         let holder = metastore.begin_transaction().await.expect("begin");
-
-        let insert = metastore
-            .execute(ExecuteParams {
-                sql: "INSERT INTO t (id, n) VALUES (2, 0)",
-                params: vec![],
-            })
-            .await
-            .expect_err("an autocommit write must not get the lock while it is held");
-        let begin = metastore
-            .begin_transaction()
-            .await
-            .err()
-            .expect("a second transaction must not begin while the lock is held");
-        let returning = metastore
-            .query_row(
-                QueryRowParams {
-                    sql: "UPDATE t SET n = n + 1 WHERE id = 1 RETURNING n",
-                    params: vec![],
-                },
-                |row| row.get_i64(0),
-            )
-            .await
-            .expect_err("a write issued as a query must queue on the writer gate too");
-        for error in [&insert, &begin, &returning] {
-            assert!(
-                crate::cayenne_catalog::is_retryable_write_conflict(error),
-                "a writer that waited out the busy timeout must see a retryable conflict: {error}"
-            );
-            assert!(
-                error.to_string().contains("database is locked"),
-                "a writer that waited out the busy timeout must see database is locked: {error}"
-            );
-        }
-
+        let gate_timeouts = contended_write_errors(&metastore).await;
         let n = metastore
             .query_row(
                 QueryRowParams {
@@ -2539,10 +2559,20 @@ mod tests {
             )
             .await
             .expect("a read must not wait for the writer gate");
-        assert_eq!(n, 0);
-
         holder.rollback().await.expect("rollback the holder");
         set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        assert_eq!(
+            gate_timeouts, busy_timeouts,
+            "a writer gate timeout must read exactly like SQLite's busy timeout"
+        );
+        for (path, message, retryable) in &gate_timeouts {
+            assert!(
+                *retryable && message.contains("database is locked"),
+                "{path}: a writer that waited out the busy timeout must see a retryable database is locked: {message}"
+            );
+        }
+        assert_eq!(n, 0, "no contended write may have applied");
     }
 
     /// Every metastore open on one file shares its writer gate, however the path
