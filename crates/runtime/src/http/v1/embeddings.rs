@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::http::v1::unavailable_model_message;
 use crate::model::EmbeddingModelStore;
 use crate::status::RuntimeStatus;
 use async_openai::types::embeddings::CreateEmbeddingRequest;
@@ -103,11 +102,9 @@ pub(crate) async fn post(
             resp
         }
         None => {
-            let message = unavailable_model_message(
-                &model_id,
-                status.get_embedding_status(&model_id).as_ref(),
-            )
-            .unwrap_or_else(|| "model not found".to_string());
+            let message = status
+                .unavailable_embedding_reason(&model_id)
+                .unwrap_or_else(|| "model not found".to_string());
             (StatusCode::NOT_FOUND, message).into_response()
         }
     }

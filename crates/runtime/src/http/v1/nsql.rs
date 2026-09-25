@@ -16,7 +16,7 @@ limitations under the License.
 use crate::{
     Runtime,
     datafusion::request_context_extension::get_current_datafusion,
-    http::v1::{ResponseMetadata, ResponseMimeType, to_http_response, unavailable_model_message},
+    http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
     model::{
         LLMChatCompletionsModelStore,
         nsql::{
@@ -597,9 +597,10 @@ pub(crate) async fn handle_nsql_query(
     let nql_model = {
         let models = llms.read().await;
         let Some(nql_model) = models.get(&model) else {
-            let message =
-                unavailable_model_message(&model, rt.status().get_model_status(&model).as_ref())
-                    .unwrap_or_else(|| format!("Model {model} not found"));
+            let message = rt
+                .status()
+                .unavailable_model_reason(&model)
+                .unwrap_or_else(|| format!("Model {model} not found"));
             return (StatusCode::BAD_REQUEST, headers, message);
         };
         Arc::clone(nql_model)

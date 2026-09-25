@@ -21,7 +21,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::http::v1::unavailable_model_message;
 use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
@@ -176,11 +175,9 @@ pub(crate) async fn post(
                 if evaluate_models.read().await.contains_key(&model_id) {
                     evaluate_only_chat_response(&model_id)
                 } else {
-                    let message = unavailable_model_message(
-                        &model_id,
-                        status.get_model_status(&model_id).as_ref(),
-                    )
-                    .unwrap_or_else(|| format!("model '{model_id}' not found"));
+                    let message = status
+                        .unavailable_model_reason(&model_id)
+                        .unwrap_or_else(|| format!("model '{model_id}' not found"));
                     (StatusCode::NOT_FOUND, message).into_response()
                 }
             }
