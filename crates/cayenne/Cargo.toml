@@ -484,6 +484,10 @@ name = "mem_tier_seal_cadence"
 
 [[bench]]
 harness = false
+name = "metastore_manifest_rewrite"
+
+[[bench]]
+harness = false
 name = "publish_metadata_wall"
 
 [[bench]]

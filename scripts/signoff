@@ -676,6 +676,35 @@ warn_status_not_recorded() {
 # guard that can pass while the real cut still truncates.
 readonly STATUS_DESC_MAX_CHARS=140
 
+# A failure verdict with its attribution, cut to fit the cap. The
+# `(triggered by <user>)` suffix is last in every verdict, so a plain slice at
+# STATUS_DESC_MAX_CHARS drops the name of whoever triggered the run — mid-word
+# — while keeping every word of the detail (#14076). Composing the suffix here,
+# once, and budgeting the *message* against what remains of the cap is what
+# makes the attribution the part that can never be lost, whatever a future arm
+# says. `${#}` and the slice count in the same units the shell does, so this
+# agrees with the cut in post_commit_status by construction.
+failure_status_desc() {
+  local message="$1" user="$2"
+  local suffix=" (triggered by ${user})"
+  local budget=$((STATUS_DESC_MAX_CHARS - ${#suffix}))
+  if ((budget < 0)); then
+    budget=0
+  fi
+  if ((${#message} > budget)); then
+    message="${message:0:budget}"
+    # Back up to the last word boundary. Under a locale that counts bytes the
+    # slice can land inside a multi-byte character (the em dash every arm
+    # carries is three), and GitHub rejects a description that is not valid
+    # UTF-8; a cut at a space never splits one. A message with no space at
+    # all keeps the plain slice.
+    case "$message" in
+      *" "*) message="${message% *}" ;;
+    esac
+  fi
+  printf '%s%s' "$message" "$suffix"
+}
+
 # Post a commit status for STATUS_CONTEXT. Used for pending/failure on remote
 # runs and the final success attestation.
 #
@@ -1373,14 +1402,14 @@ describe_check_failure() {
     disk)
       # An out-of-disk run says nothing useful by default — the commit status is
       # all most readers see, so it has to carry the distinction itself.
-      SIGNOFF_FAILURE_STATUS_DESC="Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: the runner ran out of disk (the checks did not complete)"
       ;;
     cache)
       # Same reasoning as disk: the reader sees the commit status, not the log,
       # so the status itself has to say the branch was never evaluated.
-      SIGNOFF_FAILURE_STATUS_DESC="Compiler cache unreachable after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Compiler cache unreachable after ${elapsed}s — checks did not complete, re-dispatch" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`sccache\` could not reach its storage endpoint on this runner, so every \`rustc\` invocation failed before compiling anything and **the checks did not complete**. Nothing here is a statement about the branch. Re-dispatch once the runner's cache endpoint is answering; if it stays down, the pool's \`sccache\` service is what needs attention (see \`.github/actions/setup-sccache\`)."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: sccache could not reach its storage (the checks did not complete)"
       ;;
@@ -1396,7 +1425,7 @@ describe_check_failure() {
       # binary would not load is one the branch touches. A recurrence on this
       # branch alone, or one naming a crate whose build script it changes, is
       # worth suspecting the diff for.
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a test binary on the runner would not load; re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Test binary would not load after ${elapsed}s — checks did not complete, re-dispatch" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`nextest\` could not execute a test binary while listing tests, because the runner's copy is not a loadable executable, so **the checks did not complete**. That is a truncated or clobbered artifact on the shared \`target/\` volume rather than a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build script this branch changes, the diff is worth suspecting."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a test binary on the runner would not load, so nextest never ran the suite (the checks did not complete) — re-dispatch"
       ;;
@@ -1420,14 +1449,11 @@ describe_check_failure() {
       # recurrence on this branch alone, or on a crate whose build this branch
       # changes, is worth suspecting the diff for.
       #
-      # Kept to the register of the two sibling arms that fit — cause first,
-      # then "checks did not complete, re-dispatch". `post_commit_status` cuts
-      # the description at STATUS_DESC_MAX_CHARS and the attribution suffix is
-      # last, so what an over-long line loses is the name of whoever triggered
-      # the run, mid-word, rather than any of the detail. With the longest login
-      # GitHub issues (39 characters) and a six-digit elapsed this is 135
-      # characters where the wording it replaces was 155.
-      SIGNOFF_FAILURE_STATUS_DESC="Compiler subprocess crashed after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+      # Kept to the register of the sibling arms — cause first, then "checks
+      # did not complete, re-dispatch" — so the verdict fits the cap with the
+      # longest login GitHub issues and a six-digit elapsed, and the suite
+      # holds every arm to that (assert_describe_fits).
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Compiler subprocess crashed after ${elapsed}s — checks did not complete, re-dispatch" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the compiler driver reported that a subprocess it ran died of a signal (a crash or an out-of-memory kill, not a diagnostic) — the linker on every run seen so far, though the driver words a frontend crash the same way — and cargo stopped the build at that crate, so **the checks did not complete**: the binary being linked was never produced and nothing after it ran, while whatever passed before it stands. That is the runner's toolchain failing on its own, not a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build this branch changes, the diff is worth suspecting."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a compiler subprocess crashed on the runner, so the build did not finish (the checks did not complete) — re-dispatch"
       ;;
@@ -1437,7 +1463,7 @@ describe_check_failure() {
       # like a lint denial sends the author to read a 14k-line log to discover
       # that nothing was wrong with the diff (#12813). The remedy belongs in the
       # description itself, which is all most readers see.
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — branch predates a make target the gate needs; merge ${LINT_BASE_BRANCH} in (triggered by ${user})"
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Gate make target missing after ${elapsed}s — checks did not run, merge ${LINT_BASE_BRANCH} in" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — this branch's \`Makefile\` has no rule for a target the gate invokes, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Merge \`${LINT_BASE_BRANCH}\` into the branch and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off could not run: this branch's Makefile has no rule for a target the gate invokes (the checks did not run) — merge ${LINT_BASE_BRANCH} in and sign off again"
       ;;
@@ -1447,10 +1473,11 @@ describe_check_failure() {
       # "Sign-off checks failed", which sends the author looking for a lint denial
       # in a log that contains no compilation at all.
       #
-      # "missing or out of date" because the preflight returns this kind for both:
-      # an absent Cargo.lock is a `--locked` violation in cargo's own terms, not an
-      # absence of one, and the two share a remedy.
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by ${user})"
+      # "stale" covers both readings the preflight returns this kind for: an
+      # absent Cargo.lock is a `--locked` violation in cargo's own terms, not an
+      # absence of one, and the two share a remedy. Both halves of that remedy
+      # are in the status — regenerating the lockfile is not enough on its own.
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Cargo.lock stale after ${elapsed}s — checks not run; cargo update --workspace, commit" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — \`Cargo.lock\` is missing, or cargo would have to rewrite it to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run \`cargo update --workspace\` on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock is missing or does not match the workspace manifests (the checks did not run) — run 'cargo update --workspace', commit it, then sign off again"
       ;;
@@ -1462,12 +1489,12 @@ describe_check_failure() {
       # stale-lockfile's status would do — sends the author to look for a lint
       # denial in a log full of green, and understates the remedy: there is
       # nothing in the diff to fix, only a regenerated lockfile to commit.
-      SIGNOFF_FAILURE_STATUS_DESC="Checks passed in ${elapsed}s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by ${user})"
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Checks passed in ${elapsed}s but rewrote Cargo.lock — commit the regenerated Cargo.lock" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Cannot attest** after ${elapsed}s — **the checks ran and passed**, but cargo brought \`Cargo.lock\` up to date while they ran, so the committed lockfile does not describe the tree they passed on and the merge queue would reject it. Nothing here is a statement about the code, and there is nothing in the diff to fix. Commit the regenerated \`Cargo.lock\` and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off cannot attest this branch: the checks passed, but they rewrote Cargo.lock — commit the regenerated Cargo.lock and sign off again"
       ;;
     *)
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
+      SIGNOFF_FAILURE_STATUS_DESC="$(failure_status_desc "Sign-off checks failed after ${elapsed}s" "$user")"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off checks failed"
       ;;

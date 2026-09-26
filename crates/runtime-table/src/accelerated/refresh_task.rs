@@ -3033,9 +3033,13 @@ fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
 
 /// One Prometheus registry + meter provider for this crate's tests.
 ///
-/// `REFRESH_ERRORS` is a `LazyLock` on the global meter. Installing a second
-/// provider after the first instrument is built binds the counter to the
-/// other registry, so tests that scrape would read zero. Share this installer.
+/// Every `runtime_metrics` meter (`REFRESH_ERRORS`, `dataset_load_state`, …) is
+/// a `LazyLock` over `global::meter`, which binds to whichever provider is
+/// installed when it is first built and never rebinds. Under `cargo test` all
+/// tests share one process, so a test that records a metric before any test
+/// has installed this registry binds the instrument to the no-op default
+/// provider, and every test that scrapes reads nothing. [`install_test_meter_provider`]
+/// installs it before `main`, so no test can record first.
 #[cfg(test)]
 pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
     static REGISTRY: std::sync::OnceLock<prometheus::Registry> = std::sync::OnceLock::new();
@@ -3056,6 +3060,15 @@ pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
         opentelemetry::global::set_meter_provider(provider);
         registry
     })
+}
+
+// SAFETY: runs before `main`. It only allocates, initializes the registry's
+// `OnceLock`, and stores the provider in the `opentelemetry` global; it spawns
+// no thread and depends on no other life-before-main initialization.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_meter_provider() {
+    test_prometheus_registry();
 }
 
 /// The error that ended a refresh retry loop, if the refresh itself failed.
