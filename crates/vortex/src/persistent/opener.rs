@@ -1493,10 +1493,10 @@ mod tests {
         const ROWS: i64 = 5 * BLOCK + 100;
 
         // `a = row`, except: every 1000th key is null, block 1 is entirely null,
-        // and row 30,000 (block 3) repeats key 7 (block 0).
+        // and row 30,000 (block 3) repeats key 24,000 (block 2).
         let keys: Vec<Option<i64>> = (0..ROWS)
             .map(|row| match row {
-                30_000 => Some(7),
+                30_000 => Some(24_000),
                 _ if (BLOCK..2 * BLOCK).contains(&row) || row % 1_000 == 999 => None,
                 _ => Some(row),
             })
@@ -1509,11 +1509,13 @@ mod tests {
         // (key, rows expected, whether any block can hold it)
         let cases = [
             (0, 1, true),
-            (7, 2, true),
+            (24_000, 2, true),
             (999, 0, true),
             (BLOCK - 1, 1, true),
+            // Only the all-null block spans 10,000.
             (10_000, 0, false),
             (2 * BLOCK, 1, true),
+            // Row 30,000 holds 24,000, but block 3's bounds still hold 30,000.
             (30_000, 0, true),
             (ROWS - 1, 1, true),
             (ROWS, 0, false),
@@ -1539,13 +1541,15 @@ mod tests {
             );
         }
 
-        // Every conjunct still applies: key 7 is stored twice, one row passes.
-        let predicate = col("a").eq(lit(7_i64)).and(col("p").eq(lit("row-30000")));
+        // Every conjunct still applies: key 24,000 is stored twice, one row passes.
+        let predicate = col("a")
+            .eq(lit(24_000_i64))
+            .and(col("p").eq(lit("row-30000")));
         let scanned = read_keyed(&object_store, &schema, &file, &predicate, None).await?;
         take_point_reads();
         let looked_up = read_keyed(&object_store, &schema, &file, &predicate, Some("a")).await?;
         assert_eq!(looked_up, scanned);
-        assert_eq!(looked_up, vec![(Some(7), "row-30000".to_string())]);
+        assert_eq!(looked_up, vec![(Some(24_000), "row-30000".to_string())]);
         assert_eq!(take_point_reads(), 1);
 
         // A projection of some of the columns reads the same rows.
@@ -1577,6 +1581,8 @@ mod tests {
     /// file and fails.
     #[tokio::test]
     async fn cached_key_blocks_skip_a_file_without_opening_it() -> anyhow::Result<()> {
+        use object_store::ObjectStoreExt;
+
         let keys = (0..3 * 8_192).map(Some).collect();
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let path = "cached_key_blocks_skip_a_file_without_opening_it.vortex";
