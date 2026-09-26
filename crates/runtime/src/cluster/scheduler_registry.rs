@@ -183,8 +183,11 @@ pub async fn start_scheduler_registry(
 
     // Initialize job executor for async SQL queries. Reuses the raw
     // (store, base_prefix) pair behind ClusterStateStore.
-    let (store, base_prefix) =
-        build_object_store(rt.as_ref(), &config.state_location, config).await?;
+    let state_location = config.state_location.as_deref().ok_or_else(|| Error::ObjectStoreState {
+        source: "scheduler state_location is not configured (set runtime.scheduler.state_location or runtime.state.location)"
+            .into(),
+    })?;
+    let (store, base_prefix) = build_object_store(rt.as_ref(), state_location, config).await?;
     let job_store = crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
@@ -195,10 +198,7 @@ pub async fn start_scheduler_registry(
         rt.datafusion(),
     ));
     rt.set_job_executor(Arc::clone(&job_executor)).await;
-    tracing::info!(
-        "Initialized async SQL jobs API with state location: {}",
-        config.state_location
-    );
+    tracing::info!("Initialized async SQL jobs API with state location: {state_location}");
 
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 

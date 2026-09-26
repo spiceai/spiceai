@@ -11,6 +11,13 @@ name: runtime-test
 # RUNTIME CONFIGURATION
 # =============================================================================
 runtime:
+  # Shared object store for runtime state (results-cache warmup, source
+  # rate-control, and distributed query when those sections omit state_location).
+  state:
+    location: s3://my-bucket/spice-state
+    params:
+      s3_region: us-east-1
+      s3_auth: iam_role
   caching:
     # `runtime.caching.*.engine` (`moka` | `pingora`) is accepted for
     # compatibility and ignored at runtime; LruCache always uses the Spice
@@ -20,6 +27,8 @@ runtime:
       max_size: 1GiB # Default 128 MiB
       item_ttl: 1m # Default 1s
       stale_while_revalidate_ttl: 30s # Default 0s (disabled)
+      # disabled (default) | on_first_refresh
+      warmup: on_first_refresh
     search_results:
       enabled: true
       max_size: 1GiB # Default 128 MiB

@@ -143,24 +143,42 @@ where
 
     /// Update an existing object with OCC. Returns `NotFound` if key doesn't exist.
     ///
+    /// The If-Match etag comes from this `ObjectState`'s shared cache (or a
+    /// fresh fetch when the key is uncached). Concurrent tasks that share one
+    /// `ObjectState` can therefore see a newer cached etag than the `get`
+    /// they based a merge on — use [`Self::update_with_version`] when the
+    /// write must be bound to a specific read.
+    ///
     /// # Errors
     ///
     /// Returns an error if serialization fails or the object store operation fails.
     pub async fn update(&self, key: &str, value: &T) -> Result<UpdateResult<T>> {
-        let path = self.path(key);
-
-        // Get the current version from cache or fetch it
         let version = match self.get_cached_version(key) {
             Some(v) => v,
-            None => {
-                // Fetch current value to get ETag
-                match self.get_with_version(key).await? {
-                    Some((_, v)) => v,
-                    None => return Ok(UpdateResult::NotFound),
-                }
-            }
+            None => match self.get_with_version(key).await? {
+                Some((_, v)) => v,
+                None => return Ok(UpdateResult::NotFound),
+            },
         };
+        self.update_with_version(key, value, version).await
+    }
 
+    /// Update only if `version` still matches the object.
+    ///
+    /// Pass the version returned by a preceding [`Self::get_with_version`] so
+    /// a stale merge cannot overwrite a newer writer that already refreshed
+    /// the shared cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the object store operation fails.
+    pub async fn update_with_version(
+        &self,
+        key: &str,
+        value: &T,
+        version: UpdateVersion,
+    ) -> Result<UpdateResult<T>> {
+        let path = self.path(key);
         let payload = serde_json::to_vec(value).context(SerializationSnafu { key })?;
 
         match self
@@ -178,7 +196,6 @@ where
                 Ok(UpdateResult::Ok)
             }
             Err(ObjectStoreError::Precondition { .. }) => {
-                // Conflict - fetch the current value
                 let current = self.get(key).await?.ok_or_else(|| Error::ObjectStore {
                     key: key.to_string(),
                     operation: "get",
@@ -235,7 +252,12 @@ where
             .map(|opt| opt.map(|(v, _)| v))
     }
 
-    async fn get_with_version(&self, key: &str) -> Result<Option<(T, UpdateVersion)>> {
+    /// Get object and the store version to pass to [`Self::update_with_version`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store operation fails or deserialization fails.
+    pub async fn get_with_version(&self, key: &str) -> Result<Option<(T, UpdateVersion)>> {
         let path = self.path(key);
 
         let result = match self.store.get(&path).await {
@@ -529,6 +551,104 @@ mod tests {
             .await
             .expect("insert_or_update failed");
         assert_eq!(result, WriteResult::Updated);
+    }
+
+    /// Shared-cache `update()` binds If-Match to the latest cached etag, not
+    /// the etag from this task's preceding `get`. A later writer can therefore
+    /// overwrite a newer catalog without a conflict. Warmup persist uses
+    /// `update_with_version` so this interleaving cannot drop templates.
+    #[tokio::test]
+    async fn shared_cache_update_after_newer_write_overwrites_without_conflict() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let seed = TestData {
+            name: "seed".to_string(),
+            value: 0,
+        };
+        let only_a = TestData {
+            name: "A".to_string(),
+            value: 1,
+        };
+        let a_and_b = TestData {
+            name: "A,B".to_string(),
+            value: 2,
+        };
+
+        assert_eq!(
+            state.insert("key1", &seed).await.expect("insert seed"),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            state.get("key1").await.expect("stale get"),
+            Some(seed.clone())
+        );
+        assert_eq!(state.get("key1").await.expect("fresh get"), Some(seed));
+
+        assert_eq!(
+            state.update("key1", &a_and_b).await.expect("newer writer"),
+            UpdateResult::Ok
+        );
+        let stale_result = state.update("key1", &only_a).await.expect("stale writer");
+        assert_eq!(
+            stale_result,
+            UpdateResult::Ok,
+            "shared-cache update uses the newer etag, so the stale write succeeds"
+        );
+        assert_eq!(
+            state.get("key1").await.expect("final get"),
+            Some(only_a),
+            "newer A,B catalog was overwritten by the stale A write"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_with_version_conflicts_when_read_etag_is_stale() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state: ObjectState<TestData> =
+            ObjectState::new(Arc::clone(&store)).with_prefix("test/");
+
+        let seed = TestData {
+            name: "seed".to_string(),
+            value: 0,
+        };
+        let only_a = TestData {
+            name: "A".to_string(),
+            value: 1,
+        };
+        let a_and_b = TestData {
+            name: "A,B".to_string(),
+            value: 2,
+        };
+
+        assert_eq!(
+            state.insert("key1", &seed).await.expect("insert seed"),
+            InsertResult::Ok
+        );
+        let (_, stale_version) = state
+            .get_with_version("key1")
+            .await
+            .expect("stale get")
+            .expect("seed exists");
+        assert_eq!(
+            state.update("key1", &a_and_b).await.expect("newer writer"),
+            UpdateResult::Ok
+        );
+
+        match state
+            .update_with_version("key1", &only_a, stale_version)
+            .await
+            .expect("stale versioned update")
+        {
+            UpdateResult::Conflict { current } => assert_eq!(current, a_and_b),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        assert_eq!(
+            state.get("key1").await.expect("final get"),
+            Some(a_and_b),
+            "stale writer must not drop the newer A,B catalog"
+        );
     }
 
     #[tokio::test]

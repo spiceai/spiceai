@@ -687,6 +687,17 @@
             }
           ]
         },
+        "state": {
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, source rate-control, and distributed query state when those sections do not set their own `state_location`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "scheduler": {
           "anyOf": [
             {
@@ -899,12 +910,36 @@
           "$ref": "#/$defs/Encoding",
           "default": "none"
         },
+        "warmup": {
+          "description": "Replay recorded query plans into the results cache after the first full/append refresh. Datasets stay not ready until warmup completes. Requires `enabled`. Default: `disabled`.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/ResultsCacheWarmup"
+            }
+          ],
+          "default": "disabled"
+        },
         "eviction_policy": {
           "$ref": "#/$defs/CachingPolicy",
           "default": "lru"
         }
       },
       "additionalProperties": false
+    },
+    "ResultsCacheWarmup": {
+      "description": "Whether the SQL results cache records query plans and replays them after the first full/append refresh.",
+      "oneOf": [
+        {
+          "description": "Do not record query plans or replay them after a refresh.",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "After the first full/append refresh, replay the first 10 distinct query plans (equality-filter values taken from distinct keys in the dataset) until the cache is full. Datasets stay not ready until that warmup completes. Later refreshes do not re-warm.",
+          "type": "string",
+          "const": "on_first_refresh"
+        }
+      ]
     },
     "Encoding": {
       "type": "string",
@@ -1663,11 +1698,36 @@
         "name"
       ]
     },
+    "RuntimeState": {
+      "description": "Shared object-store location for runtime state.",
+      "type": "object",
+      "required": [
+        "location"
+      ],
+      "properties": {
+        "location": {
+          "description": "Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).",
+          "type": "string"
+        },
+        "params": {
+          "description": "Optional object store params (for example S3 `s3_region` / `s3_auth`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "Scheduler": {
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state.",
+          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
           "type": "string"
         },
         "params": {
@@ -1706,10 +1766,7 @@
           "default": "60s"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "state_location"
-      ]
+      "additionalProperties": false
     },
     "SourceRateControl": {
       "type": "object",

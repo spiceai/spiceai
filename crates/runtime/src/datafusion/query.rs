@@ -66,6 +66,11 @@ pub(crate) use tracker::QueryTracker;
 pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
+mod cache_warming;
+mod warmup_plan;
+pub(crate) use cache_warming::{
+    ResultsCacheWarmer, build_results_cache_warmer, default_warmup_store_path,
+};
 pub mod transaction;
 pub use transaction::{
     TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
@@ -245,6 +250,19 @@ pub enum ResultsCacheMode {
     Bypass,
 }
 
+/// Which Tokio runtime a query executes on, and whether it takes a query
+/// admission permit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum QueryRuntimeBinding {
+    /// User queries: hop onto `cpu_runtime` when one is configured, and take
+    /// an admission permit so they share the query budget.
+    #[default]
+    QueryRuntime,
+    /// Background cache warming: stay on the current runtime (the refresh
+    /// runtime) and skip query admission so warming cannot stall user queries.
+    CurrentRuntimeUngated,
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
@@ -266,6 +284,8 @@ pub struct Query {
     /// Controls results-cache lookup and storage. Set via
     /// [`QueryBuilder::results_cache_mode`].
     results_cache_mode: ResultsCacheMode,
+    /// Where this query executes and whether it is gated by query admission.
+    runtime_binding: QueryRuntimeBinding,
 }
 
 macro_rules! handle_error {
@@ -718,7 +738,8 @@ impl Query {
                 }
             }
         }
-        if let Some(runtime_handle) = self.df.cpu_runtime().cloned()
+        if matches!(self.runtime_binding, QueryRuntimeBinding::QueryRuntime)
+            && let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
             return self
@@ -1244,6 +1265,10 @@ impl Query {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
+        let skip_query_admission = matches!(
+            self.runtime_binding,
+            QueryRuntimeBinding::CurrentRuntimeUngated
+        );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
         // Cancellation can fire after the probe, while this query is waiting
@@ -1566,7 +1591,7 @@ impl Query {
                 };
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                     match ctx.df.query_admission_semaphore() {
-                        Some(semaphore) if plan_executes_query => {
+                        Some(semaphore) if plan_executes_query && !skip_query_admission => {
                             Self::ensure_not_cancelled(
                                 &query_cancel_token,
                                 &query_id_str,
@@ -1786,6 +1811,12 @@ impl Query {
                     };
 
                 let final_stream = if cache_manager.should_cache_results() {
+                    if ctx.runtime_binding == QueryRuntimeBinding::QueryRuntime {
+                        ctx.df.observe_results_cache_warmup_plan(
+                            &plan,
+                            &request_context.cache_namespace(),
+                        );
+                    }
                     Self::wrap_stream_with_cache(
                         &ctx.df,
                         res_stream,
@@ -1883,6 +1914,7 @@ impl Query {
             cancellation_token: None,
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
         }
     }
 

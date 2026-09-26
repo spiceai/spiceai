@@ -169,6 +169,7 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod results_cache;
+mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;

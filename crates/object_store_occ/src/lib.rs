@@ -25,6 +25,7 @@ mod state;
 use snafu::Snafu;
 
 pub use local_conditional_put::LocalConditionalPut;
+pub use object_store::UpdateVersion;
 pub use state::{InsertResult, ObjectState, UpdateResult, WriteResult};
 
 /// Errors that can occur during object state operations.

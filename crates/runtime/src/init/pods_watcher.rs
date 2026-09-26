@@ -69,6 +69,7 @@ fn start_time_only_changes(
         query,
         cpu,
         metrics,
+        state,
         scheduler,
         source_rate_control,
         drasi,
@@ -144,6 +145,7 @@ fn start_time_only_changes(
             !same_start_time_config(cpu.as_ref(), current.cpu.as_ref()),
         ),
         ("runtime.metrics", Process, *metrics != current.metrics),
+        ("runtime.state", Process, *state != current.state),
         (
             "runtime.scheduler",
             Process,
@@ -384,7 +386,7 @@ mod tests {
 
     fn scheduler(state_location: &str) -> Scheduler {
         Scheduler {
-            state_location: state_location.to_string(),
+            state_location: Some(state_location.to_string()),
             params: None,
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
