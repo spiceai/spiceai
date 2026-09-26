@@ -183,6 +183,12 @@ const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// parallelism. See `snapshot_write_concurrency`.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
+/// The PK-index location of a CDC mem-tier row. Not `Inlined`: that location's
+/// inline tombstone only hides metastore-inlined rows. A key deletion hides the
+/// row both in the mem tier (scans filter it against the file deletion
+/// snapshot) and in the file a checkpoint or budget-driven spill moves it to,
+/// and the mem-tier append folds both key lists into its own tombstones.
+const MEM_TIER_ROW_LOCATION: RowLocation = RowLocation::FileUnlocated;
 /// Fraction of the query memory pool the maintained-aggregate retained indexes
 /// (per-PK contributions plus distinct `MIN`/`MAX` multiset nodes) may occupy.
 ///
@@ -9425,6 +9431,13 @@ impl CayenneTableProvider {
         self.slot_advancer.lock().is_some()
     }
 
+    /// Whether CDC appends engage the in-memory tier: a `cdc_durability: memory`
+    /// table whose runtime has installed a slot advancer.
+    #[must_use]
+    pub(crate) fn is_cdc_mem_tier_armed(&self) -> bool {
+        self.is_cdc_memory_mode() && self.has_slot_advancer()
+    }
+
     /// Whether the in-memory CDC tier can absorb CDC Delete events for this
     /// table — i.e. the runtime may keep a delete-bearing coalesced burst on
     /// the RAM path (key tombstones in the tier, durability deferred to the
@@ -12305,6 +12318,12 @@ impl CayenneTableProvider {
         self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated, sequence);
     }
 
+    /// Record keys a CDC mem-tier append just published; see
+    /// [`MEM_TIER_ROW_LOCATION`].
+    pub(crate) fn record_mem_tier_pk_keys(&self, keys: &PkDigestSet, sequence: i64) {
+        self.record_pk_keys_with_location(keys, &MEM_TIER_ROW_LOCATION, sequence);
+    }
+
     /// Per-key optimistic-concurrency re-check for a transaction commit, run
     /// under `write_lock`. Returns `true` (→ abort with a write conflict) iff a
     /// key in the read footprint or the write-set was committed after the
@@ -13204,9 +13223,7 @@ impl CayenneTableProvider {
     /// and is a no-op for non-memory tables (empty `mem_tier` segments).
     ///
     /// Keys already present from the durable scan keep their `RowLocation`; RAM-only
-    /// keys are added as `FileUnlocated` — a benign label, since the mem-tier
-    /// tombstone unions the file and inline delete lists, so the label does not change
-    /// tombstone coverage. Re-adding a mem-tier-tombstoned key is harmless: a superset
+    /// keys are added at [`MEM_TIER_ROW_LOCATION`]. Re-adding a mem-tier-tombstoned key is harmless: a superset
     /// only removes false-negatives, and a false positive is a redundant, correct
     /// upsert tombstone. `mem_snapshots` MUST be captured before the durable scan (see
     /// the caller) so a concurrent checkpoint-clear cannot hide a key from both.
@@ -13229,7 +13246,7 @@ impl CayenneTableProvider {
                     let rows = converter.convert_columns(&pk_columns)?;
                     for r in 0..batch.num_rows() {
                         // Single hash lookup, preserving any durable-scan `RowLocation`.
-                        keyset.insert_if_absent(rows.row(r).owned(), RowLocation::FileUnlocated);
+                        keyset.insert_if_absent(rows.row(r).owned(), MEM_TIER_ROW_LOCATION);
                     }
                 }
             }
@@ -14186,7 +14203,6 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
-        let mut mirrored_inlined_keys = 0;
         // Reinsert-over-tombstone resurrections recorded below — counted once per
         // key so `total_superseded` can exclude them from the live-row delta (a
         // resurrection adds a live row, it does not supersede one).
@@ -14304,12 +14320,6 @@ impl CayenneTableProvider {
         // reject them. On the hot CDC apply path this removes an O(rows x pk_cols)
         // scan from every coalesced batch (16K+ envelopes).
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
-        // An armed CDC memory table can spill a row recorded as Inlined to a
-        // file between conflict validation and the durable write. Unarmed
-        // tables take the ordinary inline path and need no file deletion vector.
-        let mirror_inlined_conflicts = self.is_cdc_memory_mode()
-            && self.has_slot_advancer()
-            && !self.is_memory_resident_mode();
 
         // Deduplicate borrowed row encodings before conflict/delete work. Upsert
         // (last_write_wins) keeps the last occurrence; DoNothing with duplicate
@@ -14388,10 +14398,6 @@ impl CayenneTableProvider {
                                         if let Some(arr) = int64_pk_array {
                                             if is_inlined_conflict {
                                                 deleted_inlined_pk_i64.push(arr.value(row_idx));
-                                                if mirror_inlined_conflicts {
-                                                    deleted_pk_i64.push(arr.value(row_idx));
-                                                    mirrored_inlined_keys += 1;
-                                                }
                                             } else {
                                                 deleted_pk_i64.push(arr.value(row_idx));
                                             }
@@ -14402,10 +14408,6 @@ impl CayenneTableProvider {
                                         // until the catalog commit.
                                         let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
-                                            if mirror_inlined_conflicts {
-                                                deleted_row_keys.push(row_key.clone());
-                                                mirrored_inlined_keys += 1;
-                                            }
                                             deleted_inlined_row_keys.push(row_key);
                                         } else {
                                             deleted_row_keys.push(row_key);
@@ -14575,7 +14577,6 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
-            mirrored_inlined_keys,
             reinserted_over_tombstone,
         })
     }
@@ -14732,7 +14733,6 @@ impl CayenneTableProvider {
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
-        let mut mirrored_inlined_keys = 0;
         let mut reinserted_over_tombstone: usize = 0;
         let mut kept_keys: PkDigestSet = PkDigestSet::default();
         let mut filtered_batches: Vec<RecordBatch> = Vec::new();
@@ -14825,7 +14825,6 @@ impl CayenneTableProvider {
             deleted_row_keys.extend(result.deleted_row_keys);
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
-            mirrored_inlined_keys += result.mirrored_inlined_keys;
             reinserted_over_tombstone += result.reinserted_over_tombstone;
             incoming_keys.extend(result.kept_keys.digests());
             kept_keys.absorb(result.kept_keys);
@@ -14846,7 +14845,6 @@ impl CayenneTableProvider {
                 deleted_row_keys,
                 deleted_inlined_pk_i64,
                 deleted_inlined_row_keys,
-                mirrored_inlined_keys,
                 reinserted_over_tombstone,
             },
             kept_keys,
@@ -15181,7 +15179,6 @@ impl CayenneTableProvider {
             combined
                 .deleted_inlined_row_keys
                 .append(&mut deletions.deleted_inlined_row_keys);
-            combined.mirrored_inlined_keys += deletions.mirrored_inlined_keys;
         }
 
         // 6. Resync the resident-keyset byte accounting: the under-lock per-shard
@@ -16152,7 +16149,6 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
-            mirrored_inlined_keys: _,
             // Already folded into `superseded` above; not needed past this point.
             reinserted_over_tombstone: _,
         } = on_conflict_deletions;
@@ -16554,9 +16550,9 @@ impl CayenneTableProvider {
         // the inline-cache delta path removes exactly the old inline rows this
         // upsert supersedes, WITHOUT a structural rebuild. These are MOVED out of
         // `prepared` (they feed nothing else), and deliberately NOT the
-        // file-deletion `deleted_pk_i64`/`deleted_row_keys`: those lists also
-        // contain conflicts that were never inline, so they cannot identify the
-        // cached rows removed by this inline tombstone. Only captured
+        // file-deletion `deleted_pk_i64`/`deleted_row_keys`: a file-conflict
+        // deletion never matches a cached inline row, so using the file keys would
+        // leave the old inline copy visible (a transient duplicate). Only captured
         // when an inline tombstone was actually written (`inlined_delete_id`).
         let tombstone_removal = if prepared.inlined_delete_id.is_some() {
             prepared.delete_sequence.map(|delete_sequence| {
@@ -16804,7 +16800,6 @@ impl CayenneTableProvider {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
-            mirrored_inlined_keys: _,
             // Live-row-delta accounting only (see `total_superseded`); the actual
             // delete/reinsert I/O below works off the key lists.
             reinserted_over_tombstone: _,
@@ -30520,7 +30515,7 @@ impl CayenneTableProvider {
             if !record_keys.is_empty()
                 && let Some(index) = self.sharded_pk_keyset_cache.lock().as_mut()
             {
-                index.record_keys_in_shard(shard_id, record_keys, &RowLocation::Inlined);
+                index.record_keys_in_shard(shard_id, record_keys, &MEM_TIER_ROW_LOCATION);
             }
             // INVARIANT — a mem-tier append must NOT bump `inlined_generation`
             // or `inlined_structural_epoch`: it never mutates the metastore

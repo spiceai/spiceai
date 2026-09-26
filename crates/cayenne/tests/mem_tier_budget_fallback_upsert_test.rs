@@ -23,22 +23,24 @@ limitations under the License.
 //! The fallback first spills this table's mem tier to files, then writes the
 //! batch durably with the conflict deletions computed while the keys were
 //! recorded as mem-tier (inline) rows. The upsert must not leave the spilled
-//! copies visible.
+//! copies visible. Covers both PK encodings (`Int64` and row-converted
+//! `Utf8`), and keys whose earlier version a durable write inlined into the
+//! metastore while other keys sat in the mem tier: that spill flushes both.
 //!
-//! Its own test binary: the budget is process-global.
+//! Its own test binary: the budget is process-global, so every case runs in
+//! sequence inside one test body.
 
 mod common;
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer, set_global_mem_tier_bytes};
 use datafusion::datasource::TableProvider;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::*;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -54,35 +56,45 @@ impl SlotAdvancer for NoopSlotAdvancer {
     async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
 }
 
-const KEYS: i64 = 100;
+const KEYS: usize = 100;
 
-fn batch(schema: &Arc<Schema>, value: i64) -> TestResult<RecordBatch> {
+/// Where the superseded versions live when the fallback upsert arrives.
+#[derive(Clone, Copy, Debug)]
+enum Prior {
+    /// Every upserted key in the mem tier.
+    MemTier,
+    /// The upserted keys inlined into the metastore by a durable write, and
+    /// other keys in the mem tier.
+    InlineAndMemTier,
+}
+
+fn ids(id_type: &DataType, keys: RangeInclusive<usize>) -> ArrayRef {
+    match id_type {
+        DataType::Utf8 => Arc::new(StringArray::from(
+            keys.map(|k| format!("key-{k:04}")).collect::<Vec<_>>(),
+        )),
+        _ => Arc::new(Int64Array::from(
+            keys.map(|k| i64::try_from(k).expect("key fits i64"))
+                .collect::<Vec<_>>(),
+        )),
+    }
+}
+
+fn batch(schema: &Arc<Schema>, keys: RangeInclusive<usize>, value: i64) -> TestResult<RecordBatch> {
+    let rows = keys.clone().count();
     Ok(RecordBatch::try_new(
         Arc::clone(schema),
         vec![
-            Arc::new(Int64Array::from((1..=KEYS).collect::<Vec<_>>())),
-            Arc::new(Int64Array::from(vec![
-                value;
-                usize::try_from(KEYS).expect(
-                    "positive key count fits usize"
-                )
-            ])),
+            ids(schema.field(0).data_type(), keys),
+            Arc::new(Int64Array::from(vec![value; rows])),
         ],
     )?)
-}
-
-fn stream(batch: RecordBatch) -> SendableRecordBatchStream {
-    let schema = batch.schema();
-    Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        futures::stream::iter([Ok(batch)]),
-    ))
 }
 
 async fn cdc_upsert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<()> {
     let ctx = SessionContext::new();
     let write = table
-        .write_cdc_append_stream(stream(batch), &ctx.task_ctx())
+        .write_cdc_append_stream(common::single_batch_stream(batch), &ctx.task_ctx())
         .await?;
     if write.has_pending_finalize() {
         write.finish().await?;
@@ -91,9 +103,9 @@ async fn cdc_upsert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> Te
 }
 
 /// `(rows served, distinct ids, rows whose value is not `want`)`.
-async fn served(ctx: &SessionContext, want: i64) -> TestResult<(i64, i64, i64)> {
+async fn served(ctx: &SessionContext, name: &str, want: i64) -> TestResult<(i64, i64, i64)> {
     let sql = format!(
-        "SELECT COUNT(*), COUNT(DISTINCT id), COALESCE(SUM(CASE WHEN value <> {want} THEN 1 ELSE 0 END), 0) FROM t"
+        "SELECT COUNT(*), COUNT(DISTINCT id), COALESCE(SUM(CASE WHEN value <> {want} THEN 1 ELSE 0 END), 0) FROM {name}"
     );
     let batches = ctx.sql(&sql).await?.collect().await?;
     let col = |i: usize| {
@@ -110,12 +122,41 @@ async fn served(ctx: &SessionContext, want: i64) -> TestResult<(i64, i64, i64)> 
 async fn budget_fallback_upsert_supersedes_mem_tier_rows_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
+    // Run every case before asserting, so one failure does not hide another.
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for (name, id_type, prior) in [
+        ("t_int64", DataType::Int64, Prior::MemTier),
+        ("t_utf8", DataType::Utf8, Prior::MemTier),
+        ("t_int64_inline", DataType::Int64, Prior::InlineAndMemTier),
+        ("t_utf8_inline", DataType::Utf8, Prior::InlineAndMemTier),
+    ] {
+        let result = run_fallback_upsert(&fixture, name, id_type, prior).await;
+        set_global_mem_tier_bytes(0);
+        let (served, keys) = result?;
+        got.push((name, served));
+        want.push((name, (keys, keys, 0, 0)));
+    }
+    assert_eq!(
+        got, want,
+        "every key served once with the fallback upsert's value, and the mem tier drained \
+         (rows, distinct ids, stale values, rows left in RAM)"
+    );
+    Ok(())
+}
+
+async fn run_fallback_upsert(
+    fixture: &common::TestFixture,
+    name: &str,
+    id_type: DataType,
+    prior: Prior,
+) -> TestResult<((i64, i64, i64, u64), i64)> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
+        Field::new("id", id_type, false),
         Field::new("value", DataType::Int64, false),
     ]));
     let table_options = CreateTableOptions {
-        table_name: "t".to_string(),
+        table_name: name.to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
@@ -138,33 +179,33 @@ async fn budget_fallback_upsert_supersedes_mem_tier_rows_impl(
     );
     assert!(
         table.is_cdc_memory_mode(),
-        "the in-memory CDC tier is armed"
+        "{name}: the in-memory CDC tier is armed"
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-    ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
-    // Room for the first batch: it lands in the mem tier.
+    // Room for the earlier writes: CDC lands in the mem tier.
     set_global_mem_tier_bytes(64 << 20);
-    cdc_upsert(&table, batch(&schema, 1)?).await?;
-    println!("after the mem-tier upsert: {:?}", served(&ctx, 1).await?);
+    let expected_keys = match prior {
+        Prior::MemTier => {
+            cdc_upsert(&table, batch(&schema, 1..=KEYS, 1)?).await?;
+            KEYS
+        }
+        Prior::InlineAndMemTier => {
+            common::insert_batch(table.as_ref(), batch(&schema, 1..=KEYS, 1)?).await?;
+            cdc_upsert(&table, batch(&schema, KEYS + 1..=2 * KEYS, 2)?).await?;
+            2 * KEYS
+        }
+    };
 
     // No room for the second: it waits, spills this table's tier, and falls
     // back to the durable path.
     set_global_mem_tier_bytes(1);
-    cdc_upsert(&table, batch(&schema, 2)?).await?;
-    let got = served(&ctx, 2).await?;
+    cdc_upsert(&table, batch(&schema, 1..=KEYS, 2)?).await?;
+    let (rows, distinct, stale) = served(&ctx, name, 2).await?;
     // The fallback spills the tier before its durable write, so a checkpoint
     // now finds nothing left in RAM.
     let left_in_ram = table.checkpoint_mem_tier().await?;
-    println!(
-        "after the budget-fallback upsert (rows, distinct ids, stale values) = {got:?}; {left_in_ram} rows were still in the mem tier"
-    );
-    set_global_mem_tier_bytes(0);
-    assert_eq!(left_in_ram, 0, "the fallback must drain the mem tier");
-    assert_eq!(
-        got,
-        (KEYS, KEYS, 0),
-        "every key served once with the fallback upsert's value"
-    );
-    Ok(())
+    let keys = i64::try_from(expected_keys).expect("key count fits i64");
+    Ok(((rows, distinct, stale, left_in_ram), keys))
 }

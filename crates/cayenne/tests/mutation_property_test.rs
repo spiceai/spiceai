@@ -1415,6 +1415,47 @@ async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResul
 }
 test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
 
+// The PK keyset can still record a checkpointed mem-tier key as inline, so a
+// durable upsert must hide the row the checkpoint moved into a file.
+async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestResult<()> {
+    let name = "durable_upsert_after_mem_tier_checkpoint";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
+    upsert(&table, &old, Durability::Memory).await?;
+    assert_eq!(
+        table.checkpoint_mem_tier().await?,
+        100,
+        "the checkpoint must move every key to files"
+    );
+    let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
+    upsert(&table, &new, Durability::File).await?;
+    let model: Model = new.into_iter().collect();
+    assert_converged(&read_rows(&ctx, name).await?, &model, name);
+    let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(count, 100, "{name}: duplicate physical rows");
+    Ok(())
+}
+test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
+
+// A durable upsert of a key still in the mem tier supersedes that row; the
+// checkpoint that later moves the old row into a file must not revive it.
+async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
+    let name = "mem_tier_checkpoint_after_durable_upsert";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
+    upsert(&table, &old, Durability::Memory).await?;
+    let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
+    upsert(&table, &new, Durability::File).await?;
+    let model: Model = new.into_iter().collect();
+    assert_converged(&read_rows(&ctx, name).await?, &model, name);
+    table.checkpoint_mem_tier().await?;
+    assert_converged(&read_rows(&ctx, name).await?, &model, name);
+    let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(count, 100, "{name}: duplicate physical rows");
+    Ok(())
+}
+test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| {

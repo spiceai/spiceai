@@ -249,7 +249,7 @@ enum MemWriteOutcome {
     /// tier durable. The caller must take the durable path for this batch (its
     /// committer advances the slot per-batch, which is safe because the spill
     /// drained every prior mem batch to durable first). The re-streamed batches
-    /// + the held write guard are handed back.
+    /// + the held write guard are handed back, for the caller to re-validate.
     FallBackToDurable {
         stream: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
@@ -348,8 +348,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
-            && self.table.is_cdc_memory_mode()
-            && self.table.has_slot_advancer()
+            && self.table.is_cdc_mem_tier_armed()
             && self.table.metadata().partition_column.is_none()
         {
             if let Some(prepared) = self
@@ -413,8 +412,8 @@ impl<'a> AppendMutationWriter<'a> {
         }
 
         let prepared = self.table.prepare_stream_for_insert(data).await?;
-        let post_validation = prepared.post_validation();
-        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let mut post_validation = prepared.post_validation();
+        let mut may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
 
         // Retention used to block the pipelined path because it ran inline
@@ -498,7 +497,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ack behind the covering durable checkpoint. Every other table/source keeps
         // the durable path below, byte-identical.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
-            || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
+            || self.table.is_cdc_mem_tier_armed()
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
@@ -511,10 +510,19 @@ impl<'a> AppendMutationWriter<'a> {
                 // are durable). This batch takes the durable path below with a
                 // NORMAL committer — safe because the slot is not ahead of
                 // durable (spill-then-fallback ordering guard).
+                //
+                // The spill moved rows the batch's conflicts were resolved
+                // against into files, so validate the batch again: the durable
+                // path must tombstone the prior versions where they live now.
                 MemWriteOutcome::FallBackToDurable {
                     stream,
                     write_guard,
-                } => (stream, write_guard),
+                } => {
+                    let prepared = self.table.prepare_stream_for_insert(stream).await?;
+                    post_validation = prepared.post_validation();
+                    may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+                    (prepared.stream, write_guard)
+                }
             }
         } else {
             (prepared_stream, write_guard)
@@ -858,20 +866,10 @@ impl<'a> AppendMutationWriter<'a> {
                     "cdc_path_inmemory_fallback",
                     write_start,
                 );
+                // The caller re-validates this stream: the on-conflict deletions
+                // above were resolved before the spill moved their rows.
                 let stream = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                     .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
-                // Restore the post-validation state consumed by `take_post_validation`
-                // above. The durable fallback path (`try_inline_or_restream`) re-reads
-                // `post_validation`, so without this the on-conflict deletions and
-                // validated-key bookkeeping would be lost — silently skipping conflict
-                // semantics under sustained memory-mode overload (a correctness risk).
-                restore_post_validation(
-                    post_validation,
-                    PostValidationState {
-                        on_conflict_deletions,
-                        validated_keys,
-                    },
-                );
                 return Ok(MemWriteOutcome::FallBackToDurable {
                     stream,
                     write_guard,
@@ -896,11 +894,11 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
-        // Record the inlined PK keys so a subsequent same-table upsert sees this
-        // batch's rows as present (same bookkeeping as the durable inline path).
+        // Record the PK keys so a subsequent same-table upsert sees this batch's
+        // rows as present.
         let record_seq = self.table.sequence_high_water().await;
         self.table
-            .record_inlined_pk_keys(&validated_keys, record_seq);
+            .record_mem_tier_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
