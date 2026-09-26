@@ -187,7 +187,7 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 
 ### Data-grounded Agentic AI Applications
 
-- **OpenAI-compatible AI Gateway**: Hosted (OpenAI, Anthropic, xAI, Bedrock, Google Vertex AI) or local models (Llama, NVIDIA NIM) with Responses API, streaming tool calls, web search, and provider-aware prompt caching. [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
+- **OpenAI-compatible AI Gateway**: Hosted (OpenAI, Anthropic, xAI, Bedrock, Google Vertex AI, Databricks) or local models (Llama, NVIDIA NIM) with Responses API, streaming tool calls, web search, and provider-aware prompt caching. [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: SQL and NSQL (text-to-SQL) across 30+ sources with advanced push-down, scaling to multi-node Ballista. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 - **Search and RAG**: Petabyte-scale vector search via Amazon S3 Vectors, BM25 full-text via Tantivy, ColBERT-style multi-vector embeddings with MaxSim, hybrid search with RRF, rerank UDTF. [Amazon S3 Vectors Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **LLM Memory and Observability**: Persistent agent memory + deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability Docs](https://spiceai.org/docs/features/observability)
