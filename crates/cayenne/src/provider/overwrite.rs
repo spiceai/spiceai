@@ -93,6 +93,9 @@ use crate::metastore::MetastoreTransaction;
 pub struct PreparedOverwrite {
     table: CayenneTableProvider,
     write_guard: Option<OwnedMutexGuard<()>>,
+    /// The table's `mem_checkpoint_lock`, held from `begin_overwrite` until the
+    /// overwrite is finished or rolled back; see `begin_overwrite`.
+    checkpoint_guard: Option<OwnedMutexGuard<()>>,
     new_snapshot_id: String,
     row_count: u64,
     write_stats_acc: Arc<ColumnStatsAccumulator>,
@@ -356,6 +359,7 @@ impl PreparedOverwrite {
         // writer can't acquire the lock and start a new commit while the
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
+        let _checkpoint_guard = self.checkpoint_guard;
 
         // The snapshot these postings address is about to be deleted.
         self.table.discard_lookup_index_build();
@@ -541,6 +545,15 @@ impl CayenneTableProvider {
         let routing = self.overwrite_range_plan(target_partitions).await;
 
         let write_guard = self.write_lock_arc().lock_owned().await;
+        // Also hold `mem_checkpoint_lock` until the overwrite is published or
+        // rolled back. A checkpoint or seal of the in-memory CDC tier takes only
+        // this lock at one shard, and the rows it would make durable are rows this
+        // overwrite replaces: one committing after the overwrite's catalog
+        // transaction would record them again, where a restart finds them. Waiting
+        // here also lets a checkpoint already in flight finish first, so its
+        // snapshot is one the overwrite's commit supersedes. `write_lock` →
+        // `mem_checkpoint_lock` is the order every other holder of both takes.
+        let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_path().starts_with("s3://");
@@ -567,6 +580,7 @@ impl CayenneTableProvider {
                 return Ok(PreparedOverwrite {
                     table: self.clone_for_write(),
                     write_guard: Some(write_guard),
+                    checkpoint_guard: Some(checkpoint_guard),
                     new_snapshot_id,
                     row_count: inlined.row_count,
                     write_stats_acc: inlined.stats,
@@ -696,6 +710,7 @@ impl CayenneTableProvider {
         Ok(PreparedOverwrite {
             table: self.clone_for_write(),
             write_guard: Some(write_guard),
+            checkpoint_guard: Some(checkpoint_guard),
             new_snapshot_id,
             row_count,
             write_stats_acc,
