@@ -903,6 +903,10 @@ impl<'a> AppendMutationWriter<'a> {
             .record_inlined_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
+        // Memory mode arms retention here — see the method's own doc. A no-op for the
+        // `cdc_durability: memory` tables that also reach this path, which arm from their
+        // own checkpoint.
+        self.table.arm_retention_after_memory_resident_write();
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
         Ok(MemWriteOutcome::Done(Box::new(
             CayenneCdcWrite::in_memory_staged(
@@ -1041,6 +1045,11 @@ impl<'a> AppendMutationWriter<'a> {
                 + apply.on_conflict_deletions.deleted_row_keys.len(),
             "Sharded in-memory CDC apply completed"
         );
+        // Provably a no-op today: the sharded path requires `is_cdc_memory_mode()`, which
+        // a memory-resident table is not, and the accelerator pins memory mode to one
+        // shard. Called anyway so that pinning becoming a default a user can raise cannot
+        // silently reinstate #14045 — it is one branch on a field read.
+        self.table.arm_retention_after_memory_resident_write();
         record_cayenne_write_phase(
             self.table.table_name(),
             "cdc_path_inmemory_sharded",
