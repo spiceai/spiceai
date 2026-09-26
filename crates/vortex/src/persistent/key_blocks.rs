@@ -251,18 +251,11 @@ async fn build(
         let mut offset = 0;
         while offset < rows {
             let block = values.slice(offset, block_rows.min(rows - offset));
-            match (compute::min(&block), compute::max(&block)) {
-                (Some(min), Some(max)) => {
-                    bounds.mins.push(min);
-                    bounds.maxs.push(max);
-                    bounds.any.push(true);
-                }
-                _ => {
-                    bounds.mins.push(0);
-                    bounds.maxs.push(0);
-                    bounds.any.push(false);
-                }
-            }
+            // Both are `None` exactly when every key in the block is null.
+            let (min, max) = (compute::min(&block), compute::max(&block));
+            bounds.any.push(min.is_some());
+            bounds.mins.push(min.unwrap_or_default());
+            bounds.maxs.push(max.unwrap_or_default());
             offset += block_rows;
         }
 
