@@ -48,6 +48,10 @@ criterion = { version = "0.7", features = ["html_reports"] }
 datafusion-functions-nested.workspace = true
 governor.workspace = true
 insta.workspace = true
+# The `embed` tests build a local Model2Vec model, which `llms` only compiles
+# with `local_embed`. The normal dependency above turns default features off,
+# so a scoped `-p runtime-datafusion-udfs --tests` build needs this to compile.
+llms = { path = "../llms", default-features = false, features = ["local_embed"] }
 tracing-subscriber.workspace = true
 tracing-test = "0.2"
 tempfile.workspace = true
