@@ -286,10 +286,10 @@ impl MetadataHandle {
 
 /// The outcome of reading `metadata.json`.
 enum MetadataRead {
-    /// A conditional read found the file unchanged.
+    /// A conditional read found the file unchanged since the given `ETag`.
     Unchanged,
-    /// The file, or `None` when it does not exist.
-    Loaded(Option<MetadataHandle>),
+    /// The file as it is now, or `None` when it does not exist.
+    Current(Option<MetadataHandle>),
 }
 
 /// The outcome of one [`SnapshotManager::download_if_newer`] poll.
@@ -746,7 +746,7 @@ impl SnapshotManager {
 
     async fn load_metadata(&self) -> Result<Option<MetadataHandle>, MetadataLoadError> {
         Ok(match self.read_metadata(None).await? {
-            MetadataRead::Loaded(handle) => handle,
+            MetadataRead::Current(handle) => handle,
             // Only a conditional read reports the file unchanged.
             MetadataRead::Unchanged => None,
         })
@@ -768,7 +768,7 @@ impl SnapshotManager {
                 Err(object_store::Error::NotModified { .. }) if if_none_match.is_some() => {
                     return Ok(MetadataRead::Unchanged);
                 }
-                Err(object_store::Error::NotFound { .. }) => return Ok(MetadataRead::Loaded(None)),
+                Err(object_store::Error::NotFound { .. }) => return Ok(MetadataRead::Current(None)),
                 Err(source) => {
                     tracing::warn!(
                         "Transient error reading snapshot metadata, retrying. path={metadata_path_display} error={source}"
@@ -817,7 +817,7 @@ impl SnapshotManager {
                 None
             };
 
-            Ok(MetadataRead::Loaded(Some(MetadataHandle { metadata, version })))
+            Ok(MetadataRead::Current(Some(MetadataHandle { metadata, version })))
         })
         .await
     }
@@ -1132,13 +1132,13 @@ impl SnapshotManager {
                     metadata_e_tag: known_metadata_e_tag.map(str::to_string),
                 });
             }
-            MetadataRead::Loaded(None) => {
+            MetadataRead::Current(None) => {
                 return Ok(SnapshotPoll {
                     download: None,
                     metadata_e_tag: None,
                 });
             }
-            MetadataRead::Loaded(Some(handle)) => Arc::new(handle),
+            MetadataRead::Current(Some(handle)) => Arc::new(handle),
         };
         let nothing_newer = SnapshotPoll {
             download: None,
