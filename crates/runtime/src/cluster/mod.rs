@@ -2538,7 +2538,7 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     // execution requires — among other things it disables CollectLeft broadcast joins
     // (whose left child must be a single partition, invalid once the input is a
     // multi-partition shuffle) and round-robin repartition.
-    let mut cfg = cfg.ballista_restricted_configuration();
+    let cfg = cfg.ballista_restricted_configuration();
 
     // An adaptive execution graph cannot be serialized — `execution_graph_to_bytes`
     // downcasts to the static graph and errors otherwise — and the scheduler persists

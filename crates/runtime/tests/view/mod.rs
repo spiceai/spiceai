@@ -18,14 +18,10 @@ use arrow::array::RecordBatch;
 use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime::{component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_checkpointer};
-use runtime_acceleration::sidecar::OpenOption;
-use runtime_acceleration::snapshot::SnapshotBehavior;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
+use spicepod::acceleration::{Acceleration, RefreshMode, ZeroResultsAction};
 use spicepod::component::{dataset::Dataset, view::View};
 use std::sync::Arc;
 
-use crate::acceleration::get_params;
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context},

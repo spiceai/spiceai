@@ -26,7 +26,7 @@ use arrow_flight::{
     sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
 };
 use arrow_schema::SchemaRef;
-use arrow_tools::map_entries::MapEntriesNormalizer;
+use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::record_batch::record_to_param_values;
 use bytes::Bytes;
 use datafusion::common::ParamValues;
@@ -43,6 +43,7 @@ use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
+use super::DecodableSchema;
 use crate::{
     datafusion::{
         query::{run_transaction, schema_statement, transaction_statements},
@@ -431,22 +432,35 @@ pub(crate) async fn do_put_query(
     let _start = metrics::track_flight_request("do_put", Some("prepared_statement_query")).await;
     tracing::debug!("do_put_query: Binding parameters to prepared statement");
 
-    let streaming_flight = streaming_flight
-        .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
+    let decodable = DecodableSchema::default();
+    let streaming_flight = streaming_flight.map({
+        let decodable = decodable.clone();
+        move |flight_data| {
+            flight_data
+                .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .map(|message| decodable.repair(message))
+        }
+    });
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
 
     // Read the schema first - Arrow Flight always sends schema before batches
-    let schema = decode_schema(&mut decoder).await?;
+    let schema = decodable.declared(decode_schema(&mut decoder).await?);
 
     tracing::debug!("do_put_query: Parameter schema: {:?}", schema);
 
-    let parameters = encode_single_row_parameters(&mut decoder, &schema).await?;
+    // The parameters are stored as bytes and read back at execution time, so what is written
+    // here is what the query binds. A `MAP` whose `entries` the client declared nullable is
+    // brought into line before it is written, not after: the stored stream is the one the Arrow
+    // map layout allows, and a client that sent an entries array holding nulls is told so now,
+    // while the column can still be named, rather than at the next `DoGet`.
+    let normalizer = MapEntriesNormalizer::for_schema(&schema);
+    let parameters = encode_single_row_parameters(&mut decoder, &normalizer).await?;
 
     // Serialize the parameter schema for later use in query planning
     let schema_bytes = {
         let mut bytes = Vec::new();
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema)
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, normalizer.schema())
             .map_err(error_to_status)?;
         writer.finish().map_err(error_to_status)?;
         bytes
@@ -477,10 +491,11 @@ pub(crate) async fn do_put_query(
 /// process — the per-message size cap bounds one batch, not the stream length.
 pub(super) async fn encode_single_row_parameters(
     decoder: &mut FlightDataDecoder,
-    schema: &SchemaRef,
+    normalizer: &MapEntriesNormalizer,
 ) -> Result<Vec<u8>, Status> {
     let mut parameters = Vec::new();
-    let mut encoder = StreamWriter::try_new(&mut parameters, schema).map_err(error_to_status)?;
+    let mut encoder =
+        StreamWriter::try_new(&mut parameters, normalizer.schema()).map_err(error_to_status)?;
     let mut total_rows = 0;
     while let Some(msg) = futures::TryStreamExt::try_next(decoder).await? {
         match msg.payload {
@@ -497,6 +512,9 @@ pub(super) async fn encode_single_row_parameters(
                         "parameters should contain a single row",
                     ));
                 }
+                let record_batch = normalizer
+                    .normalize(record_batch)
+                    .map_err(map_entries_to_status)?;
                 encoder.write(&record_batch).map_err(error_to_status)?;
             }
         }
@@ -530,32 +548,45 @@ pub(super) fn decode_param_values(
     parameters: &[u8],
 ) -> Result<Option<ParamValues>, datafusion::error::DataFusionError> {
     if parameters.is_empty() {
-        Ok(None)
-    } else {
-        let decoder = StreamReader::try_new(parameters, None)?;
-        let schema = decoder.schema();
-        // A client is free to declare a MAP's `entries` field nullable, which the Arrow map
-        // layout forbids. `concat_batches` below rebuilds every column, so such a parameter would
-        // fail there reporting nulls it does not hold; it is brought into line first, where the
-        // column is named.
-        let normalizer = MapEntriesNormalizer::for_schema(&schema);
-        let batches = decoder
-            .into_iter()
-            .map(|batch| {
-                normalizer
-                    .normalize(batch?)
-                    .map_err(|e| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to read the query parameters sent to the Flight SQL server ({e}), so the query cannot run. \
-                         Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
-                         See: https://spiceai.org/docs/api/arrow-flight-sql"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
-        let batch = concat_batches(normalizer.schema(), batches.iter())?;
-        Ok(Some(record_to_param_values(&batch)?))
+        return Ok(None);
     }
+    let declared = StreamReader::try_new(parameters, None)?.schema();
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids — and which the decode itself now refuses, over the one part of the column that
+    // holds no data, naming neither the column nor which of the two map rules was broken.
+    // Reading through `arrow_tools` decodes those buffers as the list they are laid out as and
+    // brings the parameter into line where the column can still be named.
+    let batches = map_entries::read_ipc_stream(parameters).map_err(param_decode_error)?;
+    let batch = concat_batches(&map_entries::conforming_schema(declared), batches.iter())?;
+    Ok(Some(record_to_param_values(&batch)?))
+}
+
+/// Reports a failure to read the Arrow IPC stream a client sent its parameters in.
+///
+/// Only the map failures carry the map remediation. A stream that does not decode at all fails
+/// for a reason of its own — truncated bytes, a header that will not parse — and telling its
+/// sender to check a MAP `entries` declaration names a column they may not even have sent.
+fn param_decode_error(error: map_entries::Error) -> datafusion::error::DataFusionError {
+    match error {
+        map_entries::Error::UndecodableStream { source } => source.into(),
+        named => datafusion::error::DataFusionError::Execution(format!(
+            "Failed to read the query parameters sent to the Flight SQL server ({named}), so the query cannot run. \
+             Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+             See: https://spiceai.org/docs/api/arrow-flight-sql"
+        )),
+    }
+}
+
+/// Reports a `MAP` parameter the Arrow map layout has no way to carry.
+///
+/// The client's own bytes are what is wrong, and no retry of them will succeed, so this is an
+/// argument error rather than the `Internal` a client would be entitled to retry.
+fn map_entries_to_status(error: map_entries::Error) -> Status {
+    Status::invalid_argument(format!(
+        "Failed to bind the query parameters sent to the Flight SQL server ({error}), so the query cannot run. \
+         Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))
 }
 
 pub(super) fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
@@ -678,9 +709,12 @@ mod tests {
     async fn encode_single_row_parameters_accepts_one_row() {
         let schema = int64_schema();
         let (mut decoder, schema_ref) = decoder_for(vec![one_col_batch(&schema, vec![1])]).await;
-        let params = encode_single_row_parameters(&mut decoder, &schema_ref)
-            .await
-            .expect("a single row of parameters should be accepted");
+        let params = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect("a single row of parameters should be accepted");
         assert!(!params.is_empty());
     }
 
@@ -688,9 +722,12 @@ mod tests {
     async fn encode_single_row_parameters_rejects_two_rows_in_one_batch() {
         let schema = int64_schema();
         let (mut decoder, schema_ref) = decoder_for(vec![one_col_batch(&schema, vec![1, 2])]).await;
-        let err = encode_single_row_parameters(&mut decoder, &schema_ref)
-            .await
-            .expect_err("more than one row must be rejected");
+        let err = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect_err("more than one row must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
@@ -705,9 +742,12 @@ mod tests {
             one_col_batch(&schema, vec![2]),
         ])
         .await;
-        let err = encode_single_row_parameters(&mut decoder, &schema_ref)
-            .await
-            .expect_err("multiple parameter batches must be rejected");
+        let err = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect_err("multiple parameter batches must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 

@@ -28,7 +28,10 @@ use arrow::array::{Array, RecordBatch};
 use arrow_flight::{FlightData, FlightDescriptor, PutResult, utils::flight_data_to_arrow_batch};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
-use arrow_tools::{ipc, map_entries::MapEntriesNormalizer};
+use arrow_tools::{
+    ipc,
+    map_entries::{MapEntriesNormalizer, decodable_schema},
+};
 use datafusion::{
     common::{DFSchema, ResolvedTableReference, TableReference},
     scalar::ScalarValue,
@@ -361,7 +364,7 @@ where
 
             let batch = flight_data_to_arrow_batch(
                 &message,
-                Arc::clone(&declared),
+                Arc::clone(normalizer.decode_schema()),
                 &dictionaries_by_id,
             )
             .context(DecodeBatchSnafu)?;
@@ -428,8 +431,14 @@ fn maybe_read_first_batch(
         return Ok(None);
     }
 
-    let batch = flight_data_to_arrow_batch(first_message, schema, dictionaries_by_id)
-        .context(DecodeBatchSnafu)?;
+    // `schema` is the client's own declaration, which a decoder cannot always be given: a map
+    // whose `entries` it declares nullable is refused inside the decode, over the one part of the
+    // column that holds no data. The batch is built against the form that decodes instead, and
+    // the caller's normalizer puts the map label back — or refuses, naming the column, the one
+    // shape that has no map to go back to.
+    let batch =
+        flight_data_to_arrow_batch(first_message, decodable_schema(&schema), dictionaries_by_id)
+            .context(DecodeBatchSnafu)?;
     Ok(Some(batch))
 }
 

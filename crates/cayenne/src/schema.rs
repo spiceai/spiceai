@@ -871,7 +871,8 @@ mod tests {
     /// created and then fails every write to it - the shape of spiceai/spiceai#13524.
     #[test]
     fn types_vortex_cannot_encode_are_refused_by_name_and_type() {
-        for data_type in [DataType::Union(union_fields(), UnionMode::Sparse)] {
+        {
+            let data_type = DataType::Union(union_fields(), UnionMode::Sparse);
             let schema = Schema::new(vec![Field::new("encoded", data_type.clone(), true)]);
             let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
                 .expect_err("a type Vortex cannot encode should be refused at creation");

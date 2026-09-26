@@ -83,6 +83,32 @@ impl TypeRewriteRule for MapEntriesNonNullable {
     }
 }
 
+/// Rewrites `DataType::Map(entries, _)` → `DataType::List(entries)`, keeping `entries` exactly
+/// as it was declared.
+///
+/// A map *is* a list of key/value structs — the two share one layout, and `arrow-ipc` builds
+/// both through the same code path from the same buffers. What separates them is the pair of
+/// rules Arrow puts on a map alone: `entries` must be declared non-nullable, and it must hold no
+/// nulls. `ArrayData::validate` enforces the first and `validate_nulls` the second, both inside
+/// the decode, so a producer that declared `entries` nullable writes bytes that will not decode
+/// back — and the failure names neither the column nor which of the two rules it broke.
+///
+/// Reading those same buffers as the list they are lets the decode complete under full
+/// validation, leaving [`crate::map_entries::MapEntriesNormalizer`] to say which rule was
+/// broken, name the column, and rebuild the column as the map it describes. Nothing here is a
+/// judgement about the data: it is the label the decoder is given, and it is put back before the
+/// batch is handed on.
+#[derive(Debug)]
+pub struct MapAsList;
+impl TypeRewriteRule for MapAsList {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Map(entries, _) => Some(DataType::List(Arc::clone(entries))),
+            _ => None,
+        }
+    }
+}
+
 /// Rewrites `DataType::Null` → `DataType::Int32`.
 ///
 /// `DuckDB` has no Null type and silently coerces it to INT32 when creating tables.
@@ -1056,7 +1082,7 @@ fn relabel_changes_meaning(source: &DataType, target: &DataType) -> ArrowError {
 /// This mirrors `ArrayData`'s own `validate_child_data`, and it has to cover every
 /// child-bearing type [`rewrite_data_type`] descends into: a type this misses is one whose
 /// parent gets rebuilt while its children keep the old type, which `build` then rejects.
-fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
+pub(crate) fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
     match target_type {
         DataType::List(field)
         | DataType::LargeList(field)

@@ -282,6 +282,25 @@ pub struct FlightClient {
     metadata: Option<tonic::metadata::MetadataMap>,
 }
 
+/// Returns `message` with its schema message replaced by one the decoder can build against.
+///
+/// A server is free to declare a `MAP`'s `entries` field nullable, which the Arrow map layout
+/// forbids and `ArrayData` validation refuses inside the decode — so such a stream is refused
+/// over the one part of the column that holds no data, while every buffer in it is well formed.
+/// Nullability lives in the type rather than in any buffer, so the declaration is corrected on
+/// the way past and the batches decode unchanged.
+///
+/// The correction happens here rather than at the reader because this is where the schema
+/// message is still bytes: `FlightRecordBatchStream` and `FlightDataDecoder` read it themselves
+/// and hand out batches already built against it.
+fn conform_map_entries(mut message: FlightData) -> FlightData {
+    if let Some(header) = arrow_tools::map_entries::conforming_schema_message(&message.data_header)
+    {
+        message.data_header = header.into();
+    }
+    message
+}
+
 impl FlightClient {
     /// Creates a new instance of `FlightClient`.
     ///
@@ -469,7 +488,9 @@ impl FlightClient {
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+                response_stream
+                    .map_ok(conform_map_entries)
+                    .map_err(|status| FlightError::Tonic(Box::new(status))),
             )
             .with_headers(md));
         }
@@ -505,7 +526,9 @@ impl FlightClient {
             .into_parts();
 
         Ok(FlightDataDecoder::new(
-            response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+            response_stream
+                .map_ok(conform_map_entries)
+                .map_err(|status| FlightError::Tonic(Box::new(status))),
         ))
     }
 

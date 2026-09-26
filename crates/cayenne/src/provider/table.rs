@@ -854,7 +854,15 @@ pub(super) fn serialize_batches_to_ipc(
 fn deserialize_ipc_to_batch(
     ipc_bytes: &[u8],
 ) -> std::result::Result<Vec<RecordBatch>, arrow::error::ArrowError> {
-    arrow_tools::map_entries::read_ipc_stream(ipc_bytes)
+    use arrow_tools::map_entries::Error;
+
+    arrow_tools::map_entries::read_ipc_stream(ipc_bytes).map_err(|e| match e {
+        Error::UndecodableStream { source } => source,
+        // A blob whose map entries hold nulls has no map to be read back as. The refusal names
+        // the column, which the decoder's own does not, so it is carried across rather than
+        // flattened into the IPC failure above.
+        named => arrow::error::ArrowError::InvalidArgumentError(named.to_string()),
+    })
 }
 
 /// Tombstone payload format discriminator (cycle-5 TASK 2a).

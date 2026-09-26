@@ -387,25 +387,23 @@ where
 /// What a `DoPut` stream's `MAP` columns need, resolved once from the client's schema message.
 ///
 /// A client is free to declare a `MAP`'s `entries` field nullable, which the Arrow map layout
-/// forbids. Every batch is therefore decoded under the client's own declarations and relabelled
-/// afterwards, so that an entries array carrying nulls — the one shape relabelling cannot fix — is
-/// refused rather than written under a declaration that says it holds none.
+/// forbids — and which the decode itself refuses, over the one part of the column that holds no
+/// data, naming neither the dataset nor the column. Every batch is therefore decoded under the
+/// form of the client's declarations that an Arrow decoder can build against, where a map is
+/// labelled as the list it is laid out as, and relabelled afterwards — so that an entries array
+/// carrying nulls, the one shape relabelling cannot fix, is refused by name rather than written
+/// under a declaration that says it holds none.
 ///
 /// The two decisions the write makes about that live together here because they have to agree: the
 /// schema the write stream advertises, and the shape of the batches pushed into it.
 struct MapEntriesGuard {
-    /// The client's own declaration. Batches are decoded under it — the IPC buffers are laid out
-    /// the way it describes.
-    declared: SchemaRef,
     normalizer: MapEntriesNormalizer,
 }
 
 impl MapEntriesGuard {
     fn for_declared(declared: SchemaRef) -> Self {
-        let normalizer = MapEntriesNormalizer::for_schema(&declared);
         Self {
-            declared,
-            normalizer,
+            normalizer: MapEntriesNormalizer::for_schema(&declared),
         }
     }
 
@@ -439,7 +437,7 @@ impl MapEntriesGuard {
 
         let batch = arrow_flight::utils::flight_data_to_arrow_batch(
             message,
-            Arc::clone(&self.declared),
+            Arc::clone(self.normalizer.decode_schema()),
             dictionaries_by_id,
         )
         .map_err(|e| {

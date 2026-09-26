@@ -131,8 +131,19 @@ async fn decode_flight_batches(
     ),
     Status,
 > {
-    let streaming = tokio_stream::StreamExt::map(streaming, |r| {
-        r.map_err(|s| FlightError::Tonic(Box::new(s)))
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids and the decode itself refuses. `FlightDataDecoder` reads its schema off the stream
+    // rather than taking one from here, so the repair has to reach it as bytes: the schema
+    // message is replaced on the way past with the form that decodes, and what the client
+    // actually declared is kept, since that — not the substitution the decoder will report — is
+    // what the batches have to be put back under.
+    let decodable = crate::flightsql::DecodableSchema::default();
+    let streaming = tokio_stream::StreamExt::map(streaming, {
+        let decodable = decodable.clone();
+        move |r| {
+            r.map_err(|s| FlightError::Tonic(Box::new(s)))
+                .map(|message| decodable.repair(message))
+        }
     });
     let mut decoder = FlightDataDecoder::new(streaming);
 
@@ -167,6 +178,7 @@ async fn decode_flight_batches(
     let schema = schema.ok_or_else(|| {
         Status::invalid_argument("DoPut stream must include at least one schema message")
     })?;
+    let schema = decodable.declared(schema);
 
     normalize_map_entries(table, &schema, batches)
 }

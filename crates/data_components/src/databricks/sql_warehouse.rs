@@ -17,9 +17,8 @@ limitations under the License.
 use arrow::{
     array::{Array, RecordBatch},
     datatypes::{Field, Schema, SchemaRef},
-    ipc::reader::StreamReader,
 };
-use arrow_tools::map_entries::MapEntriesNormalizer;
+use arrow_tools::map_entries;
 use async_trait::async_trait;
 use datafusion::{
     common::TableReference, datasource::TableProvider, error::DataFusionError,
@@ -43,7 +42,6 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error as StdError,
     fmt::{Display, Formatter},
-    io::Cursor,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -1320,24 +1318,23 @@ impl SqlWarehouseApi {
     fn read_arrow_batches(
         bytes: bytes::Bytes,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, Error> {
-        let cursor = Cursor::new(bytes);
-        let reader = StreamReader::try_new(cursor, None).context(ArrowStreamReadFailedSnafu)?;
-
         // The warehouse declares a MAP's `entries` field nullable, which the Arrow map layout
-        // forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds
-        // the column, so it is brought into line at the boundary rather than carried into the
-        // plan. One stream carries one schema, so what its batches need is resolved once and
-        // every batch comes out sharing the same `SchemaRef`.
-        let normalizer = MapEntriesNormalizer::for_schema(&reader.schema());
+        // forbids — and which `ArrayData` validation refuses inside the decode, over the one part
+        // of the column that holds no data, naming neither the column nor which of the two map
+        // rules was broken. Reading through `arrow_tools` decodes those buffers as the list they
+        // are laid out as and brings the column into line where it can still be named, so the
+        // chunk is readable and the batches carry the type the scan publishes.
+        let batches = map_entries::read_ipc_stream(&bytes).map_err(|error| match error {
+            map_entries::Error::UndecodableStream { source } => {
+                Error::ArrowStreamReadFailed { source }
+            }
+            named => Error::MapEntriesNotNormalizable { source: named },
+        })?;
 
-        reader
-            .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0))
-            .map(|batch| {
-                normalizer
-                    .normalize(batch.context(ArrowStreamReadFailedSnafu)?)
-                    .context(MapEntriesNotNormalizableSnafu)
-            })
-            .collect()
+        Ok(batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() != 0)
+            .collect())
     }
 
     fn extract_response_status(response: &Value) -> Result<ResponseStatus, Error> {

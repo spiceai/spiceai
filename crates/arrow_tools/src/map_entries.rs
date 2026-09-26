@@ -28,11 +28,14 @@ limitations under the License.
 //! and refuses the one shape that cannot be relabelled without inventing an answer: entries
 //! that actually contain nulls.
 //!
-//! Arrow IPC is the one arrival that cannot be repaired after the fact: `ArrayData`
-//! validation runs inside the decode, so a stream carrying the forbidden declaration yields
-//! an error instead of the batches whose buffers are all well formed. [`read_ipc_stream`]
-//! repairs that stream's schema message on the way in, which is what keeps data written
-//! under the older declaration readable.
+//! A decode is the one arrival that cannot be repaired after the fact: `ArrayData` validation
+//! runs inside it, so a stream carrying the forbidden declaration yields an error instead of the
+//! batches whose buffers are all well formed, and that error names neither the column nor which
+//! rule it broke. [`decodable_schema`] answers that by handing the decoder the `List` a map is
+//! laid out as, which carries no map rules at all; the batches come back fully validated, and
+//! [`MapEntriesNormalizer::normalize`] puts the map label back — or refuses, by name, the one
+//! shape that has no map to go back to. [`read_ipc_stream`] applies both to a stream of bytes,
+//! which is what keeps data written under the older declaration readable.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -40,11 +43,12 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayData, ArrayRef, RecordBatch, make_array};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::error::ArrowError;
+use arrow::ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message};
 use snafu::prelude::*;
 
-use crate::type_rewrite::{MapEntriesNonNullable, apply_rules, relabel_array_data};
+use crate::type_rewrite::{MapAsList, MapEntriesNonNullable, apply_rules, target_child_types};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -66,6 +70,9 @@ pub enum Error {
         schema: String,
         source: arrow::error::ArrowError,
     },
+
+    #[snafu(display("the Arrow IPC stream could not be decoded: {source}"))]
+    UndecodableStream { source: arrow::error::ArrowError },
 }
 
 /// What the batches of one Arrow stream need, resolved once from the stream's schema.
@@ -79,6 +86,10 @@ pub struct MapEntriesNormalizer {
     /// The schema every batch is relabelled to, shared by all of them. `None` when the
     /// stream's own declarations already conform.
     target: Option<SchemaRef>,
+    /// The schema a decoder has to build these batches against, with every `Map` labelled as
+    /// the `List` it is laid out as. `None` when the stream's own declarations already conform
+    /// and the decoder can be given them as they stand.
+    decodable: Option<SchemaRef>,
     /// Whether any field holds a `Map` at all. When none does, no batch can carry entry
     /// nulls, so no column is ever inspected.
     holds_map: bool,
@@ -96,11 +107,28 @@ impl MapEntriesNormalizer {
             .then(|| conforming_schema(Arc::clone(schema)))
             .filter(|target| !Arc::ptr_eq(target, schema));
 
+        // Only a schema that needs relabelling needs the substitution: one that already conforms
+        // decodes as it stands, and giving its maps a list label would put every one of them
+        // through a rebuild for nothing.
+        let decodable = target.is_some().then(|| decodable_schema(schema));
+
         Self {
             declared: Arc::clone(schema),
             target,
+            decodable,
             holds_map,
         }
+    }
+
+    /// The schema a decoder must be handed to build this stream's batches at all.
+    ///
+    /// It is [`decodable_schema`] of the stream's own, resolved once. A batch decoded under it
+    /// is what [`Self::normalize`] expects; a batch that arrived already built under the
+    /// stream's own declarations is equally acceptable there, since the two describe the same
+    /// buffers in the same order.
+    #[must_use]
+    pub fn decode_schema(&self) -> &SchemaRef {
+        self.decodable.as_ref().unwrap_or(&self.declared)
     }
 
     /// The schema every batch this normalizer returns carries: the relabelled one when the
@@ -117,9 +145,12 @@ impl MapEntriesNormalizer {
     /// Returns `batch` with every `Map` column — nested ones included — declaring its
     /// `entries` field non-nullable, as the Arrow specification requires.
     ///
-    /// Nullability lives in the type rather than in any buffer, so this only relabels: the
-    /// offsets, validity and child arrays are carried over by reference, and a column whose
-    /// type is already right is passed through untouched.
+    /// `batch` may carry the stream's own declarations or the [`Self::decode_schema`] form a
+    /// decoder had to be given; both describe the same buffers in the same order, and which one
+    /// arrived is read off the column rather than assumed. Nullability lives in the type rather
+    /// than in any buffer and a map and a list share one layout, so this only relabels: the
+    /// offsets, validity and child arrays are carried over by reference, and a column that
+    /// already carries its target type is passed through untouched.
     ///
     /// # Errors
     ///
@@ -135,12 +166,12 @@ impl MapEntriesNormalizer {
         let Some(target) = self.target.as_ref() else {
             // Nothing to relabel, but entry nulls fail downstream whatever the declaration
             // says, so they are still refused here where the column can be named.
-            Self::refuse_entry_nulls(&batch)?;
+            self.refuse_entry_nulls(&batch)?;
             return Ok(batch);
         };
 
-        let schema = batch.schema();
-        let columns = schema
+        let columns = self
+            .declared
             .fields()
             .iter()
             .zip(batch.columns())
@@ -150,13 +181,11 @@ impl MapEntriesNormalizer {
                     return Ok(Arc::clone(column));
                 }
                 let data = column.to_data();
-                refuse_entry_nulls_in(&data, field.name())?;
-                // `apply_rules` shares an unchanged field by refcount, so pointer equality is
-                // an exact test for "this column needs nothing".
-                if Arc::ptr_eq(field, target_field) {
+                refuse_entry_nulls_under(field.data_type(), &data, field.name())?;
+                if data.data_type() == target_field.data_type() {
                     return Ok(Arc::clone(column));
                 }
-                let relabelled = relabel_array_data(data, target_field.data_type()).context(
+                let relabelled = rebuild_under(data, target_field.data_type()).context(
                     UnableToNormalizeColumnSnafu {
                         column: field.name(),
                     },
@@ -170,13 +199,34 @@ impl MapEntriesNormalizer {
         })
     }
 
-    fn refuse_entry_nulls(batch: &RecordBatch) -> Result<()> {
-        for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+    fn refuse_entry_nulls(&self, batch: &RecordBatch) -> Result<()> {
+        for (field, column) in self.declared.fields().iter().zip(batch.columns()) {
             if contains(field.data_type(), &is_map) {
-                refuse_entry_nulls_in(&column.to_data(), field.name())?;
+                refuse_entry_nulls_under(field.data_type(), &column.to_data(), field.name())?;
             }
         }
         Ok(())
+    }
+}
+
+/// The form of `schema` an Arrow decoder can build batches against, with every `Map` — nested
+/// ones included — labelled as the `List` it is laid out as (see [`MapAsList`]).
+///
+/// A schema whose map declarations already conform is handed back untouched, so a caller can
+/// test whether anything changed with [`Arc::ptr_eq`] and pay nothing when nothing did. The
+/// batches a decoder returns under this schema are brought back to the map they describe by
+/// [`MapEntriesNormalizer::normalize`], which is where the substitution is undone and where the
+/// one shape that cannot be undone is refused.
+#[must_use]
+pub fn decodable_schema(schema: &SchemaRef) -> SchemaRef {
+    if schema
+        .fields()
+        .iter()
+        .any(|field| contains(field.data_type(), &declares_nullable_entries))
+    {
+        Arc::new(apply_rules(schema, &[&MapAsList]))
+    } else {
+        Arc::clone(schema)
     }
 }
 
@@ -209,27 +259,94 @@ const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
 /// that declaration — so the batches are refused over the one part of them that holds no data,
 /// while every buffer in the stream is well formed. Bytes already at rest were written before
 /// the declaration was corrected, so the repair belongs on the way in: the stream's schema
-/// message is replaced by its conforming form ([`conforming_schema`]) and the batch messages,
-/// which carry no declaration of their own, are decoded untouched against it.
+/// message is replaced by the [`decodable_schema`] form, under which the decode completes with
+/// every buffer validated, and the batch messages — which carry no declaration of their own —
+/// are decoded untouched against it. Each batch is then brought back to the map it describes.
 ///
 /// The returned batches carry the conforming schema. A stream that already conforms is decoded
 /// directly and pays nothing for this.
 ///
 /// # Errors
 ///
-/// Propagates the IPC decode failure, and reports a stream too short to hold the schema message
-/// it claims.
-pub fn read_ipc_stream(bytes: &[u8]) -> std::result::Result<Vec<RecordBatch>, ArrowError> {
-    let reader = StreamReader::try_new(Cursor::new(bytes), None)?;
+/// Returns [`Error::UndecodableStream`] for a stream that does not decode — including one too
+/// short to hold the schema message it claims — and [`Error::MapEntriesContainNulls`] for the
+/// one map shape no relabelling can repair.
+pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None).context(UndecodableStreamSnafu)?;
     let declared = reader.schema();
-    let conforming = conforming_schema(Arc::clone(&declared));
-    if Arc::ptr_eq(&conforming, &declared) {
-        return reader.collect();
+    let normalizer = MapEntriesNormalizer::for_schema(&declared);
+    let decodable = normalizer.decode_schema();
+    if Arc::ptr_eq(decodable, &declared) {
+        return reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context(UndecodableStreamSnafu);
     }
     drop(reader);
 
-    let repaired = with_schema_message(bytes, &conforming)?;
-    StreamReader::try_new(Cursor::new(repaired), None)?.collect()
+    let repaired = with_schema_message(bytes, decodable).context(UndecodableStreamSnafu)?;
+    StreamReader::try_new(Cursor::new(repaired), None)
+        .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
+        .context(UndecodableStreamSnafu)?
+        .into_iter()
+        .map(|batch| normalizer.normalize(batch))
+        .collect()
+}
+
+/// The IPC schema-message header a decoder has to be handed in place of `data_header`, together
+/// with the schema that header declared.
+///
+/// `None` when `data_header` is not a readable schema message, or when what it declares decodes
+/// as it stands — in both cases the message is passed on untouched.
+///
+/// This is the [`decodable_schema`] repair for a decoder that reads its schema off the stream
+/// rather than taking one from its caller, which is how `arrow_flight`'s `FlightDataDecoder`
+/// works: the substitution has to reach it as bytes, before it builds anything. The caller keeps
+/// the returned schema, because that — not the substituted one the decoder will report — is what
+/// [`MapEntriesNormalizer::for_schema`] has to be built from for the batches to be put back.
+#[must_use]
+pub fn decodable_schema_message(data_header: &[u8]) -> Option<(SchemaRef, Vec<u8>)> {
+    let declared: SchemaRef = Arc::new(try_schema_from_flatbuffer_bytes(data_header).ok()?);
+    let decodable = decodable_schema(&declared);
+    if Arc::ptr_eq(&decodable, &declared) {
+        return None;
+    }
+    let header = schema_message(&decodable);
+    Some((declared, header))
+}
+
+/// The IPC schema-message header a decoder that hands its batches straight on has to be given
+/// in place of `data_header`: the [`conforming_schema`] form, which needs nothing done to the
+/// batches afterwards.
+///
+/// `None` when `data_header` is not a readable schema message, or when what it declares already
+/// conforms — in both cases the message is passed on untouched.
+///
+/// This is the repair for a seam with no normalizer behind it, which is what separates it from
+/// [`decodable_schema_message`]: there, the list substitution is undone on the way past and the
+/// one shape that cannot be undone is refused by name; here, the batches the decoder builds are
+/// the batches the caller gets, so they have to come out of the decode already conforming. The
+/// cost is that a producer whose entries really do hold nulls is refused by `ArrayData`
+/// validation rather than by name — the decode is the only thing left to refuse it.
+#[must_use]
+pub fn conforming_schema_message(data_header: &[u8]) -> Option<Vec<u8>> {
+    let declared: SchemaRef = Arc::new(try_schema_from_flatbuffer_bytes(data_header).ok()?);
+    let conforming = conforming_schema(Arc::clone(&declared));
+    if Arc::ptr_eq(&conforming, &declared) {
+        return None;
+    }
+    Some(schema_message(&conforming))
+}
+
+/// The flatbuffer an IPC schema message carries for `schema`, which is what a Flight message
+/// holds in its `data_header`.
+fn schema_message(schema: &Schema) -> Vec<u8> {
+    IpcDataGenerator::default()
+        .schema_to_bytes_with_dictionary_tracker(
+            schema,
+            &mut DictionaryTracker::new(false),
+            &IpcWriteOptions::default(),
+        )
+        .ipc_message
 }
 
 /// `bytes` with its leading schema message replaced by one declaring `schema`.
@@ -356,20 +473,101 @@ fn contains(data_type: &DataType, predicate: &impl Fn(&DataType) -> bool) -> boo
     }
 }
 
-/// Walks `data` and fails on the first `Map` whose entries array carries nulls.
-fn refuse_entry_nulls_in(data: &ArrayData, column: &str) -> Result<()> {
-    if let (DataType::Map(_, _), Some(entries)) = (data.data_type(), data.child_data().first()) {
-        ensure!(
-            entries.null_count() == 0,
-            MapEntriesContainNullsSnafu { column }
-        );
+/// Walks `data` against `declared` — the type its producer meant — and fails on the first `Map`
+/// whose entries array carries nulls.
+///
+/// The walk is driven by the declared type rather than by the array's own, because the two can
+/// disagree on exactly the point at issue: a batch decoded under [`decodable_schema`] carries a
+/// `List` wherever the producer declared a `Map`, and the two are indistinguishable from the
+/// array alone. A genuine list's child is free to hold nulls, so reading the label off the array
+/// would either miss the map that broke the rule or refuse the list that did not. Both describe
+/// the same buffers in the same order, so the declared type is a sound guide to either.
+fn refuse_entry_nulls_under(declared: &DataType, data: &ArrayData, column: &str) -> Result<()> {
+    let children = data.child_data();
+    match declared {
+        DataType::Map(entries, _) => {
+            let Some(decoded) = children.first() else {
+                return Ok(());
+            };
+            ensure!(
+                decoded.null_count() == 0,
+                MapEntriesContainNullsSnafu { column }
+            );
+            refuse_entry_nulls_under(entries.data_type(), decoded, column)
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field) => match children.first() {
+            Some(child) => refuse_entry_nulls_under(field.data_type(), child, column),
+            None => Ok(()),
+        },
+        // `ArrayData` holds the run ends first and the values second.
+        DataType::RunEndEncoded(_, values) => match children.get(1) {
+            Some(child) => refuse_entry_nulls_under(values.data_type(), child, column),
+            None => Ok(()),
+        },
+        DataType::Struct(fields) => fields.iter().zip(children).try_for_each(|(field, child)| {
+            refuse_entry_nulls_under(field.data_type(), child, column)
+        }),
+        DataType::Union(fields, _) => {
+            fields
+                .iter()
+                .zip(children)
+                .try_for_each(|((_, field), child)| {
+                    refuse_entry_nulls_under(field.data_type(), child, column)
+                })
+        }
+        DataType::Dictionary(_, values) => match children.first() {
+            Some(child) => refuse_entry_nulls_under(values, child, column),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// Rebuilds `data` under `target`, relabelling each level that differs and carrying every buffer
+/// across by reference.
+///
+/// Both types are this module's own rewrites of one declared schema — the substitution
+/// [`decodable_schema`] hands the decoder, and the conforming form [`conforming_schema`] produces
+/// — so they describe the same buffers by construction, and the general guard
+/// [`crate::type_rewrite::relabel_array_data`] applies against a caller-supplied target has
+/// nothing to catch here. It would in fact refuse this one: putting a map's label back on the
+/// list it was decoded as is a change of type constructor, which that guard exists to reject.
+/// `build` still validates every level, so a target the buffers do not support is refused rather
+/// than reinterpreted.
+fn rebuild_under(data: ArrayData, target: &DataType) -> std::result::Result<ArrayData, ArrowError> {
+    if data.data_type() == target {
+        return Ok(data);
     }
 
-    for child in data.child_data() {
-        refuse_entry_nulls_in(child, column)?;
+    let targets = target_child_types(target);
+    // A child count that disagrees with the target is a layout disagreement; `build` refuses it
+    // below rather than leaving a rebuilt parent over children still carrying the old type.
+    let children_change = targets.len() == data.child_data().len()
+        && data
+            .child_data()
+            .iter()
+            .zip(&targets)
+            .any(|(child, target)| child.data_type() != *target);
+
+    if !children_change {
+        return data.into_builder().data_type(target.clone()).build();
     }
 
-    Ok(())
+    let children = data
+        .child_data()
+        .iter()
+        .zip(&targets)
+        .map(|(child, target)| rebuild_under(child.clone(), target))
+        .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+
+    data.into_builder()
+        .data_type(target.clone())
+        .child_data(children)
+        .build()
 }
 
 #[cfg(test)]
@@ -572,6 +770,108 @@ mod tests {
                 "the dictionary message decodes against the replacement schema"
             );
         }
+    }
+
+    /// Repairing the declaration alone is not enough, and the way it falls short is the reason
+    /// the decoder is handed a list rather than a conforming map: under a conforming
+    /// declaration the same stream is refused a second time, by the *other* map rule, with a
+    /// message that names no column and mentions no map the caller declared. Both refusals are
+    /// Arrow's, and neither tells a client which of its columns to fix.
+    #[test]
+    fn an_ipc_stream_whose_entries_carry_nulls_is_refused_by_column_name() {
+        let map = map_from_parts(
+            true,
+            Some(NullBuffer::from(vec![true, false])),
+            &[0, 1, 2],
+            vec!["k0", "k1"],
+            vec![Some("v0"), Some("v1")],
+        );
+        let batch = batch_of(Arc::new(map) as ArrayRef);
+        let bytes = ipc_stream(&batch.schema(), std::slice::from_ref(&batch));
+
+        let declared = StreamReader::try_new(Cursor::new(&bytes), None)
+            .expect("the schema message itself is readable")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect_err("arrow refuses the declaration while decoding");
+        assert!(
+            declared
+                .to_string()
+                .contains("The nullable should be set to false for the map entries field"),
+            "unexpected error: {declared}"
+        );
+
+        let conformed = with_schema_message(&bytes, &conforming_schema(batch.schema()))
+            .expect("the schema message is replaceable");
+        let conformed = StreamReader::try_new(Cursor::new(conformed), None)
+            .expect("the replacement schema message is readable")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect_err("arrow refuses the entry nulls while decoding");
+        assert!(
+            conformed.to_string().contains("contains nulls not present"),
+            "unexpected error: {conformed}"
+        );
+        assert!(
+            !conformed.to_string().contains("col_map"),
+            "premise of this test: Arrow's own refusal names no column: {conformed}"
+        );
+
+        let err = read_ipc_stream(&bytes).expect_err("entry nulls have no map to relabel to");
+        assert!(
+            matches!(err, Error::MapEntriesContainNulls { .. }),
+            "expected the entry-null refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("'col_map'"),
+            "the refusal must name the column: {err}"
+        );
+    }
+
+    /// The repair a decoder that reads its own schema off the stream needs, which is how
+    /// `arrow_flight`'s `FlightDataDecoder` works: the substitution has to reach it as the
+    /// schema message's bytes. What the producer declared is handed back with it, because the
+    /// substitution is not what the batches are put back under.
+    #[test]
+    fn a_schema_message_is_replaced_by_one_a_decoder_can_build_against() {
+        let map = map_from_parts(
+            true,
+            None,
+            &[0, 1, 2],
+            vec!["k0", "k1"],
+            vec![Some("v0"), None],
+        );
+        let batch = batch_of(Arc::new(map) as ArrayRef);
+        let header = schema_message(&batch.schema());
+
+        let (declared, repaired) =
+            decodable_schema_message(&header).expect("a forbidden declaration needs replacing");
+        assert_eq!(
+            declared.field(0).data_type(),
+            &map_type(true),
+            "what the producer declared is handed back as it stands"
+        );
+
+        let decodable = try_schema_from_flatbuffer_bytes(&repaired)
+            .expect("the replacement is a readable schema message");
+        let DataType::List(entries) = decodable.field(0).data_type() else {
+            panic!(
+                "the map must be offered to the decoder as the list it is laid out as, got {}",
+                decodable.field(0).data_type()
+            );
+        };
+        assert_eq!(
+            entries.as_ref(),
+            &Field::new("entries", DataType::Struct(entry_fields()), true),
+            "the entries field is carried across untouched — only the label above it changes"
+        );
+
+        assert!(
+            decodable_schema_message(&schema_message(&conforming_schema(batch.schema()))).is_none(),
+            "a declaration that decodes as it stands is passed on untouched"
+        );
+        assert!(
+            decodable_schema_message(b"this is not a flatbuffer").is_none(),
+            "a message that is not a readable schema is passed on untouched"
+        );
     }
 
     /// A stream that already conforms is handed back exactly as it decoded, schema included.
