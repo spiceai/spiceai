@@ -22,9 +22,8 @@ limitations under the License.
 //!
 //! The connector is read-only and infers its schema from a sample of
 //! documents. With the default query, a scan selects only the columns it reads
-//! and the filters Cosmos DB can evaluate, and an equality on the partition key
-//! reads that logical partition alone. See `docs/criteria/connectors/rc.md` for
-//! the full Cosmos DB row and `docs/dev/cosmosdb.md` for the type map and
+//! and the filters Cosmos DB can evaluate. See `docs/criteria/connectors/rc.md`
+//! for the full Cosmos DB row and `docs/dev/cosmosdb.md` for the type map and
 //! limitations.
 
 pub mod client;

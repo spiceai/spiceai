@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Azure Cosmos DB projection, filter and partition pushdown against the Linux
-//! emulator, compared row for row with `DataFusion` evaluating the same
-//! documents locally.
+//! Azure Cosmos DB projection and filter pushdown against the Linux emulator,
+//! compared row for row with `DataFusion` evaluating the same documents
+//! locally, and against a container whose partition keys are of two JSON types.
 //!
 //! The emulator and the service disagree on comparisons with null and with
 //! undefined properties, which is why every pushed condition is guarded by the
@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
+use arrow::array::RecordBatch;
 use azure_core::credentials::Secret;
 use azure_data_cosmos::CosmosClient;
 use azure_data_cosmos::models::ContainerProperties;
@@ -45,7 +46,10 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 use crate::pushdown_roundtrip::{Case, Pushed, Tables, assert_round_trips};
-use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
+use crate::utils::{
+    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    to_pretty_display,
+};
 use crate::{configure_test_datafusion, init_tracing};
 
 const PORT: u16 = 8082;
@@ -55,6 +59,9 @@ const KEY: &str =
     "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
 const DATABASE: &str = "roundtrip";
 const CONTAINER: &str = "people";
+/// A container one of whose partition keys is a number, which a string column
+/// cannot hold.
+const MIXED_PARTITION_KEYS: &str = "mixed_partition_keys";
 
 fn endpoint() -> String {
     format!("http://localhost:{PORT}/")
@@ -131,11 +138,36 @@ async fn seed() -> Result<(), anyhow::Error> {
         let pk = document["pk"].as_str().unwrap_or_default().to_string();
         container.upsert_item(pk, document, None).await?;
     }
+
+    let _ = database
+        .container_client(MIXED_PARTITION_KEYS)
+        .delete(None)
+        .await;
+    database
+        .create_container(
+            ContainerProperties {
+                id: MIXED_PARTITION_KEYS.into(),
+                partition_key: "/pk".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+    let mixed = database.container_client(MIXED_PARTITION_KEYS);
+    mixed
+        .upsert_item("a", json!({ "id": "good", "pk": "a" }), None)
+        .await?;
+    mixed
+        .upsert_item("b", json!({ "id": "other", "pk": "b" }), None)
+        .await?;
+    mixed
+        .upsert_item(5, json!({ "id": "wrong-type", "pk": 5 }), None)
+        .await?;
     Ok(())
 }
 
-fn dataset(name: &str, accelerated: bool) -> Dataset {
-    let mut dataset = Dataset::new(format!("cosmosdb:{DATABASE}.{CONTAINER}"), name.to_string());
+fn dataset(container: &str, name: &str, accelerated: bool) -> Dataset {
+    let mut dataset = Dataset::new(format!("cosmosdb:{DATABASE}.{container}"), name.to_string());
     dataset.params = Some(Params::from_string_map(HashMap::from([(
         "cosmosdb_connection_string".to_string(),
         format!("AccountEndpoint={};AccountKey={KEY};", endpoint()),
@@ -150,7 +182,7 @@ fn dataset(name: &str, accelerated: bool) -> Dataset {
 }
 
 fn shows_pushdown(plan: &str) -> bool {
-    plan.contains("CosmosDBExec") && (plan.contains(" WHERE ") || plan.contains("partition_key="))
+    plan.contains("CosmosDBExec") && plan.contains(" WHERE ")
 }
 
 fn cases() -> Vec<Case> {
@@ -207,7 +239,7 @@ fn cases() -> Vec<Case> {
         p("NOT vip"),
         p("vip = false"),
         p("vip IS NULL"),
-        // The partition key reads one logical partition.
+        // The partition key.
         p("pk = 'a'"),
         p("pk = 'a' AND age > 1"),
         p("pk = 'zz'"),
@@ -245,8 +277,9 @@ async fn cosmosdb_pushdown_round_trips() -> Result<(), anyhow::Error> {
             seed().await?;
 
             let app = AppBuilder::new("cosmosdb_pushdown_round_trips")
-                .with_dataset(dataset("federated", false))
-                .with_dataset(dataset("local", true))
+                .with_dataset(dataset(CONTAINER, "federated", false))
+                .with_dataset(dataset(CONTAINER, "local", true))
+                .with_dataset(dataset(MIXED_PARTITION_KEYS, MIXED_PARTITION_KEYS, false))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
@@ -270,7 +303,38 @@ async fn cosmosdb_pushdown_round_trips() -> Result<(), anyhow::Error> {
             };
             let mut all = cases();
             all.extend(projection_and_limit_cases());
-            assert_round_trips(&rt, &tables, &all).await
+            assert_round_trips(&rt, &tables, &all).await?;
+            assert_partition_key_of_another_type_fails_decoding(&rt).await
         })
         .await
+}
+
+/// A partition key of another JSON type than its column's fails decoding
+/// whether or not an equality on the partition key is pushed down. Such a key
+/// lies in a logical partition of its own, which reading the one partition the
+/// equality names would skip.
+async fn assert_partition_key_of_another_type_fails_decoding(
+    rt: &Arc<Runtime>,
+) -> Result<(), anyhow::Error> {
+    let pushed = format!("SELECT id FROM {MIXED_PARTITION_KEYS} WHERE pk = 'a'");
+    let plan = to_pretty_display(&run_query(rt, &format!("EXPLAIN {pushed}")).await?)?.to_string();
+    anyhow::ensure!(
+        shows_pushdown(&plan),
+        "expected the filter pushed down, plan:\n{plan}"
+    );
+    // `||` is not pushed down, so this reads every document's `pk`.
+    let unfiltered = format!("SELECT id FROM {MIXED_PARTITION_KEYS} WHERE pk || '' = 'a'");
+    for sql in [unfiltered, pushed] {
+        match run_query(rt, &sql).await {
+            Ok(batches) => anyhow::bail!(
+                "{sql} returned {} rows instead of failing to decode the numeric partition key",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            ),
+            Err(e) => anyhow::ensure!(
+                e.to_string().contains("whilst decoding field 'pk'"),
+                "{sql} failed other than on decoding the numeric partition key: {e}"
+            ),
+        }
+    }
+    Ok(())
 }

@@ -106,14 +106,14 @@ the query needs:
   reads a numeric string into an integer column, truncates a fraction, and fails
   on a value of another type, so each comparison is guarded by the JSON type it
   applies to (`IS_STRING`, `IS_NUMBER`, `IS_BOOL`) and keeps any value the column
-  cannot hold, which then fails the query as it would unfiltered. The guards also
+  cannot hold, which then fails the query as it would unfiltered. A document a
+  condition excludes is not read, so a value in it that another column cannot
+  hold does not fail the query. The guards also
   keep a condition from depending on how null and undefined properties compare,
   where the emulator and the service disagree. A string range is pushed only
   against an ASCII bound, where UTF-16 and UTF-8 ordering agree, and an integer
   comparison only against a bound within ±2^53, which a JSON number (a double)
   holds exactly.
-- **Partition routing**: an equality on the container's partition key, when that
-  key is a single top-level property, reads that logical partition alone.
 - **Limit**: reading stops once the limit is reached.
 
 A custom `query` is run as written, and its filters are applied locally.
@@ -123,7 +123,10 @@ A custom `query` is run as written, and its filters are applied locally.
 - Push-down with a custom `query`.
 - `ORDER BY`, `TOP` and aggregate push-down: cross-partition queries through the
   gateway serve only projections and filters.
-- Routing an `IN` list on the partition key, or a hierarchical partition key.
+- Reading one logical partition for an equality on the partition key. The
+  condition keeps a partition key of another JSON type, so that it fails the
+  query as it would unfiltered, and such a key lies in another logical
+  partition.
 - Write (`INSERT` / `UPDATE` / `DELETE`).
 - Change feed streaming (`RefreshMode::Changes`).
 - Microsoft Entra ID / managed identity authentication.

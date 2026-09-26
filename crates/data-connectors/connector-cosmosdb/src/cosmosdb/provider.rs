@@ -63,7 +63,7 @@ use snafu::ResultExt;
 use azure_data_cosmos::clients::ContainerClient;
 use azure_data_cosmos::{PartitionKey, Query};
 
-use super::filter::{Parameters, Translator, is_null_predicate, property};
+use super::filter::{Parameters, Translator, property};
 use super::resilience::{CosmosResilienceConfig, ResilienceError, run_with_resilience};
 use super::schema::{infer_schema, strip_system_fields};
 use super::{DEFAULT_SCHEMA_INFER_MAX_RECORDS, EmptyContainerSnafu, Error, JsonDecodeSnafu};
@@ -130,9 +130,6 @@ pub struct CosmosDBTableProvider {
     endpoint: Arc<str>,
     config: Arc<CosmosDBTableProviderConfig>,
     schema: SchemaRef,
-    /// The container's partition key, when it is one top-level property: a
-    /// query with an equality on it reads that logical partition alone.
-    partition_key_column: Option<String>,
 }
 
 impl std::fmt::Debug for CosmosDBTableProvider {
@@ -187,14 +184,11 @@ impl CosmosDBTableProvider {
             &config.container,
         )?;
 
-        let partition_key_column = partition_key_column(&container_client).await;
-
         Ok(Self {
             container_client,
             endpoint,
             config: Arc::new(config),
             schema,
-            partition_key_column,
         })
     }
 
@@ -346,7 +340,6 @@ impl TableProvider for CosmosDBTableProvider {
                 CosmosQuery {
                     text: self.config.query.clone(),
                     parameters: Vec::new(),
-                    partition_key: None,
                 },
                 Decode::Full(projection.cloned()),
             )
@@ -381,7 +374,10 @@ impl TableProvider for CosmosDBTableProvider {
 
 impl CosmosDBTableProvider {
     /// `SELECT` of the projected properties `WHERE` the filters' conditions,
-    /// read from one logical partition when a filter fixes the partition key.
+    /// read across every logical partition. An equality on the partition key
+    /// does not narrow it to one: the condition keeps a partition key of
+    /// another JSON type, so that it fails decoding as it would unfiltered, and
+    /// such a key lies in a logical partition of its own.
     fn pushed_down_query(&self, projected: &SchemaRef, filters: &[Expr]) -> CosmosQuery {
         let translator = Translator::new(&self.schema);
         let mut parameters = Parameters::default();
@@ -408,80 +404,8 @@ impl CosmosDBTableProvider {
         CosmosQuery {
             text,
             parameters: parameters.into_named(),
-            partition_key: self.partition_key_value(filters),
         }
     }
-
-    /// The partition-key value a filter fixes, as a string equality on the
-    /// partition-key column. Documents with that value all live in its
-    /// logical partition, so reading it alone keeps every row the filter does.
-    fn partition_key_value(&self, filters: &[Expr]) -> Option<String> {
-        use datafusion::logical_expr::{BinaryExpr, Operator};
-        use datafusion::scalar::ScalarValue;
-
-        let column = self.partition_key_column.as_deref()?;
-        let is_string_column = self
-            .schema
-            .field_with_name(column)
-            .is_ok_and(|f| f.data_type() == &DataType::Utf8);
-        if !is_string_column {
-            return None;
-        }
-        filters.iter().find_map(|filter| {
-            // Only the other side of a NULL disjunct can be true.
-            let mut filter = filter;
-            while let Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::Or,
-                right,
-            }) = filter
-            {
-                filter = match (is_null_predicate(left), is_null_predicate(right)) {
-                    (false, true) => left,
-                    (true, false) => right,
-                    _ => return None,
-                };
-            }
-            let Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::Eq,
-                right,
-            }) = filter
-            else {
-                return None;
-            };
-            let ((Expr::Column(c), Expr::Literal(ScalarValue::Utf8(Some(v)), _))
-            | (Expr::Literal(ScalarValue::Utf8(Some(v)), _), Expr::Column(c))) =
-                (left.as_ref(), right.as_ref())
-            else {
-                return None;
-            };
-            (c.name == column).then(|| v.clone())
-        })
-    }
-}
-
-/// The partition key of the container `client` addresses, when it is a single
-/// top-level property. Best-effort: without it every query reads across
-/// partitions, which is what it does anyway.
-async fn partition_key_column(client: &ContainerClient) -> Option<String> {
-    let properties = match client
-        .read(None)
-        .await
-        .and_then(azure_core::http::Response::into_model)
-    {
-        Ok(properties) => properties,
-        Err(error) => {
-            tracing::debug!(%error, "Could not read the Azure Cosmos DB container's partition key; queries read across partitions.");
-            return None;
-        }
-    };
-    let [path] = properties.partition_key.paths.as_slice() else {
-        return None;
-    };
-    let name = path.strip_prefix('/')?;
-    // A nested path, or an escaped one, names no top-level column.
-    (!name.is_empty() && !name.contains(['/', '~'])).then(|| name.to_string())
 }
 
 /// The query a scan runs.
@@ -489,8 +413,6 @@ async fn partition_key_column(client: &ContainerClient) -> Option<String> {
 struct CosmosQuery {
     text: String,
     parameters: Vec<(String, Value)>,
-    /// The logical partition to read, or every one.
-    partition_key: Option<String>,
 }
 
 /// How documents become rows.
@@ -576,9 +498,6 @@ impl DisplayAs for CosmosDBExec {
                 .map(|(name, value)| format!("{name}={value}"))
                 .collect();
             write!(f, ", parameters=[{}]", parameters.join(", "))?;
-        }
-        if let Some(partition_key) = &self.query.partition_key {
-            write!(f, ", partition_key={partition_key:?}")?;
         }
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
@@ -681,12 +600,8 @@ impl ExecutionPlan for CosmosDBExec {
                     .with_parameter(name.clone(), value)
                     .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
             }
-            let partition_key = match &query.partition_key {
-                Some(value) => PartitionKey::from(value.clone()),
-                None => PartitionKey::EMPTY,
-            };
             let mut pager = container_client
-                .query_items::<Value>(request, partition_key, None)
+                .query_items::<Value>(request, PartitionKey::EMPTY, None)
                 .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
             let to_batch = |docs: &[Value]| match &decode {

@@ -23,9 +23,12 @@ limitations under the License.
 //! a fraction truncates, and a value of another type fails the query. So each
 //! comparison is guarded by the JSON type it applies to, and a document whose
 //! value the column cannot hold is kept, so that it fails the query as it would
-//! unfiltered rather than being silently skipped. The type guards also make a
-//! condition independent of how the service evaluates a comparison with null or
-//! an undefined property, where the Cosmos DB emulator and the service disagree.
+//! unfiltered rather than being silently skipped. That covers the column a
+//! condition compares: a document a condition excludes is not read, so a value
+//! in it that another column cannot hold does not fail the query. The type
+//! guards also make a condition independent of how the service evaluates a
+//! comparison with null or an undefined property, where the Cosmos DB emulator
+//! and the service disagree.
 
 use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::functions::string::starts_with::StartsWithFunc;
@@ -454,7 +457,7 @@ fn string(value: &ScalarValue) -> Option<&str> {
 
 /// Whether `expr` is a NULL used as a predicate, which is never true: what
 /// `DataFusion` leaves of `x = NULL` when it simplifies `x IN (1, NULL)`.
-pub(super) fn is_null_predicate(expr: &Expr) -> bool {
+fn is_null_predicate(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Literal(ScalarValue::Boolean(None) | ScalarValue::Null, _)
