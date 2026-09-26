@@ -374,3 +374,66 @@ async fn a_cancelled_overwrite_still_applies_retention_impl(
 }
 
 test_with_backends!(a_cancelled_overwrite_still_applies_retention_impl);
+
+/// An overwrite's catalog commit and its publish are separate steps. A caller
+/// dropped after the metastore committed but before the publish ran would leave
+/// the provider on the snapshot the catalog no longer points at, with the replaced
+/// in-memory rows still readable. Aborts overwrites at points spread over their
+/// whole run and checks, once nothing is in flight, that the provider publishes
+/// the catalog's snapshot.
+async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    const NAME: &str = "aborted_overwrite_publish";
+    const ATTEMPTS: u32 = 256;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog),
+            memory_tier_options(&fixture, NAME, &id_name_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    overwrite(&table, id_name_batch(&[(1, "a")])?).await?;
+
+    // How long an overwrite takes here, so the abort points cover all of it.
+    let started = std::time::Instant::now();
+    overwrite(&table, id_name_batch(&[(1, "b")])?).await?;
+    let span = started.elapsed();
+
+    for attempt in 0..ATTEMPTS {
+        cdc_apply(&table, id_name_batch(&[(2, "in memory")])?).await?;
+        let batch = id_name_batch(&[(1, "c")])?;
+        let replace = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, batch)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        });
+        // The time under test: where in the overwrite the caller goes away.
+        tokio::time::sleep(span.mul_f64(f64::from(attempt) / f64::from(ATTEMPTS))).await;
+        replace.abort();
+        let _ = replace.await;
+
+        // A publish still running holds the table's write lock, which this write
+        // waits for.
+        cdc_apply(&table, id_name_batch(&[(3, "barrier")])?).await?;
+        let published = table.current_snapshot_id();
+        let committed = catalog.get_table(NAME).await?.current_snapshot_id;
+        assert_eq!(
+            published,
+            committed,
+            "attempt {attempt}: an overwrite aborted {:?} in left the provider on a snapshot the catalog replaced",
+            span.mul_f64(f64::from(attempt) / f64::from(ATTEMPTS))
+        );
+    }
+    Ok(())
+}
+
+test_with_backends!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);

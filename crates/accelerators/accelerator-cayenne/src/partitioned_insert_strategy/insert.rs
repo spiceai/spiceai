@@ -115,7 +115,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
         // coordinators on overlapping partition sets can't deadlock on
         // per-partition lock-acquisition order. Within this coordinator,
         // per-partition writer tasks run in parallel.
-        let _coordinator_guard = self.coordinator_lock.lock().await;
+        let coordinator_guard = Arc::clone(&self.coordinator_lock).lock_owned().await;
 
         // Each per-partition writer fan-outs across `target_partitions` Vortex
         // file writers; the session config drives that count to match the
@@ -236,49 +236,57 @@ impl DataSink for CayennePartitionedOverwriteSink {
             return Ok(0);
         }
 
-        // Step 3: catalog transaction. Open once, apply every partition's
-        // mutation, commit once. If any apply fails, roll back the prepared
-        // overwrites (cleanup of the staged snapshot directories) and return
-        // the error; the txn is auto-rolled-back when its handle drops.
-        if let Err(err) = self.commit_in_one_txn(&prepared).await {
+        // Steps 3 and 4 run on one task that owns the prepared overwrites and the
+        // coordinator lock. A caller dropped while `COMMIT` is in flight drops only
+        // this handle: the metastore may still commit, and the task still
+        // publishes every partition the catalog then points at, or rolls them all
+        // back if the commit failed.
+        let catalog = Arc::clone(&self.catalog);
+        let completion = tokio::spawn(async move {
+            let _coordinator_guard = coordinator_guard;
+
+            // Step 3: catalog transaction. Open once, apply every partition's
+            // mutation, commit once. If any apply fails, roll back the prepared
+            // overwrites (cleanup of the staged snapshot directories) and return
+            // the error; the txn is auto-rolled-back when its handle drops.
+            if let Err(err) = Self::commit_in_one_txn(&catalog, &prepared).await {
+                for prep in prepared {
+                    let table_id = prep.table_id().to_string();
+                    if let Err(rollback_err) = prep.rollback().await {
+                        tracing::warn!(
+                            table_id,
+                            %rollback_err,
+                            "Failed to roll back a partition's write after the multi-partition commit failed"
+                        );
+                    }
+                }
+                return Err(err);
+            }
+
+            // Step 4: per-partition in-memory finish (snapshot id, listing
+            // table, deletion caches, GC trigger). Failures here are logged but
+            // do not roll back — the catalog has already committed, so readers
+            // see the new state via the next scan.
+            let mut total_rows: u64 = 0;
             for prep in prepared {
                 let table_id = prep.table_id().to_string();
-                if let Err(rollback_err) = prep.rollback().await {
-                    tracing::warn!(
-                        table_id,
-                        %rollback_err,
-                        "Failed to roll back a partition's write after the multi-partition commit failed"
-                    );
+                match prep.finish().await {
+                    Ok(rows) => total_rows = total_rows.saturating_add(rows),
+                    Err(error) => {
+                        tracing::warn!(
+                            table_id,
+                            %error,
+                            "Failed to update a partition's in-memory state after its write was \
+                             committed; it will catch up automatically the next time this table is queried"
+                        );
+                    }
                 }
             }
-            return Err(err);
-        }
-
-        // Step 4: per-partition in-memory finish (snapshot id, listing
-        // table, deletion caches, GC trigger). Failures here are logged but
-        // do not roll back — the catalog has already committed, so readers
-        // see the new state via the next scan. Every partition's finish starts
-        // before any is awaited, so each one completes even if this write is
-        // cancelled while it waits for them.
-        let finishing: Vec<_> = prepared
-            .into_iter()
-            .map(|prep| (prep.table_id().to_string(), prep.finish()))
-            .collect();
-        let mut total_rows: u64 = 0;
-        for (table_id, finish) in finishing {
-            match finish.await {
-                Ok(rows) => total_rows = total_rows.saturating_add(rows),
-                Err(error) => {
-                    tracing::warn!(
-                        table_id,
-                        %error,
-                        "Failed to update a partition's in-memory state after its write was \
-                         committed; it will catch up automatically the next time this table is queried"
-                    );
-                }
-            }
-        }
-        Ok(total_rows)
+            Ok(total_rows)
+        });
+        completion
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
     }
 }
 
@@ -313,20 +321,19 @@ impl CayennePartitionedOverwriteSink {
     /// new snapshot directories), so re-applying their catalog mutations is
     /// safe and idempotent.
     async fn commit_in_one_txn(
-        &self,
+        catalog: &CayenneCatalog,
         prepared: &[PreparedOverwrite],
     ) -> datafusion::common::Result<()> {
         let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         for attempt in 1..=max_attempts {
-            let mut txn = self
-                .catalog
+            let mut txn = catalog
                 .begin_transaction()
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             let mut apply_err: Option<cayenne::CatalogError> = None;
             for prep in prepared {
-                if let Err(e) = prep.apply_in_txn(&self.catalog, &mut *txn).await {
+                if let Err(e) = prep.apply_in_txn(catalog, &mut *txn).await {
                     apply_err = Some(e);
                     break;
                 }
