@@ -676,6 +676,26 @@ pub(crate) fn statistics_from_persisted_blob(
     )))
 }
 
+/// Whether a restored blob was written by a build that persists per-column byte
+/// sizes.
+///
+/// Such a build writes `Stat::UncompressedSizeInBytes` for every column the file
+/// carries, so one sized column is enough to recognise it; a blob written before
+/// those sizes were persisted carries none on any column.
+///
+/// This is deliberately not `total_byte_size != Absent`. That total is summed with
+/// an absorbing [`Precision::add`], so one column without a size makes it `Absent`
+/// — and a column the file does not carry never has one. A table widened after a
+/// file was written therefore has a total that can never be restored, and reading
+/// the total as the freshness signal would reject those files' blobs on every cold
+/// scan for the life of the file (spiceai/spiceai#13829).
+pub(crate) fn blob_carries_per_column_byte_sizes(statistics: &Statistics) -> bool {
+    statistics
+        .column_statistics
+        .iter()
+        .any(|column| column.byte_size != Precision::Absent)
+}
+
 /// Serialize a Vortex [`FileStatistics`] to bytes.
 pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
     let fb = stats.write_flatbuffer_bytes()?;
@@ -876,8 +896,9 @@ mod tests {
 
     /// A blob written before byte sizes were persisted has none, and a total
     /// summed from only the columns that happen to carry one would be wrong
-    /// rather than missing. `Absent` is also the signal
-    /// `collect_scan_file_statistics` re-infers such a blob from the footer on.
+    /// rather than missing. Freshness is decided by
+    /// [`blob_carries_per_column_byte_sizes`] rather than by this total, which a
+    /// widened table's file can never restore.
     #[test]
     fn a_missing_column_byte_size_leaves_the_total_absent() {
         let schema = Arc::new(Schema::new(vec![
@@ -924,6 +945,52 @@ mod tests {
             restored.total_byte_size,
             DfPrecision::Absent,
             "one column without a size makes the total absent, not a partial sum"
+        );
+    }
+
+    /// The freshness signal has to separate "written before sizes were persisted"
+    /// from "written after, for a file that does not carry every column of the
+    /// table" — the second is what a widening schema evolution leaves behind, and
+    /// both restore a total of `Absent` (spiceai/spiceai#13829).
+    #[test]
+    fn one_sized_column_is_enough_to_recognise_a_blob_that_carries_sizes() {
+        let sized = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Absent,
+            max_value: DfPrecision::Absent,
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Exact(32),
+        };
+        let unsized_column = ColumnStatistics {
+            byte_size: DfPrecision::Absent,
+            ..sized.clone()
+        };
+        let statistics = |columns: Vec<ColumnStatistics>| Statistics {
+            num_rows: DfPrecision::Exact(4),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: columns,
+        };
+
+        assert!(
+            !blob_carries_per_column_byte_sizes(&statistics(vec![
+                unsized_column.clone(),
+                unsized_column.clone()
+            ])),
+            "a blob with no size on any column predates them and must be re-inferred"
+        );
+        assert!(
+            blob_carries_per_column_byte_sizes(&statistics(vec![sized.clone(), unsized_column])),
+            "a file missing one of the table's columns still carries sizes for the rest, \
+             and its blob must be served rather than re-read on every scan"
+        );
+        assert!(
+            blob_carries_per_column_byte_sizes(&statistics(vec![sized.clone(), sized])),
+            "a blob with every column sized carries sizes"
+        );
+        assert!(
+            !blob_carries_per_column_byte_sizes(&statistics(vec![])),
+            "a blob with no columns carries no sizes"
         );
     }
 

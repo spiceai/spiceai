@@ -34597,14 +34597,14 @@ impl CayenneTableProvider {
                 &self.table_schema(),
                 persisted.num_rows,
             )
-            // A blob written before per-column byte sizes were persisted carries no
-            // total, so serving it would report a different size for this file than
-            // the footer does and leave `JoinSelection` picking a build side by which
-            // source happened to answer. Treat it as stale and re-infer from the
-            // footer below, which rewrites the blob with the size in it. A file whose
-            // footer carries no statistics at all re-infers on first touch in each
-            // process and is then held by `scan_file_statistics`.
-            && statistics.total_byte_size != DFPrecision::Absent
+            // A blob written before per-column byte sizes were persisted carries none,
+            // so serving it would report a different size for this file than the footer
+            // does and leave `JoinSelection` picking a build side by which source
+            // happened to answer. Treat it as stale and re-infer from the footer below,
+            // which rewrites the blob with the sizes in it. A file whose footer carries
+            // no statistics at all re-infers on first touch in each process and is then
+            // held by `scan_file_statistics`.
+            && crate::stats::blob_carries_per_column_byte_sizes(&statistics)
         {
             self.scan_file_statistics.put(
                 &TableScopedPath {
