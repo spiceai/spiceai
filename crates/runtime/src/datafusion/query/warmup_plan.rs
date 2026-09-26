@@ -65,12 +65,16 @@ pub(super) fn template_id(template: &WarmupTemplate) -> u64 {
 /// the plan. Returns `None` when the plan cannot be expressed as warmup SQL.
 pub(super) fn template_from_plan(plan: &LogicalPlan) -> Option<WarmupTemplate> {
     let mut bindings = Vec::new();
+    let mut disjunctive_equality = false;
     let rewritten = plan
         .clone()
         .transform_up(|node| {
             let LogicalPlan::Filter(filter) = node else {
                 return Ok(Transformed::no(node));
             };
+            if equality_under_disjunction(&filter.predicate) {
+                disjunctive_equality = true;
+            }
             let predicate = parameterize_predicate(filter.predicate, &mut bindings);
             let new_filter =
                 datafusion::logical_expr::logical_plan::Filter::try_new(predicate, filter.input)?;
@@ -80,6 +84,15 @@ pub(super) fn template_from_plan(plan: &LogicalPlan) -> Option<WarmupTemplate> {
         .data;
 
     finalize_binding_tables(plan, &mut bindings);
+
+    // Row-wise DISTINCT cannot reconstruct OR parameter tuples (e.g. `id = 1 OR
+    // id = 2` needs `(1, 2)`, but `SELECT DISTINCT id, id` only yields diagonals).
+    // Clear table names so `template_can_warm` rejects via the empty-table path.
+    if disjunctive_equality {
+        for binding in &mut bindings {
+            binding.table.clear();
+        }
+    }
 
     let sql = datafusion::sql::unparser::plan_to_sql(&rewritten)
         .ok()?
@@ -183,6 +196,34 @@ fn fill_missing_tables(plan: &LogicalPlan, bindings: &mut [WarmupBinding]) {
     }
 }
 
+/// True when an equality-to-literal sits beneath `OR`. Row-wise DISTINCT cannot
+/// replay those parameter combinations, so such templates must not be recorded.
+fn equality_under_disjunction(expr: &Expr) -> bool {
+    fn walk(expr: &Expr, under_or: bool) -> bool {
+        if equality_column(expr).is_some() {
+            return under_or;
+        }
+        let next_under_or = under_or
+            || matches!(
+                expr,
+                Expr::BinaryExpr(BinaryExpr {
+                    op: Operator::Or,
+                    ..
+                })
+            );
+        let mut found = false;
+        let _ = expr.apply_children(|child| {
+            if walk(child, next_under_or) {
+                found = true;
+            }
+            // `apply_children` only visits direct children; `walk` recurses.
+            Ok(TreeNodeRecursion::Continue)
+        });
+        found
+    }
+    walk(expr, false)
+}
+
 fn parameterize_predicate(expr: Expr, bindings: &mut Vec<WarmupBinding>) -> Expr {
     let fallback = expr.clone();
     expr.transform_up(|e| {
@@ -251,9 +292,10 @@ fn literal_or_placeholder_type(expr: &Expr) -> Option<datafusion::arrow::datatyp
 /// Whether this template can be replayed after a refresh.
 ///
 /// No bindings: run the template SQL as-is. Bindings on one named table: fill
-/// placeholders from `SELECT DISTINCT`. Bindings that span tables, or that
-/// have an empty table name, cannot produce a valid key combination without a
-/// join, so they are not recorded or replayed.
+/// placeholders from `SELECT DISTINCT`. Bindings that span tables, have an
+/// empty table name, repeat the same column (including equalities under `OR`),
+/// or come from a disjunctive predicate cannot produce the parameter tuples
+/// that match recorded cache keys, so they are not recorded or replayed.
 #[must_use]
 pub(super) fn template_can_warm(template: &WarmupTemplate) -> bool {
     template.bindings.is_empty() || distinct_keys_sql(template).is_some()
@@ -266,8 +308,11 @@ pub(super) const MAX_WARMUP_DISTINCT_KEYS: usize = 1024;
 
 /// `SELECT DISTINCT` SQL that yields one row per unique combination of a
 /// template's bound columns. `None` when the template has no variables (run
-/// the template SQL as-is) or the bindings span more than one table (the
-/// distinct keys would not be a real join combination).
+/// the template SQL as-is), the bindings span more than one table (the
+/// distinct keys would not be a real join combination), a binding has an empty
+/// table name, or the same column is bound more than once (row-wise DISTINCT
+/// cannot reconstruct disjunctive parameter tuples such as `(1, 2)` for
+/// `id = 1 OR id = 2`).
 ///
 /// The `FROM` clause quotes each `TableReference` part so `spice.public.orders`
 /// stays catalog-qualified and a single identifier such as `users.v1` is not
@@ -283,6 +328,13 @@ pub(super) fn distinct_keys_sql(template: &WarmupTemplate) -> Option<String> {
     }
     if template.bindings.iter().any(|b| b.table != table) {
         return None;
+    }
+    let mut seen_columns = HashSet::new();
+    for binding in &template.bindings {
+        if !seen_columns.insert(binding.column.as_str()) {
+            // Repeated columns ⇒ `SELECT DISTINCT id, id` only yields diagonals.
+            return None;
+        }
     }
     let columns = template
         .bindings
@@ -589,5 +641,66 @@ mod tests {
             .collect()
             .await
             .expect("collect distinct");
+    }
+
+    #[tokio::test]
+    async fn disjunctive_equality_on_same_column_is_not_warmable() {
+        // `id = 1 OR id = 2` parameterizes to two `id` bindings. Row-wise
+        // `SELECT DISTINCT id, id` only yields diagonals like `(1,1)`, never the
+        // observed tuple `(1,2)`, so the template cannot warm the cache key that
+        // recorded it and must not consume a catalog slot.
+        let t = template_from_plan(&plan_of("SELECT id FROM orders WHERE id = 1 OR id = 2").await)
+            .expect("template");
+        assert!(
+            t.bindings.len() >= 2,
+            "both OR equalities must become bindings, got {t:?}"
+        );
+        assert!(
+            distinct_keys_sql(&t).is_none(),
+            "disjunctive/repeated-column bindings must not produce DISTINCT SQL, got {t:?}"
+        );
+        assert!(
+            !template_can_warm(&t),
+            "OR equalities must not be recorded for warmup, got {t:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disjunctive_equality_on_different_columns_is_not_warmable() {
+        let t = template_from_plan(
+            &plan_of("SELECT id FROM orders WHERE id = 1 OR status = 'open'").await,
+        )
+        .expect("template");
+        assert!(
+            t.bindings.len() >= 2,
+            "both OR equalities must become bindings, got {t:?}"
+        );
+        assert!(
+            distinct_keys_sql(&t).is_none(),
+            "disjunctive bindings must not produce DISTINCT SQL, got {t:?}"
+        );
+        assert!(
+            !template_can_warm(&t),
+            "OR equalities on different columns must not be recorded, got {t:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_binding_columns_are_not_warmable() {
+        let t = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1 OR id = $2".to_string(),
+            bindings: vec![
+                WarmupBinding {
+                    table: r#""orders""#.to_string(),
+                    column: "id".to_string(),
+                },
+                WarmupBinding {
+                    table: r#""orders""#.to_string(),
+                    column: "id".to_string(),
+                },
+            ],
+        };
+        assert!(distinct_keys_sql(&t).is_none());
+        assert!(!template_can_warm(&t));
     }
 }
