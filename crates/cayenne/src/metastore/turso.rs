@@ -1225,6 +1225,29 @@ impl MetastoreTransaction for TursoTransaction {
         Ok(())
     }
 
+    async fn execute_many(&self, sql: &str, params: Vec<Vec<MetastoreValue>>) -> CatalogResult<()> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        if params.is_empty() {
+            return Ok(());
+        }
+
+        // Prepared once; `Statement::execute` resets the statement before each run.
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .await
+            .map_err(convert_turso_error)?;
+        for row in params {
+            let turso_params: Vec<TursoValue> = row.into_iter().map(to_turso_value).collect();
+            stmt.execute(turso_params)
+                .await
+                .map_err(convert_turso_error)?;
+        }
+
+        Ok(())
+    }
+
     async fn query_values(
         &self,
         params: QueryParams<'_>,
@@ -1345,6 +1368,23 @@ mod tests {
         (dir, metastore)
     }
 
+    async fn count_tx_rows(tx: &dyn MetastoreTransaction, sql: &str) -> i64 {
+        let value = tx
+            .query_row_values(QueryRowParams {
+                sql,
+                params: vec![],
+            })
+            .await
+            .expect("count query")
+            .into_iter()
+            .next()
+            .expect("one column");
+        let MetastoreValue::Integer(count) = value else {
+            panic!("COUNT(*) returned {value:?}");
+        };
+        count
+    }
+
     /// Count the rows of `t` over `conn`, which reads whatever snapshot `conn` is on.
     async fn count_rows(conn: &Connection) -> i64 {
         let mut stmt = conn
@@ -1361,6 +1401,74 @@ mod tests {
             TursoValue::Integer(n) => n,
             other => panic!("COUNT(*) should be an integer, got {other:?}"),
         }
+    }
+
+    /// `TursoTransaction::execute_many` prepares once, resets the statement
+    /// before each run, and stops at the first failure with that entry's
+    /// error — what a loop of `execute` calls does, so the caller's rollback
+    /// leaves nothing behind.
+    #[tokio::test]
+    async fn test_execute_many_runs_every_entry_and_stops_at_the_first_failure() {
+        const INSERT: &str = "INSERT INTO t (id, label) VALUES (?1, ?2)";
+        fn row(id: i64) -> Vec<MetastoreValue> {
+            vec![
+                MetastoreValue::Integer(id),
+                MetastoreValue::Text(format!("row-{id}")),
+            ]
+        }
+        // Enough rows that the cached statement is reset and reused many
+        // times; Turso does not chunk, so this is the reuse surface.
+        let total: i64 = 128;
+        let before_failure: i64 = 17;
+        let (_dir, metastore) = temp_metastore();
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+            .await
+            .expect("create table");
+
+        let tx = metastore.begin_transaction().await.expect("begin");
+        tx.execute_many(INSERT, Vec::new())
+            .await
+            .expect("an empty batch is a no-op");
+        tx.execute_many(INSERT, (0..total).map(row).collect())
+            .await
+            .expect("insert batch");
+        tx.commit().await.expect("commit");
+
+        let tx = metastore.begin_transaction().await.expect("begin");
+        assert_eq!(
+            count_tx_rows(tx.as_ref(), "SELECT COUNT(*) FROM t").await,
+            total,
+            "every entry must run"
+        );
+        let first_new = total;
+        let mut batch: Vec<Vec<MetastoreValue>> =
+            (first_new..first_new + before_failure).map(row).collect();
+        batch.push(row(0));
+        batch.extend((first_new + before_failure..first_new + before_failure + 5).map(row));
+        let result = tx.execute_many(INSERT, batch).await;
+        assert!(
+            matches!(result, Err(CatalogError::ConstraintViolation { .. })),
+            "the failing entry's constraint violation must surface: {result:?}"
+        );
+        assert_eq!(
+            count_tx_rows(
+                tx.as_ref(),
+                &format!("SELECT COUNT(*) FROM t WHERE id >= {first_new}")
+            )
+            .await,
+            before_failure,
+            "entries before the failure stay applied until the caller rolls back, and none after it run"
+        );
+        tx.rollback().await.expect("rollback");
+
+        let tx = metastore.begin_transaction().await.expect("begin");
+        assert_eq!(
+            count_tx_rows(tx.as_ref(), "SELECT COUNT(*) FROM t").await,
+            total,
+            "rolling back drops the partially applied batch"
+        );
+        tx.rollback().await.expect("rollback");
     }
 
     /// Leave slot `idx` inside an open `BEGIN CONCURRENT`, holding an MVCC snapshot, the

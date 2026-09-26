@@ -481,7 +481,7 @@ impl TableProvider for EnsureSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{ArrayRef, Int64Array};
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -1374,6 +1374,202 @@ mod tests {
                 .ordering_satisfy(ascending_on(&schema, "b"))
                 .expect("ordering satisfaction"),
             "every ordering the child can discharge a requirement with must survive"
+        );
+    }
+
+    // ── projected statistics (#14144) ──
+
+    /// A single-batch memory source whose columns carry `nulls[i]` nulls each,
+    /// so each column's exact `null_count` identifies which input column a
+    /// projected statistic came from.
+    fn source_with_null_counts(
+        schema: &SchemaRef,
+        nulls: &[usize],
+        rows: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let columns = nulls
+            .iter()
+            .map(|&n| {
+                Arc::new(
+                    (0..rows)
+                        .map(|i| (i >= n).then_some(i64::try_from(i).unwrap_or(0)))
+                        .collect::<Int64Array>(),
+                ) as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(schema), columns).expect("valid batch");
+        MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(schema), None)
+            .expect("memory source")
+    }
+
+    /// The child reports one statistic per input column; this exec must report one
+    /// per *output* column, taken by name — so dropping and reordering columns
+    /// leaves each output entry describing the input column of the matching name.
+    #[test]
+    fn statistics_are_projected_onto_the_output_schema_by_name() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Int64, true),
+            Field::new("_hidden", DataType::Int64, true),
+        ]));
+        // id, value, _hidden carry 0, 1, and 2 nulls respectively.
+        let source = source_with_null_counts(&input_schema, &[0, 1, 2], 3);
+
+        // Output drops `_hidden` and puts `value` before `id`.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new("id", DataType::Int64, true),
+        ]));
+        let stats = SchemaCastScanExec::new(source, target_schema)
+            .partition_statistics(None)
+            .expect("partition_statistics should succeed");
+
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+        assert_eq!(
+            stats.column_statistics[0].null_count,
+            Precision::Exact(1),
+            "output column 0 is `value`, carrying `value`'s statistics"
+        );
+        assert_eq!(
+            stats.column_statistics[1].null_count,
+            Precision::Exact(0),
+            "output column 1 is `id`, carrying `id`'s statistics"
+        );
+    }
+
+    /// A retyped column (`Int64` input cast to `Utf8` output) must not carry the
+    /// input column's statistics forward: `try_cast_to` converts the values, so an
+    /// `Int64` bound would disagree with the `Utf8` field it is now attached to.
+    #[test]
+    fn retyped_columns_report_unknown_statistics() {
+        let input_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let source = source_with_null_counts(&input_schema, &[1], 2);
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let stats = SchemaCastScanExec::new(source, target_schema)
+            .partition_statistics(None)
+            .expect("partition_statistics should succeed");
+
+        assert_eq!(
+            stats.column_statistics[0],
+            ColumnStatistics::new_unknown(),
+            "an Int64 column's statistics must not be advertised for a Utf8 output field"
+        );
+    }
+
+    /// A `TableProvider` whose scan returns hidden storage columns that
+    /// [`SchemaCastScanExec`] strips — the shape a `refresh_mode: caching`
+    /// accelerator produces (its `_fetched_at` / `__spice_cache_namespace` columns
+    /// live in the accelerator but not in the user-facing schema).
+    #[derive(Debug)]
+    struct HiddenColumnScan {
+        storage: Vec<Vec<RecordBatch>>,
+        storage_schema: SchemaRef,
+        user_schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for HiddenColumnScan {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.user_schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>> {
+            // Inexact, like the caching accelerator, so the optimizer keeps a
+            // `FilterExec` above the scan — the node whose boundary analysis reads
+            // the statistics this exec advertises.
+            Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            // The storage scan always carries the hidden column; the user-facing
+            // output is the requested projection of the user schema.
+            let input = MemorySourceConfig::try_new_exec(
+                &self.storage,
+                Arc::clone(&self.storage_schema),
+                None,
+            )?;
+            let target_schema = match projection {
+                Some(indices) => Arc::new(Schema::new_with_metadata(
+                    indices
+                        .iter()
+                        .filter_map(|&i| {
+                            self.user_schema.fields().get(i).map(|f| f.as_ref().clone())
+                        })
+                        .collect::<Vec<_>>(),
+                    self.user_schema.metadata().clone(),
+                )),
+                None => Arc::clone(&self.user_schema),
+            };
+            Ok(Arc::new(SchemaCastScanExec::new(input, target_schema)))
+        }
+    }
+
+    /// An integer-column filter over a scan that hides storage columns must plan
+    /// and return the matching rows (regression test for #14144).
+    ///
+    /// Before the statistics were projected onto the output schema, the scan
+    /// advertised a two-column schema while forwarding three column statistics, and
+    /// the `id = 1` filter's boundary analysis indexed `col_index = 2` into that
+    /// two-field schema — `Internal error: Could not create ExprBoundaries ...
+    /// col_index has gone out of bounds`.
+    #[tokio::test]
+    async fn an_integer_filter_plans_when_the_scan_hides_storage_columns() {
+        let storage_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("_hidden", DataType::Int64, true),
+        ]));
+        let user_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&storage_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .expect("valid storage batch");
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(HiddenColumnScan {
+                storage: vec![vec![batch]],
+                storage_schema,
+                user_schema,
+            }),
+        )
+        .expect("table registered");
+
+        let batches = collect(&ctx, "SELECT value FROM t WHERE id = 1")
+            .await
+            .expect("an integer-column filter must plan and execute");
+        assert_batches_eq!(
+            [
+                "+-------+",
+                "| value |",
+                "+-------+",
+                "| 10    |",
+                "+-------+",
+            ],
+            &batches
         );
     }
 }
