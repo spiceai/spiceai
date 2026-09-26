@@ -25888,11 +25888,10 @@ impl CayenneTableProvider {
     ///
     /// The sole caller is the post-write maintenance loop (see
     /// [`Self::run_maintenance_state`]), which runs outside any writer's
-    /// `write_lock`. The deletion sink is built with
-    /// `Some(Arc::clone(&self.write_lock))` so the sink itself serializes
-    /// against concurrent inserts / listing refreshes for the duration of the
-    /// scan — same exclusion guarantee the inline-retention path used to
-    /// provide, just held inside the sink rather than the writer.
+    /// `write_lock`. The pass takes `write_lock` itself and holds it across making
+    /// the in-memory CDC tier durable, building the deletion sink and running it,
+    /// so no insert or listing refresh lands between what the sink scans and what
+    /// it deletes.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<RetentionPass> {
         let table_name = self.table_metadata.table_name.as_str();
         if self.retention_filters.is_empty() {
@@ -26027,33 +26026,39 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
-        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
-        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
-        // caller that passes the `write_lock` INTO the sink rather than holding it,
-        // and the wrapper takes that same non-reentrant lock itself. The consequence
-        // is that `retention_sql` does not reach a `mode: memory` tier, which the
-        // accelerator warns about at registration.
-        let sink = self
-            .build_deletion_vector_sink(
-                &filters,
-                Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::User,
-            )
+        //
+        // Rows still in the in-memory CDC tier are not among the sink's scan sources,
+        // so a key whose durable version matches `retention_sql` would be tombstoned
+        // while its newer version sits in RAM — and the tombstone would hide that live
+        // row too. So the tier is made durable first, and the sink built from the
+        // snapshot that checkpoint published, inside ONE `write_lock` hold that also
+        // covers the delete: the same treatment a user DELETE gets in
+        // `InlineAwareDeletionSink` (#13828). The sink is built without a lock of its
+        // own because this hold is it. `retention_sql` still does not reach a
+        // `mode: memory` tier, which has no durable tier to checkpoint into; the
+        // accelerator warns about that at registration.
+        let retention_failed = |err: Box<dyn std::error::Error + Send + Sync>| {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::Retention,
+                MaintenanceOutcome::Failed,
+            );
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                    self.table_metadata.table_name
+                ),
+                source: err,
+            }
+        };
+        let write_guard = self.write_lock.lock().await;
+        self.checkpoint_mem_tier_for_delete()
             .await
-            .map_err(|err| {
-                maintenance_metrics::track_maintenance(
-                    table_name,
-                    MaintenanceOp::Retention,
-                    MaintenanceOutcome::Failed,
-                );
-                CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                        self.table_metadata.table_name
-                    ),
-                    source: Box::new(err),
-                }
-            })?;
+            .map_err(|err| retention_failed(Box::new(err)))?;
+        let sink = self
+            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+            .await
+            .map_err(|err| retention_failed(Box::new(err)))?;
         // Nothing on this path re-derives `num_rows` from the rows about to be removed,
         // and a caller may have just `Set` an authoritative count (an overwrite
         // re-baselines one, and that restores exactness), so an untainted flag would let
@@ -26062,10 +26067,11 @@ impl CayenneTableProvider {
         // before the durable delete for the reason documented on it.
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
-        let deleted_count = match sink
+        let deleted = sink
             .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
-            .await
-        {
+            .await;
+        drop(write_guard);
+        let deleted_count = match deleted {
             Ok(deleted) => deleted,
             Err(err) => {
                 maintenance_metrics::track_maintenance(
