@@ -40,6 +40,7 @@ use crate::{
 use app::App;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
 use runtime_metrics as metrics;
+use spicepod::component::caching::CacheKeyType;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
@@ -185,6 +186,20 @@ pub struct RuntimeBuilder {
     runtime_config: Arc<Config>,
     resolved_cluster_config: Option<ResolvedClusterConfig>,
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+}
+
+/// Whether SQL results-cache warmup should be armed for this config.
+///
+/// Spicepod deserialization already rejects `warmup` + `cache_key_type: sql`.
+/// Programmatic `AppBuilder::with_sql_cache` can still set that combination, so
+/// callers must pass `CacheKeyType::Plan` (the default) for warmup to enable.
+#[must_use]
+pub(crate) fn sql_results_cache_warmup_enabled(
+    sql_results: &spicepod::component::caching::SQLResultsCacheConfig,
+) -> bool {
+    sql_results.enabled
+        && sql_results.warmup.is_enabled()
+        && matches!(sql_results.cache_key_type, CacheKeyType::Plan)
 }
 
 impl RuntimeBuilder {
@@ -587,13 +602,14 @@ impl RuntimeBuilder {
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         // Invalid `warmup` + `cache_key_type: sql` is rejected when the spicepod
         // deserializes (`validate_sql_results_warmup_config`), so `spiced` never
-        // reaches build with that combination. This flag only enables warmup for
-        // configs that already passed that check (or programmatic AppBuilder use).
+        // reaches build with that combination. Programmatic `AppBuilder::with_sql_cache`
+        // bypasses that check, so also require `CacheKeyType::Plan` here — warmup
+        // replays parameterized templates that only match plan-keyed live queries.
         let results_cache_warmup_enabled = spicepod_rt
             .caching
             .sql_results
             .as_ref()
-            .is_some_and(|sql_results| sql_results.enabled && sql_results.warmup.is_enabled());
+            .is_some_and(sql_results_cache_warmup_enabled);
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Resolve CDC tunables once at startup so the per-envelope hot path
@@ -2141,6 +2157,36 @@ fn task_history_output_preview(
 
 #[cfg(test)]
 mod test {
+
+    #[test]
+    fn sql_results_cache_warmup_requires_plan_key_type() {
+        use spicepod::component::caching::{
+            CacheKeyType, ResultsCacheWarmup, SQLResultsCacheConfig,
+        };
+
+        let plan = SQLResultsCacheConfig {
+            enabled: true,
+            warmup: ResultsCacheWarmup::OnFirstRefresh,
+            cache_key_type: CacheKeyType::Plan,
+            ..Default::default()
+        };
+        assert!(
+            super::sql_results_cache_warmup_enabled(&plan),
+            "plan key type must allow warmup"
+        );
+
+        let sql = SQLResultsCacheConfig {
+            enabled: true,
+            warmup: ResultsCacheWarmup::OnFirstRefresh,
+            cache_key_type: CacheKeyType::Sql,
+            ..Default::default()
+        };
+        assert!(
+            !super::sql_results_cache_warmup_enabled(&sql),
+            "sql key type must not enable warmup for programmatic AppBuilder configs"
+        );
+    }
+
     use super::*;
 
     /// A query's output preview is built only when something records it.
