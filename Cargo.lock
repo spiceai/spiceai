@@ -17177,6 +17177,8 @@ dependencies = [
  "aws-sdk-sts",
  "axum",
  "axum-extra",
+ "azure_core",
+ "azure_data_cosmos",
  "ballista-core",
  "ballista-executor",
  "ballista-scheduler",
