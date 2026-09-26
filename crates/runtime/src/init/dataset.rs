@@ -223,6 +223,25 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
+        if let Some(snapshots) = app.snapshots.as_deref() {
+            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
+                ds.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.enabled
+                        && acceleration
+                            .refresh_mode
+                            .is_some_and(|mode| mode.is_snapshot_only())
+                })
+            });
+            if let Some(warning) =
+                runtime_acceleration::snapshot::notifications::unread_queue_warning(
+                    snapshots,
+                    any_snapshot_mode_dataset,
+                )
+            {
+                tracing::warn!("{warning}");
+            }
+        }
+
         // Validate Cayenne snapshot consistency before initializing accelerators.
         // All Cayenne datasets sharing the same metadata directory must have the same
         // snapshot configuration (either all enabled or all disabled).
