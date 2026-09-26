@@ -54,6 +54,7 @@ impl DatasetCheckpointer for MockCheckpointer {
         &self,
         _schema: &arrow::datatypes::SchemaRef,
         _refresh_sql: Option<&str>,
+        _source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
         Ok(())
     }
@@ -78,6 +79,12 @@ impl DatasetCheckpointer for MockCheckpointer {
     }
 
     async fn get_refresh_sql(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn get_source_fingerprint(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)

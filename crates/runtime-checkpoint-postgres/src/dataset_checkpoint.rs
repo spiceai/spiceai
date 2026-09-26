@@ -33,6 +33,8 @@ const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 const REFRESH_SQL_MIGRATION_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS refresh_sql TEXT";
+const SOURCE_FINGERPRINT_MIGRATION_STMT: &str =
+    "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS source_fingerprint TEXT";
 
 /// Dataset schema/refresh-SQL checkpoint backed by a `PostgreSQL` accelerator.
 pub struct PostgresDatasetCheckpointer {
@@ -121,19 +123,28 @@ impl PostgresDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let conn = pool.connect_direct().await.map_err(store_error)?;
         let schema_json = serialize_schema(schema).map_err(store_error)?;
 
         let upsert = format!(
-            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at, schema_json, refresh_sql)
-             VALUES ($1, CURRENT_TIMESTAMP, $2, $3)
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at, schema_json, refresh_sql, source_fingerprint)
+             VALUES ($1, CURRENT_TIMESTAMP, $2, $3, $4)
              ON CONFLICT (dataset_name) DO UPDATE
-             SET updated_at = CURRENT_TIMESTAMP, schema_json = $2, refresh_sql = $3"
+             SET updated_at = CURRENT_TIMESTAMP, schema_json = $2, refresh_sql = $3, source_fingerprint = $4"
         );
         conn.conn
-            .execute(&upsert, &[&self.dataset_name, &schema_json, &refresh_sql])
+            .execute(
+                &upsert,
+                &[
+                    &self.dataset_name,
+                    &schema_json,
+                    &refresh_sql,
+                    &source_fingerprint,
+                ],
+            )
             .await
             .map_err(store_error)?;
 
@@ -165,6 +176,10 @@ impl PostgresDatasetCheckpointer {
             .map_err(store_error)?;
         conn.conn
             .execute(REFRESH_SQL_MIGRATION_STMT, &[])
+            .await
+            .map_err(store_error)?;
+        conn.conn
+            .execute(SOURCE_FINGERPRINT_MIGRATION_STMT, &[])
             .await
             .map_err(store_error)?;
         Ok(())
@@ -210,6 +225,24 @@ impl PostgresDatasetCheckpointer {
         }
     }
 
+    async fn get_source_fingerprint_inner(&self) -> Result<Option<String>, CheckpointError> {
+        let pool = &self.pool;
+        let conn = pool.connect_direct().await.map_err(store_error)?;
+        let query = format!(
+            "SELECT source_fingerprint FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = $1"
+        );
+        let row = conn
+            .conn
+            .query_opt(&query, &[&self.dataset_name])
+            .await
+            .map_err(store_error)?;
+
+        match row {
+            Some(row) => Ok(row.get(0)),
+            None => Ok(None),
+        }
+    }
+
     async fn delete_inner(&self) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let conn = pool.connect_direct().await.map_err(store_error)?;
@@ -234,8 +267,9 @@ impl DatasetCheckpointer for PostgresDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
-        self.checkpoint_inner(schema, refresh_sql)
+        self.checkpoint_inner(schema, refresh_sql, source_fingerprint)
             .await
             .map_err(Into::into)
     }
@@ -263,6 +297,14 @@ impl DatasetCheckpointer for PostgresDatasetCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         self.get_refresh_sql_inner().await.map_err(Into::into)
+    }
+
+    async fn get_source_fingerprint(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        self.get_source_fingerprint_inner()
+            .await
+            .map_err(Into::into)
     }
 
     async fn delete(&self) -> runtime_acceleration::dataset_checkpoint::Result<()> {

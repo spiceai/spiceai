@@ -26,6 +26,13 @@ use spicepod::component::{dataset::Dataset, view::View};
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
+// Both tests in this module exercise snapshot behavior end to end, which resolves to
+// `SnapshotBehavior::Disabled` in a build without the enterprise `snapshots` feature: the
+// round-trip test would wait out its timeout and the refusal test would find the view
+// loaded. Gated on both features so the module is only compiled where its subject exists.
+#[cfg(all(feature = "duckdb", feature = "snapshots"))]
+mod snapshot;
+
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context},

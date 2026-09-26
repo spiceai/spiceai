@@ -3671,6 +3671,28 @@ impl DataAccelerator for CayenneAccelerator {
                 "S3 Express One Zone is optimized for low-latency access within the same AWS Availability Zone. Access from outside AWS may experience higher latency."
             );
 
+            // This path returns before the snapshot bootstrap below, so an S3 Express
+            // acceleration can never restore from a snapshot — while snapshot *creation*
+            // is not gated, and would archive only the metadata directory, since the data
+            // lives in the bucket rather than under a local directory the archiver can
+            // walk. Publishing archives that nothing can consume is worse than publishing
+            // none: the operator believes the dataset is backed up. Refuse the
+            // combination instead of half-honouring it.
+            if let Some(acceleration) = source.acceleration()
+                && !matches!(
+                    acceleration.snapshot_behavior,
+                    runtime_acceleration::snapshot::SnapshotBehavior::Disabled
+                )
+            {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Failed to register {component} {} (cayenne accelerator): acceleration snapshots are not supported for S3 Express One Zone storage, because the data lives in the bucket rather than in a local directory a snapshot can capture. Set `snapshots: disabled` on this {component}, or move the acceleration to local storage by removing `cayenne_s3_zone_ids` and the S3 Express `cayenne_file_path`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots",
+                        source.name(),
+                        component = source.component_label()
+                    )),
+                }));
+            }
+
             return Ok(BootstrapStatus::none());
         }
 
@@ -3688,7 +3710,7 @@ impl DataAccelerator for CayenneAccelerator {
                 );
                 data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration,
-                    &source.name().to_string(),
+                    source,
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
@@ -3768,14 +3790,17 @@ impl DataAccelerator for CayenneAccelerator {
             );
             let refresh_mode = resolved_refresh_mode(source, acceleration);
 
-            // Decide whether to bootstrap from a snapshot before `get_or_create_catalog`
-            // below opens the local metastore: that call creates `metadata_dir` as a
-            // side effect (it's a fresh SQLite connection), and this decision's "does an
-            // acceleration already exist here" check reads that same directory's
-            // existence. Deciding first means the check sees the true pre-startup state
-            // instead of a directory the catalog open just created.
-            let should_bootstrap =
-                should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode);
+            // Config, refresh-mode, and layout checks first — before
+            // `get_or_create_catalog` below opens the local metastore. That call
+            // creates `metadata_dir` as a side effect (a fresh SQLite connection),
+            // but the decision uses `has_existing_acceleration` (data-dir
+            // contents), not metadata-dir existence, so opening the catalog does
+            // not flip the answer. Deciding first still avoids opening the
+            // catalog when snapshots are disabled or the data dir already holds
+            // rows.
+            if !should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode) {
+                return Ok(BootstrapStatus::none());
+            }
 
             // Build a CayenneSnapshotEngine so the snapshot tar uses the
             // per-dataset metastore-slice format (no raw cayenne.db file)
@@ -3786,31 +3811,62 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str)
                 .to_string();
-            // The catalog is opened unconditionally: normal operation needs it
-            // regardless of the snapshot decision above.
-            let snapshot_engine = match self
+            // No fallback to the default snapshot engine if this fails. A Cayenne archive
+            // carries its metastore as a JSON slice and only `CayenneSnapshotEngine`
+            // imports that slice after extraction, so restoring with any other engine
+            // leaves a table whose metastore knows nothing of the files just written — and
+            // a scan whose manifest is empty for its own snapshot falls back to listing the
+            // data directory, which is wrong rows rather than an error.
+            let catalog = match self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
                 .await
             {
-                Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to open the Cayenne metastore for '{}', so no snapshot is restored and the acceleration is loaded from its source instead. Cause: {err}",
+                        source.name()
+                    );
+                    return Ok(BootstrapStatus::none());
+                }
+            };
+
+            // An acceleration already exists if the METASTORE knows this table, not merely
+            // if the configured directory has contents. The two disagree exactly when the
+            // configured path changes: Cayenne treats a base-path change as non-destructive
+            // and keeps using the stored path, so the newly configured directory is empty
+            // while live — possibly newer — data sits under the old one. Bootstrapping on
+            // the directory alone would import an older slice, and the import replaces this
+            // dataset's metastore rows wholesale, orphaning the live files behind it.
+            match catalog.get_table(&source.name().to_string()).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "Acceleration for '{}' is already registered in the Cayenne metastore, so no snapshot is restored over it",
+                        source.name()
+                    );
+                    return Ok(BootstrapStatus::none());
+                }
+                // Only a definite absence clears the way. Any other failure means the
+                // metastore could not answer the question, and treating "could not answer"
+                // as "not there" is exactly how a restore lands on top of live data.
+                Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to determine whether a Cayenne acceleration for '{}' already exists, so no snapshot is restored over it and the acceleration is loaded from its source instead. Cause: {err}",
+                        source.name()
+                    );
+                    return Ok(BootstrapStatus::none());
+                }
+            }
+
+            let snapshot_engine = Some(
+                Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
                     catalog,
                     source.name().to_string(),
                     path_buf.clone(),
                 ))
-                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
-                         falling back to default engine: {err}"
-                    );
-                    None
-                }
-            };
-
-            if !should_bootstrap {
-                return Ok(BootstrapStatus::none());
-            }
-
+                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+            );
             Ok(download_snapshot(
                 acceleration,
                 source,
@@ -8107,6 +8163,25 @@ mod tests {
         assert!(
             validate_snapshot_consistency(&agreeing).is_ok(),
             "datasets that agree may share a metadata directory"
+        );
+
+        // `enabled: false` turns the acceleration block off. A disabled Cayenne
+        // view that still carries the default snapshot behavior must not
+        // collide with a live snapshot-enabled dataset in the same metastore.
+        let mut disabled_with_default_snapshots = acceleration(true);
+        disabled_with_default_snapshots.enabled = false;
+        let disabled_does_not_occupy_the_store: Vec<Arc<dyn AccelerationSource>> = vec![
+            Arc::new(
+                TestAccelerationSource::new("snapshotting").with_acceleration(acceleration(true)),
+            ),
+            Arc::new(
+                TestAccelerationSource::new("disabled_view")
+                    .with_acceleration(disabled_with_default_snapshots),
+            ),
+        ];
+        assert!(
+            validate_snapshot_consistency(&disabled_does_not_occupy_the_store).is_ok(),
+            "a disabled acceleration must not occupy the shared metastore for snapshot validation"
         );
     }
 

@@ -21,10 +21,36 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 #[async_trait]
 pub trait DatasetCheckpointer: Send + Sync {
     async fn exists(&self) -> bool;
-    async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()>;
+
+    /// Records the acceleration schema, the refresh SQL that produced the rows,
+    /// and the definition identity those rows were materialized from.
+    ///
+    /// `source_fingerprint` is written in the same upsert as the schema: a
+    /// request-scoped override that replaced the configured rows must retract
+    /// the previous stamp (`None`) in the same write, or a later
+    /// `file_create` / schema-recreation would publish those override rows
+    /// under the last configured identity. Deliberately has no default
+    /// implementation — this trait reaches its call sites as
+    /// `Arc<dyn DatasetCheckpointer>`.
+    async fn checkpoint(
+        &self,
+        schema: &SchemaRef,
+        refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
+    ) -> Result<()>;
     async fn get_schema(&self) -> Result<Option<SchemaRef>>;
     async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>>;
     async fn get_refresh_sql(&self) -> Result<Option<String>>;
+
+    /// The definition identity persisted with the local rows, if any.
+    ///
+    /// Pre-recreation publish reads this rather than the remote snapshot
+    /// fingerprint: after a withheld override the remote series still names
+    /// the last published identity, which is not what these rows are.
+    ///
+    /// Deliberately has no default implementation, for the same reason as
+    /// [`Self::checkpoint`].
+    async fn get_source_fingerprint(&self) -> Result<Option<String>>;
 
     /// Rewrites the recorded schema without recording a refresh.
     ///

@@ -23,7 +23,9 @@ use datafusion_table_providers::util::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
-use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger};
+use spicepod::acceleration::{
+    SnapshotsCompaction, SnapshotsConsistency, SnapshotsCreationPolicy, SnapshotsTrigger,
+};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
@@ -562,6 +564,13 @@ pub struct Acceleration {
     pub snapshots_reset_expiry_on_load_enabled: bool,
 
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
+
+    /// For an accelerated view: whether a snapshot may be published or restored
+    /// from a materialization that spans more than one read of the view's sources.
+    /// A dataset that sets a non-default value is refused at load — a dataset
+    /// materializes a single source and always reads it once, so the option
+    /// cannot apply.
+    pub snapshots_consistency: SnapshotsConsistency,
 }
 
 /// What durable write-back has to deliver on, given a primary key's columns.
@@ -1074,6 +1083,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
             ),
             snapshots_creation_policy: acceleration.snapshots_creation_policy,
+            snapshots_consistency: acceleration.snapshots_consistency,
         })
     }
 }
@@ -1120,6 +1130,7 @@ impl Default for Acceleration {
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load_enabled: false,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
+            snapshots_consistency: SnapshotsConsistency::default(),
         }
     }
 }

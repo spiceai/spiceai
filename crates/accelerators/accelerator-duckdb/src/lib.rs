@@ -797,18 +797,43 @@ impl DataAccelerator for DuckDBAccelerator {
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
-                    snapshot_before_recreate(
-                        acceleration,
-                        &source.name().to_string(),
-                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
-                            &path,
-                        )),
-                        AccelerationEngine::DuckDB,
-                        Arc::new(arrow_schema::Schema::empty()),
-                        None,
-                        resolved_refresh_mode(source, acceleration),
-                    )
-                    .await;
+                    // WAL fold lives in `DuckDBSnapshotEngine::checkpoint_live`,
+                    // which `snapshot_before_recreate` reaches through
+                    // `create_file_snapshot` before copying. That is the same
+                    // hook schema recreate uses, so neither call site copies a
+                    // main file that still has committed rows only in `<db>.wal`.
+                    //
+                    // Evict any cached instance first so the fold connection is
+                    // the only one on this file: the shared pool is keyed by
+                    // path, and the delete below would strand a cached instance
+                    // on a removed inode. If the log cannot be folded,
+                    // `create_file_snapshot` fails the publish rather than
+                    // making an incomplete copy the store's current snapshot.
+                    if acceleration.snapshot_behavior.create_enabled() {
+                        self.duckdb_factory
+                            .invalidate_file_instance(path.clone())
+                            .await;
+
+                        snapshot_before_recreate(
+                            acceleration,
+                            source,
+                            runtime_acceleration::snapshot::AccelerationLayout::file(
+                                PathBuf::from(&path),
+                            ),
+                            AccelerationEngine::DuckDB,
+                            Arc::new(arrow_schema::Schema::empty()),
+                            None,
+                            resolved_refresh_mode(source, acceleration),
+                        )
+                        .await;
+                    }
+
+                    // Pre-recreation reads the local checkpoint through the shared
+                    // pool. Evict it before deleting the file, or the next open of
+                    // this path reuses connections bound to the removed inode.
+                    self.duckdb_factory
+                        .invalidate_file_instance(path.clone())
+                        .await;
 
                     tracing::warn!(
                         "DuckDB acceleration mode is 'file_create', removing existing file: {}",
