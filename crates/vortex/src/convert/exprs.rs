@@ -1201,7 +1201,10 @@ mod tests {
         // As a value, `x IN (…)` must be NULL for a NULL `x`, which a bare
         // `list_contains` (FALSE) is not.
         let result = DefaultExpressionConvertor::default()
-            .convert(&nullable_in_list(vec![Some(1), Some(2), Some(3), Some(4)], false))
+            .convert(&nullable_in_list(
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                false,
+            ))
             .expect("IN-list should convert to a Vortex expression");
         let display = result.display_tree().to_string();
         assert!(display.contains("vortex.list.contains"), "{display}");
@@ -1213,7 +1216,10 @@ mod tests {
     fn test_not_in_predicate_conversion_excludes_null_values() {
         // As a predicate, a NULL `x` must not pass `x NOT IN (…)`.
         let result = DefaultExpressionConvertor::default()
-            .convert_predicate(&nullable_in_list(vec![Some(1), Some(2), Some(3), Some(4)], true))
+            .convert_predicate(&nullable_in_list(
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                true,
+            ))
             .expect("NOT IN list should convert to a Vortex expression");
         let display = result.display_tree().to_string();
         assert!(display.contains("vortex.is_not_null"), "{display}");
