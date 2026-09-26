@@ -60065,6 +60065,248 @@ mod tests {
         staged.finish().await.expect("finalize the staged write");
     }
 
+    /// A transaction that began before a pipelined staged append of the key it
+    /// read must be refused when it commits inside that append's staged window.
+    ///
+    /// The append takes the `!stage_on_conflict` arm — purely-new keys into a
+    /// table holding no tombstones, which is `do_nothing`'s steady state
+    /// (`may_have_on_conflict_deletions` is set only for `Upsert`) — so it
+    /// publishes into the current snapshot; the only sequence it draws is the one
+    /// this test pins.
+    ///
+    /// Neither writer sees the other: the transaction staged its row before the
+    /// append existed, and the append validated before the transaction published.
+    /// The commit's per-key OCC re-check is the only thing between them, so the
+    /// append's Stage-A key record has to carry a sequence strictly above the
+    /// transaction's begin token — a stamp equal to that token reads as
+    /// "committed before you began" and both rows publish under one declared
+    /// primary key. Regression test for #13685.
+    #[tokio::test]
+    async fn a_transaction_committing_inside_a_staged_append_window_is_refused() {
+        let ctx = SessionContext::new();
+        let table = "staged_append_txn_occ";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // 1. The transaction begins and reads key 77, finding it absent. The
+        //    footprint is that one key and it is complete (a bounded PK
+        //    predicate), so the commit takes the per-key OCC path.
+        let token = provider.transaction_write_token().await;
+        let footprint = std::collections::HashSet::from([int64_pk_digest(77)]);
+
+        // 2. It stages its own row for 77 while the table is still empty.
+        let staged = provider
+            .begin_staged_upsert_occ(
+                token,
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),
+                1,
+            )
+            .await
+            .expect("the transaction's write should stage");
+
+        // 3. A CDC pipelined append of the SAME key stages inside that window. It
+        //    validated against a table that does not hold the transaction's staged
+        //    row, so it keeps 77 too.
+        let append = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[1])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("the CDC append should stage");
+        assert!(
+            append.has_pending_finalize(),
+            "the append must still be staged when the transaction commits, or the window under \
+             test never opens"
+        );
+
+        // 4. The transaction commits. Its read of 77 is stale — the append owns
+        //    that key now — so the commit has to be refused.
+        let outcome = staged.commit(footprint, true).await;
+
+        append.finish().await.expect("finalize the staged append");
+
+        assert!(
+            matches!(outcome, Err(Error::WriteConflict { .. })),
+            "a transaction whose footprint key was taken by a staged append must abort with a \
+             write conflict, got {outcome:?}"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table).await,
+            vec![(77, 1)],
+            "key 77 must have exactly one live row: the append's"
+        );
+    }
+
+    /// The same window over the SYNCHRONOUS append path: an ordinary insert
+    /// publishing into the current snapshot with no on-conflict deletions has to
+    /// order itself against a transaction that read the key it appends, for the
+    /// same reason and by the same means as the pipelined case above. Sibling
+    /// regression test for #13685.
+    #[tokio::test]
+    async fn a_transaction_committing_across_a_plain_append_of_its_key_is_refused() {
+        let ctx = SessionContext::new();
+        let table = "plain_append_txn_occ";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let token = provider.transaction_write_token().await;
+        let footprint = std::collections::HashSet::from([int64_pk_digest(77)]);
+
+        let staged = provider
+            .begin_staged_upsert_occ(
+                token,
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),
+                1,
+            )
+            .await
+            .expect("the transaction's write should stage");
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[77], &[1]),
+        )
+        .await;
+
+        let outcome = staged.commit(footprint, true).await;
+
+        assert!(
+            matches!(outcome, Err(Error::WriteConflict { .. })),
+            "a transaction whose footprint key was appended by another writer must abort with a \
+             write conflict, got {outcome:?}"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table).await,
+            vec![(77, 1)],
+            "key 77 must have exactly one live row: the append's"
+        );
+    }
+
+    /// An append that writes no rows must not move the table's sequence high
+    /// water.
+    ///
+    /// The sequence a current-snapshot append draws exists to order it against a
+    /// transaction that read one of its keys (#13685). An append that wrote
+    /// nothing publishes no row for any transaction to race, so drawing one for it
+    /// buys no ordering and costs a false abort: `transaction_has_conflict` falls
+    /// back to `current_high_water != stage_seq` whenever the keyset is degraded,
+    /// cleared, or absent, and that reads any movement of the high water as a
+    /// conflict. The mem-tier checkpoint gates its own draw on `any_nonempty` for
+    /// the same reason.
+    ///
+    /// [`create_retention_table`] is the shape that reaches this: retention
+    /// filters bar the inline buffer (`InlineMutationPolicy::from_blocking_conditions`),
+    /// and that buffer is what absorbs an empty batch on an ordinary table — so the
+    /// batch goes to the plain-append arm and writes zero rows. Partitioned tables
+    /// take the same route. An empty refresh tick is the steady state for both.
+    #[tokio::test]
+    async fn an_append_that_writes_no_rows_leaves_the_sequence_high_water_alone() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_retention_table("retention_empty_append", ctx.runtime_env(), 0).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let before = provider.sequence_high_water().await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[], &[]),
+        )
+        .await;
+        assert_eq!(
+            provider.sequence_high_water().await,
+            before,
+            "an append that wrote no rows must leave the high water alone, or every empty \
+             refresh tick aborts a concurrent transaction that falls back to the per-table check"
+        );
+
+        // The same table still orders an append that DOES write rows, so the
+        // assertion above cannot be satisfied by never drawing at all. The value
+        // clears `RETENTION_FLOOR` so retention does not delete the row back out.
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1], &[RETENTION_FLOOR]),
+        )
+        .await;
+        assert!(
+            provider.sequence_high_water().await > before,
+            "an append that wrote rows must still move the high water (#13685)"
+        );
+    }
+
+    /// A pipelined append that publishes rows must move the high water even when
+    /// it validated no primary keys.
+    ///
+    /// The draw is gated on the ROW count, and this pins why it cannot be gated on
+    /// the validated key set instead. A table with no primary key returns
+    /// `PreparedInsertStream::immediate`, whose `PostValidationState` is empty on
+    /// every append however many rows it writes — and a table like this has no
+    /// per-key stamp at all, so `transaction_has_conflict` can only take the
+    /// per-table `current_high_water != stage_seq` fallback. Gating on the key set
+    /// would leave every one of its appends invisible to that fallback, which is
+    /// #13685 again on the tables least able to detect it.
+    #[tokio::test]
+    async fn a_keyless_pipelined_append_still_moves_the_sequence_high_water() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "keyless_pipelined_append",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec![],
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+
+        let before = provider.sequence_high_water().await;
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[1])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("the CDC append should stage")
+            .finish()
+            .await
+            .expect("finalize the staged append");
+
+        assert!(
+            provider.sequence_high_water().await > before,
+            "an append that published rows must move the high water even with no validated keys, \
+             or a transaction on a key-less table commits over it unseen (#13685)"
+        );
+    }
+
     /// The `u128` PK digest for a single-column `Int64` primary key, as the
     /// keyset stores it.
     fn int64_pk_digest(id: i64) -> u128 {
