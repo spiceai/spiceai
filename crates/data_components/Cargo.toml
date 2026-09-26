@@ -88,6 +88,7 @@ runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
+qdrant = { path = "../qdrant", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
 secrecy.workspace = true
@@ -147,6 +148,7 @@ debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel"]
 elasticsearch = ["dep:elasticsearch"]
+qdrant = ["dep:qdrant"]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",

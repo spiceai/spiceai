@@ -28,6 +28,7 @@ datafusion-expr.workspace = true
 datafusion-functions-json = { workspace = true }
 duration-parse = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
+qdrant = { path = "../qdrant", optional = true }
 fundu = { workspace = true, optional = true }
 futures.workspace = true
 itertools.workspace = true
@@ -61,6 +62,7 @@ tracing.workspace = true
 default = []
 duckdb = ["search/duckdb"]
 elasticsearch = ["search/elasticsearch", "dep:elasticsearch", "dep:duration-parse"]
+qdrant = ["search/qdrant", "dep:qdrant", "dep:duration-parse"]
 models = ["runtime-datafusion-udfs/models"]
 openapi = ["dep:utoipa"]
 s3_vectors = ["search/s3_vectors", "dep:fundu"]

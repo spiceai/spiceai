@@ -20,7 +20,7 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "qdrant"))]
 use runtime_datafusion_udfs::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
@@ -31,7 +31,13 @@ use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "qdrant"))]
+use datafusion::common::ToDFSchema as _;
+#[cfg(any(feature = "s3_vectors", feature = "qdrant"))]
+use runtime_table_partition::expression::partition_by_expressions;
+#[cfg(feature = "s3_vectors")]
+use search::generation::util::get_primary_keys;
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "qdrant"))]
 use {
     crate::embeddings::construct_chunker,
     arrow_schema::{Schema, SchemaRef},
@@ -45,12 +51,6 @@ use {
     spice_table::{Index, IndexLayer},
     spicepod::component::embeddings::EmbeddingChunkConfig,
     spicepod::semantic::MetadataType,
-};
-#[cfg(feature = "s3_vectors")]
-use {
-    datafusion::common::ToDFSchema as _,
-    runtime_table_partition::expression::partition_by_expressions,
-    search::generation::util::get_primary_keys,
 };
 
 pub async fn wrap_table_as_index(
@@ -76,11 +76,21 @@ pub async fn wrap_table_as_index(
     }
     #[cfg(not(feature = "s3_vectors"))]
     let _ = ctx;
-    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
+    #[cfg(not(any(
+        feature = "s3_vectors",
+        feature = "elasticsearch",
+        feature = "duckdb",
+        feature = "qdrant"
+    )))]
     let _ = file_format;
-    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
+    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "qdrant")))]
     let _ = (secrets, on_zero_results);
-    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
+    #[cfg(not(any(
+        feature = "s3_vectors",
+        feature = "elasticsearch",
+        feature = "duckdb",
+        feature = "qdrant"
+    )))]
     let _ = (
         embedding_models,
         secrets,
@@ -108,6 +118,21 @@ pub async fn wrap_table_as_index(
         #[cfg(feature = "elasticsearch")]
         Some("elasticsearch" | "es") => {
             wrap_table_as_index_elasticsearch(
+                ctx,
+                embedding_models,
+                secrets,
+                tbl,
+                columns,
+                file_format,
+                inner_table_provider,
+                vector_store,
+                on_zero_results,
+            )
+            .await
+        }
+        #[cfg(feature = "qdrant")]
+        Some("qdrant") => {
+            wrap_table_as_index_qdrant(
                 ctx,
                 embedding_models,
                 secrets,
@@ -321,7 +346,7 @@ async fn wrap_table_as_index_s3(
 /// it to `provider`, and return the [`VectorIndex`] side of it (when the chunked index
 /// supports vector search) for the caller to join onto its `VectorScanTableProvider`
 /// alongside every other column's index.
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "qdrant"))]
 async fn construct_chunked_vector_index(
     provider: IndexLayer,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
@@ -353,7 +378,7 @@ async fn construct_chunked_vector_index(
 }
 
 /// Provide updated columns and underlying [`SchemaRef`] for a [`SearchIndex`] to use based off the index being chunked.
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "qdrant"))]
 fn updated_chunked_search_index_format(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
@@ -400,7 +425,7 @@ fn updated_chunked_search_index_format(
     (columns, Arc::new(Schema::new(fields)))
 }
 
-#[cfg(feature = "s3_vectors")]
+#[cfg(any(feature = "s3_vectors", feature = "qdrant"))]
 fn get_partition_expressions(
     ctx: &Arc<SessionContext>,
     inner_table_provider: &Arc<dyn TableProvider + 'static>,
@@ -530,6 +555,116 @@ async fn wrap_table_as_index_elasticsearch(
 
     tracing::info!(
         "Elasticsearch vector engine for table {tbl} initialized in {:?}",
+        start.elapsed()
+    );
+    Ok(spice_table::SpiceTable::over(Arc::new(provider), layer_below) as Arc<dyn TableProvider>)
+}
+
+#[cfg(feature = "qdrant")]
+async fn wrap_table_as_index_qdrant(
+    ctx: &Arc<SessionContext>,
+    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+    secrets: &Arc<RwLock<Secrets>>,
+    tbl: &TableReference,
+    columns: &[Column],
+    file_format: Option<&str>,
+    inner_table_provider: Arc<dyn TableProvider + 'static>,
+    vector_store: &VectorStore,
+    on_zero_results: Option<&ZeroResultsAction>,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Qdrant vector engine for table {tbl} initializing...");
+    let start = std::time::Instant::now();
+
+    let embedding_columns: Vec<_> = columns
+        .iter()
+        .filter_map(|c| {
+            c.embeddings
+                .first()
+                .map(|embed| (c.name.clone(), embed.clone()))
+        })
+        .collect();
+
+    let (mut provider, base_below) =
+        match inner_table_provider.downcast_ref::<spice_table::SpiceTable>() {
+            Some(table) if !table.indexes().is_empty() => (
+                IndexLayer::with_indexes(table.indexes().to_vec()),
+                Arc::clone(table.below()),
+            ),
+            _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
+        };
+    let mut vector_indexes: Vec<Arc<dyn VectorIndex>> = Vec::new();
+
+    let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
+        return Err(Box::from(format!(
+            "No scalar UDF '{EMBED_UDF_NAME}' found in context"
+        )));
+    };
+
+    for (column, config) in embedding_columns {
+        let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
+        let (augmented_columns, index_schema) = match chunking {
+            Some(_) => updated_chunked_search_index_format(&inner_table_provider, columns, &column),
+            None => (columns.to_vec(), inner_table_provider.schema()),
+        };
+        let partition_by = get_partition_expressions(ctx, &inner_table_provider, vector_store)?;
+
+        let qdrant_index = super::qdrant::try_from_table(
+            tbl,
+            column.clone(),
+            config.clone(),
+            vector_store,
+            &inner_table_provider,
+            Arc::clone(&index_schema),
+            Arc::clone(embedding_models),
+            augmented_columns,
+            Arc::clone(secrets),
+            partition_by,
+        )
+        .await?;
+
+        let metadata_columns = qdrant_index.metadata_columns.clone();
+        let embedder = Arc::clone(&qdrant_index.compute_query);
+        let distance_metric = qdrant_index.distance_metric.clone();
+        let vector_index = with_memory_warm_index(
+            tbl,
+            Arc::new(qdrant_index) as Arc<dyn VectorIndex>,
+            metadata_columns,
+            embedder,
+            &embed_udf,
+            &config.model,
+            distance_metric.as_str(),
+            on_zero_results,
+        );
+
+        provider = if let Some(chunking) = chunking {
+            tracing::debug!("[Qdrant][table={tbl}] Chunking column {column}");
+            let (p, chunked_vector_index) = construct_chunked_vector_index(
+                provider,
+                embedding_models,
+                chunking,
+                vector_index as Arc<dyn SearchIndex>,
+                config.model.as_str(),
+                file_format,
+            )
+            .await?;
+            vector_indexes.extend(chunked_vector_index);
+            p
+        } else {
+            let provider = provider.add_index(Arc::clone(&vector_index) as Arc<dyn Index>);
+            vector_indexes.push(vector_index);
+            provider
+        };
+    }
+
+    let layer_below = if vector_indexes.is_empty() {
+        base_below
+    } else {
+        Arc::new(VectorScanTableProvider::try_new(base_below, &vector_indexes).boxed()?)
+            .into_table() as Arc<dyn TableProvider>
+    };
+
+    tracing::info!(
+        "Qdrant vector engine for table {tbl} initialized in {:?}",
         start.elapsed()
     );
     Ok(spice_table::SpiceTable::over(Arc::new(provider), layer_below) as Arc<dyn TableProvider>)
