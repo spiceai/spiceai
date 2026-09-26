@@ -23,6 +23,7 @@ use util::format_datafusion_error;
 mod arrow;
 mod connector;
 pub mod dml;
+mod filter;
 mod json_nest;
 pub mod provider;
 mod request_builder;

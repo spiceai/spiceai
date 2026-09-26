@@ -13,14 +13,39 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::filter::{KeyReading, MAX_EXPRESSION_BYTES, SortPredicate};
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Clone, Debug)]
 pub enum DynamoDBRequestPlan {
-    Query(QueryParams),
+    /// One Query per partition-key value, each read as its own partition.
+    Query(Vec<QueryParams>),
     Scan(ScanParams),
+    /// The filters select no item, so nothing is read.
+    Empty,
+}
+
+impl DynamoDBRequestPlan {
+    /// Whether every expression of the request is within the length
+    /// `DynamoDB` accepts.
+    pub fn fits_expression_limits(&self) -> bool {
+        let fits = |expression: &Option<String>| {
+            expression
+                .as_ref()
+                .is_none_or(|e| e.len() <= MAX_EXPRESSION_BYTES)
+        };
+        match self {
+            Self::Query(queries) => queries.iter().all(|q| {
+                fits(&q.key_condition_expression)
+                    && fits(&q.filter_expression)
+                    && fits(&q.projection_expression)
+            }),
+            Self::Scan(scan) => fits(&scan.filter_expression) && fits(&scan.projection_expression),
+            Self::Empty => true,
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -42,6 +67,16 @@ pub struct QueryParams {
     // Example: "#PK, #SK, #name, #email"
     pub projection_expression: Option<String>,
     pub limit: Option<i32>,
+    /// Reads in descending sort-key order when `false`.
+    pub scan_index_forward: Option<bool>,
+    /// Sort-key predicates each item must meet, which the key condition does
+    /// not state: a key condition holds one sort-key condition, and a Query's
+    /// filter expression may not read a key attribute.
+    pub(crate) residual: Vec<SortPredicate>,
+    /// The sort-key attribute `residual` reads.
+    pub sort_key: Option<String>,
+    /// How the sort key's column reads the values `residual` is checked on.
+    pub(crate) sort_key_reading: KeyReading,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -110,6 +145,10 @@ impl QueryParamsBuilder {
             expression_attribute_names: self.expression_attribute_names,
             projection_expression: self.projection_expression,
             limit: self.limit,
+            scan_index_forward: None,
+            residual: Vec::new(),
+            sort_key: None,
+            sort_key_reading: KeyReading::Stored,
         }
     }
 }
@@ -229,8 +268,15 @@ impl fmt::Debug for QueryParams {
 
         debug_struct.field("projection_expression", &self.projection_expression);
         debug_struct.field("limit", &self.limit);
+        if let Some(forward) = self.scan_index_forward {
+            debug_struct.field("scan_index_forward", &forward);
+        }
+        if !self.residual.is_empty() {
+            debug_struct.field("residual", &self.residual);
+            debug_struct.field("sort_key_reading", &self.sort_key_reading);
+        }
 
-        debug_struct.finish()
+        debug_struct.finish_non_exhaustive()
     }
 }
 
