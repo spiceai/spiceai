@@ -24,18 +24,17 @@ limitations under the License.
 //! subqueries, sorts, windows and unions, and walk the plan without finding one.
 //!
 //! [`is_point_lookup`] recognises the shape on the unoptimized plan. The rules named in
-//! [`SKIPPABLE_RULES`] are wrapped when the session is built; while [`plan_point_lookup`] plans a
+//! [`SKIPPABLE_RULES`] are wrapped when the session is built; while [`create_physical_plan`] plans a
 //! recognised lookup they hand their input back untouched. Every other rule runs as it always
 //! does, including any rule a `DataFusion` upgrade adds: this is a list of rules to skip, not a
 //! list of rules to keep, so a new rule is never skipped by omission.
 
 use std::fmt::{self, Debug, Formatter};
-use std::future::Future;
 use std::sync::Arc;
 
-use datafusion::common::Constraint;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Constraint, ScalarValue};
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::session_state::SessionState;
@@ -118,25 +117,62 @@ fn is_skippable(name: &str) -> bool {
     SKIPPABLE_RULES.contains(&name)
 }
 
-/// Runs `planning` — the physical planning of one query — with [`SKIPPABLE_RULES`] switched off
-/// when `point_lookup` is true.
-pub(crate) async fn plan_point_lookup<F: Future>(point_lookup: bool, planning: F) -> F::Output {
-    if point_lookup {
-        PLANNING_POINT_LOOKUP.scope((), planning).await
-    } else {
-        planning.await
-    }
-}
-
-/// Configures `session` to plan a point lookup in one pass of the logical optimizer.
+/// Plans `plan` physically, as `SessionState::create_physical_plan` does. A point lookup
+/// ([`is_point_lookup`]) is planned with the rules in [`SKIPPABLE_RULES`] switched off and with
+/// only the logical optimizer passes that can still change it.
 ///
 /// `DataFusion` repeats its logical rules until a pass leaves the plan unchanged, so a plan the
 /// first pass finishes still pays for a second pass that only confirms it. One pass finishes a
-/// point lookup: it pushes the filter into the scan and prunes the projection, and neither leaves
-/// work for another rule. Stopping after one pass could only leave a plan less optimized, never
-/// different in meaning, because every rule preserves the plan's meaning.
-pub(crate) fn plan_in_one_pass(session: &mut SessionState) {
-    session.config_mut().options_mut().optimizer.max_passes = 1;
+/// point lookup — it pushes the filter into the scan and prunes the projection — unless it leaves
+/// a constant predicate behind: a contradiction such as `id = 5 AND id = 6` folds to `false` only
+/// after `eliminate_filter` has run, and it takes another pass to turn that filter into an empty
+/// relation. The remaining passes run then, so the plan is always the one full optimization
+/// produces. `session` keeps its own pass limit.
+pub(crate) async fn create_physical_plan(
+    session: &mut SessionState,
+    plan: &LogicalPlan,
+    point_lookup: bool,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if !point_lookup {
+        return session.create_physical_plan(plan).await;
+    }
+    PLANNING_POINT_LOOKUP
+        .scope((), async {
+            let max_passes = session.config().options().optimizer.max_passes;
+            session.config_mut().options_mut().optimizer.max_passes = 1;
+            let optimized = session.optimize(plan);
+            session.config_mut().options_mut().optimizer.max_passes = max_passes;
+            let mut optimized = optimized?;
+            if has_constant_predicate(&optimized) {
+                optimized = session.optimize(&optimized)?;
+            }
+            let planner = Arc::clone(session.query_planner());
+            planner.create_physical_plan(&optimized, session).await
+        })
+        .await
+}
+
+/// Whether a filter in `plan` still holds a boolean or null constant. The next pass's expression
+/// simplification folds it — `id = 5 AND false` to `false` — and `eliminate_filter` then removes
+/// the filter or turns it into an empty relation. A filter on a boolean column compared with a
+/// literal also counts; it pays for a pass it did not need rather than risk skipping one.
+fn has_constant_predicate(plan: &LogicalPlan) -> bool {
+    fn holds_constant(predicate: &Expr) -> bool {
+        predicate
+            .exists(|expr| {
+                Ok(matches!(expr, Expr::Literal(value, _)
+                    if value.is_null() || matches!(value, ScalarValue::Boolean(_))))
+            })
+            .unwrap_or(true)
+    }
+    plan.exists(|node| {
+        Ok(match node {
+            LogicalPlan::Filter(filter) => holds_constant(&filter.predicate),
+            LogicalPlan::TableScan(scan) => scan.filters.iter().any(holds_constant),
+            _ => false,
+        })
+    })
+    .unwrap_or(true)
 }
 
 /// Whether `plan` (unoptimized) is a primary-key point lookup: plain columns projected from a
@@ -443,7 +479,7 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionContext;
 
-    use super::{is_point_lookup, plan_point_lookup, wrap_skippable_rules};
+    use super::{create_physical_plan, is_point_lookup, wrap_skippable_rules};
 
     fn context() -> SessionContext {
         let schema = Arc::new(Schema::new(vec![
@@ -540,6 +576,15 @@ mod tests {
             "SELECT * FROM keyed WHERE id = '5'",
             "SELECT * FROM composite WHERE region = 1 AND id = 5",
             "SELECT * FROM keyed WHERE id = 5 AND id = 6",
+            "SELECT * FROM keyed WHERE id = 5 AND id < 3",
+            "SELECT * FROM keyed WHERE id = 5 AND id >= 5",
+            "SELECT * FROM keyed WHERE id = 5 AND region = 1 AND region = 2",
+            "SELECT * FROM keyed WHERE id = 5 AND region IS NULL",
+            "SELECT * FROM keyed WHERE id = NULL",
+            "SELECT * FROM keyed WHERE id = 5 AND name IS NULL",
+            "SELECT * FROM keyed WHERE id = 5 AND region > 1 AND region < 0",
+            "SELECT * FROM keyed WHERE id = 5 AND id IS NULL",
+            "SELECT * FROM keyed WHERE id = 5 AND name = 'n5'",
             "SELECT * FROM keyed WHERE id = 5 AND name IS NOT NULL",
         ] {
             let plan = unoptimized(&ctx, sql).await;
@@ -549,9 +594,7 @@ mod tests {
                 .create_physical_plan(&plan)
                 .await
                 .expect("full plan");
-            let mut lean_state = ctx.state();
-            plan_in_one_pass(&mut lean_state);
-            let lean = plan_point_lookup(true, lean_state.create_physical_plan(&plan))
+            let lean = create_physical_plan(&mut ctx.state(), &plan, true)
                 .await
                 .expect("lean plan");
             assert_eq!(
