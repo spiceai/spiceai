@@ -28,6 +28,11 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Largest value, in bytes, admitted on the calling task rather than on the
+/// blocking pool (see `SpiceBackend::insert`). A point lookup's result is a few
+/// KiB.
+const INLINE_ADMISSION_MAX_BYTES: usize = 64 * 1024;
+
 /// Maps the crate-local eviction reason onto the metric label.
 fn map_reason(reason: sharded_cache::EvictionReason) -> EvictionReason {
     match reason {
@@ -84,15 +89,22 @@ where
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
     async fn insert(&self, key: u64, value: V) {
-        // Admission may expire a shard and walk LFU victims; keep that (and
-        // O(result-size) `get_memory_size` for CachedQueryResult) off the Tokio
-        // worker the way `clear` / `run_pending_tasks` already do.
+        // Admission may expire a shard, walk eviction victims and drop them. For a
+        // large value that belongs on the blocking pool, off the Tokio worker, the
+        // way `clear` and `run_pending_tasks` already run. For a small one — a
+        // point lookup's result, say — the round trip through the pool costs more
+        // than the admission: a wake-up on a pool thread and another back here,
+        // about 20µs added to every uncached query, and at high query rates
+        // contention on the pool's queue. Sizing walks a value's batches and
+        // columns, never its rows, so it is done here to choose.
+        let weight = value.get_memory_size();
+        if weight <= INLINE_ADMISSION_MAX_BYTES {
+            self.cache.insert(key, value, weight);
+            return;
+        }
         let cache = Arc::clone(&self.cache);
-        if let Err(err) = tokio::task::spawn_blocking(move || {
-            let weight = value.get_memory_size();
-            cache.insert(key, value, weight);
-        })
-        .await
+        if let Err(err) =
+            tokio::task::spawn_blocking(move || cache.insert(key, value, weight)).await
         {
             tracing::debug!("Spice cache insert task did not finish: {err}");
         }
