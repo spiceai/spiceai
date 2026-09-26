@@ -1116,7 +1116,7 @@ Parts 3 and 4 followed a change from the source into a published snapshot. This 
 
 ## Point lookups
 
-A point lookup pins a key to a literal: `WHERE id = 42`, a short integer `IN` list on the key, or equality on every column of a secondary index. Every stage below only removes work, and none can add a row: `supports_filters_pushdown` reports each data-column filter `Inexact`, so every row the scan returns is still checked against the predicate. At physical-planning time it is pushed into the Vortex scan itself (`VortexSource::try_pushdown_filters`), and the `FilterExec` above the scan is removed only when every branch of the scan accepts it.
+A point lookup pins a key to a literal: `WHERE id = 42`, a short integer `IN` list on the key, or equality on every column of a secondary index. Every stage below only removes work, and none can add a row: `supports_filters_pushdown` reports each data-column filter `Inexact`, so every row the scan returns is still checked against the predicate. At physical-planning time it is pushed into the Vortex scan itself (`VortexSource::try_pushdown_filters`), and the `FilterExec` above the scan is removed only when every branch of the scan accepts it. A partitioned table hands the same filters to every partition it does not prune: a filter that partition pruning fully resolves (`region = 'us'` under `partition_by: [region]`) is `Exact`, and every other filter is `Inexact` and reaches each partition's own `scan`, so each partition plans its own point lookup, file pruning, and secondary-index selection.
 
 ```mermaid
 flowchart TB
