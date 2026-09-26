@@ -52,7 +52,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
+use runtime_acceleration::dataupdate::{
+    StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
+};
 use runtime_component::dataset::OnSchemaChange;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_component::schema_evolution::{
@@ -72,7 +74,8 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use telemetry::timing::MultiTimeMeasurement;
 use tokio::sync::RwLock;
 
 type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated::Result<()>>;
@@ -1959,6 +1962,54 @@ impl RefreshTask {
         true
     }
 
+    /// Replace the accelerator from a [`cdc::ChangeBatch::rebuild_from_this_batch`]
+    /// snapshot already carried on the `history_unavailable` envelope. This is
+    /// the same atomic `InsertOp::Overwrite` a full refresh uses, but it does
+    /// not list the source again — so the replacement rows and the envelope's
+    /// applied-key / position commit stay on one snapshot.
+    async fn rebuild_from_batches(
+        &self,
+        context: &ApplyContext<'_>,
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+    ) -> bool {
+        let label_sets = self.get_dataset_label_sets(&RefreshMode::Full).await;
+        let _timer = MultiTimeMeasurement::new(&metrics::REFRESH_DURATION_MS, &label_sets);
+
+        tracing::warn!(
+            "Dataset {}: the source can no longer supply the changes needed to continue, so the acceleration is being replaced from the rebuild signal's snapshot. This does not re-read the source.",
+            context.dataset_name,
+        );
+
+        let stream = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(batches.into_iter().map(Ok)),
+        );
+        let update = StreamingDataUpdate::new(Box::pin(stream), UpdateType::Overwrite);
+        if let Err(e) = self
+            .write_streaming_data_update(Some(SystemTime::now()), update, context.refresh_sql, None)
+            .await
+        {
+            let error_message = format!(
+                "Failed to replace the acceleration for {} from the rebuild signal's snapshot: {e}",
+                context.dataset_name,
+            );
+            tracing::error!("{error_message}");
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return false;
+        }
+
+        tracing::info!(
+            "Dataset {}: replaced the acceleration from the rebuild signal's snapshot; resuming change streaming.",
+            context.dataset_name,
+        );
+        true
+    }
+
     async fn run_finalize_side_effects(
         &self,
         context: &mut ApplyContext<'_>,
@@ -2087,19 +2138,14 @@ impl RefreshTask {
         // under that predicate and keep durability-then-commit ordering.
         envelopes.retain(|env| !env.is_no_op_heartbeat());
 
-        // The source has lost the history that explains what changed while it was
-        // away, so nothing in this burst — or after it — can be applied on top of
-        // the accelerator's current contents. Re-read the source into the
-        // accelerator as one atomic replacement first; the changes that follow
-        // then converge on top of it (see `rebuild_from_source`).
-        if history_unavailable && !self.rebuild_from_source(context).await {
-            return false;
-        }
-
-        // Readiness-only run: every envelope was a heartbeat. Honor the ready
-        // flag and stop — there is nothing to write and nothing to commit, so
-        // the run must not touch the write path or force a checkpoint.
+        // Readiness-only run: every envelope was a heartbeat. A classic
+        // `history_unavailable` signal is itself a no-op heartbeat, so it is
+        // gone here and the replacement is a federated re-read. A listing
+        // snapshot rides a real committer and survives into `into_parts`.
         if envelopes.is_empty() {
+            if history_unavailable && !self.rebuild_from_source(context).await {
+                return false;
+            }
             if any_ready {
                 if let Some(pending) = context.pending_finalize.as_mut() {
                     // A previous durable burst's Stage-B publish is still
@@ -2141,15 +2187,69 @@ impl RefreshTask {
         };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
+        // The source has lost the history that explains what changed while it was
+        // away. Prefer the snapshot already on the signal (`rebuild_from_this_batch`)
+        // so replacement rows and the applied-key commit are the same listing; a
+        // later federated scan can invent extras the listing did not mark applied.
+        if history_unavailable {
+            let listing_rebuild = parts
+                .iter()
+                .any(|(_, batch, _, _)| batch.rebuild_from_this_batch());
+            if listing_rebuild {
+                let rebuild_batches: Vec<RecordBatch> = parts
+                    .iter()
+                    .filter(|(_, batch, _, _)| batch.rebuild_from_this_batch())
+                    .map(|(_, batch, _, _)| batch.data_batch())
+                    .collect();
+                let schema = rebuild_batches
+                    .first()
+                    .map_or_else(|| self.accelerator.schema(), RecordBatch::schema);
+                let nonempty: Vec<RecordBatch> = rebuild_batches
+                    .into_iter()
+                    .filter(|batch| batch.num_rows() > 0)
+                    .collect();
+                if !self.rebuild_from_batches(context, nonempty, schema).await {
+                    return false;
+                }
+            } else if !self.rebuild_from_source(context).await {
+                return false;
+            }
+        }
+
         // Readiness and the history-unavailable signal were both folded in before
         // the heartbeat retain, so their per-envelope flags are spent here.
-        let (committers, batches): (
-            Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
-            Vec<ChangeBatch>,
-        ) = parts
-            .into_iter()
-            .map(|(committer, batch, _is_ready, _history_unavailable)| (committer, batch))
-            .unzip();
+        // Listing-rebuild rows were the overwrite payload and must not also upsert.
+        let mut rebuild_committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
+        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
+        let mut batches: Vec<ChangeBatch> = Vec::new();
+        for (committer, batch, _is_ready, _history_unavailable) in parts {
+            if batch.rebuild_from_this_batch() {
+                rebuild_committers.push(committer);
+            } else {
+                committers.push(committer);
+                batches.push(batch);
+            }
+        }
+
+        if batches.is_empty() {
+            rebuild_committers.append(&mut committers);
+            return self
+                .run_finalize_side_effects(context, rebuild_committers, any_ready)
+                .await;
+        }
+
+        // The rebuild overwrite has already succeeded. Finalize its committer
+        // now, independently of later CDC groups: if a later group fails to
+        // coalesce/write, `apply_coalesced_run` drops those committers unacked,
+        // and an `AppliedKeysCommitter::drop` would otherwise release keys whose
+        // rows are already present — making the next backfill append them again.
+        if !rebuild_committers.is_empty()
+            && !self
+                .run_finalize_side_effects(context, rebuild_committers, false)
+                .await
+        {
+            return false;
+        }
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
@@ -5109,6 +5209,65 @@ mod tests {
         .build()
     }
 
+    fn make_refresh_task_with_source(
+        name: &str,
+        federated: Arc<dyn TableProvider>,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> RefreshTask {
+        use crate::accelerated::refresh_task::RefreshTaskBuilder;
+        use crate::federated::FederatedTable;
+        use tokio::runtime::Handle;
+        use tokio::sync::Mutex;
+
+        let federated = Arc::new(FederatedTable::new_unchecked(federated));
+        RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            datafusion::sql::TableReference::bare(name.to_string()),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build()
+    }
+
+    fn id_name_batch(ids: &[i32], names: &[&str]) -> RecordBatch {
+        let schema = Arc::new(create_test_data_schema());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(
+                    names.iter().map(|name| Some(*name)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("id/name batch should build")
+    }
+
+    async fn names_in_table(table: Arc<dyn TableProvider>) -> Vec<String> {
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(table)
+            .expect("read table")
+            .collect()
+            .await
+            .expect("collect table");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let names = batch
+                    .column_by_name("name")
+                    .expect("name")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name is Utf8");
+                (0..names.len()).map(|i| names.value(i).to_string())
+            })
+            .collect()
+    }
+
     /// `make_refresh_task` with per-dataset `cdc_*` param overrides applied, so
     /// a test can pin `cdc_delete_subbatch_max` regardless of the process-global
     /// [`CdcConfig`].
@@ -6825,6 +6984,51 @@ mod tests {
         );
     }
 
+    /// Succeeds for the first `allow` writes, then fails. Used to let a listing
+    /// rebuild overwrite land and then fail a later CDC upsert in the same run.
+    #[derive(Debug)]
+    struct FailAfterNWrites {
+        inner: Arc<dyn TableProvider>,
+        writes_seen: Arc<AtomicUsize>,
+        allow: usize,
+    }
+
+    #[async_trait]
+    impl TableProvider for FailAfterNWrites {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let seen = self.writes_seen.fetch_add(1, AtomicOrdering::SeqCst);
+            if seen >= self.allow {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "synthetic write failure after allowed writes".to_string(),
+                ));
+            }
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
     #[tokio::test]
     async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure() {
         let failures_remaining = Arc::new(AtomicUsize::new(1));
@@ -7844,6 +8048,303 @@ mod tests {
             1,
             "a rebuild must be timed as one full refresh of '{dataset}', or a changes-mode \
              dataset re-reads its whole source with nothing to show for it"
+        );
+    }
+
+    /// Coverage for a `refresh_sql` dataset, whose accelerator is created with
+    /// the projected schema while the rebuild signal still carries source rows:
+    /// the accelerator write narrows to the accelerated schema by name, so the
+    /// replacement lands with the projected columns.
+    #[tokio::test]
+    async fn listing_rebuild_lands_on_a_projected_accelerator_schema() {
+        let dataset = "listing_rebuild_projected_schema";
+        let source_schema = Arc::new(create_test_data_schema());
+        let projected_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&source_schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&projected_schema),
+                vec![vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&projected_schema),
+                        vec![Arc::new(Int32Array::from(vec![0]))],
+                    )
+                    .expect("projected accelerator batch"),
+                ]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: Some("SELECT id FROM listing_rebuild_projected_schema"),
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let listing = id_name_batch(&[1], &["existing"]);
+        let signal = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&source_schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "a listing rebuild must land on a dataset whose accelerator is a refresh_sql projection"
+        );
+
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+            .expect("read accelerator")
+            .collect()
+            .await
+            .expect("collect accelerator");
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "the replacement must be the snapshot's rows, narrowed to the accelerated columns"
+        );
+    }
+
+    /// Copilot harness dual: a later federated scan seeing `b` after the
+    /// captured listing `{a}` would write `b` and then backfill `b` again.
+    /// Listing-driven overwrite must use the envelope rows, not the federated table.
+    #[tokio::test]
+    async fn listing_rebuild_overwrites_from_envelope_not_federated_scan() {
+        // Before anything records: the acceleration meter binds whichever global
+        // provider is installed the first time one of its metrics is touched, so
+        // a sample taken before this call never reaches this registry.
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
+        let dataset = "listing_rebuild_same_snapshot";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[0], &["old"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            0,
+            "control: nothing has replaced the acceleration yet"
+        );
+
+        let listing = id_name_batch(&[1], &["existing"]);
+        let signal = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "listing-driven rebuild must succeed"
+        );
+
+        let names = names_in_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>).await;
+        assert_eq!(
+            names,
+            vec!["existing".to_string()],
+            "overwrite must use the listing snapshot, not the federated table or prior accelerator rows, got {names:?}"
+        );
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            1,
+            "a listing-driven replace is still one full refresh of '{dataset}'"
+        );
+    }
+
+    /// Copilot: after a listing rebuild overwrite succeeds, its committer must
+    /// finalize independently of later envelopes. Otherwise a later write failure
+    /// drops the rebuild committer unacked and `AppliedKeysCommitter::drop`
+    /// releases keys whose rows are already present.
+    #[tokio::test]
+    async fn listing_rebuild_commits_before_a_later_write_failure() {
+        let dataset = "listing_rebuild_commits_before_later_fail";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[0], &["old"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let writes_seen = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(FailAfterNWrites {
+            inner: Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+            writes_seen: Arc::clone(&writes_seen),
+            allow: 1, // rebuild overwrite lands; the later upsert fails
+        });
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let log = CommitLog::new();
+        let listing = id_name_batch(&[1], &["existing"]);
+        let rebuild = cdc::ChangeEnvelope::from_parts(
+            Box::new(TrackingCommitter {
+                id: 1,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            }),
+            cdc::wrap_data_as_change_batch(&schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        let later = make_tracked_envelope(2, Arc::clone(&log), false);
+
+        assert!(
+            !task
+                .apply_envelope_run(&mut context, vec![rebuild, later])
+                .await,
+            "the later upsert must fail the run after the rebuild overwrite"
+        );
+
+        // Drain the rebuild's deferred commit (spawned before the later failure).
+        if let Some(handle) = context.pending_commit.take() {
+            handle
+                .await
+                .expect("rebuild commit task join")
+                .expect("rebuild commit must succeed");
+        }
+        assert_eq!(
+            log.ids().await,
+            vec![1],
+            "rebuild committer must finalize after overwrite even when a later write fails"
+        );
+        assert_eq!(
+            writes_seen.load(AtomicOrdering::SeqCst),
+            2,
+            "rebuild overwrite + failed later upsert = two insert_into attempts"
         );
     }
 

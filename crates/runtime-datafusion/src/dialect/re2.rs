@@ -117,6 +117,8 @@ pub(super) enum EngineDependentSyntax {
     /// across all of Unicode when it factors an alternation (`([Kk]|a)`
     /// matches the Kelvin sign remotely and not locally).
     CaseFoldPair,
+    /// A `$` or a `\` in a replacement — see [`engine_neutral_replacement`].
+    RewriteTemplate,
 }
 
 impl fmt::Display for EngineDependentSyntax {
@@ -152,7 +154,34 @@ impl fmt::Display for EngineDependentSyntax {
             Self::RepetitionSpelling => {
                 "it spells a counted repetition with a leading zero or a space, which RE2 reads as literal text"
             }
+            Self::RewriteTemplate => {
+                "it holds a `$` or a `\\`, and DataFusion reads a capture group as `$1` where RE2 reads it as `\\1`"
+            }
         })
+    }
+}
+
+/// Whether the two engines build the same string out of `replacement` — the
+/// other half of the agreement question, for a call that rewrites what it
+/// matches rather than only finding it.
+///
+/// The rewrite templates are different languages. The kernel reads `$1` (and
+/// `${name}`, and `$$` for a literal `$`); RE2 reads `\1` and treats `$` as
+/// ordinary text, so `regexp_replace('ab', '(a)(b)', '$2$1')` is `ba` locally
+/// and the literal text `$2$1` federated (measured on the bundled `DuckDB`).
+/// Only a replacement holding neither character is admitted.
+///
+/// `\1` is refused along with the rest even though it was measured to agree —
+/// `DataFusion` rewrites the POSIX spelling into its own before it runs, so
+/// the two engines happen to meet there. `\10` is where they part again: group
+/// 10 to the kernel, group 1 followed by `0` to RE2, whose rewrite grammar
+/// reads one digit. The line is drawn around the whole backslash form rather
+/// than through the middle of it.
+pub(super) fn engine_neutral_replacement(replacement: &str) -> Result<(), EngineDependentSyntax> {
+    if replacement.contains(['$', '\\']) {
+        Err(EngineDependentSyntax::RewriteTemplate)
+    } else {
+        Ok(())
     }
 }
 
