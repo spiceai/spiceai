@@ -1811,6 +1811,7 @@ mod tests {
 
     async fn setup_and_test(
         status: Arc<status::RuntimeStatus>,
+        dataset: &TableReference,
         source_data: Vec<&str>,
         existing_data: Vec<&str>,
         expected_size: usize,
@@ -1845,7 +1846,7 @@ mod tests {
         let refresh_completion = RefreshCompletion::new();
         let mut refresher = Refresher::new(
             status,
-            TableReference::bare("test"),
+            dataset.clone(),
             federated,
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
@@ -1895,6 +1896,7 @@ mod tests {
         let status = status::RuntimeStatus::new();
         setup_and_test(
             Arc::clone(&status),
+            &TableReference::bare("test"),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
@@ -1902,6 +1904,7 @@ mod tests {
         .await;
         setup_and_test(
             Arc::clone(&status),
+            &TableReference::bare("test"),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![
                 "1970-01-01",
@@ -1914,6 +1917,7 @@ mod tests {
         .await;
         setup_and_test(
             Arc::clone(&status),
+            &TableReference::bare("test"),
             vec![],
             vec![
                 "1970-01-01",
@@ -1932,7 +1936,11 @@ mod tests {
         /// global, so the family holds one series per dataset any concurrently
         /// running test has registered. Select the series by its `dataset`
         /// label — reading the first one makes this assertion depend on which
-        /// other tests happen to be in flight.
+        /// other tests happen to be in flight. The label value must also be
+        /// unique to this test: every test's `RuntimeStatus` records into the
+        /// same series for a given name, so a sibling refreshing a dataset
+        /// called `test` overwrites this one's `Ready` (regression test for
+        /// #13708).
         async fn wait_until_ready_status(
             registry: &prometheus::Registry,
             dataset: &str,
@@ -1964,14 +1972,13 @@ mod tests {
 
         let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
 
+        let dataset = TableReference::bare("refresh_status_change_to_ready");
         let status = status::RuntimeStatus::new();
-        status.update_dataset(
-            &TableReference::bare("test"),
-            status::ComponentStatus::Refreshing,
-        );
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
 
         setup_and_test(
             Arc::clone(&status),
+            &dataset,
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
@@ -1982,7 +1989,7 @@ mod tests {
         assert!(
             wait_until_ready_status(
                 &registry,
-                "test",
+                dataset.table(),
                 status::ComponentStatus::Ready,
                 60,
                 Duration::from_millis(50)
@@ -1991,17 +1998,14 @@ mod tests {
             "Status did not change to Ready within timeout"
         );
 
-        status.update_dataset(
-            &TableReference::bare("test"),
-            status::ComponentStatus::Refreshing,
-        );
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
 
-        setup_and_test(Arc::clone(&status), vec![], vec![], 0).await;
+        setup_and_test(Arc::clone(&status), &dataset, vec![], vec![], 0).await;
 
         assert!(
             wait_until_ready_status(
                 &registry,
-                "test",
+                dataset.table(),
                 status::ComponentStatus::Ready,
                 60,
                 Duration::from_millis(50)
