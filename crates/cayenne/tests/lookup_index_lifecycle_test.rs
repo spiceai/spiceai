@@ -442,6 +442,11 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
     const ROWS: usize = 40_000;
+    // A refused build's pause doubles each time, so over the window below builds
+    // land at roughly 0s, 2s and 6s: 4s admits two, with one slot of slack.
+    const MAX_BUILDS: u64 = 3;
+    // Enough lookups that a build on every one of them would be unmissable.
+    const MIN_LOOKUPS: u64 = 5 * MAX_BUILDS;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
@@ -470,11 +475,21 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
         "nothing was published to select from: {after:?}"
     );
     assert!(
-        after.builds_started <= 3,
+        after.builds_started >= 1,
+        "the first lookup on an unbuilt index must claim a build: {after:?}"
+    );
+    assert!(
+        after.builds_started <= MAX_BUILDS,
         "{lookups} lookups in {window:?} started {} background builds; a refused build must back off: {after:?}",
         after.builds_started
     );
-    assert!(lookups > 100, "the lookup loop barely ran: {lookups}");
+    // How often the loop got to run is not the subject, so the floor stays well
+    // clear of what a loaded runner can deliver: an absolute floor high enough
+    // to double as a throughput assert fails there 6/6 (#14219).
+    assert!(
+        lookups >= MIN_LOOKUPS,
+        "the lookup loop ran only {lookups} times in {window:?}; too few to show that a refused build backs off: {after:?}"
+    );
 }
 
 /// Drops a lookup after `polls` polls, as a client disconnect or timeout would.
