@@ -5657,11 +5657,16 @@ impl CayenneTableProvider {
     /// `new_snapshot_id` (whose directory is then empty). It re-seeds the inline
     /// counters that [`Self::invalidate_inlined_cache`] zeroes, so the flip lands
     /// on the exact corpus the catalog holds.
+    ///
+    /// Returns the source epoch of the in-memory CDC tier the flip discarded, if it
+    /// held rows. The caller hands it to [`Self::fire_slot_advancer`], which
+    /// releases the source commits that were waiting on those rows, once it has
+    /// armed everything the flip owes (see `PreparedOverwrite::finish`).
     pub(crate) async fn publish_overwrite_snapshot(
         &self,
         new_snapshot_id: &str,
         inlined_rows: Option<InlinedOverwritePublish>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
@@ -5686,10 +5691,7 @@ impl CayenneTableProvider {
             );
             discarded_epoch
         };
-        if let Some(epoch) = discarded_epoch {
-            self.fire_slot_advancer(epoch).await;
-        }
-        Ok(())
+        Ok(discarded_epoch)
     }
 
     /// Make an inlined overwrite's replacement rows readable BEFORE its catalog
@@ -32060,7 +32062,7 @@ impl CayenneTableProvider {
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
-    async fn fire_slot_advancer(&self, durable_epoch: u64) {
+    pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
         // Record the durable high-watermark (encoded `epoch + 1`, monotone via
         // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
         // a source committer queued after this flush already drained its epoch —

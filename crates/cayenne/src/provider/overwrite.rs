@@ -235,10 +235,28 @@ impl PreparedOverwrite {
     /// will reconstruct the same in-memory state from the catalog (which
     /// already reflects the new snapshot), so durability is preserved.
     ///
+    /// The steps start when `finish` is called and run on their own task, so
+    /// they complete even if the caller stops waiting. The catalog already points
+    /// at the new snapshot: a caller cancelled part-way through would leave the
+    /// in-memory tier's replaced rows readable over it, where the next
+    /// checkpoint makes them durable, and a retention pass the new rows are owed
+    /// unscheduled.
+    ///
     /// # Errors
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
-    pub async fn finish(self) -> Result<u64> {
+    pub fn finish(self) -> impl Future<Output = Result<u64>> + Send + 'static {
+        let table = self.table.table_name().to_string();
+        let publish = tokio::spawn(self.publish());
+        async move {
+            publish
+                .await
+                .map_err(|source| super::Error::TaskPanicked { table, source })?
+        }
+    }
+
+    /// The steps of [`Self::finish`], run on their own task.
+    async fn publish(self) -> Result<u64> {
         // Finish the secondary index before the visibility flip, which publishes
         // it together with the snapshot. Finishing it after the flip would leave
         // a window in which every lookup falls back to a full scan.
@@ -254,7 +272,8 @@ impl PreparedOverwrite {
         // catalog clear and insert already committed together, so the in-memory
         // inline counters must go from "old corpus" to "these rows" without a
         // window in which the new snapshot is paired with an empty inline view.
-        self.table
+        let discarded_epoch = self
+            .table
             .publish_overwrite_snapshot(
                 &self.new_snapshot_id,
                 self.inlined
@@ -275,11 +294,11 @@ impl PreparedOverwrite {
         // reloaded expired row is hidden from every read without anything deleting it,
         // and the gate below (`has_retention_delete_filters`) matches that split.
         //
-        // Scheduled HERE and not at the end: every step below this awaits, so a refresh
-        // cancelled part-way through them would drop this future after the new rows were
-        // already visible and leave the matching ones queryable until some later refresh
-        // happened to arm a pass. Only the flip has to have succeeded for the request to
-        // be owed. Arming is a synchronous flag plus a debounced task, and that task
+        // Scheduled HERE and not at the end: every step below this awaits, and the task
+        // running them still ends with its runtime, so a request armed later could be lost
+        // after the new rows were already visible, leaving the matching ones queryable
+        // until some later refresh happened to arm a pass. Only the flip has to have
+        // succeeded for the request to be owed. Arming is a synchronous flag plus a debounced task, and that task
         // takes `write_lock` itself, so it simply waits out the guard still held here.
         if self.table.has_retention_delete_filters() {
             // Arming only: the flip re-baselines `num_rows` itself, so this call carries
@@ -293,6 +312,13 @@ impl PreparedOverwrite {
                 0,
                 self.table.reserve_live_rows_delta().published(),
             );
+        }
+
+        // The flip discarded the in-memory tier; release the source commits that
+        // were waiting on its rows, as `TRUNCATE` does. After retention is armed,
+        // because this awaits.
+        if let Some(epoch) = discarded_epoch {
+            self.table.fire_slot_advancer(epoch).await;
         }
 
         // Drain the metastore WAL on the debounced maintenance tick. An inlined

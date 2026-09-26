@@ -29,6 +29,7 @@ limitations under the License.
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -43,6 +44,7 @@ use datafusion::logical_expr::{col, lit};
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use tokio::sync::Notify;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -133,7 +135,8 @@ fn id_name_batch(rows: &[(i64, &str)]) -> TestResult<RecordBatch> {
 
 async fn overwrite(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<()> {
     let ctx = SessionContext::new();
-    let input = MemorySourceConfig::try_new_exec(&[vec![batch]], id_name_schema(), None)?;
+    let schema = batch.schema();
+    let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
     let plan = table
         .insert_into(&ctx.state(), input, InsertOp::Overwrite)
         .await?;
@@ -280,3 +283,94 @@ async fn retention_judges_a_key_by_its_live_version_impl(fixture: TestFixture) -
 }
 
 test_with_backends!(retention_judges_a_key_by_its_live_version_impl);
+
+/// How long the cancellation test waits for a step before failing.
+const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A slot advancer whose calls do not return until it is released, so a test can
+/// cancel the write waiting on it. Once released, every call returns at once: a
+/// checkpoint of an empty tier fires the advancer again for the last durable epoch.
+struct GatedSlotAdvancer {
+    entered: Notify,
+    release: Notify,
+    released: AtomicBool,
+}
+
+impl GatedSlotAdvancer {
+    fn open(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl SlotAdvancer for GatedSlotAdvancer {
+    async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+        let release = self.release.notified();
+        if self.released.load(Ordering::SeqCst) {
+            return;
+        }
+        self.entered.notify_one();
+        release.await;
+    }
+}
+
+/// An overwrite owes its new rows a retention pass once its flip commits. It also
+/// releases the discarded in-memory rows' source commits through the slot
+/// advancer, which awaits; a caller cancelled there must not take the pass with it.
+async fn a_cancelled_overwrite_still_applies_retention_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    const NAME: &str = "cancelled_overwrite_retention";
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            catalog,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            vec![col("value").lt(lit(50_i64))],
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(GatedSlotAdvancer {
+        entered: Notify::new(),
+        release: Notify::new(),
+        released: AtomicBool::new(false),
+    });
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+
+    // A row in the in-memory tier, so the overwrite discards it and releases its
+    // source commit through the advancer.
+    cdc_apply(&table, id_value_batch(&[(1, 70)])?).await?;
+
+    // The replacement holds a row `value < 50` deletes and one it keeps. Cancel the
+    // overwrite once it waits in the advancer.
+    let replace = overwrite(&table, id_value_batch(&[(2, 5), (3, 80)])?);
+    tokio::select! {
+        result = replace => {
+            return Err(format!(
+                "precondition: the overwrite must wait in the slot advancer, but it finished with {result:?}"
+            )
+            .into());
+        }
+        () = advancer.entered.notified() => {}
+        () = tokio::time::sleep(WAIT_LIMIT) => {
+            return Err("precondition: the overwrite never reached the slot advancer".into());
+        }
+    }
+    advancer.open();
+
+    tokio::time::timeout(WAIT_LIMIT, table.flush_pending_maintenance())
+        .await
+        .map_err(|_| format!("the retention pass did not finish within {WAIT_LIMIT:?}"))??;
+    assert_eq!(
+        table_rows(&table).await?,
+        ["3,80"],
+        "the overwrite's rows must still get their retention pass after its caller was cancelled"
+    );
+    Ok(())
+}
+
+test_with_backends!(a_cancelled_overwrite_still_applies_retention_impl);
