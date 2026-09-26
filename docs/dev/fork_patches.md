@@ -114,7 +114,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `11624fb82dc5460d201d0379d269a4613e82f9c7` | `spiceai-54` |
+| [datafusion](#datafusion) | `5ac6b8edb50966fe20e0886f53408d86594e2acb` | `lukim/spiceai-54-wrong-results-backports` (TEMPORARY: spiceai/datafusion#235) |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
@@ -187,6 +187,9 @@ row here. Its behaviour is covered where the code lives, by
 Upstream [apache/datafusion](https://github.com/apache/datafusion), branch
 `spiceai-54`. The branch also carries upstream's own `[branch-52]`/`[branch-53]`/
 `[branch-54]` backports; those are upstream commits and are not Spice patches.
+Fixes cherry-picked from upstream `main` ahead of any release are listed below
+like Spice patches: a re-cut onto a release that already has one drops its row,
+and a re-cut onto one that does not has to carry it.
 
 The unparser rows are the highest-consequence set in this file: every one of them
 changes the SQL sent to a federated engine, and every failure mode is *more or fewer
@@ -248,6 +251,23 @@ catch.
 | Unparser preserves a recursive CTE column-list projection through a join alias (fork PR #225) | A recursive hour generator with an explicit column list fails SQL generation when joined to a remote table | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::recursive_column_list_survives_a_join_alias`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table` |
 | Eager-aggregation physical optimizer rule (`datafusion/physical-optimizer/src/eager_aggregation.rs`, ~3000 lines, Spice-only) | Aggregations stop being pushed below joins — a large planned regression, not a correctness one | silent (perf) | **GAP** |
 | Pluggable `CollectLeftAccumulator` seam on `HashJoinExec` | Cayenne's custom left-side accumulator cannot be installed | build | compile-guarded by `crates/cayenne` |
+| Backport of apache/datafusion#24817: an aggregate builds a dynamic filter only when every aggregate in it can contribute one | The filter is built from the plain-column `MIN`/`MAX` aggregates alone and prunes the rows that decide an expression aggregate beside them, so `MIN(c + 1)` is computed from a subset of the rows | silent (wrong data) | `crates/cayenne/tests/datafusion_dynamic_filter_backports_test.rs::an_aggregate_dynamic_filter_keeps_rows_an_expression_aggregate_needs` |
+| Backport of apache/datafusion#25259, applied over #24428, which it is written against: a filter pushed through an operator has its columns mapped by position, not by name | A join or `TopK` dynamic filter pushed below an operator whose output holds two columns of one name (nested joins, a filter or projection over a join, a `GROUP BY`) lands on the wrong one: the join loses its matches, or `ORDER BY … LIMIT` returns the wrong row | silent (wrong data) | `…::a_join_dynamic_filter_maps_same_named_columns_by_position`, `…::a_topk_dynamic_filter_maps_same_named_columns_by_position` |
+| Backport of apache/datafusion#22926: an aggregate keeps the order of the parent filters it is handed | A filter holding both a grouping-column predicate and an aggregate-output predicate loses the second when it reaches the physical plan whole, which a plan the logical optimizer did not split can do | silent (wrong data) | `…::a_filter_over_an_aggregate_keeps_its_aggregate_output_predicate` |
+| Backport of apache/datafusion#24045: a filter above an anti join is pushed only into the join's output side | A filter that only the non-output side accepted is taken as handled, though filtering that side adds anti-join rows rather than removing any | silent (wrong data) | `…::a_filter_over_an_anti_join_stays_above_it` |
+| Backport of apache/datafusion#23104: a null-aware anti join's pushed filter keeps the probe side's NULLs | `x NOT IN (subquery)` returns rows although the subquery holds a NULL | silent (wrong data) | `…::not_in_keeps_the_subquerys_nulls` |
+| Backport of apache/datafusion#23173: no pushed filter for a null-aware anti join with a nullable build key | `x NOT IN (subquery)` keeps a NULL `x` once the pushed filter empties the subquery's scan | silent (wrong data) | `…::not_in_drops_a_null_value` |
+| Backport of apache/datafusion#22965 and #23106: a null-equal join's pushed filter admits NULL probe keys | A join on `IS NOT DISTINCT FROM`, and the one `INTERSECT` plans, loses its `NULL = NULL` match | silent (wrong data) | `…::a_null_equal_join_keeps_its_null_match` |
+| Backport of apache/datafusion#22810: a null-aware anti join is never planned as a sort-merge join | With `prefer_hash_join` off (`runtime.query.prefer_hash_join: false`) and more than one partition, `x NOT IN (subquery)` became a `SortMergeJoinExec`, which has no null-aware mode, and a NULL among the subquery's values stopped excluding rows | silent (wrong data) | `crates/runtime-datafusion/src/fork_backport_guards.rs::not_in_stays_a_hash_join_when_sort_merge_joins_are_preferred` |
+| Backport of apache/datafusion#23684: the `TopK` aggregation keeps groups whose `MIN`/`MAX` is NULL | `ORDER BY max(y) … LIMIT n` over grouped rows drops the groups whose maximum is NULL, whether NULLs sort first or last | silent (wrong data) | `…::topk_aggregation_keeps_groups_whose_max_is_null` |
+| Backport of apache/datafusion#24247: `log`/`power` simplification keeps NULL | `log(a, 1)`, `log(a, a)`, `power(a, 0)` and their kin are folded to constants, so a NULL `a` answers `0` or `1` instead of NULL | silent (wrong data) | `…::log_and_power_simplification_keeps_null` |
+| Backport of apache/datafusion#24248: bitwise `XOR` simplification keeps NULL | `(a # b) # a` is folded to `b` and `a # a` to `0`, so a NULL `a` answers a number | silent (wrong data) | `…::xor_simplification_keeps_null` |
+| Backport of apache/datafusion#24380: `col ~ '.*'` simplification keeps NULL | The match-everything pattern is folded to `true`, so a NULL `col` answers `true` | silent (wrong data) | `…::regex_match_all_simplification_keeps_null` |
+| Backport of apache/datafusion#24686: merging nested projections keeps every layer | Nested projections that each redefine a column are merged onto the wrong layer, so six `i + 1` layers add three | silent (wrong data) | `…::nested_projections_keep_every_layer` |
+| Backport of apache/datafusion#24958: a sort pushed below `GlobalLimitExec` keeps its `skip` | `ORDER BY` over a `LIMIT … OFFSET` subquery returns too few rows | silent (wrong data) | `…::a_sort_over_limit_offset_keeps_every_row` |
+| Backport of apache/datafusion#24997: `COUNT` with `ORDER BY` counts every argument | `COUNT(a, c ORDER BY b)` counts only `a`'s non-NULLs, and a grouped `COUNT(a ORDER BY b)` panics | silent (wrong data / query failure) | `…::count_with_order_by_counts_every_argument` |
+| Backport of apache/datafusion#25348: a constant `NOT IN (subquery)` sees the subquery's NULLs | `3 NOT IN (subquery)` returns rows although the subquery holds a NULL. A correlated form with a non-equality correlation (`3 NOT IN (… WHERE t2.g > t1.g)`) now fails at planning instead, as upstream does until apache/datafusion#25339, which needs null-aware mark joins this branch does not have | silent (wrong data) | `…::constant_not_in_sees_the_subquerys_null` |
+| Backport of apache/datafusion#25227: cast statistics propagate only through safe conversions | A `MIN`/`MAX` over a cast column is answered from the uncast Parquet statistics, so `MAX(CAST(a AS INT))` over the strings `'1'`, `'100'`, `'2'` answers `2` | silent (wrong data) | `…::a_cast_aggregate_is_not_answered_from_uncast_statistics` |
 
 ## arrow-rs
 
