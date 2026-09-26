@@ -22,24 +22,24 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | DuckLake                         | ➖          |              |
 | DynamoDB                         | ✅          | @krinart     |
 | File                             | ✅          | @Sevenannn   |
-| FlightSQL                        | ➖          |              |
+| FlightSQL                        | ✅          | @lukekim     |
 | FTP/SFTP                         | ➖          |              |
 | GCS                              | ➖          |              |
 | Git                              | ✅          | @lukekim     |
 | GitHub                           | ✅          | @peasee      |
-| Glue                             | ➖          |              |
+| Glue                             | ✅          | @lukekim     |
 | GraphQL                          | ✅          | @peasee      |
 | HTTP/HTTPS                       | ✅          | @lukekim     |
 | Iceberg                          | ✅          | @phillipleblanc |
 | IMAP                             | ➖          |              |
 | Kafka                            | ➖          |              |
 | Localpod                         | ✅          | @lukekim     |
-| MongoDB                          | ➖          |              |
+| MongoDB                          | ✅          | @lukekim     |
 | MS SQL                           | ➖          |              |
 | MySQL                            | ✅          | @peasee      |
 | NFS                              | ➖          |              |
 | ODBC                             | ➖          |              |
-| Oracle                           | ➖          |              |
+| Oracle                           | ✅          | @lukekim     |
 | PostgreSQL                       | ✅          | @Sevenannn   |
 | S3                               | ✅          | @Sevenannn   |
 | ScyllaDB                         | ➖          |              |

@@ -35,7 +35,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | IMAP                             | ✅             | @peasee         |
 | Kafka                            | ✅             | @sgrebnov       |
 | Localpod                         | ✅             | @lukekim        |
-| MongoDB                          | ➖             |                 |
+| MongoDB                          | ✅             | @lukekim        |
 | MS SQL                           | ✅             | @peasee         |
 | MySQL                            | ✅             | @peasee         |
 | NFS                              | ➖             |                 |

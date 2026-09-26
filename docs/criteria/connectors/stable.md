@@ -22,19 +22,19 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | DuckLake                         | ➖              |                 |
 | DynamoDB                         | ✅              | @krinart        |
 | File                             | ✅              | @ewgenius       |
-| FlightSQL                        | ➖              |                 |
+| FlightSQL                        | ✅              | @lukekim        |
 | FTP/SFTP                         | ➖              |                 |
 | GCS                              | ➖              |                 |
 | Git                              | ➖              |                 |
 | GitHub                           | ✅              | @phillipleblanc |
-| Glue                             | ➖              |                 |
+| Glue                             | ✅              | @lukekim        |
 | GraphQL                          | ➖              |                 |
 | HTTP/HTTPS                       | ✅              | @lukekim        |
-| Iceberg                          | ➖              |                 |
+| Iceberg                          | ✅              | @lukekim        |
 | IMAP                             | ➖              |                 |
 | Kafka                            | ➖              |                 |
 | Localpod                         | ✅              | @lukekim        |
-| MongoDB                          | ➖              |                 |
+| MongoDB                          | ✅              | @lukekim        |
 | MS SQL                           | ➖              |                 |
 | MySQL                            | ✅              | @phillipleblanc |
 | NFS                              | ➖              |                 |

@@ -242,29 +242,29 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mysql`                            | MySQL (with native binlog CDC)        | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
 | `dynamodb`                         | Amazon DynamoDB (with Streams)        | Stable            |                              |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Stable            | Parquet                      |
+| `flightsql`                        | FlightSQL                             | Stable            | Arrow Flight SQL             |
+| `glue`                             | [AWS Glue][glue]                      | Stable            | Iceberg, Parquet, CSV        |
+| `mongodb`                          | MongoDB (with change-stream CDC)      | Stable            |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
 | `git`                              | Git repositories                      | Release Candidate |                              |
 | `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
+| `oracle`                           | Oracle                                | Release Candidate | [Oracle ODPI-C][ODPIC]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
-| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`<sup>†</sup>                 | ODBC                                  | Beta              | ODBC                         |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
 | `sharepoint`                       | Microsoft SharePoint                  | Beta              | Object-store listing         |
-| `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
+| `kafka`                            | Kafka                                 | Beta              | Kafka + JSON                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | ClickHouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC (Kafka consumer)         | Alpha             | Kafka + JSON                 |
 | `cdc`                              | Debezium push ingest (no Kafka)       | Alpha             | JSON + Avro HTTP             |
 | `elasticsearch`<sup>†</sup>        | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
 | `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
-| `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
-| `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
-| `mongodb`                          | MongoDB (with change-stream CDC)      | Alpha             |                              |
 | `scylladb`<sup>†</sup>             | ScyllaDB                              | Alpha             |                              |
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
 | `nfs`<sup>†</sup>                  | NFS                                   | Alpha             | Parquet, CSV, JSON           |

@@ -27,19 +27,19 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GCS                              | ➖           |                 |
 | Git                              | ✅           | @lukekim        |
 | GitHub                           | ✅           | @peasee         |
-| Glue                             | ➖           |                 |
+| Glue                             | ✅           | @lukekim        |
 | GraphQL                          | ✅           | @peasee         |
 | HTTP/HTTPS                       | ✅           | @lukekim        |
 | Iceberg                          | ✅           | @phillipleblanc |
 | IMAP                             | ➖           |                 |
-| Kafka                            | ➖           |                 |
+| Kafka                            | ✅           | @lukekim        |
 | Localpod                         | ✅           | @lukekim        |
-| MongoDB                          | ➖           |                 |
+| MongoDB                          | ✅           | @lukekim        |
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |
 | NFS                              | ➖           |                 |
 | ODBC                             | ✅           | @lukekim        |
-| Oracle                           | ➖           |                 |
+| Oracle                           | ✅           | @lukekim        |
 | PostgreSQL                       | ✅           | @Sevenannn      |
 | S3                               | ✅           | @Sevenannn      |
 | ScyllaDB                         | ➖           |                 |
