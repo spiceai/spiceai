@@ -51,6 +51,7 @@ use futures::TryStreamExt;
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
+use std::time::Duration;
 use url::Url;
 #[cfg(not(windows))]
 use {
@@ -92,11 +93,21 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
-/// Wraps a `ListingTable` to short-circuit broad object-store listings when
-/// queries include `location` predicates, and to apply format-selected Hive
+/// Wraps a `ListingTable` to short-circuit broad object-store listings when a
+/// query filters on listing metadata, and to apply format-selected Hive
 /// listing (`*.orc` / `*.parquet`) so extensionless data objects are scanned
 /// without picking up job-marker files.
-struct LocationPruningListingTable {
+///
+/// Two metadata fast-paths avoid opening files that a predicate already
+/// excludes from the object-store listing alone:
+/// - a `_location` predicate heads only the named objects (see
+///   [`extract_location_predicates`]);
+/// - a `_last_modified` bound (e.g. an `append` refresh's
+///   `_last_modified > <watermark>`) keeps only the objects whose
+///   [`ObjectMeta::last_modified`] satisfies the bound (see
+///   [`extract_last_modified_predicate`]), so a refresh with no new data does
+///   work proportional to new files rather than re-reading every object.
+struct MetadataPruningListingTable {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
     table_path: ListingTableUrl,
@@ -112,7 +123,7 @@ struct LocationPruningListingTable {
     listing_extension: String,
 }
 
-impl LocationPruningListingTable {
+impl MetadataPruningListingTable {
     fn new(
         inner: Arc<ListingTable>,
         object_store: Arc<dyn ObjectStore>,
@@ -224,6 +235,49 @@ impl LocationPruningListingTable {
         );
 
         let files = self.format_selected_listing_files(state).await?;
+        self.scan_partitioned_files(state, files, projection, limit)
+            .await
+    }
+
+    /// Lists the objects under the table path and keeps only those whose
+    /// [`ObjectMeta::last_modified`] satisfies every `_last_modified` bound,
+    /// then scans the survivors.
+    ///
+    /// Each object's `_last_modified` value is a single timestamp known from
+    /// the listing (`meta.last_modified.timestamp_micros()`), so a bound prunes
+    /// the file exactly — an excluded object cannot contain a row that passes
+    /// the residual `FilterExec`. The comparison is done in nanoseconds to match
+    /// how `DataFusion` materializes the metadata column
+    /// (`Timestamp(Microsecond, "UTC")`, cast to nanoseconds by the refresh
+    /// predicate); scaling both sides by 1000 preserves the ordering.
+    async fn scan_last_modified_pruned(
+        &self,
+        state: &dyn Session,
+        bounds: &[LastModifiedBound],
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        state.runtime_env().register_object_store(
+            self.object_store_url().as_ref(),
+            Arc::clone(&self.object_store),
+        );
+
+        let mut file_stream = self
+            .table_path
+            .list_all_files(state, self.object_store.as_ref(), "")
+            .await?;
+
+        let mut files: Vec<PartitionedFile> = Vec::new();
+        while let Some(meta) = file_stream.try_next().await? {
+            if !file_matches_extension(&meta.location, &self.listing_extension) {
+                continue;
+            }
+            if !last_modified_meta_passes(&meta, bounds) {
+                continue;
+            }
+            files.push(self.partitioned_file_for_meta(meta)?);
+        }
+
         self.scan_partitioned_files(state, files, projection, limit)
             .await
     }
@@ -368,7 +422,7 @@ fn hive_partition_value_type_error(
 
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for LocationPruningListingTable {
+impl TableProvider for MetadataPruningListingTable {
     fn schema(&self) -> Arc<Schema> {
         self.inner.schema()
     }
@@ -393,6 +447,23 @@ impl TableProvider for LocationPruningListingTable {
                 filters.len()
             ]);
         }
+        // When `scan` will prune the listing by `_last_modified`, every
+        // predicate stays a residual `FilterExec` above the pruned scan:
+        // `Inexact` keeps the row-level filter (so precision and any
+        // partition/data-column predicate are always re-enforced) while the
+        // prune itself removes the files that cannot match. The `_location`
+        // fast-path takes precedence, so this only applies when it is absent.
+        // `scan` receives `&[Expr]`, so mirror the same predicate detection here
+        // over the borrowed slice this method is given.
+        let owned_filters: Vec<datafusion_expr::Expr> = filters.iter().copied().cloned().collect();
+        if extract_location_predicates(&owned_filters).is_none()
+            && extract_last_modified_predicate(&owned_filters).is_some()
+        {
+            return Ok(vec![
+                datafusion_expr::TableProviderFilterPushDown::Inexact;
+                filters.len()
+            ]);
+        }
         self.inner.supports_filters_pushdown(filters)
     }
 
@@ -408,6 +479,22 @@ impl TableProvider for LocationPruningListingTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let Some(locations) = extract_location_predicates(filters) else {
+            // No `_location` predicate. Prune the listing by any `_last_modified`
+            // bound before opening files, so an `append` refresh that added no
+            // new objects never re-reads (and, for `jsonl.gz`, re-decompresses)
+            // the whole source. Correctness is preserved by the residual
+            // `FilterExec` this table reports via `supports_filters_pushdown`.
+            if self.inner.options().metadata_cols.iter().any(|column| {
+                matches!(
+                    column,
+                    datafusion_datasource::metadata::MetadataColumn::LastModified
+                )
+            }) && let Some(bounds) = extract_last_modified_predicate(filters)
+            {
+                return self
+                    .scan_last_modified_pruned(state, &bounds, projection, limit)
+                    .await;
+            }
             if self.uses_format_selected_listing() {
                 return self
                     .scan_format_selected_listing(state, projection, limit)
@@ -422,6 +509,11 @@ impl TableProvider for LocationPruningListingTable {
             self.object_store_url().as_ref(),
             Arc::clone(&self.object_store),
         );
+
+        // A combined `_location = x AND _last_modified > w` heads each named
+        // object anyway, so drop the ones the mtime bound excludes before they
+        // are opened.
+        let last_modified_bounds = extract_last_modified_predicate(filters);
 
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
@@ -461,6 +553,12 @@ impl TableProvider for LocationPruningListingTable {
 
             if self.uses_format_selected_listing()
                 && !file_matches_extension(&meta.location, &self.listing_extension)
+            {
+                continue;
+            }
+
+            if let Some(bounds) = last_modified_bounds.as_deref()
+                && !last_modified_meta_passes(&meta, bounds)
             {
                 continue;
             }
@@ -640,6 +738,232 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
         Some(values)
     }
 }
+
+/// A single comparison against the `_last_modified` metadata column, with the
+/// threshold held as a [`Duration`] since the Unix epoch. An object is kept when
+/// its last-modified time satisfies the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastModifiedBound {
+    op: datafusion_expr::Operator,
+    threshold: Duration,
+}
+
+/// True when a cast target keeps the `_last_modified` value exactly.
+///
+/// The metadata column is `Timestamp(Microsecond, "UTC")`, and pruning compares
+/// in nanoseconds. A cast to microseconds or nanoseconds preserves that value
+/// (identity or an exact `* 1000`), so pruning stays equivalent to the row
+/// predicate. A coarser target (`Second`, `Millisecond`) or a non-timestamp
+/// target truncates the value, which would let, for example,
+/// `CAST(_last_modified AS Timestamp(Second)) = 200s` prune an object at 200.5s
+/// whose row still matches — so such casts are not prunable.
+fn cast_preserves_last_modified_precision(data_type: &DataType) -> bool {
+    use arrow_schema::TimeUnit;
+    matches!(
+        data_type,
+        DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
+    )
+}
+
+/// True when `expr` is the `_last_modified` column, possibly wrapped in a
+/// precision-preserving cast. An `append` refresh emits
+/// `CAST(_last_modified AS Timestamp(ns, tz)) > …`; `DataFusion`'s
+/// `unwrap_cast_in_comparison` rule may instead present the bare column with a
+/// cast literal, so both forms are accepted. A coarsening cast is rejected (see
+/// [`cast_preserves_last_modified_precision`]) so it cannot build a prunable
+/// bound; the residual filter still enforces it.
+fn is_last_modified_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(column) => column.name == "_last_modified",
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
+            cast_preserves_last_modified_precision(field.data_type()) && is_last_modified_ref(expr)
+        }
+        _ => false,
+    }
+}
+
+/// True when any subexpression references the `_last_modified` column. Used to
+/// refuse pruning when the column appears under `OR`/`NOT`, where a single
+/// disjunct is not a necessary condition and pruning on it would drop objects
+/// whose rows must still be scanned.
+fn references_last_modified(expr: &datafusion_expr::Expr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    // `apply` visits `expr` and every descendant; `is_last_modified_ref` also
+    // matches a cast wrapping the column, so either the cast or the bare column
+    // node trips the flag.
+    let _ = expr.apply(|node| {
+        if is_last_modified_ref(node) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
+}
+
+// Flip a comparison so the `_last_modified` reference is on the left, e.g.
+// `<literal> > _last_modified` becomes `_last_modified < <literal>`.
+fn flip(op: Operator) -> Operator {
+    match op {
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        other => other,
+    }
+}
+
+use datafusion_expr::{Between, Cast, Expr, Operator, TryCast};
+
+/// Reads a timestamp literal as a [`Duration`] since the Unix epoch, using the
+/// constructor for its precision so the value is exact.
+///
+/// Returns `None` for a NULL, a non-timestamp literal, or a pre-epoch (negative)
+/// value that a `Duration` cannot represent — in each case the caller declines
+/// to prune rather than risk dropping matching objects.
+fn literal_duration(expr: &Expr) -> Option<Duration> {
+    match expr {
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), _), _) => {
+            Some(Duration::from_nanos(u64::try_from(*v).ok()?))
+        }
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), _), _) => {
+            Some(Duration::from_micros(u64::try_from(*v).ok()?))
+        }
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), _), _) => {
+            Some(Duration::from_millis(u64::try_from(*v).ok()?))
+        }
+        Expr::Literal(ScalarValue::TimestampSecond(Some(v), _), _) => {
+            Some(Duration::from_secs(u64::try_from(*v).ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Returns the bounds contributed by `expr` and whether pruning stays safe.
+fn collect_last_modified_bounds(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq | Operator::Eq => {
+                if is_last_modified_ref(&binary.left) {
+                    return match literal_duration(&binary.right) {
+                        Some(threshold) => (
+                            vec![LastModifiedBound {
+                                op: binary.op,
+                                threshold,
+                            }],
+                            true,
+                        ),
+                        None => (Vec::new(), false),
+                    };
+                }
+                if is_last_modified_ref(&binary.right) {
+                    return match literal_duration(&binary.left) {
+                        Some(threshold) => (
+                            vec![LastModifiedBound {
+                                op: flip(binary.op),
+                                threshold,
+                            }],
+                            true,
+                        ),
+                        None => (Vec::new(), false),
+                    };
+                }
+                (Vec::new(), true)
+            }
+            Operator::And => {
+                let (mut lvals, lsafe) = collect_last_modified_bounds(&binary.left);
+                let (rvals, rsafe) = collect_last_modified_bounds(&binary.right);
+                lvals.extend(rvals);
+                (lvals, lsafe && rsafe)
+            }
+            Operator::Or => {
+                if references_last_modified(&binary.left) || references_last_modified(&binary.right)
+                {
+                    (Vec::new(), false)
+                } else {
+                    (Vec::new(), true)
+                }
+            }
+            _ => (Vec::new(), !references_last_modified(expr)),
+        },
+        Expr::Between(Between {
+            expr,
+            negated,
+            low,
+            high,
+        }) if is_last_modified_ref(expr) => {
+            match (*negated, literal_duration(low), literal_duration(high)) {
+                (false, Some(low), Some(high)) => (
+                    vec![
+                        LastModifiedBound {
+                            op: Operator::GtEq,
+                            threshold: low,
+                        },
+                        LastModifiedBound {
+                            op: Operator::LtEq,
+                            threshold: high,
+                        },
+                    ],
+                    true,
+                ),
+                _ => (Vec::new(), false),
+            }
+        }
+        Expr::Not(inner) => (Vec::new(), !references_last_modified(inner)),
+        other => (Vec::new(), !references_last_modified(other)),
+    }
+}
+
+/// Extracts conjunctive `_last_modified` bounds usable to prune the object-store
+/// listing before any file is opened.
+///
+/// Only a purely conjunctive form is safe: each top-level filter is an implicit
+/// `AND`, and pruning on any conjunct is a necessary condition for a row to
+/// pass. If `_last_modified` appears under `OR` or `NOT`, or a comparison
+/// against it uses a non-timestamp literal, this returns `None` so the caller
+/// falls back to a full listing.
+fn extract_last_modified_predicate(
+    filters: &[datafusion_expr::Expr],
+) -> Option<Vec<LastModifiedBound>> {
+    let mut bounds = Vec::new();
+    let mut safe = true;
+    for filter in filters {
+        let (vals, is_safe) = collect_last_modified_bounds(filter);
+        bounds.extend(vals);
+        safe &= is_safe;
+    }
+
+    if !safe || bounds.is_empty() {
+        None
+    } else {
+        Some(bounds)
+    }
+}
+
+/// True when an object's last-modified time satisfies every bound.
+///
+/// The object's mtime is taken as a [`Duration`] since the Unix epoch and
+/// compared against each threshold. Both sides are exact, so the comparison
+/// matches the row predicate. A pre-epoch (negative) mtime cannot be a
+/// `Duration`, so it is never pruned.
+fn last_modified_meta_passes(meta: &ObjectMeta, bounds: &[LastModifiedBound]) -> bool {
+    let Ok(micros) = u64::try_from(meta.last_modified.timestamp_micros()) else {
+        return true;
+    };
+    let file = Duration::from_micros(micros);
+    bounds.iter().all(|bound| match bound.op {
+        Operator::Gt => file > bound.threshold,
+        Operator::GtEq => file >= bound.threshold,
+        Operator::Lt => file < bound.threshold,
+        Operator::LtEq => file <= bound.threshold,
+        Operator::Eq => file == bound.threshold,
+        // `extract_last_modified_predicate` only produces the operators above.
+        _ => true,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectVersionType {
     Version,
@@ -1567,7 +1891,7 @@ pub trait ListingTableConnector: DataConnector {
             expanded_schema
         };
 
-        // Keep a reference to the file schema for LocationPruningListingTable
+        // Keep a reference to the file schema for MetadataPruningListingTable
         let file_schema = Arc::clone(&final_schema);
 
         let config = ListingTableConfig::new(table_path.clone())
@@ -1623,8 +1947,20 @@ pub trait ListingTableConnector: DataConnector {
             )
         });
 
-        if has_location_metadata || format_selected_data_suffix(extension).is_some() {
-            let wrapped = LocationPruningListingTable::new(
+        // A `_last_modified` column lets an `append` refresh prune the listing by
+        // object mtime, so wrap even when `_location` is not enabled.
+        let has_last_modified_metadata = table_arc.options().metadata_cols.iter().any(|c| {
+            matches!(
+                c,
+                datafusion_datasource::metadata::MetadataColumn::LastModified
+            )
+        });
+
+        if has_location_metadata
+            || has_last_modified_metadata
+            || format_selected_data_suffix(extension).is_some()
+        {
+            let wrapped = MetadataPruningListingTable::new(
                 table_arc,
                 Arc::clone(&object_store),
                 table_path,
@@ -3314,7 +3650,7 @@ mod tests {
         )
         .expect("listing table");
 
-        let provider = LocationPruningListingTable::new(
+        let provider = MetadataPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -3515,7 +3851,7 @@ mod tests {
         ctx: &SessionContext,
         store: Arc<dyn ObjectStore>,
         partition_cols: Vec<(String, DataType)>,
-    ) -> LocationPruningListingTable {
+    ) -> MetadataPruningListingTable {
         let table_path = ListingTableUrl::parse("s3://bucket/table/").expect("listing url");
         ctx.runtime_env()
             .register_object_store(table_path.object_store().as_ref(), Arc::clone(&store));
@@ -3530,7 +3866,7 @@ mod tests {
                 .with_schema(Arc::clone(&file_schema)),
         )
         .expect("listing table");
-        LocationPruningListingTable::new(Arc::new(listing), store, table_path, file_schema, "*.orc")
+        MetadataPruningListingTable::new(Arc::new(listing), store, table_path, file_schema, "*.orc")
     }
 
     #[test]
@@ -3950,7 +4286,7 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
+        let provider = MetadataPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -3994,6 +4330,327 @@ mod tests {
         );
     }
 
+    /// 200 seconds after the Unix epoch, expressed in nanoseconds, as an
+    /// `append`-refresh watermark literal carries.
+    fn watermark_ts_ns(secs: i64) -> datafusion_expr::Expr {
+        datafusion_expr::lit(ScalarValue::TimestampNanosecond(
+            Some(secs * 1_000_000_000),
+            Some("UTC".into()),
+        ))
+    }
+
+    fn cast_last_modified_to_ns() -> datafusion_expr::Expr {
+        datafusion_expr::Expr::Cast(datafusion_expr::Cast::new(
+            Box::new(datafusion_expr::col("_last_modified")),
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into())),
+        ))
+    }
+
+    #[test]
+    fn extract_last_modified_predicate_matches_bare_and_cast_forms() {
+        use datafusion_expr::Operator;
+
+        // Bare column, as `unwrap_cast_in_comparison` may leave it.
+        let bare = extract_last_modified_predicate(&[
+            datafusion_expr::col("_last_modified").gt(watermark_ts_ns(200))
+        ])
+        .expect("bare `_last_modified >` is prunable");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].op, Operator::Gt);
+        assert_eq!(bare[0].threshold, Duration::from_secs(200));
+
+        // Cast form, as the refresh predicate emits it verbatim.
+        let cast =
+            extract_last_modified_predicate(&[cast_last_modified_to_ns().gt(watermark_ts_ns(200))])
+                .expect("cast-wrapped `_last_modified >` is prunable");
+        assert_eq!(cast[0].op, Operator::Gt);
+        assert_eq!(cast[0].threshold, Duration::from_secs(200));
+
+        // Literal on the left flips the operator.
+        let flipped = extract_last_modified_predicate(&[
+            watermark_ts_ns(200).lt(datafusion_expr::col("_last_modified"))
+        ])
+        .expect("`literal < _last_modified` is prunable");
+        assert_eq!(flipped[0].op, Operator::Gt);
+
+        // `>=`, as a day-granular high-water mark uses.
+        let gte = extract_last_modified_predicate(&[
+            datafusion_expr::col("_last_modified").gt_eq(watermark_ts_ns(200))
+        ])
+        .expect("`_last_modified >=` is prunable");
+        assert_eq!(gte[0].op, Operator::GtEq);
+    }
+
+    #[test]
+    fn extract_last_modified_predicate_refuses_disjunction_and_negation() {
+        // A single disjunct of an `OR` is not a necessary condition, so pruning
+        // on it would drop objects whose rows must still be scanned.
+        assert!(
+            extract_last_modified_predicate(&[datafusion_expr::col("_last_modified")
+                .gt(watermark_ts_ns(200))
+                .or(datafusion_expr::col("value").eq(datafusion_expr::lit(1)))])
+            .is_none(),
+            "`_last_modified` under OR must not prune"
+        );
+
+        assert!(
+            extract_last_modified_predicate(&[datafusion_expr::Expr::Not(Box::new(
+                datafusion_expr::col("_last_modified").gt(watermark_ts_ns(200))
+            ))])
+            .is_none(),
+            "`_last_modified` under NOT must not prune"
+        );
+
+        // A comparison against something other than a timestamp literal cannot
+        // be evaluated from the listing alone.
+        assert!(
+            extract_last_modified_predicate(&[
+                datafusion_expr::col("_last_modified").gt(datafusion_expr::col("other"))
+            ])
+            .is_none(),
+            "`_last_modified` vs a non-literal must not prune"
+        );
+
+        // No `_last_modified` predicate at all: nothing to prune on.
+        assert!(
+            extract_last_modified_predicate(&[
+                datafusion_expr::col("value").eq(datafusion_expr::lit(1))
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_last_modified_predicate_keeps_other_conjuncts_prunable() {
+        // Pruning on any conjunct of a top-level AND is safe; the other conjunct
+        // is left to the residual `FilterExec`.
+        let bounds = extract_last_modified_predicate(&[
+            datafusion_expr::col("_last_modified").gt(watermark_ts_ns(200)),
+            datafusion_expr::col("value").eq(datafusion_expr::lit(1)),
+        ])
+        .expect("the `_last_modified` conjunct is still prunable");
+        assert_eq!(bounds.len(), 1);
+    }
+
+    #[test]
+    fn last_modified_meta_passes_compares_as_duration() {
+        use datafusion_expr::Operator;
+
+        // 200s watermark; an object at 200s does not pass strict `>` but a later
+        // one does. The mtime is taken as a Duration since the epoch.
+        let bound = LastModifiedBound {
+            op: Operator::Gt,
+            threshold: Duration::from_secs(200),
+        };
+        assert!(!last_modified_meta_passes(
+            &create_meta("f", 200, 1),
+            &[bound]
+        ));
+        assert!(last_modified_meta_passes(
+            &create_meta("f", 201, 1),
+            &[bound]
+        ));
+
+        // A microsecond above the watermark passes even though the second-level
+        // mtime rounds down — proving the comparison is not truncated to seconds.
+        let sub_second = ObjectMeta {
+            location: Path::from("f"),
+            last_modified: Utc
+                .timestamp_opt(200, 1_000)
+                .single()
+                .expect("valid timestamp"),
+            size: 1,
+            e_tag: None,
+            version: None,
+        };
+        assert!(last_modified_meta_passes(&sub_second, &[bound]));
+    }
+
+    #[test]
+    fn extract_last_modified_predicate_rejects_coarsening_cast() {
+        fn cast_last_modified_to(unit: arrow_schema::TimeUnit) -> datafusion_expr::Expr {
+            datafusion_expr::Expr::Cast(datafusion_expr::Cast::new(
+                Box::new(datafusion_expr::col("_last_modified")),
+                DataType::Timestamp(unit, Some("UTC".into())),
+            ))
+        }
+
+        // A coarsening cast (`Second`) truncates the microsecond metadata value,
+        // so `CAST(_last_modified AS Timestamp(Second)) = 200s` matches an object
+        // at 200.5s that a nanosecond prune would drop. It must not build a
+        // bound — the residual filter enforces it instead.
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Second
+            )
+            .eq(datafusion_expr::lit(ScalarValue::TimestampSecond(
+                Some(200),
+                Some("UTC".into())
+            )))])
+            .is_none(),
+            "a Second-precision cast must not prune"
+        );
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Millisecond
+            )
+            .gt(watermark_ts_ns(200))])
+            .is_none(),
+            "a Millisecond-precision cast must not prune"
+        );
+
+        // Microsecond/nanosecond casts keep the value exactly and stay prunable.
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Microsecond
+            )
+            .gt(watermark_ts_ns(200))])
+            .is_some(),
+            "a Microsecond-precision cast preserves the value and is prunable"
+        );
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Nanosecond
+            )
+            .gt(watermark_ts_ns(200))])
+            .is_some(),
+            "a Nanosecond-precision cast preserves the value and is prunable"
+        );
+    }
+
+    /// Reproduces issue #14264: an `append` refresh over an object-store source
+    /// filters on `_last_modified > <watermark>`. An object whose mtime is below
+    /// the watermark must be pruned from the listing and never opened, so a
+    /// stale corrupt object cannot fail the refresh. On the pre-fix path every
+    /// object is listed and opened before the row filter runs, so the corrupt
+    /// object errors the scan.
+    #[tokio::test]
+    async fn append_refresh_prunes_stale_objects_without_opening_them() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Valid, newest object (mtime 300s): the only row a `> 200s` filter keeps.
+        let file_schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(arrow::array::StringArray::from(vec!["new"]))],
+        )
+        .expect("valid batch");
+        let valid_path = dir.path().join("new.parquet");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&valid_path).expect("create parquet"),
+            Arc::clone(&file_schema),
+            None,
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+        std::fs::File::options()
+            .write(true)
+            .open(&valid_path)
+            .expect("open new.parquet")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_mins(5))
+            .expect("set new mtime");
+
+        // Corrupt, stale object (mtime 100s, below the watermark). A `.parquet`
+        // name so it is listed, but not valid Parquet, so opening it errors.
+        let corrupt_path = dir.path().join("old_corrupt.parquet");
+        std::fs::write(&corrupt_path, b"NOT A PARQUET FILE").expect("write corrupt object");
+        std::fs::File::options()
+            .write(true)
+            .open(&corrupt_path)
+            .expect("open old_corrupt.parquet")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+            .expect("set corrupt mtime");
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset.metadata = HashMap::from([(
+            MetadataColumn::LastModified.name().to_string(),
+            "enabled".to_string(),
+        )]);
+
+        let url = Url::parse(&table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let query_ctx = SessionContext::new();
+        query_ctx
+            .register_table("appended", provider)
+            .expect("register listing table");
+
+        // The corrupt object really does break an unpruned read, so the filtered
+        // success below can only be the prune skipping it.
+        let unfiltered = query_ctx
+            .sql("SELECT value FROM appended")
+            .await
+            .expect("plan full read")
+            .collect()
+            .await;
+        assert!(
+            unfiltered.is_err(),
+            "the corrupt object must break a full read, else this test cannot prove pruning"
+        );
+
+        // 200s watermark, at the column's exact type — the corrupt 100s object
+        // is below it and must be pruned.
+        let watermark = datafusion_expr::lit(ScalarValue::TimestampMicrosecond(
+            Some(200_000_000),
+            Some("UTC".into()),
+        ));
+        let batches = query_ctx
+            .table("appended")
+            .await
+            .expect("open table")
+            .filter(datafusion_expr::col("_last_modified").gt(watermark))
+            .expect("apply `_last_modified >` filter")
+            .collect()
+            .await
+            .expect("prune must skip the corrupt object below the watermark");
+
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows, 1,
+            "only the newest object's row is above the watermark"
+        );
+        let value_col = batches[0].column_by_name("value").expect("value column");
+        let value = if let Some(arr) = value_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+        {
+            arr.value(0).to_string()
+        } else if let Some(arr) = value_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+        {
+            arr.value(0).to_string()
+        } else if let Some(arr) = value_col
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+        {
+            arr.value(0).to_string()
+        } else {
+            panic!(
+                "value decoded as {}, expected Utf8, Utf8View, or LargeUtf8",
+                value_col.data_type()
+            );
+        };
+        assert_eq!(value, "new");
+    }
+
     /// Location predicates used to warn and skip a matching object whose Hive
     /// path could not be parsed, which is the same silent-omit as the
     /// format-selected listing scan.
@@ -4030,7 +4687,7 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
+        let provider = MetadataPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -4139,7 +4796,7 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
+        let provider = MetadataPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
