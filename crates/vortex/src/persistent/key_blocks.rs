@@ -108,6 +108,18 @@ struct BlocksKey {
     column: Arc<str>,
 }
 
+impl BlocksKey {
+    fn new(store: &Arc<str>, meta: &ObjectMeta, column: &Arc<str>) -> Self {
+        Self {
+            store: Arc::clone(store),
+            path: meta.location.clone(),
+            size: meta.size,
+            modified_micros: meta.last_modified.timestamp_micros(),
+            column: Arc::clone(column),
+        }
+    }
+}
+
 type BlocksCache = Cache<BlocksKey, Option<Arc<KeyBlocks>>, BuildHasherDefault<XxHash3_64>>;
 
 static KEY_BLOCKS: LazyLock<BlocksCache> = LazyLock::new(|| {
@@ -166,15 +178,8 @@ pub(crate) async fn key_blocks(
     if reader.row_count() > MAX_INDEXED_ROWS {
         return None;
     }
-    let key = BlocksKey {
-        store: Arc::clone(store),
-        path: meta.location.clone(),
-        size: meta.size,
-        modified_micros: meta.last_modified.timestamp_micros(),
-        column: Arc::clone(column),
-    };
     KEY_BLOCKS
-        .get_with(key, async {
+        .get_with(BlocksKey::new(store, meta, column), async {
             match build(reader.as_ref(), session, column).await {
                 Ok(blocks) => Some(Arc::new(blocks)),
                 Err(error) => {
@@ -189,6 +194,19 @@ pub(crate) async fn key_blocks(
             }
         })
         .await
+}
+
+/// The key blocks of `column` already cached for the file `meta` describes,
+/// without reading the file.
+pub(crate) async fn cached_key_blocks(
+    store: &Arc<str>,
+    meta: &ObjectMeta,
+    column: &Arc<str>,
+) -> Option<Arc<KeyBlocks>> {
+    KEY_BLOCKS
+        .get(&BlocksKey::new(store, meta, column))
+        .await
+        .flatten()
 }
 
 async fn build(

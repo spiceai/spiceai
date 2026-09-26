@@ -216,12 +216,37 @@ impl FileOpener for VortexOpener {
                 return Ok(stream::empty().boxed());
             }
 
+            // A key lookup on a file whose key blocks are already cached is decided
+            // here, before the file is opened. A file with no block that can hold the
+            // key is skipped. Otherwise the file pruner is not built: its statistics
+            // cannot rule out a key the blocks hold, and a predicate that is not
+            // dynamic gives it nothing to re-check while the file is read.
+            let early_key_ranges = match (key_column.as_ref(), filter.as_ref(), &file.range) {
+                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                    match key_equality(predicate, column, &unified_file_schema) {
+                        Some(key) => key_blocks::cached_key_blocks(
+                            &object_store_url,
+                            &file.object_meta,
+                            column,
+                        )
+                        .await
+                        .map(|blocks| blocks.candidate_ranges(key)),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            if early_key_ranges.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(stream::empty().boxed());
+            }
+
             // Create FilePruner when we have a predicate and either dynamic expressions
             // or file statistics available. The pruner can eliminate files without
             // opening them based on:
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
+                .filter(|_| early_key_ranges.is_none())
                 .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -408,6 +433,7 @@ impl FileOpener for VortexOpener {
             // and a few are read directly below instead of scanned. A dynamic filter
             // changes after the file opens, so it keeps the scan.
             let key_ranges = match (key_column.as_ref(), filter.as_ref(), &row_range) {
+                _ if early_key_ranges.is_some() => early_key_ranges,
                 (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
                     match key_equality(predicate, column, &this_file_schema) {
                         Some(key) => key_blocks::key_blocks(
@@ -1542,6 +1568,38 @@ mod tests {
         assert_eq!(looked_up.len(), 3, "{looked_up:?}");
         assert_eq!((take_point_reads(), take_scans_built()), (0, 1));
 
+        Ok(())
+    }
+
+    /// Once a file's key blocks are cached, a key no block can hold skips the file
+    /// before it is opened. The object is deleted after the blocks are built: a key
+    /// outside every block is still answered, and one a block holds has to open the
+    /// file and fails.
+    #[tokio::test]
+    async fn cached_key_blocks_skip_a_file_without_opening_it() -> anyhow::Result<()> {
+        let keys = (0..3 * 8_192).map(Some).collect();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "cached_key_blocks_skip_a_file_without_opening_it.vortex";
+        let (schema, size) = write_keyed(Arc::clone(&object_store), path, keys).await?;
+        let file = PartitionedFile::new(path.to_string(), size);
+
+        let warm = col("a").eq(lit(5_i64));
+        let rows = read_keyed(&object_store, &schema, &file, &warm, Some("a")).await?;
+        assert_eq!(rows, vec![(Some(5), "row-5".to_string())]);
+
+        object_store.delete(&Path::from(path)).await?;
+
+        let absent = col("a").eq(lit(-1_i64));
+        let rows = read_keyed(&object_store, &schema, &file, &absent, Some("a")).await?;
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let present = col("a").eq(lit(6_i64));
+        assert!(
+            read_keyed(&object_store, &schema, &file, &present, Some("a"))
+                .await
+                .is_err(),
+            "a key a block holds must open the deleted file"
+        );
         Ok(())
     }
 
