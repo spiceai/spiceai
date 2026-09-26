@@ -1668,9 +1668,14 @@ impl SnapshotManager {
             return Ok(None);
         };
 
-        self.download_snapshot_entry(&current_entry, &dataset_metadata, checkpointer_factory)
-            .await
-            .map(Some)
+        self.download_snapshot_entry(
+            &current_entry,
+            &dataset_metadata,
+            &metadata_handle.metadata.location,
+            checkpointer_factory,
+        )
+        .await
+        .map(Some)
     }
 
     async fn download_with_fallback(
@@ -1729,6 +1734,7 @@ impl SnapshotManager {
                 .download_snapshot_entry(
                     &snapshot,
                     &dataset_metadata,
+                    &metadata_handle.metadata.location,
                     Arc::clone(&checkpointer_factory),
                 )
                 .await
@@ -1792,9 +1798,31 @@ impl SnapshotManager {
         Ok(None)
     }
 
-    fn snapshot_uri_to_object_path(&self, uri: &str) -> Result<ObjectPath, SnapshotDownloadError> {
-        let base_uri = self.snapshot_location_uri.trim_end_matches('/');
-        if let Some(relative) = uri.strip_prefix(base_uri) {
+    /// Resolves a snapshot entry URI to an object path under this manager's snapshot location.
+    ///
+    /// The URI is matched, in order, against this manager's own snapshot location and the
+    /// `location` recorded in the metadata the entry came from; the part after the matching
+    /// base is joined onto the snapshot location. Matching the recorded location lets a
+    /// reader resolve entries from a copy of the writer's prefix in another bucket (e.g. one
+    /// filled by S3 replication), where every entry still names the writer's bucket.
+    fn snapshot_uri_to_object_path(
+        &self,
+        uri: &str,
+        metadata_location: Option<&str>,
+    ) -> Result<ObjectPath, SnapshotDownloadError> {
+        let bases = std::iter::once(self.snapshot_location_uri.as_str())
+            .chain(metadata_location)
+            .map(|base| base.trim_end_matches('/'))
+            .filter(|base| !base.is_empty());
+        for base in bases {
+            let Some(relative) = uri.strip_prefix(base) else {
+                continue;
+            };
+            // Only match on a path boundary: `s3://bucket/snap` is not a base of
+            // `s3://bucket/snapshots/...`.
+            if !relative.is_empty() && !relative.starts_with('/') {
+                continue;
+            }
             let relative = relative.trim_start_matches('/');
             let combined = if relative.is_empty() {
                 self.snapshots_location.to_string()
@@ -1834,6 +1862,7 @@ impl SnapshotManager {
         &self,
         entry: &SnapshotEntry,
         dataset_metadata: &DatasetMetadata,
+        metadata_location: &str,
         checkpointer_factory: DatasetCheckpointerFactory,
     ) -> Result<SnapshotDownloadInfo, SnapshotDownloadError> {
         // Validate engine matches before downloading - fail fast if engines are incompatible
@@ -1855,7 +1884,8 @@ impl SnapshotManager {
             );
         }
 
-        let object_path = self.snapshot_uri_to_object_path(&entry.snapshot)?;
+        let object_path =
+            self.snapshot_uri_to_object_path(&entry.snapshot, Some(metadata_location))?;
         let path_display = object_path.to_string();
 
         let get_result = self
@@ -2668,6 +2698,7 @@ impl SnapshotManager {
         // Check which snapshots actually exist in the object store (with bounded concurrency).
         // Eagerly collect futures into a Vec so the closure doesn't capture `&self` lazily,
         // which would cause higher-ranked lifetime issues with axum handlers.
+        let metadata_location = location.as_str();
         let existence_futures: Vec<_> = windowed_entries
             .iter()
             .map(|entry| {
@@ -2675,7 +2706,9 @@ impl SnapshotManager {
                 let snapshot_id = entry.snapshot_id;
                 let snapshot_size = entry.snapshot_size;
                 async move {
-                    let exists = self.snapshot_exists(&snapshot_uri, snapshot_size).await;
+                    let exists = self
+                        .snapshot_exists(&snapshot_uri, metadata_location, snapshot_size)
+                        .await;
                     (snapshot_id, exists)
                 }
             })
@@ -2751,8 +2784,15 @@ impl SnapshotManager {
 
     /// Checks if a snapshot exists in the object store and whether its size matches,
     /// with retry for transient errors.
-    async fn snapshot_exists(&self, snapshot_uri: &str, expected_size: u64) -> SnapshotFileStatus {
-        let Ok(object_path) = self.snapshot_uri_to_object_path(snapshot_uri) else {
+    async fn snapshot_exists(
+        &self,
+        snapshot_uri: &str,
+        metadata_location: &str,
+        expected_size: u64,
+    ) -> SnapshotFileStatus {
+        let Ok(object_path) =
+            self.snapshot_uri_to_object_path(snapshot_uri, Some(metadata_location))
+        else {
             return SnapshotFileStatus::NotFound;
         };
 
@@ -2834,7 +2874,7 @@ impl SnapshotManager {
         };
 
         let status = match self
-            .snapshot_exists(&entry.snapshot, entry.snapshot_size)
+            .snapshot_exists(&entry.snapshot, &h.metadata.location, entry.snapshot_size)
             .await
         {
             SnapshotFileStatus::Verified => "verified".to_string(),
@@ -3551,6 +3591,151 @@ mod tests {
         assert!(!local_path.exists());
     }
 
+    const WRITER_LOCATION: &str = "s3://bucket-a/snapshots/";
+
+    /// Returns `location` as an entry URI under `WRITER_LOCATION`, the way a writer whose
+    /// `snapshots.location` differs from the reader's records it.
+    fn writer_snapshot_uri(location: &ObjectPath) -> String {
+        let relative = snapshot_uri(location)
+            .strip_prefix(SNAPSHOT_URI_PREFIX)
+            .expect("snapshot uri starts with the reader prefix")
+            .trim_start_matches('/')
+            .to_string();
+        format!("{WRITER_LOCATION}{relative}")
+    }
+
+    /// Writes a snapshot under the reader's `snapshots/` path and a `metadata.json` whose
+    /// `location` and entry URIs name the writer's bucket, as a replicated copy of the
+    /// writer's prefix looks to a reader in another bucket. Returns the snapshot bytes.
+    async fn write_replicated_snapshot(
+        store: &InMemory,
+        schema: &SchemaRef,
+        snapshot_id: u64,
+    ) -> Bytes {
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        let contents = Bytes::from_static(b"replicated-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let entry = SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: writer_snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: WRITER_LOCATION.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(schema, vec![entry], Some(snapshot_id)),
+            )]),
+        };
+        write_metadata(store, &base.join(METADATA_FILE_NAME), &metadata).await;
+        contents
+    }
+
+    // regression test for #14425
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_resolves_entries_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let contents = write_replicated_snapshot(&store, &schema, 0).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("bootstrap from a replicated prefix should succeed")
+            .expect("expected snapshot");
+        assert_eq!(info.snapshot_id, 0);
+        assert_eq!(info.bytes_downloaded, contents.len() as u64);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    // regression test for #14425
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_if_newer_resolves_entries_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let contents = write_replicated_snapshot(&store, &schema, 7).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let info = manager
+            .download_if_newer(Some(6), None)
+            .await
+            .expect("refresh from a replicated prefix should succeed")
+            .expect("expected newer snapshot to be downloaded");
+        assert_eq!(info.snapshot_id, 7);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    // regression test for #14425
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn snapshot_api_reports_entries_under_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        write_replicated_snapshot(&store, &schema, 3).await;
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let summary = manager
+            .get_snapshot_summary(10)
+            .await
+            .expect("snapshot summary");
+        assert_eq!(summary.snapshots.len(), 1);
+        assert_eq!(summary.snapshots[0].status, "verified");
+
+        let info = manager.get_snapshot(3).await.expect("get snapshot");
+        assert_eq!(info.status, "verified");
+    }
     #[tokio::test]
     async fn download_with_fallback_uses_next_snapshot_on_integrity_failure() {
         let store = Arc::new(InMemory::new());
@@ -4038,7 +4223,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4106,7 +4291,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4174,7 +4359,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4249,7 +4434,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(matches!(
@@ -4329,7 +4514,7 @@ mod tests {
         );
 
         let info = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await
             .expect("pre-evolution snapshot should be accepted");
 
@@ -4403,7 +4588,7 @@ mod tests {
         );
 
         let result = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await;
 
         assert!(
@@ -4712,7 +4897,7 @@ mod tests {
 
         let uri = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
         let path = manager
-            .snapshot_uri_to_object_path(&uri)
+            .snapshot_uri_to_object_path(&uri, None)
             .expect("convert uri to path");
 
         assert_eq!(
@@ -4735,10 +4920,83 @@ mod tests {
 
         let uri = "memory://other-prefix/path/to/file.db";
         let path = manager
-            .snapshot_uri_to_object_path(uri)
+            .snapshot_uri_to_object_path(uri, None)
             .expect("convert uri to path");
 
         assert_eq!(path.to_string(), "snapshots/other-prefix/path/to/file.db");
+    }
+
+    // regression test for #14425
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn snapshot_uri_to_object_path_resolves_against_metadata_location() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+        let uri = "s3://bucket-a/snapshots/month=2025-01/day=01/dataset=dataset/file.db";
+        let expected = "snapshots/month=2025-01/day=01/dataset=dataset/file.db";
+
+        for metadata_location in ["s3://bucket-a/snapshots/", "s3://bucket-a/snapshots"] {
+            let path = manager
+                .snapshot_uri_to_object_path(uri, Some(metadata_location))
+                .expect("convert uri to path");
+            assert_eq!(path.to_string(), expected, "location={metadata_location}");
+        }
+
+        // The reader's own location still takes precedence over the recorded one.
+        let own = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
+        let path = manager
+            .snapshot_uri_to_object_path(&own, Some("s3://bucket-a/snapshots/"))
+            .expect("convert uri to path");
+        assert_eq!(path.to_string(), expected);
+
+        // An empty recorded location falls through to the host-join fallback.
+        let path = manager
+            .snapshot_uri_to_object_path(uri, Some(""))
+            .expect("convert uri to path");
+        assert_eq!(
+            path.to_string(),
+            "snapshots/bucket-a/snapshots/month=2025-01/day=01/dataset=dataset/file.db"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn snapshot_uri_to_object_path_matches_metadata_location_on_path_boundary() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        // `s3://bucket-a/snap` is a string prefix of the URI but not a path prefix, so it
+        // must not match; the URI falls through to the host-join fallback.
+        let path = manager
+            .snapshot_uri_to_object_path(
+                "s3://bucket-a/snapshots/month=2025-01/file.db",
+                Some("s3://bucket-a/snap"),
+            )
+            .expect("convert uri to path");
+        assert_eq!(
+            path.to_string(),
+            "snapshots/bucket-a/snapshots/month=2025-01/file.db"
+        );
+
+        // The same boundary applies to the reader's own location.
+        let path = manager
+            .snapshot_uri_to_object_path(&format!("{SNAPSHOT_URI_PREFIX}-old/file.db"), None)
+            .expect("convert uri to path");
+        assert_eq!(path.to_string(), "snapshots/snapshots-old/file.db");
     }
 
     #[cfg(feature = "duckdb")]
@@ -6820,7 +7078,7 @@ mod tests {
         manager.checkpointer_factory = Some(Arc::clone(&factory));
 
         let info = manager
-            .download_snapshot_entry(&entry, &metadata, factory)
+            .download_snapshot_entry(&entry, &metadata, SNAPSHOT_URI_PREFIX, factory)
             .await
             .expect("restore snapshot");
 
