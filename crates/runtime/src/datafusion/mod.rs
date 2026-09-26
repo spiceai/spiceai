@@ -1461,8 +1461,11 @@ impl DataFusion {
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                     notifier
-                } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
+                } else if source.as_any().downcast_ref::<SinkConnector>().is_some()
+                    && !dataset.is_snapshot_only()
+                {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
+                    // A snapshot-only dataset takes its schema from the restored snapshot and never receives a write, so it registers as a regular accelerated table.
                     self.runtime_status
                         .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
                     self.pending_sink_tables.write().await.insert(

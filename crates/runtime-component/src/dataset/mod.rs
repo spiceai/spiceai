@@ -658,6 +658,19 @@ impl DatasetSpec {
         false
     }
 
+    /// A dataset that omits `from:` and whose acceleration is served entirely from
+    /// snapshots (`refresh_mode: snapshot`). Its schema comes from the restored snapshot
+    /// rather than from a first write, so it registers like any accelerated dataset
+    /// instead of waiting as a `sink`. An explicit `from: sink` keeps sink semantics.
+    #[must_use]
+    pub fn is_snapshot_only(&self) -> bool {
+        self.from.is_empty()
+            && self.acceleration.as_ref().is_some_and(|acceleration| {
+                acceleration.enabled
+                    && acceleration.refresh_mode == Some(acceleration::RefreshMode::Snapshot)
+            })
+    }
+
     #[must_use]
     pub fn is_file_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {

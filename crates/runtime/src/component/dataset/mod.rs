@@ -652,6 +652,42 @@ mod tests {
         }
     }
 
+    // regression test for #14402
+    #[tokio::test]
+    async fn test_is_snapshot_only() {
+        use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+
+        let cases = [
+            ("", Some(RefreshMode::Snapshot), true, true),
+            ("sink", Some(RefreshMode::Snapshot), true, false),
+            ("", Some(RefreshMode::Snapshot), false, false),
+            ("", Some(RefreshMode::Full), true, false),
+            ("", None, true, false),
+            ("s3://bucket/t/", Some(RefreshMode::Snapshot), true, false),
+        ];
+
+        for (from, refresh_mode, enabled, expected) in cases {
+            let app = app::AppBuilder::new("test").build();
+            let rt = crate::Runtime::builder().build().await;
+            let mut dataset = DatasetBuilder::try_new(from.to_string(), "test")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
+            dataset.acceleration = Some(Acceleration {
+                enabled,
+                refresh_mode,
+                ..Acceleration::default()
+            });
+            assert_eq!(
+                dataset.is_snapshot_only(),
+                expected,
+                "from={from:?} refresh_mode={refresh_mode:?} enabled={enabled}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_path() {
         let test_cases = vec![

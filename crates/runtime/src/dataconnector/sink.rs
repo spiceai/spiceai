@@ -21,7 +21,10 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
+use crate::component::dataset::{
+    Dataset, DatasetSpec,
+    acceleration::{Engine, RefreshMode},
+};
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use datafusion::{
     catalog::Session,
@@ -38,7 +41,8 @@ use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec,
 };
 
 /// The schema a `sink` source advertises when it has no acceleration to inherit from.
@@ -51,6 +55,17 @@ fn placeholder_schema() -> SchemaRef {
         DataType::Utf8,
         false,
     )]))
+}
+
+/// Why a snapshot-only dataset (no `from:`, `refresh_mode: snapshot`) cannot be registered
+/// when no schema could be read from a restored snapshot: without a source or a snapshot
+/// there is no schema.
+fn snapshot_only_without_snapshot_message(location: &str) -> String {
+    format!(
+        "It has no `from:` source and no schema could be read from a snapshot restored from '{location}', so it cannot be registered. \
+        Publish a snapshot for this dataset to '{location}' and restart, or add a `from:` source. \
+        See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    )
 }
 
 /// The schema an accelerated `sink` dataset should advertise as its (no-op) source.
@@ -148,13 +163,30 @@ impl DataConnectorFactory for SinkConnectorFactory {
             // Reading the checkpoint needs the accelerator engine registry and the secrets, so
             // the spec is rebound to the runtime handles from the connector context; without a
             // context (connector unit tests) there is no accelerator to inherit from.
-            let schema = match &params.component {
-                ConnectorComponent::Dataset(spec) => {
-                    context.accelerated_checkpoint_schema(spec).await
+            let (schema, snapshot_location) = match &params.component {
+                ConnectorComponent::Dataset(spec) => (
+                    context.accelerated_checkpoint_schema(spec).await,
+                    snapshot_only_location(spec, context),
+                ),
+                ConnectorComponent::Catalog(_) => (None, None),
+            };
+
+            // A snapshot-only dataset has no source and no writes to learn its schema from:
+            // the restored snapshot is the only place it can come from. Datasets the snapshot
+            // path cannot serve (a non-file engine, snapshots not configured) fall through to
+            // the placeholder so the acceleration validation reports the actual misconfiguration.
+            let schema = match (schema, snapshot_location) {
+                (Some(schema), _) => schema,
+                (None, Some(location)) => {
+                    return Err(Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: SINK_DATACONNECTOR.to_string(),
+                        connector_component: params.component.clone(),
+                        message: snapshot_only_without_snapshot_message(&location),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
-                ConnectorComponent::Catalog(_) => None,
-            }
-            .unwrap_or_else(placeholder_schema);
+                (None, None) => placeholder_schema(),
+            };
 
             Ok(Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>)
         })
@@ -167,6 +199,31 @@ impl DataConnectorFactory for SinkConnectorFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         &[]
     }
+}
+
+/// The configured snapshot location for a snapshot-only dataset that the snapshot path
+/// can serve: a snapshot-capable file engine that bootstraps from snapshots, with snapshots
+/// enabled. `None` for every other dataset, so its misconfiguration is reported by the
+/// acceleration validation instead.
+fn snapshot_only_location(spec: &DatasetSpec, context: &dyn ConnectorContext) -> Option<String> {
+    let acceleration = spec.acceleration.as_ref()?;
+    let snapshot_capable_engine = matches!(
+        acceleration.engine,
+        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne
+    );
+    if !spec.is_snapshot_only()
+        || !spec.is_file_accelerated()
+        || !snapshot_capable_engine
+        || !acceleration.snapshot_behavior.bootstrap_enabled()
+    {
+        return None;
+    }
+    context
+        .app()
+        .snapshots
+        .as_ref()
+        .filter(|snapshots| snapshots.enabled)
+        .and_then(|snapshots| snapshots.location.clone())
 }
 
 #[async_trait]
