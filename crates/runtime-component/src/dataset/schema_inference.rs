@@ -154,9 +154,24 @@ pub fn apply_inferred_schema(
         .as_ref()
         .map(|pk| pk.iter().map(ToString::to_string).collect());
 
-    // 2) Secondary indexes — only when the user configured none.
+    // 2) Secondary indexes — only when the user configured none, and never for
+    // DuckDB. A DuckDB upsert sets every non-key column, and an update that sets an
+    // indexed column is executed as a delete plus an insert, so each change to a row
+    // gives it a new row id. DuckDB's primary-key index holds at most two row ids per
+    // key, so the third version of a key written while a query that began before the
+    // second is still running fails to commit ("write-write conflict on key"), and
+    // for a change stream that stops replication of the dataset (#13929). Without a
+    // secondary index the upsert updates the row in place and never adds a row id.
     let mut applied_indexes = 0usize;
-    if constraints_applicable && acceleration.indexes.is_empty() {
+    let infer_indexes = constraints_applicable && acceleration.indexes.is_empty();
+    if infer_indexes && engine == Engine::DuckDB {
+        if !inferred.indexes.is_empty() {
+            tracing::debug!(
+                dataset = %dataset_name,
+                "Skipping inferred secondary indexes; a DuckDB upsert that sets an indexed column rewrites the row, which fails to commit while an older query is still reading it"
+            );
+        }
+    } else if infer_indexes {
         for index in &inferred.indexes {
             if !index.columns.iter().all(|c| has_column(c)) {
                 continue;
@@ -605,6 +620,72 @@ mod tests {
             acc.on_conflict.get(&col_ref(&["id"])),
             Some(OnConflictBehavior::Upsert(_))
         ));
+    }
+
+    // Regression test for #13929: an inferred secondary index turned every DuckDB CDC
+    // upsert into a delete plus an insert, which fails to commit under concurrent reads.
+    #[test]
+    fn duckdb_skips_inferred_secondary_indexes_for_changes() {
+        let mut acc = accel(Engine::DuckDB);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["last".to_string(), "first".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "first", "last", "email"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+
+        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+        assert!(matches!(
+            acc.on_conflict.get(&col_ref(&["id"])),
+            Some(OnConflictBehavior::Upsert(_))
+        ));
+        assert!(
+            acc.indexes.is_empty(),
+            "no inferred secondary index may reach a DuckDB acceleration: {:?}",
+            acc.indexes
+        );
+    }
+
+    #[test]
+    fn duckdb_keeps_user_configured_indexes_for_changes() {
+        let mut acc = accel(Engine::DuckDB);
+        acc.indexes.insert(col_ref(&["email"]), IndexType::Unique);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![InferredIndex {
+                columns: vec!["last".to_string()],
+                unique: false,
+            }],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "last", "email"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+
+        assert_eq!(acc.indexes.len(), 1);
+        assert_eq!(
+            acc.indexes.get(&col_ref(&["email"])),
+            Some(&IndexType::Unique)
+        );
     }
 
     #[test]

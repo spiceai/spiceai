@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::error::format_datafusion_error;
 use arrow_schema::SchemaRef;
+use arrow_tools::metadata_keys::INFERRED_INDEXES_METADATA_KEY;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::error::DataFusionError;
@@ -488,9 +489,25 @@ fn validate_and_extract_columns(
     // are not included automatically. We verify their presence in the source schema and add them manually if needed.
     fields = include_computed_columns(&fields, &source_schema);
 
+    // Keep the source's inferred secondary indexes, which the unprojected schema above
+    // carries in full: the `DuckDB` accelerator reads them to find the indexes an earlier
+    // schema inference copied onto a stored table. The other inferred hints (sizing,
+    // column statistics) describe every source row and do not hold once a refresh SQL
+    // selects fewer.
+    let metadata = source_schema
+        .metadata()
+        .get(INFERRED_INDEXES_METADATA_KEY)
+        .map(|indexes| {
+            std::collections::HashMap::from([(
+                INFERRED_INDEXES_METADATA_KEY.to_string(),
+                indexes.clone(),
+            )])
+        })
+        .unwrap_or_default();
+
     Ok((
         RefreshSQLColumns::Named(column_idents),
-        Arc::new(Schema::new(fields)),
+        Arc::new(Schema::new_with_metadata(fields, metadata)),
     ))
 }
 
@@ -614,6 +631,43 @@ mod tests {
         assert_eq!(result_schema.field(1).name(), "name");
         assert!(matches!(refresh_sql.columns(), RefreshSQLColumns::Named(_)));
         assert_eq!(refresh_sql.to_sql(), "SELECT id, name FROM test_table");
+        Ok(())
+    }
+
+    // Regression test for #13929: the DuckDB accelerator reads the inferred indexes from
+    // the projected schema to drop the ones an earlier inference installed.
+    #[test]
+    fn test_select_columns_keeps_only_the_inferred_indexes_metadata() -> Result<()> {
+        use arrow_tools::metadata_keys::INFERRED_ROW_COUNT_METADATA_KEY;
+
+        let source = create_test_schema();
+        let mut metadata = source.metadata().clone();
+        metadata.insert(
+            INFERRED_INDEXES_METADATA_KEY.to_string(),
+            r#"[{"columns":["name"],"unique":false}]"#.to_string(),
+        );
+        metadata.insert(
+            INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+            "1000".to_string(),
+        );
+        let schema = Arc::new(source.as_ref().clone().with_metadata(metadata));
+        let table = TableReference::parse_str("test_table");
+
+        let (_, result_schema) =
+            parse_refresh_sql(table, "SELECT id, name FROM test_table", schema)?;
+        assert_eq!(
+            result_schema
+                .metadata()
+                .get(INFERRED_INDEXES_METADATA_KEY)
+                .map(String::as_str),
+            Some(r#"[{"columns":["name"],"unique":false}]"#)
+        );
+        assert!(
+            !result_schema
+                .metadata()
+                .contains_key(INFERRED_ROW_COUNT_METADATA_KEY),
+            "a row count inferred over the whole source does not describe a projection"
+        );
         Ok(())
     }
 
