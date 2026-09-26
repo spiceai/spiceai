@@ -40,7 +40,10 @@ use std::{
     ops::Not,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::OwnedMutexGuard;
@@ -1122,10 +1125,50 @@ impl SnapshotManager {
         known_metadata_e_tag: Option<&str>,
         validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
     ) -> Result<SnapshotPoll, SnapshotDownloadError> {
-        // One metadata read drives the whole poll: the id comparison, the schema check and
+        if !matches!(
+            self.bootstrap_failure_behavior,
+            BootstrapOnFailureBehavior::Retry
+        ) {
+            return self
+                .poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+                .await
+                .map_err(|err| match err {
+                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                });
+        }
+
+        // Each retry is a whole poll: it reads the metadata again, unconditionally, and
+        // validates the snapshot it then downloads, so a snapshot published to replace a
+        // failed one is picked up.
+        let first_attempt = AtomicBool::new(true);
+        retry(RetryBackoffBuilder::new().build(), || async {
+            let known_metadata_e_tag = if first_attempt.swap(false, Ordering::Relaxed) {
+                known_metadata_e_tag
+            } else {
+                None
+            };
+            self.poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+                .await
+        })
+        .await
+    }
+
+    /// One attempt of [`Self::download_if_newer`]. A failed download is a transient error
+    /// under `bootstrap_on_failure_behavior: retry`; every other error is permanent.
+    async fn poll_once(
+        &self,
+        current_local_id: Option<u64>,
+        known_metadata_e_tag: Option<&str>,
+        validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
+    ) -> Result<SnapshotPoll, RetryError<SnapshotDownloadError>> {
+        // One metadata read drives the whole attempt: the id comparison, the schema check and
         // the download all use it, so the snapshot that is downloaded is the one whose schema
         // was validated even if a writer publishes a newer one meanwhile.
-        let handle = match self.read_metadata(known_metadata_e_tag).await? {
+        let read = self
+            .read_metadata(known_metadata_e_tag)
+            .await
+            .map_err(|err| RetryError::permanent(err.into()))?;
+        let handle = match read {
             MetadataRead::Unchanged => {
                 return Ok(SnapshotPoll {
                     download: None,
@@ -1178,25 +1221,51 @@ impl SnapshotManager {
         // treated as a validation failure rather than silently skipped.
         if let Some(validate) = validate_schema {
             let metadata_schema = dataset_metadata.current_schema().ok_or_else(|| {
-                SnapshotDownloadError::SchemaMismatch {
+                RetryError::permanent(SnapshotDownloadError::SchemaMismatch {
                     dataset: self.dataset_name.clone(),
-                }
+                })
             })?;
             let metadata_schema_ref = metadata_schema.to_schema_ref().map_err(|source| {
-                SnapshotDownloadError::MetadataSchemaDeserialize {
+                RetryError::permanent(SnapshotDownloadError::MetadataSchemaDeserialize {
                     dataset: self.dataset_name.clone(),
                     source,
-                }
+                })
             })?;
             if !validate(&metadata_schema_ref) {
-                return Err(SnapshotDownloadError::SchemaMismatch {
-                    dataset: self.dataset_name.clone(),
-                });
+                return Err(RetryError::permanent(
+                    SnapshotDownloadError::SchemaMismatch {
+                        dataset: self.dataset_name.clone(),
+                    },
+                ));
             }
         }
 
         let e_tag = handle.e_tag();
-        let download = self.download_latest(Some(handle)).await?;
+        let download = if matches!(
+            self.bootstrap_failure_behavior,
+            BootstrapOnFailureBehavior::Retry
+        ) {
+            let checkpointer_factory = Arc::clone(
+                self.checkpointer_factory
+                    .as_ref()
+                    .context(CheckpointerFactoryNotSetSnafu)
+                    .map_err(RetryError::permanent)?,
+            );
+            self.download_latest_once(checkpointer_factory, Some(handle))
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        "Failed to bootstrap snapshot; retrying. dataset={} location={} error={err}",
+                        self.dataset_name,
+                        self.snapshots_location
+                    );
+                    RetryError::transient(err)
+                })?
+        } else {
+            self.download_latest(Some(handle))
+                .await
+                .map_err(RetryError::permanent)?
+        };
         // The bootstrap failure behavior can turn a failed download into no download, or fall
         // back to an older snapshot. Neither loaded the current snapshot, so the `ETag` is
         // withheld and the next poll reads the metadata again instead of skipping.
@@ -3819,6 +3888,67 @@ mod tests {
             );
             assert_eq!(poll.metadata_e_tag, None, "{behavior:?}");
         }
+    }
+
+    /// Under `bootstrap_on_failure_behavior: retry`, a poll whose current snapshot is broken
+    /// keeps retrying, and each retry reads the metadata again: a snapshot published to
+    /// replace the broken one is validated and downloaded instead of retrying forever.
+    #[tokio::test]
+    async fn download_if_newer_retry_picks_up_a_replacement_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let mut broken = put_cayenne_snapshot_entry(&store, 7, 1, b"broken").await;
+        broken.snapshot_checksum = "0".repeat(64);
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![broken.clone()], 7),
+        )
+        .await;
+
+        let root = TempDir::new().expect("create temp dir");
+        let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+        manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
+
+        let writer_store = Arc::clone(&store);
+        let writer_path = metadata_path.clone();
+        let writer_schema = Arc::clone(&schema);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let replacement = put_cayenne_snapshot_entry(&writer_store, 8, 2, b"replacement").await;
+            write_metadata(
+                &writer_store,
+                &writer_path,
+                &metadata_with(&writer_schema, vec![broken, replacement], 8),
+            )
+            .await;
+        });
+
+        let validated = std::sync::atomic::AtomicUsize::new(0);
+        let validator = |_: &SchemaRef| {
+            validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        };
+        let poll = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            manager.download_if_newer(Some(6), None, Some(&validator)),
+        )
+        .await
+        .expect("retry must observe the replacement snapshot instead of retrying forever")
+        .expect("download_if_newer should succeed");
+        writer.await.expect("writer task");
+
+        assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
+        assert!(poll.metadata_e_tag.is_some());
+        assert!(
+            validated.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "each retry validates the snapshot it downloads"
+        );
+        let restored = fs::read(root.path().join("data").join("part-8.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"replacement");
     }
 
     /// A writer that publishes between the schema check and the download must not change
