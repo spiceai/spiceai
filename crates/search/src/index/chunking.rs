@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -39,7 +40,9 @@ use datafusion::{
 use datafusion_expr::ident;
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
-use spice_table::{GroupPruning, Index, WriteWindow, build_key_match_predicate};
+use spice_table::{
+    GroupPruning, Index, SnapshotIndexIdentity, WriteWindow, build_key_match_predicate,
+};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
 /// Additional primary key column to uniquely identify chunks within a single database row.
@@ -106,6 +109,18 @@ impl Index for ChunkedSearchIndex {
                 && *s != Self::chunking_offset_col(self.search_column().as_str())
         });
         cols
+    }
+
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        self.inner.snapshot_identity()
+    }
+
+    async fn freeze_for_snapshot(&self) -> DataFusionResult<PathBuf> {
+        self.inner.freeze_for_snapshot().await
+    }
+
+    async fn restore_from(&self, extracted_dir: &Path) -> DataFusionResult<()> {
+        self.inner.restore_from(extracted_dir).await
     }
 
     /// One batch after another, in the order given — not concurrently. A write is an upsert of
@@ -1218,6 +1233,18 @@ impl Index for ChunkedVectorIndex {
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String> {
         self.delegate.required_columns()
+    }
+
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        self.inner.snapshot_identity()
+    }
+
+    async fn freeze_for_snapshot(&self) -> DataFusionResult<PathBuf> {
+        self.inner.freeze_for_snapshot().await
+    }
+
+    async fn restore_from(&self, extracted_dir: &Path) -> DataFusionResult<()> {
+        self.inner.restore_from(extracted_dir).await
     }
 
     /// Compute the index - if the index data is represented in the batch itself (i.e. a vector

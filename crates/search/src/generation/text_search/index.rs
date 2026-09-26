@@ -27,7 +27,7 @@ use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use snafu::{ResultExt, ensure};
-use spice_table::{Index, WriteWindow};
+use spice_table::{Index, SnapshotIndexIdentity, WriteWindow};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
     DocParsingError, FieldEntry, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing,
@@ -55,6 +55,18 @@ use crate::index::SearchIndex;
 /// significantly improving bulk-indexing throughput.
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
+
+/// Returns the stable snapshot identity for a full-text index.
+#[must_use]
+pub fn fts_snapshot_identity(columns: &[String]) -> SnapshotIndexIdentity {
+    let mut columns = columns.to_vec();
+    columns.sort_unstable();
+    SnapshotIndexIdentity {
+        kind: "full_text",
+        columns,
+        discriminator: None,
+    }
+}
 
 /// Tantivy's built-in English Snowball-stemmed tokenizer.
 static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
@@ -202,6 +214,10 @@ fn rollback_writer(writer: &mut tantivy::IndexWriter) -> Result<(), TantivyError
     Ok(())
 }
 
+fn copy_snapshot_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    util::directory_copy::copy_directory_rejecting_symlinks(source, destination, "snapshot index")
+}
+
 #[derive(Clone)]
 pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
@@ -229,6 +245,9 @@ pub struct FullTextDatabaseIndex {
     /// therefore disabled outright for a stream-attached index — correctness over the
     /// one-commit-per-refresh optimization.
     stream_attached: Arc<AtomicBool>,
+
+    /// The directory Tantivy persists to. `None` means the in-memory store.
+    directory: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -257,6 +276,152 @@ impl Index for FullTextDatabaseIndex {
         required_columns.extend(self.primary_key.iter().cloned());
         required_columns.extend(self.search_fields.iter().cloned());
         required_columns.into_iter().collect()
+    }
+
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        self.directory
+            .as_ref()
+            .map(|_| fts_snapshot_identity(&self.search_fields))
+    }
+
+    async fn freeze_for_snapshot(&self) -> Result<PathBuf, DataFusionError> {
+        let Some(directory) = self.directory.clone() else {
+            return Err(DataFusionError::NotImplemented(
+                "In-memory full-text indexes cannot be snapshotted".to_string(),
+            ));
+        };
+        let writer = Arc::clone(&self.writer);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut writer = writer.blocking_lock();
+            writer.commit().context(FailedToInsertDataIntoIndexSnafu)?;
+            drop(writer);
+            reader.reload().boxed().context(InvalidIndexingSnafu {
+                context: "Full-text index committed for snapshot, but failed to reload the reader."
+                    .to_string(),
+            })
+        })
+        .await
+        .map_err(|error| DataFusionError::External(Box::new(error)))?
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        Ok(directory)
+    }
+
+    async fn restore_from(&self, extracted_dir: &Path) -> Result<(), DataFusionError> {
+        let Some(directory) = self.directory.clone() else {
+            return Err(DataFusionError::NotImplemented(
+                "In-memory full-text indexes cannot restore a snapshot".to_string(),
+            ));
+        };
+        let extracted_dir = extracted_dir.to_path_buf();
+        let reader = self.reader.clone();
+        let writer = Arc::clone(&self.writer);
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let parent =
+                directory
+                    .parent()
+                    .ok_or_else(|| super::Error::SnapshotDirectoryParent {
+                        path: directory.clone(),
+                    })?;
+            let install_staging = tempfile::Builder::new()
+                .prefix(".snapshot-index-")
+                .tempdir_in(parent)
+                .map_err(|source| super::Error::SnapshotStaging {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            copy_snapshot_directory(&extracted_dir, install_staging.path()).map_err(|source| {
+                super::Error::SnapshotStaging {
+                    path: install_staging.path().to_path_buf(),
+                    source,
+                }
+            })?;
+            let staged = tantivy::Index::open_in_dir(install_staging.path())
+                .context(TextSearchIndexingSnafu)?;
+            ensure_persisted_schema_matches(
+                install_staging.path(),
+                &staged.schema(),
+                reader.searcher().schema(),
+            )?;
+
+            // Hold the writer lock across the swap below so a concurrent write can never
+            // straddle it — observing either the pre-restore or post-restore generation, never
+            // a directory mid-rename or (via the writer replacement further down) a writer whose
+            // in-memory segment/opstamp state predates the files it is about to commit alongside.
+            let mut writer_guard = writer.blocking_lock();
+
+            let old_directory = directory.with_extension(format!(
+                "snapshot-old-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos())
+            ));
+            std::fs::rename(&directory, &old_directory).map_err(|source| {
+                super::Error::SnapshotStaging {
+                    path: directory.clone(),
+                    source,
+                }
+            })?;
+            let staged_directory = install_staging.keep();
+            if let Err(error) = std::fs::rename(&staged_directory, &directory) {
+                let _ = std::fs::rename(&old_directory, &directory);
+                return Err(super::Error::SnapshotInstall {
+                    path: directory.clone(),
+                    source: error,
+                });
+            }
+
+            // From here `directory` holds the new generation on disk. Reopening it or building a
+            // writer for it can still fail; without a rollback that failure would be returned to
+            // the caller while the live index already points at a directory nothing has
+            // validated, with the pre-restore generation only reachable via `old_directory`. Roll
+            // back to `old_directory` on either failure so the live index keeps serving the
+            // last-known-good generation instead of a half-installed one.
+            let broken_directory = directory.with_extension(format!(
+                "snapshot-broken-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos())
+            ));
+            let rollback_to_old_directory = || {
+                if std::fs::rename(&directory, &broken_directory).is_ok() {
+                    let _ = std::fs::rename(&old_directory, &directory);
+                    let _ = std::fs::remove_dir_all(&broken_directory);
+                }
+            };
+
+            // The old writer's in-memory segment/opstamp state predates the swap above:
+            // committing through it would write a `meta.json` that doesn't know the installed
+            // segments exist, silently discarding them on the next write. Re-open the
+            // (now-installed) directory and take a fresh writer so the next commit builds on the
+            // restored state rather than the pre-restore one.
+            let reopened = tantivy::Index::open_in_dir(&directory)
+                .inspect_err(|_source| {
+                    rollback_to_old_directory();
+                })
+                .context(TextSearchIndexingSnafu)?;
+            let new_writer = reopened
+                .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+                .inspect_err(|_source| {
+                    rollback_to_old_directory();
+                })
+                .context(IndexCreationSnafu)?;
+            new_writer.set_merge_policy(Box::new(index_merge_policy()));
+            *writer_guard = new_writer;
+            drop(writer_guard);
+
+            reader.reload().boxed().context(InvalidIndexingSnafu {
+                context: "Full-text snapshot installed, but failed to reload the reader."
+                    .to_string(),
+            })?;
+            let _ = std::fs::remove_dir_all(old_directory);
+            Ok(())
+        })
+        .await
+        .map_err(|error| DataFusionError::External(Box::new(error)))?
+        .map_err(|error| DataFusionError::External(Box::new(error)))
     }
 
     async fn compute_index(
@@ -441,13 +606,13 @@ impl FullTextDatabaseIndex {
             store_field,
         )?;
 
-        let index = if let Some(path) = directory {
-            match tantivy::Index::create_in_dir(&path, tantivy_schema.clone()) {
+        let index = if let Some(path) = &directory {
+            match tantivy::Index::create_in_dir(path, tantivy_schema.clone()) {
                 Ok(idx) => idx,
                 Err(TantivyError::IndexAlreadyExists) => {
-                    let persisted = tantivy::index::Index::open_in_dir(&path)
+                    let persisted = tantivy::index::Index::open_in_dir(path)
                         .context(TextSearchIndexingSnafu)?;
-                    ensure_persisted_schema_matches(&path, &persisted.schema(), &tantivy_schema)?;
+                    ensure_persisted_schema_matches(path, &persisted.schema(), &tantivy_schema)?;
                     persisted
                 }
                 Err(e) => return Err(e).context(TextSearchIndexingSnafu),
@@ -469,6 +634,7 @@ impl FullTextDatabaseIndex {
             reader,
             defer_commit: Arc::new(AtomicBool::new(false)),
             stream_attached: Arc::new(AtomicBool::new(stream_attached)),
+            directory,
         })
     }
 
@@ -782,6 +948,7 @@ impl FullTextDatabaseIndex {
             // Shared for the same reason as `defer_commit`: both handles drive the
             // same tantivy writer and must agree on whether deferral is allowed.
             stream_attached: Arc::clone(&self.stream_attached),
+            directory: self.directory.clone(),
         }
     }
 
