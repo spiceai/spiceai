@@ -56,10 +56,14 @@ jobs:
   # steps on GitHub-hosted runners; the full suite runs only on non-PR events.
   check_changes:
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
-    # cold runner having to clone from scratch, not the ~1 min a warm
-    # self-hosted workspace takes.
-    timeout-minutes: 45
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Measured at
+    # 1.8 min at most across the 880 successful `push` and `merge_group` runs
+    # from 2026-08-20 to 2026-09-25 (UTC) (p99 1.1), all on warm self-hosted
+    # workspaces. The bound is sized for a cold runner cloning the ~640 MiB
+    # pack from scratch, not for that warm case, and is what keeps a wedged
+    # checkout from holding a merge-queue candidate for long: every other job
+    # waits on this one.
+    timeout-minutes: 20
     outputs:
       # Always treat a manual workflow_dispatch run as having relevant changes so the
       # tests run even when no relevant files changed.
@@ -84,8 +88,14 @@ jobs:
     name: Build Test Binary
     needs: check_changes
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    # Slowest observed success in the 2026-07-25..08-08 window: 125 min.
-    timeout-minutes: 300
+    # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
+    # step was consolidated to one `nextest archive` invocation: 151.4 min
+    # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
+    # and `merge_group` runs. The bound sits above the archive step's own 180
+    # plus the 15.7 min everything else in this job (caches, toolchain setup,
+    # the MinIO upload) has taken at most in the same window, so the step bound
+    # is what fires on a wedged build and this one stays the backstop.
+    timeout-minutes: 200
     steps:
       - name: Pull request passthrough
         if: ${{ github.event_name == 'pull_request' }}
@@ -145,18 +155,19 @@ jobs:
         # step rather than only the job is what names the step that hung, instead of leaving
         # a wedge attributed to the job as a whole.
         #
-        # 150 minutes is set from a historical reference rather than a measurement of the
-        # step as it stands: 81-117 minutes across the last eighteen successful `push` and
-        # `merge_group` runs from when this step still made seven `nextest archive`
-        # invocations. Consolidating those to one removes the six redundant dependency
-        # resolutions, so the reference is conservative for the ordinary case — but it is
-        # not a ceiling, because a cold compiler cache, a contended shared runner pool, or
-        # more test targets can each push a single invocation past it. That is why the bound
-        # sits clear of the range rather than near it: one tight enough to fail a legitimate
-        # build would be worse than the slow build it replaced. Post-consolidation
-        # measurements should replace this reference once there are eighteen of them
-        # (#13429).
-        timeout-minutes: 150
+        # Measured on the step as it stands, after the consolidation to one `nextest
+        # archive` invocation: 143.1 min at most (run 34988348747, merge_group,
+        # 2026-09-15), p99 126.4 and median 31.7 over 188 successful `push` and
+        # `merge_group` runs from 2026-08-20 to 2026-09-25 (UTC). The spread is a cold compiler
+        # cache and a contended shared runner pool, not the diff under test, which is why
+        # the bound sits clear of the slowest legitimate build rather than near it: the
+        # earlier 150 came within 7 minutes of failing that build. 180 leaves 26%
+        # over that slowest build; if a legitimate build ever passes ~165 minutes,
+        # move this and the job bound above together, since the job bound leaves
+        # this step 184 minutes once the rest of the job's 15.7 is taken out. A
+        # genuine hang is still caught, at 3 hours, and only a hang ever pays for
+        # the headroom (#13429).
+        timeout-minutes: 180
         env:
           CARGO_INCREMENTAL: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -252,8 +263,12 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    # Slowest observed success in the 2026-07-25..08-08 window: 19 min.
-    timeout-minutes: 180
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
+    # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The two bounded steps
+    # below sum to 60, and everything else in the job (image pulls, the archive
+    # download, ODPI-C) has taken at most 6.0 min in the same window, so this
+    # sits above both and the step bounds are what fire first.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -334,12 +349,13 @@ jobs:
 
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        # Part 1 is the slowest partition at 13.4 minutes across the last eighteen
-        # successful `push` and `merge_group` runs, but the spread over all three is 1.6 to
-        # 13.4 - nearly a factor of eight, because these tests wait on external services
-        # (Databricks, Oracle Cloud, S3) whose latency is not ours. The bound is set well
-        # above the worst case rather than close to it for that reason, and below the job's
-        # so a wedge here is attributed to this step rather than to the job.
+        # 13.1 minutes at most across the three partitions (run 36019894787, part 2,
+        # 2026-09-24) over 119 successful `push` and `merge_group` runs from 2026-08-20 to
+        # 2026-09-25, with a median under 4 - a spread of more than three, because these
+        # tests wait on external services (Databricks, Oracle Cloud, S3) whose latency is
+        # not ours. The bound is set well above the worst case rather than close to it for
+        # that reason, and below the job's so a wedge here is attributed to this step
+        # rather than to the job.
         #
         # The snapshot steps after it are deliberately not reached when this one fails: their
         # conditions carry no status function, so GitHub applies `success()` and a partial
@@ -516,6 +532,9 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.8 min (run
+    # 34948795744). The two bounded steps below sum to 32, and everything else
+    # in the job has taken at most 4.7 min in the same window.
     timeout-minutes: 40
     permissions:
       # GitHub's GraphQL stargazers connection rejects contents: read, including
@@ -634,7 +653,8 @@ jobs:
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 2 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.4 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 4.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -696,7 +716,8 @@ jobs:
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 9.0 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 6.7x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -762,7 +783,8 @@ jobs:
   test-snapshot-refresh:
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 5.5x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -822,7 +844,8 @@ jobs:
   test-data-components:
     name: Data Components Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
+    # 60 is kept deliberately as a stuck-runner backstop, 8.0x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
@@ -875,7 +898,8 @@ jobs:
   test-runtime-partition:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
-    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).
+    # 60 is kept deliberately as a stuck-runner backstop, 7.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
