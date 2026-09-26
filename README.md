@@ -24,12 +24,12 @@
   <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a> | <a href="https://github.com/spiceai/skills">🤖 AI Skills</a> | <a href="https://spice.ai/blog">📰 Blog</a>
 </p>
 
-**Spice** (Spice.ai Open Source) is a data and AI engine that brings your data to your application. Connect it to the databases, data warehouses, data lakes, and APIs you already use, and it serves that data to your applications and AI agents through standard APIs — with SQL query, search, and LLM inference built in. Queries return in **milliseconds** because Spice keeps a local, continuously refreshed copy of the data your application needs, so your production systems don't take the load.
+**Spice** (Spice.ai Open Source) is a data and AI engine that brings your data to your application. Connect it to the databases, data warehouses, data lakes, and APIs you already use, and it serves that data to your applications and AI agents through standard APIs — with SQL query, search, and LLM inference built in. Queries on an accelerated dataset return in **milliseconds** because Spice keeps a local, continuously refreshed copy of it, so your production systems don't take the load. Other datasets are queried in place at the source, with query push-down.
 
 **How it works:**
 
 1. **Connect** — Declare datasets from 30+ sources (PostgreSQL, MySQL, Snowflake, Databricks, S3, Iceberg, and more) in one YAML file, `spicepod.yaml`.
-2. **Accelerate** — Spice materializes the data your application uses in memory or on local disk, and keeps it fresh with scheduled refreshes or real-time change data capture (CDC).
+2. **Accelerate (optional, per dataset)** — Spice materializes the datasets you choose in memory or on local disk, and keeps them fresh with scheduled refreshes or real-time change data capture (CDC).
 3. **Query, search, and infer** — Your application queries with SQL over HTTP, Arrow Flight SQL, JDBC, ODBC, or ADBC; searches with vector, full-text, or hybrid search; and calls LLMs through OpenAI-compatible APIs and MCP — all over the same data.
 
 Spice is a single binary written in Rust on Apache DataFusion, Apache Arrow, and Vortex. Run it next to your application as a sidecar, as a standalone service, or as a multi-node distributed cluster. This repository contains the Apache-2.0 runtime (`spiced`) and CLI (`spice`); [Spice.ai Cloud](https://spice.ai) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise) are optional managed and enterprise distributions built on it.
