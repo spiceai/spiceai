@@ -686,14 +686,24 @@ fn filter_additions_for_join(
 
     let mut pair_columns: HashMap<(usize, usize), BTreeSet<String>> = HashMap::new();
     for (left_key, right_key) in hash_join.on() {
-        let Some(left_column) = physical_column_name(left_key) else {
+        let Some(left_key) = left_key.downcast_ref::<Column>() else {
             continue;
         };
-        let Some(right_column) = physical_column_name(right_key) else {
+        let Some(right_key) = right_key.downcast_ref::<Column>() else {
             continue;
         };
 
-        if left_column != right_column {
+        // A dynamic filter on one scan constrains the other only if each join key
+        // carries that scan column's values. A key with the right name can hold
+        // anything else (`t.c + 1 AS c`, or a `UNION` of two tables), so resolve
+        // each key to the scan column it actually reads.
+        let (Some((left_identity, scan_column)), Some((right_identity, right_scan_column))) = (
+            scan_column_lineage(hash_join.left(), left_key.index()),
+            scan_column_lineage(hash_join.right(), right_key.index()),
+        ) else {
+            continue;
+        };
+        if left_identity != right_identity || scan_column != right_scan_column {
             continue;
         }
 
@@ -701,20 +711,22 @@ fn filter_additions_for_join(
             &left_scans,
             &right_scans,
             &right_scans_by_identity,
-            left_column,
-            right_column,
+            &scan_column,
+            &scan_column,
         );
         let [(left_index, right_index)] = matching_pairs.as_slice() else {
             continue;
         };
-        if left_scans[*left_index].schema_fields != right_scans[*right_index].schema_fields {
+        if left_scans[*left_index].identity != left_identity
+            || left_scans[*left_index].schema_fields != right_scans[*right_index].schema_fields
+        {
             continue;
         }
 
         pair_columns
             .entry((*left_index, *right_index))
             .or_default()
-            .insert(left_column.to_string());
+            .insert(scan_column);
     }
 
     let mut left_additions = Vec::new();
@@ -1669,6 +1681,85 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
     for child in plan.children() {
         collect_cayenne_scans_inner(child, scans);
     }
+}
+
+/// The Cayenne scan and the column of it that produce output column `index` of
+/// `plan`, found by following the column down through operators that pass it
+/// through with its values unchanged: a projection of a bare column, a filter, a
+/// group-by key, either input of a hash join, and the order-, partitioning- and
+/// batching-only operators. Any other operator ends the walk with `None`: a
+/// computed column, a `UNION` (its values come from several inputs), or an
+/// operator not listed here. Filters and joins below the column only remove rows,
+/// which does not change where the surviving values come from.
+#[expect(deprecated)]
+fn scan_column_lineage(
+    plan: &Arc<dyn ExecutionPlan>,
+    index: usize,
+) -> Option<(Arc<ScanIdentity>, String)> {
+    if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>() {
+        let identity = cayenne.scan_identity()?;
+        let name = cayenne.schema().fields().get(index)?.name().clone();
+        return Some((identity, name));
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let column = projection.expr().get(index)?.expr.downcast_ref::<Column>()?;
+        return scan_column_lineage(projection.input(), column.index());
+    }
+    if let Some(filter) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
+        let input_index = match filter.projection() {
+            Some(projection) => *projection.get(index)?,
+            None => index,
+        };
+        return scan_column_lineage(filter.input(), input_index);
+    }
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        let (group_key, _) = aggregate.group_expr().expr().get(index)?;
+        let column = group_key.downcast_ref::<Column>()?;
+        return scan_column_lineage(aggregate.input(), column.index());
+    }
+    if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() {
+        let joined_index = match &hash_join.projection {
+            Some(projection) => *projection.get(index)?,
+            None => index,
+        };
+        let left_width = hash_join.left().schema().fields().len();
+        return match hash_join.join_type() {
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
+                if joined_index < left_width {
+                    scan_column_lineage(hash_join.left(), joined_index)
+                } else {
+                    scan_column_lineage(hash_join.right(), joined_index - left_width)
+                }
+            }
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+                scan_column_lineage(hash_join.left(), joined_index)
+            }
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
+                scan_column_lineage(hash_join.right(), joined_index)
+            }
+        };
+    }
+
+    let passes_columns_through = plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<datafusion_physical_plan::sorts::sort::SortExec>()
+        || plan.is::<datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>()
+        || plan.is::<datafusion_physical_plan::limit::GlobalLimitExec>()
+        || plan.is::<datafusion_physical_plan::limit::LocalLimitExec>()
+        || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
+        || plan.is::<BytesProcessedExec>()
+        || plan.is::<SchemaCastScanExec>()
+        || plan.is::<Int64PkDeletionFilterExec>()
+        || plan.is::<KeyBasedDeletionFilterExec>();
+    if !passes_columns_through {
+        return None;
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return None;
+    };
+    scan_column_lineage(child, index)
 }
 
 fn physical_column_name(expr: &Arc<dyn PhysicalExpr>) -> Option<&str> {
