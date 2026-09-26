@@ -46,7 +46,7 @@ use reqwest::{
     Client,
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
-use runtime_rate_control::{Permit, RateController};
+use runtime_rate_control::{Permit, RateController, RequestOutcome};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -1522,6 +1522,15 @@ impl HttpTableProvider {
         }
     }
 
+    /// Feed a request's outcome to the origin's rate limiter so an adaptive
+    /// controller can raise or lower the effective rate. A no-op for limiters
+    /// without adaptive control.
+    fn record_request_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
+        }
+    }
+
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -1635,15 +1644,33 @@ impl HttpTableProvider {
 
         let response = request_builder.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {e}");
+            // A timeout or connection error is a failure signal for adaptive
+            // rate control: the origin is unreachable or too slow, so admit
+            // fewer requests until it recovers.
+            self.record_request_outcome(RequestOutcome::Failure);
             RetryError::transient(RequestAttemptError::Failure(Error::HttpRequest {
                 source: e,
             }))
         })?;
 
-        let status_code = response.status().as_u16();
+        let status = response.status();
+        let status_code = status.as_u16();
         let response_headers = response.headers().clone();
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
+        // Classify the response for adaptive rate control:
+        // - retryable (408/429/5xx): a failure signal — the origin is struggling,
+        //   so admit fewer requests until it recovers.
+        // - 2xx: a success — the origin served the request under load.
+        // - anything else (a non-retryable 4xx such as 401/403/404): discarded, not
+        //   recorded. The origin answered promptly, but the failure is a
+        //   client/auth/config condition that throttling cannot remediate, so it
+        //   must move the coefficient in neither direction.
+        if crate::resilient_http::status_is_retryable(status) {
+            self.record_request_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_request_outcome(RequestOutcome::Success);
+        }
 
         if Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");

@@ -67,6 +67,7 @@ fn rps_config(rps: u32) -> HttpRateControlConfig {
         requests_per_minute: None,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
+        adaptive_rate_control: None,
     }
 }
 
@@ -165,4 +166,95 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
         observed_rps >= f64::from(cluster_rps) * 0.7,
         "combined observed {observed_rps:.1} RPS below 70% of cap {cluster_rps} (a={count_a} b={count_b})"
     );
+}
+
+/// Configuration validation for adaptive HTTP rate control.
+///
+/// These tests live here rather than in `data-http-rate-control` because they
+/// need a `ConnectorComponent`, which requires `runtime-component`; that crate
+/// must not carry a dependency on it. They exercise the public
+/// `ensure_adaptive_has_static_limit`.
+mod adaptive_config_validation {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use data_connector_api::{ConnectorComponent, DataConnectorError};
+    use data_http_rate_control::{
+        AdaptiveRateControl, HttpRateControlConfig, ensure_adaptive_has_static_limit,
+    };
+    use runtime_component::dataset::DatasetSpec;
+
+    fn test_component() -> ConnectorComponent {
+        ConnectorComponent::Dataset(Arc::new(DatasetSpec::new(
+            "https://origin.example.com/data",
+            "adaptive_rate_control_test".into(),
+        )))
+    }
+
+    fn adaptive_config(
+        adaptive: Option<AdaptiveRateControl>,
+        requests_per_second: Option<u32>,
+    ) -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            max_concurrent_requests: None,
+            requests_per_second: requests_per_second
+                .map(|rps| NonZeroU32::new(rps).expect("test rps must be non-zero")),
+            requests_per_minute: None,
+            jitter_min: Duration::ZERO,
+            jitter_max: Duration::ZERO,
+            adaptive_rate_control: adaptive,
+        }
+    }
+
+    #[test]
+    fn adaptive_enabled_without_a_static_limit_is_a_config_error() {
+        let component = test_component();
+        let adaptive = AdaptiveRateControl::new(0.5, Duration::from_secs(10))
+            .expect("test control should be valid");
+        let error = ensure_adaptive_has_static_limit(
+            &adaptive_config(Some(adaptive), None),
+            &component,
+            "https",
+        )
+        .expect_err("adaptive control with no static rate limit must be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("adaptive_rate_control"),
+                    "message must name the parameter: {message}"
+                );
+                assert!(
+                    message.contains("requests_per_second_limit")
+                        && message.contains("max_concurrent_requests"),
+                    "message must name the fix: {message}"
+                );
+                assert!(
+                    message.contains("spiceai.org/docs"),
+                    "message must include a docs link: {message}"
+                );
+            }
+            other => panic!("expected an invalid-configuration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adaptive_enabled_with_a_static_limit_is_accepted() {
+        let component = test_component();
+        let adaptive = AdaptiveRateControl::new(0.75, Duration::from_secs(10))
+            .expect("test control should be valid");
+        ensure_adaptive_has_static_limit(
+            &adaptive_config(Some(adaptive), Some(10)),
+            &component,
+            "https",
+        )
+        .expect("adaptive control with a static limit is a valid configuration");
+    }
+
+    #[test]
+    fn disabled_adaptive_needs_no_static_limit() {
+        ensure_adaptive_has_static_limit(&adaptive_config(None, None), &test_component(), "https")
+            .expect("disabled adaptive control requires no static limit");
+    }
 }
