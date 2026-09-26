@@ -557,15 +557,23 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 ///
 /// This is kept outside clap's `requires = "cloud"` relationship so the CLI
 /// can explain what the region selects and how to correct the invocation.
+/// `spice connect` never takes `--cloud`: it enrolls the directory rather than
+/// querying a runtime, so advising `--cloud` there would send the user to a
+/// flag that does nothing for them.
 fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
     if cli.cloud_region.is_none() || cli.cloud {
         return Ok(());
     }
+    let message = if matches!(cli.command, Commands::Connect(_)) {
+        "--cloud-region does not apply to spice connect: it selects the Spice.ai Cloud region \
+         that --cloud queries, and connect enrolls this directory rather than querying a \
+         runtime. Drop it."
+    } else {
+        "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to query. Pass \
+         --cloud alongside it to target Spice.ai Cloud, or drop it to use the local runtime."
+    };
     Err(spice::error::Error::InvalidArgument {
-        message: "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to \
-                  query. Pass --cloud alongside it to target Spice.ai Cloud, or drop it to use \
-                  the local runtime."
-            .to_string(),
+        message: message.to_string(),
     })
 }
 
@@ -959,8 +967,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(add::execute(&ctx, args))?;
         }
-        Commands::Connect(mut args) => {
-            args.cloud_region.clone_from(&cli.cloud_region);
+        Commands::Connect(args) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;
@@ -1380,17 +1387,21 @@ mod tests {
         assert!(message.contains("--cloud-region"), "{message}");
     }
 
-    /// `connect` is exempt from the `--cloud` requirement here so it can
-    /// diagnose the flag itself: clap's "missing --cloud" would be the wrong
-    /// answer for what is really a confusion with `--region`/`--endpoint`. The
-    /// command's own refusal is covered in `cli_integration`.
+    /// `connect` has no `--cloud` to add, so its refusal names the command
+    /// and tells the user to drop the flag instead of advising `--cloud`.
     #[test]
-    fn cloud_region_is_left_to_connect_to_diagnose() {
-        let cli = parse_normalized(&["spice", "connect", "status", "--cloud-region", "us-west-2"]);
+    fn cloud_region_on_connect_is_refused_without_cloud_advice() {
+        let cli = parse_normalized(&["spice", "connect", "org/pod", "--cloud-region", "us-west-2"]);
         assert!(!cli.cloud);
         assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
-        validate_cloud_region_usage(&cli)
-            .expect("connect refuses the flag itself, with a better message");
+        let Err(error) = validate_cloud_region_usage(&cli) else {
+            panic!("cloud-region on connect should be rejected");
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("spice connect"), "{message}");
+        assert!(message.contains("Drop it"), "{message}");
+        assert!(!message.contains("Pass --cloud"), "{message}");
     }
 
     #[test]
