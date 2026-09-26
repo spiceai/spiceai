@@ -2529,9 +2529,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl<V: AsTableRefs + Clone + Send + Sync + 'static> CacheProvider<V>
-        for RecordingCache<V>
-    {
+    impl<V: AsTableRefs + Clone + Send + Sync + 'static> CacheProvider<V> for RecordingCache<V> {
         async fn get_raw_key(&self, _key: &u64) -> Option<Arc<V>> {
             None
         }
@@ -2565,12 +2563,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl<V: AsTableRefs + Clone + Send + Sync + 'static> TabledCacheProvider<V>
-        for RecordingCache<V>
-    {
+    impl<V: AsTableRefs + Clone + Send + Sync + 'static> TabledCacheProvider<V> for RecordingCache<V> {
         async fn invalidate_for_table(&self, _table_ref: TableReference) -> Result<()> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fails {
                 Err(Error::FailedToInvalidateCacheGeneric {
                     source: moka::PredicateError::InvalidationClosuresDisabled,
@@ -2579,11 +2574,7 @@ mod tests {
                 Ok(())
             }
         }
-        fn tables_changed_since(
-            &self,
-            _tables: &HashSet<TableReference>,
-            _since: Instant,
-        ) -> bool {
+        fn tables_changed_since(&self, _tables: &HashSet<TableReference>, _since: Instant) -> bool {
             false
         }
     }
