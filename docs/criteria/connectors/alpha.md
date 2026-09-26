@@ -14,7 +14,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Cosmos DB (NoSQL)                | ✅             | @lukekim        |
 | Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
 | Databricks (mode: spark_connect) | ✅             | @Sevenannn      |
-| Databricks (mode: sql_warehouse) | ➖             |                 |
+| Databricks (mode: sql_warehouse) | ✅             | @lukekim        |
 | Debezium                         | ➖             |                 |
 | CDC (Debezium push ingest)       | ➖             |                 |
 | Delta Lake                       | ✅             | @Sevenannn      |
@@ -30,12 +30,12 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | GitHub                           | ✅             | @peasee         |
 | Glue                             | ✅             | @kczimm         |
 | GraphQL                          | ✅             | @peasee         |
-| HTTP/HTTPS                       | ➖             |                 |
+| HTTP/HTTPS                       | ✅             | @lukekim        |
 | Iceberg                          | ✅             | @phillipleblanc |
 | IMAP                             | ✅             | @peasee         |
 | Kafka                            | ✅             | @sgrebnov       |
-| Localpod                         | ➖             |                 |
-| MongoDB                          | ➖             |                 |
+| Localpod                         | ✅             | @lukekim        |
+| MongoDB                          | ✅             | @lukekim        |
 | MS SQL                           | ✅             | @peasee         |
 | MySQL                            | ✅             | @peasee         |
 | NFS                              | ➖             |                 |

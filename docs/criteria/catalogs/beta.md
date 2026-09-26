@@ -12,7 +12,7 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 | Cayenne       | ➖            |                 |
 | Databricks    | ✅            | @Sevenannn      |
 | DuckLake      | ✅            | @sgrebnov       |
-| Glue          | ➖            |                 |
+| Glue          | ✅            | @lukekim        |
 | Iceberg       | ✅            | @phillipleblanc |
 | MS SQL        | ➖            |                 |
 | MySQL         | ➖            |                 |
