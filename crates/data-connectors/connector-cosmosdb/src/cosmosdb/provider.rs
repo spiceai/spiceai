@@ -25,7 +25,9 @@ limitations under the License.
 //! This is an RC-quality implementation with the following current
 //! limitations:
 //! * Read-only (no INSERT / UPDATE / DELETE).
-//! * Cross-partition scan only — no filter or projection push-down.
+//! * Projection and filter push-down apply only to the default query; a custom
+//!   `query` is run as written and filtered locally. Pushed filters are
+//!   supersets that `DataFusion` filters again (see [`super::filter`]).
 //! * Schema inferred from a sample; pin the schema via the dataset
 //!   `columns:` spicepod property when stability is required.
 //! * Retries/backoff apply to the schema-inference pass only; mid-stream
@@ -45,6 +47,7 @@ use datafusion::common::{Result as DataFusionResult, project_schema};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::{
@@ -58,7 +61,9 @@ use serde_json::Value;
 use snafu::ResultExt;
 
 use azure_data_cosmos::clients::ContainerClient;
+use azure_data_cosmos::{PartitionKey, Query};
 
+use super::filter::{Parameters, Translator, is_null_predicate, property};
 use super::resilience::{CosmosResilienceConfig, ResilienceError, run_with_resilience};
 use super::schema::{infer_schema, strip_system_fields};
 use super::{DEFAULT_SCHEMA_INFER_MAX_RECORDS, EmptyContainerSnafu, Error, JsonDecodeSnafu};
@@ -125,6 +130,9 @@ pub struct CosmosDBTableProvider {
     endpoint: Arc<str>,
     config: Arc<CosmosDBTableProviderConfig>,
     schema: SchemaRef,
+    /// The container's partition key, when it is one top-level property: a
+    /// query with an equality on it reads that logical partition alone.
+    partition_key_column: Option<String>,
 }
 
 impl std::fmt::Debug for CosmosDBTableProvider {
@@ -179,12 +187,24 @@ impl CosmosDBTableProvider {
             &config.container,
         )?;
 
+        let partition_key_column = partition_key_column(&container_client).await;
+
         Ok(Self {
             container_client,
             endpoint,
             config: Arc::new(config),
             schema,
+            partition_key_column,
         })
+    }
+
+    /// Whether scans may rewrite the query: only the default one, which a
+    /// projection and conditions extend without changing what it means.
+    fn pushes_down(&self) -> bool {
+        self.config
+            .query
+            .trim()
+            .eq_ignore_ascii_case(super::DEFAULT_QUERY)
     }
 
     #[must_use]
@@ -311,10 +331,26 @@ impl TableProvider for CosmosDBTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(&self.schema, projection)?;
+
+        let (query, decode) = if self.pushes_down() {
+            (
+                self.pushed_down_query(&projected_schema, filters),
+                Decode::Projected,
+            )
+        } else {
+            (
+                CosmosQuery {
+                    text: self.config.query.clone(),
+                    parameters: Vec::new(),
+                    partition_key: None,
+                },
+                Decode::Full(projection.cloned()),
+            )
+        };
 
         Ok(Arc::new(CosmosDBExec::new(
             self.container_client.clone(),
@@ -322,9 +358,148 @@ impl TableProvider for CosmosDBTableProvider {
             Arc::clone(&self.config),
             Arc::clone(&self.schema),
             projected_schema,
-            projection.cloned(),
+            query,
+            decode,
+            limit,
         )))
     }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        if !self.pushes_down() {
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
+        let translator = Translator::new(&self.schema);
+        Ok(filters.iter().map(|f| translator.classify(f)).collect())
+    }
+}
+
+impl CosmosDBTableProvider {
+    /// `SELECT` of the projected properties `WHERE` the filters' conditions,
+    /// read from one logical partition when a filter fixes the partition key.
+    fn pushed_down_query(&self, projected: &SchemaRef, filters: &[Expr]) -> CosmosQuery {
+        let translator = Translator::new(&self.schema);
+        let mut parameters = Parameters::default();
+        // A document with none of the projected properties still counts as a
+        // row; `id` is on every document, so an empty projection reads it.
+        let columns: Vec<String> = if projected.fields().is_empty() {
+            vec![property("id")]
+        } else {
+            projected
+                .fields()
+                .iter()
+                .map(|f| property(f.name()))
+                .collect()
+        };
+        let conditions: Vec<String> = filters
+            .iter()
+            .filter_map(|f| translator.condition(f, &mut parameters))
+            .collect();
+        let mut text = format!("SELECT {} FROM c", columns.join(", "));
+        if !conditions.is_empty() {
+            text.push_str(" WHERE ");
+            text.push_str(&conditions.join(" AND "));
+        }
+        CosmosQuery {
+            text,
+            parameters: parameters.into_named(),
+            partition_key: self.partition_key_value(filters),
+        }
+    }
+
+    /// The partition-key value a filter fixes, as a string equality on the
+    /// partition-key column. Documents with that value all live in its
+    /// logical partition, so reading it alone keeps every row the filter does.
+    fn partition_key_value(&self, filters: &[Expr]) -> Option<String> {
+        use datafusion::logical_expr::{BinaryExpr, Operator};
+        use datafusion::scalar::ScalarValue;
+
+        let column = self.partition_key_column.as_deref()?;
+        let is_string_column = self
+            .schema
+            .field_with_name(column)
+            .is_ok_and(|f| f.data_type() == &DataType::Utf8);
+        if !is_string_column {
+            return None;
+        }
+        filters.iter().find_map(|filter| {
+            // Only the other side of a NULL disjunct can be true.
+            let mut filter = filter;
+            while let Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Or,
+                right,
+            }) = filter
+            {
+                filter = match (is_null_predicate(left), is_null_predicate(right)) {
+                    (false, true) => left,
+                    (true, false) => right,
+                    _ => return None,
+                };
+            }
+            let Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) = filter
+            else {
+                return None;
+            };
+            let ((Expr::Column(c), Expr::Literal(ScalarValue::Utf8(Some(v)), _))
+            | (Expr::Literal(ScalarValue::Utf8(Some(v)), _), Expr::Column(c))) =
+                (left.as_ref(), right.as_ref())
+            else {
+                return None;
+            };
+            (c.name == column).then(|| v.clone())
+        })
+    }
+}
+
+/// The partition key of the container `client` addresses, when it is a single
+/// top-level property. Best-effort: without it every query reads across
+/// partitions, which is what it does anyway.
+async fn partition_key_column(client: &ContainerClient) -> Option<String> {
+    let properties = match client
+        .read(None)
+        .await
+        .and_then(azure_core::http::Response::into_model)
+    {
+        Ok(properties) => properties,
+        Err(error) => {
+            tracing::debug!(%error, "Could not read the Azure Cosmos DB container's partition key; queries read across partitions.");
+            return None;
+        }
+    };
+    let [path] = properties.partition_key.paths.as_slice() else {
+        return None;
+    };
+    let name = path.strip_prefix('/')?;
+    // A nested path, or an escaped one, names no top-level column.
+    (!name.is_empty() && !name.contains(['/', '~'])).then(|| name.to_string())
+}
+
+/// The query a scan runs.
+#[derive(Debug, Clone)]
+struct CosmosQuery {
+    text: String,
+    parameters: Vec<(String, Value)>,
+    /// The logical partition to read, or every one.
+    partition_key: Option<String>,
+}
+
+/// How documents become rows.
+#[derive(Debug, Clone)]
+enum Decode {
+    /// Documents hold the projected properties; decode them as they are.
+    Projected,
+    /// Documents are whole; decode the full schema, then take these columns.
+    Full(Option<Vec<usize>>),
 }
 
 /// [`ExecutionPlan`] that streams documents from a Cosmos DB container and
@@ -337,18 +512,24 @@ struct CosmosDBExec {
     full_schema: SchemaRef,
     /// Schema presented to `DataFusion` after projection.
     projected_schema: SchemaRef,
-    projection: Option<Vec<usize>>,
+    query: CosmosQuery,
+    decode: Decode,
+    /// The most rows to read.
+    limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
 
 impl CosmosDBExec {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         container_client: ContainerClient,
         endpoint: Arc<str>,
         config: Arc<CosmosDBTableProviderConfig>,
         full_schema: SchemaRef,
         projected_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
+        query: CosmosQuery,
+        decode: Decode,
+        limit: Option<usize>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
@@ -362,7 +543,9 @@ impl CosmosDBExec {
             config,
             full_schema,
             projected_schema,
-            projection,
+            query,
+            decode,
+            limit,
             properties,
         }
     }
@@ -373,7 +556,7 @@ impl std::fmt::Debug for CosmosDBExec {
         f.debug_struct("CosmosDBExec")
             .field("database", &self.config.database)
             .field("container", &self.config.container)
-            .field("query", &self.config.query)
+            .field("query", &self.query.text)
             .finish_non_exhaustive()
     }
 }
@@ -383,8 +566,24 @@ impl DisplayAs for CosmosDBExec {
         write!(
             f,
             "CosmosDBExec: database={}, container={}, query={}",
-            self.config.database, self.config.container, self.config.query
-        )
+            self.config.database, self.config.container, self.query.text
+        )?;
+        if !self.query.parameters.is_empty() {
+            let parameters: Vec<String> = self
+                .query
+                .parameters
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect();
+            write!(f, ", parameters=[{}]", parameters.join(", "))?;
+        }
+        if let Some(partition_key) = &self.query.partition_key {
+            write!(f, ", partition_key={partition_key:?}")?;
+        }
+        if let Some(limit) = self.limit {
+            write!(f, ", limit={limit}")?;
+        }
+        Ok(())
     }
 }
 
@@ -424,7 +623,10 @@ impl ExecutionPlan for CosmosDBExec {
         let endpoint = Arc::clone(&self.endpoint);
         let config = Arc::clone(&self.config);
         let full_schema = Arc::clone(&self.full_schema);
-        let projection = self.projection.clone();
+        let projected_schema = Arc::clone(&self.projected_schema);
+        let query = self.query.clone();
+        let decode = self.decode.clone();
+        let limit = self.limit;
 
         builder.spawn(async move {
             if config.resilience.disabled.load(Ordering::Acquire) {
@@ -473,21 +675,41 @@ impl ExecutionPlan for CosmosDBExec {
                 })
             };
 
+            let mut request = Query::from(query.text.as_str());
+            for (name, value) in &query.parameters {
+                request = request
+                    .with_parameter(name.clone(), value)
+                    .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
+            }
+            let partition_key = match &query.partition_key {
+                Some(value) => PartitionKey::from(value.clone()),
+                None => PartitionKey::EMPTY,
+            };
             let mut pager = container_client
-                .query_items::<Value>(config.query.as_str(), (), None)
+                .query_items::<Value>(request, partition_key, None)
                 .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
-            let mut buffer: Vec<Value> = Vec::with_capacity(STREAM_BATCH_SIZE);
+            let to_batch = |docs: &[Value]| match &decode {
+                Decode::Projected => decode_batch(docs, &projected_schema, None),
+                Decode::Full(projection) => decode_batch(docs, &full_schema, projection.as_deref()),
+            };
+            let limit = limit.unwrap_or(usize::MAX);
+            let batch_size = limit.clamp(1, STREAM_BATCH_SIZE);
+            let mut buffer: Vec<Value> = Vec::with_capacity(batch_size);
+            let mut read = 0_usize;
 
-            while let Some(item) = pager.next().await {
+            while read < limit {
+                let Some(item) = pager.next().await else {
+                    break;
+                };
                 let doc =
                     item.map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
                 buffer.push(strip_system_fields(doc));
+                read += 1;
 
-                if buffer.len() >= STREAM_BATCH_SIZE {
-                    let batch = decode_batch(&buffer, &full_schema, projection.as_deref())
-                        .map_err(to_df_error)?;
+                if buffer.len() >= batch_size {
+                    let batch = to_batch(&buffer).map_err(to_df_error)?;
                     buffer.clear();
                     if tx.send(Ok(batch)).await.is_err() {
                         // Receiver dropped; stop scanning.
@@ -497,8 +719,7 @@ impl ExecutionPlan for CosmosDBExec {
             }
 
             if !buffer.is_empty() {
-                let batch = decode_batch(&buffer, &full_schema, projection.as_deref())
-                    .map_err(to_df_error)?;
+                let batch = to_batch(&buffer).map_err(to_df_error)?;
                 let _ = tx.send(Ok(batch)).await;
             }
 
@@ -514,6 +735,15 @@ fn decode_batch(
     full_schema: &SchemaRef,
     projection: Option<&[usize]>,
 ) -> Result<RecordBatch, Error> {
+    // With no column to decode, the documents are only counted.
+    if full_schema.fields().is_empty() {
+        return RecordBatch::try_new_with_options(
+            Arc::clone(full_schema),
+            vec![],
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(docs.len())),
+        )
+        .context(JsonDecodeSnafu);
+    }
     // Hand the Value slice directly to arrow-json's serde-aware decoder,
     // avoiding the NDJSON serialize -> parse round-trip.
     let mut decoder = ReaderBuilder::new(Arc::clone(full_schema))

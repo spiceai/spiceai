@@ -38,7 +38,7 @@ use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
     Client as DbClient,
     error::SdkError,
-    types::{AttributeValue, KeyType, TableStatus},
+    types::{AttributeValue, KeyType, ScalarAttributeType, TableDescription, TableStatus},
 };
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
 use data_components::cdc::ChangeBatch;
@@ -49,9 +49,13 @@ use datafusion::common::{Constraint, Constraints, DFSchema};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::datasource::sink::DataSinkExec;
+use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{
     LogicalPlanBuilder, TableProviderFilterPushDown, dml::InsertOp, ident,
 };
+use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::prelude::SessionContext;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -101,11 +105,48 @@ const DEFAULT_PARTITIONS: usize = 8;
 
 struct TableMetadata {
     schema: SchemaRef,
-    partition_key: String,
-    sort_key: Option<String>,
+    keys: TableKeys,
     flattened_fields: HashSet<String>,
     item_count: Option<i64>,
     streams_enabled: bool,
+}
+
+/// A table's primary key attributes and their types.
+struct TableKeys {
+    partition_key: String,
+    partition_key_type: Option<ScalarAttributeType>,
+    sort_key: Option<String>,
+    sort_key_type: Option<ScalarAttributeType>,
+}
+
+impl TableKeys {
+    fn of(table: &TableDescription) -> Result<Self> {
+        let mut partition_key = None;
+        let mut sort_key = None;
+        for key in table.key_schema() {
+            match key.key_type() {
+                KeyType::Hash => partition_key = Some(key.attribute_name().to_string()),
+                KeyType::Range => sort_key = Some(key.attribute_name().to_string()),
+                _ => {}
+            }
+        }
+        let Some(partition_key) = partition_key else {
+            return Err(Error::MissingPartitionKey);
+        };
+        let type_of = |name: &str| {
+            table
+                .attribute_definitions()
+                .iter()
+                .find(|definition| definition.attribute_name() == name)
+                .map(|definition| definition.attribute_type().clone())
+        };
+        Ok(Self {
+            partition_key_type: type_of(&partition_key),
+            sort_key_type: sort_key.as_deref().and_then(type_of),
+            partition_key,
+            sort_key,
+        })
+    }
 }
 
 impl DynamoDBTableProvider {
@@ -141,8 +182,7 @@ impl DynamoDBTableProvider {
 
         let TableMetadata {
             schema: table_schema,
-            partition_key,
-            sort_key,
+            keys,
             flattened_fields,
             item_count: table_total_item_count,
             streams_enabled,
@@ -178,11 +218,18 @@ impl DynamoDBTableProvider {
         let table_schema = DynamoDBTableSchema::new(
             table_name,
             table_schema,
-            partition_key,
-            sort_key,
+            keys.partition_key,
+            keys.sort_key,
             flattened_fields,
             &time_format,
-        );
+        )
+        .with_key_types(keys.partition_key_type, keys.sort_key_type)
+        .with_catch_all(
+            projection
+                .and_then(SchemaProjection::catch_all_name)
+                .map(str::to_string),
+        )
+        .with_unnest_depth(unnest_depth);
 
         // Create constraints with the primary key indices
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(table_schema.schema())) else {
@@ -243,8 +290,7 @@ impl DynamoDBTableProvider {
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
 
-        let (partition_key, sort_key) =
-            Self::fetch_table_keys(Arc::clone(&db_client), &table_name).await?;
+        let keys = Self::fetch_table_keys(Arc::clone(&db_client), &table_name).await?;
 
         let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
         let streams_client = Arc::new(
@@ -258,11 +304,12 @@ impl DynamoDBTableProvider {
         let table_schema = DynamoDBTableSchema::new(
             table_name,
             schema,
-            partition_key,
-            sort_key,
+            keys.partition_key,
+            keys.sort_key,
             HashSet::new(),
             &time_format,
-        );
+        )
+        .with_key_types(keys.partition_key_type, keys.sort_key_type);
 
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(table_schema.schema())) else {
             unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
@@ -304,11 +351,8 @@ impl DynamoDBTableProvider {
         self.streams_enabled
     }
 
-    /// Fetch partition key and sort key from `DynamoDB` table metadata.
-    async fn fetch_table_keys(
-        db_client: Arc<DbClient>,
-        table_name: &str,
-    ) -> Result<(String, Option<String>)> {
+    /// Fetch the partition and sort key, and their types, from the table description.
+    async fn fetch_table_keys(db_client: Arc<DbClient>, table_name: &str) -> Result<TableKeys> {
         let response = db_client
             .describe_table()
             .table_name(table_name)
@@ -321,27 +365,7 @@ impl DynamoDBTableProvider {
             return TableDoesNotExistSnafu { table_name }.fail();
         };
 
-        let key_schema = table.key_schema();
-        let mut partition_key = None;
-        let mut sort_key = None;
-
-        for key in key_schema {
-            match key.key_type() {
-                KeyType::Hash => {
-                    partition_key = Some(key.attribute_name().to_string());
-                }
-                KeyType::Range => {
-                    sort_key = Some(key.attribute_name().to_string());
-                }
-                _ => {}
-            }
-        }
-
-        let Some(partition_key) = partition_key else {
-            return Err(Error::MissingPartitionKey);
-        };
-
-        Ok((partition_key, sort_key))
+        TableKeys::of(table)
     }
 
     async fn fetch_table_metadata(
@@ -374,26 +398,7 @@ impl DynamoDBTableProvider {
 
         let streams_enabled = table.latest_stream_arn.is_some();
 
-        let key_schema = table.key_schema();
-
-        let mut partition_key = None;
-        let mut sort_key = None;
-
-        for key in key_schema {
-            match key.key_type() {
-                KeyType::Hash => {
-                    partition_key = Some(key.attribute_name().to_string());
-                }
-                KeyType::Range => {
-                    sort_key = Some(key.attribute_name().to_string());
-                }
-                _ => {}
-            }
-        }
-
-        let Some(partition_key) = partition_key else {
-            return Err(Error::MissingPartitionKey);
-        };
+        let keys = TableKeys::of(table)?;
 
         let mut request = db_client.scan().table_name(table_name);
 
@@ -417,8 +422,7 @@ impl DynamoDBTableProvider {
                     );
                     Ok(TableMetadata {
                         schema,
-                        partition_key,
-                        sort_key,
+                        keys,
                         flattened_fields: HashSet::new(),
                         item_count: table.item_count,
                         streams_enabled,
@@ -462,8 +466,7 @@ impl DynamoDBTableProvider {
 
         Ok(TableMetadata {
             schema,
-            partition_key,
-            sort_key,
+            keys,
             flattened_fields,
             item_count: table.item_count,
             streams_enabled,
@@ -651,7 +654,7 @@ impl TableProvider for DynamoDBTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -685,10 +688,24 @@ impl TableProvider for DynamoDBTableProvider {
             .filter(|p| p.has_catch_all())
             .map(|p| p.static_fields().clone());
 
-        let request_plan = self.request_plan_builder.build_request_plan(
+        // What does not fit in one request is checked against the rows read,
+        // which then have to carry every column those filters reference and
+        // cannot stop at the limit.
+        let (remote, local) = self.request_plan_builder.split_within_limits(
             filters,
             &projected_schema,
-            limit,
+            json_nesting_static_fields.as_ref(),
+        )?;
+        let scan_schema = if local.is_empty() {
+            Arc::clone(&projected_schema)
+        } else {
+            Arc::clone(self.table_schema.schema())
+        };
+        let scan_limit = limit.filter(|_| local.is_empty());
+        let request_plan = self.request_plan_builder.build_request_plan(
+            &remote,
+            &scan_schema,
+            scan_limit,
             json_nesting_static_fields.as_ref(),
         )?;
 
@@ -698,14 +715,15 @@ impl TableProvider for DynamoDBTableProvider {
             request_plan
         );
 
-        let total_partitions = match request_plan {
-            // For Query request, always use 1 partition.
-            DynamoDBRequestPlan::Query(_) => 1,
+        let total_partitions = match &request_plan {
+            // One partition per partition-key value queried.
+            DynamoDBRequestPlan::Query(queries) => queries.len().max(1),
             DynamoDBRequestPlan::Scan(_) => {
                 self.config_partitions
                     // If `config_partitions` is empty (i.e. it was set to 'auto' in the config), use table size as a heuristic.
                     .unwrap_or_else(|| self.get_partitions_from_table_size())
             }
+            DynamoDBRequestPlan::Empty => 1,
         };
 
         tracing::debug!(
@@ -714,15 +732,58 @@ impl TableProvider for DynamoDBTableProvider {
             total_partitions
         );
 
-        Ok(Arc::new(DynamoDBTableProviderExec::new(
-            Arc::clone(&self.db_client),
-            request_plan,
-            self.unnest_depth,
-            projected_schema,
-            total_partitions,
-            self.table_schema.time_format(),
-            self.projection.clone(),
-        )))
+        // A sort-key order the Query can read in: a string key orders by its
+        // bytes, which is how Arrow orders the `Utf8` column, and is never NULL.
+        let orderable_sort_key = self
+            .table_schema
+            .sort_key()
+            .filter(|_| {
+                matches!(
+                    self.table_schema.sort_key_type(),
+                    Some(aws_sdk_dynamodb::types::ScalarAttributeType::S)
+                )
+            })
+            .filter(|sk| {
+                self.table_schema
+                    .schema()
+                    .field_with_name(sk)
+                    .is_ok_and(|f| f.data_type() == &arrow::datatypes::DataType::Utf8)
+            })
+            .map(ToString::to_string);
+
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            DynamoDBTableProviderExec::new(
+                Arc::clone(&self.db_client),
+                request_plan,
+                self.unnest_depth,
+                Arc::clone(&scan_schema),
+                total_partitions,
+                self.table_schema.time_format(),
+                self.projection.clone(),
+            )
+            .with_limit(scan_limit)
+            .with_orderable_sort_key(orderable_sort_key),
+        );
+        let Some(predicate) = conjunction(local) else {
+            return Ok(exec);
+        };
+        let df_schema = DFSchema::try_from(scan_schema.as_ref().clone())?;
+        let predicate = state.create_physical_expr(predicate, &df_schema)?;
+        // The limit is left to the plan above: a fetch on the filter would
+        // apply to each partition of the scan, not to the rows in all.
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, exec)?);
+        let columns = projected_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let index = scan_schema.index_of(field.name())?;
+                Ok(ProjectionExpr {
+                    expr: Arc::new(PhysicalColumn::new(field.name(), index)),
+                    alias: field.name().clone(),
+                })
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        Ok(Arc::new(ProjectionExec::try_new(columns, filtered)?))
     }
 
     fn supports_filters_pushdown(
@@ -796,6 +857,7 @@ impl TableProvider for DynamoDBTableProvider {
     }
 }
 
+#[derive(Clone)]
 pub struct DynamoDBTableProviderExec {
     client: Arc<DbClient>,
     request_plan: DynamoDBRequestPlan,
@@ -804,6 +866,10 @@ pub struct DynamoDBTableProviderExec {
     time_format: Arc<String>,
     properties: Arc<PlanProperties>,
     projection: Option<SchemaProjection>,
+    /// The most rows to read, per partition.
+    fetch: Option<usize>,
+    /// The sort key, when a Query can be read in its order.
+    orderable_sort_key: Option<String>,
 }
 
 impl DynamoDBTableProviderExec {
@@ -830,7 +896,39 @@ impl DynamoDBTableProviderExec {
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             )),
+            fetch: None,
+            orderable_sort_key: None,
         }
+    }
+
+    /// Stops reading once `limit` rows are read, and asks `DynamoDB` for no
+    /// more than that per request where no filter expression thins them.
+    #[must_use]
+    fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.fetch = limit;
+        let page = limit.and_then(|l| i32::try_from(l).ok());
+        match &mut self.request_plan {
+            DynamoDBRequestPlan::Query(queries) => {
+                // A filter expression or a residual thins what `Limit` counts.
+                for query in queries
+                    .iter_mut()
+                    .filter(|q| q.filter_expression.is_none() && q.residual.is_empty())
+                {
+                    query.limit = page;
+                }
+            }
+            DynamoDBRequestPlan::Scan(scan) if scan.filter_expression.is_none() => {
+                scan.limit = page;
+            }
+            DynamoDBRequestPlan::Scan(_) | DynamoDBRequestPlan::Empty => {}
+        }
+        self
+    }
+
+    #[must_use]
+    fn with_orderable_sort_key(mut self, sort_key: Option<String>) -> Self {
+        self.orderable_sort_key = sort_key;
+        self
     }
 }
 
@@ -874,6 +972,66 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         Ok(self)
     }
 
+    fn fetch(&self) -> Option<usize> {
+        // `fetch` limits each partition. Reported for several, it would read as
+        // a limit on their total, and the limit above them would be dropped.
+        self.fetch
+            .filter(|_| self.properties.partitioning.partition_count() == 1)
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // The limit applies to the rows across partitions, and each partition
+        // stops at it on its own, so this holds only with one partition.
+        if self.properties.partitioning.partition_count() != 1 {
+            return None;
+        }
+        Some(Arc::new(self.clone().with_limit(limit)))
+    }
+
+    /// A Query of one partition reads in sort-key order, ascending or, with
+    /// `ScanIndexForward` false, descending. A string sort key orders by its
+    /// bytes, as Arrow orders a `Utf8` column, and is never NULL, so the order
+    /// is exact.
+    fn try_pushdown_sort(
+        &self,
+        order: &[datafusion::physical_expr::PhysicalSortExpr],
+    ) -> DataFusionResult<
+        datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult<Arc<dyn ExecutionPlan>>,
+    > {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
+
+        let (Some(sort_key), DynamoDBRequestPlan::Query(queries)) =
+            (&self.orderable_sort_key, &self.request_plan)
+        else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let ([query], [sort]) = (queries.as_slice(), order) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let on_sort_key = sort
+            .expr
+            .downcast_ref::<PhysicalColumn>()
+            .is_some_and(|column| column.name() == sort_key);
+        if !on_sort_key {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        let mut exec = self.clone();
+        let mut query = query.clone();
+        query.scan_index_forward = Some(!sort.options.descending);
+        exec.request_plan = DynamoDBRequestPlan::Query(vec![query]);
+        let eq_properties = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&self.projected_schema),
+            vec![order.to_vec()],
+        );
+        exec.properties =
+            Arc::new(PlanProperties::clone(&self.properties).with_eq_properties(eq_properties));
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(exec),
+        })
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -884,10 +1042,10 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         let schema = Arc::clone(&self.projected_schema);
         let client = Arc::clone(&self.client);
-        let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
         let time_format = Arc::clone(&self.time_format);
         let projection = self.projection.clone();
+        let fetch = self.fetch;
 
         let total_partitions = match self.properties.partitioning {
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
@@ -906,12 +1064,24 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
             ))
         })?;
 
+        let request = match &self.request_plan {
+            DynamoDBRequestPlan::Query(queries) => match queries.get(partition) {
+                Some(query) => Request::Query(query.clone()),
+                None => Request::Nothing,
+            },
+            DynamoDBRequestPlan::Scan(scan) => Request::Scan(scan.clone()),
+            DynamoDBRequestPlan::Empty => Request::Nothing,
+        };
+
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
-            let item_stream =
-                build_stream_from_plan(&client, request_plan, segment, total_segments);
-            let chunked_stream = item_stream.chunks(CHUNK_SIZE);
+            let item_stream = build_stream_from_plan(&client, request, segment, total_segments);
+            // Stop reading at the limit; batch no more than it, so its rows are
+            // not held back waiting for a full chunk the limit never reaches.
+            let item_stream = item_stream.take(fetch.unwrap_or(usize::MAX));
+            let chunk_size = fetch.map_or(CHUNK_SIZE, |fetch| fetch.clamp(1, CHUNK_SIZE));
+            let chunked_stream = item_stream.chunks(chunk_size);
             pin_mut!(chunked_stream);
 
             while let Some(chunk) = chunked_stream.next().await {
@@ -944,15 +1114,23 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
     }
 }
 
+/// The request one partition of a scan issues.
+enum Request {
+    Query(QueryParams),
+    Scan(ScanParams),
+    Nothing,
+}
+
 #[deny(unused_variables)]
 fn build_stream_from_plan(
     client: &Arc<DbClient>,
-    request: DynamoDBRequestPlan,
+    request: Request,
     segment: i32,
     total_segments: i32,
 ) -> Pin<Box<DynamoDBItemStream>> {
     match request {
-        DynamoDBRequestPlan::Query(QueryParams {
+        Request::Nothing => Box::pin(stream::empty()),
+        Request::Query(QueryParams {
             table_name,
             key_condition_expression,
             filter_expression,
@@ -960,6 +1138,10 @@ fn build_stream_from_plan(
             expression_attribute_names,
             projection_expression,
             limit,
+            scan_index_forward,
+            residual,
+            sort_key,
+            sort_key_reading,
         }) => {
             let request = client
                 .query()
@@ -969,7 +1151,8 @@ fn build_stream_from_plan(
                 .set_expression_attribute_values(expression_attribute_values)
                 .set_expression_attribute_names(expression_attribute_names)
                 .set_projection_expression(projection_expression)
-                .set_limit(limit);
+                .set_limit(limit)
+                .set_scan_index_forward(scan_index_forward);
 
             let pagination_stream = TryFlatMap::new(request.into_paginator().send())
                 .flat_map(|output| output.items().to_vec());
@@ -981,9 +1164,25 @@ fn build_stream_from_plan(
                 })
             });
 
+            // The sort-key predicates the key condition could not state.
+            let stream = stream.filter(move |item| {
+                let keep = match item {
+                    Ok(item) if !residual.is_empty() => sort_key
+                        .as_ref()
+                        .and_then(|sk| item.get(sk))
+                        .is_some_and(|v| {
+                            residual.iter().all(|p| {
+                                crate::filter::satisfies(v, p, sort_key_reading) == Some(true)
+                            })
+                        }),
+                    _ => true,
+                };
+                futures::future::ready(keep)
+            });
+
             Box::pin(stream)
         }
-        DynamoDBRequestPlan::Scan(ScanParams {
+        Request::Scan(ScanParams {
             table_name,
             filter_expression,
             expression_attribute_values,
