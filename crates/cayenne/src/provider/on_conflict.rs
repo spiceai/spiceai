@@ -73,9 +73,9 @@ pub struct PreparedOnConflictDeletionPublish {
     /// kept separate from the file-deletion `deleted_pk_i64`/`deleted_row_keys`
     /// above (cycle-5 TASK 1). At finalize these — at `delete_sequence` — are the
     /// removal applied to the inline-cache base via `pending_tombstone_deltas`, so
-    /// they MUST be the inline keys (the tombstone's keys), NOT the file keys: a
-    /// file-conflict deletion never matches a cached inline row, so using the file
-    /// keys would fail to hide the old inline copy (a transient duplicate). Empty
+    /// they MUST be the inline keys (the tombstone's keys), NOT the file keys:
+    /// the file list can also contain conflicts that were never inline, so it
+    /// does not identify which cached rows the inline tombstone removes. Empty
     /// when the batch replaced no inline rows (then `inlined_delete_id` is `None`
     /// and no removal is enqueued). One of the two is always empty per PK strategy.
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
@@ -736,14 +736,16 @@ pub(crate) struct BatchValidationResult {
     /// file-local row positions. Empty unless `deletion_mode: position`.
     pub(crate) delete_specs: Vec<(Arc<str>, Vec<u64>)>,
     pub(crate) kept_keys: PkDigestSet,
-    /// File-backed Int64 PK values being deleted (for `Int64Pk` strategy).
+    /// Int64 PKs to tombstone in files (including mirrored inline conflicts).
     pub(crate) deleted_pk_i64: Vec<i64>,
-    /// File-backed row key bytes being deleted (for `RowConverterBased` strategy).
+    /// Row keys to tombstone in files (including mirrored inline conflicts).
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
     /// Inlined Int64 PK values being deleted.
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     /// Inlined row key bytes being deleted.
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    /// Inlined conflicts also recorded in the file list for a possible spill.
+    pub(crate) mirrored_inlined_keys: usize,
     /// Count of reinsert-over-tombstone resurrections among the keys above; see
     /// [`OnConflictDeletions::reinserted_over_tombstone`].
     pub(crate) reinserted_over_tombstone: usize,
@@ -882,14 +884,16 @@ pub(crate) struct OnConflictDeletions {
     /// Per-file position deletes: file path -> deleted file-local row positions.
     /// Routed to the position-vector write path; empty unless `deletion_mode: position`.
     pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
-    /// Deleted file-backed Int64 PK values (for `Int64Pk` strategy).
+    /// Int64 PKs to tombstone in files (including mirrored inline conflicts).
     pub(crate) deleted_pk_i64: Vec<i64>,
-    /// Deleted file-backed row keys (for `RowConverterBased` strategy).
+    /// Row keys to tombstone in files (including mirrored inline conflicts).
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
     /// Deleted inlined Int64 PK values.
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     /// Deleted inlined row keys.
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    /// Inlined conflicts encoded in both key lists; each supersedes one row.
+    pub(crate) mirrored_inlined_keys: usize,
     /// How many of the keys in the lists above are reinsert-over-tombstone
     /// resurrections (a key ABSENT from the visible existence index that still
     /// carried a pending DELETE tombstone) rather than supersedes of a live row.
@@ -920,6 +924,10 @@ impl OnConflictDeletions {
     /// conflicts with no key twin (the `PositionBased` strategy, whose key
     /// lists stay empty).
     ///
+    /// Inline conflicts mirrored into the file list are likewise counted once:
+    /// their file-list entry covers a checkpointed or spilled copy, not another
+    /// live row.
+    ///
     /// Reinsert-over-tombstone resurrections (`reinserted_over_tombstone`) are
     /// subtracted from BOTH the file-key and inline-key totals: a resurrected
     /// key sits in both a file and an inline list (to drive the reinsert marker)
@@ -934,7 +942,9 @@ impl OnConflictDeletions {
         let inline_key_deletes = (self.deleted_inlined_pk_i64.len()
             + self.deleted_inlined_row_keys.len())
         .saturating_sub(reinserts);
-        file_key_deletes + position_deletes.saturating_sub(file_key_deletes) + inline_key_deletes
+        file_key_deletes
+            + position_deletes.saturating_sub(file_key_deletes)
+            + inline_key_deletes.saturating_sub(self.mirrored_inlined_keys)
     }
 }
 
@@ -1261,6 +1271,7 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    mirrored_inlined_keys: usize,
     reinserted_over_tombstone: usize,
     post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     /// The checkout window `existing_keys` was taken under, held for the whole
@@ -1312,6 +1323,7 @@ impl OnConflictValidationStream {
             deleted_row_keys: Vec::new(),
             deleted_inlined_pk_i64: Vec::new(),
             deleted_inlined_row_keys: Vec::new(),
+            mirrored_inlined_keys: 0,
             reinserted_over_tombstone: 0,
             post_validation,
             pk_checkout,
@@ -1375,6 +1387,7 @@ impl OnConflictValidationStream {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
+            mirrored_inlined_keys,
             reinserted_over_tombstone,
         } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
 
@@ -1387,6 +1400,7 @@ impl OnConflictValidationStream {
         self.deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
         self.deleted_inlined_row_keys
             .extend(deleted_inlined_row_keys);
+        self.mirrored_inlined_keys += mirrored_inlined_keys;
         self.reinserted_over_tombstone += reinserted_over_tombstone;
 
         self.incoming_keys.extend(kept_keys.digests());
@@ -1418,6 +1432,7 @@ impl OnConflictValidationStream {
                 deleted_row_keys: std::mem::take(&mut self.deleted_row_keys),
                 deleted_inlined_pk_i64: std::mem::take(&mut self.deleted_inlined_pk_i64),
                 deleted_inlined_row_keys: std::mem::take(&mut self.deleted_inlined_row_keys),
+                mirrored_inlined_keys: self.mirrored_inlined_keys,
                 reinserted_over_tombstone: self.reinserted_over_tombstone,
             },
             validated_keys: std::mem::take(&mut self.kept_keys),

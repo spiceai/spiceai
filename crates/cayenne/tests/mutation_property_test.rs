@@ -1380,6 +1380,41 @@ async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
 }
 test_with_backends!(prop_sequential_memory_impl);
 
+// A memory-durable table can receive a durable write when CDC cannot use the
+// mem tier. Walk both write paths against one model, checking the physical row
+// count as well as the key/value map after every write.
+async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResult<()> {
+    let name = "mixed_memory_and_durable_upserts";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let mut model = Model::new();
+    let initial: Vec<(i64, i64)> = (0..8).map(|id| (id, 0)).collect();
+    upsert(&table, &initial, Durability::Memory).await?;
+    model.extend(initial);
+
+    let mut rng = Rng::new(14413);
+    for step in 0..24 {
+        let rows = random_rows(&mut rng, 8, 4);
+        let durability = if step % 2 == 0 {
+            Durability::File
+        } else {
+            Durability::Memory
+        };
+        upsert(&table, &rows, durability).await?;
+        model.extend(rows);
+        let message = format!("mixed upsert step {step} ({durability:?})");
+        let live = read_rows(&ctx, name).await?;
+        assert_converged(&live, &model, &message);
+        let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+        assert_eq!(
+            count,
+            i64::try_from(model.len()).expect("model size fits i64"),
+            "{message}: duplicate physical rows"
+        );
+    }
+    Ok(())
+}
+test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| {
