@@ -171,7 +171,10 @@ fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
         .iter()
         .flat_map(|predicate| split_conjunction(predicate))
         .collect();
-    if !conjuncts.iter().all(|conjunct| is_simple_comparison(conjunct)) {
+    if !conjuncts
+        .iter()
+        .all(|conjunct| is_simple_comparison(conjunct))
+    {
         return false;
     }
     let schema = scan.source.schema();
@@ -226,7 +229,9 @@ fn is_equality_on(expr: &Expr, column: &str) -> bool {
         return false;
     };
     match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(c), other) | (other, Expr::Column(c)) => c.name == column && is_constant(other),
+        (Expr::Column(c), other) | (other, Expr::Column(c)) => {
+            c.name == column && is_constant(other)
+        }
         _ => false,
     }
 }
@@ -354,7 +359,10 @@ impl OptimizerRule for SkippableOptimizerRule {
         }
     }
 
-    #[expect(deprecated, reason = "a wrapper forwards every trait method to the rule it wraps")]
+    #[expect(
+        deprecated,
+        reason = "a wrapper forwards every trait method to the rule it wraps"
+    )]
     fn supports_rewrite(&self) -> bool {
         self.0.supports_rewrite()
     }
@@ -436,28 +444,33 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from_iter_values(0..64)),
                 Arc::new(Int32Array::from_iter_values((0..64).map(|i| i % 4))),
-                Arc::new(StringArray::from_iter_values((0..64).map(|i| format!("n{i}")))),
+                Arc::new(StringArray::from_iter_values(
+                    (0..64).map(|i| format!("n{i}")),
+                )),
             ],
         )
         .expect("batch");
         let keyed = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])
             .expect("table")
-            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![
-                0,
-            ])]));
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
         let composite = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])
             .expect("table")
-            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![
-                1, 0,
-            ])]));
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![1, 0],
+            )]));
         let unkeyed = MemTable::try_new(schema, vec![vec![batch]]).expect("table");
 
         let mut builder = SessionStateBuilder::new().with_default_features();
         wrap_skippable_rules(&mut builder);
         let ctx = SessionContext::new_with_state(builder.build());
-        ctx.register_table("keyed", Arc::new(keyed)).expect("register");
-        ctx.register_table("composite", Arc::new(composite)).expect("register");
-        ctx.register_table("unkeyed", Arc::new(unkeyed)).expect("register");
+        ctx.register_table("keyed", Arc::new(keyed))
+            .expect("register");
+        ctx.register_table("composite", Arc::new(composite))
+            .expect("register");
+        ctx.register_table("unkeyed", Arc::new(unkeyed))
+            .expect("register");
         ctx
     }
 
