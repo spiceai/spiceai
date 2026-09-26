@@ -249,7 +249,8 @@ enum MemWriteOutcome {
     /// tier durable. The caller must take the durable path for this batch (its
     /// committer advances the slot per-batch, which is safe because the spill
     /// drained every prior mem batch to durable first). The re-streamed batches
-    /// + the held write guard are handed back, for the caller to re-validate.
+    /// and the held write guard are handed back; the caller must pass the stream
+    /// through `prepare_stream_for_insert` again.
     FallBackToDurable {
         stream: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
@@ -809,13 +810,6 @@ impl<'a> AppendMutationWriter<'a> {
             drain_start,
         );
 
-        let PostValidationState {
-            on_conflict_deletions,
-            validated_keys,
-        } = take_post_validation(post_validation);
-        let superseded =
-            u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
-
         // CAP CHECK + spill/fallback decision (OOM-safety, correctness item #2).
         //
         // 1. Per-table BYTE cap breached → spill (checkpoint) FIRST — double-
@@ -866,8 +860,6 @@ impl<'a> AppendMutationWriter<'a> {
                     "cdc_path_inmemory_fallback",
                     write_start,
                 );
-                // The caller re-validates this stream: the on-conflict deletions
-                // above were resolved before the spill moved their rows.
                 let stream = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                     .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
                 return Ok(MemWriteOutcome::FallBackToDurable {
@@ -876,6 +868,13 @@ impl<'a> AppendMutationWriter<'a> {
                 });
             }
         }
+
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+        let superseded =
+            u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
 
         // Append to the RAM tier under the listing fence. The reserved bytes stay
         // held (released by the checkpoint that flushes this epoch). On append

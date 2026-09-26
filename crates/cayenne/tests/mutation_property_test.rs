@@ -1380,9 +1380,26 @@ async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
 }
 test_with_backends!(prop_sequential_memory_impl);
 
+/// [`assert_converged`] plus a physical row count, which catches a duplicate
+/// row that `read_rows` would fold into the key/value map.
+async fn assert_converged_no_duplicates(
+    ctx: &SessionContext,
+    name: &str,
+    model: &Model,
+    message: &str,
+) -> TestResult<()> {
+    assert_converged(&read_rows(ctx, name).await?, model, message);
+    let count = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(
+        count,
+        i64::try_from(model.len()).expect("model size fits i64"),
+        "{message}: duplicate physical rows"
+    );
+    Ok(())
+}
+
 // A memory-durable table can receive a durable write when CDC cannot use the
-// mem tier. Walk both write paths against one model, checking the physical row
-// count as well as the key/value map after every write.
+// mem tier. Walk both write paths against one model after every write.
 async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResult<()> {
     let name = "mixed_memory_and_durable_upserts";
     let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
@@ -1402,58 +1419,48 @@ async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResul
         upsert(&table, &rows, durability).await?;
         model.extend(rows);
         let message = format!("mixed upsert step {step} ({durability:?})");
-        let live = read_rows(&ctx, name).await?;
-        assert_converged(&live, &model, &message);
-        let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
-        assert_eq!(
-            count,
-            i64::try_from(model.len()).expect("model size fits i64"),
-            "{message}: duplicate physical rows"
-        );
+        assert_converged_no_duplicates(&ctx, name, &model, &message).await?;
     }
     Ok(())
 }
 test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
 
-// The PK keyset can still record a checkpointed mem-tier key as inline, so a
-// durable upsert must hide the row the checkpoint moved into a file.
-async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestResult<()> {
-    let name = "durable_upsert_after_mem_tier_checkpoint";
+// A durable upsert of keys first written through the mem tier must hide the
+// old rows whether a checkpoint moves them into a file before the upsert or
+// after it.
+async fn durable_upsert_of_mem_tier_keys(
+    f: TestFixture,
+    name: &str,
+    checkpoint_first: bool,
+) -> TestResult<()> {
     let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
     let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
     upsert(&table, &old, Durability::Memory).await?;
-    assert_eq!(
-        table.checkpoint_mem_tier().await?,
-        100,
-        "the checkpoint must move every key to files"
-    );
+    if checkpoint_first {
+        assert_eq!(
+            table.checkpoint_mem_tier().await?,
+            100,
+            "{name}: the checkpoint must move every key to files"
+        );
+    }
     let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
     upsert(&table, &new, Durability::File).await?;
     let model: Model = new.into_iter().collect();
-    assert_converged(&read_rows(&ctx, name).await?, &model, name);
-    let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
-    assert_eq!(count, 100, "{name}: duplicate physical rows");
+    assert_converged_no_duplicates(&ctx, name, &model, name).await?;
+    if !checkpoint_first {
+        table.checkpoint_mem_tier().await?;
+        assert_converged_no_duplicates(&ctx, name, &model, &format!("{name} after checkpoint"))
+            .await?;
+    }
     Ok(())
+}
+async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "durable_upsert_after_mem_tier_checkpoint", true).await
+}
+async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
 }
 test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
-
-// A durable upsert of a key still in the mem tier supersedes that row; the
-// checkpoint that later moves the old row into a file must not revive it.
-async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
-    let name = "mem_tier_checkpoint_after_durable_upsert";
-    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
-    let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
-    upsert(&table, &old, Durability::Memory).await?;
-    let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
-    upsert(&table, &new, Durability::File).await?;
-    let model: Model = new.into_iter().collect();
-    assert_converged(&read_rows(&ctx, name).await?, &model, name);
-    table.checkpoint_mem_tier().await?;
-    assert_converged(&read_rows(&ctx, name).await?, &model, name);
-    let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
-    assert_eq!(count, 100, "{name}: duplicate physical rows");
-    Ok(())
-}
 test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

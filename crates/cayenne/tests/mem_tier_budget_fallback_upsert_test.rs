@@ -56,7 +56,10 @@ impl SlotAdvancer for NoopSlotAdvancer {
     async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
 }
 
-const KEYS: usize = 100;
+const KEYS: i64 = 100;
+
+/// `(rows served, distinct ids, rows whose value is stale, rows left in RAM)`.
+type Observed = (i64, i64, i64, u64);
 
 /// Where the superseded versions live when the fallback upsert arrives.
 #[derive(Clone, Copy, Debug)]
@@ -68,27 +71,19 @@ enum Prior {
     InlineAndMemTier,
 }
 
-fn ids(id_type: &DataType, keys: RangeInclusive<usize>) -> ArrayRef {
+fn ids(id_type: &DataType, keys: RangeInclusive<i64>) -> ArrayRef {
     match id_type {
-        DataType::Utf8 => Arc::new(StringArray::from(
-            keys.map(|k| format!("key-{k:04}")).collect::<Vec<_>>(),
+        DataType::Utf8 => Arc::new(StringArray::from_iter_values(
+            keys.map(|k| format!("key-{k:04}")),
         )),
-        _ => Arc::new(Int64Array::from(
-            keys.map(|k| i64::try_from(k).expect("key fits i64"))
-                .collect::<Vec<_>>(),
-        )),
+        _ => Arc::new(Int64Array::from_iter_values(keys)),
     }
 }
 
-fn batch(schema: &Arc<Schema>, keys: RangeInclusive<usize>, value: i64) -> TestResult<RecordBatch> {
-    let rows = keys.clone().count();
-    Ok(RecordBatch::try_new(
-        Arc::clone(schema),
-        vec![
-            ids(schema.field(0).data_type(), keys),
-            Arc::new(Int64Array::from(vec![value; rows])),
-        ],
-    )?)
+fn batch(schema: &Arc<Schema>, keys: RangeInclusive<i64>, value: i64) -> TestResult<RecordBatch> {
+    let ids = ids(schema.field(0).data_type(), keys);
+    let values = Arc::new(Int64Array::from(vec![value; ids.len()]));
+    Ok(RecordBatch::try_new(Arc::clone(schema), vec![ids, values])?)
 }
 
 async fn cdc_upsert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<()> {
@@ -133,9 +128,9 @@ async fn budget_fallback_upsert_supersedes_mem_tier_rows_impl(
     ] {
         let result = run_fallback_upsert(&fixture, name, id_type, prior).await;
         set_global_mem_tier_bytes(0);
-        let (served, keys) = result?;
-        got.push((name, served));
-        want.push((name, (keys, keys, 0, 0)));
+        let (observed, expected) = result?;
+        got.push((name, observed));
+        want.push((name, expected));
     }
     assert_eq!(
         got, want,
@@ -150,7 +145,7 @@ async fn run_fallback_upsert(
     name: &str,
     id_type: DataType,
     prior: Prior,
-) -> TestResult<((i64, i64, i64, u64), i64)> {
+) -> TestResult<(Observed, Observed)> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", id_type, false),
         Field::new("value", DataType::Int64, false),
@@ -206,6 +201,8 @@ async fn run_fallback_upsert(
     // The fallback spills the tier before its durable write, so a checkpoint
     // now finds nothing left in RAM.
     let left_in_ram = table.checkpoint_mem_tier().await?;
-    let keys = i64::try_from(expected_keys).expect("key count fits i64");
-    Ok(((rows, distinct, stale, left_in_ram), keys))
+    Ok((
+        (rows, distinct, stale, left_in_ram),
+        (expected_keys, expected_keys, 0, 0),
+    ))
 }

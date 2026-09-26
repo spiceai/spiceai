@@ -1223,7 +1223,9 @@ fn write_cdc_pipelined(batch):
 
 The single most important branch is `stage_protected`: a plain append (Flow B) targets the *current* snapshot; anything carrying on-conflict deletions or pending PK deletions (Flow C) targets a *protected* snapshot whose threshold immunizes the new rows from old tombstones.
 
-For a `cdc_durability: memory` table, the PK index records a key that a CDC mem-tier append publishes at the same location as a file row, not as an inline row: an inline tombstone hides only rows inlined into the metastore, while a key deletion hides the row in the mem tier (scans filter mem-tier rows against the file deletion snapshot) and in the file a checkpoint or spill later moves it to. The mem-tier append folds both key lists into its own tombstones, so the location does not change what that path hides. When the global budget forces a CDC batch onto the durable path, the batch is validated again after the spill, because the spill can move the rows its conflicts were resolved against, including metastore-inlined rows, into files.
+For a `cdc_durability: memory` table, the PK index records a key that a CDC mem-tier append publishes at the same location as a file row, not as an inline row: an inline tombstone hides only rows inlined into the metastore, while a key deletion hides the row in the mem tier (scans filter mem-tier rows against the file deletion snapshot) and in the file a checkpoint or spill later moves it to. The mem-tier append folds both key lists into its own tombstones, so the location does not change what that path hides.
+
+When the global budget forces a CDC batch onto the durable path, the batch is validated again after the spill, because the spill can move the rows its conflicts were resolved against, including metastore-inlined rows, into files.
 
 ## Metastore transaction semantics
 
