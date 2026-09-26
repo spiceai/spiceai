@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::RecordBatch;
-use arrow_schema::Field;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use elasticsearch::{Elasticsearch, FieldMapping};
@@ -59,12 +62,32 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which no exact-match filter can address — a `text` mapping indexes analyzed tokens rather than the value, and an unsearchable mapping indexes nothing — and it has no exact-match sub-field either, so the delete was not issued. Map '{column}' as a searchable `keyword` and re-create the index; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which no exact-match filter can address — a `text` mapping indexes analyzed tokens rather than the value, and an unsearchable mapping indexes nothing — and it has no exact-match sub-field either, so the delete was not issued. Re-create the index and let the runtime map '{column}': it maps a string key as a searchable `keyword`, and every other key type to that type's own exact mapping. Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
     ))]
     KeyColumnNotExactlyMatchable {
         index: String,
         column: String,
         mapped_as: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped with the normalizer '{normalizer}', so an exact-match filter on it also matches every other value that normalizes the same way — deleting one row's documents would reach another row's — and it has no unnormalized exact-match sub-field either; the delete was not issued. Re-create the index and let the runtime map its key columns: it maps a string key `keyword` with no `normalizer`, and every other key type to that type's own exact mapping. Elasticsearch cannot change an existing field's normalizer. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyColumnNormalized {
+        index: String,
+        column: String,
+        normalizer: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' holds {source_type} values but is mapped `{mapped_as}`, which {why}, so an exact-match filter on it also reaches every other value indexed under that same term — deleting one row's documents would reach another row's — and it has no exactly-addressable sub-field either; the delete was not issued. Re-create the index and let the runtime map its key columns: it maps a string key `keyword`, and every other key type to that type's own exact mapping (an `Int64` key becomes `long`, not `keyword`). Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyColumnOverMatches {
+        index: String,
+        column: String,
+        mapped_as: String,
+        source_type: String,
+        why: &'static str,
     },
 
     #[snafu(display(
@@ -98,6 +121,24 @@ pub fn document_key_columns(primary_key: &[Field]) -> Vec<String> {
 /// comfortably under Elasticsearch's default `indices.query.bool.max_clause_count` (1024) and
 /// request-size limits, regardless of how many keys the caller is deleting in one call.
 const DELETE_CHUNK_ROWS: usize = 512;
+
+/// Member budget for one group-remainder `_delete_by_query` ([`group_requests`]). Whole key
+/// groups are accumulated until their members reach this many, which bounds both the group count
+/// (every group holds at least one member) and the `ids` list inside each group's clause. Spent
+/// in members rather than in groups for that reason — [`DELETE_CHUNK_ROWS`] bounds one `should`
+/// clause per *row*, which is a different accounting.
+///
+/// A group is not one clause: Elasticsearch counts the leaves of nested `bool`s towards one
+/// budget (it answers `too_many_nested_clauses` when they exceed it), and each group contributes
+/// one `term` leaf per key column plus its `ids` leaf. So the widest request this budget admits
+/// carries `PRUNE_MEMBERS_PER_REQUEST * (key columns + 1)` leaves — 1024, 1536 and 2048 for a
+/// one-, two- and three-column key.
+///
+/// Those fit: on Elasticsearch 8 the clause budget is derived from the node's heap rather than
+/// taken from `indices.query.bool.max_clause_count` (deprecated there, and ignored), measuring
+/// 9362 on a 1 GiB-heap node and 2340 on a 256 MiB one — so even the narrowest node Elasticsearch
+/// will start leaves the three-column request room to spare.
+const PRUNE_MEMBERS_PER_REQUEST: usize = 512;
 
 /// Deletes every document whose `key_columns` match a row of `keys` — an exact-key delete when
 /// `key_columns` covers every `primary_key` column, a prefix delete when it's a strict subset
@@ -164,7 +205,7 @@ pub async fn delete_by_keys(
     let key_paths = if addresses_whole_key {
         Vec::new()
     } else {
-        match resolve_term_exact_paths(client, es_index, key_columns).await {
+        match resolve_term_exact_paths(client, es_index, key_columns, keys.schema_ref()).await {
             Ok(Some(paths)) => paths,
             // No document carries these columns, so there is nothing this delete can address.
             Ok(None) => return Ok(()),
@@ -211,6 +252,199 @@ pub async fn delete_by_keys(
     }
 
     Ok(())
+}
+
+/// Delete every document that agrees with a row of `members` on `group_columns` but whose own
+/// `_id` is not one of that group's members — the rest of each named group, with the listed
+/// members kept. See [`spice_table::Index::delete_group_remainder`] for what a caller expects
+/// of it.
+///
+/// This is what removes the chunks a shortened row no longer produces (#13717). A row rewritten
+/// to fewer chunks is upserted under chunk ids `0..n`, so every higher chunk id its previous
+/// text produced stays in the index and keeps answering searches for content the row no longer
+/// has. The write path knows the chunks it produced, not how many the previous text had, so it
+/// names the survivors and Elasticsearch removes the rest.
+///
+/// One `should` clause per group, each carrying its own group's filter *and* its own group's
+/// surviving `_id`s in `must_not`. The scoping is per group rather than per request so that a
+/// group split across two requests cannot have one request delete the members the other
+/// request's clause was protecting: every clause carries the whole of the group it names, or
+/// the group is not named at all.
+///
+/// A group is skipped outright — nothing deleted, nothing reported — when it cannot be
+/// addressed on both halves at once: a group-column value no `term` can express (NULL, or a
+/// type that has no JSON term form), or a member whose `_id` the write path would not have
+/// derived either. Deleting a group whose survivors cannot all be named would remove documents
+/// this write just wrote, which is worse than leaving a superseded chunk behind.
+///
+/// Like every other delete on this write path, this is a `_delete_by_query` — a *search* — and a
+/// document `_bulk` wrote is not searchable until the index refreshes. A prune issued inside the
+/// same refresh window as the write that superseded its targets can therefore match nothing and
+/// report a clean delete. That is shared with the eviction deletes either side of it rather than
+/// introduced here, and closing it trades against `bulk_load_refresh_interval`'s whole purpose:
+/// #14318 owns the decision.
+///
+/// Addressing, chunking, and error reporting are [`delete_by_keys`]': the group columns are
+/// resolved to the field path a `term` matches their stored value on (a `text`-mapped column is
+/// matched on its `keyword` multi-field), every request is issued even after an earlier one
+/// comes back partially applied, and only a refused connection ends the batch early.
+pub async fn delete_group_remainder(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    primary_key: &[Field],
+    group_columns: &[String],
+    members: &RecordBatch,
+) -> DataFusionResult<()> {
+    if members.num_rows() == 0 {
+        return Ok(());
+    }
+
+    let key_paths =
+        match resolve_term_exact_paths(client, es_index, group_columns, members.schema_ref()).await
+        {
+            Ok(Some(paths)) => paths,
+            // No document carries these columns, so there is no group here to prune.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(DataFusionError::External(Box::new(e))),
+        };
+    ensure_keys_are_indexable(es_index, &key_paths, members)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let groups = collect_groups(primary_key, es_index, &key_paths, members)?;
+
+    let mut failure: Option<DataFusionError> = None;
+    for request in group_requests(groups) {
+        let outcome = issue_delete_chunk(client, es_index, &request).await;
+        if let Some(e) = outcome.failure {
+            failure.get_or_insert(e);
+        }
+        if outcome.never_reached {
+            break;
+        }
+    }
+
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// One key group of a [`delete_group_remainder`] call: the `term` clauses that address its
+/// documents, and the `_id`s of the members to keep.
+struct MemberGroup {
+    terms: Vec<Value>,
+    survivors: Vec<String>,
+}
+
+/// Gather `members` into one [`MemberGroup`] per distinct value of the group columns, in
+/// first-seen order.
+///
+/// Rows are grouped by the term values their key columns render to, so nothing here depends on a
+/// group's rows being adjacent in `members`, and two rows group together exactly when the same
+/// `term` filter would reach both — which is the property the emitted query relies on. A row that
+/// cannot be expressed as a `term` filter, or whose `_id` the write path would not have derived,
+/// drops the *whole* group it belongs to, whichever end of the batch it sits at: those two halves
+/// address the same documents from opposite sides, so a group that loses either one can no longer
+/// name what to keep. A dropped group is held as `None` in place rather than removed, so a later
+/// row for the same key cannot resurrect it.
+fn collect_groups(
+    primary_key: &[Field],
+    es_index: &str,
+    key_paths: &[KeyFieldPath],
+    members: &RecordBatch,
+) -> DataFusionResult<Vec<MemberGroup>> {
+    let ids = write::extract_primary_key_from_fields(primary_key, es_index, members)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let arrays = key_column_arrays(key_paths, members, "group-remainder member batch")?;
+
+    // Groups in first-seen order, `None` for one that turned out to be unaddressable; the map
+    // only locates a key's slot.
+    let mut groups: Vec<Option<MemberGroup>> = Vec::new();
+    let mut slots: HashMap<Vec<String>, usize> = HashMap::new();
+
+    for (row, id) in ids.into_iter().enumerate() {
+        let Some(values) = row_term_values(key_paths, &arrays, row)? else {
+            // No group identity, so this row names no group to protect or prune.
+            continue;
+        };
+
+        let slot = match slots.entry(values.iter().map(ToString::to_string).collect()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                groups.push(Some(MemberGroup {
+                    terms: term_clauses(key_paths, &values),
+                    survivors: Vec::new(),
+                }));
+                *e.insert(groups.len() - 1)
+            }
+        };
+
+        match id {
+            Some(id) => {
+                if let Some(group) = groups[slot].as_mut() {
+                    group.survivors.push(id);
+                }
+            }
+            // The write path stores no document for a row whose `_id` it cannot derive, so this
+            // group's membership is not fully known — leave it alone entirely.
+            None => groups[slot] = None,
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .flatten()
+        // Belt and braces: an empty `must_not` would make the group's filter delete the whole
+        // group, members included. Every surviving group holds at least one member by
+        // construction, since each row either contributes one or drops the group.
+        .filter(|group| !group.survivors.is_empty())
+        .collect())
+}
+
+/// Split `groups` into `_delete_by_query` bodies, never splitting a group across two of them.
+///
+/// Each request holds whole groups up to [`PRUNE_MEMBERS_PER_REQUEST`] members; a single group
+/// larger than that budget is issued on its own rather than split.
+fn group_requests(groups: Vec<MemberGroup>) -> Vec<Value> {
+    let mut requests = Vec::new();
+    let mut clauses: Vec<Value> = Vec::new();
+    let mut members = 0usize;
+
+    for group in groups {
+        if !clauses.is_empty() && members + group.survivors.len() > PRUNE_MEMBERS_PER_REQUEST {
+            requests.push(should_match_one(std::mem::take(&mut clauses)));
+            members = 0;
+        }
+        members += group.survivors.len();
+        clauses.push(json!({
+            "bool": {
+                "filter": group.terms,
+                "must_not": [ids_query(&group.survivors)]
+            }
+        }));
+    }
+
+    if !clauses.is_empty() {
+        requests.push(should_match_one(clauses));
+    }
+
+    requests
+}
+
+/// `{"bool": {"should": [...], "minimum_should_match": 1}}` — the clauses ORed.
+///
+/// Assembled rather than written as a `json!` literal so `clauses` is moved into the body; the
+/// macro would take it by reference and rebuild every clause it already holds.
+fn should_match_one(clauses: Vec<Value>) -> Value {
+    let mut bool_query = serde_json::Map::new();
+    bool_query.insert("should".to_string(), Value::Array(clauses));
+    bool_query.insert("minimum_should_match".to_string(), Value::from(1));
+
+    let mut query = serde_json::Map::new();
+    query.insert("bool".to_string(), Value::Object(bool_query));
+    Value::Object(query)
 }
 
 /// What issuing one `_delete_by_query` chunk produced: the failure to report, if any, and
@@ -272,11 +506,10 @@ pub async fn delete_by_ids(
     let mut failure: Option<DataFusionError> = None;
 
     for chunk in ids.chunks(DELETE_CHUNK_ROWS) {
-        let values: Vec<Value> = chunk.iter().cloned().map(Value::String).collect();
-        if values.is_empty() {
+        if chunk.is_empty() {
             continue;
         }
-        let query = json!({ "ids": { "values": values } });
+        let query = ids_query(chunk);
 
         let outcome = issue_delete_chunk(client, es_index, &query).await;
         if let Some(e) = outcome.failure {
@@ -471,12 +704,12 @@ fn build_ids_query(
     let ids = write::extract_primary_key_from_fields(primary_key, es_index, keys)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let values: Vec<Value> = ids.into_iter().flatten().map(Value::String).collect();
+    let values: Vec<String> = ids.into_iter().flatten().collect();
     if values.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(json!({ "ids": { "values": values } })))
+    Ok(Some(ids_query(&values)))
 }
 
 /// Builds `{"bool": {"should": [{"bool": {"filter": [{"term": {...}}, ...]}}, ...], "minimum_should_match": 1}}`
@@ -493,32 +726,14 @@ fn build_or_of_row_term_queries(
         return Ok(None);
     }
 
-    let arrays: Vec<_> = key_paths
-        .iter()
-        .map(|p| keys.column_by_name(&p.column).cloned())
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
-            DataFusionError::Plan(format!(
-                "delete key batch is missing one of the requested key columns: {columns:?}"
-            ))
-        })?;
+    let arrays = key_column_arrays(key_paths, keys, "delete key batch")?;
 
     let mut row_clauses = Vec::with_capacity(keys.num_rows());
     for row in 0..keys.num_rows() {
-        let mut terms = Vec::with_capacity(key_paths.len());
-        for (key_path, array) in key_paths.iter().zip(&arrays) {
-            let value = ScalarValue::try_from_array(array.as_ref(), row)?;
-            let Some(json_value) = scalar_to_term_value(&value) else {
-                // A NULL/unsupported key column can never equal anything via `term` — skip this
-                // row's clause entirely rather than emit a filter that matches everything.
-                terms.clear();
-                break;
-            };
-            terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
-        }
-        if !terms.is_empty() {
-            row_clauses.push(json!({ "bool": { "filter": terms } }));
+        // A row with a value no `term` can express is skipped entirely rather than filtered on
+        // what is left of its key — see `row_term_values`.
+        if let Some(values) = row_term_values(key_paths, &arrays, row)? {
+            row_clauses.push(json!({ "bool": { "filter": term_clauses(key_paths, &values) } }));
         }
     }
 
@@ -526,12 +741,65 @@ fn build_or_of_row_term_queries(
         return Ok(None);
     }
 
-    Ok(Some(json!({
-        "bool": {
-            "should": row_clauses,
-            "minimum_should_match": 1
-        }
-    })))
+    Ok(Some(should_match_one(row_clauses)))
+}
+
+/// The arrays `key_paths` names in `batch`, in the same order. `what` names the batch in the
+/// error, which is the caller's own vocabulary for it.
+fn key_column_arrays(
+    key_paths: &[KeyFieldPath],
+    batch: &RecordBatch,
+    what: &str,
+) -> DataFusionResult<Vec<ArrayRef>> {
+    key_paths
+        .iter()
+        .map(|p| batch.column_by_name(&p.column).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
+            DataFusionError::Plan(format!(
+                "{what} is missing one of the requested key columns: {columns:?}"
+            ))
+        })
+}
+
+/// The values one row of `arrays` would be matched on, or `None` when any of its key columns
+/// holds a value no `term` can express.
+///
+/// `None` is the whole row, not the one column: a filter built from the rest would name fewer
+/// columns than the key has and so match documents the row does not identify — reporting that as
+/// a successful delete is the failure this addressing exists to avoid (#13714). Both
+/// [`build_or_of_row_term_queries`] and [`collect_groups`] read the rule from here so the two
+/// cannot drift on it.
+fn row_term_values(
+    key_paths: &[KeyFieldPath],
+    arrays: &[ArrayRef],
+    row: usize,
+) -> DataFusionResult<Option<Vec<Value>>> {
+    let mut values = Vec::with_capacity(key_paths.len());
+    for array in arrays {
+        let value = ScalarValue::try_from_array(array.as_ref(), row)?;
+        let Some(json_value) = scalar_to_term_value(&value) else {
+            return Ok(None);
+        };
+        values.push(json_value);
+    }
+    Ok(Some(values))
+}
+
+/// One `{"term": {path: value}}` per key column, naming the field path each column's stored value
+/// is matched on.
+fn term_clauses(key_paths: &[KeyFieldPath], values: &[Value]) -> Vec<Value> {
+    key_paths
+        .iter()
+        .zip(values)
+        .map(|(key_path, value)| json!({ "term": { key_path.path.as_str(): value } }))
+        .collect()
+}
+
+/// `{"ids": {"values": [...]}}` — documents addressed by the `_id` the write path stored.
+fn ids_query(values: &[String]) -> Value {
+    json!({ "ids": { "values": values } })
 }
 
 /// The Elasticsearch field a key column's values are matched on, and the length past which that
@@ -552,8 +820,12 @@ struct KeyFieldPath {
 /// query matches what the write path stored.
 ///
 /// `text` (and its variants) is deliberately absent: it holds the value's *analyzed* tokens, so a
-/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing. Being
-/// one of these types is necessary but not sufficient — see [`is_term_exact`].
+/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing.
+///
+/// Being one of these types is necessary and not sufficient — see [`is_term_exact`]. In
+/// particular several of them index a *rounded* form of the value, so a `term` is unanalyzed and
+/// still reaches more than the key names; [`term_over_matches`] is what rejects those, and it
+/// stays a separate question because the answer depends on the column's own type.
 const TERM_EXACT_FIELD_TYPES: &[&str] = &[
     "boolean",
     "byte",
@@ -574,16 +846,200 @@ const TERM_EXACT_FIELD_TYPES: &[&str] = &[
     "wildcard",
 ];
 
-/// Whether a `term` on this field matches the value the write path stored: an exact type, and
-/// searchable at all. A field mapped `index: false` — which is what a column the user declared
-/// non-filterable gets — is stored in `_source` and indexed nowhere, so a filter naming it
-/// matches nothing however exact its type is.
-fn is_term_exact(mapping: &FieldMapping) -> bool {
+/// Stands in for a key column the delete batch does not carry, until `key_column_arrays` fails
+/// on it: the renderable type that the most mappings are refused for, so an absent column can
+/// never resolve to a mapping a present one would have been refused for.
+///
+/// `Utf8` holds that position, and `assumed_key_type_is_refused_for_every_mapping_any_type_is`
+/// keeps it there: a string is refused for every rounding type *and* for every exact type that
+/// reaches it through a parse, which is a superset of what any other renderable type is refused
+/// for.
+const ASSUMED_KEY_TYPE: DataType = DataType::Utf8;
+
+/// Field types whose indexed form is a *rounded* form of the value, whatever it holds, so one
+/// term stands for a range of values and a `term` on one reaches documents the key never named.
+///
+/// These are exact-match types in the sense that a `term` is not analyzed, which is why they read
+/// as safe; they are not exact in the sense this addressing needs, which is that the value the
+/// write path stored is recoverable from the term. Measured against Elasticsearch 8.15.0, a
+/// `term` for one row's value returns a second row's documents as well:
+///
+/// | type | two distinct values | `term` for the first matches |
+/// |---|---|---|
+/// | `scaled_float` (factor 100) | `1.234`, `1.2337` | both — `round(v * 100)` is `123` for each |
+/// | `float` | `1.0000000000000002`, `1.0` | both — a 24-bit mantissa holds neither apart |
+/// | `half_float` | `1.0001`, `1.0002` | both — an 11-bit mantissa is coarser still |
+/// | `date` | `…:00.123456Z`, `…:00.123789Z` | both — `date` quantizes to milliseconds |
+/// | `constant_keyword` | any two | *every* document — the index stores one value for the field |
+const TERM_ROUNDING_FIELD_TYPES: &[(&str, &str)] = &[
+    (
+        "constant_keyword",
+        "indexes one value for the whole index rather than the row's",
+    ),
+    ("date", "indexes the value rounded to the millisecond"),
+    ("float", "indexes the value rounded to a 24-bit mantissa"),
+    (
+        "half_float",
+        "indexes the value rounded to an 11-bit mantissa",
+    ),
+    (
+        "scaled_float",
+        "indexes `round(value * scaling_factor)` rather than the value",
+    ),
+];
+
+/// Why a `term` on this field would reach more than the key names, or `None` when it would not.
+///
+/// Three ways one term can stand for several keys, and the caller needs to tell them apart only
+/// to say so in the message:
+///
+/// - the type rounds every value it holds ([`TERM_ROUNDING_FIELD_TYPES`]);
+/// - the type is exact but too narrow for this column. `double` is the only such pairing that
+///   arises: Elasticsearch indexes it as an IEEE-754 binary64, whose integers are exact only up
+///   to 2^53, so an `Int64`/`UInt64` column mapped `double` collapses `9007199254740992` and
+///   `9007199254740993` onto one term — measured against Elasticsearch 8.15.0, a `term` for the
+///   first returns both rows' documents, while the same two keys under `long` return one each.
+///   `long` holds every Arrow integer, and `byte`/`short`/`integer` reject an out-of-range value
+///   at index time rather than rounding it, so the write fails where this would have had to.
+/// - the type is exact in its own values but reached through a parse, because the column's own
+///   values are strings and the field is not. Elasticsearch parses the stored string and the
+///   query's string with the same lenient parser, and that parse is not injective: measured
+///   against Elasticsearch 8.15.0, `"1"` and `"01"` under `long` both index as the term `1` and
+///   a `term` for either returns both rows' documents, as do `"1.0"`/`"1.00"` under `double` and
+///   `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date`, `"false"`/`""` under `boolean` and
+///   `"2001:db8::1"`/`"2001:0db8:0:0:0:0:0:1"` under `ip`. [`STRING_FIELD_TYPES`] is the measured
+///   set a string *does* reach as itself, and carries the rest of the measurements.
+///
+/// Only asked of a column whose values [`scalar_to_term_value`] can render, because a column it
+/// cannot render issues no `term` at all: its group is dropped by [`collect_groups`] instead, and
+/// [`key_renders_terms`] is what stops that drop being reported as a complete prune. That is what
+/// keeps this rule pointed at over-matching rather than at mappings the runtime itself writes —
+/// `primary_key_mapping` maps a `Float32` key column `float` and a timestamp key column `date`,
+/// and neither renders a term; it maps a string key column bare `keyword`, so the parse rule
+/// above only ever fires on an index the runtime did not create.
+fn term_over_matches(mapping: &FieldMapping, source_type: &DataType) -> Option<TermOverMatch> {
+    let field_type = mapping.field_type.as_deref()?;
+    if !renders_a_term(source_type) {
+        return None;
+    }
+    if let Some((mapped_as, why)) = TERM_ROUNDING_FIELD_TYPES
+        .iter()
+        .find(|(t, _)| *t == field_type)
+    {
+        return Some(TermOverMatch { mapped_as, why });
+    }
+    if field_type == "double" && matches!(source_type, DataType::Int64 | DataType::UInt64) {
+        return Some(TermOverMatch {
+            mapped_as: "double",
+            why: "indexes integers past 2^53 rounded, being an IEEE-754 binary64",
+        });
+    }
+    if !is_string_type(source_type) || STRING_FIELD_TYPES.contains(&field_type) {
+        return None;
+    }
+    // Only an *exact* type can over-match, and looking the name up here is what enforces that: a
+    // type that is not exact at all is refused by `is_term_exact` with
+    // [`Error::KeyColumnNotExactlyMatchable`], whose message is the right one for it — saying
+    // `text` "parses this column's strings" would describe analysis as coercion. The lookup also
+    // supplies the `&'static str` the message needs, so no mapping-supplied name is carried.
+    TERM_EXACT_FIELD_TYPES
+        .iter()
+        .find(|t| **t == field_type)
+        .map(|mapped_as| TermOverMatch {
+            mapped_as,
+            why: "parses this column's strings to index them, and that parse maps several strings onto one value",
+        })
+}
+
+/// The exact field types that a string column reaches without a lossy parse, so a `term` on one
+/// matches the stored string and no other. Everything [`TERM_EXACT_FIELD_TYPES`] holds that is
+/// *not* here is what [`term_over_matches`] refuses for a string column.
+///
+/// Measured against Elasticsearch 8.15.0 rather than reasoned from the type's name, and the pair
+/// has to come from the type's *own* parser — a pair it rejects proves nothing, because rejecting
+/// is not collapsing. Collapsing (so refused): `"1"`/`"01"` index as the same term under `byte`,
+/// `short`, `integer`, `long` and `unsigned_long`; `"1.0"`/`"1.00"` under `double`;
+/// `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` and `date_nanos`; `"false"`/`""` under
+/// `boolean`, which reads an empty string as false; and `"2001:db8::1"`/`"2001:0db8:0:0:0:0:0:1"`
+/// under `ip`, which canonicalizes the address. Each of those types *also* rejects some pairs
+/// (`"True"` under `boolean`, `"1.2.3.04"` under `ip`) — which is why a single rejected pair is
+/// not evidence the type is safe.
+///
+/// Distinct (so kept): `"1"`/`"01"`, `"A"`/`"a"` and `"ORDER-1"`/`"order-1"` under `keyword`,
+/// `wildcard` and `version`; `version` stores the original string in its doc values, so
+/// `"1.0.0"`/`"1.00.0"`, `"1.0.0"`/`"01.0.0"`, `"1.0"`/`"1.0.0"` and `"1.0.0"`/`"1.0.0+build"`
+/// each index as themselves. `constant_keyword` is absent because [`TERM_ROUNDING_FIELD_TYPES`]
+/// already refuses it for every source type.
+const STRING_FIELD_TYPES: &[&str] = &["keyword", "version", "wildcard"];
+
+/// Whether `source_type` holds strings, so a non-string mapping reaches it only through a parse.
+fn is_string_type(source_type: &DataType) -> bool {
+    matches!(
+        source_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// A mapping that would make a `term` reach more than the key it names: the type, and the clause
+/// [`Error::KeyColumnOverMatches`] states it with.
+struct TermOverMatch {
+    mapped_as: &'static str,
+    why: &'static str,
+}
+
+/// Whether every column of `primary_key` has a `term` form, so a group keyed on it can be
+/// addressed at all.
+///
+/// A key column whose values [`scalar_to_term_value`] cannot render drops its whole group in
+/// [`collect_groups`], which leaves that group's superseded documents in place. That is a
+/// defensible thing to do — a partial filter would reach documents the row does not identify —
+/// but it is not a complete prune, so an index over such a key reports
+/// `GroupPruning::Unsupported` rather than `GroupPruning::Complete` and the caller warns.
+/// The runtime maps a `Float32` key column `float` and a timestamp key column `date`
+/// (`primary_key_mapping`), and neither renders a term, so these are key types a user can
+/// actually declare rather than a theoretical gap.
+pub(crate) fn key_renders_terms(primary_key: &[Field]) -> bool {
+    primary_key.iter().all(|f| renders_a_term(f.data_type()))
+}
+
+/// Whether a value of `source_type` has a `term` form at all, mirroring [`scalar_to_term_value`].
+///
+/// `term_renderable_types_match_scalar_to_term_value` pins the two together, so a type added to
+/// one is caught if it is not added to the other.
+fn renders_a_term(source_type: &DataType) -> bool {
+    matches!(
+        source_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// Whether a `term` on this field matches the value the write path stored, and no other row's:
+/// an exact type, searchable at all, unnormalized, and not standing for a range of values. A
+/// field mapped `index: false` — which is what a column the user declared non-filterable gets —
+/// is stored in `_source` and indexed nowhere, so a filter naming it matches nothing however
+/// exact its type is.
+fn is_term_exact(mapping: &FieldMapping, source_type: &DataType) -> bool {
     mapping.is_indexed()
+        // A normalizer is applied to the query's value as well as the stored one, so `term` on a
+        // normalized field matches every value that normalizes the same way. That is exact
+        // enough to find a row's documents and not exact enough to stop at them.
+        && mapping.normalizer.is_none()
         && mapping
             .field_type
             .as_deref()
             .is_some_and(|t| TERM_EXACT_FIELD_TYPES.contains(&t))
+        && term_over_matches(mapping, source_type).is_none()
 }
 
 /// Resolves each of `key_columns` to the field path an exact-match `term` query has to name, by
@@ -610,6 +1066,7 @@ async fn resolve_term_exact_paths(
     client: &dyn Elasticsearch,
     es_index: &str,
     key_columns: &[String],
+    source_schema: &Schema,
 ) -> Result<Option<Vec<KeyFieldPath>>> {
     if key_columns.is_empty() {
         return Ok(None);
@@ -640,7 +1097,14 @@ async fn resolve_term_exact_paths(
             return Ok(None);
         };
 
-        if is_term_exact(mapping) {
+        // A column the batch does not carry fails later in `key_column_arrays`; until then
+        // `ASSUMED_KEY_TYPE` stands in, so an unknown column cannot resolve to a mapping a known
+        // one would have been refused for.
+        let source_type = source_schema
+            .column_with_name(column)
+            .map_or(&ASSUMED_KEY_TYPE, |(_, f)| f.data_type());
+
+        if is_term_exact(mapping, source_type) {
             paths.push(KeyFieldPath {
                 column: column.clone(),
                 path: column.clone(),
@@ -657,19 +1121,41 @@ async fn resolve_term_exact_paths(
             .and_then(|fields| {
                 fields
                     .get("keyword")
-                    .filter(|m| is_term_exact(m))
+                    .filter(|m| is_term_exact(m, source_type))
                     .map(|m| ("keyword", m))
             })
             .or_else(|| {
                 sub_fields
                     .into_iter()
                     .flatten()
-                    .filter(|(_, m)| is_term_exact(m))
+                    .filter(|(_, m)| is_term_exact(m, source_type))
                     .min_by(|(a, _), (b, _)| a.cmp(b))
                     .map(|(n, m)| (n.as_str(), m))
             });
 
         let Some((sub_name, sub_mapping)) = exact_sub else {
+            // A normalized column is refused by name: the generic message would say it cannot be
+            // matched at all, when the real hazard is that it matches too much.
+            if let Some(normalizer) = mapping.normalizer.as_deref() {
+                return KeyColumnNormalizedSnafu {
+                    index: es_index.to_string(),
+                    column: column.clone(),
+                    normalizer: normalizer.to_string(),
+                }
+                .fail();
+            }
+            // Likewise for a mapping that reaches past the key it names: the generic message
+            // would say the column cannot be matched at all, when the hazard is the opposite.
+            if let Some(over) = term_over_matches(mapping, source_type) {
+                return KeyColumnOverMatchesSnafu {
+                    index: es_index.to_string(),
+                    column: column.clone(),
+                    mapped_as: over.mapped_as.to_string(),
+                    source_type: source_type.to_string(),
+                    why: over.why,
+                }
+                .fail();
+            }
             return KeyColumnNotExactlyMatchableSnafu {
                 index: es_index.to_string(),
                 column: column.clone(),
@@ -768,7 +1254,7 @@ mod tests {
     use std::sync::Mutex;
 
     use arrow::array::{Int64Array, StringArray};
-    use arrow_schema::{DataType, Schema};
+    use arrow_schema::{DataType, Schema, TimeUnit};
     use elasticsearch::{
         Error as EsError, IndexMapping, MappingResponse, Mappings, Result as EsResult,
         SearchRequest, SearchResponse,
@@ -1006,6 +1492,7 @@ mod tests {
             fields: None,
             ignore_above: None,
             index: None,
+            normalizer: None,
             dims: None,
             similarity: None,
         }
@@ -1139,6 +1626,866 @@ mod tests {
                 }
             })],
         );
+    }
+
+    /// Member rows as [`spice_table::Index::delete_group_remainder`] receives them from a
+    /// chunked index: the base key plus the chunk id of every chunk the row still produces.
+    fn member_batch(rows: &[(Option<&str>, u64)]) -> RecordBatch {
+        member_batch_keyed(
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )),
+            &rows.iter().map(|(_, chunk)| *chunk).collect::<Vec<_>>(),
+        )
+    }
+
+    /// The same batch for a key column of any type — the shape is one place so the chunk key's
+    /// spelling cannot drift between the tests that build it.
+    fn member_batch_keyed(ids: ArrayRef, chunks: &[u64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ids.data_type().clone(), true),
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![ids, Arc::new(UInt64Array::from(chunks.to_vec()))],
+        )
+        .expect("member batch should build")
+    }
+
+    /// The primary key a chunked index actually has, taken from the augmentation the chunking
+    /// layer applies rather than re-spelled here, so these tests cannot drift from it.
+    fn chunked_key() -> Vec<Field> {
+        chunked_key_of(DataType::Utf8)
+    }
+
+    /// The same, for a key column of another type.
+    fn chunked_key_of(data_type: DataType) -> Vec<Field> {
+        ChunkedSearchIndex::augment_primary_key(vec![pk("id", data_type)])
+    }
+
+    /// The `_id`s a `must_not` clause protects, for every `should` clause of `query`.
+    fn protected_ids(query: &Value) -> Vec<Vec<String>> {
+        query["bool"]["should"]
+            .as_array()
+            .expect("the request ORs one clause per group")
+            .iter()
+            .map(|clause| {
+                clause["bool"]["must_not"][0]["ids"]["values"]
+                    .as_array()
+                    .expect("each clause protects its group's members by _id")
+                    .iter()
+                    .map(|v| v.as_str().expect("an _id is a string").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Each group is pruned against its own surviving members: the filter names the group and the
+    /// `must_not` beside it names only that group's `_id`s, so one group's members cannot be
+    /// protected by another group's clause (or, worse, deleted by it).
+    #[tokio::test]
+    async fn each_group_is_pruned_against_only_its_own_members() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("a"), 0), (Some("b"), 0), (Some("b"), 1)]),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [
+                        {"bool": {
+                            "filter": [{"term": {"id": "a"}}],
+                            "must_not": [{"ids": {"values": [
+                                "{\"_spice.chunk_id\":0,\"id\":\"a\"}"
+                            ]}}]
+                        }},
+                        {"bool": {
+                            "filter": [{"term": {"id": "b"}}],
+                            "must_not": [{"ids": {"values": [
+                                "{\"_spice.chunk_id\":0,\"id\":\"b\"}",
+                                "{\"_spice.chunk_id\":1,\"id\":\"b\"}"
+                            ]}}]
+                        }}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// A group is never split across two requests. Splitting it would leave one request deleting
+    /// the very members the other request's clause was protecting — the write's own chunks —
+    /// so the budget is spent in whole groups even when that overshoots it.
+    #[tokio::test]
+    async fn a_group_is_never_split_across_two_requests() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        // Two groups whose members do not fit one request together, and a third that starts a
+        // second request; `big` alone is over the budget, so it is issued on its own.
+        let mut rows: Vec<(Option<&str>, u64)> = Vec::new();
+        for chunk in 0..(DELETE_CHUNK_ROWS as u64 + 10) {
+            rows.push((Some("big"), chunk));
+        }
+        rows.push((Some("small"), 0));
+        rows.push((Some("small"), 1));
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&rows),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        let queries = client.queries();
+        assert_eq!(queries.len(), 2, "the two groups do not fit one request");
+        assert_eq!(
+            protected_ids(&queries[0])
+                .into_iter()
+                .map(|ids| ids.len())
+                .collect::<Vec<_>>(),
+            vec![DELETE_CHUNK_ROWS + 10],
+            "an oversized group is issued whole rather than split"
+        );
+        assert_eq!(
+            protected_ids(&queries[1])
+                .into_iter()
+                .map(|ids| ids.len())
+                .collect::<Vec<_>>(),
+            vec![2],
+        );
+    }
+
+    /// A NULL group-column value can be expressed by no `term`, so the group it belongs to is
+    /// left alone entirely rather than addressed by a filter that would match every document.
+    #[tokio::test]
+    async fn a_null_group_key_prunes_nothing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(None, 0)]),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert!(
+            client.queries().is_empty(),
+            "a group with no expressible key must not be addressed at all"
+        );
+    }
+
+    /// An empty member batch names no group, so it must not reach the index — not even for the
+    /// mapping read, whose failure would report a prune of nothing as failed.
+    #[tokio::test]
+    async fn an_empty_member_batch_issues_no_request() {
+        let client = RecordingClient::default();
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[]),
+        )
+        .await
+        .expect("an empty prune should succeed without reaching the index");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// A member whose `_id` the write path would not have derived leaves that member unnamed in
+    /// `must_not` — so the group is left alone entirely rather than pruned against a survivor
+    /// list that is missing one of its own documents.
+    #[tokio::test]
+    async fn a_group_with_an_underivable_member_id_is_left_alone() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
+
+        // The chunk id is NULL, so `_id` derivation yields nothing for that member while the
+        // group's own key stays perfectly expressible.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, true),
+        ]));
+        let members = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(UInt64Array::from(vec![Some(0), None, Some(0)])),
+            ],
+        )
+        .expect("member batch should build");
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &members,
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert_eq!(
+            protected_ids(&client.queries()[0]),
+            vec![vec!["{\"_spice.chunk_id\":0,\"id\":\"b\"}".to_string()]],
+            "only the group whose every member could be named is pruned"
+        );
+    }
+
+    fn normalized_keyword(normalizer: &str) -> FieldMapping {
+        FieldMapping {
+            normalizer: Some(normalizer.to_string()),
+            ..field_mapping("keyword")
+        }
+    }
+
+    /// A `keyword` key column with a normalizer looks exactly matchable and is not: Elasticsearch
+    /// normalizes a `term` query's value too, so a filter on `A` also matches the documents of a
+    /// distinct row keyed `a`.
+    ///
+    /// On the prune that is worse than over-deleting, which is what it would be on a delete: the
+    /// sibling's `_id`s are in no group's `must_not`, so an ordinary write of `A` would remove the
+    /// chunks of a row `a` that still exists and was never written. The mapping is refused before
+    /// a request is issued instead.
+    #[tokio::test]
+    async fn a_normalized_group_column_refuses_before_issuing() {
+        let client = RecordingClient::mapped(vec![("id", normalized_keyword("lowercase"))]);
+
+        let err = delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("A"), 0)]),
+        )
+        .await
+        .expect_err("a normalized group column must fail the prune");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id'") && message.contains("lowercase"),
+            "the error must name the column and its normalizer, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued against a key field that matches sibling values"
+        );
+    }
+
+    /// The same mapping is refused on the partial-key delete, which shares the resolution. There
+    /// the filter over-deletes rather than crossing into a live row, but it is the same field that
+    /// cannot address one row's documents and the same refusal.
+    #[tokio::test]
+    async fn a_normalized_key_column_refuses_a_partial_key_delete_too() {
+        let client = RecordingClient::mapped(vec![("id", normalized_keyword("lowercase"))]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &string_key_batch(vec![Some("A")]),
+        )
+        .await
+        .expect_err("a normalized key column must fail the delete");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// A normalized column that also carries an unnormalized exact sub-field is still addressable
+    /// — on that sub-field. Refusing it would fail a delete the index can serve exactly.
+    #[tokio::test]
+    async fn a_normalized_column_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut normalized = normalized_keyword("lowercase");
+        normalized.fields = Some(std::collections::HashMap::from([(
+            "exact".to_string(),
+            field_mapping("keyword"),
+        )]));
+        let client = RecordingClient::mapped(vec![("id", normalized)]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("A"), 0)]),
+        )
+        .await
+        .expect("the prune should succeed on the exact sub-field");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.exact": "A"}}]),
+        );
+    }
+
+    /// A key column whose type indexes a *rounded* form of the value is the normalizer hazard
+    /// under a different name, and the same refusal answers it.
+    ///
+    /// Measured against Elasticsearch 8.15.0 rather than reasoned from the mapping: two documents
+    /// carrying distinct `scaled_float` values `1.234` and `1.2337` (scaling factor 100) are both
+    /// returned by `{"term": {"pk": 1.234}}`, because each indexes as `123`. Issuing the prune's
+    /// own body for the first row — `filter` that term, `must_not` its surviving chunk `_id`s —
+    /// then deleted three documents and reported no failures: the row's one superseded chunk, and
+    /// both chunks of the *other* row, which no `must_not` named because it is not in the group.
+    /// `float`, `half_float` and `date` collide the same way, and `constant_keyword` matches every
+    /// document in the index.
+    #[tokio::test]
+    async fn a_rounding_group_column_refuses_before_issuing() {
+        for (field_type, _) in TERM_ROUNDING_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
+
+            let err = delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key(),
+                &["id".to_string()],
+                &member_batch(&[(Some("A"), 0)]),
+            )
+            .await
+            .expect_err("a rounding group column must fail the prune");
+
+            let message = err.to_string();
+            assert!(
+                message.contains("'id'") && message.contains(*field_type),
+                "the error must name the column and its mapping, got: {message}"
+            );
+            assert!(
+                client.queries().is_empty(),
+                "no _delete_by_query may be issued against a key field mapped `{field_type}`, \
+                 whose terms stand for a range of values"
+            );
+        }
+    }
+
+    /// The same mapping is refused on the partial-key delete, which shares the resolution — the
+    /// filter over-deletes there rather than crossing into a live row, but it is the same field
+    /// that cannot address one row's documents.
+    #[tokio::test]
+    async fn a_rounding_key_column_refuses_a_partial_key_delete_too() {
+        for (field_type, _) in TERM_ROUNDING_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
+
+            delete_by_keys(
+                &client,
+                "idx",
+                &chunked_key(),
+                &["id".to_string()],
+                &string_key_batch(vec![Some("A")]),
+            )
+            .await
+            .expect_err("a rounding key column must fail the delete");
+
+            assert!(client.queries().is_empty());
+        }
+    }
+
+    /// A rounded column that also carries an exactly-indexed sub-field is still addressable — on
+    /// that sub-field, which is the shape a `text` column with a `keyword` multi-field has too.
+    #[tokio::test]
+    async fn a_rounding_column_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut rounding = field_mapping("scaled_float");
+        rounding.fields = Some(std::collections::HashMap::from([(
+            "exact".to_string(),
+            field_mapping("keyword"),
+        )]));
+        let client = RecordingClient::mapped(vec![("id", rounding)]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("A"), 0)]),
+        )
+        .await
+        .expect("the prune should succeed on the exact sub-field");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.exact": "A"}}]),
+        );
+    }
+
+    /// `double` is an exact type and still cannot address an `Int64` key: Elasticsearch indexes
+    /// it as an IEEE-754 binary64, exact for integers only up to 2^53.
+    ///
+    /// Measured against Elasticsearch 8.15.0, not reasoned from the mapping. Two documents keyed
+    /// `9007199254740992` and `9007199254740993` under `{"type": "double"}` are both returned by
+    /// `{"term": {"k": 9007199254740992}}`; the same two keys under `long` and under
+    /// `unsigned_long` return one document each. So the prune would protect one row's chunk
+    /// `_id`s and delete the other row's, which is the [`Error::KeyColumnNormalized`] hazard
+    /// reached through the mapping's *width* rather than its kind.
+    #[tokio::test]
+    async fn an_int64_key_column_mapped_double_refuses_before_issuing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("double"))]);
+
+        let err = delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key_of(DataType::Int64),
+            &["id".to_string()],
+            &member_batch_keyed(
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_992_i64])),
+                &[0],
+            ),
+        )
+        .await
+        .expect_err("an Int64 key column mapped `double` must fail the prune");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id'") && message.contains("double") && message.contains("Int64"),
+            "the error must name the column, its mapping and the source type, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued against a mapping that collapses distinct keys"
+        );
+    }
+
+    /// [`ASSUMED_KEY_TYPE`] stands in for a column the batch does not carry, and the whole point
+    /// of the choice is that it cannot let such a column through a mapping a real one would have
+    /// been refused for. Pin that: every mapping refused for any renderable source type must be
+    /// refused for the assumed one too.
+    #[test]
+    fn assumed_key_type_is_refused_for_every_mapping_any_type_is() {
+        let renderable = [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        for field_type in TERM_EXACT_FIELD_TYPES {
+            let mapping = field_mapping(field_type);
+            let refused_for_some = renderable
+                .iter()
+                .any(|t| term_over_matches(&mapping, t).is_some());
+            if refused_for_some {
+                assert!(
+                    term_over_matches(&mapping, &ASSUMED_KEY_TYPE).is_some(),
+                    "`{field_type}` is refused for some source type, so it must be refused for \
+                     the assumed one — otherwise an absent key column resolves to a mapping a \
+                     present one would have been refused for"
+                );
+            }
+        }
+    }
+
+    /// A string key column mapped to a non-string type is reached only through Elasticsearch's
+    /// parse of the stored string, and that parse is not injective — so a `term` for one key
+    /// returns another key's documents and the prune deletes the sibling row's chunks.
+    ///
+    /// Measured against Elasticsearch 8.15.0, not reasoned from the mapping. Under
+    /// `{"type": "long"}`, documents keyed `"1"` and `"01"` both index as the term `1`, and the
+    /// prune this code builds for row `"1"` shortened to one chunk —
+    /// `{"bool": {"filter": [{"term": {"row_key": "1"}}], "must_not": [{"ids": …}]}}` — reported
+    /// `"deleted": 3`, removing row `"01"`'s two chunks along with row `"1"`'s superseded one.
+    /// The same two keys under `keyword` leave `"deleted": 1`. `"1.0"`/`"1.00"` under `double`
+    /// and `"2020-01-01"`/`"2020-01-01T00:00:00Z"` under `date` collide the same way, as do
+    /// `"false"`/`""` under `boolean` (an empty string reads as false) and
+    /// `"2001:db8::1"`/`"2001:0db8:0:0:0:0:0:1"` under `ip` (the address is canonicalized).
+    ///
+    /// `boolean` and `ip` are in this list because of those pairs, not despite rejecting others:
+    /// `"True"` and `"1.2.3.04"` are refused at index time, and taking a rejected pair as proof
+    /// the type is injective is what left both of them wrongly in [`STRING_FIELD_TYPES`] once.
+    #[tokio::test]
+    async fn a_string_key_column_mapped_to_a_parsed_type_refuses_before_issuing() {
+        for mapped_as in [
+            "byte",
+            "short",
+            "integer",
+            "long",
+            "unsigned_long",
+            "double",
+            "date",
+            "date_nanos",
+            "boolean",
+            "ip",
+        ] {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+
+            let Err(err) = delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(DataType::Utf8),
+                &["id".to_string()],
+                &member_batch_keyed(Arc::new(StringArray::from(vec!["1"])), &[0]),
+            )
+            .await
+            else {
+                panic!("a Utf8 key column mapped `{mapped_as}` must fail the prune")
+            };
+
+            let message = err.to_string();
+            assert!(
+                message.contains("'id'") && message.contains(mapped_as) && message.contains("Utf8"),
+                "the error must name the column, its mapping and the source type, got: {message}"
+            );
+            assert!(
+                client.queries().is_empty(),
+                "no _delete_by_query may be issued against `{mapped_as}`, which collapses distinct string keys"
+            );
+        }
+    }
+
+    /// The parse rule is about the *pairing*, not about string columns: a string key mapped to a
+    /// type it reaches as itself is stored and matched as itself, and `keyword` is the mapping
+    /// the runtime writes for every string key (`primary_key_mapping`). A blanket refusal of
+    /// string keys would cost the common case its prune entirely.
+    #[tokio::test]
+    async fn a_string_key_column_mapped_to_a_type_it_reaches_as_itself_still_resolves() {
+        for mapped_as in STRING_FIELD_TYPES {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(DataType::Utf8),
+                &["id".to_string()],
+                &member_batch_keyed(Arc::new(StringArray::from(vec!["1"])), &[0]),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("a Utf8 key column mapped `{mapped_as}` should address its group: {e}")
+            });
+
+            assert_eq!(
+                client.queries().len(),
+                1,
+                "`{mapped_as}` addresses the group exactly, so the prune is issued"
+            );
+        }
+    }
+
+    /// A key column no `term` can render drops its whole group in [`collect_groups`], so an
+    /// index over such a key prunes nothing — and [`key_renders_terms`] is what stops that being
+    /// reported as a complete prune. `primary_key_mapping` maps a `Float32` key `float` and a
+    /// timestamp key `date`, so these are keys a user can declare today.
+    #[test]
+    fn a_key_type_that_renders_no_term_is_not_addressable() {
+        for unaddressable in [
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            assert!(
+                !key_renders_terms(&chunked_key_of(unaddressable.clone())),
+                "{unaddressable} renders no term, so a group keyed on it cannot be addressed"
+            );
+        }
+        for addressable in [DataType::Utf8, DataType::Int64, DataType::UInt32] {
+            assert!(
+                key_renders_terms(&chunked_key_of(addressable.clone())),
+                "{addressable} renders a term, so its groups are addressable"
+            );
+        }
+    }
+
+    /// The width rule is about the pairing, not about `double`: a `UInt32` column mapped
+    /// `double` still addresses its group, because binary64 holds every `u32` apart, and the
+    /// same `Int64` column mapped `long` does too. A blanket refusal of `double` would fail the
+    /// first of these and cost an index a delete it can serve exactly.
+    #[tokio::test]
+    async fn a_mapping_wide_enough_for_the_source_type_still_resolves() {
+        for (source, mapped_as, key, expected) in [
+            (
+                DataType::Int64,
+                "long",
+                ScalarValue::Int64(Some(9_007_199_254_740_993)),
+                json!(9_007_199_254_740_993_i64),
+            ),
+            (
+                DataType::UInt32,
+                "double",
+                ScalarValue::UInt32(Some(4_294_967_295)),
+                json!(4_294_967_295_u32),
+            ),
+        ] {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+            let members =
+                member_batch_keyed(key.to_array().expect("key should render to an array"), &[0]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(source.clone()),
+                &["id".to_string()],
+                &members,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{source} under `{mapped_as}` must be addressable: {e}"));
+
+            assert_eq!(
+                client.queries().len(),
+                1,
+                "{source} under `{mapped_as}` must reach the index, not return early"
+            );
+            assert_eq!(
+                client.queries()[0]["bool"]["should"][0]["bool"]["filter"][0]["term"]["id"],
+                expected,
+                "the group must be filtered on the column itself"
+            );
+        }
+    }
+
+    /// `renders_a_term` has to agree with [`scalar_to_term_value`], which is the function that
+    /// decides whether a `term` is emitted at all. They are separate because one answers on a
+    /// type and the other on a value, so this pins them together: a type added to either without
+    /// the other shows up here rather than as a refusal for a delete that never issues, or a
+    /// missed refusal for one that does.
+    #[test]
+    fn term_renderable_types_match_scalar_to_term_value() {
+        let cases = [
+            ScalarValue::Utf8(Some("a".to_string())),
+            ScalarValue::LargeUtf8(Some("a".to_string())),
+            ScalarValue::Utf8View(Some("a".to_string())),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Int8(Some(1)),
+            ScalarValue::Int16(Some(1)),
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::UInt8(Some(1)),
+            ScalarValue::UInt16(Some(1)),
+            ScalarValue::UInt32(Some(1)),
+            ScalarValue::UInt64(Some(1)),
+            ScalarValue::Float32(Some(1.0)),
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Date32(Some(1)),
+            ScalarValue::Date64(Some(1)),
+            ScalarValue::TimestampMillisecond(Some(1), None),
+            ScalarValue::Decimal128(Some(1), 10, 2),
+            ScalarValue::Binary(Some(vec![1])),
+        ];
+        for value in cases {
+            assert_eq!(
+                renders_a_term(&value.data_type()),
+                scalar_to_term_value(&value).is_some(),
+                "`renders_a_term` and `scalar_to_term_value` disagree about {}",
+                value.data_type()
+            );
+        }
+    }
+
+    /// The width rule must be threaded into the sub-field fallback as well as the column itself,
+    /// which is two call sites — a regression that dropped it from one would leave the other's
+    /// test green.
+    #[tokio::test]
+    async fn an_int64_column_mapped_double_with_an_exact_sub_field_uses_the_sub_field() {
+        let mut narrow = field_mapping("double");
+        narrow.fields = Some(std::collections::HashMap::from([(
+            "exact".to_string(),
+            field_mapping("long"),
+        )]));
+        let client = RecordingClient::mapped(vec![("id", narrow)]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key_of(DataType::Int64),
+            &["id".to_string()],
+            &member_batch_keyed(
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_992_i64])),
+                &[0],
+            ),
+        )
+        .await
+        .expect("the prune should succeed on the exact sub-field");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.exact": 9_007_199_254_740_992_i64}}]),
+        );
+    }
+
+    /// The refusal must not fire on a mapping the runtime itself writes. `primary_key_mapping`
+    /// maps a `Float32` key column `float` and a `Date32`/`Date64`/`Timestamp` one `date`, both
+    /// of which round their values — but [`scalar_to_term_value`] renders neither type, so those
+    /// columns emit no `term` and the group is dropped by [`collect_groups`] rather than
+    /// refused. Refusing them would fail a delete with a message telling the user to re-map a
+    /// column the runtime chose the mapping for.
+    #[tokio::test]
+    async fn a_rounding_mapping_the_runtime_writes_is_not_refused() {
+        for (source, mapped_as) in [
+            (DataType::Float32, "float"),
+            (DataType::Float64, "double"),
+            (DataType::Date32, "date"),
+            (DataType::Date64, "date"),
+            (DataType::Timestamp(TimeUnit::Millisecond, None), "date"),
+        ] {
+            let client = RecordingClient::mapped(vec![("id", field_mapping(mapped_as))]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key_of(source.clone()),
+                &["id".to_string()],
+                &member_batch_keyed(arrow::array::new_null_array(&source, 1), &[0]),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{source} under `{mapped_as}` is what the runtime writes; it must not be refused: {e}")
+            });
+        }
+    }
+
+    /// The refusal's wording is what a user acts on, so it is asserted rather than left to a
+    /// reword to quietly drop the column, the mapping, the source type or the remedy.
+    #[test]
+    fn the_over_match_refusal_names_the_column_mapping_source_and_remedy() {
+        let message = Error::KeyColumnOverMatches {
+            index: "reviews".to_string(),
+            column: "order_id".to_string(),
+            mapped_as: "scaled_float".to_string(),
+            source_type: "Int64".to_string(),
+            why: "indexes `round(value * scaling_factor)` rather than the value",
+        }
+        .to_string();
+
+        for expected in [
+            "'reviews'",
+            "'order_id'",
+            "Int64",
+            "`scaled_float`",
+            "round(value * scaling_factor)",
+            "reaches every other value indexed under that same term",
+            "the delete was not issued",
+            "`keyword`",
+            "https://spiceai.org/docs/features/search",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must carry {expected:?}, got: {message}"
+            );
+        }
+        assert!(
+            !message.contains('\n'),
+            "a log line must stay on one line, got: {message}"
+        );
+    }
+
+    /// Every rounding type must also be an exact-match type, because `term_over_matches` is only
+    /// consulted for a mapping that got that far. Dropping one from
+    /// [`TERM_EXACT_FIELD_TYPES`] does not make it *more* refused — it makes it refused with the
+    /// wrong message ("no exact-match filter can address") and, worse, refused even for a source
+    /// type that renders no term, which is a mapping the runtime itself writes.
+    #[test]
+    fn every_rounding_type_is_also_an_exact_match_type() {
+        for (rounding, _) in TERM_ROUNDING_FIELD_TYPES {
+            assert!(
+                TERM_EXACT_FIELD_TYPES.contains(rounding),
+                "`{rounding}` must be in TERM_EXACT_FIELD_TYPES for term_over_matches to reach it"
+            );
+        }
+    }
+
+    /// The counterpart of the refusal: a type whose indexed form *is* the value still resolves to
+    /// the column itself, so tightening the list did not cost an index its delete.
+    ///
+    /// The key here is `Utf8`, so the set is [`STRING_FIELD_TYPES`] rather than every non-rounding
+    /// exact type: Elasticsearch reaches a string through a parse for the numeric and date types,
+    /// and that parse collapses distinct keys onto one term (see [`STRING_FIELD_TYPES`] for the
+    /// measurements). `a_string_key_column_mapped_to_a_parsed_type_refuses_before_issuing` is the
+    /// other half, and `a_mapping_wide_enough_for_the_source_type_still_resolves` keeps the
+    /// numeric types addressable for the numeric key columns they are exact for.
+    #[tokio::test]
+    async fn an_exactly_indexed_group_column_still_resolves_to_the_column() {
+        let rounding: Vec<&str> = TERM_ROUNDING_FIELD_TYPES.iter().map(|(t, _)| *t).collect();
+        for field_type in STRING_FIELD_TYPES {
+            if rounding.contains(field_type) {
+                continue;
+            }
+            let client = RecordingClient::mapped(vec![("id", field_mapping(field_type))]);
+
+            delete_group_remainder(
+                &client,
+                "idx",
+                &chunked_key(),
+                &["id".to_string()],
+                &member_batch(&[(Some("A"), 0)]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("`{field_type}` must still address the group: {e}"));
+
+            assert_eq!(
+                client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+                json!([{"term": {"id": "A"}}]),
+                "`{field_type}` must be filtered on the column itself"
+            );
+        }
+    }
+
+    /// The group columns are resolved the same way [`delete_by_keys`] resolves them, so a
+    /// `text`-mapped key column is filtered on its `keyword` multi-field rather than on the
+    /// analyzed tokens the column itself indexes (#13714).
+    #[tokio::test]
+    async fn a_text_mapped_group_column_is_filtered_on_its_keyword_sub_field() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+
+        delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("ORDER-1024"), 0)]),
+        )
+        .await
+        .expect("the prune should succeed");
+
+        assert_eq!(
+            client.queries()[0]["bool"]["should"][0]["bool"]["filter"],
+            json!([{"term": {"id.keyword": "ORDER-1024"}}]),
+        );
+    }
+
+    /// A group column with no exact-match field fails the prune before a request is issued, for
+    /// the same reason [`delete_by_keys`] refuses it: a filter that matches nothing would delete
+    /// nothing and report success.
+    #[tokio::test]
+    async fn a_group_column_with_no_exact_match_field_refuses_before_issuing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("text"))]);
+
+        let err = delete_group_remainder(
+            &client,
+            "idx",
+            &chunked_key(),
+            &["id".to_string()],
+            &member_batch(&[(Some("ORDER-1024"), 0)]),
+        )
+        .await
+        .expect_err("a group column with no exact-match field must fail the prune");
+
+        assert!(
+            err.to_string().contains("'id'"),
+            "the error must name the group column, got: {err}"
+        );
+        assert!(client.queries().is_empty());
     }
 
     /// The reported bug (#13714) on the half `_id` addressing cannot reach: a chunked index's
@@ -2354,5 +3701,67 @@ mod tests {
             serde_json::json!([{ "term": { "id": 7 } }]),
             "the chunk id must not narrow the delete: {query}"
         );
+    }
+
+    /// Every leaf query under `query`, counting through nested `bool`s the way Elasticsearch
+    /// does when it raises `too_many_nested_clauses`.
+    fn leaf_clause_count(query: &Value) -> usize {
+        let Some(bool_query) = query.get("bool") else {
+            return 1;
+        };
+        ["should", "filter", "must", "must_not"]
+            .iter()
+            .filter_map(|occur| bool_query.get(*occur))
+            .flat_map(|clauses| match clauses {
+                Value::Array(clauses) => clauses.as_slice(),
+                clause => std::slice::from_ref(clause),
+            })
+            .map(leaf_clause_count)
+            .sum()
+    }
+
+    /// The group budget is spent in members, but Elasticsearch charges the request in leaves, and
+    /// a group is worth one `term` leaf per key column plus its `ids` leaf. Pins that ceiling so a
+    /// group that grows a clause — or a budget raised on the member accounting alone — has to say
+    /// so here rather than in a rejected delete, which lands *after* the bulk write and leaves the
+    /// index carrying the chunks the prune existed to remove.
+    ///
+    /// The bound is the smallest clause budget an Elasticsearch 8 node was measured to derive from
+    /// its heap (2340 on a 256 MiB heap; 9362 on 1 GiB). `indices.query.bool.max_clause_count` is
+    /// deprecated and ignored there, so its old 1024 default is not the ceiling to size against.
+    #[test]
+    fn group_remainder_request_leaf_count_stays_within_the_smallest_supported_clause_budget() {
+        const SMALLEST_MEASURED_CLAUSE_BUDGET: usize = 2340;
+
+        for key_columns in 1..=3 {
+            // One member each, so the member budget admits as many groups as it can — the shape
+            // that carries the most leaves for a given budget.
+            let groups: Vec<MemberGroup> = (0..PRUNE_MEMBERS_PER_REQUEST)
+                .map(|group| MemberGroup {
+                    terms: (0..key_columns)
+                        .map(|column| json!({ "term": { format!("k{column}"): format!("g{group}") } }))
+                        .collect(),
+                    survivors: vec![format!("id{group}")],
+                })
+                .collect();
+
+            let requests = group_requests(groups);
+            assert_eq!(
+                requests.len(),
+                1,
+                "{key_columns} key columns: the member budget should hold every group in one request"
+            );
+
+            let leaves = leaf_clause_count(&requests[0]);
+            assert_eq!(
+                leaves,
+                PRUNE_MEMBERS_PER_REQUEST * (key_columns + 1),
+                "{key_columns} key columns: a group is worth one term leaf per column plus its ids leaf"
+            );
+            assert!(
+                leaves <= SMALLEST_MEASURED_CLAUSE_BUDGET,
+                "{key_columns} key columns: {leaves} leaves exceeds the {SMALLEST_MEASURED_CLAUSE_BUDGET} a 256 MiB-heap node allows"
+            );
+        }
     }
 }
