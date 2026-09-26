@@ -452,8 +452,15 @@ async fn a_build_the_pool_cannot_fit_is_not_retried_on_every_lookup() {
         .expect("fixture");
     let (env, _pool) = runtime_with_pool(MIB);
     let name = "refused";
+    let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    overwrite(&initial, rows(0, ROWS)).await;
+    // The overwrite's own write-time build is refused by this pool too, and a
+    // refused write-time build seeds the very schedule the loop below measures:
+    // the next build waits `2 * max(1s, 10 * write_build_time)`, which passes the
+    // window as soon as that write takes 200ms. Reopening drops that schedule, so
+    // what the first lookup claims is the subject rather than the host's speed.
+    drop(initial);
     let table = open(&fixture, env, name, &[&KEY]).await;
-    overwrite(&table, rows(0, ROWS)).await;
 
     let window = Duration::from_secs(4);
     let started = Instant::now();
