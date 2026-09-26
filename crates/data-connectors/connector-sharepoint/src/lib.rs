@@ -990,15 +990,8 @@ impl ListingTableConnector for SharepointListingConnector {
         // Fallback for contexts where the runtime isn't wired in (e.g. tests,
         // cluster schema-inference). Build a fresh session with a dedicated
         // RuntimeEnv and register the store on that.
-        let mut config = runtime_datafusion::session_config::DEFAULT_DATAFUSION_CONFIG
-            .read()
-            .map_or_else(|_| datafusion::prelude::SessionConfig::new(), |c| c.clone());
-        config
-            .options_mut()
-            .execution
-            .listing_table_ignore_subdirectory = false;
         let ctx = SessionContext::new_with_config_rt(
-            config,
+            runtime_datafusion::session_config::get_df_default_config(),
             default_runtime_env(self.tokio_io_runtime.clone()),
         );
         register_sharepoint_store_on_fresh(

@@ -59,7 +59,7 @@ impl QuerySession {
     #[must_use]
     pub fn default_session() -> Self {
         Self {
-            ctx: Arc::new(SessionContext::new()),
+            ctx: Arc::new(util::session_state::session_context()),
         }
     }
 }

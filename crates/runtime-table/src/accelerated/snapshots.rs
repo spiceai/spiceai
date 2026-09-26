@@ -19,7 +19,6 @@ use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::prelude::SessionContext;
 use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
@@ -551,7 +550,7 @@ async fn get_row_count(
     accelerator: &Arc<dyn TableProvider>,
     dataset_name: &TableReference,
 ) -> Option<u64> {
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let table_name = dataset_name.table();
 
     if ctx

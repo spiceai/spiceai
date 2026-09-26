@@ -304,7 +304,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             dataset: dataset.to_string(),
-            session_config: SessionConfig::default(),
+            session_config: util::session_state::session_config(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,

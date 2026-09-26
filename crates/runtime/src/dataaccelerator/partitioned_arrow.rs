@@ -25,7 +25,7 @@ use datafusion::{
     error::DataFusionError,
     execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
-    prelude::{Expr, SessionContext},
+    prelude::Expr,
     scalar::ScalarValue,
 };
 use runtime_table_partition::{
@@ -85,7 +85,7 @@ impl PartitionCreator for ArrowPartitionCreator {
             });
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider =
             TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &self.cmd)
                 .await

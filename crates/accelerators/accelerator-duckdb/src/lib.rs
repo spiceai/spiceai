@@ -34,7 +34,7 @@ use datafusion::{
     catalog::{Session, TableProviderFactory},
     common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
-    execution::{SendableRecordBatchStream, context::SessionContext},
+    execution::SendableRecordBatchStream,
     logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
@@ -1530,7 +1530,7 @@ pub(crate) async fn create_table_provider(
     cmd: &CreateExternalTable,
     on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
 
     let table_provider = duckdb_factory
         .create(&ctx.state(), cmd)

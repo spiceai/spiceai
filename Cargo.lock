@@ -128,6 +128,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-table-partition",
  "snafu",
+ "util",
 ]
 
 [[package]]
@@ -156,6 +157,7 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -4872,6 +4874,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -17682,6 +17685,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "cpu-budget",
  "criterion 0.7.0",
  "dashmap",
  "datafusion",
@@ -17929,6 +17933,7 @@ dependencies = [
  "datafusion",
  "globset",
  "snafu",
+ "util",
 ]
 
 [[package]]
@@ -18096,6 +18101,7 @@ dependencies = [
  "cache",
  "cayenne",
  "chrono",
+ "cpu-budget",
  "data-accelerator-api",
  "data-connector-api",
  "data_components",
@@ -18239,6 +18245,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -23015,6 +23022,7 @@ dependencies = [
  "arrow-schema",
  "backoff",
  "chrono",
+ "cpu-budget",
  "ctrlc",
  "datafusion",
  "futures",

@@ -29,8 +29,7 @@ use data_accelerator_api::{FilePathError, spice_data_base_path};
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
@@ -571,7 +570,7 @@ impl DataAccelerator for SqliteAccelerator {
             }
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), &cmd)
             .await
             .context(UnableToCreateTableSnafu)

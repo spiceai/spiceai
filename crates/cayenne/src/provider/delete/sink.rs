@@ -72,7 +72,6 @@ use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::TaskContext;
-use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
@@ -1098,7 +1097,7 @@ impl CayenneDeletionSink {
             });
         }
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
         let listing_table = self.listing_table.load_full();
@@ -1361,7 +1360,7 @@ impl DeletionSink for CayenneDeletionSink {
         };
 
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
 

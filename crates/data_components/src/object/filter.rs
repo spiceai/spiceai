@@ -24,10 +24,7 @@ use datafusion::logical_expr::ColumnarValue;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use datafusion::{
-    error::DataFusionError,
-    prelude::{Expr, SessionContext},
-};
+use datafusion::{error::DataFusionError, prelude::Expr};
 use object_store::ObjectMeta;
 
 static OBJECT_META_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -61,7 +58,7 @@ pub fn filter_object_meta(
             Some("Failed to convert 'ObjectMeta' to arrow".to_string()),
         )
     })?;
-    let ctx = SessionContext::default();
+    let ctx = util::session_state::session_context();
 
     let df_schema =
         DFSchema::from_unqualified_fields(OBJECT_META_SCHEMA.fields().clone(), HashMap::default())?;
