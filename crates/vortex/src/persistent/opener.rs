@@ -42,7 +42,10 @@ use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
 use vortex::array::expr::Expression;
 use vortex::array::expr::forms::conjuncts;
+use vortex::array::expr::root;
+use vortex::array::expr::transform::replace_root_fields;
 use vortex::arrow::ArrowSessionExt;
+use vortex::dtype::DType;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
@@ -709,7 +712,15 @@ fn point_read_stream(
 ) -> VortexResult<BoxStream<'static, VortexResult<RecordBatch>>> {
     let conjuncts: Arc<[Expression]> =
         conjuncts(&filter.optimize_recursive(reader.dtype())?).into();
-    let projection = projection.optimize_recursive(reader.dtype())?;
+    // A projection of every field in file order is the root itself. The struct
+    // reader rewrites a projection against its own expansion of the root before
+    // partitioning it by field, and for that `pack` the rewrite nests the
+    // expansion once per field; handed `root()`, it has nothing to rewrite.
+    let projection = if is_identity_projection(projection, reader.dtype()) {
+        root()
+    } else {
+        projection.optimize_recursive(reader.dtype())?
+    };
     let reads = ranges.into_iter().map(move |range| {
         read_range(
             Arc::clone(&reader),
@@ -724,6 +735,16 @@ fn point_read_stream(
         .buffered(POINT_READ_MAX_RANGES)
         .try_filter_map(|batch| async move { Ok(batch) })
         .boxed())
+}
+
+/// Whether `projection` selects every field of the non-nullable struct `dtype`,
+/// in order and under its own name — the expansion of `root()` a struct reader
+/// builds for `dtype`.
+fn is_identity_projection(projection: &Expression, dtype: &DType) -> bool {
+    !dtype.is_nullable()
+        && dtype
+            .as_struct_fields_opt()
+            .is_some_and(|fields| *projection == replace_root_fields(root(), fields))
 }
 
 async fn read_range(
@@ -1405,6 +1426,36 @@ mod tests {
         Ok(rows)
     }
 
+    /// Reads `file` with `predicate`, projecting only `p`, and returns its values.
+    async fn read_positions(
+        object_store: &Arc<dyn ObjectStore>,
+        schema: &SchemaRef,
+        file: &PartitionedFile,
+        predicate: &datafusion::logical_expr::Expr,
+        key_column: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        use datafusion::arrow::util::display::ArrayFormatter;
+
+        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let filter = logical2physical(predicate, table_schema.table_schema());
+        let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
+        opener.projection = ProjectionExprs::from_indices(&[1], schema);
+        opener.key_column = key_column.map(Arc::from);
+        let batches = opener
+            .open(file.clone())?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 1, "only `p` is projected");
+            let formatter = ArrayFormatter::try_new(batch.column(0), &FormatOptions::default())?;
+            values.extend((0..batch.num_rows()).map(|row| formatter.value(row).to_string()));
+        }
+        values.sort();
+        Ok(values)
+    }
+
     /// A key lookup over a whole file reads only the blocks whose bounds hold the
     /// key, and must return exactly what the scan returns — for keys at block
     /// edges, a key stored twice, keys inside an all-null block, and keys the
@@ -1470,6 +1521,18 @@ mod tests {
         assert_eq!(looked_up, scanned);
         assert_eq!(looked_up, vec![(Some(7), "row-30000".to_string())]);
         assert_eq!(take_point_reads(), 1);
+
+        // A projection of some of the columns reads the same rows.
+        for key in [0, ROWS - 1] {
+            let predicate = col("a").eq(lit(key));
+            let scanned = read_positions(&object_store, &schema, &file, &predicate, None).await?;
+            take_point_reads();
+            let looked_up =
+                read_positions(&object_store, &schema, &file, &predicate, Some("a")).await?;
+            assert_eq!(looked_up, scanned);
+            assert_eq!(looked_up, vec![format!("row-{key}")]);
+            assert_eq!(take_point_reads(), 1);
+        }
 
         // Anything but an equality on the key keeps the scan.
         let predicate = col("a").gt_eq(lit(ROWS - 3));
