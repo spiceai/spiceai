@@ -361,16 +361,14 @@ impl CayenneAccelerationExec {
         plan_has_pushed_filter(&self.inner)
     }
 
-    /// Like [`Self::has_pushed_filter`] but detects a predicate pushed onto a file
-    /// source ANYWHERE in the wrapped plan — including below a deletion-filter exec
-    /// on a merge-on-read table (which [`Self::has_pushed_filter`]'s shallow walk
-    /// stops above). The maintained-aggregate rewrite's soundness guard uses this:
-    /// a maintained view answers the unfiltered relation, so it must decline when a
-    /// query predicate has narrowed the scan — even when a pending-tombstone
-    /// deletion-filter exec sits between the scan wrapper and the source.
+    /// Whether this scan produces every live row of the table: nothing in the
+    /// wrapped plan filters or limits rows. A maintained aggregate view describes
+    /// exactly that relation, so the maintained-aggregate rewrite may substitute the
+    /// view for this scan only when this returns `true`. See
+    /// [`plan_scans_whole_relation`].
     #[must_use]
-    pub(crate) fn has_pushed_filter_deep(&self) -> bool {
-        plan_has_pushed_filter_deep(&self.inner)
+    pub(crate) fn scans_whole_relation(&self) -> bool {
+        plan_scans_whole_relation(&self.inner)
     }
 
     /// Push additional dynamic filters into the underlying file source.
@@ -556,32 +554,48 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .any(|config| config.file_source().filter().is_some())
 }
 
-/// Like [`plan_has_pushed_filter`] but walks the ENTIRE subtree (every descendant,
-/// not just the identity-preserving whitelist), so a query predicate pushed onto a
-/// file source BELOW a non-passthrough operator is still detected. The critical
-/// case is a merge-on-read table with pending tombstones: `scan()` wraps the Vortex
-/// `DataSourceExec` in a deletion-filter exec (which is NOT identity-preserving, so
-/// [`plan_has_pushed_filter`] stops above it), and a Vortex-convertible `WHERE` is
-/// pushed THROUGH that exec onto the source. The aggregate-rewrite soundness guard
-/// must see that predicate — otherwise a maintained / whole-file aggregate silently
-/// serves the unfiltered relation for a filtered query. Over-detection is sound for
-/// that guard: it only ever causes a decline (the real scan+aggregate runs).
-/// Distinct from [`plan_has_pushed_filter`], which is intentionally shallow because
-/// the deletion-filter exec's delete-aware `num_rows` math must NOT see a filtered
-/// (subset) count as a whole-table count.
-pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// Whether `plan` produces every live row of the table it scans: no node in the
+/// subtree filters or limits rows.
+///
+/// A query's `WHERE` or `LIMIT` does not have to stay above the scan. Physical
+/// `FilterPushdown` hands a predicate to a Vortex source that accepts it, and to
+/// a `FilterExec` inside the scan when a branch cannot evaluate it: the in-memory
+/// branch that `scan()` already wraps in the query's filters absorbs it, and
+/// `UnionExec` wraps each rejecting branch in its own `FilterExec`. Either way the
+/// `FilterExec` above the scan is removed. A `LIMIT` in a subquery becomes a fetch
+/// inside the scan. So the scan's own subtree is the only place to look.
+///
+/// The walk fails closed: only nodes known to pass every row through (and every
+/// child of theirs) count, so an operator added later is treated as narrowing the
+/// scan until it is listed here. The deletion-filter execs are listed because they
+/// remove only rows that are no longer live, which is the relation a maintained
+/// view describes. Any fetch fails the check, and a file source fails it when it
+/// carries a predicate (static or dynamic). An in-memory source never carries one.
+#[expect(deprecated)]
+pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.fetch().is_some() {
+        return false;
+    }
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
-        return data_source_exec
-            .data_source()
-            .downcast_ref::<FileScanConfig>()
-            .is_some_and(|config| config.file_source().filter().is_some());
-    }
-    for child in plan.children() {
-        if plan_has_pushed_filter_deep(child) {
-            return true;
+        let source = data_source_exec.data_source();
+        if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+            return config.file_source().filter().is_none();
         }
+        return source
+            .downcast_ref::<datafusion::datasource::memory::MemorySourceConfig>()
+            .is_some();
     }
-    false
+    let passes_every_row = plan.is::<CayenneAccelerationExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
+        || plan.is::<datafusion_physical_plan::empty::EmptyExec>()
+        || plan.is::<crate::provider::delete::KeyBasedDeletionFilterExec>()
+        || plan.is::<crate::provider::delete::Int64PkDeletionFilterExec>();
+    passes_every_row && plan.children().into_iter().all(plan_scans_whole_relation)
 }
 
 /// Splits the file-backed scans under `plan` decode CONCURRENTLY, summed across the

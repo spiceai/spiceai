@@ -492,24 +492,17 @@ fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<MaintainedAggregateSource<'_>> {
     if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
-        // Soundness guard — mirrors `CayenneStatsAggregateRewriter::optimize`,
-        // which declines when `scan.has_pushed_filter()`. A maintained aggregate
-        // view answers the *unfiltered* relation, but the physical `FilterPushdown`
-        // pass can push a query's `WHERE` ONTO the scan and REMOVE the `FilterExec`
-        // above it (the inner Vortex source accepts the predicate; see
-        // `CayenneAccelerationExec::handle_child_pushdown_result`). Reaching the bare
-        // scan with a pushed filter therefore means the scan returns a row *subset*
-        // the whole-relation view cannot answer — serving it would silently drop the
-        // predicate and return wrong results. Decline so the real scan+aggregate runs.
-        // (A *surviving* `FilterExec` is still captured by the `FilterExec` branch
-        // below and matched against a filtered view, so filtered views are unaffected.)
-        //
-        // DEEP walk: on a merge-on-read table with pending tombstones the scan is
-        // wrapped in a deletion-filter exec and the predicate is pushed onto the file
-        // source BELOW it, which the shallow `has_pushed_filter` (identity-preserving
-        // whitelist) would miss — leaving the bug open on exactly the delete-heavy CDC
-        // tables this view targets.
-        if cayenne_scan.has_pushed_filter_deep() {
+        // Soundness guard. A maintained view answers the whole table, but reaching
+        // the bare scan says nothing about whether the query still reads the whole
+        // table: physical `FilterPushdown` can move a `WHERE` into the scan (onto a
+        // Vortex source, or into a `FilterExec` on a branch that cannot evaluate it)
+        // and remove the `FilterExec` above, and a subquery `LIMIT` becomes a fetch
+        // inside the scan. Serving the view for such a scan returns whole-table
+        // totals for a subset. Decline unless the scan's subtree provably passes
+        // every live row through, so the real scan and aggregate run. (A `FilterExec`
+        // that survives above the scan is captured by the branch below and matched
+        // against a filtered view.)
+        if !cayenne_scan.scans_whole_relation() {
             return None;
         }
         return cayenne_scan
@@ -2119,7 +2112,7 @@ mod tests {
     /// O(groups) maintained state, not an O(rows) re-scan. Pairs with the
     /// module's value-correctness tests (`maintains_min_max_with_retraction`), so
     /// together they prove the served path is both selected AND correct. MIN/MAX
-    /// inherits the P0-1 `has_pushed_filter_deep` guard from the shared,
+    /// inherits the whole-relation guard (`scans_whole_relation`) from the shared,
     /// function-agnostic `maintained_aggregate_source`.
     #[test]
     fn maintained_aggregate_rewriter_serves_min_max_group_by() -> DFResult<()> {
