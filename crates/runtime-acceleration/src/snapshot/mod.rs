@@ -529,7 +529,11 @@ pub enum SnapshotUploadError {
         "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema, and the change is not a lossless widening that snapshot schema versioning can record. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
     ))]
     UploadSchemaMismatch { dataset: String, details: String },
-    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
+    #[snafu(display(
+        "Failed to snapshot dataset '{dataset}': there is no acceleration file at {path:?} to snapshot, so no snapshot was created and the dataset's newest snapshot is unchanged. Check the acceleration is loaded and that its file has not been removed. See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MissingAccelerationFile { dataset: String, path: PathBuf },
+    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}: {source}"))]
     CopyLocal {
         source_path: PathBuf,
         dest_path: PathBuf,
@@ -1286,10 +1290,24 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
+        // Every engine hook below opens the accelerator file as a database, and each
+        // driver's open CREATES one at a path that has none — so an absent file would be
+        // materialized as an empty database and published by the copy below as this
+        // dataset's snapshot. Refuse it here, where the answer is the same for every
+        // engine and the message can name the dataset. The caller holds the accelerator
+        // write lock, so nothing removes the file between this check and the copy.
+        ensure!(
+            source_local_path.is_file(),
+            MissingAccelerationFileSnafu {
+                dataset: self.dataset_name.clone(),
+                path: source_local_path.clone(),
+            }
+        );
+
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For SQLite/Turso this drains the WAL into the main file so that
-        // the subsequent `fs::copy` produces a self-contained snapshot.
-        // Default (no-op) for engines without WAL.
+        // For DuckDB/SQLite/Turso this drains the write-ahead log into the main
+        // file so that the subsequent `fs::copy` produces a self-contained
+        // snapshot. Engines with nothing to flush return `Ok(())`.
         self.snapshot_engine
             .checkpoint_live(source_local_path, &self.dataset_name)
             .await
@@ -3169,7 +3187,7 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
-    use crate::snapshot::engine::create_snapshot_engine;
+    use crate::snapshot::engine::{DefaultSnapshotEngine, create_snapshot_engine};
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
@@ -3233,12 +3251,18 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `SQLite`/`Turso`, creates a real (empty) `SQLite` WAL-mode database
-    /// so that the engine's `checkpoint_live` hook can open it. For other
-    /// engines, writes opaque test bytes since no engine-side validation
-    /// runs against the file pre-snapshot.
+    /// For `DuckDB`/`SQLite`/`Turso`, creates a real (empty) database so that the
+    /// engine's `checkpoint_live` hook can open it. For other engines, writes opaque
+    /// test bytes since no engine-side validation runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
+            #[cfg(feature = "duckdb")]
+            AccelerationEngine::DuckDB => {
+                let conn = duckdb::Connection::open(path).expect("open sample duckdb db");
+                conn.execute_batch("CREATE TABLE sample(id INTEGER)")
+                    .expect("create sample table");
+                drop(conn);
+            }
             #[cfg(any(feature = "sqlite", feature = "turso"))]
             AccelerationEngine::Sqlite | AccelerationEngine::Turso => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
@@ -3292,6 +3316,13 @@ mod tests {
         }
     }
 
+    /// A `DuckDB` manager whose engine hook does nothing, for the tests about the
+    /// manager's own file path. Those hand it a local file of arbitrary bytes and assert
+    /// the uploaded object matches, which `DuckDBSnapshotEngine` cannot do because it
+    /// opens that file as a database. Only the hook is swapped: the manager keeps the
+    /// `DuckDB` identity that names the snapshot file, is published in the metadata, and
+    /// is matched at restore. Tests about engine *behaviour* use
+    /// [`build_manager_for_engine`].
     #[cfg(feature = "duckdb")]
     fn build_manager(
         store: Arc<InMemory>,
@@ -3300,14 +3331,16 @@ mod tests {
         schema: &SchemaRef,
         compaction_enabled: bool,
     ) -> SnapshotManager {
-        build_manager_for_engine(
+        let mut manager = build_manager_for_engine(
             store,
             local_path,
             behavior,
             schema,
             &AccelerationEngine::DuckDB,
             compaction_enabled,
-        )
+        );
+        manager.snapshot_engine = Arc::new(DefaultSnapshotEngine);
+        manager
     }
 
     async fn write_metadata(store: &InMemory, metadata_path: &Path, metadata: &SnapshotMetadata) {
@@ -4778,11 +4811,12 @@ mod tests {
             .len();
 
         let schema = sample_schema();
-        let manager = build_manager(
+        let manager = build_manager_for_engine(
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            &AccelerationEngine::DuckDB,
             true,
         );
 
@@ -5090,6 +5124,134 @@ mod tests {
     #[tokio::test]
     async fn duckdb_create_snapshot_updates_metadata() {
         generic_create_snapshot_updates_metadata(&AccelerationEngine::DuckDB).await;
+    }
+
+    /// The whole upload path, not just the engine hook: a `DuckDB` write that is still
+    /// in the write-ahead log when the snapshot is taken must reach the uploaded object.
+    /// Before the `checkpoint_live` override, `create_file_snapshot` copied the database
+    /// file while the write sat in `<db>.wal`, and the snapshot was published without it
+    /// (#13912). The accelerator's connection stays open throughout, as it does in
+    /// production.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_snapshot_carries_a_write_still_in_the_write_ahead_log() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let live = duckdb::Connection::open(&local_path).expect("open live database");
+        live.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1); CHECKPOINT;")
+            .expect("seed a checkpointed baseline");
+        live.execute_batch("INSERT INTO t VALUES (2);")
+            .expect("write without checkpointing");
+
+        let wal = PathBuf::from(format!("{}.wal", local_path.display()));
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0),
+            "the second write must still be in the write-ahead log for this test to mean anything"
+        );
+
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let uploaded_path = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot should be created");
+
+        let uploaded = store
+            .get(&uploaded_path)
+            .await
+            .expect("snapshot stored")
+            .bytes()
+            .await
+            .expect("read stored snapshot");
+
+        let restored = temp_dir.path().join("restored.db");
+        std::fs::write(&restored, &uploaded).expect("materialize the uploaded snapshot");
+        let verify = duckdb::Connection::open(&restored).expect("open the uploaded snapshot");
+        let rows: i64 = verify
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("count rows in the uploaded snapshot");
+        assert_eq!(
+            rows, 2,
+            "the uploaded snapshot must carry the write that was still in the log"
+        );
+    }
+
+    /// An absent accelerator file must fail the snapshot, not become one. Every engine
+    /// hook opens that file as a database, and each driver's open creates one at a path
+    /// that has none — so without the guard in `create_file_snapshot` the hook would
+    /// materialize an empty database and the copy would publish it as this dataset's
+    /// snapshot, leaving `current_snapshot_id` pointing at an empty database for the next
+    /// restore to bootstrap from. Generic because the contract is the caller's, not any
+    /// one engine's (#13912).
+    async fn generic_an_absent_accelerator_file_fails_the_snapshot(engine: &AccelerationEngine) {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("absent.db");
+        assert!(
+            !local_path.exists(),
+            "the accelerator file must be absent for this test to mean anything"
+        );
+
+        let schema = sample_schema();
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            engine,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let err = manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect_err("an absent accelerator file must fail the snapshot");
+
+        assert!(
+            matches!(err, SnapshotUploadError::MissingAccelerationFile { .. }),
+            "the missing file must be named, not reached as a copy failure: {err}"
+        );
+        assert!(
+            !local_path.exists(),
+            "no engine hook may bring the accelerator file into existence"
+        );
+        assert!(
+            store.list(None).next().await.is_none(),
+            "nothing may be published when there is no accelerator file to snapshot"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::DuckDB).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Turso).await;
     }
 
     #[cfg(feature = "duckdb")]
