@@ -267,7 +267,7 @@ async fn drain_in_flight_maintenance_bounded(
 ///
 /// Quiescing first is what makes the answer deterministic. A post-write pass and
 /// this helper both call `compact_current_snapshot_small_files`, so they contend
-/// for the same `compaction_lock` (`try_lock`, so the loser reports a no-op) and
+/// for the same `compaction_lock` (`try_write`, so the loser reports a no-op) and
 /// for the same one-shot `new_files_since_last_compaction` credit, which the
 /// winner resets on commit. Once that credit is spent the explicit trigger
 /// declines *permanently*, so waiting longer cannot recover it — the wait has to
