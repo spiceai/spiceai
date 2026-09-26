@@ -42,6 +42,26 @@ pub fn legacy_partition_child_table_name(parent: &str, partition_values: &[Strin
     format!("{}_{}", parent, partition_values.join("_"))
 }
 
+/// Every child table name a partition holding `partition_values` may legally
+/// answer to under `parent`: the composite-key name this build writes, and the
+/// [legacy][legacy_partition_child_table_name] one an older runtime wrote.
+///
+/// Both the catalog's child lookup and the snapshot slice's validator have to
+/// accept the same set — one resolves a child to drop or export, the other
+/// decides whether a restored child is this dataset's — so a name the two
+/// disagree about is a dataset one of them drops and the other refuses. The
+/// composite key is derived here rather than by the caller for the same reason.
+#[must_use]
+pub fn partition_child_candidate_names(parent: &str, partition_values: &[String]) -> [String; 2] {
+    [
+        partition_child_table_name(
+            parent,
+            &crate::metadata::composite_partition_key(partition_values),
+        ),
+        legacy_partition_child_table_name(parent, partition_values),
+    ]
+}
+
 fn encode_identifier_hex(value: &str) -> String {
     use std::fmt::Write as _;
 

@@ -708,6 +708,88 @@ mod tests {
         assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
+    /// The slice a real partitioned table exports must restore into a fresh
+    /// metastore that the runtime can then *open*: `infer_existing_partitions`
+    /// resolves each `cayenne_partition` row to its own child `cayenne_table`
+    /// row, and a restore that dropped those children leaves a table whose
+    /// every partition fails to open with `TableNotFound`.
+    ///
+    /// This drives the production surface end to end — the catalog's real
+    /// `create_partition`, `export_dataset_slice`, and `import_dataset_slice`,
+    /// the same three the snapshot engine calls — rather than hand-built
+    /// metastore rows, so the child's name, path, and `table_id` are whatever
+    /// the runtime actually writes.
+    #[tokio::test]
+    async fn a_restored_partitioned_table_opens_every_partition() {
+        let source = fixture().await;
+        let creator = creator_for(&source);
+        for value in ["alpha", "beta"] {
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .expect("partition is created");
+        }
+
+        let source_anchor = source
+            .base_path
+            .parent()
+            .expect("the table directory has a parent")
+            .to_path_buf();
+        let slice = source
+            .catalog
+            .export_dataset_slice(TABLE, &source_anchor)
+            .await
+            .expect("the partitioned dataset exports");
+
+        // A fresh node: its own metastore, its own data directory. Nothing is
+        // copied across — the slice alone has to describe the dataset well
+        // enough for every partition to open.
+        let restored_tmp = TempDir::new().expect("tempdir");
+        let restored_anchor = restored_tmp.path().to_path_buf();
+        let restored_catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}",
+                restored_anchor.join("meta.db").display()
+            ))
+            .expect("catalog opens"),
+        );
+        restored_catalog
+            .init()
+            .await
+            .expect("catalog schema initializes");
+        restored_catalog
+            .import_dataset_slice(&slice, &restored_anchor)
+            .await
+            .expect("the slice imports into a fresh metastore");
+
+        let restored_table_id = restored_catalog
+            .get_table(TABLE)
+            .await
+            .expect("the restored parent is registered")
+            .table_id;
+        let restored = Fixture {
+            catalog: restored_catalog,
+            table_id: restored_table_id,
+            schema: Arc::clone(&source.schema),
+            base_path: restored_anchor.join(TABLE),
+            runtime_env: Arc::clone(&source.runtime_env),
+            _tmp: restored_tmp,
+        };
+
+        let mut values: Vec<String> = creator_for(&restored)
+            .infer_existing_partitions()
+            .await
+            .expect("every restored partition opens")
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
     /// One value per `partition_by` expression, no more and no fewer.
     #[tokio::test]
     async fn partition_values_must_match_the_partition_by_arity() {

@@ -26,6 +26,7 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
+use std::collections::HashSet;
 use std::fmt::Display;
 
 use super::catalog::{CatalogError, CatalogResult};
@@ -76,6 +77,28 @@ pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()>
     Ok(())
 }
 
+/// How a metadata table stores its `table_id` column.
+///
+/// A `TEXT` bind against a `BLOB` column is not an error in `SQLite` — the
+/// comparison simply never matches — so a filter that guesses wrong reads zero
+/// rows and reports nothing. Every consumer that binds a `table_id` reads this
+/// off the [`ExpectedTable`] it is already holding, so a new table cannot be
+/// added without deciding which encoding it uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableIdEncoding {
+    /// The 36-character hyphenated UUID, bound as `MetastoreValue::Text`.
+    Text,
+    /// The 16 raw UUID bytes of [`table_id_to_key_bytes`], bound as
+    /// `MetastoreValue::Blob`.
+    ///
+    /// Used by the high-write per-key marker tables to cut WAL volume on hot
+    /// upsert bursts. The encoding and a foreign key to `cayenne_table` are
+    /// mutually exclusive — `SQLite` never equates a `BLOB` child value to a
+    /// `TEXT`-affinity parent key — so a table keyed this way is also outside
+    /// `cayenne_table`'s `ON DELETE CASCADE` and must be cleared explicitly.
+    RawUuidBlob,
+}
+
 /// Expected column definitions for a metadata table.
 ///
 /// Used by [`validate_existing_schema`] to compare the actual schema of an existing
@@ -86,6 +109,8 @@ pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()>
 pub struct ExpectedTable {
     /// The table name (e.g., `"cayenne_table"`).
     pub name: &'static str,
+    /// How this table stores `table_id`; see [`TableIdEncoding`].
+    pub table_id_encoding: TableIdEncoding,
     /// The ordered list of expected column names.
     pub columns: &'static [&'static str],
 }
@@ -97,6 +122,7 @@ pub struct ExpectedTable {
 pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     ExpectedTable {
         name: "cayenne_table",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "table_name",
@@ -113,6 +139,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_delete_file",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "delete_file_id",
             "table_id",
@@ -130,6 +157,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_partition",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "partition_id",
             "table_id",
@@ -144,6 +172,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_insert_record",
+        table_id_encoding: TableIdEncoding::RawUuidBlob,
         // Composite-PK table keyed on (table_id, pk_bytes); the former
         // `insert_record_id` UUID column was never read and is dropped. SQLite
         // declares it `WITHOUT ROWID`; Turso uses a plain rowid table because it
@@ -163,14 +192,17 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // cayenne_insert_record plus first_marked_at (lag metric). Never cleared
         // at checkpoint/overwrite.
         name: "cayenne_pending_write_back",
+        table_id_encoding: TableIdEncoding::RawUuidBlob,
         columns: &["table_id", "pk_bytes", "sequence_number", "first_marked_at"],
     },
     ExpectedTable {
         name: "cayenne_snapshot_sequence",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &["table_id", "snapshot_id", "sequence_number"],
     },
     ExpectedTable {
         name: "cayenne_table_statistics",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "statistics_blob",
@@ -181,6 +213,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_snapshot_file_statistics",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "snapshot_id",
@@ -196,6 +229,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // node inherits the complete file set. Column order MUST match the DDL
         // in `sqlite.rs`/`turso.rs` and the export/import column order.
         name: "cayenne_snapshot_file",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "snapshot_id",
@@ -214,6 +248,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // Column order MUST match the DDL in `sqlite.rs`/`turso.rs` and the
         // export/import column order.
         name: "cayenne_cold_tier_file",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "file_url",
@@ -227,10 +262,12 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_pk_index",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &["table_id", "snapshot_id", "index_blob"],
     },
     ExpectedTable {
         name: "cayenne_inlined_data",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "inlined_id",
             "table_id",
@@ -243,6 +280,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_inlined_delete",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "inlined_id",
             "table_id",
@@ -298,6 +336,154 @@ pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
         Ok(uuid) => uuid.as_bytes().to_vec(),
         Err(_) => table_id.as_bytes().to_vec(),
     }
+}
+
+/// The value to bind for a `WHERE table_id = ?` filter against a table using
+/// `encoding`.
+///
+/// Read the encoding off the [`ExpectedTable`] rather than deciding it by name:
+/// that is what keeps the filter and the schema from drifting apart.
+#[must_use]
+pub(crate) fn table_id_filter_value(encoding: TableIdEncoding, table_id: &str) -> MetastoreValue {
+    match encoding {
+        TableIdEncoding::Text => MetastoreValue::Text(table_id.to_string()),
+        TableIdEncoding::RawUuidBlob => MetastoreValue::Blob(table_id_to_key_bytes(table_id)),
+    }
+}
+
+/// Every metadata table that keys `table_id` as [`TableIdEncoding::RawUuidBlob`]
+/// — which is exactly the set outside `cayenne_table`'s `ON DELETE CASCADE`, so
+/// it is also the set a caller deleting a table has to clear by hand.
+pub(crate) fn blob_keyed_tables() -> impl Iterator<Item = &'static ExpectedTable> {
+    EXPECTED_TABLES
+        .iter()
+        .filter(|table| table.table_id_encoding == TableIdEncoding::RawUuidBlob)
+}
+
+/// Delete the rows `table_id` owns in every [`blob_keyed_tables`] table.
+///
+/// Those are the tables `cayenne_table`'s `ON DELETE CASCADE` cannot reach, so
+/// both callers that remove a table's rows — the catalog dropping it and the
+/// snapshot import replacing it — have to clear them by hand, and they do it
+/// through here so a table added to one is not missed by the other.
+///
+/// # Errors
+///
+/// Returns an error naming the table whose rows could not be deleted.
+pub(crate) async fn clear_blob_keyed_marker_rows(
+    transaction: &dyn MetastoreTransaction,
+    table_id: &str,
+) -> CatalogResult<()> {
+    for table in blob_keyed_tables() {
+        transaction
+            .execute(ExecuteParams {
+                sql: &format!("DELETE FROM {} WHERE table_id = ?", table.name),
+                params: vec![table_id_filter_value(table.table_id_encoding, table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to delete the rows of {} for the table being removed.",
+                    table.name
+                ),
+                source: Box::new(e),
+            })?;
+    }
+    Ok(())
+}
+
+/// Resolve the `table_id`s of `parent_name`'s per-partition child tables.
+///
+/// A partitioned Cayenne table's partitions are catalog tables of their own:
+/// each has its own `cayenne_table` row, its own `table_id`, and its own
+/// dependent rows. Three callers need that set and must agree on it — the
+/// catalog drops the children with their parent, the metastore snapshot exports
+/// them with it, and the snapshot's import clears the reader's own before
+/// replacing them. A second copy of this rule is how a dataset comes to be
+/// dropped by one definition of "child" and exported by another, so it lives
+/// here once.
+///
+/// A name match alone is not enough: the legacy convention
+/// (`{parent}_{values}`) can also spell an unrelated table an operator happens
+/// to have accelerated into the same metastore — partitioning `events` by year
+/// spells `events_2024`. A child is rooted at its partition's own directory
+/// ([`crate::partition_creator`] passes one path to both the partition row and
+/// the child table), so the row's `path` must equal the partition's before it
+/// counts as one. A child whose path somehow differs is left behind rather than
+/// matched, which is the safe direction to be wrong in for a drop and the loud
+/// one for an export, where [`snapshot::DatasetMetastoreSlice::validate`]
+/// refuses the resulting slice.
+///
+/// The key is **derived** from the partition's stored values rather than read
+/// from `cayenne_partition.partition_key`, because deriving is what
+/// `infer_existing_partitions` does when it opens a child: a child that can
+/// only be found under the stored key is a child the runtime cannot open.
+///
+/// A child never has partitions of its own, so this does not recurse. Empty for
+/// an unpartitioned table, which has no `cayenne_partition` rows.
+///
+/// # Errors
+///
+/// Returns an error if a metastore query fails, or if a partition's stored
+/// `partition_values_json` cannot be read — a partition whose values will not
+/// parse cannot be matched to its child, and silently omitting one is the
+/// failure this lookup exists to prevent.
+pub(crate) async fn partition_child_table_ids(
+    metastore: &impl MetastoreBackend,
+    parent_name: &str,
+    parent_table_id: &str,
+) -> CatalogResult<Vec<String>> {
+    // `ORDER BY partition_id` so the child set — and therefore a slice built
+    // from it — is the same on every read of the same metastore.
+    let partitions: Vec<(String, String)> = metastore
+        .query(
+            QueryParams {
+                sql: "SELECT partition_values_json, path FROM cayenne_partition \
+                      WHERE table_id = ? ORDER BY partition_id",
+                params: vec![MetastoreValue::Text(parent_table_id.to_string())],
+            },
+            |row| Ok((row.get_string(0)?, row.get_string(1)?)),
+        )
+        .await?;
+
+    let mut child_ids: Vec<String> = Vec::new();
+    // `child_ids` keeps export order; membership is answered by the set, so a
+    // snapshot with many partitions does not spend quadratic time here.
+    let mut seen_child_ids: HashSet<String> = HashSet::new();
+    for (values_json, path) in partitions {
+        let values: Vec<String> =
+            serde_json::from_str(&values_json).map_err(|e| CatalogError::Database {
+                message: format!(
+                    "cannot resolve the partition child tables of '{parent_name}': a partition's stored values are unreadable: {e}"
+                ),
+            })?;
+        let [composite_name, legacy_name] =
+            crate::partition_naming::partition_child_candidate_names(parent_name, &values);
+        let matched: Vec<String> = metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT table_id FROM cayenne_table \
+                          WHERE table_name IN (?1, ?2) AND path = ?3",
+                    params: vec![
+                        MetastoreValue::Text(composite_name),
+                        MetastoreValue::Text(legacy_name),
+                        MetastoreValue::Text(path),
+                    ],
+                },
+                |row| row.get_string(0),
+            )
+            .await?;
+        // `cayenne_table(table_name)` is unique and a partition owns its
+        // directory, so a child matches at most one partition — but matching
+        // one twice would export its rows twice and fail the import's INSERT on
+        // that same uniqueness, so do not depend on it holding.
+        for id in matched {
+            if seen_child_ids.insert(id.clone()) {
+                child_ids.push(id);
+            }
+        }
+    }
+    Ok(child_ids)
 }
 
 /// Validate the existing metadata table schemas against the expected definitions.
