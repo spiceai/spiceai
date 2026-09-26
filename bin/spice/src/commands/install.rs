@@ -32,7 +32,7 @@ use clap::Args;
 Examples:
   spice install              # Install latest version (auto-detects Metal/CUDA)
   spice install v1.8.3       # Install specific version
-  spice install cuda         # Install with CUDA support (Linux only)
+  spice install cuda         # Install with CUDA support (Linux/Windows only)
 
 See more at: https://spiceai.org/docs/"#
 )]
@@ -55,10 +55,10 @@ struct ParsedArgs {
 /// Runtime flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Flavor {
-    /// Default flavor - auto-detects hardware accelerator (Metal on macOS, CUDA on Linux if available)
+    /// Default flavor - auto-detects hardware accelerator (Metal on macOS, CUDA on Linux/Windows if available)
     #[default]
     Default,
-    /// Explicit CUDA flavor for Linux systems with NVIDIA GPUs
+    /// Explicit CUDA flavor for Linux and Windows systems with NVIDIA GPUs
     Cuda,
 }
 
