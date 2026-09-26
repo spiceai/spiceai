@@ -38,6 +38,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::Transformed;
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, TableScan};
 use datafusion::optimizer::{AnalyzerRule, ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
@@ -125,6 +126,17 @@ pub(crate) async fn plan_point_lookup<F: Future>(point_lookup: bool, planning: F
     } else {
         planning.await
     }
+}
+
+/// Configures `session` to plan a point lookup in one pass of the logical optimizer.
+///
+/// `DataFusion` repeats its logical rules until a pass leaves the plan unchanged, so a plan the
+/// first pass finishes still pays for a second pass that only confirms it. One pass finishes a
+/// point lookup: it pushes the filter into the scan and prunes the projection, and neither leaves
+/// work for another rule. Stopping after one pass could only leave a plan less optimized, never
+/// different in meaning, because every rule preserves the plan's meaning.
+pub(crate) fn plan_in_one_pass(session: &mut SessionState) {
+    session.config_mut().options_mut().optimizer.max_passes = 1;
 }
 
 /// Whether `plan` (unoptimized) is a primary-key point lookup: plain columns projected from a
@@ -516,10 +528,10 @@ mod tests {
         }
     }
 
-    /// The rules skipped for a point lookup must not have changed its plan: plan every accepted
-    /// shape with and without the skip and compare the physical plans.
+    /// Neither the rules a point lookup skips nor the optimizer pass it does without may change
+    /// its plan: plan every accepted shape both ways and compare the physical plans and rows.
     #[tokio::test]
-    async fn skipping_rules_leaves_point_lookup_plans_unchanged() {
+    async fn lean_planning_leaves_point_lookup_plans_unchanged() {
         let ctx = context();
         for sql in [
             "SELECT * FROM keyed WHERE id = 5",
@@ -532,9 +544,14 @@ mod tests {
         ] {
             let plan = unoptimized(&ctx, sql).await;
             assert!(is_point_lookup(&plan), "{sql}");
-            let state = ctx.state();
-            let full = state.create_physical_plan(&plan).await.expect("full plan");
-            let lean = plan_point_lookup(true, state.create_physical_plan(&plan))
+            let full = ctx
+                .state()
+                .create_physical_plan(&plan)
+                .await
+                .expect("full plan");
+            let mut lean_state = ctx.state();
+            plan_in_one_pass(&mut lean_state);
+            let lean = plan_point_lookup(true, lean_state.create_physical_plan(&plan))
                 .await
                 .expect("lean plan");
             assert_eq!(

@@ -1673,6 +1673,9 @@ impl Query {
                     // For regular plans, use the standard physical plan execution
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let point_lookup = super::point_lookup::is_point_lookup(&plan);
+                    if point_lookup {
+                        super::point_lookup::plan_in_one_pass(&mut session);
+                    }
                     let mut physical_plan = match super::point_lookup::plan_point_lookup(
                         point_lookup,
                         session.create_physical_plan(&plan),
