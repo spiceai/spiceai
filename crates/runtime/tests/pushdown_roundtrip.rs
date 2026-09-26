@@ -147,7 +147,7 @@ pub(crate) async fn assert_round_trips(
     Ok(())
 }
 
-fn same_rows(federated: &[String], local: &[String], ordered: bool) -> Result<(), String> {
+fn same_rows(federated: &[Row], local: &[Row], ordered: bool) -> Result<(), String> {
     if ordered {
         return (federated == local)
             .then_some(())
@@ -161,7 +161,7 @@ fn same_rows(federated: &[String], local: &[String], ordered: bool) -> Result<()
         .ok_or_else(|| "rows differ".to_string())
 }
 
-fn limited_subset(federated: &[String], local: &[String], limit: usize) -> Result<(), String> {
+fn limited_subset(federated: &[Row], local: &[Row], limit: usize) -> Result<(), String> {
     let expected = limit.min(local.len());
     if federated.len() != expected {
         return Err(format!("expected {expected} rows, got {}", federated.len()));
@@ -172,19 +172,24 @@ fn limited_subset(federated: &[String], local: &[String], limit: usize) -> Resul
             Some(i) => {
                 available.swap_remove(i);
             }
-            None => return Err(format!("row {row} is not one the query keeps")),
+            None => return Err(format!("row {row:?} is not one the query keeps")),
         }
     }
     Ok(())
 }
 
-/// The rows of `sql`, each rendered as its values joined by ` | `.
-async fn rows(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<String>, String> {
+/// A row as its cells, each rendered, or `None` for NULL. The cells stay apart
+/// and a NULL stays apart from the string "NULL", so two results render alike
+/// only when their values do.
+type Row = Vec<Option<String>>;
+
+/// The rows of `sql`.
+async fn rows(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<Row>, String> {
     let batches = run_query(rt, sql).await.map_err(|e| e.to_string())?;
     render(&batches)
 }
 
-fn render(batches: &[RecordBatch]) -> Result<Vec<String>, String> {
+fn render(batches: &[RecordBatch]) -> Result<Vec<Row>, String> {
     let options = FormatOptions::default().with_null("NULL");
     let mut rendered = Vec::new();
     for batch in batches {
@@ -195,19 +200,67 @@ fn render(batches: &[RecordBatch]) -> Result<Vec<String>, String> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         for row in 0..batch.num_rows() {
-            let values: Vec<String> = formatters
-                .iter()
-                .map(|f| f.value(row).to_string())
-                .collect();
-            rendered.push(values.join(" | "));
+            rendered.push(
+                batch
+                    .columns()
+                    .iter()
+                    .zip(&formatters)
+                    .map(|(column, formatter)| {
+                        (!column.is_null(row)).then(|| formatter.value(row).to_string())
+                    })
+                    .collect(),
+            );
         }
     }
     Ok(rendered)
 }
 
+/// The plan of `sql` as text, one line per row, for the checks that search it.
 async fn explain(rt: &Arc<Runtime>, sql: &str) -> Result<String, String> {
     let batches = run_query(rt, &format!("EXPLAIN {sql}"))
         .await
         .map_err(|e| e.to_string())?;
-    Ok(render(&batches)?.join("\n"))
+    let lines: Vec<String> = render(&batches)?
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(Option::unwrap_or_default)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+
+    use super::render;
+
+    fn batch(columns: &[&[Option<&str>]]) -> RecordBatch {
+        RecordBatch::try_from_iter(columns.iter().enumerate().map(|(i, values)| {
+            let array: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+            (format!("c{i}"), array)
+        }))
+        .expect("a batch")
+    }
+
+    #[test]
+    fn cells_render_apart() {
+        // Joined into one string, both of these read `a | b | c`.
+        let split_early = render(&[batch(&[&[Some("a | b")], &[Some("c")]])]).expect("rendered");
+        let split_late = render(&[batch(&[&[Some("a")], &[Some("b | c")]])]).expect("rendered");
+        assert_ne!(split_early, split_late);
+    }
+
+    #[test]
+    fn a_null_renders_apart_from_the_string_null() {
+        let null = render(&[batch(&[&[None]])]).expect("rendered");
+        let word = render(&[batch(&[&[Some("NULL")]])]).expect("rendered");
+        assert_ne!(null, word);
+        assert_eq!(null, vec![vec![None]]);
+    }
 }

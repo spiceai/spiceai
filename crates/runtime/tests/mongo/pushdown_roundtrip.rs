@@ -197,6 +197,15 @@ async fn seed(port: u16) -> Result<(), anyhow::Error> {
     db.collection::<Document>("roundtrip_collated")
         .insert_many(collated_documents())
         .await?;
+    // A view can project `_id` away, which a filter that matches nothing must
+    // not rely on.
+    let _ = db.collection::<Document>("roundtrip_noid").drop().await;
+    db.run_command(doc! {
+        "create": "roundtrip_noid",
+        "viewOn": "roundtrip",
+        "pipeline": [{ "$project": { "_id": 0, "i32": 1, "s": 1 } }],
+    })
+    .await?;
     Ok(())
 }
 
@@ -435,6 +444,22 @@ fn dotted_cases() -> Vec<Case> {
     ]
 }
 
+/// Filters that match no row, over a view whose documents have no `_id`.
+fn noid_cases() -> Vec<Case> {
+    let p = |predicate: &str| {
+        Case::pushed(format!(
+            "SELECT i32, s FROM {{t}} WHERE {predicate} ORDER BY i32, s"
+        ))
+    };
+    vec![
+        p("i32 = 2.5"),
+        p("i32 IN (5000000000, 6000000000)"),
+        p("i32 = 30 AND NULL"),
+        p("i32 IN (30, NULL)"),
+        p("i32 = 30"),
+    ]
+}
+
 fn distant_cases() -> Vec<Case> {
     let p = |predicate: &str| {
         Case::pushed(format!(
@@ -531,6 +556,8 @@ async fn mongodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 .with_dataset(dotted_local)
                 .with_dataset(distant)
                 .with_dataset(distant_local)
+                .with_dataset(dataset("roundtrip_noid", "noid", false, &inference))
+                .with_dataset(dataset("roundtrip_noid", "noid_local", true, &inference))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
@@ -588,6 +615,13 @@ async fn mongodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 shows_pushdown,
             };
             assert_round_trips(&rt, &dotted, &dotted_cases()).await?;
+
+            let noid = Tables {
+                federated: "noid",
+                local: "noid_local",
+                shows_pushdown,
+            };
+            assert_round_trips(&rt, &noid, &noid_cases()).await?;
 
             let distant = Tables {
                 federated: "distant",
