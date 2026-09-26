@@ -442,10 +442,18 @@ impl PartitionCreator for CayennePartitionCreator {
         Ok(result)
     }
 
-    /// Every filter is `Inexact`: `DataFusion` re-applies it above the scan, and
-    /// the partition providers use it to prune files, the mem-tier, and to
-    /// detect primary-key point lookups. `Unsupported` would withhold the
-    /// filter from `scan()` entirely and buy no extra safety.
+    /// This creator reports every filter `Inexact`, so a filter it is asked about
+    /// stays available to `scan()`, where the partition providers use it to prune
+    /// files, prune the mem-tier, and detect primary-key point lookups.
+    /// `Unsupported` would withhold the filter from `scan()` entirely and buy no
+    /// extra safety.
+    ///
+    /// That result is this creator's alone, and it is not what the caller
+    /// necessarily sees. `PartitionTableProvider` promotes a filter comparing a
+    /// partition expression to a literal to `Exact`, and its `scan()` additionally
+    /// withholds from the partition scans any filter over a single simple
+    /// partition column — so `region IN ('us', 'eu')` under `partition_by:
+    /// [region]` stays `Inexact` here yet never reaches a child scan.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
