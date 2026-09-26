@@ -56,7 +56,7 @@ use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 
@@ -109,7 +109,12 @@ fn unfiltered_sum_v_by_k() -> MaintainedAggregateSpec {
 
 /// `DataFusion`'s default physical rules followed by the maintained-aggregate rewrite.
 fn rewriter_ctx() -> SessionContext {
+    rewriter_ctx_with(SessionConfig::new())
+}
+
+fn rewriter_ctx_with(config: SessionConfig) -> SessionContext {
     let state = SessionStateBuilder::new()
+        .with_config(config)
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(CayenneMaintainedAggregateRewriter::new()))
         .build();
@@ -118,7 +123,16 @@ fn rewriter_ctx() -> SessionContext {
 
 /// The same rules without the rewrite: the answer the rewrite must reproduce.
 fn reference_ctx() -> SessionContext {
-    SessionContext::new_with_state(SessionStateBuilder::new().with_default_features().build())
+    reference_ctx_with(SessionConfig::new())
+}
+
+fn reference_ctx_with(config: SessionConfig) -> SessionContext {
+    SessionContext::new_with_state(
+        SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .build(),
+    )
 }
 
 struct NoopSlotAdvancer;
@@ -271,6 +285,39 @@ async fn unfiltered_view_answers_only_whole_table_queries(
                 "WHERE {predicate}: got {got:?}, expected {expected:?} (served_by_view={})",
                 served_by_view(&rewriter, &sql).await?
             ));
+        }
+    }
+
+    // A projection that computes a new `v`: the view holds sums of the stored `v`.
+    // With one partition nothing separates the projection from the scan, so it is
+    // pushed into the scan and the scan itself outputs the computed `v`.
+    let one_partition = || SessionConfig::new().with_target_partitions(1);
+    let one_partition_rewriter = rewriter_ctx_with(one_partition());
+    let one_partition_reference = reference_ctx_with(one_partition());
+    one_partition_rewriter.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    one_partition_reference.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    for (rewriter, reference, partitions) in [
+        (&rewriter, &reference, "default partitions"),
+        (
+            &one_partition_rewriter,
+            &one_partition_reference,
+            "one partition",
+        ),
+    ] {
+        for computed in [
+            format!("SELECT k, SUM(v) FROM (SELECT k, v + 1 AS v FROM {name}) q GROUP BY k"),
+            format!("SELECT k, SUM(v) FROM (SELECT k, v * 2 AS v FROM {name}) q GROUP BY k"),
+            format!("SELECT k, SUM(v) FROM (SELECT k, id AS v FROM {name}) q GROUP BY k"),
+            format!("SELECT v AS k, SUM(k) FROM (SELECT v AS k, k AS v FROM {name}) q GROUP BY v"),
+        ] {
+            let got = sorted_rows(rewriter, &computed).await?;
+            let expected = sorted_rows(reference, &computed).await?;
+            if got != expected {
+                wrong.push(format!(
+                    "{partitions}: {computed}: got {got:?}, expected {expected:?} (served_by_view={})",
+                    served_by_view(rewriter, &computed).await?
+                ));
+            }
         }
     }
 

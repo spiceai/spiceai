@@ -371,6 +371,13 @@ impl CayenneAccelerationExec {
         plan_scans_whole_relation(&self.inner)
     }
 
+    /// Whether every column this scan outputs is the stored table column of the
+    /// same name. See [`plan_outputs_table_columns`].
+    #[must_use]
+    pub(crate) fn outputs_table_columns(&self) -> bool {
+        plan_outputs_table_columns(&self.inner)
+    }
+
     /// Push additional dynamic filters into the underlying file source.
     ///
     /// Returns `Ok(None)` when the scan source declined all filters or the inner
@@ -596,6 +603,41 @@ pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.is::<crate::provider::delete::KeyBasedDeletionFilterExec>()
         || plan.is::<crate::provider::delete::Int64PkDeletionFilterExec>();
     passes_every_row && plan.children().into_iter().all(plan_scans_whole_relation)
+}
+
+/// Whether every column `plan` outputs is the table column of the same name, with
+/// its stored values: every projection in the subtree, a `ProjectionExec` or one
+/// pushed into a file source, selects a column under that column's own name.
+///
+/// A projection pushed into the scan can compute a value and name it after a
+/// table column (`c + 1 AS c`), and nothing above the scan can tell that column
+/// from the stored one. A maintained view and a dynamic filter both describe the
+/// stored values, so neither applies to such a column.
+pub(crate) fn plan_outputs_table_columns(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let selects_own_column = |expr: &Arc<dyn PhysicalExpr>, alias: &str| {
+        expr.downcast_ref::<Column>()
+            .is_some_and(|column| column.name() == alias)
+    };
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>()
+        && !projection
+            .expr()
+            .iter()
+            .all(|projected| selects_own_column(&projected.expr, &projected.alias))
+    {
+        return false;
+    }
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
+        && let Some(config) = data_source_exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+        && let Some(projection) = config.file_source().projection()
+        && !projection
+            .iter()
+            .all(|projected| selects_own_column(&projected.expr, &projected.alias))
+    {
+        return false;
+    }
+    plan.children().into_iter().all(plan_outputs_table_columns)
 }
 
 /// Splits the file-backed scans under `plan` decode CONCURRENTLY, summed across the

@@ -501,8 +501,10 @@ fn maintained_aggregate_source(
         // totals for a subset. Decline unless the scan's subtree provably passes
         // every live row through, so the real scan and aggregate run. (A `FilterExec`
         // that survives above the scan is captured by the branch below and matched
-        // against a filtered view.)
-        if !cayenne_scan.scans_whole_relation() {
+        // against a filtered view.) The view also describes the stored values, so a
+        // projection pushed into the scan that computes a column under a table
+        // column's name declines it too.
+        if !cayenne_scan.scans_whole_relation() || !cayenne_scan.outputs_table_columns() {
             return None;
         }
         return cayenne_scan
@@ -1686,23 +1688,47 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
 /// The Cayenne scan and the column of it that produce output column `index` of
 /// `plan`, found by following the column down through operators that pass it
 /// through with its values unchanged: a projection of a bare column, a filter, a
-/// group-by key, either input of a hash join, and the order-, partitioning- and
-/// batching-only operators. Any other operator ends the walk with `None`: a
-/// computed column, a `UNION` (its values come from several inputs), or an
+/// group-by key, either input of a hash join, a schema cast that keeps the
+/// column's type, and the order-, partitioning- and batching-only operators. Any
+/// other operator ends the walk with `None`: a computed column (above the scan or
+/// pushed into it), a `UNION` (its values come from several inputs), or an
 /// operator not listed here. Filters and joins below the column only remove rows,
 /// which does not change where the surviving values come from.
+///
+/// A limit ends the walk too. The walk proves which values a column holds, and a
+/// filter shared into the scan below a limit changes which rows the limit keeps:
+/// `ORDER BY c DESC LIMIT 1` over a scan filtered to `c = 1` returns 1, not the
+/// largest `c`.
 #[expect(deprecated)]
 fn scan_column_lineage(
     plan: &Arc<dyn ExecutionPlan>,
     index: usize,
 ) -> Option<(Arc<ScanIdentity>, String)> {
+    if plan.fetch().is_some() {
+        return None;
+    }
     if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>() {
+        if !cayenne.outputs_table_columns() {
+            return None;
+        }
         let identity = cayenne.scan_identity()?;
         let name = cayenne.schema().fields().get(index)?.name().clone();
         return Some((identity, name));
     }
+    if let Some(cast) = plan.downcast_ref::<SchemaCastScanExec>() {
+        let input_index = cast.input_column(index)?;
+        let children = plan.children();
+        let [input] = children.as_slice() else {
+            return None;
+        };
+        return scan_column_lineage(input, input_index);
+    }
     if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        let column = projection.expr().get(index)?.expr.downcast_ref::<Column>()?;
+        let column = projection
+            .expr()
+            .get(index)?
+            .expr
+            .downcast_ref::<Column>()?;
         return scan_column_lineage(projection.input(), column.index());
     }
     if let Some(filter) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
@@ -1713,6 +1739,10 @@ fn scan_column_lineage(
         return scan_column_lineage(filter.input(), input_index);
     }
     if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        // A group limit keeps the first groups it sees, which is a limit too.
+        if aggregate.limit_options().is_some() {
+            return None;
+        }
         let (group_key, _) = aggregate.group_expr().expr().get(index)?;
         let column = group_key.downcast_ref::<Column>()?;
         return scan_column_lineage(aggregate.input(), column.index());
@@ -1744,12 +1774,11 @@ fn scan_column_lineage(
         || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
         || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
         || plan.is::<datafusion_physical_plan::sorts::sort::SortExec>()
-        || plan.is::<datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>()
-        || plan.is::<datafusion_physical_plan::limit::GlobalLimitExec>()
-        || plan.is::<datafusion_physical_plan::limit::LocalLimitExec>()
+        || plan
+            .is::<datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>(
+            )
         || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
         || plan.is::<BytesProcessedExec>()
-        || plan.is::<SchemaCastScanExec>()
         || plan.is::<Int64PkDeletionFilterExec>()
         || plan.is::<KeyBasedDeletionFilterExec>();
     if !passes_columns_through {
@@ -5205,6 +5234,84 @@ mod tests {
             assert!(
                 child.is::<SortMergeJoinExec>(),
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
+            );
+        }
+    }
+
+    /// Output column `index` of a schema cast is the input column of the same name,
+    /// which need not sit at the same position; a column the cast retypes carries
+    /// other values.
+    #[test]
+    fn lineage_follows_a_schema_cast_by_name_and_stops_at_a_retyped_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let reordered = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let cast: Arc<dyn ExecutionPlan> = Arc::new(
+            runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec::new(
+                cayenne_file_exec(&schema, "t/file.vortex", None),
+                reordered,
+            ),
+        );
+        let (_, name) =
+            super::scan_column_lineage(&cast, 0).expect("`b` carries over the cast unchanged");
+        assert_eq!(name, "b");
+
+        let retyped = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let cast: Arc<dyn ExecutionPlan> = Arc::new(
+            runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec::new(
+                cayenne_file_exec(&schema, "t/file.vortex", None),
+                retyped,
+            ),
+        );
+        assert!(
+            super::scan_column_lineage(&cast, 0).is_none(),
+            "a retyped column is a cast of the stored values"
+        );
+        assert_eq!(
+            super::scan_column_lineage(&cast, 1).map(|(_, name)| name),
+            Some("b".to_string())
+        );
+    }
+
+    /// A filter shared below a limit changes which rows the limit keeps, so the
+    /// walk ends at every kind of limit.
+    #[test]
+    fn lineage_stops_at_a_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)]));
+        let scan = || cayenne_file_exec(&schema, "t/file.vortex", None);
+        assert!(super::scan_column_lineage(&scan(), 0).is_some());
+
+        let top_k: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(
+                datafusion::physical_expr::LexOrdering::new(vec![
+                    datafusion::physical_expr::PhysicalSortExpr::new_default(
+                        col("c", &schema).expect("column c exists"),
+                    ),
+                ])
+                .expect("non-empty ordering"),
+                scan(),
+            )
+            .with_fetch(Some(1)),
+        );
+        let global: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::limit::GlobalLimitExec::new(scan(), 1, None),
+        );
+        let local: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::limit::LocalLimitExec::new(scan(), 1),
+        );
+        for limited in [top_k, global, local] {
+            assert!(
+                super::scan_column_lineage(&limited, 0).is_none(),
+                "the walk must end at {}",
+                limited.name()
             );
         }
     }
