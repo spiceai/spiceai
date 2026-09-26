@@ -125,9 +125,7 @@ pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
 pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
-        .scalar_call(Arc::new(|call, _| {
-            crate::dialect::duckdb_can_translate(call)
-        }))
+        .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
 }
 
@@ -137,9 +135,7 @@ fn duckdb_function_support() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::duckdb_native_function_names())
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
-        .scalar_call(Arc::new(|call, _| {
-            crate::dialect::duckdb_can_translate(call)
-        }))
+        .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
 }
 
