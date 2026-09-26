@@ -87,18 +87,46 @@ intentionally out-of-scope for this connector's RC:
 | Criterion         | Status | Reason                                                                                      |
 | ----------------- | ------ | ------------------------------------------------------------------------------------------- |
 | TPC-H / TPC-DS    | ➖      | Cosmos DB's SQL surface does not cover TPC workloads; exempt per the per-connector matrix.  |
-| Federation        | ➖      | Cosmos SQL does not support joins across containers; no filter or projection push-down yet. |
-| Data Correctness  | ➖      | No TPC harness, so no correctness diff against a native CLI.                                |
+| Federation        | ➖      | Cosmos SQL does not support joins across containers. Projections and filters are pushed down; see below. |
+| Data Correctness  | ➖      | No TPC harness, so no correctness diff against a native CLI. Push-down is diffed against local evaluation by `crates/runtime/tests/cosmosdb/pushdown_roundtrip.rs` on the Linux emulator. |
 | Streaming         | ➖      | No change-feed support yet; `RefreshMode::Changes` is not wired.                            |
 | Schema Inference  | ☑️     | Inferred from a sample of documents — Cosmos DB has no native schema.                       |
 
+## Push-down
+
+With the default `query` (`SELECT * FROM c`), a scan asks Cosmos DB only for what
+the query needs:
+
+- **Projection**: only the columns the query reads are selected, as
+  `c["name"]`, so any property name is expressible.
+- **Filters**: comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, a `LIKE 'prefix%'`
+  and `DataFusion`'s own `starts_with` become a `WHERE` clause with parameters.
+  Every condition selects a superset of the rows its filter keeps, and
+  `DataFusion` filters them again. Documents are decoded by `arrow-json`, which
+  reads a numeric string into an integer column, truncates a fraction, and fails
+  on a value of another type, so each comparison is guarded by the JSON type it
+  applies to (`IS_STRING`, `IS_NUMBER`, `IS_BOOL`) and keeps any value the column
+  cannot hold, which then fails the query as it would unfiltered. The guards also
+  keep a condition from depending on how null and undefined properties compare,
+  where the emulator and the service disagree. A string range is pushed only
+  against an ASCII bound, where UTF-16 and UTF-8 ordering agree, and an integer
+  comparison only against a bound within ±2^53, which a JSON number (a double)
+  holds exactly.
+- **Partition routing**: an equality on the container's partition key, when that
+  key is a single top-level property, reads that logical partition alone.
+- **Limit**: reading stops once the limit is reached.
+
+A custom `query` is run as written, and its filters are applied locally.
+
 ## What's not yet supported (post-RC tracking)
 
-- Filter / projection / limit push-down into Cosmos DB.
+- Push-down with a custom `query`.
+- `ORDER BY`, `TOP` and aggregate push-down: cross-partition queries through the
+  gateway serve only projections and filters.
+- Routing an `IN` list on the partition key, or a hierarchical partition key.
 - Write (`INSERT` / `UPDATE` / `DELETE`).
 - Change feed streaming (`RefreshMode::Changes`).
 - Microsoft Entra ID / managed identity authentication.
-- Fine-grained partition-key routing.
 
 ## Resilience parameters
 

@@ -20,12 +20,15 @@ limitations under the License.
 //! `azure_data_cosmos` crate. Documents are fetched via a Cosmos SQL query
 //! (`SELECT * FROM c` by default) and projected into Arrow `RecordBatch`es.
 //!
-//! The current connector release targets *RC* quality: read-only,
-//! cross-partition scan, schema inference from a sample of documents, and no
-//! filter push-down yet. See `docs/criteria/connectors/rc.md` for the full
-//! Cosmos DB row and `docs/dev/cosmosdb.md` for the type map and limitations.
+//! The connector is read-only and infers its schema from a sample of
+//! documents. With the default query, a scan selects only the columns it reads
+//! and the filters Cosmos DB can evaluate, and an equality on the partition key
+//! reads that logical partition alone. See `docs/criteria/connectors/rc.md` for
+//! the full Cosmos DB row and `docs/dev/cosmosdb.md` for the type map and
+//! limitations.
 
 pub mod client;
+mod filter;
 pub mod provider;
 pub mod resilience;
 pub mod schema;
