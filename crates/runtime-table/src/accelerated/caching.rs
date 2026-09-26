@@ -38,7 +38,6 @@ use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter,
 };
 use datafusion::physical_plan::{Distribution, Partitioning, PlanProperties};
-use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
@@ -1288,7 +1287,7 @@ impl CacheRefreshHelper {
         let plan = accelerator
             .scan(session_state.as_ref(), None, &filters, None)
             .await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = Arc::new(util::session_state::task_context());
 
         // Collect all stale rows from accelerator
         let stale_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
@@ -1624,7 +1623,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches
@@ -1678,7 +1677,7 @@ impl CacheRefreshHelper {
 
         // Execute the insertion
         tracing::debug!("overwrite_accelerator executing insert plan for dataset={dataset_name}",);
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
         tracing::debug!(
             "overwrite_accelerator COMPLETED - successfully inserted {total_rows} rows into accelerator for dataset={dataset_name}",
@@ -1794,7 +1793,7 @@ impl CacheRefreshHelper {
             return Ok(false);
         };
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         let plan = match accelerator.delete_from(&state, vec![delete_expr]).await {
@@ -1808,7 +1807,7 @@ impl CacheRefreshHelper {
             Err(e) => return Err(e),
         };
 
-        let deleted = datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+        let deleted = datafusion::physical_plan::collect(plan, ctx.task_ctx())
             .await?
             .first()
             .map_or(0, |batch| {
@@ -1860,7 +1859,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1890,7 +1889,7 @@ impl CacheRefreshHelper {
 
         let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
 
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
 
         tracing::debug!(
@@ -1922,7 +1921,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         tracing::trace!(
@@ -1932,7 +1931,7 @@ impl CacheRefreshHelper {
 
         // Scan all data from the accelerator (no filters to get everything)
         let plan = accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
@@ -2106,7 +2105,7 @@ impl CacheRefreshHelper {
         child_accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
     ) -> DataFusionResult<usize> {
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let state = ctx.state();
 
         tracing::debug!(
@@ -2116,7 +2115,7 @@ impl CacheRefreshHelper {
 
         // Scan all existing data from the parent accelerator
         let plan = parent_accelerator.scan(&state, None, &[], None).await?;
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = ctx.task_ctx();
         let batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -2164,7 +2163,7 @@ impl CacheRefreshHelper {
             "Federated source SCAN successful for dataset={dataset_name}, plan has {} partitions",
             plan.properties().output_partitioning().partition_count()
         );
-        let task_ctx = Arc::new(TaskContext::default());
+        let task_ctx = Arc::new(util::session_state::task_context());
 
         // Execute and collect all batches
         let all_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
@@ -2665,8 +2664,14 @@ pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 /// arbitrary caller `Expr`s, so full default features are kept rather than a stripped-down
 /// set, but the registry itself never varies by dataset or query, so it's built once for the
 /// process instead of once per exec.
-pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> =
-    LazyLock::new(|| Arc::new(SessionStateBuilder::new().with_default_features().build()));
+pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> = LazyLock::new(|| {
+    Arc::new(
+        SessionStateBuilder::new()
+            .with_config(util::session_state::session_config())
+            .with_default_features()
+            .build(),
+    )
+});
 
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
@@ -3203,6 +3208,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::SessionContext;
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -6811,6 +6817,7 @@ mod write_path_tests {
     use datafusion::catalog::{Session, TableProvider};
     use datafusion::common::Constraints;
     use datafusion::datasource::TableType;
+    use datafusion::prelude::SessionContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Wraps a real accelerator and records which operations it was asked for.

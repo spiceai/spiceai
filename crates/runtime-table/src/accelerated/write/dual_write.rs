@@ -51,7 +51,6 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
-use datafusion::prelude::SessionContext;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -421,7 +420,7 @@ fn spawn_federated_insert(
     receiver: mpsc::Receiver<datafusion::common::Result<arrow::record_batch::RecordBatch>>,
 ) -> JoinHandle<datafusion::common::Result<()>> {
     tokio::spawn(async move {
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let stream = RecordBatchStreamAdapter::new(schema, ReceiverStream::new(receiver));
         let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(stream))),

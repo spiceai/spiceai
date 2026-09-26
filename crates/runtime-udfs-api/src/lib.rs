@@ -40,7 +40,6 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{
     FunctionRestriction, FunctionSupport, ScalarCallSupport,
 };
@@ -171,7 +170,7 @@ pub fn spice_function_names() -> Vec<String> {
 #[must_use]
 pub fn json_function_names() -> &'static [String] {
     static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let mut ctx = SessionContext::new();
+        let mut ctx = util::session_state::session_context();
         let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
         // A failure here would yield an incomplete list, and this list is a
         // *deny*-list: a missing name federates instead of being blocked, so the

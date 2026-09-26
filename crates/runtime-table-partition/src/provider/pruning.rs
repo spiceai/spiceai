@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_schema::{Field, Schema};
 use chrono::{Datelike as _, TimeZone as _, Utc};
@@ -941,6 +941,11 @@ fn evaluate_function_filter(
     Ok(&result == partition_value)
 }
 
+/// Shared across calls: pruning evaluates a partition function once per candidate
+/// value, up to [`MAX_BUCKET_ENUMERATION_I32`] times per partition and filter.
+static CALL_CONFIG_OPTIONS: LazyLock<Arc<ConfigOptions>> =
+    LazyLock::new(|| Arc::clone(util::session_state::session_config().options()));
+
 fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusionError> {
     let arg_types = args.iter().map(ScalarValue::data_type).collect::<Vec<_>>();
     let return_type = f.return_type(&arg_types)?;
@@ -953,7 +958,7 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
         arg_fields: vec![],
         number_rows: 1,
         return_field,
-        config_options: Arc::new(ConfigOptions::default()),
+        config_options: Arc::clone(&CALL_CONFIG_OPTIONS),
     };
 
     let ColumnarValue::Scalar(bucket_value) = f.invoke_with_args(args)? else {

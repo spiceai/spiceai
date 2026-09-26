@@ -7103,7 +7103,7 @@ impl CayenneTableProvider {
             schema,
             vortex_format,
             strategy,
-            &SessionConfig::default(),
+            &util::session_state::session_config(),
         )
     }
 
@@ -22599,7 +22599,7 @@ impl CayenneTableProvider {
         // would be dropped from the rewrite while the commit below still
         // retires it — silent row loss (#12708).
         let ctx = self.create_compaction_session_context_with_config(
-            SessionConfig::default().with_extension(Arc::new(
+            util::session_state::session_config().with_extension(Arc::new(
                 super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
@@ -24431,9 +24431,9 @@ impl CayenneTableProvider {
     /// Session context for Cayenne-internal writes and maintenance (snapshot
     /// writes, compaction, keyset/deletion scans).
     ///
-    /// Deliberately built from `SessionConfig::default()` rather than the
-    /// operator's query session, so `target_partitions` resolves to the host's
-    /// available parallelism (≈ logical CPU count). On the write path this value
+    /// Deliberately built from `util::session_state::session_config()` rather
+    /// than the operator's query session, so `target_partitions` is the CPU
+    /// budget's core count. On the write path this value
     /// is the **parallel-encode shard ceiling**: `VortexFormat::build_shard_spec`
     /// clamps the requested `cayenne_write_concurrency` to it. Encoding a snapshot
     /// is CPU-bound, so allowing more shards than cores buys no encode throughput
@@ -24446,7 +24446,7 @@ impl CayenneTableProvider {
     /// `cayenne_upload_concurrency`.
     fn create_session_context(&self) -> SessionContext {
         SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(self.context.runtime_env()),
         )
     }
@@ -24503,7 +24503,7 @@ impl CayenneTableProvider {
             })?;
 
         Ok(SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             runtime_env,
         ))
     }
@@ -25053,7 +25053,7 @@ impl CayenneTableProvider {
     /// snapshot rewrite cannot starve concurrent queries. Falls back to the
     /// shared query environment when no dedicated compaction env is set.
     fn create_compaction_session_context(&self) -> SessionContext {
-        self.create_compaction_session_context_with_config(SessionConfig::default())
+        self.create_compaction_session_context_with_config(util::session_state::session_config())
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
@@ -25353,7 +25353,7 @@ impl CayenneTableProvider {
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
         let deleted_count = match sink
-            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
+            .delete_from(Arc::new(util::session_state::task_context()))
             .await
         {
             Ok(deleted) => deleted,
@@ -35789,7 +35789,7 @@ impl TableProvider for CayenneTableProvider {
         let options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
-            &SessionConfig::default(),
+            &util::session_state::session_config(),
         );
         let partition_column_names = options
             .table_partition_cols
@@ -36376,7 +36376,7 @@ impl CayenneTableProvider {
             filters: filters.to_vec(),
         };
         let deleted = sink
-            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
+            .delete_from(Arc::new(util::session_state::task_context()))
             .await
             .map_err(datafusion_common::DataFusionError::External)?;
         Ok(Some(deleted))
@@ -47447,6 +47447,49 @@ mod tests {
                 .write_concurrency,
             8
         );
+    }
+
+    #[tokio::test]
+    async fn cayenne_maintenance_sessions_use_cpu_budget_partitions() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "provider::table::tests::cayenne_maintenance_sessions_use_cpu_budget_partitions",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "cpu_budget_maintenance",
+            schema,
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        let internal = provider
+            .create_session_context()
+            .state()
+            .config()
+            .target_partitions();
+        let compaction = provider
+            .create_compaction_session_context()
+            .state()
+            .config()
+            .target_partitions();
+        let custom_writer = provider
+            .compaction_session_context(
+                crate::provider::compaction_writer::CompactionWriterConfig::for_ebs_tier(),
+                256 * 1024 * 1024,
+            )
+            .expect("custom compaction writer session should be created")
+            .state()
+            .config()
+            .target_partitions();
+        assert_eq!(internal, cores, "internal session");
+        assert_eq!(compaction, cores, "compaction session");
+        assert_eq!(custom_writer, cores, "compaction-writer session");
     }
 
     #[tokio::test]

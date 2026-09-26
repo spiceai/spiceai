@@ -41,7 +41,6 @@ use async_trait::async_trait;
 use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::datasource::{TableProvider, TableType, provider_as_source};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, Operator, is_not_true};
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -1553,7 +1552,7 @@ impl DeletionSink for MemDeletionSink {
                 .await?);
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
 
         for _ in 0..DELETE_REPLACE_MAX_RETRIES {
             let batches = self.batches.clone();

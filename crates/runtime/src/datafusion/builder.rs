@@ -2745,7 +2745,7 @@ mod tests {
             "target_partitions wired through DataFusionBuilder should be visible on the session config"
         );
 
-        // Sanity check the inverse — None leaves DataFusion's default in place.
+        // Sanity check the inverse — None sizes the fan-out from the CPU budget.
         let df_default = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
@@ -2753,7 +2753,7 @@ mod tests {
         )
         .target_partitions(None)
         .build();
-        assert_ne!(
+        assert_eq!(
             df_default
                 .ctx
                 .state()
@@ -2761,8 +2761,8 @@ mod tests {
                 .options()
                 .execution
                 .target_partitions,
-            4,
-            "Without an override target_partitions should fall back to DataFusion's default"
+            cpu_budget::cpu_budget().target_partitions(),
+            "Without an override target_partitions should fall back to the CPU budget"
         );
     }
 

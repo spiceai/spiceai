@@ -68,6 +68,7 @@ limitations under the License.
 //! ```
 
 pub mod cgroup;
+pub mod testing;
 
 use std::sync::OnceLock;
 

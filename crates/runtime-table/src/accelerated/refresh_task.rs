@@ -2793,7 +2793,7 @@ pub async fn probe_acceleration_contents(
     // the source-federation wiring a refresh needs applies. `accelerator_df`
     // still normalizes the provider chain, and a `FederatedTableProviderAdaptor`
     // left un-federated scans its inner provider directly.
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let batches = async {
         accelerator_df(accelerator, &ctx)
             .and_then(|df| df.limit(0, Some(1)))?
@@ -3914,6 +3914,35 @@ mod tests {
             ),
             "RefreshTaskBuilder::build must hand out the shared state, not build its own"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_uses_cpu_budget_partitions() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "accelerated::refresh_task::tests::refresh_session_uses_cpu_budget_partitions",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("cpu_budget_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert_eq!(refresh.state().config().target_partitions(), cores);
     }
 
     #[derive(Debug)]

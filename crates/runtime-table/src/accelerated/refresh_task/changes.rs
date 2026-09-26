@@ -1278,7 +1278,7 @@ impl RefreshTask {
         let mut carried_received_ms: Option<i64> = None;
         let mut carried_received_at: Option<Instant> = None;
         let mut last_cycle_start = Instant::now();
-        let write_ctx = SessionContext::new();
+        let write_ctx = util::session_state::session_context();
         let write_session_state = write_ctx.state();
         let recv_wait_labels = metric_labels.dataset();
 

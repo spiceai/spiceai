@@ -30,7 +30,6 @@ use chunking::Chunker;
 use datafusion::{
     common::Column,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::context::SessionContext,
     functions_aggregate::expr_fn::{array_agg, first_value},
     logical_expr::{Aggregate, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
@@ -248,7 +247,7 @@ async fn delete_chunked_vector_by_outer_keys(
         .distinct()?
         .build()?;
 
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let matches = ctx
         .execute_logical_plan(filtered_plan)
         .await?
