@@ -1161,6 +1161,12 @@ impl SnapshotManager {
                     "snapshot metadata current id is older than the locally loaded snapshot; \
                      skipping reload to avoid regression"
                 );
+                // Withheld so the next poll reads the metadata again and repeats this warning
+                // for as long as the rollback lasts.
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: None,
+                });
             }
             return Ok(nothing_newer);
         }
@@ -3580,6 +3586,10 @@ mod tests {
             .expect("download_if_newer should succeed");
         assert!(result.download.is_none(), "matching ids must not download");
         assert!(
+            result.metadata_e_tag.is_some(),
+            "an up-to-date poll reports the ETag so the next poll can skip"
+        );
+        assert!(
             !local_path.exists(),
             "local file must not be written when nothing is newer"
         );
@@ -3595,6 +3605,10 @@ mod tests {
         assert!(
             result.download.is_none(),
             "local id ahead of remote must not regress"
+        );
+        assert_eq!(
+            result.metadata_e_tag, None,
+            "a rollback withholds the ETag so every poll re-checks and warns again"
         );
         assert!(
             !local_path.exists(),
