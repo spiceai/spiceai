@@ -1223,6 +1223,8 @@ fn write_cdc_pipelined(batch):
 
 The single most important branch is `stage_protected`: a plain append (Flow B) targets the *current* snapshot; anything carrying on-conflict deletions or pending PK deletions (Flow C) targets a *protected* snapshot whose threshold immunizes the new rows from old tombstones.
 
+For a `cdc_durability: memory` table with the CDC mem tier armed, conflict preparation records an upsert of an in-memory row for both the inline tombstone and the file key deletion, counting the superseded row once. The mem-tier append folds those key lists into one tombstone set. On the durable branch, they remain separate: the inline tombstone hides any inline copy, while the file deletion hides a copy that a checkpoint or budget-driven spill moved into a Vortex file after conflict preparation. The replacement row has a higher sequence, so the key deletion does not hide it. This also covers a durable upsert of a key that is still in the mem tier. Tables without an armed CDC mem tier keep the inline-only conflict path when the prior row is inline.
+
 ## Metastore transaction semantics
 
 All metadata mutation is a metastore transaction. The backend chooses the right `BEGIN` for its concurrency model:
