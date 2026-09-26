@@ -14,7 +14,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Cosmos DB (NoSQL)                | ✅          | @lukekim     |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
 | Databricks (mode: spark_connect) | ✅          | @lukekim     |
-| Databricks (mode: sql_warehouse) | ➖          |              |
+| Databricks (mode: sql_warehouse) | ✅          | @lukekim     |
 | Debezium                         | ➖          |              |
 | Delta Lake                       | ✅          | @Sevenannn   |
 | Dremio                           | ✅          | @Sevenannn   |

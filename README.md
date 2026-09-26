@@ -163,7 +163,7 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 - **Provider-aware LLM prompt caching** for cost reduction
 - **mTLS** for all internal cluster communication; OpenTelemetry metric export with delta temporality
 - **Streamable HTTP MCP transport** (`2026-07-28` + legacy `initialize`) with browser `Origin` checks, MCP gateway, MCP server
-- **Explicit CPU sizing** (`runtime.cpu.cores`), so a pod with a CPU request but no limit sizes itself to its share rather than the whole node
+- **CPU sizing for Kubernetes pods** — a pod that declares its CPU request (`SPICE_CPU_REQUEST_MILLICORES`, from the downward API) and sets no limit is sized at twice that request (at least two cores) instead of the whole node; `runtime.cpu.cores` sets an exact core count, or `all` for the whole node
 - **30+ data connectors** with shared HTTP rate control, dynamic headers, schema decomposition
 
 ## How is Spice different?
@@ -230,6 +230,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `adbc`                             | ADBC (incl. BigQuery)                 | Stable            | Arrow                        |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Stable            | [Spark Connect][spark]       |
+| `databricks (mode: sql_warehouse)` | [Databricks][databricks]              | Stable            | SQL Statement Execution API  |
 | `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
 | `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
 | `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
@@ -269,7 +270,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
 | `nfs`<sup>†</sup>                  | NFS                                   | Alpha             | Parquet, CSV, JSON           |
 
-<sup>†</sup> Not included in the release binaries or Docker images. Build `spiced` from source with the connector's feature: `make install-odbc`, `make install-scylladb`, `make install-nfs` (requires the system `libnfs` library), or `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
+<sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries or Docker images. To use one with the open-source runtime, build `spiced` from source with the connector's feature: `make install-odbc`, `make install-scylladb`, `make install-nfs` (requires the system `libnfs` library), or `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [ducklake]: https://ducklake.select/
@@ -337,7 +338,7 @@ Configured as `.vectors.engine` on a column-level embedding.
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch`<sup>†</sup> | Elasticsearch with kNN                                  | Alpha  |
 
-<sup>†</sup> Not included in the release binaries; build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
+<sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries. To use it with the open-source runtime, build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
 
 ## Change Forwarding to Drasi (Alpha)
 
@@ -402,10 +403,10 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | --------------- | ----------------------- | ------ | ---------------------------- |
 | `spice.ai`      | Spice.ai Cloud Platform | Stable | Arrow Flight                 |
 | `unity_catalog` | Unity Catalog           | Stable | Delta Lake                   |
+| `glue`          | AWS Glue                | Stable | CSV, Parquet, Iceberg        |
 | `databricks`    | Databricks              | Beta   | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
-| `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
 | `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Beta | PostgreSQL Wire Protocol |
 
 ## Supported Secret Stores
