@@ -1925,6 +1925,12 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a full current-snapshot rewrite finishes its
+    /// off-fence re-encode and before it takes the listing fence to commit, so a
+    /// test can publish a protected snapshot the rewrite's scan never folded.
+    /// Consumed on first fire.
+    #[cfg(test)]
+    test_pre_rewrite_commit_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -8944,6 +8950,8 @@ impl CayenneTableProvider {
             test_post_scan_view_selection_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -11007,6 +11015,8 @@ impl CayenneTableProvider {
             ),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
+            #[cfg(test)]
+            test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -22045,6 +22055,8 @@ impl CayenneTableProvider {
         // the `match &fence` below). Holding the fence across the catalog write
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
+        #[cfg(test)]
+        self.run_test_pre_rewrite_commit_hook().await;
         {
             let listing_guard = self.listing_fence.write().await;
             let snapshot_id_now = self.get_current_snapshot_id();
@@ -22170,10 +22182,8 @@ impl CayenneTableProvider {
 
             // Persist accumulated stats from the rewrite — keeps DataFusion's
             // synchronous statistics path consistent with the new snapshot.
-            // The rewrite materializes exactly the live rows, so its min/max +
-            // NDV + count are authoritative: replace the aggregate, correcting
-            // any drift the incremental merges/deltas accumulated.
-            self.replace_table_stats_after_rewrite(&stats_acc).await;
+            self.persist_table_stats_after_snapshot_rewrite(&stats_acc)
+                .await;
         };
 
         // Commit succeeded: `new_snapshot_id` is now current, so the old
@@ -26609,6 +26619,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only pre-rewrite-commit hook, if one is
+    /// installed. See [`Self::test_pre_rewrite_commit_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_rewrite_commit_hook(&self) {
+        let hook = self.test_pre_rewrite_commit_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
@@ -27184,20 +27204,42 @@ impl CayenneTableProvider {
             .await;
     }
 
-    /// Replace the aggregate with a full live-row rewrite (compaction).
+    /// Persist a full current-snapshot rewrite's statistics.
     ///
-    /// Compaction materializes exactly the live rows, so its accumulator's
-    /// min/max + NDV are the authoritative *live* aggregate. Replacing (rather
-    /// than merging) resets any superset drift accumulated incrementally — e.g.
-    /// min/max widened by since-deleted rows, or an NDV sketch inflated by
-    /// superseded keys — back to the live set, and `Set`s the live count.
-    pub(crate) async fn replace_table_stats_after_rewrite(
+    /// A rewrite that measured every live row materialized exactly the live set,
+    /// so its min/max + NDV are the authoritative *live* aggregate: replacing
+    /// (rather than merging) resets any superset drift accumulated incrementally
+    /// — min/max widened by since-deleted rows, an NDV sketch inflated by
+    /// superseded keys — and the count is `Set`.
+    ///
+    /// Two kinds of write can land during the re-encode, after the scan captured
+    /// its input, and survive the commit: a protected snapshot (the commit retains
+    /// what it did not fold) and an inline row (the capture drained the memtable,
+    /// and the commit preserves inline data). Their rows are live but absent from
+    /// the accumulator, and their deltas may already be folded into the count a
+    /// `Set` would overwrite — recording a short count as `Exact`, which a
+    /// distributed `COUNT(*)` folds, and narrowing min/max to exclude those rows.
+    /// So when either is present the min/max merge onto the existing aggregate,
+    /// which already covers them, and the count is recorded as a
+    /// [`RowCountUpdate::Estimate`].
+    ///
+    /// A survivor's delta is persisted under the same persistence lock this takes,
+    /// after its publish: one published before the check below is seen by it, and
+    /// one published after lands its delta on top of the count written here.
+    pub(crate) async fn persist_table_stats_after_snapshot_rewrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         let new_rows = accumulator.row_count();
-        self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
+        let measured_every_live_row =
+            self.protected_snapshots.load().is_empty() && self.cached_inlined_row_count() == 0;
+        let num_rows_update = if measured_every_live_row {
+            RowCountUpdate::Set(new_rows)
+        } else {
+            RowCountUpdate::Estimate(new_rows)
+        };
+        self.persist_table_stats_locked(accumulator, num_rows_update, measured_every_live_row)
             .await;
     }
 
@@ -27413,6 +27455,7 @@ impl CayenneTableProvider {
                 exact && prev_num_rows_exact,
             ),
             RowCountUpdate::Set(n) => (n.max(0), true),
+            RowCountUpdate::Estimate(n) => (n.max(0), false),
             RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
         }
     }
@@ -40535,6 +40578,239 @@ mod tests {
         }
     }
 
+    /// A key-deletion CDC upsert table holding three rows, each written into its
+    /// own file-backed protected snapshot, with its statistics persisted and the
+    /// background compactor pinned out so only explicit rewrites run.
+    async fn seeded_key_rewrite_table(
+        table_name: &str,
+        ctx: &SessionContext,
+    ) -> (CayenneTableProvider, TempDir) {
+        let (provider, _catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = provider.table_schema();
+        for i in 0..3i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        (provider, tmp)
+    }
+
+    /// A full rewrite that retains a protected snapshot published during its
+    /// re-encode must not re-declare the count `Exact`.
+    ///
+    /// The rewrite counts only the rows it materialized. The late snapshot's rows
+    /// are live too, and its commit's live-rows delta was already folded into the
+    /// count the rewrite then replaced — so `Set`ting the rewrite's count serves a
+    /// number short by that snapshot's rows as `Exact`, which a distributed
+    /// `COUNT(*)` folds. Found by `prop_concurrent_mixed_key_sqlite`, which served
+    /// `Exact(15)` with 16 rows live.
+    ///
+    /// Driven in key mode, where an insert can publish inside the window. A
+    /// position-delete rewrite holds `write_lock` throughout, so there only a
+    /// mem-tier checkpoint can publish mid-rewrite (#11477); the fix does not
+    /// depend on the rewrite scope, so it covers that publisher too.
+    #[tokio::test]
+    async fn key_rewrite_retaining_a_late_snapshot_serves_no_short_exact_count() {
+        let table_name = "key_rewrite_late_snapshot_count";
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table(table_name, &ctx).await;
+
+        // Mid-rewrite: publish one more protected snapshot and fold its delta into
+        // the persisted count, as the post-write maintenance loop does
+        // concurrently with a running compaction.
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let fired = Arc::clone(&hook_fired);
+            *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let before = provider_in_hook.protected_snapshot_ids();
+                    publish_one_more_protected_snapshot(&provider_in_hook, &before, 99).await;
+                    provider_in_hook
+                        .flush_pending_maintenance()
+                        .await
+                        .expect("fold the late snapshot's delta");
+                    fired.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let rewrote = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("full rewrite");
+        assert!(rewrote, "the rewrite must commit");
+        assert!(
+            hook_fired.load(Ordering::SeqCst),
+            "the rewrite must reach its pre-commit window (hook consumed)"
+        );
+        assert!(
+            !provider.protected_snapshots.load().is_empty(),
+            "precondition: the late protected snapshot must be retained by the commit"
+        );
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-rewrite maintenance");
+
+        let live = collect_id_value_pairs(&ctx, &provider, table_name).await;
+        assert_eq!(
+            live.len(),
+            4,
+            "every row, including the late one, stays live"
+        );
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("the table serves statistics");
+        assert!(
+            !matches!(stats.num_rows, DFPrecision::Exact(_)),
+            "WRONG COUNT(*): the rewrite served {:?} as Exact with {} rows live — it \
+             overwrote the late snapshot's already-folded delta with a count that \
+             excludes those rows",
+            stats.num_rows,
+            live.len()
+        );
+    }
+
+    /// The inline-tier shape of the test above: an inline upsert that lands during
+    /// the re-encode is not in the rewrite's input (the rewrite drained the inline
+    /// memtable at capture) and is preserved by the fenced commit. Once its delta
+    /// has folded and a later checkpoint moves the rows out of the memtable —
+    /// clearing the inline-row proxy that otherwise demotes the count — nothing
+    /// may still serve the rewrite's short count as `Exact`.
+    #[tokio::test]
+    async fn key_rewrite_retaining_a_late_inline_upsert_serves_no_short_exact_count() {
+        let table_name = "key_rewrite_late_inline_count";
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = provider.table_schema();
+        for i in 0..3i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let fired = Arc::clone(&hook_fired);
+            *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let schema = provider_in_hook.table_schema();
+                    insert_batch(&provider_in_hook, id_value_batch(schema, &[99], &[990])).await;
+                    assert!(
+                        provider_in_hook.cached_inlined_row_count() > 0,
+                        "precondition: the late upsert must land in the inline memtable"
+                    );
+                    provider_in_hook
+                        .flush_pending_maintenance()
+                        .await
+                        .expect("fold the late upsert's delta");
+                    fired.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let rewrote = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("full rewrite");
+        assert!(rewrote, "the rewrite must commit");
+        assert!(hook_fired.load(Ordering::SeqCst), "hook consumed");
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("checkpoint the late inline rows");
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-checkpoint maintenance");
+
+        let live = collect_id_value_pairs(&ctx, &provider, table_name).await;
+        assert_eq!(
+            live.len(),
+            4,
+            "every row, including the late one, stays live"
+        );
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("the table serves statistics");
+        assert!(
+            !matches!(stats.num_rows, DFPrecision::Exact(n) if n != live.len()),
+            "WRONG COUNT(*): served {:?} with {} rows live",
+            stats.num_rows,
+            live.len()
+        );
+    }
+
+    /// The control for the test above: the same rewrite with no snapshot
+    /// published inside its window folds everything, so its count is
+    /// authoritative and must come back `Exact` — the fix demotes only the
+    /// retained-snapshot case, not every rewrite.
+    #[tokio::test]
+    async fn key_rewrite_folding_every_snapshot_restores_an_exact_count() {
+        let table_name = "key_rewrite_no_late_snapshot_count";
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table(table_name, &ctx).await;
+
+        let rewrote = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("full rewrite");
+        assert!(rewrote, "the rewrite must commit");
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "precondition: the rewrite folded every protected snapshot"
+        );
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-rewrite maintenance");
+
+        let live = collect_id_value_pairs(&ctx, &provider, table_name).await;
+        assert_eq!(live.len(), 3);
+        let stats = provider
+            .optimizer_table_statistics()
+            .expect("the table serves statistics");
+        assert_eq!(
+            stats.num_rows,
+            DFPrecision::Exact(live.len()),
+            "a rewrite that folded everything materialized exactly the live rows, so its \
+             count must be served Exact"
+        );
+    }
+
     /// The contrast that makes the test above load-bearing: [`RewriteScope::All`]
     /// clears EVERY protected snapshot, including one published after the scan.
     ///
@@ -51548,7 +51824,7 @@ mod tests {
         // A full rewrite materializes exactly the live rows, so it — and only it —
         // may re-baseline.
         reopened
-            .replace_table_stats_after_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator)
             .await;
         assert!(
             reopened.table_statistics.read().count_exact,
@@ -51643,7 +51919,7 @@ mod tests {
         let accumulator = ColumnStatsAccumulator::new(&schema);
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
         provider
-            .replace_table_stats_after_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator)
             .await;
         assert!(
             provider
