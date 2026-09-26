@@ -5963,6 +5963,7 @@ async fn build_snapshot_refresh_state(
         swappable_provider,
         provider_factory,
         current_snapshot_id,
+        metadata_e_tag: Arc::default(),
     })
 }
 
