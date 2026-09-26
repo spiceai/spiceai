@@ -30,11 +30,11 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | GitHub                           | ✅             | @peasee         |
 | Glue                             | ✅             | @kczimm         |
 | GraphQL                          | ✅             | @peasee         |
-| HTTP/HTTPS                       | ➖             |                 |
+| HTTP/HTTPS                       | ✅             | @lukekim        |
 | Iceberg                          | ✅             | @phillipleblanc |
 | IMAP                             | ✅             | @peasee         |
 | Kafka                            | ✅             | @sgrebnov       |
-| Localpod                         | ➖             |                 |
+| Localpod                         | ✅             | @lukekim        |
 | MongoDB                          | ➖             |                 |
 | MS SQL                           | ✅             | @peasee         |
 | MySQL                            | ✅             | @peasee         |

@@ -8,12 +8,12 @@ All criteria must be met for the connector to be considered Stable, with excepti
 
 | Connector                        | Stable Quality | DRI Sign-off    |
 | -------------------------------- | -------------- | --------------- |
-| ADBC                             | ➖              |                 |
+| ADBC                             | ✅              | @lukekim        |
 | Azure BlobFS                     | ➖              |                 |
 | Clickhouse                       | ➖              |                 |
 | Cosmos DB (NoSQL)                | ➖              |                 |
 | Databricks (mode: delta_lake)    | ✅              | @Sevenannn      |
-| Databricks (mode: spark_connect) | ➖              |                 |
+| Databricks (mode: spark_connect) | ✅              | @lukekim        |
 | Databricks (mode: sql_warehouse) | ➖              |                 |
 | Debezium                         | ➖              |                 |
 | Delta Lake                       | ✅              | @Sevenannn      |
@@ -29,11 +29,11 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | GitHub                           | ✅              | @phillipleblanc |
 | Glue                             | ➖              |                 |
 | GraphQL                          | ➖              |                 |
-| HTTP/HTTPS                       | ➖              |                 |
+| HTTP/HTTPS                       | ✅              | @lukekim        |
 | Iceberg                          | ➖              |                 |
 | IMAP                             | ➖              |                 |
 | Kafka                            | ➖              |                 |
-| Localpod                         | ➖              |                 |
+| Localpod                         | ✅              | @lukekim        |
 | MongoDB                          | ➖              |                 |
 | MS SQL                           | ➖              |                 |
 | MySQL                            | ✅              | @phillipleblanc |

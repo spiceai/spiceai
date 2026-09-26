@@ -29,11 +29,11 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GitHub                           | ✅           | @peasee         |
 | Glue                             | ➖           |                 |
 | GraphQL                          | ✅           | @peasee         |
-| HTTP/HTTPS                       | ➖           |                 |
+| HTTP/HTTPS                       | ✅           | @lukekim        |
 | Iceberg                          | ✅           | @phillipleblanc |
 | IMAP                             | ➖           |                 |
 | Kafka                            | ➖           |                 |
-| Localpod                         | ➖           |                 |
+| Localpod                         | ✅           | @lukekim        |
 | MongoDB                          | ➖           |                 |
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |

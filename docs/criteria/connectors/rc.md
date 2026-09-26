@@ -13,7 +13,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Clickhouse                       | ➖          |              |
 | Cosmos DB (NoSQL)                | ✅          | @lukekim     |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖          |              |
+| Databricks (mode: spark_connect) | ✅          | @lukekim     |
 | Databricks (mode: sql_warehouse) | ➖          |              |
 | Debezium                         | ➖          |              |
 | Delta Lake                       | ✅          | @Sevenannn   |
@@ -29,11 +29,11 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | GitHub                           | ✅          | @peasee      |
 | Glue                             | ➖          |              |
 | GraphQL                          | ✅          | @peasee      |
-| HTTP/HTTPS                       | ➖          |              |
+| HTTP/HTTPS                       | ✅          | @lukekim     |
 | Iceberg                          | ✅          | @phillipleblanc |
 | IMAP                             | ➖          |              |
 | Kafka                            | ➖          |              |
-| Localpod                         | ➖          |              |
+| Localpod                         | ✅          | @lukekim     |
 | MongoDB                          | ➖          |              |
 | MS SQL                           | ➖          |              |
 | MySQL                            | ✅          | @peasee      |

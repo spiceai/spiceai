@@ -227,12 +227,16 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
+| `adbc`                             | ADBC (incl. BigQuery)                 | Stable            | Arrow                        |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
+| `databricks (mode: spark_connect)` | [Databricks][databricks]              | Stable            | [Spark Connect][spark]       |
 | `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
 | `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
 | `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
 | `file`                             | File                                  | Stable            | Parquet, CSV                 |
 | `github`                           | GitHub                                | Stable            | GitHub API                   |
+| `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Stable            | Parquet, CSV, JSON           |
+| `localpod`                         | [Local dataset replication][localpod] | Stable            |                              |
 | `postgres`                         | PostgreSQL (with native WAL CDC)      | Stable            |                              |
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
 | `mysql`                            | MySQL (with native binlog CDC)        | Stable            |                              |
@@ -242,9 +246,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
 | `git`                              | Git repositories                      | Release Candidate |                              |
 | `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
-| `adbc`                             | ADBC (incl. BigQuery)                 | Release Candidate | Arrow                        |
 | `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
-| `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
@@ -261,9 +263,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
-| `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Alpha             | Parquet, CSV, JSON           |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
-| `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `mongodb`                          | MongoDB (with change-stream CDC)      | Alpha             |                              |
 | `scylladb`<sup>†</sup>             | ScyllaDB                              | Alpha             |                              |
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
