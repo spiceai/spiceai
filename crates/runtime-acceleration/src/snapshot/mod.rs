@@ -23,7 +23,7 @@ use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::{
-    GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    GetOptions, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
     path::Path as ObjectPath,
 };
 use opentelemetry::KeyValue;
@@ -40,7 +40,10 @@ use std::{
     ops::Not,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::OwnedMutexGuard;
@@ -274,6 +277,32 @@ pub struct SnapshotDownloadInfo {
 struct MetadataHandle {
     metadata: SnapshotMetadata,
     version: Option<UpdateVersion>,
+}
+
+impl MetadataHandle {
+    fn e_tag(&self) -> Option<String> {
+        self.version
+            .as_ref()
+            .and_then(|version| version.e_tag.clone())
+    }
+}
+
+/// The outcome of reading `metadata.json`.
+enum MetadataRead {
+    /// A conditional read found the file unchanged since the given `ETag`.
+    Unchanged,
+    /// The file as it is now, or `None` when it does not exist.
+    Current(Option<MetadataHandle>),
+}
+
+/// The outcome of one [`SnapshotManager::download_if_newer`] poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPoll {
+    /// The snapshot that was downloaded, or `None` when nothing newer was available.
+    pub download: Option<SnapshotDownloadInfo>,
+    /// The `ETag` of the metadata this poll acted on, when the store reports one. Passing
+    /// it to the next poll lets that poll skip entirely if the metadata has not changed.
+    pub metadata_e_tag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -719,13 +748,30 @@ impl SnapshotManager {
     }
 
     async fn load_metadata(&self) -> Result<Option<MetadataHandle>, MetadataLoadError> {
+        Ok(match self.read_metadata(None).await? {
+            MetadataRead::Current(handle) => handle,
+            // Only a conditional read reports the file unchanged.
+            MetadataRead::Unchanged => None,
+        })
+    }
+
+    /// Reads `metadata.json`. With `if_none_match` set, the GET is conditional on that
+    /// `ETag` and an unchanged file returns [`MetadataRead::Unchanged`] without a body.
+    async fn read_metadata(
+        &self,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataRead, MetadataLoadError> {
         let metadata_path = self.metadata_path();
         let metadata_path_display = metadata_path.to_string();
 
         retry(self.network_retry_strategy.clone(), || async {
-            let get_result = match self.object_store.get(&metadata_path).await {
+            let options = GetOptions::new().with_if_none_match(if_none_match);
+            let get_result = match self.object_store.get_opts(&metadata_path, options).await {
                 Ok(result) => result,
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(object_store::Error::NotModified { .. }) if if_none_match.is_some() => {
+                    return Ok(MetadataRead::Unchanged);
+                }
+                Err(object_store::Error::NotFound { .. }) => return Ok(MetadataRead::Current(None)),
                 Err(source) => {
                     tracing::warn!(
                         "Transient error reading snapshot metadata, retrying. path={metadata_path_display} error={source}"
@@ -774,7 +820,7 @@ impl SnapshotManager {
                 None
             };
 
-            Ok(Some(MetadataHandle { metadata, version }))
+            Ok(MetadataRead::Current(Some(MetadataHandle { metadata, version })))
         })
         .await
     }
@@ -1053,22 +1099,20 @@ impl SnapshotManager {
     /// Downloads the latest snapshot only if its `snapshot_id` is strictly
     /// greater than `current_local_id`. When the remote `current_snapshot_id`
     /// is less than or equal to `current_local_id` (matching id, or remote
-    /// metadata rolled back), returns `Ok(None)` without touching local files.
+    /// metadata rolled back), nothing is downloaded and local files are untouched.
     ///
     /// This is the primary entry point for `refresh_mode: snapshot`, which polls
     /// the snapshot store on a fixed cadence and only reloads the accelerator
     /// when a strictly newer snapshot is available. Snapshot mode never
     /// regresses the accelerator to an older snapshot id.
     ///
-    /// # Errors
+    /// `known_metadata_e_tag` is the [`SnapshotPoll::metadata_e_tag`] of the last poll the
+    /// caller completed. The metadata read is conditional on it, so when the metadata has
+    /// not changed the poll returns without downloading it.
     ///
-    /// Same errors as [`SnapshotManager::download_latest_snapshot`].
-    /// Download the latest snapshot if it is strictly newer than
-    /// `current_local_id`. The optional `validate_schema` callback is given
-    /// the snapshot metadata's recorded schema **before** any bytes are
-    /// downloaded or written to disk; if it returns false a schema
-    /// mismatch is reported and the accelerator's primary file is left
-    /// untouched.
+    /// The optional `validate_schema` callback is given the snapshot metadata's recorded
+    /// schema **before** any bytes are downloaded or written to disk; if it returns false a
+    /// schema mismatch is reported and the accelerator's primary file is left untouched.
     ///
     /// # Errors
     ///
@@ -1078,76 +1122,160 @@ impl SnapshotManager {
     pub async fn download_if_newer(
         &self,
         current_local_id: Option<u64>,
+        known_metadata_e_tag: Option<&str>,
         validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
-    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        let Some(remote_id) = self.remote_current_snapshot_id().await? else {
-            return Ok(None);
-        };
-        match current_local_id {
-            Some(local_id) if remote_id <= local_id => {
-                if remote_id < local_id {
-                    tracing::warn!(
-                        dataset = %self.dataset_name,
-                        remote_snapshot_id = remote_id,
-                        local_snapshot_id = local_id,
-                        "snapshot metadata current id is older than the locally loaded snapshot; \
-                         skipping reload to avoid regression"
-                    );
-                }
-                Ok(None)
-            }
-            _ => {
-                // Inspect the metadata-recorded schema first, before
-                // touching the file: an incompatible snapshot must never
-                // overwrite the accelerator's current primary file. If a
-                // validator is provided we require the remote metadata to
-                // expose a parseable schema for this dataset — missing or
-                // malformed schema metadata is treated as a validation
-                // failure rather than silently skipped.
-                if let Some(validate) = validate_schema {
-                    let handle = self.load_metadata().await.map_err(|e| match e {
-                        MetadataLoadError::Read { path, source } => {
-                            SnapshotDownloadError::ReadMetadata { path, source }
-                        }
-                        MetadataLoadError::Parse { path, source } => {
-                            SnapshotDownloadError::ParseMetadata { path, source }
-                        }
-                        MetadataLoadError::UnsupportedVersion { path, version } => {
-                            SnapshotDownloadError::UnsupportedMetadataVersion { path, version }
-                        }
-                    })?;
-                    let handle = handle.ok_or_else(|| SnapshotDownloadError::SchemaMismatch {
-                        dataset: self.dataset_name.clone(),
-                    })?;
-                    let dataset_metadata = handle
-                        .metadata
-                        .datasets
-                        .get(&self.dataset_name)
-                        .ok_or_else(|| SnapshotDownloadError::SchemaMismatch {
-                            dataset: self.dataset_name.clone(),
-                        })?;
-                    let metadata_schema = dataset_metadata.current_schema().ok_or_else(|| {
-                        SnapshotDownloadError::SchemaMismatch {
-                            dataset: self.dataset_name.clone(),
-                        }
-                    })?;
-                    let metadata_schema_ref =
-                        metadata_schema.to_schema_ref().map_err(|source| {
-                            SnapshotDownloadError::MetadataSchemaDeserialize {
-                                dataset: self.dataset_name.clone(),
-                                source,
-                            }
-                        })?;
-                    if !validate(&metadata_schema_ref) {
-                        return Err(SnapshotDownloadError::SchemaMismatch {
-                            dataset: self.dataset_name.clone(),
-                        });
-                    }
-                }
+    ) -> Result<SnapshotPoll, SnapshotDownloadError> {
+        if !matches!(
+            self.bootstrap_failure_behavior,
+            BootstrapOnFailureBehavior::Retry
+        ) {
+            return self
+                .poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+                .await
+                .map_err(|err| match err {
+                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                });
+        }
 
-                self.download_latest_snapshot().await
+        // Each retry is a whole poll: it reads the metadata again, unconditionally, and
+        // validates the snapshot it then downloads, so a snapshot published to replace a
+        // failed one is picked up.
+        let first_attempt = AtomicBool::new(true);
+        retry(RetryBackoffBuilder::new().build(), || async {
+            let known_metadata_e_tag = if first_attempt.swap(false, Ordering::Relaxed) {
+                known_metadata_e_tag
+            } else {
+                None
+            };
+            self.poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+                .await
+        })
+        .await
+    }
+
+    /// One attempt of [`Self::download_if_newer`]. A failed download is a transient error
+    /// under `bootstrap_on_failure_behavior: retry`; every other error is permanent.
+    async fn poll_once(
+        &self,
+        current_local_id: Option<u64>,
+        known_metadata_e_tag: Option<&str>,
+        validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
+    ) -> Result<SnapshotPoll, RetryError<SnapshotDownloadError>> {
+        // One metadata read drives the whole attempt: the id comparison, the schema check and
+        // the download all use it, so the snapshot that is downloaded is the one whose schema
+        // was validated even if a writer publishes a newer one meanwhile.
+        let read = self
+            .read_metadata(known_metadata_e_tag)
+            .await
+            .map_err(|err| RetryError::permanent(err.into()))?;
+        let handle = match read {
+            MetadataRead::Unchanged => {
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: known_metadata_e_tag.map(str::to_string),
+                });
+            }
+            MetadataRead::Current(None) => {
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: None,
+                });
+            }
+            MetadataRead::Current(Some(handle)) => Arc::new(handle),
+        };
+        let nothing_newer = SnapshotPoll {
+            download: None,
+            metadata_e_tag: handle.e_tag(),
+        };
+        let Some(dataset_metadata) = handle.metadata.datasets.get(&self.dataset_name) else {
+            return Ok(nothing_newer);
+        };
+        let Some(remote_id) = dataset_metadata.current_snapshot_id else {
+            return Ok(nothing_newer);
+        };
+        if let Some(local_id) = current_local_id
+            && remote_id <= local_id
+        {
+            if remote_id < local_id {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    remote_snapshot_id = remote_id,
+                    local_snapshot_id = local_id,
+                    "snapshot metadata current id is older than the locally loaded snapshot; \
+                     skipping reload to avoid regression"
+                );
+                // Withheld so the next poll reads the metadata again and repeats this warning
+                // for as long as the rollback lasts.
+                return Ok(SnapshotPoll {
+                    download: None,
+                    metadata_e_tag: None,
+                });
+            }
+            return Ok(nothing_newer);
+        }
+
+        // Inspect the metadata-recorded schema first, before touching the file: an
+        // incompatible snapshot must never overwrite the accelerator's current primary
+        // file. If a validator is provided we require the remote metadata to expose a
+        // parseable schema for this dataset — missing or malformed schema metadata is
+        // treated as a validation failure rather than silently skipped.
+        if let Some(validate) = validate_schema {
+            let metadata_schema = dataset_metadata.current_schema().ok_or_else(|| {
+                RetryError::permanent(SnapshotDownloadError::SchemaMismatch {
+                    dataset: self.dataset_name.clone(),
+                })
+            })?;
+            let metadata_schema_ref = metadata_schema.to_schema_ref().map_err(|source| {
+                RetryError::permanent(SnapshotDownloadError::MetadataSchemaDeserialize {
+                    dataset: self.dataset_name.clone(),
+                    source,
+                })
+            })?;
+            if !validate(&metadata_schema_ref) {
+                return Err(RetryError::permanent(
+                    SnapshotDownloadError::SchemaMismatch {
+                        dataset: self.dataset_name.clone(),
+                    },
+                ));
             }
         }
+
+        let e_tag = handle.e_tag();
+        let download = if matches!(
+            self.bootstrap_failure_behavior,
+            BootstrapOnFailureBehavior::Retry
+        ) {
+            let checkpointer_factory = Arc::clone(
+                self.checkpointer_factory
+                    .as_ref()
+                    .context(CheckpointerFactoryNotSetSnafu)
+                    .map_err(RetryError::permanent)?,
+            );
+            self.download_latest_once(checkpointer_factory, Some(handle))
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        "Failed to bootstrap snapshot; retrying. dataset={} location={} error={err}",
+                        self.dataset_name,
+                        self.snapshots_location
+                    );
+                    RetryError::transient(err)
+                })?
+        } else {
+            self.download_latest(Some(handle))
+                .await
+                .map_err(RetryError::permanent)?
+        };
+        // The bootstrap failure behavior can turn a failed download into no download, or fall
+        // back to an older snapshot. Neither loaded the current snapshot, so the `ETag` is
+        // withheld and the next poll reads the metadata again instead of skipping.
+        let loaded_current = download
+            .as_ref()
+            .is_some_and(|info| info.snapshot_id == remote_id);
+        Ok(SnapshotPoll {
+            download,
+            metadata_e_tag: e_tag.filter(|_| loaded_current),
+        })
     }
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
@@ -1570,6 +1698,15 @@ impl SnapshotManager {
     pub async fn download_latest_snapshot(
         &self,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
+        self.download_latest(None).await
+    }
+
+    /// Downloads the current snapshot described by `pinned`, or by a fresh metadata read
+    /// on each attempt when `pinned` is `None`.
+    async fn download_latest(
+        &self,
+        pinned: Option<Arc<MetadataHandle>>,
+    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let checkpointer_factory = Arc::clone(
             self.checkpointer_factory
                 .as_ref()
@@ -1577,7 +1714,10 @@ impl SnapshotManager {
         );
         match self.bootstrap_failure_behavior {
             BootstrapOnFailureBehavior::Warn => {
-                match self.download_latest_once(checkpointer_factory).await {
+                match self
+                    .download_latest_once(checkpointer_factory, pinned.clone())
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
@@ -1597,7 +1737,7 @@ impl SnapshotManager {
 
                 retry(retry_strategy, || async {
                     match self
-                        .download_latest_once(Arc::clone(&checkpointer_factory))
+                        .download_latest_once(Arc::clone(&checkpointer_factory), pinned.clone())
                         .await
                     {
                         Ok(result) => Ok(result),
@@ -1614,7 +1754,10 @@ impl SnapshotManager {
                 .await
             }
             BootstrapOnFailureBehavior::Fallback => {
-                match self.download_with_fallback(checkpointer_factory).await {
+                match self
+                    .download_with_fallback(checkpointer_factory, pinned)
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
@@ -1629,11 +1772,23 @@ impl SnapshotManager {
         }
     }
 
+    /// Returns `pinned` when set, otherwise reads the metadata.
+    async fn pinned_or_load_metadata(
+        &self,
+        pinned: Option<Arc<MetadataHandle>>,
+    ) -> Result<Option<Arc<MetadataHandle>>, MetadataLoadError> {
+        match pinned {
+            Some(handle) => Ok(Some(handle)),
+            None => Ok(self.load_metadata().await?.map(Arc::new)),
+        }
+    }
+
     async fn download_latest_once(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
+        pinned: Option<Arc<MetadataHandle>>,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        let metadata_handle = match self.load_metadata().await {
+        let metadata_handle = match self.pinned_or_load_metadata(pinned).await {
             Ok(Some(handle)) => handle,
             Ok(None) => {
                 let location_display = self.snapshots_location.to_string();
@@ -1676,8 +1831,9 @@ impl SnapshotManager {
     async fn download_with_fallback(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
+        pinned: Option<Arc<MetadataHandle>>,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        let metadata_handle = match self.load_metadata().await {
+        let metadata_handle = match self.pinned_or_load_metadata(pinned).await {
             Ok(Some(handle)) => handle,
             Ok(None) => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -3494,10 +3650,14 @@ mod tests {
         );
 
         let result = manager
-            .download_if_newer(Some(7), None)
+            .download_if_newer(Some(7), None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.is_none(), "matching ids must not download");
+        assert!(result.download.is_none(), "matching ids must not download");
+        assert!(
+            result.metadata_e_tag.is_some(),
+            "an up-to-date poll reports the ETag so the next poll can skip"
+        );
         assert!(
             !local_path.exists(),
             "local file must not be written when nothing is newer"
@@ -3508,12 +3668,16 @@ mod tests {
         // newer remote snapshot causes a reload. Here the remote current id
         // is 7 and the local id we claim is 8, so this must be a no-op.
         let result = manager
-            .download_if_newer(Some(8), None)
+            .download_if_newer(Some(8), None, None)
             .await
             .expect("download_if_newer should succeed");
         assert!(
-            result.is_none(),
+            result.download.is_none(),
             "local id ahead of remote must not regress"
+        );
+        assert_eq!(
+            result.metadata_e_tag, None,
+            "a rollback withholds the ETag so every poll re-checks and warns again"
         );
         assert!(
             !local_path.exists(),
@@ -3522,11 +3686,316 @@ mod tests {
 
         // A strictly older local id (6) than the remote (7) should download.
         let info = manager
-            .download_if_newer(Some(6), None)
+            .download_if_newer(Some(6), None, None)
             .await
             .expect("download_if_newer should succeed")
+            .download
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
+    }
+
+    /// A Cayenne manager over `root/metadata` and `root/data`, the directories a Cayenne
+    /// snapshot archives.
+    fn build_cayenne_manager(
+        store: Arc<InMemory>,
+        root: &std::path::Path,
+        schema: &SchemaRef,
+    ) -> SnapshotManager {
+        let mut manager = build_manager_for_engine(
+            store,
+            root.join("unused"),
+            BootstrapOnFailureBehavior::Warn,
+            schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        manager.layout = AccelerationLayout::cayenne(root.join("metadata"), root.join("data"));
+        manager
+    }
+
+    /// Archives a Cayenne `metadata/` + `data/` layout whose data file `part-{snapshot_id}.vortex`
+    /// holds `marker`, stores it as the snapshot taken at `second` past a fixed minute, and
+    /// returns its entry. Cayenne never rewrites a data file in place, so each snapshot's
+    /// file has its own name.
+    async fn put_cayenne_snapshot_entry(
+        store: &InMemory,
+        snapshot_id: u64,
+        second: u32,
+        marker: &[u8],
+    ) -> SnapshotEntry {
+        let source = TempDir::new().expect("create source dir");
+        let metadata_dir = source.path().join("metadata");
+        let data_dir = source.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(metadata_dir.join("metastore.db"), b"metastore").expect("write metastore");
+        std::fs::write(data_dir.join(format!("part-{snapshot_id}.vortex")), marker)
+            .expect("write data file");
+        let archive = source.path().join("snapshot.tar");
+        crate::snapshot::directory_archive::archive_directories_to_file_with_plan(
+            &[
+                (metadata_dir, "metadata/".to_string()),
+                (data_dir, "data/".to_string()),
+            ],
+            &archive,
+            &[],
+            &[],
+        )
+        .await
+        .expect("archive cayenne directories");
+        let contents = Bytes::from(std::fs::read(&archive).expect("read archive"));
+
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Cayenne);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, second)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&Path::from(SNAPSHOT_BASE_PATH), instant);
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(&contents),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: Some(AccelerationEngine::Cayenne.to_string()),
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        }
+    }
+
+    fn metadata_with(
+        schema: &SchemaRef,
+        entries: Vec<SnapshotEntry>,
+        current: u64,
+    ) -> SnapshotMetadata {
+        SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(schema, entries, Some(current)),
+            )]),
+        }
+    }
+
+    /// A poll given the `ETag` of unchanged metadata skips without acting on it; a poll whose
+    /// `ETag` is stale reads the metadata again.
+    #[tokio::test]
+    async fn download_if_newer_skips_when_metadata_e_tag_is_unchanged() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let first = put_cayenne_snapshot_entry(&store, 0, 1, b"first").await;
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![first.clone()], 0),
+        )
+        .await;
+
+        let root = TempDir::new().expect("create temp dir");
+        let manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+
+        let loaded = manager
+            .download_if_newer(None, None, None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert_eq!(
+            loaded.download.as_ref().map(|info| info.snapshot_id),
+            Some(0)
+        );
+        let e_tag = loaded
+            .metadata_e_tag
+            .expect("the in-memory store reports an ETag");
+
+        // Claiming no snapshot is loaded would download snapshot 0 again, so returning
+        // nothing shows the poll skipped on the unchanged ETag alone.
+        let unchanged = manager
+            .download_if_newer(None, Some(&e_tag), None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert_eq!(
+            unchanged,
+            SnapshotPoll {
+                download: None,
+                metadata_e_tag: Some(e_tag.clone()),
+            }
+        );
+
+        let second = put_cayenne_snapshot_entry(&store, 1, 2, b"second").await;
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![first, second], 1),
+        )
+        .await;
+        let changed = manager
+            .download_if_newer(Some(0), Some(&e_tag), None)
+            .await
+            .expect("download_if_newer should succeed");
+        assert_eq!(
+            changed.download.as_ref().map(|info| info.snapshot_id),
+            Some(1),
+            "changed metadata must be read again"
+        );
+        assert_ne!(changed.metadata_e_tag, Some(e_tag));
+        let restored = fs::read(root.path().join("data").join("part-1.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"second");
+    }
+
+    /// A poll that did not load the current snapshot, because the bootstrap failure behavior
+    /// tolerated a failed download or fell back to an older snapshot, must not report an
+    /// `ETag`: recording it would make every later poll skip instead of retrying.
+    #[tokio::test]
+    async fn download_if_newer_withholds_e_tag_when_current_snapshot_is_not_loaded() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let older = put_cayenne_snapshot_entry(&store, 0, 1, b"older").await;
+        let mut corrupt = put_cayenne_snapshot_entry(&store, 1, 2, b"current").await;
+        corrupt.snapshot_checksum = "0".repeat(64);
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![older, corrupt], 1),
+        )
+        .await;
+
+        for (behavior, expected_snapshot) in [
+            (BootstrapOnFailureBehavior::Warn, None),
+            (BootstrapOnFailureBehavior::Fallback, Some(0)),
+        ] {
+            let root = TempDir::new().expect("create temp dir");
+            let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+            manager.bootstrap_failure_behavior = behavior;
+
+            let poll = manager
+                .download_if_newer(None, None, None)
+                .await
+                .expect("download_if_newer should succeed");
+            assert_eq!(
+                poll.download.as_ref().map(|info| info.snapshot_id),
+                expected_snapshot,
+                "{behavior:?}"
+            );
+            assert_eq!(poll.metadata_e_tag, None, "{behavior:?}");
+        }
+    }
+
+    /// Under `bootstrap_on_failure_behavior: retry`, a poll whose current snapshot is broken
+    /// keeps retrying, and each retry reads the metadata again: a snapshot published to
+    /// replace the broken one is validated and downloaded instead of retrying forever.
+    #[tokio::test]
+    async fn download_if_newer_retry_picks_up_a_replacement_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let mut broken = put_cayenne_snapshot_entry(&store, 7, 1, b"broken").await;
+        broken.snapshot_checksum = "0".repeat(64);
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![broken.clone()], 7),
+        )
+        .await;
+
+        let root = TempDir::new().expect("create temp dir");
+        let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+        manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
+
+        let writer_store = Arc::clone(&store);
+        let writer_path = metadata_path.clone();
+        let writer_schema = Arc::clone(&schema);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let replacement = put_cayenne_snapshot_entry(&writer_store, 8, 2, b"replacement").await;
+            write_metadata(
+                &writer_store,
+                &writer_path,
+                &metadata_with(&writer_schema, vec![broken, replacement], 8),
+            )
+            .await;
+        });
+
+        let validated = std::sync::atomic::AtomicUsize::new(0);
+        let validator = |_: &SchemaRef| {
+            validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        };
+        let poll = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            manager.download_if_newer(Some(6), None, Some(&validator)),
+        )
+        .await
+        .expect("retry must observe the replacement snapshot instead of retrying forever")
+        .expect("download_if_newer should succeed");
+        writer.await.expect("writer task");
+
+        assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
+        assert!(poll.metadata_e_tag.is_some());
+        assert!(
+            validated.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "each retry validates the snapshot it downloads"
+        );
+        let restored = fs::read(root.path().join("data").join("part-8.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"replacement");
+    }
+
+    /// A writer that publishes between the schema check and the download must not change
+    /// which snapshot is downloaded: the one validated is the one loaded.
+    #[tokio::test]
+    async fn download_if_newer_downloads_the_snapshot_it_validated() {
+        let store = Arc::new(InMemory::new());
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let schema = sample_schema();
+        let validated = put_cayenne_snapshot_entry(&store, 7, 1, b"validated").await;
+        write_metadata(
+            &store,
+            &metadata_path,
+            &metadata_with(&schema, vec![validated.clone()], 7),
+        )
+        .await;
+        let published = put_cayenne_snapshot_entry(&store, 8, 2, b"published-later").await;
+        let republished = metadata_with(&schema, vec![validated, published], 8);
+
+        let root = TempDir::new().expect("create temp dir");
+        let manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+
+        let writer_store = Arc::clone(&store);
+        let writer_path = metadata_path.clone();
+        let validator = move |_: &SchemaRef| {
+            let payload = serde_json::to_vec_pretty(&republished).expect("serialize metadata");
+            futures::executor::block_on(writer_store.put(&writer_path, payload.into()))
+                .expect("publish newer metadata");
+            true
+        };
+
+        let info = manager
+            .download_if_newer(Some(6), None, Some(&validator))
+            .await
+            .expect("download_if_newer should succeed")
+            .download
+            .expect("expected a newer snapshot");
+        assert_eq!(info.snapshot_id, 7);
+        let data_dir = root.path().join("data");
+        let restored = fs::read(data_dir.join("part-7.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(restored.as_slice(), b"validated");
+        assert!(
+            !data_dir.join("part-8.vortex").exists(),
+            "the snapshot published after validation must not be restored"
+        );
     }
 
     #[tokio::test]
@@ -3544,10 +4013,10 @@ mod tests {
             false,
         );
         let result = manager
-            .download_if_newer(None, None)
+            .download_if_newer(None, None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.is_none());
+        assert!(result.download.is_none());
         assert!(!local_path.exists());
     }
 

@@ -375,7 +375,8 @@ pub struct CayenneTableProvider {
 
     // Per-table locks
     write_lock: Arc<tokio::sync::Mutex<()>>,
-    compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
 
     // Object store
     object_store_config: Option<ObjectStoreConfig>,
