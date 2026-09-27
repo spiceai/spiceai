@@ -200,6 +200,19 @@ const SLOW_TIER_MEM_DRAIN_OFFSET: f64 = 0.07;
 /// cliff the busy-fraction sampler cannot see coming.
 const CPU_PRESSURE_OK_BURSTABLE: f64 = 0.50;
 
+/// Hysteresis band below the CPU growth gate ([`CPU_PRESSURE_OK`] /
+/// [`CPU_PRESSURE_OK_BURSTABLE`]) at which a query-admission reserve is RELEASED
+/// on the CPU signal alone. The reserve is grown while CPU is contended (busy
+/// fraction at/over the gate) and its own effect — shedding queries — lowers the
+/// busy fraction, so releasing at the very same threshold makes the two moves
+/// chase each other every dwell (the closed-loop harness measured 221 direction
+/// reversals in 240 ticks with one threshold). Releasing only once CPU is
+/// comfortably below the gate gives the pair the band the memory rule already
+/// has ([`MEM_PRESSURE_HIGH`] vs [`MEM_PRESSURE_OK`]). The other release
+/// triggers (ingest goal met with apply headroom, query SLO violated) are
+/// unaffected.
+const CPU_RELEASE_HYSTERESIS: f64 = 0.15;
+
 /// Idle horizon for [`QueryObservations::qph`]: with no query observed within this
 /// window the table is treated as having no QPH signal (the goal is skipped) rather
 /// than reporting a lifetime rate that decays toward 0 while parked. ~5 minutes —
@@ -1367,12 +1380,26 @@ impl IngestSnapshot {
     /// `true` (the CPU rule is inert). Single source of truth for the gate, shared
     /// by both decide ladders and [`binding_constraint`].
     fn cpu_ok(&self) -> bool {
-        let gate = if self.cpu_burstable {
+        self.cpu_pressure.is_none_or(|p| p < self.cpu_gate())
+    }
+
+    /// CPU is comfortably free — the release-side twin of [`Self::cpu_ok`], a
+    /// [`CPU_RELEASE_HYSTERESIS`] band below the growth gate, so a reserve grown
+    /// under contention is not handed back by the relief it created. Unknown
+    /// pressure ⇒ `true` (the CPU rule is inert).
+    fn cpu_uncontended(&self) -> bool {
+        self.cpu_pressure
+            .is_none_or(|p| p < self.cpu_gate() - CPU_RELEASE_HYSTERESIS)
+    }
+
+    /// The CPU growth gate for this host ([`CPU_PRESSURE_OK_BURSTABLE`] on a
+    /// T-family burstable instance, else [`CPU_PRESSURE_OK`]).
+    fn cpu_gate(&self) -> f64 {
+        if self.cpu_burstable {
             CPU_PRESSURE_OK_BURSTABLE
         } else {
             CPU_PRESSURE_OK
-        };
-        self.cpu_pressure.is_none_or(|p| p < gate)
+        }
     }
 
     /// The data volume is on a slow/networked tier — the continuous,
@@ -2671,10 +2698,17 @@ fn decide_goal(
 
     // (1b) Release the query-admission reserve as soon as its justification is gone
     // OR it has overshot a query SLO. Three triggers, all safe/stable:
-    //   - CPU no longer contended (`cpu_ok`) — shedding queries can't help the apply
-    //     if CPU isn't the bottleneck, so nothing to relieve;
-    //   - the ingest goal is comfortably met (`ingest_comfortably_met`) — the apply
-    //     caught up, the reserve's whole reason is gone;
+    //   - CPU comfortably uncontended (`cpu_uncontended`: a hysteresis band UNDER
+    //     the growth gate, not the gate itself) — shedding queries can't help the
+    //     apply if CPU isn't the bottleneck, so nothing to relieve. The band
+    //     matters: the reserve's own effect lowers CPU, and releasing at the
+    //     growth threshold re-grows it next dwell (a measured limit cycle);
+    //   - the ingest goal is comfortably met (`ingest_comfortably_met`) AND the
+    //     apply has real headroom (`apply_vs_arrival < HEALTHY_RATIO`) — the apply
+    //     caught up, the reserve's whole reason is gone. The headroom conjunct is
+    //     the same rule the relax tier applies: a goal met only *because* the
+    //     reserve keeps the apply afloat is re-violated by the release (measured
+    //     as a ~100 s grow/release sawtooth), so "met" alone is not enough;
     //   - a query SLO (QPH or query-latency) is now VIOLATED (`query_violated`) — the
     //     throttle has borrowed too much query capacity and pushed a query goal past
     //     target, so back off. This is the QUERY-SLO BRAKE: throttling moves QPH/
@@ -2686,7 +2720,9 @@ fn decide_goal(
     // honoring the query SLOs) is high priority. Fast handback (legacy ±⅓ step);
     // the bound floor is 0.
     if cur.query_admission_reserve > 0
-        && (cpu_ok || goals.ingest_comfortably_met(s) || query_violated)
+        && (s.cpu_uncontended()
+            || (goals.ingest_comfortably_met(s) && s.apply_vs_arrival < HEALTHY_RATIO)
+            || query_violated)
         && let Some(v) = clamp_move_usize(
             cur.query_admission_reserve,
             shrink_usize(cur.query_admission_reserve),
@@ -6032,5 +6068,119 @@ mod tests {
 
     fn latency_goal_for_test(ms: f64) -> Goals {
         Goals::from_targets(None, None, Some(ms), None, Duration::from_mins(1))
+    }
+
+    /// The reserve's release triggers must not undo the relief they serve: the
+    /// CPU trigger sits a hysteresis band UNDER the growth gate (inside the band a
+    /// held reserve neither grows nor releases on CPU; below it releases), and the
+    /// ingest-goal-met trigger needs apply headroom (a lag goal met only because
+    /// the reserve keeps the apply afloat is not released). Regression guards for
+    /// the grow/release chase (221 reversals in 240 ticks) and the ~100 s sawtooth
+    /// the closed-loop harness measured.
+    #[test]
+    fn query_admission_reserve_release_is_hysteretic_and_headroom_gated() {
+        let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
+        let b = bounds();
+        // Freshness behind, shrink lever exhausted (mem-tier at floor), a reserve
+        // already held: the only reserve-related moves left are grow/release.
+        let reserve_held = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
+            query_admission_reserve: 3,
+            ..actuators()
+        };
+        let decide = |s: &IngestSnapshot| {
+            decide_with_goals(s, &reserve_held, &b, ms(60_000), ms(30_000), 0, &goals)
+        };
+        // CPU inside the band (just under the growth gate): neither grow nor release.
+        let in_band = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(CPU_PRESSURE_OK - CPU_RELEASE_HYSTERESIS / 2.0),
+            ..snap()
+        };
+        assert!(
+            !matches!(
+                decide(&in_band),
+                Some(adj) if adj.actuator == Actuator::QueryAdmissionReserve
+            ),
+            "inside the hysteresis band the reserve must neither grow nor release"
+        );
+        // CPU below the band: comfortably uncontended ⇒ release.
+        let below_band = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(CPU_PRESSURE_OK - CPU_RELEASE_HYSTERESIS - 0.05),
+            ..snap()
+        };
+        let adj = decide(&below_band).expect("CPU comfortably free ⇒ release a slot");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!((adj.new_value as usize) < 3, "released toward 0");
+        // Ingest goal comfortably met but the apply barely keeps up (0.9 of the
+        // arrival gap) under contention: the reserve is what keeps it met — hold.
+        let met_no_headroom = IngestSnapshot {
+            freshness_secs: Some(1.0),
+            cpu_pressure: Some(0.95),
+            apply_vs_arrival: 0.9,
+            ..snap()
+        };
+        assert!(
+            !matches!(
+                decide(&met_no_headroom),
+                Some(adj) if adj.actuator == Actuator::QueryAdmissionReserve
+            ),
+            "goal met without apply headroom must not release the reserve"
+        );
+        // Same, with real headroom ⇒ release.
+        let met_headroom = IngestSnapshot {
+            freshness_secs: Some(1.0),
+            cpu_pressure: Some(0.95),
+            apply_vs_arrival: 0.2,
+            ..snap()
+        };
+        let adj = decide(&met_headroom).expect("goal met with headroom ⇒ release");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+
+        // Closed loop against a plant where each reserved slot relieves 7.5% of
+        // CPU (0.89 with none held): the reserve must settle, not chase itself.
+        let live = LiveActuators::new(ActuatorValues {
+            query_admission_reserve: 0,
+            ..reserve_held
+        });
+        let mut last_sign = 0i8;
+        let mut reversals = 0u32;
+        for _ in 0..40 {
+            let cur = live.values();
+            let cpu = 0.89 - 0.075 * cur.query_admission_reserve as f64;
+            let s = IngestSnapshot {
+                freshness_secs: Some(60.0),
+                cpu_pressure: Some(cpu),
+                ..snap()
+            };
+            let Some(adj) = decide_with_goals(&s, &cur, &b, ms(60_000), ms(30_000), 0, &goals)
+            else {
+                continue;
+            };
+            if adj.actuator != Actuator::QueryAdmissionReserve {
+                live.apply(&adj);
+                continue;
+            }
+            let sign: i8 = if adj.new_value as usize > cur.query_admission_reserve {
+                1
+            } else {
+                -1
+            };
+            if last_sign != 0 && sign != last_sign {
+                reversals += 1;
+            }
+            last_sign = sign;
+            live.apply(&adj);
+        }
+        assert!(
+            reversals <= 1,
+            "the reserve chased its own CPU relief: {reversals} direction reversals"
+        );
+        assert!(
+            live.values().query_admission_reserve > 0,
+            "under sustained contention the reserve settles above zero"
+        );
     }
 }
