@@ -4168,9 +4168,10 @@ mod tests {
         );
 
         let info = manager
-            .download_if_newer(Some(6), None)
+            .download_if_newer(Some(6), None, None)
             .await
             .expect("refresh from a replicated prefix should succeed")
+            .download
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
         let downloaded = fs::read(&local_path)
