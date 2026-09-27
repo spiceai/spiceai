@@ -156,7 +156,6 @@ impl<V> Shard<V> {
         self.map.len()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn contains(&self, key: u64) -> bool {
         self.map.contains_key(&key)
     }
