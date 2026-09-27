@@ -269,6 +269,109 @@ async fn constant_not_in_sees_the_subquerys_null() {
     );
 }
 
+/// A correlated `NOT IN (subquery)` in a `WHERE` clause is planned as the
+/// `NOT EXISTS` it equals there. The fork's null-aware hash join takes a single
+/// key and checks the subquery's NULLs over every row, so with a correlation it
+/// applied the NULL rules to the correlation key, missed that the correlation
+/// excludes a NULL, or failed to plan. The expected rows are `SQLite`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn correlated_not_in_is_answered_as_not_exists() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE nacorr_t1(id INT, g INT) AS VALUES (1, 1), (2, 2), (3, NULL), (NULL, 1)",
+            "CREATE TABLE nacorr_t2(id INT, g INT) AS VALUES (1, 1), (NULL, 2), (4, NULL), (2, 3)",
+        ],
+    )
+    .await;
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "SELECT id FROM nacorr_t1 WHERE 3 NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g = nacorr_t1.g)",
+            &["1", "3", "NULL"],
+        ),
+        (
+            "SELECT id FROM nacorr_t1 WHERE nacorr_t1.id NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g = nacorr_t1.g)",
+            &["3"],
+        ),
+        (
+            "SELECT id FROM nacorr_t1 WHERE 3 NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g > nacorr_t1.g)",
+            &["2", "3"],
+        ),
+        (
+            "SELECT id FROM nacorr_t1 WHERE nacorr_t1.id NOT IN \
+             (SELECT nacorr_t2.id FROM nacorr_t2 WHERE nacorr_t2.g > nacorr_t1.g)",
+            &["3"],
+        ),
+    ];
+    let mut answers = Vec::with_capacity(cases.len());
+    for (sql, _) in cases {
+        answers.push((sql, sorted_answer(&ctx, sql).await));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(sql, rows)| (*sql, Ok(sorted(rows))))
+        .collect();
+    assert_eq!(answers, expected);
+}
+
+/// apache/datafusion#24516. A scalar subquery that returns no rows is NULL, but its
+/// nullability came from its projected field, so `IS NULL` over one whose field is
+/// non-nullable was folded to `false`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_scalar_subquery_is_null() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE essq_t(id INT) AS VALUES (1), (2)",
+            "CREATE TABLE essq_u(z INT NOT NULL)",
+        ],
+    )
+    .await;
+    assert_eq!(
+        (
+            answer(&ctx, "SELECT (SELECT 1 WHERE FALSE) IS NULL").await,
+            sorted_answer(
+                &ctx,
+                "SELECT id FROM essq_t WHERE (SELECT z FROM essq_u) IS NULL"
+            )
+            .await,
+        ),
+        (Ok(owned(&["true"])), Ok(sorted(&["1", "2"])))
+    );
+}
+
+/// apache/datafusion#23429, which #24516 is written against. `x IN (subquery)` is
+/// NULL when `x` matches no row and the subquery holds a NULL, but its nullability
+/// came from `x` alone, and the simplifier folds on it (`A = A` to `true`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_subquery_over_a_nullable_column_is_nullable() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE innl_s(c INT NOT NULL) AS VALUES (1), (2)",
+            "CREATE TABLE innl_t(a INT) AS VALUES (2), (NULL)",
+        ],
+    )
+    .await;
+    let plan = ctx
+        .sql("SELECT c IN (SELECT a FROM innl_t) AS in_t FROM innl_s")
+        .await
+        .expect("the query plans");
+    assert!(
+        plan.schema()
+            .field_with_unqualified_name("in_t")
+            .expect("the IN column")
+            .is_nullable(),
+        "an IN over a subquery that can hold a NULL is nullable"
+    );
+}
+
 /// apache/datafusion#25227. Parquet column statistics were cast along with the
 /// column, so `MAX(CAST(a AS INT))` over the strings `'1'`, `'100'`, `'2'` was
 /// answered from the string maximum `'2'`.
