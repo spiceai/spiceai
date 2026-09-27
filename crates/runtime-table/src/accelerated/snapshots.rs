@@ -15,7 +15,6 @@ use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use cayenne::CayenneTableProvider;
-use spice_table::{LayerWalk, find_concrete};
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
@@ -27,6 +26,7 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
+use spice_table::{LayerWalk, find_concrete};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -511,8 +511,8 @@ pub async fn create_checkpoint_and_snapshot(
     // while its timestamp is recorded, so `on_change` skips every later trigger and the
     // snapshot never catches up with the table. Done before taking the write lock, which
     // the tier's own capture locks must not nest inside.
-    if let Some(cayenne) =
-        accelerator.and_then(|a| find_concrete::<CayenneTableProvider>(a.as_ref(), LayerWalk::Write))
+    if let Some(cayenne) = accelerator
+        .and_then(|a| find_concrete::<CayenneTableProvider>(a.as_ref(), LayerWalk::Write))
     {
         match cayenne.checkpoint_mem_tier().await {
             Ok(rows) => tracing::debug!(
