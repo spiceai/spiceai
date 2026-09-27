@@ -1038,11 +1038,22 @@ fn evaluate(sc: &Scenario) -> Eval {
                 ));
             }
         }
-        // I6b — relax liveness.
+        // I6b — relax liveness. "Handed back" for the interval means at least the
+        // warm start or the goal dwell, whichever is smaller: in goal mode the
+        // dwell (window / 8, floored at 5 s) is the controller's own cadence and
+        // the relax ceiling, and a warm start above it is tolerated but never
+        // restored.
+        let goal_dwell_ms =
+            (u64::try_from(sc.goals.convergence_window.as_millis()).unwrap_or(u64::MAX) / 8)
+                .max(5_000);
+        let interval_reference = sc
+            .init
+            .compaction_background_interval_ms
+            .min(goal_dwell_ms);
         if phase.expect_relax
             && let Some(v) = pa.final_values
             && (v.write_concurrency > sc.init.write_concurrency
-                || v.compaction_background_interval_ms < sc.init.compaction_background_interval_ms)
+                || v.compaction_background_interval_ms < interval_reference)
         {
             violations.push(format!(
                 "I6b phase={pi}({}) resources not handed back: write_concurrency={} (init {}) \

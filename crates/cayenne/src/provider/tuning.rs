@@ -84,6 +84,17 @@ pub(crate) const BAKE_BACKPRESSURE_RATIO: f64 = 1.0;
 /// latency is well under the offered-load interval.
 const HEALTHY_RATIO: f64 = 0.5;
 
+/// Apply-deficit ratio (`apply_vs_arrival`) beyond which a violated ingest goal
+/// takes the throughput-cliff fast path: the buffer levers (commit and spill
+/// amortization) recover a few percent of apply time, so a deficit this large
+/// can only be closed by encode parallelism. The goal ladder's buffers-first
+/// order spent 16 dwells on levers that could not help while the backlog grew at
+/// the full deficit rate (the closed-loop harness measured 366 s of lag built in
+/// the 230 s before the first shard was added after a 6× shift, more than the
+/// untouched warm start accumulated). ~2× separates a real cliff from the
+/// [`BEHIND_RATIO`] band the additive ladder is designed for.
+const APPLY_CLIFF_RATIO: f64 = 2.0;
+
 /// Read-amplification (small-file count) above which compaction is judged to be
 /// behind and should run more aggressively.
 const READ_AMP_HIGH: usize = 8;
@@ -2692,7 +2703,7 @@ pub(crate) fn decide_with_goals(
     // deliberately NOT shrunk here — there is no memory pressure, and keeping them
     // sized leaves the table ready for the next burst at no query/CPU cost.
     if s.apply_vs_arrival < HEALTHY_RATIO && s.read_amp <= READ_AMP_LOW && mem_ok {
-        return relax_step(cur, b);
+        return relax_step(cur, b, b.compaction_background_interval_ms.1);
     }
 
     None
@@ -2978,6 +2989,51 @@ fn decide_goal(
     // gated so extra shards (= more files) never fire while a query goal is
     // violated, read-amp is high, or the stream is delete-heavy.
     if ingest_violated {
+        // The resource gates the write-shard lever always carries (more shards =
+        // more files, uploads, commits, key churn, in-flight buffers): never while
+        // a query goal is violated, never mutation-heavy, never CPU-, I/O- or
+        // publish-bound, never under memory pressure.
+        let shards_allowed = !query_violated
+            && mem_ok
+            && !mutation_heavy
+            && cpu_ok
+            && !io_bound
+            && !publish_bound;
+        // (3a) Throughput cliff: the apply is behind by more than amortization can
+        // recover (`APPLY_CLIFF_RATIO`), so go to encode parallelism FIRST — the
+        // ingest analogue of the I/O-cliff fast path — with the legacy ×1.5 step
+        // rather than the additive crawl. If read-amp is what withholds shards
+        // (a trigger the relax tier raised), lower the trigger this tick so the
+        // next one can add the shard; the buffers-first order below stays for the
+        // ordinary [`BEHIND_RATIO`] band it was designed for.
+        if s.apply_vs_arrival > APPLY_CLIFF_RATIO && shards_allowed {
+            if s.read_amp > READ_AMP_LOW
+                && let Some(v) = clamp_move_usize(
+                    cur.compaction_trigger_files,
+                    shrink_usize(cur.compaction_trigger_files),
+                    b.compaction_trigger_files,
+                )
+            {
+                return Some(Adjustment {
+                    actuator: Actuator::CompactionTriggerFiles,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "replication-lag goal, apply cliff: lower compaction trigger → drain small files so write shards can be added",
+                });
+            }
+            if s.read_amp <= READ_AMP_LOW
+                && let Some(v) = clamp_move_usize(
+                    cur.write_concurrency.max(1),
+                    grow_usize(cur.write_concurrency.max(1)),
+                    b.write_concurrency,
+                )
+            {
+                return Some(Adjustment {
+                    actuator: Actuator::WriteConcurrency,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "replication-lag goal, apply cliff: raise write concurrency first (buffers cannot close a 2× deficit)",
+                });
+            }
+        }
         // Buffer growth is withheld under a freshness violation (see the mem-tier
         // grow gate below): when data is too slow to become queryable, growing
         // buffers is the wrong direction. Under a pure LAG violation it fires as
@@ -3023,13 +3079,8 @@ fn decide_goal(
         // grow move: each extra shard is another in-flight encode buffer and
         // inline memtable, so near the budget this lever converts a lag
         // violation into an OOM kill.
-        if !query_violated
+        if shards_allowed
             && s.read_amp <= READ_AMP_LOW
-            && mem_ok
-            && !mutation_heavy
-            && cpu_ok
-            && !io_bound
-            && !publish_bound
             && let Some(v) = clamp_move_usize(
                 cur.write_concurrency.max(1),
                 goal_grow_usize(cur.write_concurrency.max(1), b.write_concurrency, ingest_v),
@@ -3143,7 +3194,20 @@ fn decide_goal(
         && s.apply_vs_arrival < HEALTHY_RATIO
         && s.read_amp <= READ_AMP_LOW
     {
-        return relax_step(cur, b);
+        // The compaction interval is also the controller's own tick (the
+        // background compactor sleeps the live interval and runs the control step
+        // on each wake), so in goal mode it is never relaxed past the goal dwell:
+        // a controller that lengthened its clock to 60 s could not take its
+        // `STEPS_PER_WINDOW` steps inside the window it promised, and the
+        // closed-loop harness measured a shift reacted to 50 s late and then
+        // walked at 50 s per step. An interval already above the dwell (e.g. the
+        // 10 s CDC warm start) is left where it is — never raised further.
+        let dwell_ms = u64::try_from(goals.dwell().as_millis()).unwrap_or(u64::MAX);
+        let interval_ceiling = b
+            .compaction_background_interval_ms
+            .1
+            .min(dwell_ms.max(b.compaction_background_interval_ms.0));
+        return relax_step(cur, b, interval_ceiling);
     }
 
     None
@@ -3155,8 +3219,10 @@ fn decide_goal(
 /// incremental). The memory buffers (memtable, mem-tier) are deliberately NOT
 /// shrunk here (no memory pressure; keep them sized for the next burst). Returns
 /// `None` when every lever is already at its efficient extreme. The caller gates
-/// on the appropriate healthy / all-goals-met + memory-ok condition.
-fn relax_step(cur: &ActuatorValues, b: &TuningBounds) -> Option<Adjustment> {
+/// on the appropriate healthy / all-goals-met + memory-ok condition, and passes
+/// the interval ceiling it allows (the static ceiling on the legacy path; the
+/// goal dwell in goal mode — an interval already above it is left alone).
+fn relax_step(cur: &ActuatorValues, b: &TuningBounds, interval_ceiling: u64) -> Option<Adjustment> {
     if let Some(v) = clamp_move_usize(
         cur.write_concurrency.max(1),
         shrink_usize(cur.write_concurrency.max(1)),
@@ -3179,11 +3245,13 @@ fn relax_step(cur: &ActuatorValues, b: &TuningBounds) -> Option<Adjustment> {
             reason: "healthy: relax the compaction trigger to reduce background churn",
         });
     }
-    if let Some(v) = clamp_move_u64(
-        cur.compaction_background_interval_ms,
-        grow_u64(cur.compaction_background_interval_ms),
-        b.compaction_background_interval_ms,
-    ) {
+    if cur.compaction_background_interval_ms < interval_ceiling
+        && let Some(v) = clamp_move_u64(
+            cur.compaction_background_interval_ms,
+            grow_u64(cur.compaction_background_interval_ms),
+            (b.compaction_background_interval_ms.0, interval_ceiling),
+        )
+    {
         return Some(Adjustment {
             actuator: Actuator::CompactionIntervalMs,
             new_value: v,
@@ -6238,6 +6306,106 @@ mod tests {
 
     fn lag_and_latency_goal_for_test(lag_secs: f64, ms: f64) -> Goals {
         Goals::from_targets(Some(lag_secs), None, Some(ms), None, Duration::from_mins(1))
+    }
+
+    /// Under an apply cliff (deficit beyond `APPLY_CLIFF_RATIO`) a violated lag
+    /// goal raises write shards FIRST, with the legacy ×1.5 step; in the ordinary
+    /// behind band the buffers-first order is unchanged. If read-amp withholds
+    /// shards, the cliff path lowers the compaction trigger instead. Regression
+    /// guard for the 16-dwell buffer crawl the closed-loop harness measured after
+    /// a 6× shift.
+    #[test]
+    fn apply_cliff_raises_write_concurrency_before_buffers() {
+        let goals = lag_goal(5.0);
+        let b = bounds();
+        let one_shard = ActuatorValues {
+            write_concurrency: 1,
+            ..actuators()
+        };
+        let cliff = IngestSnapshot {
+            replication_lag_secs: Some(60.0),
+            apply_vs_arrival: 3.0,
+            read_amp: 1,
+            ..snap()
+        };
+        let adj = goal_decide(&cliff, &one_shard, &b, &goals).expect("a move");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency, "cliff ⇒ shards first");
+        assert_eq!(adj.new_value, 2, "legacy ×1.5 step from 1 (at least +1)");
+        let mild = IngestSnapshot {
+            apply_vs_arrival: 1.5,
+            ..cliff
+        };
+        let adj = goal_decide(&mild, &one_shard, &b, &goals).expect("a move");
+        assert_eq!(
+            adj.actuator,
+            Actuator::InlineFlushBytes,
+            "ordinary behind band keeps the buffers-first order"
+        );
+        let cliff_read_amp_high = IngestSnapshot {
+            read_amp: READ_AMP_LOW + 5,
+            ..cliff
+        };
+        let relaxed_trigger = ActuatorValues {
+            compaction_trigger_files: 32,
+            ..one_shard
+        };
+        let adj = goal_decide(&cliff_read_amp_high, &relaxed_trigger, &b, &goals).expect("a move");
+        assert_eq!(
+            adj.actuator,
+            Actuator::CompactionTriggerFiles,
+            "read-amp withholds shards ⇒ lower the trigger first"
+        );
+        assert!(adj.new_value < 32);
+        // Cliff with the shard gates closed (mutation-heavy) falls through to the
+        // ordinary ladder rather than adding shards.
+        let cliff_mutations = IngestSnapshot {
+            delete_fraction: 0.5,
+            ..cliff
+        };
+        let adj = goal_decide(&cliff_mutations, &one_shard, &b, &goals).expect("a move");
+        assert_ne!(adj.actuator, Actuator::WriteConcurrency);
+    }
+
+    /// In goal mode the relax tier never lengthens the compaction interval — the
+    /// controller's own tick — past the goal dwell, and leaves an interval already
+    /// above the dwell where it is. The legacy ladder still relaxes to the static
+    /// ceiling.
+    #[test]
+    fn goal_relax_never_lengthens_the_interval_past_the_dwell() {
+        let goals = lag_goal(5.0); // 60 s window ⇒ 7.5 s dwell
+        let b = bounds();
+        let healthy = IngestSnapshot {
+            replication_lag_secs: Some(0.5),
+            apply_vs_arrival: 0.2,
+            read_amp: 1,
+            ..snap()
+        };
+        // Shards and trigger at their efficient extremes: the interval is next.
+        let below_dwell = ActuatorValues {
+            write_concurrency: 1,
+            compaction_trigger_files: b.compaction_trigger_files.1,
+            compaction_background_interval_ms: 6_000,
+            ..actuators()
+        };
+        let adj = goal_decide(&healthy, &below_dwell, &b, &goals).expect("a move");
+        assert_eq!(adj.actuator, Actuator::CompactionIntervalMs);
+        assert_eq!(adj.new_value, 7_500, "relaxed up to, not past, the dwell");
+        let above_dwell = ActuatorValues {
+            compaction_background_interval_ms: 10_000,
+            ..below_dwell
+        };
+        assert!(
+            goal_decide(&healthy, &above_dwell, &b, &goals).is_none(),
+            "an interval above the dwell is left alone (never raised, never lowered)"
+        );
+        // Legacy ladder: unchanged, relaxes toward the static ceiling.
+        let legacy_healthy = IngestSnapshot {
+            replication_lag_secs: None,
+            ..healthy
+        };
+        let adj = decide_fresh(&legacy_healthy, &above_dwell, &b).expect("legacy relax");
+        assert_eq!(adj.actuator, Actuator::CompactionIntervalMs);
+        assert_eq!(adj.new_value, 15_000);
     }
 
     /// The reserve's release triggers must not undo the relief they serve: the
