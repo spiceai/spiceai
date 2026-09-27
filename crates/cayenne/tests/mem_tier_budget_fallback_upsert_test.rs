@@ -27,8 +27,9 @@ limitations under the License.
 //! earlier version a durable write inlined into the metastore while other keys
 //! sat in the mem tier: that spill flushes both.
 //!
-//! Its own test binary: the budget is process-global, so every case runs in
-//! sequence inside one test body.
+//! Its own test binary with a single test: the budget is process-global, so
+//! every backend and case runs in sequence rather than on parallel test
+//! threads.
 
 mod common;
 
@@ -48,7 +49,21 @@ use datafusion_table_providers::util::{
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-test_with_backends!(budget_fallback_upsert_supersedes_mem_tier_rows_impl);
+// Not `test_with_backends!`: its per-backend tests would run concurrently and
+// race on the process-global budget.
+#[test]
+fn budget_fallback_upsert_supersedes_mem_tier_rows() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        budget_fallback_upsert_supersedes_mem_tier_rows_impl,
+    )?;
+    #[cfg(feature = "turso")]
+    common::run_with_backend_blocking(
+        common::BackendType::Turso,
+        budget_fallback_upsert_supersedes_mem_tier_rows_impl,
+    )?;
+    Ok(())
+}
 
 struct NoopSlotAdvancer;
 #[async_trait::async_trait]
