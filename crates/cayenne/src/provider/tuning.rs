@@ -438,11 +438,22 @@ fn adaptive_inline_flush_bounds_for_budget(
 /// up to 4× the configured size for scan-heavy query goals and shrink to ½ — never
 /// below a 64 MiB floor, never above 2 GiB — always bounded by the static config.
 /// A configured size of `0` (size-rolling disabled) is left for the caller to pin.
+///
+/// The ceiling is kept at least at the warm start (as the memtable and mem-tier
+/// bounds do), so the range is ordered for ANY warm start: a configured size
+/// above 4 GiB has a half-size floor above the 2 GiB ceiling, and clamping the
+/// ceiling to `[lo, CEIL]` there panicked (`clamp` with `min > max`) on every
+/// control tick — the pure-decision sweep caught it. Such a size is simply held
+/// (never grown past itself, never shrunk below half).
 pub(crate) fn adaptive_target_file_size_bounds(initial_bytes: i64) -> (i64, i64) {
     const FLOOR: i64 = 64 * MIB;
     const CEIL: i64 = 2048 * MIB;
     let lo = (initial_bytes / 2).max(FLOOR);
-    let hi = initial_bytes.saturating_mul(4).clamp(lo, CEIL);
+    let hi = initial_bytes
+        .saturating_mul(4)
+        .min(CEIL)
+        .max(initial_bytes)
+        .max(lo);
     (lo, hi)
 }
 
@@ -6364,6 +6375,34 @@ mod tests {
         };
         let adj = goal_decide(&cliff_mutations, &one_shard, &b, &goals).expect("a move");
         assert_ne!(adj.actuator, Actuator::WriteConcurrency);
+    }
+
+    /// The target-file-size bounds are ordered (`floor <= ceiling`) and contain
+    /// the warm start for any configured size, including sizes above 4 GiB whose
+    /// half-size floor exceeds the 2 GiB ceiling — the case that panicked in
+    /// `clamp` on every control tick.
+    #[test]
+    fn target_file_size_bounds_are_ordered_for_any_warm_start() {
+        let mib = 1024 * 1024_i64;
+        for initial in [0, 1, 64 * mib, 512 * mib, 4096 * mib, 5000 * mib, 65_536 * mib, i64::MAX / 8]
+        {
+            let (lo, hi) = adaptive_target_file_size_bounds(initial);
+            assert!(lo <= hi, "unordered bounds ({lo}, {hi}) for warm start {initial}");
+            assert!(
+                initial <= hi,
+                "warm start {initial} above its own ceiling {hi}"
+            );
+        }
+        // Above 4 GiB the size is held: half-size floor, ceiling at the warm start.
+        assert_eq!(
+            adaptive_target_file_size_bounds(5000 * mib),
+            (2500 * mib, 5000 * mib)
+        );
+        // The documented shape for ordinary sizes is unchanged.
+        assert_eq!(
+            adaptive_target_file_size_bounds(256 * mib),
+            (128 * mib, 1024 * mib)
+        );
     }
 
     /// In goal mode the relax tier never lengthens the compaction interval — the
