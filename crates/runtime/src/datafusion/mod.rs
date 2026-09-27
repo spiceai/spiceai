@@ -729,7 +729,7 @@ const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 /// not specify `refresh_check_interval` explicitly. Picked to be slightly
 /// shorter than the default snapshot creation interval so a freshly created
 /// snapshot is picked up promptly without aggressive object-store load.
-const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+pub(crate) const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
 pub enum Table {
     Accelerated {

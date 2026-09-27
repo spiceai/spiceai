@@ -718,7 +718,18 @@ impl Runtime {
         bootstrap_status: BootstrapStatus,
         load_semaphore: Arc<Semaphore>,
     ) {
-        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
+        // A `refresh_mode: snapshot` dataset loads only from snapshots. When none existed as
+        // its accelerator initialized (a reader started before its writer published), each
+        // retry re-attempts the bootstrap rather than retrying the source with the empty
+        // status from startup, and the backoff is capped at the refresh interval so a
+        // snapshot published later is picked up about as fast as a newer one would be.
+        let first_snapshot_poll = waits_for_first_snapshot(&ds, &bootstrap_status);
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .max_duration(first_snapshot_poll)
+            .build();
+        let bootstrap_status = parking_lot::Mutex::new(bootstrap_status);
+        let attempt = std::sync::atomic::AtomicUsize::new(0);
 
         let runtime = Arc::clone(&self);
         let shutdown_token = runtime.status.shutdown_token();
@@ -732,10 +743,24 @@ impl Runtime {
                 ));
             }
 
+            let mut status = bootstrap_status.lock().clone();
+            // The first attempt uses the bootstrap startup just ran.
+            if first_snapshot_poll.is_some()
+                && !status.is_bootstrapped()
+                && attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
+                && let Some(Ok(retried)) = runtime
+                    .initialize_datasets_accelerators(std::slice::from_ref(&ds))
+                    .await
+                    .remove(&ds.name)
+            {
+                (*bootstrap_status.lock()).clone_from(&retried);
+                status = retried;
+            }
+
             match runtime
                 .try_load_dataset_once(
                     Arc::clone(&ds),
-                    bootstrap_status.clone(),
+                    status,
                     Some(Arc::clone(&load_semaphore)),
                 )
                 .await
@@ -2663,6 +2688,21 @@ fn with_localpod_dependents(
     };
     reloading.sort_by_cached_key(depth);
     reloading
+}
+
+/// The interval at which a `refresh_mode: snapshot` dataset that has not bootstrapped
+/// re-attempts its snapshot bootstrap, or `None` when the dataset is not waiting for one:
+/// it is not accelerated, does not refresh from snapshots, cannot bootstrap from them, or
+/// already bootstrapped.
+fn waits_for_first_snapshot(ds: &Dataset, bootstrap_status: &BootstrapStatus) -> Option<Duration> {
+    let acceleration = ds.acceleration.as_ref().filter(|a| a.enabled)?;
+    (acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+        && acceleration.snapshot_behavior.bootstrap_enabled()
+        && !bootstrap_status.is_bootstrapped())
+    .then(|| {
+        ds.refresh_check_interval()
+            .unwrap_or(crate::datafusion::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL)
+    })
 }
 
 #[cfg(test)]
