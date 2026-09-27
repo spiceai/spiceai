@@ -974,10 +974,18 @@ impl DataAccelerator for DuckDBAccelerator {
             .fail()?,
         }
 
-        let is_changes_refresh = source
-            .and_then(|src| src.acceleration())
-            .and_then(|acceleration| acceleration.refresh_mode)
-            .is_some_and(|refresh_mode| refresh_mode == RefreshMode::Changes);
+        // The mode this dataset actually runs with, not the literal `refresh_mode`
+        // field. `cdc:` and `debezium:` resolve an omitted mode to `Changes` and
+        // never write it back (see `resolved_refresh_mode`), and schema inference
+        // classifies with that resolved mode — so reading the raw field here would
+        // disagree with the code that inferred the indexes this function cleans up,
+        // leaving them on an upgraded file for exactly the datasets that must not
+        // carry them.
+        let is_changes_refresh = source.is_some_and(|src| {
+            src.acceleration().is_some_and(|acceleration| {
+                resolved_refresh_mode(src, acceleration) == RefreshMode::Changes
+            })
+        });
         apply_changes_refresh_write_defaults(&mut cmd, is_changes_refresh);
 
         // Modify the `cmd` by adding options to attach other databases
