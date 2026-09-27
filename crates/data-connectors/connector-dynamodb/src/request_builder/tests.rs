@@ -404,3 +404,42 @@ fn filters_beyond_one_expression_are_left_to_check_on_the_rows_read() {
         .expect("plan");
     assert!(plan.fits_expression_limits(), "{plan:?}");
 }
+
+#[test]
+fn a_flattened_column_projects_every_attribute_it_can_be_read_from() {
+    // Unnesting reads `m.x.y` from the map `m`, from a map attribute `m.x`, or
+    // from an attribute named `m.x.y`, and a projection of `m` alone reads the
+    // other two as NULL.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("sk", DataType::Utf8, false),
+        Field::new("m.x.y", DataType::Int64, true),
+    ]));
+    let builder = DynamoDBRequestPlanBuilder::new(
+        DynamoDBTableSchema::new(
+            Arc::from("t"),
+            schema,
+            "pk".to_string(),
+            Some("sk".to_string()),
+            HashSet::from(["m.x.y".to_string()]),
+            "2006-01-02T15:04:05.000Z07:00",
+        )
+        .with_unnest_depth(Some(2))
+        .with_key_types(Some(ScalarAttributeType::S), Some(ScalarAttributeType::S)),
+    );
+    let plan = builder
+        .build_request_plan(&[], &projection(&["sk", "m.x.y"]), None, None)
+        .expect("plan");
+    let DynamoDBRequestPlan::Scan(scan) = plan else {
+        panic!("expected a Scan");
+    };
+    let names = scan.expression_attribute_names.expect("names");
+    let projected: Vec<&str> = scan
+        .projection_expression
+        .as_deref()
+        .expect("projection")
+        .split(", ")
+        .map(|placeholder| names[placeholder].as_str())
+        .collect();
+    assert_eq!(projected, vec!["sk", "m", "m.x", "m.x.y"]);
+}

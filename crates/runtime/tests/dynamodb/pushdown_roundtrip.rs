@@ -218,8 +218,8 @@ async fn seed(client: &Client) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// `m.x.y` read from a nested map in one item and from a map key that
-/// contains a dot in another.
+/// `m.x.y` read from a nested map, from a map key that contains a dot, from a
+/// map attribute `m.x`, and from an attribute named `m.x.y`, one item each.
 async fn seed_colliding(client: &Client) -> Result<(), anyhow::Error> {
     create_table(client, COLLIDING).await?;
     for item in [
@@ -242,6 +242,15 @@ async fn seed_colliding(client: &Client) -> Result<(), anyhow::Error> {
                 AttributeValue::M(HashMap::from([("x.y".to_string(), n("1"))])),
             )],
         ),
+        item(
+            "c",
+            "top-map",
+            vec![(
+                "m.x",
+                AttributeValue::M(HashMap::from([("y".to_string(), n("1"))])),
+            )],
+        ),
+        item("c", "top-attribute", vec![("m.x.y", n("1"))]),
     ] {
         client
             .put_item()
@@ -609,9 +618,37 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 p("m IS NULL"),
             ];
             assert_round_trips(&rt, &shallow, &shallow_cases).await?;
+            assert_every_path_is_read(&rt).await?;
             assert_colliding_paths_fail_unnesting(&rt, &client).await
         })
         .await
+}
+
+/// Each item's `m.x.y` is 1, whichever path it is read from, and a filter on
+/// it keeps every item. A projection of `m` alone reads the attributes `m.x`
+/// and `m.x.y` as NULL, and the local copy shares the projection, so this is
+/// checked against the values written rather than round-tripped.
+async fn assert_every_path_is_read(rt: &Arc<Runtime>) -> Result<(), anyhow::Error> {
+    let every_item = ["dotted", "nested", "top-attribute", "top-map"];
+    for sql in [
+        r#"SELECT sk FROM colliding WHERE "m.x.y" = 1 ORDER BY sk"#,
+        // `+ 0` is not pushed down, so this reads every item's `m.x.y`.
+        r#"SELECT sk FROM colliding WHERE "m.x.y" + 0 = 1 ORDER BY sk"#,
+    ] {
+        let rows = to_pretty_display(&run_query(rt, sql).await?)?.to_string();
+        // The cells of the table's one column, below its header.
+        let found: Vec<&str> = rows
+            .lines()
+            .filter_map(|line| line.strip_prefix('|'))
+            .map(|cell| cell.trim_end_matches('|').trim())
+            .skip(1)
+            .collect();
+        anyhow::ensure!(
+            found == every_item,
+            "{sql} returned {found:?} instead of every item"
+        );
+    }
+    Ok(())
 }
 
 /// An item that unnesting reads `m.x.y` from twice fails the query, whether or

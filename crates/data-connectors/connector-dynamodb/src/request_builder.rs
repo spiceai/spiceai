@@ -377,15 +377,10 @@ impl DynamoDBRequestPlanBuilder {
         let mut projection_expr = Vec::new();
 
         for field in &projection.fields {
-            let field_name = field.name();
-            // A flattened column is read by projecting its top-level attribute.
-            let top_level = if self.schema.is_flattened_field(field_name) {
-                field_name.split('.').next().unwrap_or(field_name)
-            } else {
-                field_name
-            };
-            if seen_top_level.insert(top_level) {
-                projection_expr.push(out.name(top_level));
+            for top_level in top_level_attributes(&self.schema, field.name()) {
+                if seen_top_level.insert(top_level) {
+                    projection_expr.push(out.name(top_level));
+                }
             }
         }
 
@@ -395,6 +390,21 @@ impl DynamoDBRequestPlanBuilder {
             Some(projection_expr.join(", "))
         }
     }
+}
+
+/// The top-level attributes `column` can be read from. Unnesting reads a
+/// flattened column from every split of its name into an attribute and map
+/// keys, so the attribute is any prefix of the name that ends before a dot, or
+/// the whole name: `m.x.y` is read from `m`, `m.x` or `m.x.y`.
+fn top_level_attributes<'a>(schema: &DynamoDBTableSchema, column: &'a str) -> Vec<&'a str> {
+    if !schema.is_flattened_field(column) {
+        return vec![column];
+    }
+    column
+        .match_indices('.')
+        .map(|(at, _)| &column[..at])
+        .chain(std::iter::once(column))
+        .collect()
 }
 
 enum SortChoice {
