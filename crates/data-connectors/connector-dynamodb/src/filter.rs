@@ -25,7 +25,9 @@ limitations under the License.
 //! offset it was written with. A condition is therefore reported exact only
 //! where `DynamoDB` evaluates it as SQL does on every item, and otherwise
 //! widened to a superset that `DataFusion` filters again — never narrowed,
-//! which would drop rows the query should return.
+//! which would drop rows the query should return. An item that unnesting
+//! reads a filtered column from twice is kept too, so that it fails the query
+//! as it would unfiltered.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -47,6 +49,11 @@ const MAX_IN_OPERANDS: usize = 100;
 
 /// The longest expression `DynamoDB` accepts, in bytes.
 pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
+
+/// The most dots a flattened column's name has for a condition on it to be
+/// pushed down. Each of the name's `2^dots - 1` other splits into an attribute
+/// and map keys is one more path the condition checks.
+const MAX_FLATTENED_DOTS: usize = 6;
 
 /// A bound on the UTC offset of a timestamp string the conversion reads, in
 /// milliseconds: chrono accepts any offset under a day, beyond the ±14 hours
@@ -605,10 +612,13 @@ impl<'a> Translator<'a> {
     }
 
     /// `condition` on `attribute`, widened for a column unnesting flattens out
-    /// of a map by the items whose column is read from a map key that contains
-    /// a dot: `m.x.y` holds the `1` of `{"m": {"x.y": 1}}` as well as of
-    /// `{"m": {"x": {"y": 1}}}`, and an expression path reaches only the
-    /// second. Such an item has nothing at the path.
+    /// of a map by the items an expression path cannot tell apart. Unnesting
+    /// reads `m.x.y` from every split of the name into an attribute and map
+    /// keys: the `1` of `{"m": {"x": {"y": 1}}}`, of `{"m": {"x.y": 1}}`, of
+    /// `{"m.x": {"y": 1}}` and of `{"m.x.y": 1}`. A path of the name's segments
+    /// reaches only the first, so an item with nothing there is kept, and so is
+    /// one with something at another split, which fails unnesting as it would
+    /// unfiltered when both are there.
     fn flattened(
         &self,
         attribute: &Attribute<'_>,
@@ -619,9 +629,18 @@ impl<'a> Translator<'a> {
         if !attribute.name.contains('.') || !self.schema.is_flattened_field(attribute.name) {
             return Some(condition);
         }
+        let others = other_splits(attribute.name)?;
         let path = out.path(self.schema, attribute.name);
+        let mut disjuncts = vec![
+            condition.expression,
+            format!("attribute_not_exists({path})"),
+        ];
+        disjuncts.extend(others.into_iter().map(|split| {
+            let other: Vec<String> = split.into_iter().map(|name| out.name(name)).collect();
+            format!("attribute_exists({})", other.join("."))
+        }));
         Some(Condition::new(
-            format!("({} OR attribute_not_exists({path}))", condition.expression),
+            format!("({})", disjuncts.join(" OR ")),
             false,
             condition.reads_key,
         ))
@@ -1314,6 +1333,35 @@ pub(crate) fn is_null_predicate(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Literal(ScalarValue::Boolean(None) | ScalarValue::Null, _)
+    )
+}
+
+/// Every split of a flattened column's name into an attribute and map keys but
+/// the one at every dot: `m.x.y` is also the `x.y` key of `m`, the `y` key of an
+/// attribute `m.x`, and an attribute `m.x.y`. `None` past `MAX_FLATTENED_DOTS`.
+fn other_splits(name: &str) -> Option<Vec<Vec<&str>>> {
+    let dots: Vec<usize> = name.match_indices('.').map(|(at, _)| at).collect();
+    if dots.len() > MAX_FLATTENED_DOTS {
+        return None;
+    }
+    // Bit `i` of a split is set when it splits at the `i`th dot; the split
+    // with every bit set is the path of every segment.
+    let every_dot = (1_usize << dots.len()) - 1;
+    Some(
+        (0..every_dot)
+            .map(|split| {
+                let mut parts = Vec::with_capacity(dots.len() + 1);
+                let mut start = 0;
+                for (bit, &dot) in dots.iter().enumerate() {
+                    if split & (1 << bit) != 0 {
+                        parts.push(&name[start..dot]);
+                        start = dot + 1;
+                    }
+                }
+                parts.push(&name[start..]);
+                parts
+            })
+            .collect(),
     )
 }
 

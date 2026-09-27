@@ -22,12 +22,14 @@ limitations under the License.
 //! the ±14 hours of any time zone, a timestamp finer than its column, numbers
 //! an integer column reads as NULL, decimals an `f64` rounds, maps a string
 //! column renders as JSON, a map key that contains a dot, a date padded with a
-//! space, and attribute names no bare placeholder can spell.
+//! space, and attribute names no bare placeholder can spell. A second table
+//! holds an item that unnesting reads a column from twice.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use app::AppBuilder;
+use arrow::array::RecordBatch;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
@@ -42,11 +44,16 @@ use spicepod::semantic::Column;
 
 use super::streams::{get_client, start_dynamodb_docker_container};
 use crate::pushdown_roundtrip::{Case, Pushed, Tables, assert_round_trips};
-use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
+use crate::utils::{
+    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    to_pretty_display,
+};
 use crate::{configure_test_datafusion, init_tracing};
 
 const PORT: u16 = 8040;
 const TABLE: &str = "pushdown_roundtrip";
+/// A table with items that unnesting reads `m.x.y` from by different paths.
+const COLLIDING: &str = "pushdown_roundtrip_colliding";
 
 fn s(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
@@ -199,7 +206,55 @@ fn items() -> Vec<HashMap<String, AttributeValue>> {
 }
 
 async fn seed(client: &Client) -> Result<(), anyhow::Error> {
-    let _ = client.delete_table().table_name(TABLE).send().await;
+    create_table(client, TABLE).await?;
+    for item in items() {
+        client
+            .put_item()
+            .table_name(TABLE)
+            .set_item(Some(item))
+            .send()
+            .await?;
+    }
+    Ok(())
+}
+
+/// `m.x.y` read from a nested map in one item and from a map key that
+/// contains a dot in another.
+async fn seed_colliding(client: &Client) -> Result<(), anyhow::Error> {
+    create_table(client, COLLIDING).await?;
+    for item in [
+        item(
+            "c",
+            "nested",
+            vec![(
+                "m",
+                AttributeValue::M(HashMap::from([(
+                    "x".to_string(),
+                    AttributeValue::M(HashMap::from([("y".to_string(), n("1"))])),
+                )])),
+            )],
+        ),
+        item(
+            "c",
+            "dotted",
+            vec![(
+                "m",
+                AttributeValue::M(HashMap::from([("x.y".to_string(), n("1"))])),
+            )],
+        ),
+    ] {
+        client
+            .put_item()
+            .table_name(COLLIDING)
+            .set_item(Some(item))
+            .send()
+            .await?;
+    }
+    Ok(())
+}
+
+async fn create_table(client: &Client, table: &str) -> Result<(), anyhow::Error> {
+    let _ = client.delete_table().table_name(table).send().await;
     let key = |name: &str, key_type: KeyType| {
         KeySchemaElement::builder()
             .attribute_name(name)
@@ -214,7 +269,7 @@ async fn seed(client: &Client) -> Result<(), anyhow::Error> {
     };
     client
         .create_table()
-        .table_name(TABLE)
+        .table_name(table)
         .key_schema(key("pk", KeyType::Hash)?)
         .key_schema(key("sk", KeyType::Range)?)
         .attribute_definitions(definition("pk")?)
@@ -222,14 +277,6 @@ async fn seed(client: &Client) -> Result<(), anyhow::Error> {
         .billing_mode(BillingMode::PayPerRequest)
         .send()
         .await?;
-    for item in items() {
-        client
-            .put_item()
-            .table_name(TABLE)
-            .set_item(Some(item))
-            .send()
-            .await?;
-    }
     Ok(())
 }
 
@@ -467,13 +514,17 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let _container = start_dynamodb_docker_container(PORT).await?;
-            seed(&get_client(PORT, "fake", "fake")).await?;
+            let client = get_client(PORT, "fake", "fake");
+            seed(&client).await?;
+            seed_colliding(&client).await?;
 
             // A layout finer than a millisecond, and maps flattened into columns.
             let micro = [("time_format", "2006-01-02T15:04:05.000000")];
             let micro_columns = || vec![Column::new("ts6").with_type("Timestamp(Millisecond)")];
             let unnested = [("unnest_depth", "2")];
             let shallow = [("unnest_depth", "1")];
+            let mut colliding = dataset_with("colliding", false, &unnested, Vec::new());
+            colliding.from = format!("dynamodb:{COLLIDING}");
             let app = AppBuilder::new("dynamodb_pushdown_round_trips")
                 .with_dataset(dataset("federated", false))
                 .with_dataset(dataset("local", true))
@@ -483,6 +534,7 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 .with_dataset(dataset_with("unnested_local", true, &unnested, Vec::new()))
                 .with_dataset(dataset_with("shallow", false, &shallow, Vec::new()))
                 .with_dataset(dataset_with("shallow_local", true, &shallow, Vec::new()))
+                .with_dataset(colliding)
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
@@ -556,7 +608,61 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 Case::either("SELECT * FROM {t} WHERE \"m.x\" IS NOT NULL ORDER BY pk, sk"),
                 p("m IS NULL"),
             ];
-            assert_round_trips(&rt, &shallow, &shallow_cases).await
+            assert_round_trips(&rt, &shallow, &shallow_cases).await?;
+            assert_colliding_paths_fail_unnesting(&rt, &client).await
         })
         .await
+}
+
+/// An item that unnesting reads `m.x.y` from twice fails the query, whether or
+/// not a condition on `m.x.y` is pushed down. An expression path reaches only
+/// the nested map, and the pushed condition keeps the item for its map key
+/// that contains a dot. The item is written once the table is registered,
+/// since registering reads every item's schema.
+async fn assert_colliding_paths_fail_unnesting(
+    rt: &Arc<Runtime>,
+    client: &Client,
+) -> Result<(), anyhow::Error> {
+    let both = item(
+        "c",
+        "both",
+        vec![(
+            "m",
+            AttributeValue::M(HashMap::from([
+                ("x.y".to_string(), n("1")),
+                (
+                    "x".to_string(),
+                    AttributeValue::M(HashMap::from([("y".to_string(), n("2"))])),
+                ),
+            ])),
+        )],
+    );
+    client
+        .put_item()
+        .table_name(COLLIDING)
+        .set_item(Some(both))
+        .send()
+        .await?;
+
+    let pushed = r#"SELECT sk FROM colliding WHERE "m.x.y" = 1"#;
+    let plan = to_pretty_display(&run_query(rt, &format!("EXPLAIN {pushed}")).await?)?.to_string();
+    anyhow::ensure!(
+        shows_pushdown(&plan),
+        "expected the filter pushed down, plan:\n{plan}"
+    );
+    // `+ 0` is not pushed down, so this reads every item's `m`.
+    let unfiltered = r#"SELECT sk FROM colliding WHERE "m.x.y" + 0 = 1"#;
+    for sql in [unfiltered, pushed] {
+        match run_query(rt, sql).await {
+            Ok(batches) => anyhow::bail!(
+                "{sql} returned {} rows instead of failing on the item with two `m.x.y`",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            ),
+            Err(e) => anyhow::ensure!(
+                e.to_string().contains("already exists in the item"),
+                "{sql} failed other than on unnesting the item with two `m.x.y`: {e}"
+            ),
+        }
+    }
+    Ok(())
 }

@@ -248,10 +248,23 @@ fn a_null_disjunct_leaves_the_other_side_as_a_superset() {
     );
 }
 
+/// `expression` with each name placeholder replaced by its name in brackets.
+fn resolved(expression: &str, out: &Placeholders) -> String {
+    let mut names: Vec<&(String, String)> = out.names.iter().collect();
+    // `#n1` is a prefix of `#n10`.
+    names.sort_by_key(|(placeholder, _)| std::cmp::Reverse(placeholder.len()));
+    names
+        .into_iter()
+        .fold(expression.to_string(), |expression, (placeholder, name)| {
+            expression.replace(placeholder.as_str(), &format!("[{name}]"))
+        })
+}
+
 #[test]
 fn a_flattened_column_takes_in_items_whose_map_key_has_a_dot() {
-    // Unnesting reads `{"m": {"x.y": 1}}` into `m.x.y` as it does
-    // `{"m": {"x": {"y": 1}}}`, and only the second has anything at the path.
+    // Unnesting reads `{"m": {"x.y": 1}}`, `{"m.x": {"y": 1}}` and
+    // `{"m.x.y": 1}` into `m.x.y` as it does `{"m": {"x": {"y": 1}}}`, only the
+    // last has anything at the path, and an item with two of them fails.
     let schema = Arc::new(Schema::new(vec![
         Field::new("pk", DataType::Utf8, false),
         Field::new("m.x.y", DataType::Float64, true),
@@ -267,27 +280,39 @@ fn a_flattened_column_takes_in_items_whose_map_key_has_a_dot() {
     )
     .with_unnest_depth(Some(2));
     let translator = Translator::new(&schema);
-    for (expr, path) in [
-        (col(r#""m.x.y""#).eq(lit(1.0_f64)), "#n0.#n1.#n2"),
-        (col(r#""m.x.y""#).is_null(), "#n0.#n1.#n2"),
-        (col(r#""m.x.y""#).is_not_null(), "#n0.#n1.#n2"),
+    let xy = " OR attribute_not_exists([m].[x].[y]) OR attribute_exists([m.x.y]) \
+              OR attribute_exists([m].[x.y]) OR attribute_exists([m.x].[y]))";
+    let tag = " OR attribute_not_exists([m].[tag]) OR attribute_exists([m.tag]))";
+    for (expr, tail) in [
+        (col(r#""m.x.y""#).eq(lit(1.0_f64)), xy),
+        (col(r#""m.x.y""#).is_null(), xy),
+        (col(r#""m.x.y""#).is_not_null(), xy),
         (
             col(r#""m.tag""#).in_list(vec![lit("a"), lit("b")], false),
-            "#n0.#n1",
+            tag,
         ),
-        (col(r#""m.tag""#).like(lit("a%")), "#n0.#n1"),
+        (col(r#""m.tag""#).like(lit("a%")), tag),
     ] {
         let mut out = Placeholders::default();
         let condition = translator.condition(&expr, &mut out).expect("translatable");
         assert!(!condition.exact, "{expr}");
-        assert!(
-            condition
-                .expression
-                .ends_with(&format!(" OR attribute_not_exists({path}))")),
-            "{expr}: {}",
-            condition.expression
-        );
+        let expression = resolved(&condition.expression, &out);
+        assert!(expression.ends_with(tail), "{expr}: {expression}");
     }
+}
+
+#[test]
+fn a_flattened_name_splits_at_every_dot_but_all() {
+    assert_eq!(other_splits("m.tag"), Some(vec![vec!["m.tag"]]));
+    assert_eq!(
+        other_splits("m.x.y"),
+        Some(vec![vec!["m.x.y"], vec!["m", "x.y"], vec!["m.x", "y"]])
+    );
+    assert_eq!(
+        other_splits("a.b.c.d.e.f.g").map(|splits| splits.len()),
+        Some(63)
+    );
+    assert_eq!(other_splits("a.b.c.d.e.f.g.h"), None);
 }
 
 #[test]
