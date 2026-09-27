@@ -1741,13 +1741,47 @@ pub(crate) struct Adjustment {
 // Query-side observations (pushed down from the runtime)
 // ---------------------------------------------------------------------------
 
-/// Latency histogram bucket upper-bounds in ms (log-spaced). p99 is read as the
-/// bucket whose running cumulative count first crosses 99%; an implicit
-/// `(60s, +inf)` overflow bucket sits beyond the last bound.
-const LAT_BUCKET_BOUNDS_MS: [f64; 15] = [
-    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0,
-    20_000.0, 60_000.0,
-];
+/// Ratio between consecutive latency-histogram bucket bounds. Log-spaced at
+/// 1.25× so a bucket's upper bound overstates the true p99 by at most 25 %:
+/// together with evaluating a goal's *violation* on the bucket's LOWER bound
+/// ([`Goals::query_violation`]), quantization can never manufacture a violation
+/// of a goal the table meets, and a real violation is detected within one bucket
+/// (≤ 25 %) of the deadband. The coarse 2–2.5× layout this replaced reported a
+/// 110 ms p99 as the 200 ms bucket against a 150 ms goal — a phantom +33 %.
+const LAT_BUCKET_RATIO: f64 = 1.25;
+
+/// Number of finite bucket bounds: `1.25^50 ≈ 70 s`, so the ladder spans 1 ms to
+/// beyond the 60 s the coarse layout ended at. An implicit `(~70s, +inf)`
+/// overflow bucket sits beyond the last bound.
+const LAT_BUCKET_COUNT: usize = 51;
+
+/// Latency histogram bucket upper-bounds in ms: the geometric ladder
+/// `1.25^k`, `k = 0..LAT_BUCKET_COUNT`. p99 is read as the bucket whose running
+/// cumulative count first crosses 99 %.
+const LAT_BUCKET_BOUNDS_MS: [f64; LAT_BUCKET_COUNT] = lat_bucket_bounds_ms();
+
+const fn lat_bucket_bounds_ms() -> [f64; LAT_BUCKET_COUNT] {
+    let mut bounds = [0.0; LAT_BUCKET_COUNT];
+    let mut bound = 1.0;
+    let mut i = 0;
+    while i < LAT_BUCKET_COUNT {
+        bounds[i] = bound;
+        bound *= LAT_BUCKET_RATIO;
+        i += 1;
+    }
+    bounds
+}
+
+/// The LOWER bound of the histogram bucket whose upper bound is `upper_ms` — the
+/// optimistic end of the p99 interval the histogram actually knows (`0` for the
+/// first bucket). Consecutive bounds differ by exactly [`LAT_BUCKET_RATIO`].
+fn p99_bucket_lower_ms(upper_ms: f64) -> f64 {
+    if upper_ms <= LAT_BUCKET_BOUNDS_MS[0] {
+        0.0
+    } else {
+        upper_ms / LAT_BUCKET_RATIO
+    }
+}
 
 /// Per-table query-side observations, fed by the runtime on query completion and
 /// read by the per-table tuner on its background tick. Lock-free: a fixed bucket
@@ -1802,11 +1836,14 @@ impl QueryObservations {
     }
 
     /// p99 latency estimate (upper bound of the bucket where the running cumulative
-    /// count crosses 99%), or `None` if no queries have been recorded.
+    /// count crosses 99%), or `None` if no queries have been recorded. The
+    /// histogram knows an interval, not a point: the true p99 lies in
+    /// `(upper / LAT_BUCKET_RATIO, upper]`, which is why the goal controller
+    /// evaluates a violation on the lower end ([`Goals::query_violation`]).
     #[must_use]
     pub fn p99_latency_ms(&self) -> Option<f64> {
-        // Two passes directly over the 16 atomics (no heap alloc): total, then the
-        // bucket where the running count crosses 99%.
+        // Two passes directly over the bucket atomics (no heap alloc): total, then
+        // the bucket where the running count crosses 99%.
         let total: u64 = self
             .lat_buckets
             .iter()
@@ -2131,10 +2168,22 @@ impl Goals {
     }
 
     /// Max violation among the query-side goals — drives the query tier's step size.
+    ///
+    /// The latency goal is evaluated on the LOWER bound of the p99 histogram
+    /// bucket (`s.query_latency_p99_ms` carries the bucket's upper bound — see
+    /// [`QueryObservations::p99_latency_ms`]): the histogram knows an interval,
+    /// not a point, and a violation is claimed only when even its optimistic end
+    /// is past the deadband. Evaluating the upper bound manufactured violations
+    /// from quantization alone — every query at 110 ms read as the 200 ms bucket
+    /// against a 150 ms goal (+33 %, past the 20 % deadband), and the closed-loop
+    /// harness measured 69 phantom "query-latency goal" moves ending in an
+    /// infeasible-SLO verdict. [`Self::query_comfortably_met`] keeps the upper
+    /// bound (the pessimistic end), the hysteresis-consistent direction: never
+    /// tighten on an uncertain violation, never relax on an uncertain margin.
     fn query_violation(self, s: &IngestSnapshot) -> f64 {
-        let lat = self
-            .query_latency_p99
-            .map_or(0.0, |g| g.violation(s.query_latency_p99_ms));
+        let lat = self.query_latency_p99.map_or(0.0, |g| {
+            g.violation(s.query_latency_p99_ms.map(p99_bucket_lower_ms))
+        });
         let qph = self.qph.map_or(0.0, |g| g.violation(s.qph));
         lat.max(qph)
     }
@@ -5041,9 +5090,13 @@ mod tests {
         obs.record_query(5_000.0); // the top-1% outlier
         assert_eq!(obs.total_queries(), 100);
         let p99 = obs.p99_latency_ms().expect("p99");
-        // 99% threshold is reached within the 5ms bucket; the lone slow query is
-        // the 100th (top 1%), so p99 reports the 5ms bucket bound.
-        assert!((p99 - 5.0).abs() < f64::EPSILON, "p99 ~5ms, got {p99}");
+        // The 99% threshold is reached inside the bucket holding 5 ms; the lone
+        // slow query is the 100th (top 1%), so p99 reports that bucket's upper
+        // bound — within one bucket ratio of 5 ms, nowhere near the 5 s outlier.
+        assert!(
+            (5.0..=5.0 * LAT_BUCKET_RATIO).contains(&p99),
+            "p99 must report the bucket holding 5 ms, got {p99}"
+        );
     }
 
     #[test]
@@ -6068,6 +6121,59 @@ mod tests {
 
     fn latency_goal_for_test(ms: f64) -> Goals {
         Goals::from_targets(None, None, Some(ms), None, Duration::from_mins(1))
+    }
+
+    /// A query-latency goal the table meets is never reported violated by the
+    /// histogram's quantization: the goal is evaluated on the bucket's lower
+    /// bound, and the 1.25× buckets keep that bound within one bucket of the true
+    /// p99. Regression guard for the phantom moves + infeasible verdict the
+    /// closed-loop harness measured with the coarse buckets and upper-bound
+    /// evaluation.
+    #[test]
+    fn query_latency_goal_is_not_violated_by_bucket_quantization() {
+        let goals = latency_goal_for_test(150.0);
+        // Every query at 118 ms: the true p99 is under the 150 ms goal.
+        let obs = QueryObservations::new();
+        for _ in 0..200 {
+            obs.record_query(118.0);
+        }
+        let upper = obs.p99_latency_ms().expect("p99");
+        assert!(
+            (118.0..=118.0 * LAT_BUCKET_RATIO).contains(&upper),
+            "bucket bound {upper}"
+        );
+        let met = IngestSnapshot {
+            query_latency_p99_ms: Some(upper),
+            ..snap()
+        };
+        assert!(
+            goals.query_violation(&met).abs() < f64::EPSILON,
+            "a met goal must not read as violated (bucket upper bound {upper})"
+        );
+        assert!(
+            goal_decide(&met, &actuators(), &bounds(), &goals).is_none(),
+            "no query-tier move on a met goal"
+        );
+        // Every query at 240 ms (+60 %): a genuine violation, detected.
+        let obs = QueryObservations::new();
+        for _ in 0..200 {
+            obs.record_query(240.0);
+        }
+        let violated = IngestSnapshot {
+            query_latency_p99_ms: obs.p99_latency_ms(),
+            ..snap()
+        };
+        assert!(
+            goals.query_violation(&violated) > 0.0,
+            "a +60% p99 is a violation"
+        );
+        // The bucket series is a 1.25× geometric ladder from 1 ms past 60 s.
+        assert!((LAT_BUCKET_BOUNDS_MS[0] - 1.0).abs() < f64::EPSILON);
+        for w in LAT_BUCKET_BOUNDS_MS.windows(2) {
+            assert!((w[1] / w[0] - LAT_BUCKET_RATIO).abs() < 1e-9);
+        }
+        assert!(LAT_BUCKET_BOUNDS_MS[LAT_BUCKET_COUNT - 1] > 60_000.0);
+        assert!((p99_bucket_lower_ms(1.0) - 0.0).abs() < f64::EPSILON);
     }
 
     /// The reserve's release triggers must not undo the relief they serve: the
