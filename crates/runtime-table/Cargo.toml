@@ -74,6 +74,7 @@ kafka = ["data_components/kafka"]
 openapi = ["dep:utoipa", "runtime-acceleration/openapi"]
 
 [dev-dependencies]
+ctor.workspace = true
 insta.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk.workspace = true
