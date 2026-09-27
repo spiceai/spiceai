@@ -310,6 +310,16 @@ impl ColumnStatsAccumulator {
     }
 
     /// Compute `DataFusion` `ColumnStatistics` from a single Arrow column.
+    ///
+    /// Nested columns (`Map`, `List`, `Struct`, `Union`, and dictionary or
+    /// run-end encodings of them) report only the null count. Their min/max
+    /// could only come from a per-row `ScalarValue` scan, the persisted Vortex
+    /// statistics cannot represent it, and `DataFusion` does not prune on a
+    /// nested value's bounds. `ScalarValue`'s `Map` ordering is also
+    /// unreliable: rows sliced from one batch all compare equal, at a cost that
+    /// grows with the whole batch, so the scan is quadratic and returns an
+    /// arbitrary row. Parquet, ORC, Iceberg, and Delta Lake likewise keep bounds
+    /// only for primitive leaf columns.
     pub(crate) fn compute_column_stats(
         col: &dyn arrow::array::Array,
     ) -> datafusion_common::ColumnStatistics {
@@ -317,7 +327,7 @@ impl ColumnStatsAccumulator {
 
         let null_count = Precision::Exact(col.null_count());
 
-        if col.is_empty() || col.null_count() == col.len() {
+        if col.is_empty() || col.null_count() == col.len() || col.data_type().is_nested() {
             return datafusion_common::ColumnStatistics {
                 null_count,
                 min_value: Precision::Absent,
@@ -781,5 +791,115 @@ mod tests {
             None,
             "float column must not get an NDV sketch"
         );
+    }
+
+    fn header_map(keys: &[Option<&str>]) -> arrow::array::MapArray {
+        let mut builder = arrow::array::MapBuilder::new(
+            None,
+            arrow::array::StringBuilder::new(),
+            arrow::array::StringBuilder::new(),
+        );
+        for key in keys {
+            match key {
+                Some(key) => {
+                    builder.keys().append_value(key);
+                    builder.values().append_value("v");
+                    builder.append(true).expect("append map entry");
+                }
+                None => builder.append(false).expect("append null map"),
+            }
+        }
+        builder.finish()
+    }
+
+    fn assert_null_count_only(stats: &datafusion_common::ColumnStatistics, nulls: usize) {
+        use datafusion_common::stats::Precision;
+        assert_eq!(stats.null_count, Precision::Exact(nulls));
+        assert_eq!(
+            stats.min_value,
+            Precision::Absent,
+            "nested min must be absent"
+        );
+        assert_eq!(
+            stats.max_value,
+            Precision::Absent,
+            "nested max must be absent"
+        );
+    }
+
+    // regression test for #14368
+    #[test]
+    fn nested_columns_report_null_count_without_min_max() {
+        use arrow::array::{Array, DictionaryArray, ListArray, StructArray, UInt8Array};
+        use arrow::datatypes::Int64Type;
+
+        // Keys chosen so a per-row scan that treats every row as equal would
+        // report 'm' as both bounds instead of 'a'/'z'.
+        let map = header_map(&[Some("m"), Some("z"), None, Some("a")]);
+        assert_null_count_only(&ColumnStatsAccumulator::compute_column_stats(&map), 1);
+
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(3), Some(1)]),
+            None,
+            Some(vec![Some(2)]),
+        ]);
+        assert_null_count_only(&ColumnStatsAccumulator::compute_column_stats(&list), 1);
+
+        let structs = StructArray::from(vec![(
+            Arc::new(Field::new("a", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(2), Some(1)])) as arrow::array::ArrayRef,
+        )]);
+        assert_null_count_only(&ColumnStatsAccumulator::compute_column_stats(&structs), 0);
+
+        let dictionary = DictionaryArray::new(
+            UInt8Array::from(vec![0, 0, 0]),
+            Arc::new(list.slice(0, 1)) as arrow::array::ArrayRef,
+        );
+        assert!(dictionary.data_type().is_nested());
+        assert_null_count_only(
+            &ColumnStatsAccumulator::compute_column_stats(&dictionary),
+            0,
+        );
+    }
+
+    #[test]
+    fn nested_column_stats_leave_primitive_columns_intact() {
+        use arrow::array::Array;
+        use datafusion_common::stats::Precision;
+
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "headers",
+                header_map(&[Some("x")]).data_type().clone(),
+                true,
+            ),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![7, 3, 9])),
+                Arc::new(header_map(&[Some("b"), None, Some("a")])),
+            ],
+        )
+        .expect("batch");
+
+        let stats = crate::provider::file_pruning::statistics_from_record_batches(
+            &Arc::new(schema.clone()),
+            std::slice::from_ref(&batch),
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+        let id = &stats.column_statistics[0];
+        assert_eq!(id.min_value, Precision::Exact(ScalarValue::Int64(Some(3))));
+        assert_eq!(id.max_value, Precision::Exact(ScalarValue::Int64(Some(9))));
+        assert_null_count_only(&stats.column_statistics[1], 1);
+
+        // The persisted path still produces a blob for the table.
+        let acc = ColumnStatsAccumulator::new(&schema);
+        acc.update(&batch);
+        let (_, rows) = acc
+            .to_file_statistics_blob_with_row_count()
+            .expect("file statistics blob");
+        assert_eq!(rows, 3);
     }
 }
