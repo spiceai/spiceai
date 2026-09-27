@@ -21,9 +21,9 @@ use aws_sdk_credential_bridge::object_store_builder::{
 };
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, stream::BoxStream};
 use object_store::{
-    GetOptions, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
     path::Path as ObjectPath,
 };
 use opentelemetry::KeyValue;
@@ -68,6 +68,13 @@ pub mod metrics;
 pub use crate::layout::AccelerationLayout;
 pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
 use engine::{SnapshotEngine, create_snapshot_engine};
+
+/// Size of each ranged GET a snapshot is downloaded in (see `snapshot_chunks`): small
+/// enough to finish within the default 30s request timeout at ~0.3 MB/s.
+const SNAPSHOT_DOWNLOAD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// Ranged GETs in flight per snapshot download; bounds its buffered memory to
+/// `SNAPSHOT_DOWNLOAD_CONCURRENCY * SNAPSHOT_DOWNLOAD_CHUNK_BYTES`.
+const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 /// Public API types for snapshot information exposed via HTTP endpoints.
 pub mod api {
@@ -2016,6 +2023,54 @@ impl SnapshotManager {
         }
     }
 
+    /// Streams the snapshot object at `object_path` as consecutive ranged GETs, in order.
+    ///
+    /// One GET for the whole object cannot survive a slow link: the object store bounds
+    /// every request by its timeout (30s unless `client_timeout` is set), body included, so
+    /// a snapshot that takes longer to transfer fails at the same point on every retry —
+    /// the cross-region replica case. Each range is its own request, bounded and retried on
+    /// its own, and a few are in flight at once so the transfers overlap while the bytes are
+    /// still consumed (hashed and written) sequentially.
+    fn snapshot_chunks<'a>(
+        &'a self,
+        object_path: &'a ObjectPath,
+        size: u64,
+    ) -> BoxStream<'a, Result<bytes::Bytes, object_store::Error>> {
+        let ranges = std::iter::successors(Some(0_u64), |start| {
+            Some(start.saturating_add(SNAPSHOT_DOWNLOAD_CHUNK_BYTES))
+        })
+        .take_while(move |start| *start < size)
+        .map(move |start| {
+            start
+                ..start
+                    .saturating_add(SNAPSHOT_DOWNLOAD_CHUNK_BYTES)
+                    .min(size)
+        });
+        futures::stream::iter(ranges)
+            .map(move |range| async move {
+                retry(self.network_retry_strategy.clone(), || async {
+                    self.object_store
+                        .get_range(object_path, range.clone())
+                        .await
+                        .map_err(|err| match err {
+                            object_store::Error::NotFound { .. } => RetryError::permanent(err),
+                            err => {
+                                tracing::warn!(
+                                    "Transient error downloading snapshot bytes {}..{} of {object_path}, retrying. dataset={} error={err}",
+                                    range.start,
+                                    range.end,
+                                    self.dataset_name,
+                                );
+                                RetryError::transient(err)
+                            }
+                        })
+                })
+                .await
+            })
+            .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY)
+            .boxed()
+    }
+
     /// Returns the URI a snapshot entry is read from, for logs.
     ///
     /// An entry's recorded URI can name another bucket than the one read, e.g. the writer's
@@ -2079,14 +2134,16 @@ impl SnapshotManager {
         // bucket), so a log still ties the restore back to the writer's metadata entry.
         let recorded_as = (snapshot_uri != entry.snapshot).then_some(entry.snapshot.as_str());
 
-        let get_result = self
+        let object_size = self
             .object_store
-            .get(&object_path)
+            .head(&object_path)
             .await
             .map_err(|source| SnapshotDownloadError::Download {
                 path: path_display.clone(),
                 source,
-            })?;
+            })?
+            .size;
+        let chunks = self.snapshot_chunks(&object_path, object_size);
 
         tracing::debug!(
             dataset = %self.dataset_name,
@@ -2103,11 +2160,11 @@ impl SnapshotManager {
                 });
             }
             AccelerationLayout::File { path } => {
-                self.download_to_file(path, get_result, entry, &path_display)
+                self.download_to_file(path, chunks, entry, &path_display)
                     .await?
             }
             AccelerationLayout::Directories { dirs } => {
-                self.download_to_directories(dirs, get_result, entry, &path_display)
+                self.download_to_directories(dirs, chunks, entry, &path_display)
                     .await?
             }
         };
@@ -2240,7 +2297,7 @@ impl SnapshotManager {
     async fn download_to_file(
         &self,
         local_path: &PathBuf,
-        get_result: GetResult,
+        mut stream: BoxStream<'_, Result<bytes::Bytes, object_store::Error>>,
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
@@ -2252,8 +2309,6 @@ impl SnapshotManager {
                 }
             })?;
         }
-
-        let mut stream = get_result.into_stream();
 
         // Write to a sibling temp file then atomically rename into the primary
         // path. This guarantees concurrent readers (e.g. an active accelerator
@@ -2415,7 +2470,7 @@ impl SnapshotManager {
     async fn download_to_directories(
         &self,
         dirs: &[(PathBuf, String)],
-        get_result: GetResult,
+        mut stream: BoxStream<'_, Result<bytes::Bytes, object_store::Error>>,
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
@@ -2441,7 +2496,6 @@ impl SnapshotManager {
             })?;
         }
 
-        let mut stream = get_result.into_stream();
         let mut file = fs::File::create(&temp_archive_path)
             .await
             .map_err(|source| SnapshotDownloadError::WriteLocal {
@@ -3673,6 +3727,84 @@ mod tests {
             .await
             .expect("read downloaded snapshot");
         assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    /// A snapshot larger than one ranged GET downloads as several ranges, reassembled in
+    /// order: the bytes and checksum match the object exactly.
+    #[tokio::test]
+    async fn download_latest_snapshot_reassembles_a_multi_range_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        // Two and a half ranges, with a distinct byte pattern so a reordered or dropped
+        // range changes the checksum.
+        let len = usize::try_from(SNAPSHOT_DOWNLOAD_CHUNK_BYTES * 5 / 2).expect("fits usize");
+        let contents: Bytes = (0..len)
+            .map(|i| u8::try_from((i / 4096) % 251).expect("< 251"))
+            .collect::<Vec<u8>>()
+            .into();
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(
+                    &schema,
+                    vec![SnapshotEntry {
+                        snapshot_id: 0,
+                        timestamp_ms: instant.timestamp_millis(),
+                        snapshot: snapshot_uri(&location),
+                        snapshot_checksum: checksum.clone(),
+                        snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                        snapshot_size: contents.len() as u64,
+                        snapshot_engine: None,
+                        snapshot_row_count: None,
+                        snapshot_last_updated_at_ms: None,
+                    }],
+                    Some(0),
+                ),
+            )]),
+        };
+        write_metadata(&store, &base.join(METADATA_FILE_NAME), &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("expected snapshot");
+        assert_eq!(info.bytes_downloaded, contents.len() as u64);
+        assert_eq!(info.checksum, checksum);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert!(
+            downloaded.as_slice() == contents.as_ref(),
+            "reassembled bytes differ"
+        );
     }
 
     #[tokio::test]
