@@ -26,13 +26,16 @@ limitations under the License.
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
-use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
-use runtime_acceleration::acceleration_source::AccelerationSource;
+use runtime_acceleration::acceleration::{
+    Acceleration, DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, Mode, RefreshMode,
+};
+use runtime_acceleration::acceleration_source::{AccelerationSource, resolved_refresh_mode};
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
 };
 use snafu::Snafu;
+use spicepod::component::snapshot::BootstrapOnFailureBehavior;
 
 use crate::{AcceleratorEngineRegistry, acceleration_file_path};
 
@@ -69,15 +72,7 @@ pub fn should_download_snapshot(
     layout: &AccelerationLayout,
     refresh_mode: RefreshMode,
 ) -> bool {
-    if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return false;
-    }
-
-    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
-        tracing::info!(
-            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
-            source.name()
-        );
+    if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
         return false;
     }
 
@@ -90,6 +85,28 @@ pub fn should_download_snapshot(
         tracing::info!(
             "Acceleration already exists at {}, skipping snapshot download",
             primary_path.display()
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Whether the configuration permits bootstrap. Engines with a shared metastore
+/// must check for the individual table, rather than the metastore directory.
+pub fn snapshot_bootstrap_enabled(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    refresh_mode: RefreshMode,
+) -> bool {
+    if !acceleration.snapshot_behavior.bootstrap_enabled() {
+        return false;
+    }
+
+    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
+        tracing::info!(
+            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
+            source.name()
         );
         return false;
     }
@@ -129,21 +146,39 @@ pub async fn download_snapshot(
             manager = manager.with_snapshot_engine(engine_override);
         }
         let start_time = Instant::now();
-        match manager.download_latest_snapshot().await {
-            Ok(Some(info)) => {
-                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                metrics::record_bootstrap_metrics(
-                    &dataset_name,
-                    duration_ms,
-                    info.bytes_downloaded,
-                    &info.checksum,
-                );
-                BootstrapStatus::bootstrapped(info)
-            }
-            Ok(None) => BootstrapStatus::none(),
-            Err(e) => {
-                tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
-                BootstrapStatus::none()
+        let wait_for_snapshot = resolved_refresh_mode(source, acceleration)
+            == RefreshMode::Snapshot
+            && matches!(
+                &acceleration.snapshot_behavior,
+                SnapshotBehavior::Enabled(config, ..) | SnapshotBehavior::BootstrapOnly(config, ..)
+                    if config.bootstrap_on_failure_behavior == BootstrapOnFailureBehavior::Retry
+            );
+        let poll_interval = acceleration
+            .refresh_check_interval
+            .unwrap_or(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL);
+        loop {
+            match manager.download_latest_snapshot().await {
+                Ok(Some(info)) => {
+                    let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                    metrics::record_bootstrap_metrics(
+                        &dataset_name,
+                        duration_ms,
+                        info.bytes_downloaded,
+                        &info.checksum,
+                    );
+                    return BootstrapStatus::bootstrapped(info);
+                }
+                Ok(None) if wait_for_snapshot => {
+                    // A snapshot reader has no source from which to create its initial
+                    // schema. Keep initialization pending until a publisher supplies it.
+                    tracing::debug!(dataset = %dataset_name, "Waiting for the first snapshot");
+                    tokio::time::sleep(poll_interval).await;
+                }
+                Ok(None) => return BootstrapStatus::none(),
+                Err(e) => {
+                    tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
+                    return BootstrapStatus::none();
+                }
             }
         }
     } else {

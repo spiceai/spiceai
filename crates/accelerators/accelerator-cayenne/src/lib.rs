@@ -52,7 +52,7 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::{download_snapshot, should_download_snapshot};
+use data_accelerator_api::snapshots::{download_snapshot, snapshot_bootstrap_enabled};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -3768,55 +3768,37 @@ impl DataAccelerator for CayenneAccelerator {
             );
             let refresh_mode = resolved_refresh_mode(source, acceleration);
 
-            // Decide whether to bootstrap from a snapshot before `get_or_create_catalog`
-            // below opens the local metastore: that call creates `metadata_dir` as a
-            // side effect (it's a fresh SQLite connection), and this decision's "does an
-            // acceleration already exist here" check reads that same directory's
-            // existence. Deciding first means the check sees the true pre-startup state
-            // instead of a directory the catalog open just created.
-            let should_bootstrap =
-                should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode);
-
-            // Build a CayenneSnapshotEngine so the snapshot tar uses the
-            // per-dataset metastore-slice format (no raw cayenne.db file)
-            // and so `download_latest_snapshot` imports the slice into the
-            // local metastore as the final extraction step.
             let metastore_type = acceleration
                 .params
                 .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str)
-                .to_string();
-            // The catalog is opened unconditionally: normal operation needs it
-            // regardless of the snapshot decision above.
-            let snapshot_engine = match self
-                .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-                .await
-            {
-                Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
-                    catalog,
-                    source.name().to_string(),
-                    path_buf.clone(),
-                ))
-                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
-                         falling back to default engine: {err}"
-                    );
-                    None
-                }
-            };
+                .map_or("sqlite", String::as_str);
+            let catalog = self
+                .get_or_create_catalog(&metadata_dir.to_string_lossy(), metastore_type)
+                .await?;
 
-            if !should_bootstrap {
+            if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
                 return Ok(BootstrapStatus::none());
             }
+
+            // The metastore is shared across datasets. Its existence does not
+            // establish that this dataset has a local acceleration to reopen.
+            match catalog.get_table(&source.name().to_string()).await {
+                Ok(_) => return Ok(BootstrapStatus::none()),
+                Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                Err(err) => return Err(Box::new(err)),
+            }
+            let snapshot_engine = Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
+                catalog,
+                source.name().to_string(),
+                path_buf.clone(),
+            ));
 
             Ok(download_snapshot(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
-                snapshot_engine,
+                Some(snapshot_engine),
             )
             .await)
         } else {

@@ -61,6 +61,7 @@ use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use data_connector_api::federated::FederatedTableProvider;
+use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
@@ -736,12 +737,6 @@ fn remap_constraints_to_refresh_schema(
 
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
-
-/// Default polling interval for `refresh_mode: snapshot` when the user does
-/// not specify `refresh_check_interval` explicitly. Picked to be slightly
-/// shorter than the default snapshot creation interval so a freshly created
-/// snapshot is picked up promptly without aggressive object-store load.
-const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
 pub enum Table {
     Accelerated {
