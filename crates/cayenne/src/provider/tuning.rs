@@ -3177,6 +3177,16 @@ fn shrink_i64(v: i64) -> i64 {
 // Additive (not multiplicative) so the convergence guarantee holds against the
 // linear range. The result is clamped to `[floor, ceiling]` by `clamp_move_*` at
 // the call site, exactly like the legacy steps.
+//
+// A SHRINK is additionally capped at the legacy ×2/3 step — never more than a
+// third of the current value per tick (at least 1 unit) — because an additive
+// `range / N` measured against a wide range is most of a small current value: a
+// 256 MiB mem-tier against a 2 GiB range was cut to its 64 MiB floor in one move,
+// and a 10 s compaction interval to 2.75 s — the shape of the L-20 incident
+// (#11893, a 1 GiB tier collapsed to 67 MiB). Growth stays purely additive:
+// every raise is memory-gated and ceiling-clamped, and the window promise (N
+// steps span the range) is pinned for the tighten direction by
+// `lag_goal_converges_to_ceiling_within_window_steps`.
 
 /// Per-tick goal-mode step magnitude for an actuator with the given `range`,
 /// scaled by `violation` in `[0, 1]`. At least 1 so a tiny range still moves.
@@ -3197,13 +3207,25 @@ fn goal_grow_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
     v.saturating_add(step)
 }
 
+/// Per-tick goal-mode SHRINK magnitude for a current value `v` over `range`: the
+/// additive step ([`goal_step_magnitude_u64`]) capped at the legacy ×2/3 step, so
+/// one tick never removes more than a third of the current value (and at least 1
+/// unit, so a tiny value still makes progress).
+fn goal_shrink_step_u64(v: u64, range: u64, violation: f64) -> u64 {
+    let additive = goal_step_magnitude_u64(range, violation);
+    let multiplicative = v.saturating_sub(shrink_u64(v)).max(1);
+    additive.min(multiplicative)
+}
+
 /// Shrink an `i64` actuator by one goal-mode step (the `saturating_sub` twin of
-/// [`goal_grow_i64`]). The result is clamped to `[floor, ceiling]` by
-/// `clamp_move_i64` at the call site — the floor (e.g. [`MEM_TIER_MIN_BYTES`])
-/// bounds how far the freshness lever can shrink the mem-tier.
+/// [`goal_grow_i64`], capped per [`goal_shrink_step_u64`]). The result is clamped
+/// to `[floor, ceiling]` by `clamp_move_i64` at the call site — the floor (e.g.
+/// [`MEM_TIER_MIN_BYTES`]) bounds how far the freshness lever can shrink the
+/// mem-tier.
 fn goal_shrink_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
     let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(0);
-    let step = i64::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(i64::MAX);
+    let cur = u64::try_from(v.max(0)).unwrap_or(0);
+    let step = i64::try_from(goal_shrink_step_u64(cur, range, violation)).unwrap_or(i64::MAX);
     v.saturating_sub(step)
 }
 
@@ -3214,12 +3236,13 @@ fn goal_grow_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usize 
 }
 
 fn goal_shrink_u64(v: u64, (lo, hi): (u64, u64), violation: f64) -> u64 {
-    v.saturating_sub(goal_step_magnitude_u64(hi.saturating_sub(lo), violation))
+    v.saturating_sub(goal_shrink_step_u64(v, hi.saturating_sub(lo), violation))
 }
 
 fn goal_shrink_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usize {
     let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(u64::MAX);
-    let step = usize::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(usize::MAX);
+    let cur = u64::try_from(v).unwrap_or(u64::MAX);
+    let step = usize::try_from(goal_shrink_step_u64(cur, range, violation)).unwrap_or(usize::MAX);
     v.saturating_sub(step)
 }
 
@@ -5956,5 +5979,58 @@ mod tests {
         let adj = goal_decide(&headroom, &cur, &b, &goals).expect("headroom ⇒ relax");
         assert_eq!(adj.actuator, Actuator::WriteConcurrency);
         assert!(adj.new_value < cur.write_concurrency as u64);
+    }
+
+    /// A goal-mode SHRINK never removes more than a third of the current value in
+    /// one tick, however large the violation: the additive `range / N` step is
+    /// capped at the legacy ×2/3 step. Pins the fix for the L-20 shape (a 256 MiB
+    /// mem-tier cut to its floor in one move; a 10 s compaction interval cut to
+    /// 2.75 s) measured in the closed-loop harness.
+    #[test]
+    fn goal_shrink_is_capped_at_a_third_per_tick() {
+        let b = bounds();
+        // Freshness massively violated with the apply behind ⇒ the mem-tier shrink
+        // lever, against a 2 GiB range from a 256 MiB current value.
+        let s = IngestSnapshot {
+            freshness_secs: Some(1_000.0),
+            apply_vs_arrival: 1.5,
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let cur = actuators();
+        let adj = goal_decide(&s, &cur, &b, &goals).expect("a shrink move");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        let floor_of_step = cur.mem_tier_max_bytes as u64 * 2 / 3;
+        assert!(
+            adj.new_value < cur.mem_tier_max_bytes as u64 && adj.new_value >= floor_of_step,
+            "one tick may remove at most a third: {} -> {} (min {floor_of_step})",
+            cur.mem_tier_max_bytes,
+            adj.new_value
+        );
+        // Query-latency goal massively violated with the memtable already at its
+        // ceiling ⇒ the compaction-interval shrink, against a 58 s range from 10 s.
+        let s = IngestSnapshot {
+            query_latency_p99_ms: Some(60_000.0),
+            ..snap()
+        };
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            ..actuators()
+        };
+        let adj = goal_decide(&s, &cur, &b, &latency_goal_for_test(100.0)).expect("a move");
+        assert_eq!(adj.actuator, Actuator::CompactionIntervalMs);
+        assert!(
+            adj.new_value >= cur.compaction_background_interval_ms * 2 / 3,
+            "interval {} -> {} exceeds the ×2/3 cap",
+            cur.compaction_background_interval_ms,
+            adj.new_value
+        );
+        // The pure helper: a tiny value still steps by at least 1.
+        assert_eq!(goal_shrink_u64(2, (0, 1_000_000), 1.0), 1);
+        assert_eq!(goal_shrink_u64(1, (0, 1_000_000), 1.0), 0);
+    }
+
+    fn latency_goal_for_test(ms: f64) -> Goals {
+        Goals::from_targets(None, None, Some(ms), None, Duration::from_mins(1))
     }
 }
