@@ -2689,10 +2689,12 @@ fn with_localpod_dependents(
 /// The interval at which a `refresh_mode: snapshot` dataset that has not bootstrapped
 /// re-attempts its snapshot bootstrap, or `None` when the dataset is not waiting for one:
 /// it is not accelerated, does not refresh from snapshots, cannot bootstrap from them, or
-/// already bootstrapped.
+/// already bootstrapped. `mode: file_create` is excluded: re-running its accelerator init
+/// recreates the acceleration each time.
 fn waits_for_first_snapshot(ds: &Dataset, bootstrap_status: &BootstrapStatus) -> Option<Duration> {
     let acceleration = ds.acceleration.as_ref().filter(|a| a.enabled)?;
     (acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+        && acceleration.mode != Mode::FileCreate
         && acceleration.snapshot_behavior.bootstrap_enabled()
         && !bootstrap_status.is_bootstrapped())
     .then(|| {
