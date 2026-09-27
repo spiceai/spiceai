@@ -2069,6 +2069,23 @@ impl Goal {
     fn comfortably_met(self, measured: Option<f64>) -> bool {
         matches!(self.normalized_error(measured), Some(e) if e <= -GOAL_RELAX_FRACTION)
     }
+
+    /// [`Self::comfortably_met`], with an unavailable measurement counting as
+    /// "no objection". A goal that cannot be measured — no query has run yet
+    /// (p99 `None`), the query side went idle (QPH `None` past `QPH_IDLE_MS`), a
+    /// source that carries no commit timestamp (lag `None`) — cannot veto handing
+    /// a resource back: nothing the tighten tiers took can be serving it. Without
+    /// this an unmeasured goal froze the controller at its aggressive extreme
+    /// (every write shard, a 2 s compaction interval) for as long as the table
+    /// lived — the closed-loop harness measured it over a 30-minute idle phase.
+    /// Used only by the relax / release gates; the tighten path already treats an
+    /// unmeasured goal as not violated, so the pair is consistent: unmeasured ⇒
+    /// neither tighten nor veto. The relax tier stays gated on the legacy healthy
+    /// predicate, so relaxing on an unmeasured goal is exactly as safe as relaxing
+    /// with no goal configured.
+    fn comfortably_met_or_unmeasured(self, measured: Option<f64>) -> bool {
+        measured.is_none() || self.comfortably_met(measured)
+    }
 }
 
 /// Operator-configured tuning goals (each `None` when unset) plus the convergence
@@ -2188,17 +2205,21 @@ impl Goals {
         lat.max(qph)
     }
 
-    /// Are all *active* goals comfortably met? Gate for the healthy-relax tier.
+    /// Are all *active* goals comfortably met (an unmeasured goal counting as no
+    /// objection — see [`Goal::comfortably_met_or_unmeasured`])? Gate for the
+    /// healthy-relax tier.
     fn all_comfortably_met(self, s: &IngestSnapshot) -> bool {
         self.replication_lag
-            .is_none_or(|g| g.comfortably_met(s.replication_lag_secs))
+            .is_none_or(|g| g.comfortably_met_or_unmeasured(s.replication_lag_secs))
             && self
                 .freshness
-                .is_none_or(|g| g.comfortably_met(s.freshness_secs))
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.freshness_secs))
             && self
                 .query_latency_p99
-                .is_none_or(|g| g.comfortably_met(s.query_latency_p99_ms))
-            && self.qph.is_none_or(|g| g.comfortably_met(s.qph))
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.query_latency_p99_ms))
+            && self
+                .qph
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.qph))
     }
 
     /// Are the ingest-side goals (replication-lag + freshness) comfortably met?
@@ -2214,10 +2235,10 @@ impl Goals {
     /// "release on violated" is a stable negative-feedback brake, not a latch.
     fn ingest_comfortably_met(self, s: &IngestSnapshot) -> bool {
         self.replication_lag
-            .is_none_or(|g| g.comfortably_met(s.replication_lag_secs))
+            .is_none_or(|g| g.comfortably_met_or_unmeasured(s.replication_lag_secs))
             && self
                 .freshness
-                .is_none_or(|g| g.comfortably_met(s.freshness_secs))
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.freshness_secs))
     }
 
     /// Are the query-side goals (query-latency-p99 + QPH) comfortably met? The
@@ -6174,6 +6195,49 @@ mod tests {
         }
         assert!(LAT_BUCKET_BOUNDS_MS[LAT_BUCKET_COUNT - 1] > 60_000.0);
         assert!((p99_bucket_lower_ms(1.0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// A configured goal whose metric is unavailable (no queries yet, an idle
+    /// query side) must not veto the relax tier: with the lag goal comfortably
+    /// met and the plant healthy, resources are handed back. A goal that IS
+    /// measured and merely met (not comfortably) still vetoes. Regression guard
+    /// for the shards + 2 s compaction interval left at their extremes through a
+    /// 30-minute idle phase in the closed-loop harness.
+    #[test]
+    fn unmeasured_goal_does_not_block_relax() {
+        let b = bounds();
+        let cur = actuators();
+        let healthy_lag_met = IngestSnapshot {
+            replication_lag_secs: Some(1.0),
+            query_latency_p99_ms: None,
+            qph: None,
+            apply_vs_arrival: 0.2,
+            read_amp: 1,
+            ..snap()
+        };
+        let lag_and_latency = lag_and_latency_goal_for_test(5.0, 200.0);
+        let adj = goal_decide(&healthy_lag_met, &cur, &b, &lag_and_latency)
+            .expect("an unmeasured latency goal cannot veto relax");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        assert!(adj.new_value < cur.write_concurrency as u64);
+        let lag_and_qph =
+            Goals::from_targets(Some(5.0), None, None, Some(1000.0), Duration::from_mins(1));
+        let adj = goal_decide(&healthy_lag_met, &cur, &b, &lag_and_qph)
+            .expect("an idle (None) QPH goal cannot veto relax");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        // Measured but only just met (−7 %, inside the relax hysteresis): veto holds.
+        let measured_not_comfortable = IngestSnapshot {
+            query_latency_p99_ms: Some(186.0),
+            ..healthy_lag_met
+        };
+        assert!(
+            goal_decide(&measured_not_comfortable, &cur, &b, &lag_and_latency).is_none(),
+            "a measured goal without relax headroom still vetoes"
+        );
+    }
+
+    fn lag_and_latency_goal_for_test(lag_secs: f64, ms: f64) -> Goals {
+        Goals::from_targets(Some(lag_secs), None, Some(ms), None, Duration::from_mins(1))
     }
 
     /// The reserve's release triggers must not undo the relief they serve: the
