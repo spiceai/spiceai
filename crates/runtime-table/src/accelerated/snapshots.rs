@@ -14,6 +14,7 @@ use crate::accelerated::SnapshotCreateTrigger;
 use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use arrow_schema::{FieldRef, Schema, SchemaRef};
+use cayenne::CayenneTableProvider;
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
@@ -497,6 +498,27 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) {
+    // The snapshot claims the changes up to this timestamp, so it is read before anything
+    // is captured: a change applied after this read is either in the snapshot anyway or
+    // moves the timestamp, which makes the next `on_change` trigger publish it.
+    let updated_at = match last_updated_at.load(Ordering::Acquire) {
+        0 => None,
+        i => Some(i),
+    };
+    // Cayenne applies CDC changes to an in-memory tier first, and a snapshot copies only
+    // what is on disk. Without this, a change still in memory is left out of the snapshot
+    // while its timestamp is recorded, so `on_change` skips every later trigger and the
+    // snapshot never catches up with the table. Done before taking the write lock, which
+    // the tier's own capture locks must not nest inside.
+    if let Some(cayenne) = accelerator.and_then(|a| a.downcast_ref::<CayenneTableProvider>())
+        && let Err(e) = cayenne.checkpoint_mem_tier().await
+    {
+        if !is_shutdown_cancellation(&e) {
+            snapshot_metrics::record_snapshot_failure(&dataset_name.to_string());
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
+        }
+        return;
+    }
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
@@ -529,11 +551,6 @@ pub async fn create_checkpoint_and_snapshot(
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
-        let updated_at = match last_updated_at.load(Ordering::Acquire) {
-            0 => None,
-            i => Some(i),
-        };
-
         // Get the current row count from the accelerator using the `DataFrame` API.
         // This must be done after checkpoint while holding the write lock to ensure atomicity.
         let row_count = if let Some(accelerator) = accelerator {
