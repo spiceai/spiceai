@@ -19,13 +19,15 @@ pub use duplicate_plan_node::*;
 pub mod partitioned_table_scan_rewrite;
 pub use partitioned_table_scan_rewrite::*;
 
+pub mod correlated_filter_push_down;
+pub use correlated_filter_push_down::{CorrelatedFilterPushDown, federation_analyzer_rule};
+
 use std::sync::Arc;
 
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::optimizer::analyzer::{
     resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
 };
-use datafusion_federation::sql::federation_analyzer_rule;
 
 /// Builds the analyzer-rule list Spice runs, in Spice's order.
 pub struct AnalyzerRulesBuilder {

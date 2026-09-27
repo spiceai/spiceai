@@ -29,6 +29,7 @@ use datafusion::{
     common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
+    physical_plan::ExecutionPlan,
     sql::TableReference,
 };
 use runtime_request_context::{
@@ -1205,12 +1206,13 @@ impl Query {
     async fn cache_revalidation_result(
         df: &Arc<DataFusion>,
         cache_key: &RawCacheKey,
-        cache_key_u64: u64,
         batches: Vec<arrow::record_batch::RecordBatch>,
         schema: arrow::datatypes::SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         revalidation_started_at: std::time::Instant,
+        physical_plan: Option<Arc<dyn ExecutionPlan>>,
     ) {
+        let cache_key_u64 = cache_key.as_u64();
         if let Some(cache_provider) = df.results_cache_provider() {
             // A revalidation runs asynchronously, so an accelerated refresh or
             // DML may have invalidated one of its tables while it was
@@ -1237,6 +1239,23 @@ impl Query {
                 tracing::debug!(
                     cache_key = cache_key_u64,
                     "Background revalidation returned transient HTTP error responses, preserving stale cache"
+                );
+                record_revalidation_outcome(RevalidationOutcome::TransientErrors);
+                return;
+            }
+
+            // `batches_cacheable` only sees a retryable status through the
+            // `response_status` column or the schema-metadata fallback, both
+            // of which a narrow projection (e.g. `SELECT rank FROM ...`) can
+            // drop before this admission check ever runs — see
+            // `cache::utils::plan_saw_transient_http_failure`.
+            if physical_plan
+                .as_ref()
+                .is_some_and(cache::plan_saw_transient_http_failure)
+            {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation's execution plan recorded a transient HTTP error response (5xx/429) that a projection excluded from the output columns, preserving stale cache"
                 );
                 record_revalidation_outcome(RevalidationOutcome::TransientErrors);
                 return;
@@ -1388,6 +1407,7 @@ impl Query {
                             let schema = query_result
                                 .cached_schema()
                                 .unwrap_or_else(|| query_result.schema());
+                            let physical_plan = query_result.physical_plan();
                             tracing::debug!(
                                 cache_key = cache_key_u64,
                                 "Background query execution succeeded, collecting batches"
@@ -1402,11 +1422,11 @@ impl Query {
                                     Self::cache_revalidation_result(
                                         &df,
                                         &cache_key,
-                                        cache_key_u64,
                                         batches,
                                         schema,
                                         input_tables,
                                         revalidation_started_at,
+                                        physical_plan,
                                     )
                                     .await;
                                 }
@@ -1473,6 +1493,7 @@ impl Query {
         plan_cache_key: RawCacheKey,
         datasets: Arc<HashSet<TableReference>>,
         read_started_at: std::time::Instant,
+        physical_plan: Arc<dyn ExecutionPlan>,
     ) -> SendableRecordBatchStream {
         if let Some(cache_provider) = df.results_cache_provider() {
             to_cached_record_batch_stream(
@@ -1481,6 +1502,7 @@ impl Query {
                 plan_cache_key,
                 datasets,
                 read_started_at,
+                Some(physical_plan),
             )
         } else {
             stream
@@ -2431,11 +2453,11 @@ mod tests {
         Query::cache_revalidation_result(
             &df,
             &invalidated_key,
-            invalidated_key.as_u64(),
             vec![batch.clone()],
             Arc::clone(&schema),
             Arc::new(HashSet::from([TableReference::bare("revalidated_table")])),
             revalidation_started_at,
+            None,
         )
         .await;
         cache_provider.run_pending_tasks().await;
@@ -2455,11 +2477,11 @@ mod tests {
         Query::cache_revalidation_result(
             &df,
             &untouched_key,
-            untouched_key.as_u64(),
             vec![batch],
             schema,
             Arc::new(HashSet::from([TableReference::bare("untouched_table")])),
             revalidation_started_at,
+            None,
         )
         .await;
         cache_provider.run_pending_tasks().await;
@@ -2471,6 +2493,140 @@ mod tests {
                 .expect("cache access should succeed")
                 .is_some(),
             "an unaffected revalidation must still populate the cache"
+        );
+    }
+
+    /// Reports a fixed [`MetricsSet`], standing in for an `HttpExec` whose
+    /// `HTTP_TRANSIENT_FAILURE_METRIC_NAME` counter was incremented by a
+    /// fetch a narrow projection then excluded `response_status` from.
+    #[derive(Debug)]
+    struct MetricsOnlyExecutionPlan {
+        metrics: datafusion::physical_plan::metrics::MetricsSet,
+        properties: Arc<datafusion::physical_plan::PlanProperties>,
+    }
+
+    impl MetricsOnlyExecutionPlan {
+        fn with_transient_failure_count(count: usize) -> Self {
+            let metrics_set = datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new();
+            datafusion::physical_plan::metrics::MetricBuilder::new(&metrics_set)
+                .counter(
+                    arrow_tools::metadata_keys::HTTP_TRANSIENT_FAILURE_METRIC_NAME,
+                    0,
+                )
+                .add(count);
+            Self {
+                metrics: metrics_set.clone_inner(),
+                properties: Arc::new(datafusion::physical_plan::PlanProperties::new(
+                    datafusion::physical_expr::EquivalenceProperties::new(Arc::new(
+                        arrow::datatypes::Schema::empty(),
+                    )),
+                    datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }
+        }
+    }
+
+    impl datafusion::physical_plan::DisplayAs for MetricsOnlyExecutionPlan {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            _f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            unimplemented!("not used in tests")
+        }
+    }
+
+    impl ExecutionPlan for MetricsOnlyExecutionPlan {
+        fn name(&self) -> &'static str {
+            "MetricsOnlyExecutionPlan"
+        }
+
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+            Some(self.metrics.clone())
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::common::Result<datafusion::execution::SendableRecordBatchStream> {
+            unimplemented!("not used in tests")
+        }
+    }
+
+    /// The narrow-projection counterpart to
+    /// `test_swr_revalidation_discards_result_invalidated_mid_flight`: a
+    /// revalidation whose collected batches carry no `response_status`
+    /// column or schema-metadata marker (a narrow `SELECT` pruned it, same
+    /// as the live-query gap `plan_saw_transient_http_failure` fixes) must
+    /// still not overwrite the stale entry when its execution plan recorded
+    /// a transient HTTP failure — `batches_cacheable` alone cannot see it.
+    #[tokio::test]
+    async fn test_swr_revalidation_discards_result_with_plan_reported_transient_failure() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+
+        let schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("rank", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("valid record batch");
+
+        let revalidation_started_at = std::time::Instant::now();
+        let plan_with_failure: Arc<dyn ExecutionPlan> =
+            Arc::new(MetricsOnlyExecutionPlan::with_transient_failure_count(1));
+
+        let key = RawCacheKey::new(33);
+        Query::cache_revalidation_result(
+            &df,
+            &key,
+            vec![batch],
+            schema,
+            Arc::new(HashSet::from([TableReference::bare(
+                "narrow_projection_table",
+            )])),
+            revalidation_started_at,
+            Some(plan_with_failure),
+        )
+        .await;
+        cache_provider.run_pending_tasks().await;
+
+        assert!(
+            cache_provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "a revalidation whose plan recorded a transient HTTP failure must not \
+            repopulate the cache, even when the collected batches themselves carry no \
+            response_status signal"
         );
     }
 

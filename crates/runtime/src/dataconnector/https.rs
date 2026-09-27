@@ -1514,7 +1514,14 @@ fn build_json_nest_schema(
         let nullable = column.nullable.unwrap_or(true);
         fields.push(arrow_schema::Field::new(name, dt, nullable));
     }
-    Ok(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
+    // Carry the base schema's HTTP-provenance marker forward even though the
+    // decomposed schema is otherwise a different set of fields: it is what
+    // `cache::http_fetch_status` checks to tell a real HTTP-connector
+    // batch from an unrelated dataset that happens to have a same-shaped
+    // `response_status` column of its own (see `HTTP_RESPONSE_STATUS_METADATA_KEY`).
+    Ok(std::sync::Arc::new(
+        arrow_schema::Schema::new_with_metadata(fields, base.metadata().clone()),
+    ))
 }
 
 /// Compute the static schema (no source I/O) for an HTTPS dataset in
@@ -1609,6 +1616,11 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
         .cloned()
         .collect();
+    // The user-declared subset, captured before `_fetched_at` and
+    // `response_status` are force-added below regardless of declaration —
+    // see `HttpJsonNesting::catch_all_exclusions` for why only this subset
+    // may take a same-named JSON body key away from the catch-all.
+    let catch_all_exclusions = metadata_fields.clone();
 
     // Ensure `fetched_at` is always present so caching TTL eviction and
     // append-mode `time_column` work even when the user omits the column.
@@ -1617,10 +1629,42 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         metadata_fields.insert("_fetched_at".to_string());
     }
 
+    // `cache::batches_cacheable` tells a transient origin failure from real
+    // data by the row's `response_status` — not only for `refresh_mode:
+    // caching` (every fetch there, regardless of `caching_stale_if_error`),
+    // but also for the independent, runtime-wide SQL results cache
+    // (`cache::to_cached_record_batch_stream`), which can cache the result of
+    // any query against any dataset — accelerated or not, whatever its
+    // refresh mode — whenever `runtime.caching.sql_results` is enabled.
+    //
+    // The HTTP connector also tags every fetched batch's *schema* with the
+    // real per-fetch status (`HTTP_RESPONSE_STATUS_METADATA_KEY`, set by
+    // `HttpTableProvider::schema_with_fetch_status`), but that signal alone
+    // is not reliable once a query plan wraps the scan in another operator:
+    // a `FilterExec` (any `WHERE` clause) rebuilds its output batches against
+    // the plan's own schema, fixed at plan-construction time, which discards
+    // the dynamic per-fetch metadata — a regression test
+    // (`a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerated_dataset`
+    // in `caching_mode_stale_if_error.rs`) reproduces this with a plain
+    // `SELECT * ... WHERE request_path = ...`. Only the materialized
+    // `response_status` *column* survives such an operator (its data is
+    // preserved by value, independent of schema-object identity), so force
+    // it in unconditionally, the same way as `_fetched_at` above, rather
+    // than leaving either caller unable to detect the failure because the
+    // column never existed. A narrower gap remains for a `SELECT` that
+    // doesn't project `response_status` at all — see the PR discussion for
+    // #14157.
+
+    if !column_order.iter().any(|n| n == "response_status") {
+        column_order.push("response_status".to_string());
+        metadata_fields.insert("response_status".to_string());
+    }
+
     Ok(Some(HttpJsonNesting::new(
         column_order,
         json_column.name.clone(),
         metadata_fields,
+        catch_all_exclusions,
     )))
 }
 
@@ -2130,7 +2174,7 @@ data_connector_api::register_data_connector!(
 mod tests {
     use super::*;
     use crate::component::dataset::Dataset;
-    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::acceleration::{Acceleration, StaleIfError};
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::RuntimeConnectorContext;
     use crate::parameters::Parameters;
@@ -3607,7 +3651,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert_eq!(nesting.json_field_name(), "data");
         assert_eq!(
             nesting.column_order,
-            vec!["id", "name", "data", "_fetched_at"]
+            vec!["id", "name", "data", "_fetched_at", "response_status"]
         );
         assert!(nesting.static_fields().contains("id"));
         assert!(nesting.static_fields().contains("name"));
@@ -3726,6 +3770,131 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(nesting.static_fields().contains("id"));
     }
 
+    /// Regression test for #14156/#14157: without this, a `refresh_mode:
+    /// caching` dataset that decomposes JSON into named columns never carries
+    /// `response_status` unless the user happens to declare it, so
+    /// `cache::batches_cacheable` can never see a transient origin failure —
+    /// not just for the stale-if-error fallback, but for the unconditional
+    /// "don't cache a 5xx as if it were data" check every caching-mode fetch
+    /// goes through. Forced regardless of `caching_stale_if_error`: leaving it
+    /// out when stale-if-error happens to be disabled would still let a 5xx
+    /// silently overwrite the last good cached entry. The schema-level
+    /// `HTTP_RESPONSE_STATUS_METADATA_KEY` marker alone is not enough: a
+    /// `FilterExec` (any `WHERE` clause) rebuilds its output against the
+    /// plan's own, plan-time-fixed schema and discards the dynamic per-fetch
+    /// metadata — see the comment above this function.
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_when_stale_if_error_enabled() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::Enabled,
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "response_status must be force-included so stale-if-error can detect a transient failure"
+        );
+        assert!(nesting.metadata_fields.contains("response_status"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_even_when_stale_if_error_disabled()
+     {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::Disabled,
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "batches_cacheable's unconditional 'don't cache a 5xx as data' check needs \
+            response_status regardless of caching_stale_if_error"
+        );
+    }
+
+    /// Regression test: `cache::batches_cacheable` isn't only called for
+    /// `refresh_mode: caching` — the independent, runtime-wide SQL results
+    /// cache (`runtime.caching.sql_results`) calls it for the query result of
+    /// *any* dataset, whatever its refresh mode. `response_status` has to be
+    /// force-included here too, or that cache can store a transient 5xx/429
+    /// from an `append`/`full` JSON-decomposed dataset as if it were ordinary
+    /// data and keep serving it for the entry's TTL.
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_for_non_caching_refresh_modes()
+    {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Append),
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "the runtime-wide SQL results cache can call batches_cacheable for any \
+            dataset's query result, regardless of its own refresh mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_for_a_finite_stale_if_error_window()
+     {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::For(std::time::Duration::from_mins(1)),
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "a finite stale-if-error window also needs response_status to detect a transient failure"
+        );
+    }
+
     #[tokio::test]
     async fn parse_http_json_nesting_rejects_catchall_named_after_metadata() {
         let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
@@ -3818,8 +3987,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        // 3 user-declared columns + auto-injected _fetched_at
-        assert_eq!(schema.fields().len(), 4);
+        // 3 user-declared columns + auto-injected _fetched_at + response_status
+        assert_eq!(schema.fields().len(), 5);
         // User-declared columns default to Utf8.
         for name in &["id", "name", "data"] {
             let f = schema
@@ -3846,7 +4015,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id", "name", "data", "_fetched_at"]
+            vec!["id", "name", "data", "_fetched_at", "response_status"]
         );
     }
 
@@ -3861,8 +4030,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        // 3 user-declared columns + auto-injected _fetched_at
-        assert_eq!(schema.fields().len(), 4);
+        // 3 user-declared columns + auto-injected _fetched_at + response_status
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
         assert!(!schema.field(0).is_nullable());
@@ -3875,6 +4044,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             schema.field(3).data_type(),
             &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
         );
+        assert_eq!(schema.field(4).name(), "response_status");
+        assert_eq!(schema.field(4).data_type(), &arrow_schema::DataType::UInt16,);
     }
 
     #[tokio::test]
@@ -3914,13 +4085,18 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             !nesting.static_fields().contains("_fetched_at"),
             "_fetched_at must not be a static body field"
         );
-        // Auto-injected at the end, after user-declared columns.
-        assert_eq!(
-            nesting
-                .column_order
-                .last()
-                .expect("column_order should include auto-injected _fetched_at"),
-            "_fetched_at"
+        // Auto-injected after the user-declared columns (response_status is
+        // also auto-injected, after _fetched_at — see
+        // parse_http_json_nesting_force_includes_response_status_for_non_caching_refresh_modes).
+        let user_declared = ["id", "title", "extra"];
+        let fetched_at_index = nesting
+            .column_order
+            .iter()
+            .position(|c| c == "_fetched_at")
+            .expect("column_order should include auto-injected _fetched_at");
+        assert!(
+            fetched_at_index >= user_declared.len(),
+            "_fetched_at must come after every user-declared column"
         );
     }
 
