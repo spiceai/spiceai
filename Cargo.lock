@@ -1955,6 +1955,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-sqs"
+version = "1.102.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0246bf049cfc003ce44599dff955b9353758de3afa68a053da9b2c7de20a07d8"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.6",
+ "aws-smithy-json",
+ "aws-smithy-observability 0.2.6",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.1",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.101.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3388,6 +3413,7 @@ dependencies = [
  "pingora-lru",
  "rand 0.10.1",
  "rstest 0.25.0",
+ "sharded-cache",
  "snafu",
  "spicepod",
  "tokio",
@@ -6212,6 +6238,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
+ "bytes",
  "chrono",
  "data-connector-types",
  "data-http-rate-control",
@@ -8208,6 +8235,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bb7ef65b3777a325d1eeefefab5b6d4959da54747e33bd6258e789640f307ad"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "evaluate-api"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "utoipa",
 ]
 
 [[package]]
@@ -11740,6 +11780,7 @@ dependencies = [
  "dotenv 2.4.0-unstable",
  "either",
  "embed-api",
+ "evaluate-api",
  "futures",
  "google-genai",
  "governor",
@@ -11778,6 +11819,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
+ "wiremock",
 ]
 
 [[package]]
@@ -17131,6 +17173,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-glue",
  "aws-sdk-s3",
+ "aws-sdk-sqs",
  "aws-sdk-sts",
  "axum",
  "axum-extra",
@@ -17205,6 +17248,7 @@ dependencies = [
  "duckdb",
  "duration-parse",
  "elasticsearch",
+ "evaluate-api",
  "event_stream",
  "flight_client",
  "fundu",
@@ -19275,6 +19319,14 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sharded-cache"
+version = "2.4.0-unstable"
+dependencies = [
+ "parking_lot",
+ "vstd",
 ]
 
 [[package]]

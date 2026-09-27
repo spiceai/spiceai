@@ -209,7 +209,9 @@ async fn shared_databricks_catalog_rate_controller(
         }
     })?;
     let connector_component = ConnectorComponent::from(catalog);
-    let rate_control = http_rate_control::resolve_config_for_component(
+    // The Databricks clients do not report per-request outcomes, so only the
+    // static limits apply.
+    let rate_control = http_rate_control::resolve_static_config_for_component(
         params,
         Some(&catalog.app.runtime.params),
         &connector_component,

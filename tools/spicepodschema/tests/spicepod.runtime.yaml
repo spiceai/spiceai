@@ -12,6 +12,9 @@ name: runtime-test
 # =============================================================================
 runtime:
   caching:
+    # `runtime.caching.*.engine` (`moka` | `pingora`) is accepted for
+    # compatibility and ignored at runtime; LruCache always uses the Spice
+    # sharded-cache backend. `engine: pingora` no longer selects Pingora.
     sql_results:
       enabled: true
       max_size: 1GiB # Default 128 MiB

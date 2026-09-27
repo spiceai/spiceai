@@ -1,0 +1,69 @@
+[
+  {
+    "name": "unauthenticated",
+    "status": 401,
+    "body": {
+      "error": "unauthorized"
+    }
+  },
+  {
+    "name": "north-sales",
+    "status": 200,
+    "body": {
+      "tenant_id": "north",
+      "paid_orders": 4,
+      "gross_cents": 22200,
+      "currency": "USD",
+      "definition": "paid-gross-v1"
+    }
+  },
+  {
+    "name": "south-sales",
+    "status": 200,
+    "body": {
+      "tenant_id": "south",
+      "paid_orders": 2,
+      "gross_cents": 24900,
+      "currency": "USD",
+      "definition": "paid-gross-v1"
+    }
+  },
+  {
+    "name": "tenant-query-rejected",
+    "status": 404,
+    "body": {
+      "error": "not_found"
+    }
+  },
+  {
+    "name": "north-search",
+    "status": 200,
+    "body": {
+      "tenant_id": "north",
+      "question": "shipping",
+      "evidence": [
+        {
+          "citation_id": "policy-3",
+          "article_id": 3,
+          "title": "Shipping delays",
+          "source_version": "fixture-2026-08",
+          "text": "Check the tracking number before opening a shipping delay ticket. Contact support after five business days."
+        },
+        {
+          "citation_id": "policy-1",
+          "article_id": 1,
+          "title": "Returning a trail boot",
+          "source_version": "fixture-2026-08",
+          "text": "Unused trail boots may be returned within 30 days. Keep the receipt and original packaging."
+        },
+        {
+          "citation_id": "policy-2",
+          "article_id": 2,
+          "title": "Waterproof care",
+          "source_version": "fixture-2026-08",
+          "text": "Brush off dirt and air dry waterproof shells. Do not use a tumble dryer."
+        }
+      ]
+    }
+  }
+]

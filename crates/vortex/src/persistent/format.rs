@@ -8,6 +8,7 @@ use std::fmt::Formatter;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -72,6 +73,7 @@ use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
+use super::access_plan::VortexRuntimeAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
 use super::cache::cache_footer;
 use super::segment_cache;
@@ -288,6 +290,7 @@ pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
     write_observer: Option<Arc<dyn VortexWriteObserver>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
@@ -300,6 +303,13 @@ impl Debug for VortexFormat {
             .field(
                 "access_plan_provider",
                 &self.access_plan_provider.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "runtime_access_plan_provider",
+                &self
+                    .runtime_access_plan_provider
+                    .as_ref()
+                    .map(|_| "configured"),
             )
             .field(
                 "write_observer",
@@ -487,6 +497,7 @@ impl VortexFormat {
             session,
             opts,
             access_plan_provider: None,
+            runtime_access_plan_provider: None,
             write_observer: None,
             segment_cache,
             write_shard: None,
@@ -615,6 +626,19 @@ impl VortexFormat {
     ) -> Self {
         Self {
             access_plan_provider: Some(access_plan_provider),
+            ..self.clone()
+        }
+    }
+
+    /// Creates a format whose scans also plan each file from the scan's runtime
+    /// predicate as the file opens. See [`VortexRuntimeAccessPlanProvider`].
+    #[must_use]
+    pub fn with_runtime_access_plan_provider(
+        &self,
+        runtime_access_plan_provider: Arc<dyn VortexRuntimeAccessPlanProvider>,
+    ) -> Self {
+        Self {
+            runtime_access_plan_provider: Some(runtime_access_plan_provider),
             ..self.clone()
         }
     }
@@ -1007,18 +1031,20 @@ impl FileFormat for VortexFormat {
                     .map(|(acc, size)| acc + size);
 
                 let target_dtype = DType::from_arrow(field.as_ref());
-                let min = scalar_stat_to_df(
+                let min = stat_bound_to_df(
                     Stat::Min,
                     stats_set.get(Stat::Min),
                     stats_dtype,
                     &target_dtype,
+                    field.data_type(),
                 );
 
-                let max = scalar_stat_to_df(
+                let max = stat_bound_to_df(
                     Stat::Max,
                     stats_set.get(Stat::Max),
                     stats_dtype,
                     &target_dtype,
+                    field.data_type(),
                 );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
@@ -1090,6 +1116,10 @@ impl FileFormat for VortexFormat {
 
         source = source
             .with_file_metadata_cache(state.runtime_env().cache_manager.get_file_metadata_cache());
+
+        if let Some(provider) = self.runtime_access_plan_provider.as_ref() {
+            source = source.with_runtime_access_plan_provider(Arc::clone(provider));
+        }
 
         let conf = FileScanConfigBuilder::from(file_scan_config)
             .with_source(Arc::new(source))
@@ -1166,6 +1196,123 @@ impl FileFormat for VortexFormat {
     }
 }
 
+/// A `Min` or `Max` bound, tagged as the column's own Arrow type.
+///
+/// Bounds are compared against literals of the column's type. `FilterExec` builds
+/// an `Interval` from the pair and asserts both endpoints share one type, taking
+/// whichever end the file does not describe from the column, so a bound tagged
+/// for another type fails planning for every query that projects that column,
+/// rather than only costing pruning.
+///
+/// Vortex has one string dtype and one binary dtype where Arrow has several
+/// representations, so a footer bound on a `LargeUtf8` column surfaces as `Utf8`.
+/// The column's Vortex dtype is tried first because it reconstructs the types
+/// Vortex models directly (dictionaries, temporal extensions); the fallback
+/// converts on the value's own dtype and copies the column's tag onto the
+/// payload. Decimal bounds also use the column's Arrow storage width: Vortex
+/// chooses their width from precision, independently of the Arrow field's width.
+/// A value that cannot carry the column's type is reported as no bound.
+fn stat_bound_to_df(
+    stat: Stat,
+    value: stats::Precision<VortexScalarValue>,
+    stats_dtype: &DType,
+    target_dtype: &DType,
+    column_type: &DataType,
+) -> stats::Precision<datafusion_common::ScalarValue> {
+    let Some(scalar_dtype) = stat.dtype(stats_dtype) else {
+        return stats::Precision::Absent;
+    };
+
+    value.and_then(|value| {
+        let scalar = Scalar::try_new(scalar_dtype, Some(value)).ok()?;
+        scalar
+            .cast(target_dtype)
+            .ok()
+            .and_then(|cast| cast.try_to_df().ok())
+            .or_else(|| scalar.try_to_df().ok())
+            .and_then(|bound| retag_bound_to_column(&bound, column_type))
+    })
+}
+
+/// `value` as `column_type`, keeping the payload.
+///
+/// Arrow's string and binary families each hold several representations that
+/// Vortex collapses to one dtype, and a bound recorded under one of them still
+/// describes the other: bytes for a string column while they are valid UTF-8,
+/// text for a binary column as its bytes. A bound with no value describes no
+/// bound, so it is dropped rather than retagged.
+fn retag_bound_to_column(value: &ScalarValue, column_type: &DataType) -> Option<ScalarValue> {
+    if value.is_null() {
+        return None;
+    }
+    let value_type = value.data_type();
+    if &value_type == column_type {
+        return Some(value.clone());
+    }
+
+    // Vortex uses the narrowest decimal width for its precision. Restoring the
+    // Arrow field's width only widens storage, without rounding or rescaling.
+    if matches!(
+        (&value_type, column_type),
+        (
+            DataType::Decimal32(p, s),
+            DataType::Decimal64(target_p, target_s)
+                | DataType::Decimal128(target_p, target_s)
+                | DataType::Decimal256(target_p, target_s),
+        ) | (
+            DataType::Decimal64(p, s),
+            DataType::Decimal128(target_p, target_s)
+                | DataType::Decimal256(target_p, target_s),
+        ) | (
+            DataType::Decimal128(p, s),
+            DataType::Decimal256(target_p, target_s),
+        ) if p == target_p && s == target_s
+    ) {
+        return value
+            .cast_to(column_type)
+            .ok()
+            .filter(|bound| !bound.is_null());
+    }
+
+    match column_type {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            let text = match value {
+                ScalarValue::Utf8(text)
+                | ScalarValue::LargeUtf8(text)
+                | ScalarValue::Utf8View(text) => text.clone()?,
+                ScalarValue::Binary(bytes)
+                | ScalarValue::LargeBinary(bytes)
+                | ScalarValue::BinaryView(bytes) => {
+                    std::str::from_utf8(bytes.as_deref()?).ok()?.to_string()
+                }
+                _ => return None,
+            };
+            Some(match column_type {
+                DataType::Utf8 => ScalarValue::Utf8(Some(text)),
+                DataType::LargeUtf8 => ScalarValue::LargeUtf8(Some(text)),
+                _ => ScalarValue::Utf8View(Some(text)),
+            })
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+            let bytes = match value {
+                ScalarValue::Binary(bytes)
+                | ScalarValue::LargeBinary(bytes)
+                | ScalarValue::BinaryView(bytes) => bytes.clone()?,
+                ScalarValue::Utf8(text)
+                | ScalarValue::LargeUtf8(text)
+                | ScalarValue::Utf8View(text) => text.as_deref()?.as_bytes().to_vec(),
+                _ => return None,
+            };
+            Some(match column_type {
+                DataType::Binary => ScalarValue::Binary(Some(bytes)),
+                DataType::LargeBinary => ScalarValue::LargeBinary(Some(bytes)),
+                _ => ScalarValue::BinaryView(Some(bytes)),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn scalar_stat_to_df(
     stat: Stat,
     value: stats::Precision<VortexScalarValue>,
@@ -1198,6 +1345,146 @@ mod tests {
 
     use super::*;
     use crate::common_tests::TestSessionContext;
+    use crate::convert::FromDataFusion;
+    use datafusion_common::arrow::datatypes::i256;
+
+    #[test]
+    fn decimal_bounds_preserve_arrow_width_and_statistical_precision() -> anyhow::Result<()> {
+        for expected in [
+            ScalarValue::Decimal32(Some(-4_200), 5, 2),
+            ScalarValue::Decimal64(Some(-4_200), 5, 2),
+            ScalarValue::Decimal128(Some(-4_200), 5, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(-4_200)), 5, 2),
+            ScalarValue::Decimal64(Some(4_200), 10, 2),
+            ScalarValue::Decimal128(Some(4_200), 10, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(4_200)), 10, 2),
+            ScalarValue::Decimal128(Some(i128::from(i64::MAX) + 1), 20, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(i128::from(i64::MAX) + 1)), 20, 2),
+            ScalarValue::Decimal256(Some(i256::from_i128(i128::MAX)), 50, 10),
+            ScalarValue::Decimal128(Some(99_999), 5, -2),
+            ScalarValue::Decimal256(Some(i256::ZERO), 5, 2),
+        ] {
+            let scalar = Scalar::from_df(&expected)?;
+            let raw = scalar
+                .value()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("expected a non-null decimal bound"))?;
+            let column_type = expected.data_type();
+            for stat in [Stat::Min, Stat::Max] {
+                for value in [
+                    stats::Precision::Exact(raw.clone()),
+                    stats::Precision::Inexact(raw.clone()),
+                ] {
+                    let expected_stat = value.as_ref().map(|_| expected.clone());
+                    assert_eq!(
+                        stat_bound_to_df(stat, value, scalar.dtype(), scalar.dtype(), &column_type),
+                        expected_stat,
+                        "{stat:?} bound for {column_type:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_bounds_reject_narrowing_rescaling_and_nulls() {
+        for (value, column_type) in [
+            (
+                ScalarValue::Decimal64(Some(42), 5, 2),
+                DataType::Decimal32(5, 2),
+            ),
+            (
+                ScalarValue::Decimal64(Some(4_200), 10, 2),
+                DataType::Decimal128(10, 3),
+            ),
+            (
+                ScalarValue::Decimal64(Some(4_200), 10, 2),
+                DataType::Decimal128(12, 2),
+            ),
+            (
+                ScalarValue::Decimal64(Some(i64::MAX), 9, 2),
+                DataType::Decimal32(9, 2),
+            ),
+            (
+                ScalarValue::Decimal32(None, 5, 2),
+                DataType::Decimal128(5, 2),
+            ),
+            (ScalarValue::Int64(Some(42)), DataType::Decimal128(10, 2)),
+        ] {
+            assert_eq!(retag_bound_to_column(&value, &column_type), None);
+        }
+    }
+
+    #[test]
+    fn string_bounds_take_the_columns_representation() {
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::Utf8(Some("N".to_string())),
+                &DataType::LargeUtf8
+            ),
+            Some(ScalarValue::LargeUtf8(Some("N".to_string()))),
+            "a `Utf8` bound keeps its value as the `LargeUtf8` column's bound"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::LargeUtf8(Some("N".to_string())),
+                &DataType::Utf8View
+            ),
+            Some(ScalarValue::Utf8View(Some("N".to_string()))),
+            "and back the other way"
+        );
+        assert_eq!(
+            retag_bound_to_column(&ScalarValue::Utf8(None), &DataType::LargeUtf8),
+            None,
+            "a bound with no value describes no bound"
+        );
+    }
+
+    #[test]
+    fn bounds_survive_the_string_and_binary_families_being_swapped() {
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::Binary(Some(b"Y".to_vec())),
+                &DataType::LargeUtf8
+            ),
+            Some(ScalarValue::LargeUtf8(Some("Y".to_string()))),
+            "a bound recorded as bytes is still the string column's bound"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::LargeUtf8(Some("Y".to_string())),
+                &DataType::Binary
+            ),
+            Some(ScalarValue::Binary(Some(b"Y".to_vec()))),
+            "and the same holds for a binary column whose bound came back as text"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::Binary(Some(vec![0xff, 0xfe])),
+                &DataType::Utf8
+            ),
+            None,
+            "bytes that are not text are not a bound for a string column"
+        );
+    }
+
+    #[test]
+    fn a_bound_of_another_family_is_dropped_rather_than_mistagged() {
+        assert_eq!(
+            retag_bound_to_column(&ScalarValue::Int32(Some(7)), &DataType::LargeUtf8),
+            None,
+            "a number is not a bound for a string column"
+        );
+        assert_eq!(
+            retag_bound_to_column(
+                &ScalarValue::LargeUtf8(Some("N".to_string())),
+                &DataType::Int64
+            ),
+            None,
+            "and text is not a bound for a numeric column"
+        );
+    }
 
     #[tokio::test]
     async fn create_table() -> anyhow::Result<()> {

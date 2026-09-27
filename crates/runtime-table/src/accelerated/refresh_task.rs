@@ -287,7 +287,7 @@ impl RefreshTaskBuilder {
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
-                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
             )),
         }
     }

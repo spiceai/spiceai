@@ -1,0 +1,15 @@
+{
+  "scope": "Offline outer-CRD structural validation; no runtime, admission, image, identity, or cluster execution. Nested Spicepod needs separate validation.",
+  "results": [
+    {
+      "file": "spicepodcluster.template.json",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepodset.template.json",
+      "valid": true,
+      "errors": []
+    }
+  ]
+}

@@ -63,7 +63,7 @@ utoipa = { workspace = true, optional = true }
 # These three came across with the code that reads them and are forwarded from
 # `runtime`'s features of the same name, so the carve does not change what is
 # compiled. They are NOT new capability features — see the "a feature is a crate"
-# rule in CLAUDE.md; they retire with the rest of `runtime`'s feature set.
+# rule in AGENTS.md; they retire with the rest of `runtime`'s feature set.
 #
 # `kafka` matters for behaviour, not just codegen: `handle_stream_error` classifies
 # `EmptyBatch`/`PollExceeded` as transient so a Kafka CDC stream retries instead of
