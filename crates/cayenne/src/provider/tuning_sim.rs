@@ -764,7 +764,9 @@ impl<'a> Sim<'a> {
                     let rec = self.moves.last().expect("just pushed");
                     let key = adj.actuator.as_str();
                     let sign: i8 = if rec.new > rec.old { 1 } else { -1 };
-                    if rec.old > 0 {
+                    // A move of magnitude 1 is the minimal integer step (e.g. a
+                    // reserve slot 1 -> 0): never a "jump", whatever its ratio.
+                    if rec.old > 0 && rec.new.abs_diff(rec.old) > 1 {
                         let rel = (rec.new as f64 - rec.old as f64).abs() / rec.old as f64;
                         if sign < 0 {
                             pm.max_relative_shrink = pm.max_relative_shrink.max(rel);

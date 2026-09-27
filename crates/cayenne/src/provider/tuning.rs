@@ -3019,12 +3019,24 @@ fn decide_goal(
         });
     }
 
-    // (4) Healthy-relax: every active goal comfortably met and memory ok → hand
-    // resources back, one per tick, smallest-goal-impact first. Relaxing need not
-    // be incremental, so it reuses the legacy ±50% steps. The memory buffers are
-    // deliberately NOT shrunk here (no memory pressure; keep them sized for the
-    // next burst).
-    if goals.all_comfortably_met(s) && mem_ok {
+    // (4) Healthy-relax: every active goal comfortably met, memory ok, AND the
+    // legacy healthy predicate — apply well under the offered-load interval and
+    // read-amp low. A goal being comfortably met is necessary but not sufficient
+    // to hand a resource back: the relax tier sheds write shards, and a shard
+    // shed at ρ≈0.9 (lag fine, apply barely keeping up) saturates the apply, the
+    // lag goal violates, the ingest tier re-adds the shard, and the two tiers
+    // limit-cycle (the closed-loop harness measured 116 direction reversals of
+    // `write_concurrency` per hour on a steady ρ≈0.9 stream, and a never-worse-
+    // than-static violation — the untouched warm start simply kept up). The
+    // headroom gate is what makes a ×2/3 shard step safe: at apply < 0.5 the
+    // step lands at ≤ 0.75, still keeping up. Relaxing need not be incremental,
+    // so it reuses the legacy ±50% steps. The memory buffers are deliberately NOT
+    // shrunk here (no memory pressure; keep them sized for the next burst).
+    if goals.all_comfortably_met(s)
+        && mem_ok
+        && s.apply_vs_arrival < HEALTHY_RATIO
+        && s.read_amp <= READ_AMP_LOW
+    {
         return relax_step(cur, b);
     }
 
@@ -5903,5 +5915,46 @@ mod tests {
         record_query_latency("never_registered_zzz", 1.0);
         deregister_query_observations("regtest_unique_tbl");
         record_query_latency("regtest_unique_tbl", 9.0); // post-deregister: no-op
+    }
+
+    /// Goal-mode relax needs apply headroom, not just a comfortably-met goal: a
+    /// lag goal far under target while the apply barely keeps up (ρ≈0.9) must NOT
+    /// shed a shard — that saturates the apply and starts a relax/tighten limit
+    /// cycle (measured in the closed-loop harness: 116 write-concurrency
+    /// reversals per hour). With real headroom (ρ=0.2) the shed still happens.
+    #[test]
+    fn goal_relax_requires_apply_headroom() {
+        let goals = lag_goal(5.0);
+        let b = bounds();
+        let cur = actuators();
+        let no_headroom = IngestSnapshot {
+            replication_lag_secs: Some(0.3),
+            apply_vs_arrival: 0.9,
+            read_amp: 1,
+            ..snap()
+        };
+        assert!(
+            goal_decide(&no_headroom, &cur, &b, &goals).is_none(),
+            "lag comfortably met but apply at 0.9 of the arrival gap: hold, do not shed"
+        );
+        let read_amp_high = IngestSnapshot {
+            replication_lag_secs: Some(0.3),
+            apply_vs_arrival: 0.2,
+            read_amp: READ_AMP_LOW + 1,
+            ..snap()
+        };
+        assert!(
+            goal_decide(&read_amp_high, &cur, &b, &goals).is_none(),
+            "lag comfortably met but read-amp elevated: hold, do not relax compaction"
+        );
+        let headroom = IngestSnapshot {
+            replication_lag_secs: Some(0.3),
+            apply_vs_arrival: 0.2,
+            read_amp: 1,
+            ..snap()
+        };
+        let adj = goal_decide(&headroom, &cur, &b, &goals).expect("headroom ⇒ relax");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        assert!(adj.new_value < cur.write_concurrency as u64);
     }
 }
