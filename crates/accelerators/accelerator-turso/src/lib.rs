@@ -741,7 +741,7 @@ impl DataAccelerator for TursoAccelerator {
                 None,
                 resolved_refresh_mode(source, acceleration),
             )
-            .await;
+            .await?;
 
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;

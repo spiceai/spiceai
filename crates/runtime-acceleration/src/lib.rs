@@ -43,16 +43,38 @@ pub enum Error {
 
 /// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
 /// during initialization, and carries any metadata from the snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum BootstrapStatus {
-    Bootstrapped(SnapshotDownloadInfo),
+    Bootstrapped {
+        info: SnapshotDownloadInfo,
+        subscription: Option<snapshot::notifications::Subscription>,
+    },
     None,
 }
 
+// A subscription is runtime ownership, not part of the downloaded snapshot's
+// identity. Cloning status preserves it through dataset initialization retries.
+impl PartialEq for BootstrapStatus {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::Bootstrapped { info: left, .. }, Self::Bootstrapped { info: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BootstrapStatus {}
+
 impl BootstrapStatus {
     #[must_use]
-    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
-        Self::Bootstrapped(info)
+    pub const fn bootstrapped(
+        info: SnapshotDownloadInfo,
+        subscription: Option<snapshot::notifications::Subscription>,
+    ) -> Self {
+        Self::Bootstrapped { info, subscription }
     }
 
     #[must_use]
@@ -69,7 +91,7 @@ impl BootstrapStatus {
     pub const fn last_updated_at(&self) -> Option<i64> {
         match self {
             Self::None => None,
-            Self::Bootstrapped(info) => info.last_updated_at,
+            Self::Bootstrapped { info, .. } => info.last_updated_at,
         }
     }
 
@@ -79,7 +101,16 @@ impl BootstrapStatus {
     pub const fn loaded_snapshot_id(&self) -> Option<u64> {
         match self {
             Self::None => None,
-            Self::Bootstrapped(info) => Some(info.snapshot_id),
+            Self::Bootstrapped { info, .. } => Some(info.snapshot_id),
+        }
+    }
+
+    /// Hand the bootstrap subscription to the table's refresh task without
+    /// stopping its consumer or losing announcements received during download.
+    pub fn take_snapshot_subscription(&mut self) -> Option<snapshot::notifications::Subscription> {
+        match self {
+            Self::Bootstrapped { subscription, .. } => subscription.take(),
+            Self::None => None,
         }
     }
 }

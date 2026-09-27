@@ -828,7 +828,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 None,
                 resolved_refresh_mode(source, acceleration),
             )
-            .await;
+            .await?;
 
             self.get_shared_pool(source).await?;
 

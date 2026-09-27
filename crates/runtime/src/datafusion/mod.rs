@@ -66,9 +66,7 @@ use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
-use runtime_acceleration::snapshot::notifications::{
-    NotificationConfig, SnapshotNotifications, Subscription,
-};
+use runtime_acceleration::snapshot::notifications::{SnapshotNotifications, Subscription};
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -882,7 +880,7 @@ pub struct DataFusion {
     /// The SQS consumers that reload `refresh_mode: snapshot` datasets when
     /// their snapshot location reports a new snapshot. Shared, so datasets on
     /// one queue use one consumer.
-    snapshot_notifications: SnapshotNotifications,
+    snapshot_notifications: Arc<SnapshotNotifications>,
     /// Datasets whose table provider is installed somewhere other than the
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
@@ -2885,7 +2883,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-        bootstrap_status: BootstrapStatus,
+        mut bootstrap_status: BootstrapStatus,
         initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
@@ -3085,14 +3083,20 @@ impl DataFusion {
         // Subscribed before the table is built, so a bad `s3_queue_url` fails the
         // dataset before its first refresh starts.
         let snapshot_subscription = match &snapshot_refresh_state {
-            Some(state) => self
-                .subscribe_to_snapshot_notifications(
-                    dataset,
-                    &acceleration_settings.snapshot_behavior,
-                    state,
-                )
-                .await?
-                .map(|subscription| (subscription, state.clone())),
+            Some(state) => {
+                let subscription = match bootstrap_status.take_snapshot_subscription() {
+                    Some(subscription) => Some(subscription),
+                    None => {
+                        self.subscribe_to_snapshot_notifications(
+                            dataset,
+                            &acceleration_settings.snapshot_behavior,
+                            state,
+                        )
+                        .await?
+                    }
+                };
+                subscription.map(|subscription| (subscription, state.clone()))
+            }
             None => None,
         };
 
@@ -3643,30 +3647,26 @@ impl DataFusion {
         snapshot_behavior: &SnapshotBehavior,
         state: &SnapshotRefreshState,
     ) -> Result<Option<Subscription>> {
-        let (SnapshotBehavior::Enabled(snapshots, secrets, io_runtime, _)
-        | SnapshotBehavior::BootstrapOnly(snapshots, secrets, io_runtime)) = snapshot_behavior
-        else {
+        let Some(notifications) = self.snapshot_notifications() else {
             return Ok(None);
         };
-        // The runtime's secrets are gone only while it shuts down.
-        let Some(secrets) = secrets.upgrade() else {
-            return Ok(None);
-        };
-        let config = NotificationConfig::resolve(snapshots, secrets)
+        notifications
+            .subscribe_for_behavior(snapshot_behavior, &state.manager)
             .await
             .context(SnapshotNotificationsConfigSnafu {
                 dataset_name: dataset.name.to_string(),
-            })?;
+            })
+    }
+
+    /// The queue consumers shared by local snapshot bootstrap and refresh.
+    pub(crate) fn snapshot_notifications(&self) -> Option<Arc<SnapshotNotifications>> {
         if matches!(
             self.cluster_config.effective_role(),
             Some(crate::config::ClusterRole::Scheduler)
         ) {
-            return Ok(None);
+            return None;
         }
-        Ok(config.map(|config| {
-            self.snapshot_notifications
-                .subscribe(&config, &state.manager, io_runtime)
-        }))
+        Some(Arc::clone(&self.snapshot_notifications))
     }
 
     // Compare the checkpoint schema (from the previous run) against the source/refresh

@@ -31,6 +31,7 @@ use runtime_acceleration::acceleration::{
 };
 use runtime_acceleration::acceleration_source::{AccelerationSource, resolved_refresh_mode};
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
+use runtime_acceleration::snapshot::notifications;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
 };
@@ -120,13 +121,16 @@ pub fn snapshot_bootstrap_enabled(
 /// [`should_download_snapshot`]; this function performs no checks of its own before
 /// downloading — it exists so the decision and the (potentially side-effecting) act of
 /// downloading can happen at different points in a caller's startup sequence.
+///
+/// # Errors
+/// Returns an error when snapshot notification configuration is invalid.
 pub async fn download_snapshot(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
-) -> BootstrapStatus {
+) -> Result<BootstrapStatus, notifications::Error> {
     let dataset_name = source.name().to_string();
     // The source opens its own checkpoint: each engine's checkpointer carries that
     // engine's sidecar SQL and lives in its own `runtime-checkpoint-*` crate, so it
@@ -145,9 +149,18 @@ pub async fn download_snapshot(
         if let Some(engine_override) = engine_override {
             manager = manager.with_snapshot_engine(engine_override);
         }
+        let manager = Arc::new(manager);
         let start_time = Instant::now();
-        let wait_for_snapshot = resolved_refresh_mode(source, acceleration)
-            == RefreshMode::Snapshot
+        let snapshot_reader = resolved_refresh_mode(source, acceleration) == RefreshMode::Snapshot;
+        let mut subscription =
+            if snapshot_reader && let Some(notifications) = source.snapshot_notifications() {
+                notifications
+                    .subscribe_for_behavior(&acceleration.snapshot_behavior, &manager)
+                    .await?
+            } else {
+                None
+            };
+        let wait_for_snapshot = snapshot_reader
             && matches!(
                 &acceleration.snapshot_behavior,
                 SnapshotBehavior::Enabled(config, ..) | SnapshotBehavior::BootstrapOnly(config, ..)
@@ -166,23 +179,35 @@ pub async fn download_snapshot(
                         info.bytes_downloaded,
                         &info.checksum,
                     );
-                    return BootstrapStatus::bootstrapped(info);
+                    return Ok(BootstrapStatus::bootstrapped(info, subscription));
                 }
                 Ok(None) if wait_for_snapshot => {
                     // A snapshot reader has no source from which to create its initial
                     // schema. Keep initialization pending until a publisher supplies it.
                     tracing::debug!(dataset = %dataset_name, "Waiting for the first snapshot");
-                    tokio::time::sleep(poll_interval).await;
+                    if let Some(notifications) = subscription.as_mut() {
+                        tokio::select! {
+                            announced = notifications.next_snapshot() => {
+                                if announced.is_none() {
+                                    subscription = None;
+                                    tokio::time::sleep(poll_interval).await;
+                                }
+                            }
+                            () = tokio::time::sleep(poll_interval) => {}
+                        }
+                    } else {
+                        tokio::time::sleep(poll_interval).await;
+                    }
                 }
-                Ok(None) => return BootstrapStatus::none(),
+                Ok(None) => return Ok(BootstrapStatus::none()),
                 Err(e) => {
                     tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
-                    return BootstrapStatus::none();
+                    return Ok(BootstrapStatus::none());
                 }
             }
         }
     } else {
-        BootstrapStatus::none()
+        Ok(BootstrapStatus::none())
     }
 }
 
@@ -193,6 +218,9 @@ pub async fn download_snapshot(
 /// callers (`DuckDB`, `SQLite`, Turso) that make the decision and perform the download at
 /// the same point in their startup, with no side-effecting setup of their own in
 /// between.
+///
+/// # Errors
+/// Returns an error when snapshot notification configuration is invalid.
 pub async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
@@ -200,9 +228,9 @@ pub async fn download_snapshot_if_needed(
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
     refresh_mode: RefreshMode,
-) -> BootstrapStatus {
+) -> Result<BootstrapStatus, notifications::Error> {
     if !should_download_snapshot(acceleration, source, &layout, refresh_mode) {
-        return BootstrapStatus::none();
+        return Ok(BootstrapStatus::none());
     }
 
     download_snapshot(acceleration, source, layout, engine, engine_override).await

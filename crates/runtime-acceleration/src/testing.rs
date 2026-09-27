@@ -164,6 +164,12 @@ impl AccelerationSource for TestAccelerationSource {
         Arc::clone(&self.secrets)
     }
 
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<crate::snapshot::notifications::SnapshotNotifications>> {
+        None
+    }
+
     fn acceleration(&self) -> Option<&Acceleration> {
         self.acceleration.as_ref()
     }

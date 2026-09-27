@@ -3800,7 +3800,7 @@ impl DataAccelerator for CayenneAccelerator {
                 AccelerationEngine::Cayenne,
                 Some(snapshot_engine),
             )
-            .await)
+            .await?)
         } else {
             Ok(BootstrapStatus::none())
         }
