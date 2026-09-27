@@ -255,6 +255,28 @@ impl PreparedOverwrite {
         }
     }
 
+    /// Publish every overwrite of one committed multi-table transaction, such as
+    /// a partitioned table's overwrite, and return each one's result with its
+    /// table id, in input order.
+    ///
+    /// Every publish starts before any is awaited. A publish can wait on its
+    /// table's listing fence, on the catalog, or on the source commits its
+    /// discarded in-memory rows release, while the transaction has already
+    /// committed every table: awaited one at a time, each table after a waiting
+    /// one would keep serving the rows the transaction replaced until it
+    /// finished.
+    pub async fn finish_all(prepared: Vec<Self>) -> Vec<(String, Result<u64>)> {
+        let publishes: Vec<_> = prepared
+            .into_iter()
+            .map(|prep| (prep.table_id().to_string(), prep.finish()))
+            .collect();
+        let mut results = Vec::with_capacity(publishes.len());
+        for (table_id, publish) in publishes {
+            results.push((table_id, publish.await));
+        }
+        results
+    }
+
     /// The steps of [`Self::finish`], run on their own task.
     async fn publish(self) -> Result<u64> {
         // Finish the secondary index before the visibility flip, which publishes

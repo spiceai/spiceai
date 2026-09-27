@@ -264,13 +264,13 @@ impl DataSink for CayennePartitionedOverwriteSink {
             }
 
             // Step 4: per-partition in-memory finish (snapshot id, listing
-            // table, deletion caches, GC trigger). Failures here are logged but
-            // do not roll back — the catalog has already committed, so readers
-            // see the new state via the next scan.
+            // table, deletion caches, GC trigger). Every partition's publish
+            // starts at once, so one that waits holds back no other. Failures
+            // here are logged but do not roll back — the catalog has already
+            // committed, so readers see the new state via the next scan.
             let mut total_rows: u64 = 0;
-            for prep in prepared {
-                let table_id = prep.table_id().to_string();
-                match prep.finish().await {
+            for (table_id, finished) in PreparedOverwrite::finish_all(prepared).await {
+                match finished {
                     Ok(rows) => total_rows = total_rows.saturating_add(rows),
                     Err(error) => {
                         tracing::warn!(

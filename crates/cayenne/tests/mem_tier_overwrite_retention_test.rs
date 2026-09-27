@@ -35,7 +35,10 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, PreparedOverwrite,
+    SlotAdvancer,
+};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -374,6 +377,95 @@ async fn a_cancelled_overwrite_still_applies_retention_impl(
 }
 
 test_with_backends!(a_cancelled_overwrite_still_applies_retention_impl);
+
+/// A partitioned table's overwrite commits every partition in one transaction and
+/// then publishes each partition's new snapshot. One partition's publish waiting,
+/// here on the source commits its discarded in-memory rows release, must not hold
+/// back the others: they committed with it, and until each one publishes, a scan
+/// of it serves the rows the transaction replaced.
+async fn a_waiting_publish_does_not_hold_back_the_other_partitions_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let waiting = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog),
+            memory_tier_options(&fixture, "partition_waiting", &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let other = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog),
+            memory_tier_options(&fixture, "partition_other", &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(GatedSlotAdvancer {
+        entered: Notify::new(),
+        release: Notify::new(),
+        released: AtomicBool::new(false),
+    });
+    waiting.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+    other.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    // A row in the first partition's in-memory tier, so its publish releases that
+    // row's source commit through the gated advancer and waits there.
+    cdc_apply(&waiting, id_value_batch(&[(1, 10)])?).await?;
+    cdc_apply(&other, id_value_batch(&[(2, 20)])?).await?;
+
+    let mut prepared = Vec::new();
+    for (table, row) in [(&waiting, (1, 11)), (&other, (2, 21))] {
+        let replacement = common::single_batch_stream(id_value_batch(&[row])?);
+        prepared
+            .push(tokio::time::timeout(WAIT_LIMIT, table.begin_overwrite(replacement, 1)).await??);
+    }
+    let mut txn = fixture.catalog.begin_transaction().await?;
+    for prep in &prepared {
+        prep.apply_in_txn(&fixture.catalog, &mut *txn).await?;
+    }
+    txn.commit().await?;
+    let committed = catalog
+        .get_table("partition_other")
+        .await?
+        .current_snapshot_id;
+
+    // The waiting partition is first, and the partitions are finished in order.
+    let publishing = tokio::spawn(PreparedOverwrite::finish_all(prepared));
+    tokio::time::timeout(WAIT_LIMIT, advancer.entered.notified())
+        .await
+        .map_err(
+            |_| "precondition: the first partition's publish never reached the slot advancer",
+        )?;
+    let deadline = tokio::time::Instant::now() + WAIT_LIMIT;
+    while other.current_snapshot_id() != committed {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the second partition still served snapshot {} {WAIT_LIMIT:?} after the transaction committed {committed}, while the first partition's publish waited",
+                other.current_snapshot_id()
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        table_rows(&other).await?,
+        ["2,21"],
+        "the second partition must serve its replacement while the first partition's publish waits"
+    );
+
+    advancer.open();
+    for (table_id, finished) in tokio::time::timeout(WAIT_LIMIT, publishing).await?? {
+        finished.map_err(|error| format!("publishing table {table_id}: {error}"))?;
+    }
+    assert_eq!(table_rows(&waiting).await?, ["1,11"]);
+    Ok(())
+}
+
+test_with_backends!(a_waiting_publish_does_not_hold_back_the_other_partitions_impl);
 
 /// An overwrite's catalog commit and its publish are separate steps. A caller
 /// dropped after the metastore committed but before the publish ran would leave
