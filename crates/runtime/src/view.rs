@@ -315,18 +315,42 @@ impl TableLayer for AttestingViewProvider {
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> Result<ScanResult> {
+        // Sample dependency generations before and after plan construction. The
+        // plan captures each provider's read view during `below.scan_with_args`;
+        // a dependency can refresh in that window (override B → configured A).
+        // Recording only the after sample would stamp A's fingerprint on B-derived
+        // rows and the publish gate would wrongly pass. Equal samples mean the
+        // recorded generation is the one the plan actually captured.
+        let before = if session_is_refresh_scan(state) {
+            Some(self.sample_dependency_generations().await)
+        } else {
+            None
+        };
+
         let result = below.scan_with_args(state, args).await?;
         let plan = result.into_inner();
-        if session_is_refresh_scan(state) {
-            let mut dependencies = Vec::with_capacity(self.dependency_refreshes.len());
-            for (name, refresh) in &self.dependency_refreshes {
-                let live = refresh.read().await;
-                dependencies.push((name.clone(), live.sample_materialization()));
+        if let Some(before_deps) = before {
+            let after_deps = self.sample_dependency_generations().await;
+            if before_deps == after_deps {
+                self.attestation
+                    .record_with_dependencies(classify_executed_read(plan.as_ref()), before_deps);
             }
-            self.attestation
-                .record_with_dependencies(classify_executed_read(plan.as_ref()), dependencies);
+            // Mismatch: leave any prior stamp alone. This refresh's view epoch was
+            // already advanced, so `bind_materialization_epoch` refuses an older
+            // stamp; a missing stamp refuses the same way.
         }
         Ok(ScanResult::new(plan))
+    }
+}
+
+impl AttestingViewProvider {
+    async fn sample_dependency_generations(&self) -> Vec<(TableReference, MaterializationSample)> {
+        let mut dependencies = Vec::with_capacity(self.dependency_refreshes.len());
+        for (name, refresh) in &self.dependency_refreshes {
+            let live = refresh.read().await;
+            dependencies.push((name.clone(), live.sample_materialization()));
+        }
+        dependencies
     }
 }
 
@@ -2482,6 +2506,106 @@ mod tests {
             assert!(
                 attestation.last_stamped().is_none(),
                 "a non-refresh scan must not write publish-gate attestation"
+            );
+        }
+
+        /// Layer that advances a dependency's materialization during `scan_with_args`,
+        /// modelling a refresh that lands while the view plan is being captured.
+        #[derive(Debug)]
+        struct FlipDepGenerationOnScan {
+            dep_identity: MaterializationIdentity,
+        }
+
+        #[async_trait]
+        impl TableLayer for FlipDepGenerationOnScan {
+            async fn scan_with_args<'a>(
+                &self,
+                below: &Arc<dyn TableProvider>,
+                state: &dyn Session,
+                args: ScanArgs<'a>,
+            ) -> Result<ScanResult> {
+                // Override B → configured A during plan capture.
+                let _ = self.dep_identity.begin_refresh();
+                self.dep_identity.set_configured(true);
+                below.scan_with_args(state, args).await
+            }
+        }
+
+        /// Behavioral model of Copilot `discussion_r4110568668`.
+        ///
+        /// Sampling dependency generation only *after* `below.scan_with_args`
+        /// lets a mid-scan B→A refresh stamp A's fingerprint on a plan that
+        /// captured B. Before+after equality refuses that interleaving: no
+        /// stamp is written, so publish cannot archive B-derived rows as A.
+        #[tokio::test]
+        async fn attesting_provider_refuses_to_stamp_when_dependency_moves_mid_scan() {
+            use runtime_component::dataset::acceleration::RefreshMode;
+            use runtime_table::accelerated::refresh::Refresh;
+            use tokio::sync::RwLock;
+
+            let dep_name = TableReference::bare("orders");
+            let dep_identity = MaterializationIdentity::new();
+            let dep_refresh = Arc::new(RwLock::new(
+                Refresh::new(RefreshMode::Full).with_materialization_identity(dep_identity.clone()),
+            ));
+
+            // Dependency starts on override B.
+            let epoch_b = dep_identity.begin_refresh();
+            assert_eq!(epoch_b, 1);
+            dep_identity.set_configured(false);
+
+            let ctx = ctx_with_tables(&["orders"]);
+            let logical = ctx
+                .state()
+                .create_logical_plan("SELECT id FROM orders")
+                .await
+                .expect("logical plan");
+            let view_table = ViewTable::new(logical, Some("orders view".to_string()));
+            let flipping = spice_table::SpiceTable::over(
+                Arc::new(FlipDepGenerationOnScan {
+                    dep_identity: dep_identity.clone(),
+                }),
+                Arc::new(view_table),
+            );
+
+            let view_identity = MaterializationIdentity::new();
+            let attestation = ViewRefreshReadAttestation::with_identity(view_identity.clone());
+            let _view_epoch = view_identity.begin_refresh();
+            let wrapped = wrap_view_refresh_attestation(
+                flipping,
+                attestation.clone(),
+                vec![(dep_name.clone(), Arc::clone(&dep_refresh))],
+            );
+
+            let mut state = ctx.state();
+            runtime_datafusion::refresh_scan::mark_refresh_scan(&mut state);
+            let _plan = wrapped
+                .scan(&state, None, &[], None)
+                .await
+                .expect("refresh scan");
+
+            let after = dep_identity.sample();
+            assert_eq!(after.epoch, 2, "flip layer must advance to A");
+            assert!(after.configured, "flip layer must mark A configured");
+
+            assert!(
+                attestation.last_stamped().is_none(),
+                "mid-scan B→A must not record A's generation over a B-captured plan"
+            );
+
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation.clone(),
+                vec![(dep_name, dep_refresh)],
+            );
+            gate.bind_materialization_epoch(view_identity.epoch());
+            let refused = gate
+                .check_publish()
+                .await
+                .expect_err("missing mid-scan stamp must refuse publish");
+            assert!(
+                refused.contains("no refresh-plan attestation") || refused.contains("orders_us"),
+                "refusal must withhold publish, got {refused}"
             );
         }
 
