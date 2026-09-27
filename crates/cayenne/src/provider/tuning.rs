@@ -3004,12 +3004,8 @@ fn decide_goal(
         // more files, uploads, commits, key churn, in-flight buffers): never while
         // a query goal is violated, never mutation-heavy, never CPU-, I/O- or
         // publish-bound, never under memory pressure.
-        let shards_allowed = !query_violated
-            && mem_ok
-            && !mutation_heavy
-            && cpu_ok
-            && !io_bound
-            && !publish_bound;
+        let shards_allowed =
+            !query_violated && mem_ok && !mutation_heavy && cpu_ok && !io_bound && !publish_bound;
         // (3a) Throughput cliff: the apply is behind by more than amortization can
         // recover (`APPLY_CLIFF_RATIO`), so go to encode parallelism FIRST — the
         // ingest analogue of the I/O-cliff fast path — with the legacy ×1.5 step
@@ -6272,7 +6268,15 @@ mod tests {
         for w in LAT_BUCKET_BOUNDS_MS.windows(2) {
             assert!((w[1] / w[0] - LAT_BUCKET_RATIO).abs() < 1e-9);
         }
-        assert!(LAT_BUCKET_BOUNDS_MS[LAT_BUCKET_COUNT - 1] > 60_000.0);
+        let last = LAT_BUCKET_BOUNDS_MS
+            .iter()
+            .copied()
+            .last()
+            .expect("non-empty ladder");
+        assert!(
+            last > 60_000.0,
+            "the ladder must reach past 60 s, top bound {last}"
+        );
         assert!((p99_bucket_lower_ms(1.0) - 0.0).abs() < f64::EPSILON);
     }
 
@@ -6340,7 +6344,11 @@ mod tests {
             ..snap()
         };
         let adj = goal_decide(&cliff, &one_shard, &b, &goals).expect("a move");
-        assert_eq!(adj.actuator, Actuator::WriteConcurrency, "cliff ⇒ shards first");
+        assert_eq!(
+            adj.actuator,
+            Actuator::WriteConcurrency,
+            "cliff ⇒ shards first"
+        );
         assert_eq!(adj.new_value, 2, "legacy ×1.5 step from 1 (at least +1)");
         let mild = IngestSnapshot {
             apply_vs_arrival: 1.5,
@@ -6384,10 +6392,21 @@ mod tests {
     #[test]
     fn target_file_size_bounds_are_ordered_for_any_warm_start() {
         let mib = 1024 * 1024_i64;
-        for initial in [0, 1, 64 * mib, 512 * mib, 4096 * mib, 5000 * mib, 65_536 * mib, i64::MAX / 8]
-        {
+        for initial in [
+            0,
+            1,
+            64 * mib,
+            512 * mib,
+            4096 * mib,
+            5000 * mib,
+            65_536 * mib,
+            i64::MAX / 8,
+        ] {
             let (lo, hi) = adaptive_target_file_size_bounds(initial);
-            assert!(lo <= hi, "unordered bounds ({lo}, {hi}) for warm start {initial}");
+            assert!(
+                lo <= hi,
+                "unordered bounds ({lo}, {hi}) for warm start {initial}"
+            );
             assert!(
                 initial <= hi,
                 "warm start {initial} above its own ceiling {hi}"

@@ -317,23 +317,29 @@ fn bounds_for(cores: usize) -> TuningBounds {
 }
 
 fn lag_goal(secs: f64) -> Goals {
-    Goals::from_targets(Some(secs), None, None, None, Duration::from_secs(60))
+    Goals::from_targets(Some(secs), None, None, None, Duration::from_mins(1))
 }
 
 fn freshness_goal(secs: f64) -> Goals {
-    Goals::from_targets(None, Some(secs), None, None, Duration::from_secs(60))
+    Goals::from_targets(None, Some(secs), None, None, Duration::from_mins(1))
 }
 
 fn latency_goal(ms: f64) -> Goals {
-    Goals::from_targets(None, None, Some(ms), None, Duration::from_secs(60))
+    Goals::from_targets(None, None, Some(ms), None, Duration::from_mins(1))
 }
 
 fn lag_and_latency_goal(lag_secs: f64, ms: f64) -> Goals {
-    Goals::from_targets(Some(lag_secs), None, Some(ms), None, Duration::from_secs(60))
+    Goals::from_targets(Some(lag_secs), None, Some(ms), None, Duration::from_mins(1))
 }
 
 fn lag_and_qph_goal(lag_secs: f64, qph: f64) -> Goals {
-    Goals::from_targets(Some(lag_secs), None, None, Some(qph), Duration::from_secs(60))
+    Goals::from_targets(
+        Some(lag_secs),
+        None,
+        None,
+        Some(qph),
+        Duration::from_mins(1),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -515,11 +521,15 @@ impl<'a> Sim<'a> {
             let rho = (phase.rows_per_s / p.service_rows_per_s(cur.write_concurrency)).min(1.5);
             p.cpu_ingest_per_shard * cur.write_concurrency.max(1) as f64 * rho.min(1.0)
         };
-        let cpu_compaction =
-            p.cpu_compaction * (2000.0 / cur.compaction_background_interval_ms.max(1) as f64).sqrt();
-        let cpu = (p.cpu_base + p.cpu_per_qps * served_qps + cpu_ingest + cpu_compaction)
-            .clamp(0.0, 1.5);
-        let served_qps = if cpu > 1.0 { served_qps / cpu } else { served_qps };
+        let cpu_compaction = p.cpu_compaction
+            * (2000.0 / cur.compaction_background_interval_ms.max(1) as f64).sqrt();
+        let cpu =
+            (p.cpu_base + p.cpu_per_qps * served_qps + cpu_ingest + cpu_compaction).clamp(0.0, 1.5);
+        let served_qps = if cpu > 1.0 {
+            served_qps / cpu
+        } else {
+            served_qps
+        };
         let p99_true = p.p99_base_ms
             + phase.query_ms_offset
             + p.p99_per_small_file_ms * read_amp as f64
@@ -531,7 +541,7 @@ impl<'a> Sim<'a> {
         let n_rec = n_q.min(64);
         for _ in 0..n_rec {
             self.query_counter += 1;
-            let lat = if self.query_counter % 50 == 0 {
+            let lat = if self.query_counter.is_multiple_of(50) {
                 p99_true
             } else {
                 p99_true * 0.4
@@ -585,9 +595,9 @@ impl<'a> Sim<'a> {
     /// Faithful copy of `CayenneContext::retune` + `track_goal_feasibility`.
     fn control_step(&mut self, snap: &IngestSnapshot, phase_idx: usize) -> Option<Adjustment> {
         let cur = self.live.values();
-        let since_last = self
-            .last_adjust_ms
-            .map_or(Duration::MAX, |t| Duration::from_millis((self.now_ms - t).max(0) as u64));
+        let since_last = self.last_adjust_ms.map_or(Duration::MAX, |t| {
+            Duration::from_millis((self.now_ms - t).max(0) as u64)
+        });
         let samples_at_last_move = self.last_adjust_samples;
         let b = self.sc.bounds;
         let goals = self.sc.goals;
@@ -758,7 +768,7 @@ impl<'a> Sim<'a> {
                 lag_sum += obs.lag_true_s;
                 pm.max_lag_s = pm.max_lag_s.max(obs.lag_true_s);
                 p99_sum += obs.p99_true_ms;
-                if let Mode::Auto = self.mode
+                if matches!(self.mode, Mode::Auto)
                     && let Some(adj) = self.control_step(&snap, pi)
                 {
                     let rec = self.moves.last().expect("just pushed");
@@ -981,7 +991,7 @@ fn evaluate(sc: &Scenario) -> Eval {
         // I4 — reversals on a stationary phase.
         if phase.stationary {
             for (k, n) in &pa.reversals {
-                let allowed = (MAX_REVERSALS_PER_HOUR as f64 * hours).ceil().max(1.0) as u32;
+                let allowed = (f64::from(MAX_REVERSALS_PER_HOUR) * hours).ceil().max(1.0) as u32;
                 if *n > allowed {
                     violations.push(format!(
                         "I4 phase={pi}({}) {k} reversed direction {n} times (allowed {allowed})",
@@ -1001,7 +1011,15 @@ fn evaluate(sc: &Scenario) -> Eval {
                     let rb = (b.old as f64 - b.new as f64) / b.old as f64;
                     ra.partial_cmp(&rb).expect("finite")
                 })
-                .map(|m| format!("{} {} -> {} ({})", m.actuator.as_str(), m.old, m.new, m.reason))
+                .map(|m| {
+                    format!(
+                        "{} {} -> {} ({})",
+                        m.actuator.as_str(),
+                        m.old,
+                        m.new,
+                        m.reason
+                    )
+                })
                 .unwrap_or_default();
             violations.push(format!(
                 "I4b phase={pi}({}) max relative shrink {:.2} > {MAX_RELATIVE_SHRINK}: {worst}",
@@ -1046,10 +1064,7 @@ fn evaluate(sc: &Scenario) -> Eval {
         let goal_dwell_ms =
             (u64::try_from(sc.goals.convergence_window.as_millis()).unwrap_or(u64::MAX) / 8)
                 .max(5_000);
-        let interval_reference = sc
-            .init
-            .compaction_background_interval_ms
-            .min(goal_dwell_ms);
+        let interval_reference = sc.init.compaction_background_interval_ms.min(goal_dwell_ms);
         if phase.expect_relax
             && let Some(v) = pa.final_values
             && (v.write_concurrency > sc.init.write_concurrency
@@ -1091,7 +1106,8 @@ fn evaluate(sc: &Scenario) -> Eval {
             ));
         }
         if auto.phases.iter().any(|p| p.infeasible_fired) {
-            violations.push("I6a plant meets every goal but the SLO was declared infeasible".to_string());
+            violations
+                .push("I6a plant meets every goal but the SLO was declared infeasible".to_string());
         }
     }
     Eval {
@@ -1110,7 +1126,11 @@ fn print_eval(e: &Eval) {
         .phases
         .iter()
         .map(|p| {
-            let mut r: Vec<String> = p.reversals.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            let mut r: Vec<String> = p
+                .reversals
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect();
             r.sort();
             format!("{}[{}]", p.name, r.join(","))
         })
@@ -1495,14 +1515,20 @@ fn run_set(set: Set, scenarios: &[Scenario]) -> usize {
 #[test]
 fn sim_train_invariants() {
     let total = run_set(Set::Train, &train_scenarios());
-    assert_eq!(total, 0, "controller invariant violations on the TRAIN set: {total}");
+    assert_eq!(
+        total, 0,
+        "controller invariant violations on the TRAIN set: {total}"
+    );
 }
 
 /// HELD-OUT set: never used to develop a fix; the report's headline.
 #[test]
 fn sim_heldout_invariants() {
     let total = run_set(Set::HeldOut, &heldout_scenarios());
-    assert_eq!(total, 0, "controller invariant violations on the HELD-OUT set: {total}");
+    assert_eq!(
+        total, 0,
+        "controller invariant violations on the HELD-OUT set: {total}"
+    );
 }
 
 /// G2 — the legacy (no goals) ladder's trace must not change. The hashes are
@@ -1579,15 +1605,20 @@ fn sim_property_sweep_no_panic_in_bounds_coherent() {
         if rng.chance(0.1) {
             b.compaction_background_interval_ms = (0, 0);
         }
-        let within_i64 = |rng: &mut Rng, (lo, hi): (i64, i64)| lo + ((hi - lo) as f64 * rng.next_f64()) as i64;
+        let within_i64 =
+            |rng: &mut Rng, (lo, hi): (i64, i64)| lo + ((hi - lo) as f64 * rng.next_f64()) as i64;
         let within_u64 = |rng: &mut Rng, (lo, hi): (u64, u64)| rng.range_u64(lo, hi);
-        let within_usize = |rng: &mut Rng, (lo, hi): (usize, usize)| rng.range_u64(lo as u64, hi as u64) as usize;
+        let within_usize =
+            |rng: &mut Rng, (lo, hi): (usize, usize)| rng.range_u64(lo as u64, hi as u64) as usize;
         let inline = within_i64(&mut rng, b.inline_flush_max_bytes);
         let cur = ActuatorValues {
             inline_flush_max_bytes: inline,
             inline_flush_max_rows: (inline / 256).max(64),
             inline_flush_max_segments: 64,
-            compaction_background_interval_ms: within_u64(&mut rng, b.compaction_background_interval_ms),
+            compaction_background_interval_ms: within_u64(
+                &mut rng,
+                b.compaction_background_interval_ms,
+            ),
             compaction_trigger_files: within_usize(&mut rng, b.compaction_trigger_files),
             bake_deletion_index_trigger: within_usize(&mut rng, b.bake_deletion_index_trigger),
             write_concurrency: within_usize(&mut rng, b.write_concurrency),
@@ -1646,7 +1677,15 @@ fn sim_property_sweep_no_panic_in_bounds_coherent() {
         let since_last = Duration::from_millis(rng.range_u64(0, 120_000));
         let samples_at_last = rng.range_u64(0, 100_000);
         let res = catch_unwind(AssertUnwindSafe(|| {
-            decide_with_goals(&snap, &cur, &b, since_last, MIN_DWELL, samples_at_last, &goals)
+            decide_with_goals(
+                &snap,
+                &cur,
+                &b,
+                since_last,
+                MIN_DWELL,
+                samples_at_last,
+                &goals,
+            )
         }));
         match res {
             Err(_) => {
@@ -1691,7 +1730,11 @@ fn sim_property_sweep_no_panic_in_bounds_coherent() {
     }
     assert_eq!(panics, 0, "decide_with_goals panicked");
     assert_eq!(out_of_bounds, 0, "a move left its bounds");
-    assert!(incoherent.is_empty(), "direction-incoherent moves: {}", incoherent.len());
+    assert!(
+        incoherent.is_empty(),
+        "direction-incoherent moves: {}",
+        incoherent.len()
+    );
 }
 
 /// P2 — the adaptive bounds derivations never produce `floor > ceiling` (which
@@ -1705,10 +1748,14 @@ fn sim_bounds_derivations_are_ordered() {
     std::panic::set_hook(Box::new(|_| {}));
     for _ in 0..2_000 {
         let initial = rng.range_u64(0, 8 * 1024 * MIB as u64) as i64;
-        let r = catch_unwind(AssertUnwindSafe(|| adaptive_target_file_size_bounds(initial)));
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            adaptive_target_file_size_bounds(initial)
+        }));
         match r {
             Err(_) => bad.push(format!("target_file_size_bounds({initial}) panicked")),
-            Ok((lo, hi)) if lo > hi => bad.push(format!("target_file_size_bounds({initial}) = ({lo}, {hi})")),
+            Ok((lo, hi)) if lo > hi => {
+                bad.push(format!("target_file_size_bounds({initial}) = ({lo}, {hi})"));
+            }
             Ok(_) => {}
         }
         let (lo, hi) = adaptive_inline_flush_bounds(initial);
