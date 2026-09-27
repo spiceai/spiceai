@@ -18162,6 +18162,12 @@ impl CayenneTableProvider {
         // currently visible rows. The rewrite commit clears deletion/protected
         // snapshot state, so the input stream must have already applied it.
         let ctx = self.create_session_context();
+        // The snapshot these rows come from, which the commit below replaces only
+        // if the table still points at it. Read before the rows, as the full
+        // compaction does: this method holds no `write_lock`, so a whole overwrite
+        // can run while it sorts, and the snapshot current at commit time would
+        // then be the overwrite's.
+        let replaced_snapshot_id = self.get_current_snapshot_id();
         let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Configured sort_columns win; default empty uses hottest observed filters (F4).
@@ -18311,15 +18317,24 @@ impl CayenneTableProvider {
         // state this rewrite did not fold in. FOLLOW-UP: give this path the same
         // scope tracking as `rewrite_current_snapshot_for_compaction` if it ever
         // becomes reachable concurrently with writers.
+        #[cfg(test)]
+        self.run_test_pre_publish_hook().await;
         if let Err(e) = self
-            .commit_snapshot_rewrite(
-                &self.get_current_snapshot_id(),
-                &new_snapshot_id,
-                &RewriteScope::All,
-            )
+            .commit_snapshot_rewrite(&replaced_snapshot_id, &new_snapshot_id, &RewriteScope::All)
             .await
         {
             cleanup_failed_snapshot.await;
+            if let CatalogError::SnapshotReplaced { current, .. } = &e {
+                // The table was replaced while this rewrite sorted: the sort is of
+                // rows the table no longer holds. Defer, as for staged work above.
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    replaced_snapshot_id = replaced_snapshot_id.as_str(),
+                    catalog_snapshot_id = current.as_str(),
+                    "Deferring sort-and-rewrite: the table was replaced while it sorted"
+                );
+                return Ok(());
+            }
             return Err(Error::Catalog { source: e });
         }
 
@@ -40677,6 +40692,92 @@ mod tests {
             provider.cold_manifest.load().is_none(),
             "a warm-only table's keyset rebuild must not resolve (and therefore must \
              not read) the cold-tier manifest"
+        );
+    }
+
+    /// `sort_and_rewrite_data` holds no `write_lock`, so a whole overwrite can run
+    /// while it sorts and encodes. Its commit must check the snapshot it read the
+    /// rows from: checked against the snapshot current at commit time, which is
+    /// the overwrite's, it would commit a sort of the replaced rows over the
+    /// overwrite, and both the live table and a restart would serve them.
+    #[tokio::test]
+    async fn sort_rewrite_does_not_supersede_an_overwrite_published_mid_rewrite() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const NAME: &str = "sort_rewrite_vs_overwrite";
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            NAME,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        for i in 0..4 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+
+        // A whole overwrite, catalog commit and in-memory publish, lands after
+        // the rewrite read its rows and before it commits.
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let schema = Arc::clone(&schema);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let replacement = id_value_batch(Arc::clone(&schema), &[100], &[1000]);
+                    let prepared = provider_in_hook
+                        .begin_overwrite(
+                            Box::pin(
+                                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                                    schema,
+                                    futures::stream::iter([Ok(replacement)]),
+                                ),
+                            ),
+                            1,
+                        )
+                        .await
+                        .expect("begin the replacement");
+                    prepared
+                        .apply_owned_txn()
+                        .await
+                        .expect("commit the replacement");
+                    prepared.finish().await.expect("publish the replacement");
+                })
+            }));
+        }
+
+        provider
+            .sort_and_rewrite_data(64 * 1024 * 1024)
+            .await
+            .expect("the sort rewrite runs");
+        assert!(
+            provider.test_pre_publish_hook.lock().is_none(),
+            "precondition: the rewrite must reach its commit"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, NAME).await,
+            vec![(100, 1000)],
+            "the replacement's rows are served"
+        );
+        let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .open(NAME)
+            .await
+            .expect("reopen the table from its catalog");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, NAME).await,
+            vec![(100, 1000)],
+            "after a restart the table must hold the replacement's rows, not a sort of the rows it replaced"
         );
     }
 
