@@ -6,19 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
-        ]
-      },
-      "primary_key": {
-        "id": 890
-      }
-    },
-    {
-      "_score": "0.01",
+      "_score": "0.28",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -30,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.01",
+      "_score": "0.24",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -42,7 +30,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.01",
+      "_score": "0.23",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -51,6 +39,18 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 449
+      }
+    },
+    {
+      "_score": "0.20",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
+        ]
+      },
+      "primary_key": {
+        "id": 1193
       }
     }
   ]
