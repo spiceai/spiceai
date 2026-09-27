@@ -1691,9 +1691,9 @@ impl ScanViewCache {
     }
 }
 
-/// Test-only mid-pass hook: an async callback fired between a compaction
-/// pass's catalog CAS commit and its fenced in-memory publish. See
-/// `CayenneTableProvider::test_pre_publish_hook`.
+/// Test-only mid-pass hook: an async callback fired at a fixed point of a
+/// compaction or rewrite pass. See `CayenneTableProvider::test_pre_publish_hook`
+/// and `CayenneTableProvider::test_post_catalog_commit_hook`.
 #[cfg(test)]
 type TestPrePublishHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
@@ -1897,12 +1897,19 @@ pub struct CayenneTableProvider {
     /// the capture that follows a promotion pays no metastore read. Shared across
     /// writer clones of the same table.
     cold_manifest: Arc<ArcSwap<Option<ColdManifestForSnapshot>>>,
-    /// Test-only seam fired between the catalog CAS commit and the fenced
-    /// in-memory publish of the subset-merge/seq-prefix-bake passes, so a test
-    /// can commit a snapshot replacement (overwrite/promotion) inside the exact
-    /// window the mid-pass overwrite guard defends. Consumed on first fire.
+    /// Test-only seam fired just before a pass publishes, so a test can commit a
+    /// snapshot replacement (overwrite/promotion) inside the exact window the
+    /// pass's overwrite guard defends: between the catalog CAS commit and the
+    /// fenced in-memory publish of the subset-merge/seq-prefix-bake passes, and
+    /// before the full compaction and `sort_and_rewrite_data` take the fence
+    /// they commit under. Consumed on first fire.
     #[cfg(test)]
     test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired by `sort_and_rewrite_data` after its catalog commit
+    /// and before its in-memory flip, so a test can commit an overwrite between
+    /// the two. Consumed on first fire.
+    #[cfg(test)]
+    test_post_catalog_commit_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Test-only seam fired after the orphaned-DV sweep captures its eligibility
     /// view (and released the listing fence) but before it unlinks anything, so a
     /// test can advance the floor and re-signal inside the exact window a running
@@ -8944,6 +8951,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -11004,6 +11013,8 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
+            #[cfg(test)]
+            test_post_catalog_commit_hook: Arc::clone(&self.test_post_catalog_commit_hook),
             #[cfg(test)]
             test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
             #[cfg(test)]
@@ -18317,12 +18328,22 @@ impl CayenneTableProvider {
         // state this rewrite did not fold in. FOLLOW-UP: give this path the same
         // scope tracking as `rewrite_current_snapshot_for_compaction` if it ever
         // becomes reachable concurrently with writers.
+        //
+        // The commit and the in-memory flip below run under one
+        // `listing_fence.write()`, as in the full compaction. An overwrite
+        // publishes under this fence after committing its own catalog pointer,
+        // so one that commits after this commit publishes after the flip, and
+        // the live table and the catalog both end on its snapshot. Were the
+        // fence released between the two, that overwrite could publish first,
+        // and the flip would then put the sorted old rows back over it.
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
+        let listing_guard = self.listing_fence.write().await;
         if let Err(e) = self
             .commit_snapshot_rewrite(&replaced_snapshot_id, &new_snapshot_id, &RewriteScope::All)
             .await
         {
+            drop(listing_guard);
             cleanup_failed_snapshot.await;
             if let CatalogError::SnapshotReplaced { current, .. } = &e {
                 // The table was replaced while this rewrite sorted: the sort is of
@@ -18337,20 +18358,20 @@ impl CayenneTableProvider {
             }
             return Err(Error::Catalog { source: e });
         }
+        #[cfg(test)]
+        self.run_test_post_catalog_commit_hook().await;
 
-        // Now that the catalog is committed, publish the new snapshot to the in-memory
-        // state as a SINGLE atomic visibility flip under listing_fence: the snapshot-id
-        // update, deletion-cache clear, and listing swap must be visible together, or a
+        // Publish the new snapshot in memory as a SINGLE atomic visibility flip
+        // under the fence still held from the commit: the snapshot-id update,
+        // deletion-cache clear, and listing swap must be visible together, or a
         // concurrent scan (holding listing_fence.read() and capturing the deletion
         // snapshot and snapshot id at different points) can observe a torn state and
         // silently vanish/resurrect rows. Mirrors `publish_overwrite_snapshot` and the
         // compaction publish in `rewrite_current_snapshot_for_compaction`.
-        {
-            let _fence = self.listing_fence.write().await;
-            self.update_current_snapshot_id(&new_snapshot_id);
-            self.clear_all_deletion_caches();
-            self.listing_table.store(new_listing_table);
-        }
+        self.update_current_snapshot_id(&new_snapshot_id);
+        self.clear_all_deletion_caches();
+        self.listing_table.store(new_listing_table);
+        drop(listing_guard);
 
         // Old snapshot directories are cleaned up in the background
         self.schedule_old_snapshot_cleanup();
@@ -26627,6 +26648,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_pre_publish_hook(&self) {
         let hook = self.test_pre_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-catalog-commit hook, if one is
+    /// installed. See [`Self::test_post_catalog_commit_hook`].
+    #[cfg(test)]
+    async fn run_test_post_catalog_commit_hook(&self) {
+        let hook = self.test_post_catalog_commit_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -40778,6 +40809,116 @@ mod tests {
             collect_id_value_pairs(&ctx, &reopened, NAME).await,
             vec![(100, 1000)],
             "after a restart the table must hold the replacement's rows, not a sort of the rows it replaced"
+        );
+    }
+
+    /// An overwrite publishes under `listing_fence` after committing its catalog
+    /// pointer, so the sort rewrite has to hold that fence from its own catalog
+    /// commit to its in-memory flip. Otherwise an overwrite committing between
+    /// the two publishes first, the flip then puts the sorted old rows back in
+    /// the live table, and the table serves them while the catalog points at
+    /// the overwrite.
+    #[tokio::test]
+    async fn sort_rewrite_flip_does_not_land_over_an_overwrite_committed_after_it() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const NAME: &str = "sort_rewrite_flip_vs_overwrite";
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            NAME,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        for i in 0..4 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+
+        // Written before the rewrite starts, and holding `write_lock`, which the
+        // rewrite does not take.
+        let replacement = id_value_batch(Arc::clone(&schema), &[100], &[1000]);
+        let prepared = provider
+            .begin_overwrite(
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        futures::stream::iter([Ok(replacement)]),
+                    ),
+                ),
+                1,
+            )
+            .await
+            .expect("begin the replacement");
+
+        // The overwrite commits right after the rewrite's catalog commit, then
+        // publishes as early as the rewrite's locks let it: at once when the
+        // rewrite does not hold the listing fence here, and once it releases the
+        // fence when it does.
+        let deferred_publish: Arc<ParkingMutex<Option<tokio::task::JoinHandle<Result<u64>>>>> =
+            Arc::default();
+        {
+            let deferred_publish = Arc::clone(&deferred_publish);
+            let fence = Arc::clone(&provider.listing_fence);
+            *provider.test_post_catalog_commit_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    prepared
+                        .apply_owned_txn()
+                        .await
+                        .expect("commit the replacement");
+                    let fence_is_free = fence.try_write().is_ok();
+                    let publish = tokio::spawn(prepared.finish());
+                    if fence_is_free {
+                        publish
+                            .await
+                            .expect("the publish task completes")
+                            .expect("publish the replacement");
+                    } else {
+                        *deferred_publish.lock() = Some(publish);
+                    }
+                })
+            }));
+        }
+
+        provider
+            .sort_and_rewrite_data(64 * 1024 * 1024)
+            .await
+            .expect("the sort rewrite runs");
+        assert!(
+            provider.test_post_catalog_commit_hook.lock().is_none(),
+            "precondition: the rewrite must commit"
+        );
+        let deferred = deferred_publish.lock().take();
+        if let Some(publish) = deferred {
+            publish
+                .await
+                .expect("the publish task completes")
+                .expect("publish the replacement");
+        }
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, NAME).await,
+            vec![(100, 1000)],
+            "the live table must serve the replacement, not a sort of the rows it replaced"
+        );
+        let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .open(NAME)
+            .await
+            .expect("reopen the table from its catalog");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, NAME).await,
+            vec![(100, 1000)],
+            "after a restart the table must hold the replacement's rows"
         );
     }
 
