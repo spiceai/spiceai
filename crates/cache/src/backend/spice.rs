@@ -28,9 +28,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Largest value, in bytes, that `SpiceBackend::insert` tries to admit on the
-/// calling task before it uses the blocking pool. A point lookup's result is a
-/// few KiB.
+/// Largest value, in bytes, that `SpiceBackend::insert_with_weight` tries to
+/// admit on the calling task before it uses the blocking pool. A point lookup's
+/// result is a few KiB.
 const INLINE_ADMISSION_MAX_BYTES: usize = 64 * 1024;
 
 /// Maps the crate-local eviction reason onto the metric label.
@@ -74,6 +74,33 @@ where
         Self::new(builder.max_capacity(), builder.ttl(), policy)
     }
 
+    /// Admit `value`, which the caller has already sized to `weight`: what
+    /// [`Sizeable::get_memory_size`] returns for it.
+    ///
+    /// A value of at most `INLINE_ADMISSION_MAX_BYTES` that fits without
+    /// eviction or expiry — a point lookup's result, say — is admitted here by
+    /// [`ShardedCache::try_insert`], because the round trip through the blocking
+    /// pool costs more than that admission: a wake-up on a pool thread and
+    /// another back here, about 20µs added to every uncached query, and at high
+    /// query rates contention on the pool's queue. Anything else is admitted on
+    /// the pool, as [`CacheBackend::insert`] admits every value.
+    pub async fn insert_with_weight(&self, key: u64, value: V, weight: usize) {
+        let value = if weight <= INLINE_ADMISSION_MAX_BYTES {
+            match self.cache.try_insert(key, value, weight) {
+                Ok(()) => return,
+                Err(value) => value,
+            }
+        } else {
+            value
+        };
+        let cache = Arc::clone(&self.cache);
+        if let Err(err) =
+            tokio::task::spawn_blocking(move || cache.insert(key, value, weight)).await
+        {
+            tracing::debug!("Spice cache insert task did not finish: {err}");
+        }
+    }
+
     /// Drop every entry whose value satisfies `predicate` without promoting survivors.
     pub fn invalidate_matching<F>(&self, predicate: F) -> usize
     where
@@ -89,28 +116,16 @@ where
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
     async fn insert(&self, key: u64, value: V) {
-        // Admission may expire a shard, walk eviction victims and drop them, and
-        // what that costs depends on the cache, not on the value. That work runs
-        // on the blocking pool, off the Tokio worker, the way `clear` and
-        // `run_pending_tasks` already run. A small value that fits without it — a
-        // point lookup's result, say — is admitted here by `try_insert`, because
-        // the round trip through the pool costs more than that admission: a
-        // wake-up on a pool thread and another back here, about 20µs added to
-        // every uncached query, and at high query rates contention on the pool's
-        // queue. Sizing walks a value's batches and columns, never its rows, so it
-        // is done here to choose.
-        let weight = value.get_memory_size();
-        let value = if weight <= INLINE_ADMISSION_MAX_BYTES {
-            match self.cache.try_insert(key, value, weight) {
-                Ok(()) => return,
-                Err(value) => value,
-            }
-        } else {
-            value
-        };
+        // Admission may expire a shard and walk LFU victims; keep that (and
+        // O(result-size) `get_memory_size` for CachedQueryResult) off the Tokio
+        // worker the way `clear` / `run_pending_tasks` already do. A caller that
+        // has already sized the value uses `insert_with_weight` instead.
         let cache = Arc::clone(&self.cache);
-        if let Err(err) =
-            tokio::task::spawn_blocking(move || cache.insert(key, value, weight)).await
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            let weight = value.get_memory_size();
+            cache.insert(key, value, weight);
+        })
+        .await
         {
             tracing::debug!("Spice cache insert task did not finish: {err}");
         }
@@ -197,7 +212,8 @@ mod tests {
     use futures::FutureExt;
     use rstest::rstest;
     use sharded_cache::EvictionPolicy;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
+    use std::thread::ThreadId;
     use std::time::Duration;
 
     #[test]
@@ -285,11 +301,14 @@ mod tests {
                 SpiceBackend::<Entry>::new(4 * ENTRY_BYTES as u64, Duration::from_mins(1), policy);
             for key in 0..4 {
                 assert!(
-                    backend.insert(key, Entry).now_or_never().is_some(),
+                    backend
+                        .insert_with_weight(key, Entry, ENTRY_BYTES)
+                        .now_or_never()
+                        .is_some(),
                     "an insert that fits must be admitted on the calling task"
                 );
             }
-            let mut over_budget = backend.insert(4, Entry);
+            let mut over_budget = Box::pin(backend.insert_with_weight(4, Entry, ENTRY_BYTES));
             assert!(
                 (&mut over_budget).now_or_never().is_none(),
                 "an insert that has to evict must wait for the blocking pool"
@@ -319,7 +338,7 @@ mod tests {
                 Duration::from_mins(1),
                 EvictionPolicy::TinyLfu,
             );
-            let mut first = backend.insert(0, Entry);
+            let mut first = Box::pin(backend.insert_with_weight(0, Entry, ENTRY_BYTES));
             assert!(
                 (&mut first).now_or_never().is_none(),
                 "a W-TinyLFU admission must wait for the blocking pool"
@@ -331,5 +350,58 @@ mod tests {
                 "the pool admits the insert once it runs"
             );
         });
+    }
+
+    /// A value that records the thread each `get_memory_size` call runs on.
+    #[derive(Clone)]
+    struct SizedOn(Arc<parking_lot::Mutex<Vec<ThreadId>>>);
+
+    impl Sizeable for SizedOn {
+        fn get_memory_size(&self) -> usize {
+            self.0.lock().push(std::thread::current().id());
+            ENTRY_BYTES
+        }
+    }
+
+    impl CacheMetrics for SizedOn {
+        fn record_hit() {}
+        fn record_miss() {}
+        fn record_request() {}
+        fn record_item_count(_count: u64) {}
+        fn record_size(_size: u64) {}
+        fn record_max_size(_size: u64) {}
+        fn record_eviction(_reason: EvictionReason) {}
+        fn record_stale_rejection(_reason: StaleRejectionReason) {}
+        fn record_table_invalidation(_mode: InvalidationMode) {}
+        fn update_hit_ratio(_hits: u64, _total: u64) {}
+        fn publish_counters_at_zero() {}
+    }
+
+    /// Sizing walks the whole value, so a value the caller has not sized is
+    /// sized on the blocking pool, and one it has sized is not sized again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_the_blocking_pool_sizes_a_value() {
+        let sized_on = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let backend = SpiceBackend::<SizedOn>::new(
+            1024 * ENTRY_BYTES as u64,
+            Duration::from_mins(1),
+            EvictionPolicy::Lru,
+        );
+        backend.insert(0, SizedOn(Arc::clone(&sized_on))).await;
+        backend
+            .insert_with_weight(1, SizedOn(Arc::clone(&sized_on)), ENTRY_BYTES)
+            .await;
+        let sized_on = sized_on.lock().clone();
+        assert_eq!(
+            sized_on.len(),
+            1,
+            "only the value without a known weight is sized"
+        );
+        assert_ne!(
+            sized_on[0],
+            std::thread::current().id(),
+            "a value without a known weight must be sized on the blocking pool"
+        );
+        assert_eq!(backend.len().await, 2);
     }
 }
