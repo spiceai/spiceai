@@ -1650,11 +1650,11 @@ assert_describe "still publishes the unreachable-cache verdict" 101 \
 # indistinguishable from a test that genuinely failed. It also has to name the
 # remedy, since the reader who needs it is not going to open the log.
 assert_describe "says an unloadable test binary could not complete, not that checks failed" 104 \
-  "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
+  "Test binary would not load after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "the checks did not complete" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "tells the author to re-dispatch rather than to read the log" 104 \
-  "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
+  "Test binary would not load after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "re-dispatch" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # A compiler subprocess that died of a signal has to say so in the commit status
@@ -1720,12 +1720,91 @@ assert_describe_fits() {
     fail_test "$name: the verdict must carry the whole login: '${output}'"
     return
   fi
+  # Fitting is not enough: the helper cuts an over-long message at a word
+  # boundary, which keeps the verdict inside the cap while silently dropping
+  # its tail — the remedy. The verdict at the longest login has to be the
+  # short-login verdict with only the login swapped.
+  local short
+  short="$(call_subject \
+    "describe_check_failure ${check_status} 999999 someone
+     printf '%s' \"\$SIGNOFF_FAILURE_STATUS_DESC\"" \
+    "$@")"
+  short="${short#*|}"
+  local desc="${output#*DESC[}"; desc="${desc%]*}"
+  if [[ "$desc" != "${short/(triggered by someone)/(triggered by ${login})}" ]]; then
+    fail_test "$name: the verdict is cut at the longest login — its message must fit whole: '${desc}' vs '${short}'"
+    return
+  fi
   echo "  ok: $name"
 }
 readonly LONGEST_LOGIN_LEN=39
 
 assert_describe_fits "the crash verdict fits a commit status with the longest login GitHub issues" 101 \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The same property for every other verdict that names a cause. Four of these
+# lost the attribution at the boundary (#14076), and `stale-lockfile` lost it
+# for the two logins that actually sign off; none is exempt now.
+assert_describe_fits "the out-of-disk verdict fits with the longest login" 101 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the unreachable-cache verdict fits with the longest login" 101 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the unloadable-binary verdict fits with the longest login" 104 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the missing-target verdict fits with the longest login" 71 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the stale-lockfile verdict fits with the longest login" 72 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the rewritten-lockfile verdict fits with the longest login" 73 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the generic check-failure verdict fits with the longest login" 101 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The helper's contract, pinned on its own: a message longer than the budget is
+# what gets cut, and the whole attribution survives. Driven with a message that
+# cannot fit so the cut is exercised, which no arm does once they all fit.
+tests_run=$((tests_run + 1))
+long_message="$(printf "%0200d" 0 | tr 0 m)"
+long_login="$(printf "%0${LONGEST_LOGIN_LEN}d" 0 | tr 0 a)"
+result="$(call_subject \
+  "failure_status_desc '${long_message}' '${long_login}'" STUB_FREE_KB="$(gib_to_kb 200)")"
+rc="${result%%|*}"
+output="${result#*|}"
+if [[ "$rc" -ne 0 ]]; then
+  fail_test "an over-long verdict: expected exit 0, got ${rc} (output: ${output})"
+elif [[ "$output" != *"(triggered by ${long_login})" ]]; then
+  fail_test "an over-long verdict must end with the whole attribution: '${output}'"
+elif (( ${#output} != 140 )); then
+  fail_test "an over-long verdict must be cut to exactly the cap, got ${#output}: '${output}'"
+elif [[ "$output" != "mmmm"* ]]; then
+  fail_test "an over-long verdict keeps the head of its message: '${output}'"
+else
+  echo "  ok: an over-long verdict loses the tail of its message, never the attribution"
+fi
+
+# The cut lands on a word boundary: a byte-counting locale would otherwise be
+# able to leave a partial multi-byte character — the em dash every arm carries
+# — at the end of the message, and GitHub rejects a description that is not
+# valid UTF-8. The message here puts a three-byte dash right where the slice
+# falls, and the whole verdict is measured in bytes so the case is strict.
+tests_run=$((tests_run + 1))
+worded_message="$(printf 'word %.0s' $(seq 1 16))abc— tail of the message"   # 83 chars, then a three-byte dash straddling the 85-byte budget
+result="$(call_subject \
+  "failure_status_desc '${worded_message}' '${long_login}'" LC_ALL=C STUB_FREE_KB="$(gib_to_kb 200)")"
+rc="${result%%|*}"
+output="${result#*|}"
+if [[ "$rc" -ne 0 ]]; then
+  fail_test "a word-boundary cut: expected exit 0, got ${rc} (output: ${output})"
+elif [[ "$output" != *"(triggered by ${long_login})" ]]; then
+  fail_test "a word-boundary cut must end with the whole attribution: '${output}'"
+elif (( $(printf '%s' "$output" | LC_ALL=C wc -c) > 140 )); then
+  fail_test "a word-boundary cut must stay inside the cap in bytes: '${output}'"
+elif ! printf '%s' "$output" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+  fail_test "a word-boundary cut left a partial multi-byte character behind: '${output}'"
+elif [[ "$output" != "word word "* ]]; then
+  fail_test "a word-boundary cut keeps the head of its message: '${output}'"
+else
+  echo "  ok: an over-long verdict is cut at a word boundary, never inside a character"
+fi
 
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
@@ -1742,10 +1821,10 @@ assert_describe "publishes no verdict when a signalled run's make returned an or
 # failure it is indistinguishable from a lint denial. It also has to carry the
 # remedy, because the reader who needs it is not going to open the log.
 assert_describe "says a missing make target could not run, not that checks failed" 71 \
-  "Sign-off could not run after 21195s — branch predates a make target the gate needs; merge trunk in (triggered by someone)" \
+  "Gate make target missing after 21195s — checks did not run, merge trunk in (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "tells the author to merge trunk in" 71 \
-  "Sign-off could not run after 21195s — branch predates a make target the gate needs; merge trunk in (triggered by someone)" \
+  "Gate make target missing after 21195s — checks did not run, merge trunk in (triggered by someone)" \
   "merge trunk in and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 
 # The two above use a status the signal reading must not claim. A run signalled
@@ -1760,10 +1839,10 @@ assert_describe "declines the missing-target verdict for a signalled run" 71 "" 
 # as a check failure it sends them looking for a lint denial in a log containing
 # no compilation. The remedy has to be in the description itself.
 assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
-  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; cargo update --workspace, commit (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "names the command that regenerates the lockfile" 72 \
-  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; cargo update --workspace, commit (triggered by someone)" \
   "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # And, as for missing-target, "no verdict" outranks naming a cause.
 assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
@@ -1773,10 +1852,10 @@ assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" 
 # whole reason for having a status of its own is that the two must read
 # differently. Both halves are asserted: what it does say, and what it must not.
 assert_describe "says a rewritten lockfile passed its checks, not that they failed" 73 \
-  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "Checks passed in 21195s but rewrote Cargo.lock — commit the regenerated Cargo.lock (triggered by someone)" \
   "the checks passed" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "names committing the regenerated lockfile as the remedy" 73 \
-  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "Checks passed in 21195s but rewrote Cargo.lock — commit the regenerated Cargo.lock (triggered by someone)" \
   "commit the regenerated Cargo.lock and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # The regression this distinction exists to prevent, stated as a contract: the
 # post-check must never publish the preflight's "did not run" wording.

@@ -106,6 +106,17 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A retryable HTTP status retains its response so the final allowed attempt
+/// can supply its body and metadata after the retry budget is exhausted.
+enum RequestAttemptError {
+    Response {
+        response: reqwest::Response,
+        attempt_started: Instant,
+        permit: Option<Permit>,
+    },
+    Failure(Error),
+}
+
 impl From<Error> for DataFusionError {
     fn from(err: Error) -> Self {
         match err {
@@ -1533,32 +1544,33 @@ impl HttpTableProvider {
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(
-                    &url,
-                    body.as_deref(),
-                    request_headers.as_ref(),
-                    &path,
-                    false,
-                )
-                .await
+                this.perform_single_request(&url, body.as_deref(), request_headers.as_ref(), &path)
+                    .await
             }
         })
         .await;
 
-        // If retries exhausted due to transient errors (5xx/429), make one final attempt
-        // and return whatever response we get - the response is still valid data.
-        // Don't retry on permanent errors (e.g., failed to read response body).
-        if let Ok(fetch_result) = result {
-            Ok(fetch_result)
-        } else {
-            tracing::debug!(
-                "Retries exhausted for {url}, making final attempt accepting any status"
-            );
-            self.perform_single_request(&url, body, request_headers, path_label, true)
+        match result {
+            Ok(fetch_result) => Ok(fetch_result),
+            Err(RequestAttemptError::Response {
+                response,
+                attempt_started,
+                permit: _rate_control_permit,
+            }) => {
+                let status_code = response.status().as_u16();
+                Self::extract_response(
+                    response,
+                    status_code,
+                    path_label,
+                    attempt_started,
+                    self.auth.as_ref().map(|auth| auth.header_name()),
+                )
                 .await
                 .map_err(|e| match e {
                     RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
                 })
+            }
+            Err(RequestAttemptError::Failure(err)) => Err(err),
         }
     }
 
@@ -1573,20 +1585,18 @@ impl HttpTableProvider {
 
     /// Perform a single HTTP request without retry logic.
     ///
-    /// If `accept_retryable` is false, returns a transient error on 5xx/429 to trigger retry.
-    /// If `accept_retryable` is true, accepts any status code and returns the response.
+    /// Retains a 5xx/429 response in the transient error for retry or final extraction.
     async fn perform_single_request(
         &self,
         url: &Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
         path_label: &str,
-        accept_retryable: bool,
-    ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
-        let _rate_control_permit = self
+    ) -> std::result::Result<HttpFetchResult, RetryError<RequestAttemptError>> {
+        let rate_control_permit = self
             .acquire_rate_control_permit()
             .await
-            .map_err(RetryError::transient)?;
+            .map_err(|err| RetryError::transient(RequestAttemptError::Failure(err)))?;
 
         // The freshness window is spent from the moment the origin generated the
         // response, so the round trip spends it too — waiting on the origin and
@@ -1625,7 +1635,9 @@ impl HttpTableProvider {
 
         let response = request_builder.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {e}");
-            RetryError::transient(Error::HttpRequest { source: e })
+            RetryError::transient(RequestAttemptError::Failure(Error::HttpRequest {
+                source: e,
+            }))
         })?;
 
         let status_code = response.status().as_u16();
@@ -1633,21 +1645,16 @@ impl HttpTableProvider {
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
 
-        // 5xx/429: retry with backoff (transient server issue or rate limiting)
-        // After retries exhausted, we'll accept the response as valid data.
-        if !accept_retryable && Self::is_retryable_status(status_code) {
+        if Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
-            if let Err(e) = response.error_for_status() {
-                return Err(RetryError::transient(Error::HttpRequest { source: e }));
-            }
-            // Defensive: should never reach here since 4xx and 5xx always produce error_for_status Err
-            return Err(RetryError::transient(Error::HttpServerError {
-                status: status_code,
+            return Err(RetryError::transient(RequestAttemptError::Response {
+                response,
+                attempt_started,
+                permit: rate_control_permit,
             }));
         }
 
-        // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
-        // 4xx like 404 "not found" is a valid business response, not an error
+        // 2xx, 3xx, 4xx: valid response; 4xx may be a business response.
         Self::extract_response(
             response,
             status_code,
@@ -1656,6 +1663,13 @@ impl HttpTableProvider {
             self.auth.as_ref().map(|auth| auth.header_name()),
         )
         .await
+        .map_err(|error| match error {
+            RetryError::Permanent(err) => RetryError::Permanent(RequestAttemptError::Failure(err)),
+            RetryError::Transient { err, retry_after } => RetryError::Transient {
+                err: RequestAttemptError::Failure(err),
+                retry_after,
+            },
+        })
     }
 
     /// Extract content and metadata from an HTTP response.
@@ -5118,8 +5132,16 @@ mod tests {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
     use reqwest::header::AUTHORIZATION;
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use runtime_rate_control::{RateControllerBuilder, RateControllerMetrics};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use url::Url;
 
     #[derive(Debug)]
@@ -5207,6 +5229,268 @@ mod tests {
             "json".to_string(),
             false,
         )
+    }
+
+    async fn retry_test_server(
+        replies: Vec<(u16, String)>,
+        delay: Duration,
+    ) -> (Url, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("origin address")
+        ))
+        .expect("valid origin URL");
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&count);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let ordinal = requests.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = &replies[ordinal.min(replies.len() - 1)];
+                let mut buffer = [0; 4096];
+                if stream.read(&mut buffer).await.is_err() {
+                    continue;
+                }
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nX-Reply: {ordinal}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, count, task)
+    }
+
+    fn retry_test_provider(
+        url: Url,
+        max_retries: usize,
+        timeout: Duration,
+    ) -> (HttpTableProvider, Arc<RateControllerMetrics>) {
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(4)
+            .build();
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("HTTP test client");
+        let mut provider = HttpTableProvider::new(url, client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(u32::try_from(max_retries).expect("small retry count"));
+        provider.retry_strategy = RetryBackoffBuilder::new()
+            .max_retries(Some(max_retries))
+            .base_interval(Duration::from_millis(1))
+            .method(BackoffMethod::Linear)
+            .randomization_factor(0.0)
+            .build();
+        (provider, metrics)
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_transport_failure_and_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("socket address")
+        ))
+        .expect("valid URL");
+        drop(listener);
+        for budget in [0, 2] {
+            let (provider, permits) =
+                retry_test_provider(url.clone(), budget, Duration::from_secs(2));
+            let Err(error) = provider
+                .perform_request_with_retry(url.clone(), None, None, "/lookup")
+                .await
+            else {
+                panic!("connection refusal should fail");
+            };
+            assert!(matches!(error, Error::HttpRequest { source } if source.is_connect()));
+            assert_eq!(permits.permits_acquired_total(), budget as u64 + 1);
+        }
+
+        let (url, requests, server) =
+            retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
+        let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
+        let Err(error) = provider
+            .perform_request_with_retry(url, None, None, "/lookup")
+            .await
+        else {
+            panic!("timed out origin should fail");
+        };
+        assert!(matches!(error, Error::HttpRequest { source } if source.is_timeout()));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.permits_acquired_total(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_keeps_last_allowed_response() {
+        for status in [429, 500, 503] {
+            for budget in [0, 2] {
+                let replies = (0..=budget)
+                    .map(|i| (status, format!("{{\"attempt\":{i}}}")))
+                    .collect::<Vec<_>>();
+                // The server replies with a distinct body on every request, including an
+                // unexpected extra attempt beyond the configured budget.
+                let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+                let (provider, permits) =
+                    retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+                let result = provider
+                    .perform_request_with_retry(url, None, None, "/lookup")
+                    .await
+                    .expect("final error response is data");
+                assert_eq!(result.response_status, status);
+                assert_eq!(result.content, format!("{{\"attempt\":{budget}}}"));
+                assert!(
+                    result
+                        .response_headers
+                        .iter()
+                        .any(|(name, value)| name == "x-reply" && value == &budget.to_string())
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), budget + 1);
+                assert_eq!(permits.permits_acquired_total(), (budget + 1) as u64);
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_holds_permit_until_final_body_is_read() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let (release_body, mut body_ready) = tokio::sync::oneshot::channel();
+        let (second_accepted, second_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
+            let body = "{\"error\":\"final-response\"}";
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            headers_sent.send(()).expect("signal response headers");
+            tokio::select! {
+                second = listener.accept() => {
+                    second.expect("accept second request");
+                    second_accepted.send(()).expect("signal second request");
+                    body_ready.await.expect("body release signal");
+                }
+                result = &mut body_ready => {
+                    result.expect("body release signal");
+                }
+            }
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("write response body");
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0);
+        let second_provider = provider.clone();
+        let second_url = url.clone();
+        let request = tokio::spawn(async move {
+            provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), headers_received)
+            .await
+            .expect("response headers arrived in time")
+            .expect("headers signal sent");
+        let second_request = tokio::spawn(async move {
+            second_provider
+                .perform_request_with_retry(second_url, None, None, "/lookup")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), second_received)
+                .await
+                .is_err(),
+            "the next origin request must wait for the first response body"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(
+            metrics.inflight_permits(),
+            1,
+            "response body still in flight"
+        );
+        second_request.abort();
+        release_body.send(()).expect("release response body");
+        let result = request
+            .await
+            .expect("request task completed")
+            .expect("final HTTP response retained");
+        assert_eq!(result.response_status, 503);
+        assert_eq!(result.content, "{\"error\":\"final-response\"}");
+        assert_eq!(metrics.inflight_permits(), 0);
+        server.await.expect("streaming origin finished");
+    }
+
+    #[tokio::test]
+    async fn http_retry_budget_success_and_permanent_status() {
+        for (replies, budget, expected_status, expected_body, expected_attempts) in [
+            (
+                vec![(503, "{\"attempt\":0}"), (200, "{\"attempt\":1}")],
+                2,
+                200,
+                "{\"attempt\":1}",
+                2,
+            ),
+            (vec![(200, "{\"ok\":true}")], 2, 200, "{\"ok\":true}", 1),
+            (
+                vec![(404, "{\"message\":\"missing\"}")],
+                2,
+                404,
+                "{\"message\":\"missing\"}",
+                1,
+            ),
+        ] {
+            let replies = replies
+                .into_iter()
+                .map(|(status, body)| (status, body.to_string()))
+                .collect();
+            let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+            let (provider, permits) =
+                retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+            let result = provider
+                .perform_request_with_retry(url, None, None, "/lookup")
+                .await
+                .expect("HTTP response should remain available");
+            assert_eq!(result.response_status, expected_status);
+            assert_eq!(result.content, expected_body);
+            assert_eq!(requests.load(Ordering::SeqCst), expected_attempts);
+            assert_eq!(permits.permits_acquired_total(), expected_attempts as u64);
+            server.abort();
+        }
     }
 
     /// Test helper: build the legacy all-Utf8 nesting schema that

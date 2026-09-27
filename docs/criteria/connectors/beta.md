@@ -14,7 +14,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | Cosmos DB (NoSQL)                | ✅           | @lukekim        |
 | Databricks (mode: delta_lake)    | ✅           | @Sevenannn      |
 | Databricks (mode: spark_connect) | ✅           | @Sevenannn      |
-| Databricks (mode: sql_warehouse) | ➖           |                 |
+| Databricks (mode: sql_warehouse) | ✅           | @lukekim        |
 | Debezium                         | ➖           |                 |
 | Delta Lake                       | ✅           | @Sevenannn      |
 | Dremio                           | ✅           | @Sevenannn      |
@@ -27,19 +27,19 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GCS                              | ➖           |                 |
 | Git                              | ✅           | @lukekim        |
 | GitHub                           | ✅           | @peasee         |
-| Glue                             | ➖           |                 |
+| Glue                             | ✅           | @lukekim        |
 | GraphQL                          | ✅           | @peasee         |
-| HTTP/HTTPS                       | ➖           |                 |
+| HTTP/HTTPS                       | ✅           | @lukekim        |
 | Iceberg                          | ✅           | @phillipleblanc |
 | IMAP                             | ➖           |                 |
-| Kafka                            | ➖           |                 |
-| Localpod                         | ➖           |                 |
-| MongoDB                          | ➖           |                 |
+| Kafka                            | ✅           | @lukekim        |
+| Localpod                         | ✅           | @lukekim        |
+| MongoDB                          | ✅           | @lukekim        |
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |
 | NFS                              | ➖           |                 |
 | ODBC                             | ✅           | @lukekim        |
-| Oracle                           | ➖           |                 |
+| Oracle                           | ✅           | @lukekim        |
 | PostgreSQL                       | ✅           | @Sevenannn      |
 | S3                               | ✅           | @Sevenannn      |
 | ScyllaDB                         | ➖           |                 |

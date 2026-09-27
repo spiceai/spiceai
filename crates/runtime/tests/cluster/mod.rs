@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(not(target_os = "windows"))]
+mod ballista_partition_scoped_scan;
 mod cancel_tasks;
 mod distributed_acceleration;
 mod distributed_cayenne_catalog;

@@ -58,6 +58,10 @@ pub struct SnapshotRefreshState {
     /// snapshot, so `Option<u64>` is the correct representation rather than
     /// using a sentinel value.
     pub current_snapshot_id: Arc<StdMutex<Option<u64>>>,
+    /// The snapshot metadata `ETag` of the last poll that completed: a reload that was
+    /// swapped in, or a check that found nothing newer. The next poll reads the metadata
+    /// conditionally on it and skips when it is unchanged. `None` until the first such poll.
+    pub metadata_e_tag: Arc<StdMutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for SnapshotRefreshState {
@@ -81,13 +85,33 @@ impl SnapshotRefreshState {
             .copied()
     }
 
-    /// Records `snapshot_id` as the most recently loaded snapshot id.
-    pub fn set_current_loaded_id(&self, snapshot_id: u64) {
+    /// Records `snapshot_id` as the most recently loaded snapshot id, read from the
+    /// metadata with `metadata_e_tag`.
+    pub fn set_current_loaded_id(&self, snapshot_id: u64, metadata_e_tag: Option<String>) {
         let mut guard = self
             .current_snapshot_id
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(snapshot_id);
+        drop(guard);
+        self.record_metadata_e_tag(metadata_e_tag);
+    }
+
+    /// Returns the snapshot metadata `ETag` of the last completed poll.
+    #[must_use]
+    pub fn metadata_e_tag(&self) -> Option<String> {
+        self.metadata_e_tag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records the snapshot metadata `ETag` of a poll that completed.
+    pub fn record_metadata_e_tag(&self, metadata_e_tag: Option<String>) {
+        *self
+            .metadata_e_tag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata_e_tag;
     }
 }
 
