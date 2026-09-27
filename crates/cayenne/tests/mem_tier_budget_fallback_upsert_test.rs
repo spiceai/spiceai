@@ -21,11 +21,11 @@ limitations under the License.
 //! mem-tier versions on a `cdc_durability: memory` upsert table.
 //!
 //! The fallback first spills this table's mem tier to files, then writes the
-//! batch durably with the conflict deletions computed while the keys were
-//! recorded as mem-tier (inline) rows. The upsert must not leave the spilled
-//! copies visible. Covers both PK encodings (`Int64` and row-converted
-//! `Utf8`), and keys whose earlier version a durable write inlined into the
-//! metastore while other keys sat in the mem tier: that spill flushes both.
+//! batch durably. The spill moves the rows the batch's conflicts were first
+//! resolved against, so the upsert must not leave the spilled copies visible.
+//! Covers both PK encodings (`Int64` and row-converted `Utf8`), and keys whose
+//! earlier version a durable write inlined into the metastore while other keys
+//! sat in the mem tier: that spill flushes both.
 //!
 //! Its own test binary: the budget is process-global, so every case runs in
 //! sequence inside one test body.
