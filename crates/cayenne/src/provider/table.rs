@@ -34,9 +34,10 @@ limitations under the License.
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
-    CayenneDeletionSink, DeleteScanSource, DeletionIdentifier, DeletionVectorWriteResult,
-    DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling,
-    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
+    DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
+    FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec,
 };
 use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
@@ -36987,14 +36988,14 @@ impl CayenneTableProvider {
         // A protected snapshot ignores re-inserts AND carries a cutoff — the pairing
         // `apply_partial_deletion_filter` gives these same rows on the scan path.
         //
-        // The protected set and the deletion index are captured under one
-        // `listing_fence` read, the pairing `scan` gives the same rows: a seq-prefix
-        // bake swaps the set and prunes the index under `listing_fence.write()`, so a
-        // set read before that publish judged by the index read after it sees a
-        // superseded version as live (#13913). See
+        // The protected set is captured with the deletion index it is judged by — see
         // [`DeleteScanSource::tombstones_at_capture`].
+        let capture_locks = CaptureLocks {
+            listing_fence: Arc::clone(&self.listing_fence),
+            scan_state_lock: Arc::clone(&self.scan_state_lock),
+        };
         let (protected_tables, tombstones_at_capture) = {
-            let _fence = self.listing_fence.read().await;
+            let _guards = capture_locks.read().await;
             (
                 self.build_protected_snapshot_listing_tables()?,
                 self.pk_deletion_snapshot(),
@@ -37063,7 +37064,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         )
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
-        .with_listing_fence(Arc::clone(&self.listing_fence))
+        .with_capture_locks(capture_locks)
         .with_exact_count(source.requires_exact_count());
 
         Ok(sink)

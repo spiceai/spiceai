@@ -513,10 +513,33 @@ pub struct CayenneDeletionSink {
     /// bypassed so the scan-based path returns an exact count of the live rows
     /// actually removed.
     count_exact: bool,
-    /// The owning table's scan fence, taken to capture the main listing together with
-    /// the deletion index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]).
-    /// `None` on internal persist-only helpers, which capture without it.
-    listing_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// The owning table's `listing_fence` and `scan_state_lock`, taken in that order —
+    /// the pairing `scan` uses — to capture the main listing together with the deletion
+    /// index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]). `None` on
+    /// internal persist-only helpers, which capture without them.
+    capture_locks: Option<CaptureLocks>,
+}
+
+/// The locks a coherent (listing, deletion index) capture holds, outer first.
+#[derive(Clone)]
+pub(crate) struct CaptureLocks {
+    pub(crate) listing_fence: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) scan_state_lock: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl CaptureLocks {
+    /// Both read guards, taken in `scan`'s order: `listing_fence`, then
+    /// `scan_state_lock`.
+    pub(crate) async fn read(
+        &self,
+    ) -> (
+        tokio::sync::RwLockReadGuard<'_, ()>,
+        tokio::sync::RwLockReadGuard<'_, ()>,
+    ) {
+        let fence = self.listing_fence.read().await;
+        let state = self.scan_state_lock.read().await;
+        (fence, state)
+    }
 }
 
 impl CayenneDeletionSink {
@@ -557,26 +580,23 @@ impl CayenneDeletionSink {
             seq_allocator,
             count_exact: false,
             scan_input_version: None,
-            listing_fence: None,
+            capture_locks: None,
         }
     }
 
-    /// Wire the owning table's `listing_fence`, so the main listing is captured with
-    /// the deletion index it is judged by.
+    /// Wire the owning table's capture locks, so the main listing is captured with the
+    /// deletion index it is judged by.
     #[must_use]
-    pub(crate) fn with_listing_fence(
-        mut self,
-        listing_fence: Arc<tokio::sync::RwLock<()>>,
-    ) -> Self {
-        self.listing_fence = Some(listing_fence);
+    pub(crate) fn with_capture_locks(mut self, capture_locks: CaptureLocks) -> Self {
+        self.capture_locks = Some(capture_locks);
         self
     }
 
     /// The main listing as a scan source, captured together with the deletion index
-    /// under one `listing_fence` read — the pairing `scan` gives the same rows.
+    /// under the same read guards `scan` captures the same rows under.
     async fn capture_main_scan_source(&self) -> DeleteScanSource {
-        let _fence = match &self.listing_fence {
-            Some(fence) => Some(fence.read().await),
+        let _guards = match &self.capture_locks {
+            Some(locks) => Some(locks.read().await),
             None => None,
         };
         let table = self.listing_table.load_full();
@@ -851,26 +871,38 @@ impl CayenneDeletionSink {
     ///
     /// Live only if live under BOTH the index captured with the source and the current
     /// one — see [`DeleteScanSource::tombstones_at_capture`] for why neither alone is
-    /// enough.
+    /// enough. The second probe is skipped while the two are the same index, which is
+    /// every row unless a prune landed after the capture.
     fn is_live_int64_pk(&self, pk: i64, source: &DeleteScanSource) -> bool {
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return true;
+        };
         let visible = |tombstones: &DeletionIndex| {
             is_pk_visible_i64(pk, tombstones, source.insert_records, source.min_delete_seq)
         };
-        let live_now = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => visible(&deletion_snapshot.load().tombstones),
-            _ => true,
-        };
-        live_now
+        let current = deletion_snapshot.load();
+        visible(&current.tombstones)
             && match &source.tombstones_at_capture {
-                Some(PkDeletionSnapshot::Int64Pk { tombstones }) => visible(tombstones),
+                Some(PkDeletionSnapshot::Int64Pk { tombstones })
+                    if !Arc::ptr_eq(tombstones, &current.tombstones) =>
+                {
+                    visible(tombstones)
+                }
                 _ => true,
             }
     }
 
     /// [`Self::is_live_int64_pk`] for composite / non-integer primary keys.
     fn is_live_row_key(&self, key: &[u8], source: &DeleteScanSource) -> bool {
+        let PkDeletionStrategyWithCache::RowConverterBased {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return true;
+        };
         let visible = |tombstones: &KeyDeletionIndex| {
             is_pk_visible_row_key(
                 key,
@@ -879,15 +911,14 @@ impl CayenneDeletionSink {
                 source.min_delete_seq,
             )
         };
-        let live_now = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => visible(&deletion_snapshot.load().tombstones),
-            _ => true,
-        };
-        live_now
+        let current = deletion_snapshot.load();
+        visible(&current.tombstones)
             && match &source.tombstones_at_capture {
-                Some(PkDeletionSnapshot::RowConverterBased { tombstones }) => visible(tombstones),
+                Some(PkDeletionSnapshot::RowConverterBased { tombstones })
+                    if !Arc::ptr_eq(tombstones, &current.tombstones) =>
+                {
+                    visible(tombstones)
+                }
                 _ => true,
             }
     }
