@@ -2605,19 +2605,65 @@ impl MetadataCatalog for CayenneCatalog {
         self.persist_table_schema(table_id, schema, true).await
     }
 
-    async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+    async fn set_current_snapshot(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        // Same transaction/retry envelope as `commit_compaction`: the pointer is
+        // read inside the transaction that swaps it, so a replacement committing
+        // in between conflicts with this transaction instead of being overwritten.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "set_current_snapshot requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let tx = self.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
+                }
+            })?;
+            Self::ensure_current_snapshot_in_txn(&*tx, table_id, replaced_snapshot_id).await?;
+            tx.execute(ExecuteParams {
                 sql: "UPDATE cayenne_table SET current_snapshot_id = ?1 WHERE table_id = ?2",
                 params: vec![
-                    MetastoreValue::Text(snapshot_id.to_string()),
+                    MetastoreValue::Text(new_snapshot_id.to_string()),
                     MetastoreValue::Text(table_id.to_string()),
                 ],
             })
             .await
             .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
-            })
+            })?;
+            match tx.commit().await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying snapshot pointer swap after commit conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    return Err(CatalogError::FailedToSetCurrentSnapshot {
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "set_current_snapshot exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
     }
 
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String> {
@@ -8914,8 +8960,8 @@ mod tests {
 
     /// A compaction is built from one snapshot of its table. If a replacement moved
     /// the table to another snapshot while the compaction ran, committing the
-    /// compaction would point the table back at the replaced rows, so both commit
-    /// forms refuse, and the table keeps the replacement.
+    /// compaction would point the table back at the replaced rows, so every commit
+    /// form refuses, and the table keeps the replacement.
     #[tokio::test]
     async fn commit_compaction_refuses_a_snapshot_the_table_moved_off() {
         let (_table_root, base_path) = test_table_root();
@@ -8951,7 +8997,18 @@ mod tests {
                 &[],
             )
             .await;
-        for (form, result) in [("wholesale", wholesale), ("fenced", fenced)] {
+        let pointer_only = catalog
+            .set_current_snapshot(
+                &table_id,
+                &compacted_from,
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await;
+        for (form, result) in [
+            ("wholesale", wholesale),
+            ("fenced", fenced),
+            ("pointer-only", pointer_only),
+        ] {
             assert!(
                 matches!(
                     &result,

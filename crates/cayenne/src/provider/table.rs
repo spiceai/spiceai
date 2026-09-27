@@ -18957,12 +18957,32 @@ impl CayenneTableProvider {
 
             if let Err(e) = self
                 .catalog
-                .set_current_snapshot(&self.table_metadata.table_id, &new_snapshot_id)
+                .set_current_snapshot(
+                    &self.table_metadata.table_id,
+                    source_snapshot_id,
+                    &new_snapshot_id,
+                )
                 .await
             {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
+                if let CatalogError::SnapshotReplaced { current, .. } = &e {
+                    // A replacement committed its catalog pointer during the
+                    // rewrite and has not published it in memory yet, so the
+                    // in-memory check above could not see it. Committing over it
+                    // would bring the replaced rows back after a restart.
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        new_snapshot_id = new_snapshot_id.as_str(),
+                        source_snapshot_id,
+                        catalog_snapshot_id = current.as_str(),
+                        "Aborting subset small-file rewrite: the catalog moved to another \
+                         snapshot during the rewrite; discarding output and retrying"
+                    );
+                    return Ok(false);
+                }
                 return Err(Error::Catalog { source: e });
             }
 
@@ -39407,6 +39427,131 @@ mod tests {
                 .collect(),
             total_bytes: files.iter().take(2).map(|(_, size)| *size).sum(),
         }
+    }
+
+    /// On a `deletion_mode: key` table the subset rewrite of the current snapshot
+    /// runs without `write_lock`, so an overwrite can commit its catalog pointer
+    /// while the rewrite encodes. The rewrite's in-memory check cannot see that
+    /// overwrite until it publishes, so the commit has to check the catalog:
+    /// pointing the catalog at the rewrite would bring the replaced rows back
+    /// after a restart.
+    #[tokio::test]
+    async fn subset_rewrite_does_not_supersede_a_committed_overwrite() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const NAME: &str = "subset_vs_overwrite";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            // Pad the payload so each append settles as its own Small-tier file
+            // rather than being inlined.
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            // This test drives the subset rewrite directly, so no automatic
+            // compaction may rotate the snapshot underneath it.
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            NAME,
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to pick from, listed {} file(s)",
+            files.len()
+        );
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        // An overwrite commits its catalog pointer while the rewrite encodes, and
+        // publishes in memory only after the rewrite returns.
+        let prepared = provider
+            .begin_overwrite(
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        futures::stream::iter([Ok(batch_of(5_000, 1))]),
+                    ),
+                ),
+                1,
+            )
+            .await
+            .expect("begin the replacement");
+        prepared
+            .apply_owned_txn()
+            .await
+            .expect("commit the replacement");
+
+        let committed = tokio::time::timeout(
+            Duration::from_mins(1),
+            provider.rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &snapshot_id,
+                generation_before,
+            ),
+        )
+        .await
+        .expect("the subset rewrite must not wait on the overwrite")
+        .expect("the subset rewrite runs");
+        prepared.finish().await.expect("publish the replacement");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![5_000],
+            "the live table serves the replacement"
+        );
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(provider.catalog()), ctx.runtime_env())
+                .open(NAME)
+                .await
+                .expect("reopen the table from its catalog");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![5_000],
+            "after a restart the table must hold the replacement's rows, not a rewrite of the rows it replaced"
+        );
+        assert!(
+            !committed,
+            "the subset rewrite must abort when the catalog moved off the snapshot it rewrote"
+        );
     }
 
     /// The subset rewrite carries forward exactly the files its caller listed, so

@@ -299,8 +299,20 @@ pub trait MetadataCatalog: Send + Sync {
         schema: &SchemaRef,
     ) -> CatalogResult<()>;
 
-    /// Set the current snapshot ID for a table (`UUIDv7` string).
-    async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
+    /// Point `table_id` at `new_snapshot_id` (`UUIDv7` string) if it still points
+    /// at `replaced_snapshot_id`. Only the pointer changes: unlike
+    /// [`Self::commit_compaction`], delete files, insert records and protected
+    /// snapshots are left as they are.
+    ///
+    /// Changes nothing and returns [`CatalogError::SnapshotReplaced`] when the
+    /// table no longer points at `replaced_snapshot_id`, as
+    /// [`Self::commit_compaction`] does.
+    async fn set_current_snapshot(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Increment the table's sequence number and return the new value.
     ///

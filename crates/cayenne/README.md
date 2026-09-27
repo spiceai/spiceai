@@ -222,6 +222,7 @@ pub trait MetadataCatalog: Send + Sync {
     // A compaction commits only while the table still points at the snapshot it
     // was built from (`SnapshotReplaced` otherwise).
     async fn commit_compaction(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    async fn set_current_snapshot(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     // Partitions
