@@ -19,6 +19,7 @@ pub mod cdc;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
+pub mod evaluate;
 pub mod functions;
 pub mod iceberg;
 pub mod responses;

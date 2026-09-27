@@ -1181,7 +1181,11 @@ impl Query {
                         // Hop the assembled serve stream onto this runtime.
                         // Cancellation and the tracker wrap that same stream.
                         let cache_status = query_result.cache_status;
-                        (cache_status, query_result.into_record_batch_stream())
+                        let physical_plan = query_result.physical_plan();
+                        (
+                            (cache_status, physical_plan),
+                            query_result.into_record_batch_stream(),
+                        )
                     })
             },
         )
@@ -1195,9 +1199,13 @@ impl Query {
             },
         })?;
 
-        let (cache_status, stream) = managed_stream.into_parts();
+        let ((cache_status, physical_plan), stream) = managed_stream.into_parts();
 
-        Ok(QueryResult::new(stream, cache_status))
+        let query_result = QueryResult::new(stream, cache_status);
+        Ok(match physical_plan {
+            Some(physical_plan) => query_result.with_physical_plan(physical_plan),
+            None => query_result,
+        })
     }
 
     async fn run_internal(
@@ -1784,11 +1792,13 @@ impl Query {
                         cache_manager.raw_cache_key,
                         datasets,
                         started_at,
+                        Arc::clone(&physical_plan),
                     )
                 } else {
                     res_stream
                 };
 
+                let physical_plan_for_result = Arc::clone(&physical_plan);
                 let final_stream = attach_physical_plan_metrics_to_stream(
                     final_stream,
                     physical_plan,
@@ -1837,7 +1847,8 @@ impl Query {
                         final_stream,
                     ),
                     cache_manager.cache_status,
-                ))
+                )
+                .with_physical_plan(physical_plan_for_result))
             }
             .instrument(span.clone())
             .instrument(trace_span.clone());

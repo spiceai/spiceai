@@ -265,6 +265,7 @@ runtime-checkpoint-api = "foundation"
 # `embed-api` is assigned explicitly rather than left to `default_tier`, so that
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
+evaluate-api = "foundation"
 embed-api = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"

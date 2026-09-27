@@ -27,6 +27,7 @@ use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::execution::RecordBatchStream;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use futures::Stream;
@@ -691,6 +692,14 @@ pub struct QueryResult {
     /// so `.data` and [`Self::into_source`] observe the same lifetime.
     pub data: QueryResultData,
     pub cache_status: CacheStatus,
+    /// The physical plan this result was executed from, when one exists
+    /// (absent for a cache hit served straight from `CachedRaw`). Carried
+    /// alongside the stream so a caller that re-admits already-collected
+    /// batches into the cache (background stale-while-revalidate) can also
+    /// use `plan_saw_transient_http_failure` as the narrow-projection
+    /// fallback `batches_cacheable` alone cannot provide — see
+    /// `cache::utils::plan_saw_transient_http_failure`.
+    physical_plan: Option<Arc<dyn ExecutionPlan>>,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -714,7 +723,22 @@ impl QueryResult {
         Self {
             data: QueryResultData::Stream(data),
             cache_status,
+            physical_plan: None,
         }
+    }
+
+    /// Attaches the physical plan this result was executed from. See the
+    /// `physical_plan` field doc for why a caller would want it.
+    #[must_use]
+    pub fn with_physical_plan(mut self, physical_plan: Arc<dyn ExecutionPlan>) -> Self {
+        self.physical_plan = Some(physical_plan);
+        self
+    }
+
+    /// The physical plan this result was executed from, when one exists.
+    #[must_use]
+    pub fn physical_plan(&self) -> Option<Arc<dyn ExecutionPlan>> {
+        self.physical_plan.clone()
     }
 
     /// Serve pre-`Arc`'d Raw (or just-decoded) batches on the SQL path.
@@ -734,6 +758,7 @@ impl QueryResult {
                 schema,
             },
             cache_status,
+            physical_plan: None,
         }
     }
 

@@ -156,7 +156,7 @@ async fn get_github_auth_rate_control(auth_context: String) -> GitHubAuthRateCon
     control
 }
 
-const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
+const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 4;
 
 pub struct Github {
     params: Parameters,
@@ -2354,6 +2354,23 @@ mod tests {
                 "'{resource_type}' has an owner-level match arm but no path entry"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_github_uses_connector_default_concurrency_when_unset() {
+        let (params, params_context) = github_connector_params(
+            "github_default_concurrency",
+            "github-default-concurrency-token",
+            &[],
+        )
+        .await;
+
+        let connector = GithubFactory::new()
+            .create(params, &params_context)
+            .await
+            .expect("GitHub connector should be created");
+
+        assert_eq!(github_available_permits(&connector), 4);
     }
 
     #[tokio::test]

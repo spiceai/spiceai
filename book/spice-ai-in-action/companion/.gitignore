@@ -1,0 +1,10 @@
+.spice/
+__pycache__/
+.env
+verification.json
+service-verification.json
+
+# Keep the book fixtures and starter Spicepod in version control.
+!data/
+!data/*.csv
+!spicepod.yaml

@@ -165,7 +165,7 @@ jobs:
       - name: Set up spiceio
         if: matrix.target.builder == 'spiceai-macos-large' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -2164,7 +2164,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
@@ -2371,7 +2375,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
