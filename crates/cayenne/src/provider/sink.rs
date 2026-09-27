@@ -250,7 +250,7 @@ impl DataSink for CayenneDataSink {
             // bookkeeping the in-memory CDC append does after its append.
             if let Some(keys) = validated_keys {
                 let record_seq = self.table.sequence_high_water().await;
-                self.table.record_inlined_pk_keys(&keys, record_seq);
+                self.table.record_mem_tier_pk_keys(&keys, record_seq);
             }
             return Ok(rows);
         }

@@ -9465,6 +9465,13 @@ impl CayenneTableProvider {
         self.slot_advancer.lock().is_some()
     }
 
+    /// Whether CDC appends engage the in-memory tier: a `cdc_durability: memory`
+    /// table whose runtime has installed a slot advancer.
+    #[must_use]
+    pub(crate) fn is_cdc_mem_tier_armed(&self) -> bool {
+        self.is_cdc_memory_mode() && self.has_slot_advancer()
+    }
+
     /// Whether the in-memory CDC tier can absorb CDC Delete events for this
     /// table — i.e. the runtime may keep a delete-bearing coalesced burst on
     /// the RAM path (key tombstones in the tier, durability deferred to the
@@ -12347,6 +12354,12 @@ impl CayenneTableProvider {
         self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated, sequence);
     }
 
+    /// Record keys a mem-tier append just published; see
+    /// [`RowLocation::MEM_TIER`].
+    pub(crate) fn record_mem_tier_pk_keys(&self, keys: &PkDigestSet, sequence: i64) {
+        self.record_pk_keys_with_location(keys, &RowLocation::MEM_TIER, sequence);
+    }
+
     /// Per-key optimistic-concurrency re-check for a transaction commit, run
     /// under `write_lock`. Returns `true` (→ abort with a write conflict) iff a
     /// key in the read footprint or the write-set was committed after the
@@ -13246,11 +13259,9 @@ impl CayenneTableProvider {
     /// and is a no-op for non-memory tables (empty `mem_tier` segments).
     ///
     /// Keys already present from the durable scan keep their `RowLocation`; RAM-only
-    /// keys are added as `FileUnlocated` — a benign label, since the mem-tier
-    /// tombstone unions the file and inline delete lists, so the label does not change
-    /// tombstone coverage. Re-adding a mem-tier-tombstoned key is harmless: a superset
-    /// only removes false-negatives, and a false positive is a redundant, correct
-    /// upsert tombstone. `mem_snapshots` MUST be captured before the durable scan (see
+    /// keys are added at [`RowLocation::MEM_TIER`]. Re-adding a mem-tier-tombstoned
+    /// key is harmless: a superset only removes false-negatives, and a false positive
+    /// is a redundant, correct upsert tombstone. `mem_snapshots` MUST be captured before the durable scan (see
     /// the caller) so a concurrent checkpoint-clear cannot hide a key from both.
     fn fold_mem_tier_keys_into_keyset(
         mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
@@ -13271,7 +13282,7 @@ impl CayenneTableProvider {
                     let rows = converter.convert_columns(&pk_columns)?;
                     for r in 0..batch.num_rows() {
                         // Single hash lookup, preserving any durable-scan `RowLocation`.
-                        keyset.insert_if_absent(rows.row(r).owned(), RowLocation::FileUnlocated);
+                        keyset.insert_if_absent(rows.row(r).owned(), RowLocation::MEM_TIER);
                     }
                 }
             }
@@ -30632,7 +30643,7 @@ impl CayenneTableProvider {
             if !record_keys.is_empty()
                 && let Some(index) = self.sharded_pk_keyset_cache.lock().as_mut()
             {
-                index.record_keys_in_shard(shard_id, record_keys, &RowLocation::Inlined);
+                index.record_keys_in_shard(shard_id, record_keys, &RowLocation::MEM_TIER);
             }
             // INVARIANT — a mem-tier append must NOT bump `inlined_generation`
             // or `inlined_structural_epoch`: it never mutates the metastore
@@ -58359,7 +58370,7 @@ mod tests {
         // the write silently takes the durable path and this test covers nothing.
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         assert!(
-            provider.is_cdc_memory_mode() && provider.has_slot_advancer(),
+            provider.is_cdc_mem_tier_armed(),
             "precondition: the applies must take the in-memory CDC path this test is about"
         );
 
@@ -58612,7 +58623,7 @@ mod tests {
         // the write silently takes the durable path and this test covers nothing.
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         assert!(
-            provider.is_cdc_memory_mode() && provider.has_slot_advancer(),
+            provider.is_cdc_mem_tier_armed(),
             "precondition: the write must take the in-memory CDC path this test is about"
         );
 
