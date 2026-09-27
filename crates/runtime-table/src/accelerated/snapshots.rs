@@ -15,6 +15,7 @@ use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use cayenne::CayenneTableProvider;
+use spice_table::{LayerWalk, find_concrete};
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
 use data_accelerator_api::swappable::SwappableTableProvider;
@@ -510,14 +511,23 @@ pub async fn create_checkpoint_and_snapshot(
     // while its timestamp is recorded, so `on_change` skips every later trigger and the
     // snapshot never catches up with the table. Done before taking the write lock, which
     // the tier's own capture locks must not nest inside.
-    if let Some(cayenne) = accelerator.and_then(|a| a.downcast_ref::<CayenneTableProvider>())
-        && let Err(e) = cayenne.checkpoint_mem_tier().await
+    if let Some(cayenne) =
+        accelerator.and_then(|a| find_concrete::<CayenneTableProvider>(a.as_ref(), LayerWalk::Write))
     {
-        if !is_shutdown_cancellation(&e) {
-            snapshot_metrics::record_snapshot_failure(&dataset_name.to_string());
-            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
+        match cayenne.checkpoint_mem_tier().await {
+            Ok(rows) => tracing::debug!(
+                dataset = %dataset_name,
+                rows,
+                "Checkpointed the in-memory CDC tier before snapshotting"
+            ),
+            Err(e) => {
+                if !is_shutdown_cancellation(&e) {
+                    snapshot_metrics::record_snapshot_failure(&dataset_name.to_string());
+                    tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
+                }
+                return;
+            }
         }
-        return;
     }
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
