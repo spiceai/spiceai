@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::{Arc, LazyLock};
 
 use datafusion::common::DFSchema;
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
@@ -227,6 +228,19 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
         .is_ok()
 }
 
+/// Whether `DuckDB` evaluates this non-function expression node the way
+/// `DataFusion` does, for
+/// [`datafusion_table_providers::util::supported_functions::FunctionSupport::with_expression_support`].
+///
+/// Today that is one shape: a cast into text whose operand reaches a binary
+/// value, which `DuckDB` answers with a row where `DataFusion` raises or
+/// answers NULL (issue #14355). Every other node is left to the function
+/// checks.
+#[must_use]
+pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    duckdb::cast_is_renderable(expr, scope)
+}
+
 /// Names of the functions [`new_bigquery_dialect`] rewrites to native
 /// `BigQuery` SQL. The federation deny-list derives its `BigQuery` carve-out
 /// from this list; see [`crate::function_support::deny_spice_functions_for_bigquery_table_providers`].
@@ -310,7 +324,8 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 mod tests {
     use super::{
         bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
-        duckdb_can_translate, duckdb_native_function_names, new_duckdb_dialect,
+        duckdb_can_evaluate_expression, duckdb_can_translate, duckdb_native_function_names,
+        new_duckdb_dialect,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::DFSchema;
@@ -487,6 +502,88 @@ mod tests {
     /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
     /// its type is readable only against a scope. That is why the scope is what
     /// closes #13915 and an inspection of the arguments alone would not have.
+    /// Regression test for #14355: `DuckDB`'s `CAST(BLOB AS VARCHAR)` renders
+    /// bytes that are not valid UTF-8 as their escaped form, where
+    /// `DataFusion`'s cast raises and its `TRY_CAST` answers NULL, so a text
+    /// cast over a binary operand stays local — whichever text type, and
+    /// wherever the binary value sits under it.
+    #[test]
+    fn duckdb_declines_a_text_cast_over_a_binary_operand() {
+        let scope = scope_of(&[
+            ("a", DataType::Binary),
+            ("l", DataType::LargeBinary),
+            ("s", DataType::Utf8),
+        ]);
+        for text in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            for operand in [
+                col("a"),
+                col("l"),
+                // A binary value reached through another node still decides
+                // it: `coalesce` answers binary here.
+                datafusion::functions::expr_fn::coalesce(vec![col("a"), col("l")]),
+                lit(ScalarValue::Binary(Some(vec![0xff]))),
+            ] {
+                for expr in [
+                    cast(operand.clone(), text.clone()),
+                    try_cast(operand.clone(), text.clone()),
+                ] {
+                    assert!(
+                        !duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                        "{expr} must stay local"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The complement of the test above: only text casts of a binary operand
+    /// are refused. Casting binary into a number is unsupported on both
+    /// engines, so both refuse the query and that shape federates as before;
+    /// a text cast of a string or a number is the common case and federates;
+    /// and a node that is not a cast has no opinion here.
+    #[test]
+    fn duckdb_federates_every_other_cast() {
+        let scope = scope_of(&[
+            ("a", DataType::Binary),
+            ("s", DataType::Utf8),
+            ("n", DataType::Int64),
+        ]);
+        for expr in [
+            cast(col("a"), DataType::Int64),
+            try_cast(col("a"), DataType::Float64),
+            cast(col("n"), DataType::Utf8),
+            try_cast(col("n"), DataType::Utf8View),
+            cast(col("s"), DataType::LargeUtf8),
+            cast(col("s"), DataType::Int64),
+            col("a"),
+            col("a").is_null(),
+        ] {
+            assert!(
+                duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                "{expr} has a faithful DuckDB rendering and must federate"
+            );
+        }
+    }
+
+    /// With no scope a column's type cannot be proven, so a text cast of it is
+    /// refused rather than assumed to be over a string; a non-text cast is not
+    /// this check's to refuse, and a literal carries its own type.
+    #[test]
+    fn duckdb_declines_a_text_cast_whose_operand_type_cannot_be_read() {
+        assert!(!duckdb_can_evaluate_expression(
+            &cast(col("a"), DataType::Utf8),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(col("a"), DataType::Int64),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(lit(1_i64), DataType::Utf8),
+            None
+        ));
+    }
+
     #[test]
     fn duckdb_reads_a_literal_argument_without_a_scope() {
         assert!(duckdb_can_translate(

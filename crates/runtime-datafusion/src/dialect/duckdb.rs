@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_schema::DataType;
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
@@ -405,6 +406,42 @@ pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSc
     let empty = DFSchema::empty();
     let scope = scope.unwrap_or(&empty);
     !args.iter().any(|arg| operand_reaches_binary(arg, scope))
+}
+
+/// Whether `DuckDB` evaluates this cast the way `DataFusion` does.
+///
+/// A cast into text is where the two engines part on binary input. `DataFusion`
+/// validates the bytes: `CAST` raises `Encountered non UTF-8 data` and
+/// `TRY_CAST` answers NULL. `DuckDB`'s `CAST(BLOB AS VARCHAR)` validates
+/// nothing and renders unprintable bytes as their escaped form, so both
+/// spellings return a row. Measured on `DuckDB` v1.4.4 through a real `spiced`,
+/// the bytes `FF FE 20 62 61 64` come back from either as the 12-character
+/// `\xFF\xFE bad`, and a `WHERE CAST(a AS VARCHAR) LIKE '%bad%'` selects the
+/// row the unaccelerated query refuses to read (issue #14355). As with
+/// [`concat_arguments_are_renderable`], no rendering closes that, so the cast
+/// stays local.
+///
+/// Only text targets are refused. Casting binary into a number, a date or a
+/// boolean is unsupported on both engines, so both refuse the query, and that
+/// shape is left to federate as before.
+///
+/// The operand tree is searched with the same rule `concat` uses, so a column
+/// whose type cannot be read against `scope` counts as binary: an unprovable
+/// cast is kept local rather than assumed safe.
+pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (operand, target) = match expr {
+        Expr::Cast(cast) => (cast.expr.as_ref(), cast.field.data_type()),
+        Expr::TryCast(cast) => (cast.expr.as_ref(), cast.field.data_type()),
+        _ => return true,
+    };
+    if !matches!(
+        target,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        return true;
+    }
+    let empty = DFSchema::empty();
+    !operand_reaches_binary(operand, scope.unwrap_or(&empty))
 }
 
 /// Whether any node of this operand's expression tree is, or carries, a binary
