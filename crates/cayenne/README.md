@@ -218,8 +218,10 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_all_snapshot_sequences(&self, table_id: &str) -> CatalogResult<HashMap<String, i64>>;
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 
-    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic)
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic).
+    // A compaction commits only while the table still points at the snapshot it
+    // was built from (`SnapshotReplaced` otherwise).
+    async fn commit_compaction(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     // Partitions

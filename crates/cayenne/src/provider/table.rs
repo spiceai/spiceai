@@ -5593,13 +5593,18 @@ impl CayenneTableProvider {
     /// state the rewrite materialized (see [`RewriteScope`]).
     pub(crate) async fn commit_snapshot_rewrite(
         &self,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         scope: &RewriteScope,
     ) -> CatalogResult<()> {
         match scope {
             RewriteScope::All => {
                 self.catalog
-                    .commit_compaction(&self.table_metadata.table_id, new_snapshot_id)
+                    .commit_compaction(
+                        &self.table_metadata.table_id,
+                        replaced_snapshot_id,
+                        new_snapshot_id,
+                    )
                     .await
             }
             RewriteScope::AllTombstonesFoldedSnapshots { folded } => {
@@ -5607,6 +5612,7 @@ impl CayenneTableProvider {
                 self.catalog
                     .commit_compaction_fenced(
                         &self.table_metadata.table_id,
+                        replaced_snapshot_id,
                         new_snapshot_id,
                         // Position tombstones are file-path scoped, not
                         // sequence-tagged, so they cannot be carried past a
@@ -5624,6 +5630,7 @@ impl CayenneTableProvider {
                 self.catalog
                     .commit_compaction_fenced(
                         &self.table_metadata.table_id,
+                        replaced_snapshot_id,
                         new_snapshot_id,
                         *cutoff,
                         &folded_ids,
@@ -18305,7 +18312,11 @@ impl CayenneTableProvider {
         // scope tracking as `rewrite_current_snapshot_for_compaction` if it ever
         // becomes reachable concurrently with writers.
         if let Err(e) = self
-            .commit_snapshot_rewrite(&new_snapshot_id, &RewriteScope::All)
+            .commit_snapshot_rewrite(
+                &self.get_current_snapshot_id(),
+                &new_snapshot_id,
+                &RewriteScope::All,
+            )
             .await
         {
             cleanup_failed_snapshot.await;
@@ -22045,6 +22056,8 @@ impl CayenneTableProvider {
         // the `match &fence` below). Holding the fence across the catalog write
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
+        #[cfg(test)]
+        self.run_test_pre_publish_hook().await;
         {
             let listing_guard = self.listing_fence.write().await;
             let snapshot_id_now = self.get_current_snapshot_id();
@@ -22095,10 +22108,35 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             }
-            if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id, &scope).await {
+            if let Err(e) = self
+                .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope)
+                .await
+            {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
+                if let crate::catalog::CatalogError::SnapshotReplaced { current, .. } = &e {
+                    // A replacement committed its catalog pointer during the
+                    // re-encode and has not published it in memory yet, so the
+                    // in-memory check above could not see it. Committing over it
+                    // would bring the replaced rows back after a restart. Discard
+                    // and retry, as for a replacement the check does see.
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        new_snapshot_id = new_snapshot_id.as_str(),
+                        snapshot_id_before = snapshot_id_before.as_str(),
+                        catalog_snapshot_id = current.as_str(),
+                        "Aborting current-snapshot compaction: the catalog moved to another \
+                         snapshot during the re-encode; discarding output and retrying"
+                    );
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::Full,
+                        CompactionOutcome::AbortedConcurrentChange,
+                    );
+                    return Ok(false);
+                }
                 return Err(Error::Catalog { source: e });
             }
 
@@ -40490,6 +40528,7 @@ mod tests {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         provider
             .commit_snapshot_rewrite(
+                &provider.get_current_snapshot_id(),
                 &new_snapshot_id,
                 &RewriteScope::AllTombstonesFoldedSnapshots {
                     folded: folded.clone(),
@@ -40559,7 +40598,11 @@ mod tests {
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         provider
-            .commit_snapshot_rewrite(&new_snapshot_id, &RewriteScope::All)
+            .commit_snapshot_rewrite(
+                &provider.get_current_snapshot_id(),
+                &new_snapshot_id,
+                &RewriteScope::All,
+            )
             .await
             .expect("wholesale compaction commit succeeds");
         provider.clear_all_deletion_caches();
@@ -40634,6 +40677,100 @@ mod tests {
             provider.cold_manifest.load().is_none(),
             "a warm-only table's keyset rebuild must not resolve (and therefore must \
              not read) the cold-tier manifest"
+        );
+    }
+
+    /// A table replacement can commit its catalog pointer while a full compaction
+    /// of the current snapshot encodes, and publish in memory only after the
+    /// compaction has. The compaction was built from the replaced snapshot, so its
+    /// catalog commit must not land over the replacement's: a restart would serve
+    /// the compacted old rows instead of the rows that replaced them. Key deletes
+    /// are the case: a position-delete table holds `write_lock` across the whole
+    /// pass, so no replacement can begin during it.
+    #[tokio::test]
+    async fn current_snapshot_compaction_does_not_supersede_a_committed_overwrite() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const NAME: &str = "compaction_vs_committed_overwrite";
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            NAME,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        for i in 0..4 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+
+        // The replacement commits its catalog pointer at the compaction's publish
+        // point and is published in memory only after the compaction's publish.
+        let committed: Arc<ParkingMutex<Option<crate::provider::PreparedOverwrite>>> =
+            Arc::new(ParkingMutex::new(None));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let committed = Arc::clone(&committed);
+            let schema = Arc::clone(&schema);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let replacement = id_value_batch(Arc::clone(&schema), &[100], &[1000]);
+                    let prepared = provider_in_hook
+                        .begin_overwrite(
+                            Box::pin(
+                                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                                    schema,
+                                    futures::stream::iter([Ok(replacement)]),
+                                ),
+                            ),
+                            1,
+                        )
+                        .await
+                        .expect("begin the replacement");
+                    prepared
+                        .apply_owned_txn()
+                        .await
+                        .expect("commit the replacement");
+                    *committed.lock() = Some(prepared);
+                })
+            }));
+        }
+
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("the compaction pass runs");
+        let prepared = committed
+            .lock()
+            .take()
+            .expect("precondition: the pass must reach its publish point");
+        prepared.finish().await.expect("publish the replacement");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, NAME).await,
+            vec![(100, 1000)],
+            "the replacement's rows are served"
+        );
+
+        let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .open(NAME)
+            .await
+            .expect("reopen the table from its catalog");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, NAME).await,
+            vec![(100, 1000)],
+            "after a restart the table must hold the replacement's rows, not the compacted ones it replaced"
         );
     }
 

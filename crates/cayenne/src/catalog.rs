@@ -71,6 +71,20 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// A compaction's commit found the table on a snapshot other than the one
+    /// the compaction was built from.
+    #[snafu(display(
+        "Table {table_id} moved from snapshot {replaced} to {current} while it was compacted, so the compacted snapshot was not committed"
+    ))]
+    SnapshotReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// The snapshot the compaction was built from
+        replaced: String,
+        /// The snapshot the table points at instead
+        current: String,
+    },
+
     /// IO error
     #[snafu(display("IO error: {source}"))]
     Io {
@@ -588,7 +602,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// rows for the table. This is only correct when the rewrite excluded
     /// concurrent writers (it held `write_lock` throughout). For the concurrent
     /// key-delete path use [`Self::commit_compaction_fenced`] instead.
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    ///
+    /// `replaced_snapshot_id` is the snapshot the compaction was built from. The
+    /// commit changes nothing and returns [`CatalogError::SnapshotReplaced`] when
+    /// the table no longer points at it: a replacement committed while the
+    /// compaction ran, and committing over it would bring the replaced rows back.
+    async fn commit_compaction(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Sequence-fenced variant of [`Self::commit_compaction`] for compactions
     /// that ran concurrently with writers.
@@ -607,9 +631,12 @@ pub trait MetadataCatalog: Send + Sync {
     /// Protected snapshots are cleared by explicit id rather than by sequence
     /// because their `sequence_number` column records the delete-fence at
     /// creation, not the snapshot's own creation sequence.
+    ///
+    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`].
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],

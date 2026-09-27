@@ -722,6 +722,33 @@ impl CayenneCatalog {
         validate_existing_delete_file_record(delete_file, &existing_record)
     }
 
+    /// Fail with [`CatalogError::SnapshotReplaced`] unless `table_id` still points
+    /// at `replaced_snapshot_id`. Read inside the caller's transaction, so the
+    /// check and the pointer swap after it commit together: a replacement that
+    /// commits in between conflicts with this transaction instead of being
+    /// overwritten by it.
+    async fn ensure_current_snapshot_in_txn(
+        txn: &dyn MetastoreTransaction,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        let values = txn
+            .query_row_values(QueryRowParams {
+                sql: "SELECT current_snapshot_id FROM cayenne_table WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await?;
+        let current = String::from_value(metastore_value_at(&values, 0)?)?;
+        if current != replaced_snapshot_id {
+            return Err(CatalogError::SnapshotReplaced {
+                table_id: table_id.to_string(),
+                replaced: replaced_snapshot_id.to_string(),
+                current,
+            });
+        }
+        Ok(())
+    }
+
     /// Apply a compaction commit's catalog mutations inside the caller's
     /// `MetastoreTransaction`, without opening a new transaction.
     ///
@@ -756,6 +783,7 @@ impl CayenneCatalog {
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
     ) -> CatalogResult<()> {
         // Validate that IDs are well-formed UUIDs to prevent SQL injection.
@@ -769,6 +797,7 @@ impl CayenneCatalog {
                 });
             }
         }
+        Self::ensure_current_snapshot_in_txn(&*txn, table_id, replaced_snapshot_id).await?;
 
         let table_id_literal = sql_text_literal(table_id);
         // `cayenne_insert_record.table_id` is a raw-UUID-bytes BLOB, so it must
@@ -808,6 +837,7 @@ impl CayenneCatalog {
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],
@@ -829,6 +859,7 @@ impl CayenneCatalog {
                 });
             }
         }
+        Self::ensure_current_snapshot_in_txn(&*txn, table_id, replaced_snapshot_id).await?;
 
         let table_id_literal = sql_text_literal(table_id);
         let insert_record_table_id_literal = insert_record_table_id_blob_literal(table_id);
@@ -3227,7 +3258,12 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+    async fn commit_compaction(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
         // Execute all operations atomically using a proper transaction.
         //
         // Order matters for crash safety (enforced by `commit_compaction_in_txn`):
@@ -3277,7 +3313,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_compaction_in_txn(&mut *tx, table_id, new_snapshot_id)
+                .commit_compaction_in_txn(&mut *tx, table_id, replaced_snapshot_id, new_snapshot_id)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -3315,6 +3351,7 @@ impl MetadataCatalog for CayenneCatalog {
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],
@@ -3339,6 +3376,7 @@ impl MetadataCatalog for CayenneCatalog {
                 .commit_compaction_fenced_in_txn(
                     &mut *tx,
                     table_id,
+                    replaced_snapshot_id,
                     new_snapshot_id,
                     cutoff,
                     protected_snapshot_ids_to_clear,
@@ -5788,6 +5826,31 @@ mod tests {
     use super::*;
     use crate::metadata::DeletionType;
     use std::sync::Arc;
+
+    /// The snapshot `table_id` points at, read inside `tx` the way a compaction
+    /// commit reads it.
+    async fn current_snapshot_id_in(tx: &dyn MetastoreTransaction, table_id: &str) -> String {
+        let values = tx
+            .query_row_values(QueryRowParams {
+                sql: "SELECT current_snapshot_id FROM cayenne_table WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .expect("read the table's current snapshot");
+        String::from_value(metastore_value_at(&values, 0).expect("one column"))
+            .expect("current_snapshot_id is text")
+    }
+
+    /// [`current_snapshot_id_in`] outside any caller transaction.
+    async fn current_snapshot_id(catalog: &CayenneCatalog, table_id: &str) -> String {
+        let tx = catalog
+            .begin_transaction()
+            .await
+            .expect("begin a read transaction");
+        let current = current_snapshot_id_in(&*tx, table_id).await;
+        tx.rollback().await.expect("end the read transaction");
+        current
+    }
 
     /// A table root of this test's own, and the `base_path` string to hand to
     /// [`CreateTableOptions`].
@@ -8816,8 +8879,9 @@ mod tests {
 
         // Commit compaction with a new snapshot ID.
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let replaced = current_snapshot_id(&catalog, &table_id).await;
         catalog
-            .commit_compaction(&table_id, &new_snapshot_id)
+            .commit_compaction(&table_id, &replaced, &new_snapshot_id)
             .await
             .expect("commit_compaction failed");
 
@@ -8848,6 +8912,68 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
+    /// A compaction is built from one snapshot of its table. If a replacement moved
+    /// the table to another snapshot while the compaction ran, committing the
+    /// compaction would point the table back at the replaced rows, so both commit
+    /// forms refuse, and the table keeps the replacement.
+    #[tokio::test]
+    async fn commit_compaction_refuses_a_snapshot_the_table_moved_off() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_commit_compaction_moved_off_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let table_id =
+            setup_table_with_delete_file(&catalog, "compaction_moved_off", &base_path).await;
+
+        let compacted_from = current_snapshot_id(&catalog, &table_id).await;
+        let replacement = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_compaction(&table_id, &compacted_from, &replacement)
+            .await
+            .expect("the replacement commits");
+
+        let wholesale = catalog
+            .commit_compaction(
+                &table_id,
+                &compacted_from,
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await;
+        let fenced = catalog
+            .commit_compaction_fenced(
+                &table_id,
+                &compacted_from,
+                &uuid::Uuid::now_v7().to_string(),
+                i64::MAX,
+                &[],
+            )
+            .await;
+        for (form, result) in [("wholesale", wholesale), ("fenced", fenced)] {
+            assert!(
+                matches!(
+                    &result,
+                    Err(CatalogError::SnapshotReplaced { current, .. })
+                        if current == &replacement
+                ),
+                "{form}: a compaction of a replaced snapshot must be refused, got {result:?}"
+            );
+        }
+        assert_eq!(
+            current_snapshot_id(&catalog, &table_id).await,
+            replacement,
+            "the table keeps the replacement"
+        );
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
     /// Test that `commit_compaction` rejects non-UUID identifiers.
     #[tokio::test]
     async fn test_commit_compaction_rejects_invalid_uuid() {
@@ -8862,12 +8988,14 @@ mod tests {
 
         // Invalid table_id should fail.
         let result = catalog
-            .commit_compaction("'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .commit_compaction("'; DROP TABLE cayenne_table;--", &valid_uuid, &valid_uuid)
             .await;
         assert!(result.is_err(), "Should reject non-UUID table_id");
 
         // Invalid new_snapshot_id should fail.
-        let result = catalog.commit_compaction(&valid_uuid, "not-a-uuid").await;
+        let result = catalog
+            .commit_compaction(&valid_uuid, &valid_uuid, "not-a-uuid")
+            .await;
         assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
 
         // Cleanup.
@@ -9835,8 +9963,9 @@ mod tests {
             .begin_transaction()
             .await
             .expect("Failed to begin transaction");
+        let replaced = current_snapshot_id_in(&*tx, &table_id).await;
         catalog
-            .commit_compaction_in_txn(&mut *tx, &table_id, &new_snapshot_id)
+            .commit_compaction_in_txn(&mut *tx, &table_id, &replaced, &new_snapshot_id)
             .await
             .expect("commit_compaction_in_txn failed");
         tx.commit()
@@ -9913,10 +10042,12 @@ mod tests {
             .begin_transaction()
             .await
             .expect("Failed to begin transaction");
+        let replaced = current_snapshot_id_in(&*tx, &table_id).await;
         catalog
             .commit_compaction_fenced_in_txn(
                 &mut *tx,
                 &table_id,
+                &replaced,
                 &new_snapshot_id,
                 i64::MAX,
                 &folded,
@@ -10005,12 +10136,14 @@ mod tests {
             .begin_transaction()
             .await
             .expect("Failed to begin transaction");
+        let replaced_a = current_snapshot_id_in(&*tx, &table_a).await;
+        let replaced_b = current_snapshot_id_in(&*tx, &table_b).await;
         catalog
-            .commit_compaction_in_txn(&mut *tx, &table_a, &snap_a)
+            .commit_compaction_in_txn(&mut *tx, &table_a, &replaced_a, &snap_a)
             .await
             .expect("partition A in_txn failed");
         catalog
-            .commit_compaction_in_txn(&mut *tx, &table_b, &snap_b)
+            .commit_compaction_in_txn(&mut *tx, &table_b, &replaced_b, &snap_b)
             .await
             .expect("partition B in_txn failed");
         tx.commit().await.expect("Failed to commit transaction");
@@ -10060,7 +10193,12 @@ mod tests {
                 .await
                 .expect("Failed to begin transaction");
             catalog
-                .commit_compaction_in_txn(&mut *tx, &table_id, &attempted_snapshot_id)
+                .commit_compaction_in_txn(
+                    &mut *tx,
+                    &table_id,
+                    &original_snapshot_id,
+                    &attempted_snapshot_id,
+                )
                 .await
                 .expect("in_txn variant succeeded inside tx");
             // Drop tx without committing — auto-rollback.
@@ -10112,13 +10250,18 @@ mod tests {
 
         // Invalid table_id should fail.
         let result = catalog
-            .commit_compaction_in_txn(&mut *tx, "'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .commit_compaction_in_txn(
+                &mut *tx,
+                "'; DROP TABLE cayenne_table;--",
+                &valid_uuid,
+                &valid_uuid,
+            )
             .await;
         assert!(result.is_err(), "Should reject non-UUID table_id");
 
         // Invalid new_snapshot_id should fail.
         let result = catalog
-            .commit_compaction_in_txn(&mut *tx, &valid_uuid, "not-a-uuid")
+            .commit_compaction_in_txn(&mut *tx, &valid_uuid, &valid_uuid, "not-a-uuid")
             .await;
         assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
 
