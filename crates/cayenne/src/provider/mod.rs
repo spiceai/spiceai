@@ -103,6 +103,7 @@ pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
 pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
+pub(crate) mod protected_merge_claims;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;

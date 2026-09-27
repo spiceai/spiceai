@@ -75,7 +75,8 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::mutation_writer::InlineBatchBuffer;
 use super::table::{
-    CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, serialize_batches_to_ipc,
+    CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
+    RangePartitioning, serialize_batches_to_ipc,
 };
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
@@ -537,7 +538,7 @@ impl CayenneTableProvider {
         // Read the split points off the table being replaced before taking the
         // write lock, so the sampling scan never holds it. A replace that lands
         // in the inline tier below ignores the plan.
-        let range_plan = self.overwrite_range_plan(target_partitions).await;
+        let routing = self.overwrite_range_plan(target_partitions).await;
 
         let write_guard = self.write_lock_arc().lock_owned().await;
 
@@ -588,6 +589,16 @@ impl CayenneTableProvider {
         let (data, target_partitions, write_policy) =
             self.sort_overwrite_input(data, target_partitions)?;
 
+        // A first load has no rows of its own to cut split points from; it may
+        // take them from the head of its input instead (`input_range_plan`).
+        let (data, range_plan) = match routing {
+            OverwriteRouting::Range(plan) => (data, Some(plan)),
+            OverwriteRouting::NothingToSample => {
+                self.input_range_plan(data, target_partitions).await?
+            }
+            OverwriteRouting::Hash => (data, None),
+        };
+
         let target_size_bytes = self.target_file_size_bytes();
         // Build the point-lookup index from the rows this write is already
         // touching. The sink reports each batch's file and file-local position,
@@ -600,9 +611,12 @@ impl CayenneTableProvider {
         // sized from the bytes the probe buffered: that is only a lower bound, and
         // under-sharding a multi-GB refresh to one writer would serialize the encode.
         //
-        // The shards cover the key ranges `overwrite_range_plan` chose, when it
-        // found a key to split; it declines for the sorted and clustered replaces
-        // above, which keep their single serial writer.
+        // The shards cover the key ranges `overwrite_range_plan` (or, for a first
+        // load, `input_range_plan`) chose, when it found a key to split; both
+        // decline for the sorted and clustered replaces above, which keep their
+        // single serial writer. Without split points the shards hash the key and
+        // each still sorts its rows by it, so an equality on the key reads about
+        // one zone of every file instead of all of them.
         let written: Result<_> = async {
             let written = self
                 .write_to_snapshot_range_partitioned(
@@ -612,7 +626,10 @@ impl CayenneTableProvider {
                     target_partitions,
                     None,
                     write_policy,
-                    range_plan.as_ref().map(OverwriteRangePlan::partitioning),
+                    Some(range_plan.as_ref().map_or_else(
+                        RangePartitioning::hashed_run_sorted,
+                        OverwriteRangePlan::partitioning,
+                    )),
                     lookup_index_observer,
                 )
                 .await?;
