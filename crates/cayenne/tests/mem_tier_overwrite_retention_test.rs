@@ -429,7 +429,7 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
         assert_eq!(
             published,
             committed,
-            "attempt {attempt}: an overwrite aborted {:?} in left the provider on a snapshot the catalog replaced",
+            "attempt {attempt}: an overwrite aborted {:?} into its run left the provider on a snapshot the catalog replaced",
             span.mul_f64(f64::from(attempt) / f64::from(ATTEMPTS))
         );
     }
