@@ -487,21 +487,6 @@ mod tests {
         ));
     }
 
-    /// A literal carries its own type, so an all-literal call still federates
-    /// with no scope: the refusal must cost only the calls it is about.
-    ///
-    /// A binary *literal* is refused on two independent paths, and each is
-    /// asserted separately because only one of them is this check's.
-    /// `duckdb_can_translate` consults the type guard *before* the unparser,
-    /// and a `ScalarValue::Binary` reports `Binary` with or without a scope, so
-    /// the guard is what answers `false` here. The `expr_to_sql` assertion
-    /// establishes the other path — the renderer would have refused it too,
-    /// with `NotImplemented("Unsupported scalar: Binary")` — so neither can be
-    /// removed on the assumption that the other still covers a binary literal.
-    ///
-    /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
-    /// its type is readable only against a scope. That is why the scope is what
-    /// closes #13915 and an inspection of the arguments alone would not have.
     /// Regression test for #14355: `DuckDB`'s `CAST(BLOB AS VARCHAR)` renders
     /// bytes that are not valid UTF-8 as their escaped form, where
     /// `DataFusion`'s cast raises and its `TRY_CAST` answers NULL, so a text
@@ -584,6 +569,21 @@ mod tests {
         ));
     }
 
+    /// A literal carries its own type, so an all-literal call still federates
+    /// with no scope: the refusal must cost only the calls it is about.
+    ///
+    /// A binary *literal* is refused on two independent paths, and each is
+    /// asserted separately because only one of them is this check's.
+    /// `duckdb_can_translate` consults the type guard *before* the unparser,
+    /// and a `ScalarValue::Binary` reports `Binary` with or without a scope, so
+    /// the guard is what answers `false` here. The `expr_to_sql` assertion
+    /// establishes the other path — the renderer would have refused it too,
+    /// with `NotImplemented("Unsupported scalar: Binary")` — so neither can be
+    /// removed on the assumption that the other still covers a binary literal.
+    ///
+    /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
+    /// its type is readable only against a scope. That is why the scope is what
+    /// closes #13915 and an inspection of the arguments alone would not have.
     #[test]
     fn duckdb_reads_a_literal_argument_without_a_scope() {
         assert!(duckdb_can_translate(
