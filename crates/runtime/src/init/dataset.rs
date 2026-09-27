@@ -758,11 +758,7 @@ impl Runtime {
             }
 
             match runtime
-                .try_load_dataset_once(
-                    Arc::clone(&ds),
-                    status,
-                    Some(Arc::clone(&load_semaphore)),
-                )
+                .try_load_dataset_once(Arc::clone(&ds), status, Some(Arc::clone(&load_semaphore)))
                 .await
             {
                 Ok(()) => Ok(()),
