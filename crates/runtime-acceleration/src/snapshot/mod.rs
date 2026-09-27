@@ -1872,6 +1872,8 @@ impl SnapshotManager {
 
         let current_engine = self.engine.to_string();
         for snapshot in ordered_snapshots {
+            let snapshot_uri = self
+                .snapshot_read_uri(&snapshot.snapshot, Some(&metadata_handle.metadata.location));
             // Early engine filtering: skip snapshots created by a different engine before
             // attempting any download. This avoids wasting bandwidth on incompatible files
             // (e.g. DuckDB snapshots when the current engine is Cayenne).
@@ -1881,7 +1883,7 @@ impl SnapshotManager {
                 tracing::debug!(
                     "Skipping snapshot with incompatible engine; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snap_engine} current_engine={current_engine}",
                     self.dataset_name,
-                    snapshot.snapshot,
+                    snapshot_uri,
                 );
                 continue;
             }
@@ -1911,7 +1913,7 @@ impl SnapshotManager {
                         tracing::warn!(
                             "Snapshot schema mismatch; attempting next available snapshot. dataset={} snapshot={} sha={sha}",
                             self.dataset_name,
-                            snapshot.snapshot,
+                            snapshot_uri,
                             sha = snapshot.snapshot_checksum.as_str(),
                         );
                     }
@@ -1923,7 +1925,7 @@ impl SnapshotManager {
                         tracing::warn!(
                             "Snapshot engine mismatch; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snapshot_engine} current_engine={current_engine}",
                             self.dataset_name,
-                            snapshot.snapshot,
+                            snapshot_uri,
                         );
                     }
                     SnapshotDownloadError::InvalidSnapshotUri { ref uri, .. } => {
@@ -1937,7 +1939,7 @@ impl SnapshotManager {
                         tracing::warn!(
                             "Failed to download snapshot while attempting fallback. dataset={} snapshot={} sha={sha} error={other}",
                             self.dataset_name,
-                            snapshot.snapshot,
+                            snapshot_uri,
                             sha = snapshot.snapshot_checksum.as_str(),
                         );
                         return Err(other);
@@ -2014,6 +2016,35 @@ impl SnapshotManager {
         }
     }
 
+    /// Returns the URI a snapshot entry is read from, for logs.
+    ///
+    /// An entry's recorded URI can name another bucket than the one read, e.g. the writer's
+    /// when this manager reads a replica, so logs name the resolved location under this
+    /// manager's snapshot location instead. Falls back to the recorded URI when it does
+    /// not resolve.
+    fn snapshot_read_uri(&self, uri: &str, metadata_location: Option<&str>) -> String {
+        self.snapshot_uri_to_object_path(uri, metadata_location)
+            .map_or_else(|_| uri.to_string(), |path| self.object_path_uri(&path))
+    }
+
+    /// Returns `object_path` as a URI under this manager's snapshot location, or the bare
+    /// object path when it lies outside that location.
+    fn object_path_uri(&self, object_path: &ObjectPath) -> String {
+        let Some(parts) = object_path.prefix_match(&self.snapshots_location) else {
+            return object_path.to_string();
+        };
+        let relative = parts
+            .map(|part| part.as_ref().to_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let base = self.snapshot_location_uri.trim_end_matches('/');
+        if relative.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}/{relative}")
+        }
+    }
+
     async fn download_snapshot_entry(
         &self,
         entry: &SnapshotEntry,
@@ -2043,6 +2074,10 @@ impl SnapshotManager {
         let object_path =
             self.snapshot_uri_to_object_path(&entry.snapshot, Some(metadata_location))?;
         let path_display = object_path.to_string();
+        let snapshot_uri = self.object_path_uri(&object_path);
+        // The recorded URI, when it differs from what is read (e.g. a replica of the writer's
+        // bucket), so a log still ties the restore back to the writer's metadata entry.
+        let recorded_as = (snapshot_uri != entry.snapshot).then_some(entry.snapshot.as_str());
 
         let get_result = self
             .object_store
@@ -2055,7 +2090,7 @@ impl SnapshotManager {
 
         tracing::debug!(
             dataset = %self.dataset_name,
-            snapshot = %entry.snapshot,
+            snapshot = %snapshot_uri,
             snapshot_id = entry.snapshot_id,
             sha = %entry.snapshot_checksum,
             "Downloading snapshot"
@@ -2109,7 +2144,7 @@ impl SnapshotManager {
                     SchemaEvolution::Identical => {
                         tracing::debug!(
                             dataset = %self.dataset_name,
-                            snapshot = %entry.snapshot,
+                            snapshot = %snapshot_uri,
                             "restored snapshot checkpoint schema differs from the metadata-recorded schema in field order, metadata, or nullability only; keeping the restored schema"
                         );
                     }
@@ -2120,7 +2155,7 @@ impl SnapshotManager {
                     SchemaEvolution::Widening(plan) => {
                         tracing::warn!(
                             dataset = %self.dataset_name,
-                            snapshot = %entry.snapshot,
+                            snapshot = %snapshot_uri,
                             snapshot_id = entry.snapshot_id,
                             "restored a snapshot that predates a widening schema change ({}); the acceleration is re-evolved to the current schema when the dataset registers",
                             plan.describe()
@@ -2137,7 +2172,7 @@ impl SnapshotManager {
                     SchemaEvolution::Incompatible { reason } => {
                         tracing::warn!(
                             dataset = %self.dataset_name,
-                            snapshot = %entry.snapshot,
+                            snapshot = %snapshot_uri,
                             snapshot_id = entry.snapshot_id,
                             "restored snapshot checkpoint schema is incompatible with the metadata-recorded schema: {reason}"
                         );
@@ -2169,7 +2204,7 @@ impl SnapshotManager {
             // Closes spiceai/spiceai#10658.
             tracing::debug!(
                 dataset = %self.dataset_name,
-                snapshot = %entry.snapshot,
+                snapshot = %snapshot_uri,
                 sha = %entry.snapshot_checksum,
                 "Bootstrapping dataset checkpoint from snapshot metadata"
             );
@@ -2186,7 +2221,8 @@ impl SnapshotManager {
             .map_or_else(|| "<directories>".to_string(), |p| p.display().to_string());
         tracing::info!(
             dataset = %self.dataset_name,
-            snapshot = %entry.snapshot,
+            snapshot = %snapshot_uri,
+            recorded_as,
             size_bytes = actual_size,
             sha = %actual_checksum,
             "Snapshot restored to {local_path_display}"
@@ -5467,6 +5503,40 @@ mod tests {
             .snapshot_uri_to_object_path(&format!("{SNAPSHOT_URI_PREFIX}-old/file.db"), None)
             .expect("convert uri to path");
         assert_eq!(path.to_string(), "snapshots/snapshots-old/file.db");
+    }
+
+    // regression test for #14425: logs name the location read, not the writer's bucket
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn snapshot_read_uri_names_the_location_read() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        // An entry recorded under the writer's bucket reads from this manager's location.
+        assert_eq!(
+            manager.snapshot_read_uri(
+                "s3://bucket-a/snapshots/month=2025-01/file.db",
+                Some("s3://bucket-a/snapshots/"),
+            ),
+            format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/file.db")
+        );
+
+        // An entry under this manager's own location is logged unchanged.
+        let own = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/file.db");
+        assert_eq!(manager.snapshot_read_uri(&own, None), own);
+
+        // A URI that does not resolve is logged as recorded.
+        assert_eq!(
+            manager.snapshot_read_uri("s3://[bad/file.db", None),
+            "s3://[bad/file.db"
+        );
     }
 
     #[cfg(feature = "duckdb")]
