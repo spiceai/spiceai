@@ -2099,10 +2099,20 @@ enum Keep {
 /// skip list could not prevent because a repin adds a collision with no signal.
 ///
 /// Why each side, for whoever changes an entry:
-/// - `abs`, `ascii`, `array_contains` (the built-in `array_has`'s alias) and
-///   `array_repeat` agree with the built-in on their documented inputs; the
-///   built-in is kept because it is the documented one and the one a
-///   federated rendering pushes down unchanged.
+/// - `abs`, `array_contains` (the built-in `array_has`'s alias) and `ascii`
+///   differ from the built-in on a few inputs, and on each the built-in is
+///   the one that agrees with the `DuckDB` rendering the call is pushed down
+///   as (measured on `DuckDB` 1.4.4), so a query answers the same whether or
+///   not it is accelerated:
+///   - `abs(CAST(-9223372036854775808 AS BIGINT))`: Spark's wraps to
+///     `-9223372036854775808`, a wrong, negative absolute value; the built-in
+///     and `DuckDB` fail with an overflow error.
+///   - `array_contains(make_array(1, NULL), 2)`: Spark's answers NULL; the
+///     built-in and `DuckDB` answer `false`.
+///   - `ascii(5)`: Spark's coerces the number to a string and answers 53; the
+///     built-in and `DuckDB` accept only strings, and the call fails to plan.
+/// - `array_repeat`: the two agree, including on a NULL count (NULL under
+///   both); the built-in is kept because it is the documented one.
 /// - `ceil` and `floor`: Spark's return `Int64` for a float argument where the
 ///   built-in returns the float's type — the return-type class, which a
 ///   federated rendering surfaces as a schema assertion, not a function error.
@@ -2111,10 +2121,12 @@ enum Keep {
 /// - `round`: Spark's returns the argument's type; the built-in returns
 ///   `Float64` for an integer argument.
 /// - `concat` is **Spark's on purpose**: it answers NULL when any argument is
-///   NULL where the built-in skips the argument, and the accelerator dialects
-///   render the call to match that — `DuckDB`'s as `||`
-///   (`concat_to_string_concat`, #13849), with `SQLite` and `PostgreSQL` in
-///   #13875 — so flipping it would invert every one of those renderings.
+///   NULL where the built-in skips the argument. The `DuckDB` dialect renders
+///   the call to match (`||`, `concat_to_string_concat`, #13849), so flipping
+///   it would make a `DuckDB`-accelerated `concat` disagree with the local
+///   result. The `PostgreSQL` and `SQLite` renderings do **not** match yet:
+///   they still skip a NULL argument and diverge from the local result
+///   (#13875, unresolved), so they are not evidence for either side here.
 ///   The fork patch it carries (fork PR #217, `docs/dev/fork_patches.md`) is
 ///   guarded by `the_built_session_concatenates_an_untyped_null`.
 /// - `date_part` (also `datepart`): Spark's counts `dow` from Sunday = 1
@@ -3064,11 +3076,12 @@ mod tests {
     }
 
     /// The built session registers **Spark's** `concat` over the built-in, on
-    /// purpose: it answers NULL when any argument is NULL, and the accelerator
-    /// dialects render the call to match (`DuckDB`'s `||`, #13849). This pins
-    /// the `Keep::Spark` entry in `SPARK_SCALAR_COLLISIONS`: were it flipped,
+    /// purpose: it answers NULL when any argument is NULL, and the `DuckDB`
+    /// dialect renders the call to match (`||`, #13849). This pins the
+    /// `Keep::Spark` entry in `SPARK_SCALAR_COLLISIONS`: were it flipped,
     /// `concat('a', NULL, 'b')` would answer `'ab'` locally and NULL once
-    /// accelerated.
+    /// accelerated in `DuckDB`. The `PostgreSQL` and `SQLite` renderings still
+    /// skip the NULL (#13875, unresolved).
     #[tokio::test]
     #[cfg(not(windows))]
     async fn the_built_session_keeps_spark_concat_over_the_built_in() {
@@ -3091,7 +3104,7 @@ mod tests {
         assert_eq!(
             batch.column(0).null_count(),
             1,
-            "Spark's concat answers NULL for a NULL argument, as the dialects render it; got {}",
+            "Spark's concat answers NULL for a NULL argument, as the DuckDB dialect renders it; got {}",
             arrow::util::pretty::pretty_format_batches(&batches).expect("format concat")
         );
     }
@@ -3127,6 +3140,66 @@ mod tests {
             batch.schema().field(0).data_type(),
             &DataType::Float64,
             "ceil over a Float64 must stay Float64, as the built-in answers"
+        );
+    }
+
+    /// The built session answers `abs`, `array_contains`, `ascii`, `floor` and
+    /// `round` as the built-in does, on the inputs where Spark's disagrees (see
+    /// `SPARK_SCALAR_COLLISIONS`). The collision-set test ignores the `Keep`
+    /// field, so this is what fails when one of these entries is flipped.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_answers_each_collision_as_decided() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        let batches = df
+            .ctx
+            .sql(
+                "SELECT array_contains(make_array(1, NULL), 2) AS contains_absent, \
+                        floor(1.5) AS floor_float, \
+                        round(5) AS round_integer",
+            )
+            .await
+            .expect("plan the decided collisions")
+            .collect()
+            .await
+            .expect("run the decided collisions");
+        let expected = [
+            "+-----------------+-------------+---------------+",
+            "| contains_absent | floor_float | round_integer |",
+            "+-----------------+-------------+---------------+",
+            "| false           | 1.0         | 5.0           |",
+            "+-----------------+-------------+---------------+",
+        ];
+        datafusion::assert_batches_eq!(&expected, &batches);
+        let schema = batches.first().expect("one batch").schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+
+        let ascii_of_a_number = df.ctx.sql("SELECT ascii(5) AS v").await;
+        assert!(
+            ascii_of_a_number.is_err(),
+            "ascii over a number must not plan under the built-in"
+        );
+
+        let wrapped = df
+            .ctx
+            .sql("SELECT abs(CAST(-9223372036854775808 AS BIGINT)) AS v")
+            .await
+            .expect("plan abs over the minimum BIGINT")
+            .collect()
+            .await;
+        let err = wrapped.expect_err(
+            "abs over the minimum BIGINT must fail, not answer Spark's wrapped negative value",
+        );
+        assert!(
+            err.to_string().contains("overflow"),
+            "abs over the minimum BIGINT must fail with an overflow error, got {err}"
         );
     }
 
