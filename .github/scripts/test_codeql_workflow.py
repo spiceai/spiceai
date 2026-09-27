@@ -37,6 +37,20 @@ class CodeQlWorkflowTest(unittest.TestCase):
         self.assertIn("pull_request|pull_request_target)", script)
         self.assertNotIn("refs/pull/", script)
 
+    def test_analyze_runs_on_spiceai_macos(self):
+        import yaml
+
+        doc = yaml.safe_load(WORKFLOW.read_text())
+        analyze = doc["jobs"]["analyze"]
+        self.assertEqual(analyze["runs-on"], "spiceai-macos")
+        # Query evaluation stays on a fresh hosted VM. It does not check out
+        # the scanned tree.
+        self.assertEqual(doc["jobs"]["sarif"]["runs-on"], "ubuntu-24.04")
+        sccache = next(
+            step for step in analyze["steps"] if step["name"] == "Set up sccache with local MinIO"
+        )
+        self.assertIn("runner.os == 'Linux'", sccache["if"])
+
     def test_produce_sarif_uses_the_cli_code_scanning_suite(self):
         import yaml
 
