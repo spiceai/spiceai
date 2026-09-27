@@ -60,6 +60,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
@@ -1293,6 +1294,7 @@ impl RefreshTask {
 
         let start_time = SystemTime::now();
         let current_local_id = state.current_loaded_id();
+        let known_metadata_e_tag = state.metadata_e_tag();
 
         // Take the accelerator write mutex up front so the entire refresh
         // (download + provider rebuild + swap) is serialized with other code
@@ -1336,12 +1338,19 @@ impl RefreshTask {
             });
         let download_result = state
             .manager
-            .download_if_newer(current_local_id, Some(validator.as_ref()))
+            .download_if_newer(
+                current_local_id,
+                known_metadata_e_tag.as_deref(),
+                Some(validator.as_ref()),
+            )
             .await;
 
-        let info = match download_result {
-            Ok(Some(info)) => info,
-            Ok(None) if current_local_id.is_none() => {
+        let (info, metadata_e_tag) = match download_result {
+            Ok(SnapshotPoll {
+                download: Some(info),
+                metadata_e_tag,
+            }) => (info, metadata_e_tag),
+            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
                 // No snapshot has ever been loaded and none is available at the configured location.
                 tracing::warn!(
                     dataset = %self.dataset_name,
@@ -1364,7 +1373,11 @@ impl RefreshTask {
                     },
                 ));
             }
-            Ok(None) => {
+            Ok(SnapshotPoll {
+                download: None,
+                metadata_e_tag,
+            }) => {
+                state.record_metadata_e_tag(metadata_e_tag);
                 tracing::debug!(
                     dataset = %self.dataset_name,
                     current_snapshot_id = ?current_local_id,
@@ -1557,7 +1570,7 @@ impl RefreshTask {
                 },
             ));
         }
-        state.set_current_loaded_id(info.snapshot_id);
+        state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
         if let Some(updated_at) = info.last_updated_at {
             self.last_updated_at
                 .store(updated_at, std::sync::atomic::Ordering::Release);
