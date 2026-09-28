@@ -70,6 +70,7 @@ use crate::schema_discovery::{
     discover_schema,
 };
 use crate::{DESCRIPTION_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
+use runtime_udfs_api::deny_spice_specific_functions;
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -391,8 +392,11 @@ pub struct DatabricksSqlWarehouse {
     metrics: Arc<DatabricksMetrics>,
     api: Arc<SqlWarehouseApi>,
     /// Which functions may be pushed into the SQL sent to the warehouse.
-    /// `None` federates every function -- see [`Self::with_function_support`].
-    function_support: Option<FunctionSupport>,
+    ///
+    /// Defaults to the Spice deny-list rather than to "federate everything",
+    /// so a caller that forgets to set it is safe: the omission costs a
+    /// pushdown, not a query the warehouse answers `UNRESOLVED_ROUTINE` to.
+    function_support: Arc<FunctionSupport>,
 }
 
 impl DatabricksSqlWarehouse {
@@ -521,20 +525,19 @@ impl DatabricksSqlWarehouse {
             pool,
             metrics,
             api,
-            function_support: None,
+            function_support: deny_spice_specific_functions(),
         })
     }
 
-    /// Restricts which functions may be unparsed into the SQL sent to the
-    /// warehouse.
+    /// Replaces the deny-list applied to functions unparsed into the SQL sent
+    /// to the warehouse.
     ///
-    /// Databricks evaluates no Spice-only function -- the `json_get_str` set,
-    /// the embedding and distance UDFs, every user-registered one -- so
-    /// without a deny-list a query naming one federates verbatim and the
-    /// warehouse answers `UNRESOLVED_ROUTINE`. See issues #10703 and #13664.
+    /// The default already denies every Spice function, which is what
+    /// Databricks needs -- it evaluates none of them (issues #10703 and
+    /// #13664). This exists for a caller that has to widen or narrow that set.
     #[must_use]
-    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
-        self.function_support = Some(function_support);
+    pub fn with_function_support(mut self, function_support: Arc<FunctionSupport>) -> Self {
+        self.function_support = function_support;
         self
     }
 
@@ -2125,7 +2128,7 @@ impl crate::Read for DatabricksSqlWarehouse {
                 .await
                 .context(SqlTableInitializationFailedSnafu)?
                 .with_dialect(dialect)
-                .with_function_support(self.function_support.clone()),
+                .with_function_support(Some(self.function_support.as_ref().clone())),
         );
 
         Ok(Arc::new(

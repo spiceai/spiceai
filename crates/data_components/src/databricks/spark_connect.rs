@@ -19,7 +19,6 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::function_support::FunctionSupport;
 use crate::{Read, spark_connect::SparkConnect};
 use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
@@ -106,19 +105,6 @@ impl DatabricksSparkConnect {
         }
 
         Ok(result)
-    }
-}
-
-impl DatabricksSparkConnect {
-    /// Restricts which functions may be unparsed into the SQL sent to the
-    /// cluster; see [`SparkConnect::with_function_support`].
-    #[must_use]
-    pub fn with_function_support(self, function_support: FunctionSupport) -> Self {
-        Self {
-            spark_connect: Arc::new(
-                SparkConnect::clone(&self.spark_connect).with_function_support(function_support),
-            ),
-        }
     }
 }
 

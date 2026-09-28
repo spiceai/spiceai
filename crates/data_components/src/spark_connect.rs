@@ -46,6 +46,7 @@ use datafusion::{
 };
 use futures::Stream;
 use runtime_rate_control::RateController;
+use runtime_udfs_api::deny_spice_specific_functions;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col};
 use tokio::sync::{Mutex, RwLock};
@@ -162,10 +163,14 @@ impl SparkSessionFactory {
 #[derive(Clone)]
 pub struct SparkConnect {
     inner: Arc<SparkConnectInner>,
-    /// Which functions may be pushed into the SQL sent to Spark. `None`
-    /// federates every function, which is only safe for a caller that
-    /// registers no function Spark lacks -- see [`Self::with_function_support`].
-    function_support: Option<FunctionSupport>,
+    /// Which functions may be pushed into the SQL sent to Spark.
+    ///
+    /// Defaults to the Spice deny-list rather than to "federate everything",
+    /// so a connector that forgets to set it is safe: the omission costs a
+    /// pushdown, not a query that Spark answers `[UNRESOLVED_ROUTINE]` to.
+    /// Behind an `Arc` because `SparkConnect` is cloned per query and per
+    /// partition, and the list it holds is one `String` per Spice function.
+    function_support: Arc<FunctionSupport>,
 }
 
 struct SparkConnectInner {
@@ -218,21 +223,28 @@ impl SparkConnect {
                 join_push_down_context,
                 rate_controller,
             }),
-            function_support: None,
+            function_support: deny_spice_specific_functions(),
         })
     }
 
-    /// Restricts which functions may be unparsed into the SQL sent to Spark.
+    /// Replaces the deny-list applied to functions unparsed into the SQL sent
+    /// to Spark.
     ///
-    /// Spark evaluates no Spice-only function -- the `json_get_str` set, the
-    /// embedding and distance UDFs, every user-registered one -- so without a
-    /// deny-list a query naming one federates verbatim and Spark answers
-    /// `[UNRESOLVED_ROUTINE]`. Every caller that registers Spice functions
-    /// installs the list; see issues #10703 and #13664.
+    /// The default already denies every Spice function, which is what Spark
+    /// needs -- it evaluates none of them and answers `[UNRESOLVED_ROUTINE]`
+    /// for the `json_get_str` set, the embedding and distance UDFs, and every
+    /// user-registered one (issues #10703 and #13664). This exists for a
+    /// caller that has to widen or narrow that set, such as a dialect that
+    /// rewrites one of those names into a real Spark function.
     #[must_use]
-    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
-        self.function_support = Some(function_support);
+    pub fn with_function_support(mut self, function_support: Arc<FunctionSupport>) -> Self {
+        self.function_support = function_support;
         self
+    }
+
+    /// The functions this connection may ask Spark to evaluate.
+    pub(crate) fn function_support(&self) -> &FunctionSupport {
+        &self.function_support
     }
 
     /// The join push-down context used for federation compute-context matching.
@@ -430,11 +442,9 @@ async fn get_table_provider(
         .await?;
 
     let join_push_down_context = spark_connect.join_push_down_context().to_string();
-    let function_support = spark_connect.function_support.clone();
 
     Ok(Arc::new(SparkConnectTableProvider {
         spark_connect,
-        function_support,
         table_reference: spark_table_reference.as_ref().into(),
         spark_table_reference,
         join_push_down_context,
@@ -445,9 +455,6 @@ async fn get_table_provider(
 #[derive(Debug)]
 struct SparkConnectTableProvider {
     spark_connect: SparkConnect,
-    /// Copied off the [`SparkConnect`] so the federation executor can read it
-    /// without reaching back through the provider's connection.
-    function_support: Option<FunctionSupport>,
     table_reference: TableReference,
     /// Backtick-quoted Spark table name, used to (re)build dataframes against the
     /// current session each time the table is scanned.
@@ -483,10 +490,10 @@ impl TableProvider for SparkConnectTableProvider {
             // federate the plan only moves a denied predicate into the
             // `TableScan`, and `scan` then hands it to Spark anyway. Same
             // screen `SqlTable::supports_filters_pushdown` applies.
-            if self
-                .function_support
-                .as_ref()
-                .is_some_and(|support| !support.supports(filter, scope.as_ref()))
+            if !self
+                .spark_connect
+                .function_support()
+                .supports(filter, scope.as_ref())
             {
                 filter_push_down.push(TableProviderFilterPushDown::Unsupported);
                 continue;
@@ -735,16 +742,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live Spark Connect server; set SPARK_REMOTE"]
     async fn a_spice_only_udf_is_not_pushed_into_the_spark_statement() {
-        let Ok(remote) = std::env::var("SPARK_REMOTE") else {
-            panic!("SPARK_REMOTE must name a Spark Connect server holding `docs`");
-        };
+        let remote = std::env::var("SPARK_REMOTE")
+            .expect("SPARK_REMOTE must name a Spark Connect server holding `docs`");
 
         // The negative control, first: with no deny-list the same plan
         // federates, which is what gives the assertion below teeth -- and is
         // the behaviour this test exists to keep from coming back.
         let unguarded = SparkConnect::from_connection(&remote)
             .await
-            .expect("connect to the Spark Connect server");
+            .expect("connect to the Spark Connect server")
+            .with_function_support(permit_everything());
         let unguarded_sql = federated_sql_for_spice_only_udf(&unguarded).await;
         assert!(
             unguarded_sql
@@ -755,6 +762,9 @@ mod tests {
              something. Got: {unguarded_sql:?}"
         );
 
+        // No `with_function_support`: the connection defaults to the Spice
+        // deny-list, which is what every connector gets, and what the
+        // stand-in UDF below is registered as a member of.
         let guarded = SparkConnect::from_connection(&remote)
             .await
             .expect("connect to the Spark Connect server")
@@ -776,6 +786,22 @@ mod tests {
                 .as_deref()
                 .is_some_and(|sql| sql.contains("upper(")),
             "upper() is a Spark function and must keep federating. Got: {control_sql:?}"
+        );
+
+        // The default, with no `with_function_support` at all: a connector
+        // that sets no policy must still be safe, which is what keeps the
+        // next Spark-backed connector from re-opening this bug.
+        let defaulted = SparkConnect::from_connection(&remote)
+            .await
+            .expect("connect to the Spark Connect server");
+        let defaulted_sql =
+            federated_sql(&defaulted, "SELECT id, json_get_str(body) AS c FROM docs").await;
+        assert!(
+            defaulted_sql
+                .as_deref()
+                .is_none_or(|sql| !sql.contains(SPICE_SET_UDF)),
+            "a connection that set no policy must still deny the Spice set. \
+             Got: {defaulted_sql:?}"
         );
 
         // The predicate half. `PushDownFilter` runs before the federation
@@ -827,7 +853,8 @@ mod tests {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .build();
         let ctx = datafusion::prelude::SessionContext::new_with_state(state);
-        ctx.register_udf(spice_only_udf());
+        ctx.register_udf(stub_udf(SPICE_ONLY_UDF));
+        ctx.register_udf(stub_udf(SPICE_SET_UDF));
         ctx.register_table(TableReference::bare("docs"), provider)
             .expect("register the docs table");
 
@@ -855,14 +882,19 @@ mod tests {
 
     const SPICE_ONLY_UDF: &str = "spice_only_udf";
 
-    /// Stands in for any Spice-only UDF: Spark has no function of this name,
-    /// exactly as it has none called `json_get_str`.
-    fn spice_only_udf() -> datafusion::logical_expr::ScalarUDF {
+    /// A function that really is in the Spice set the default policy denies,
+    /// so the default can be tested without naming the whole set.
+    const SPICE_SET_UDF: &str = "json_get_str";
+
+    /// A UDF of `name`, standing in for a Spice function Spark does not have.
+    /// The deny-list screens by name, so a stub is denied exactly as the real
+    /// function is.
+    fn stub_udf(name: &str) -> datafusion::logical_expr::ScalarUDF {
         use arrow::datatypes::DataType;
         use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 
         create_udf(
-            SPICE_ONLY_UDF,
+            name,
             vec![DataType::Utf8],
             DataType::Utf8,
             Volatility::Immutable,
@@ -871,16 +903,24 @@ mod tests {
     }
 
     /// A deny-list naming exactly one function, standing in for the Spice set
-    /// the connectors install (`runtime_udfs_api::deny_spice_functions_for_table_providers`,
-    /// which `data_components` is below and cannot call).
-    fn deny_only(name: &str) -> crate::function_support::FunctionSupport {
-        crate::function_support::FunctionSupport::new(
+    /// a real connection defaults to. Named explicitly so the test does not
+    /// depend on which functions that set happens to contain.
+    fn deny_only(name: &str) -> Arc<crate::function_support::FunctionSupport> {
+        Arc::new(crate::function_support::FunctionSupport::new(
             Some(crate::function_support::FunctionRestriction::Deny(vec![
                 name.to_string(),
             ])),
             None,
             None,
-        )
+        ))
+    }
+
+    /// A policy that restricts nothing, for the negative control -- the
+    /// default is the deny-list, so "unguarded" has to be asked for.
+    fn permit_everything() -> Arc<crate::function_support::FunctionSupport> {
+        Arc::new(crate::function_support::FunctionSupport::new(
+            None, None, None,
+        ))
     }
 
     async fn federated_sql_for_spice_only_udf(spark: &SparkConnect) -> Option<String> {
@@ -906,7 +946,8 @@ mod tests {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .build();
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_udf(spice_only_udf());
+        ctx.register_udf(stub_udf(SPICE_ONLY_UDF));
+        ctx.register_udf(stub_udf(SPICE_SET_UDF));
         ctx.register_table(TableReference::bare("docs"), provider)
             .expect("register the docs table");
 

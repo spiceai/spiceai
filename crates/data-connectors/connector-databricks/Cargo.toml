@@ -38,7 +38,6 @@ runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
 runtime-parameters = { path = "../../runtime-parameters" }
-runtime-udfs-api = { path = "../../runtime-udfs-api" }
 runtime-rate-control = { path = "../../runtime-rate-control" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 secrecy.workspace = true

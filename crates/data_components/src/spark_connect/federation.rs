@@ -29,7 +29,7 @@ use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSou
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::Stream;
 
-use crate::function_support::contains_unsupported_functions;
+use crate::function_support::plan_is_federatable;
 use crate::spark_connect::map_error_to_datafusion_err;
 use datafusion::logical_expr::LogicalPlan;
 
@@ -81,18 +81,9 @@ impl SQLExecutor for SparkConnectTableProvider {
     /// Refuses to federate a plan naming a function Spark cannot evaluate, so
     /// `DataFusion` runs it locally instead of unparsing it into the statement
     /// sent to Spark -- which answers `[UNRESOLVED_ROUTINE]` for every
-    /// Spice-only UDF. Without a configured policy every plan federates, which
-    /// is what this executor did for as long as it had no `can_execute_plan`.
-    ///
-    /// Fails safe, matching `SqlTable`'s arm of the same decision: a support
-    /// check that itself errors is read as "unsupported", so a plan is never
-    /// sent on the strength of a check that did not complete.
+    /// Spice-only UDF (#13664).
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        self.function_support
-            .as_ref()
-            .is_none_or(|function_support| {
-                !contains_unsupported_functions(plan, function_support).unwrap_or(true)
-            })
+        plan_is_federatable(plan, Some(self.spark_connect.function_support()))
     }
 
     fn execute(

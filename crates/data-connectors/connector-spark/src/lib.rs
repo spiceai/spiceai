@@ -35,7 +35,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -84,11 +83,7 @@ impl Spark {
             .context(InvalidEndpointSnafu { endpoint: conn })?;
         let spark = SparkConnect::from_connection(conn)
             .await
-            .context(UnableToConstructSparkConnectSnafu)?
-            // Spark has none of the Spice-only functions, so they are
-            // evaluated locally instead of being unparsed into the statement
-            // sent to the cluster (#10703, #13664).
-            .with_function_support(deny_spice_functions_for_table_providers());
+            .context(UnableToConstructSparkConnectSnafu)?;
         Ok(Self {
             read_provider: Arc::new(spark),
         })
