@@ -787,6 +787,15 @@ fn try_rewrite_oversized_join(
         return Ok(None);
     }
 
+    // `x NOT IN (subquery)` plans as a null-aware anti join: a NULL among the
+    // subquery's values leaves no row selected, and a NULL `x` is never selected.
+    // `SortMergeJoinExec` has no null-aware mode, so the rewrite would answer as
+    // the plain anti join `NOT EXISTS` plans and keep both kinds of row. This is
+    // the same rule DataFusion's planner applies when it picks a join.
+    if hash_join.null_aware {
+        return Ok(None);
+    }
+
     if hash_join.on().is_empty() {
         return Ok(None);
     }
@@ -1149,7 +1158,7 @@ fn rewrite_partitioned_hash_join_to_collect_left(
             .map(|indices| indices.to_vec()),
         PartitionMode::CollectLeft,
         hash_join.null_equality(),
-        false,
+        hash_join.null_aware,
     )?;
     Ok(Some(Arc::new(join)))
 }

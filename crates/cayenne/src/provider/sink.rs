@@ -521,11 +521,21 @@ impl CayenneDataSink {
     ) -> super::Result<u64> {
         let target_partitions = context.session_config().target_partitions();
         let prepared = self.table.begin_overwrite(data, target_partitions).await?;
-        prepared
-            .apply_owned_txn()
-            .await
-            .map_err(super::Error::from)?;
-        prepared.finish().await
+        // The durable commit and the publish run on one task that owns the
+        // prepared overwrite. A caller dropped while `COMMIT` is in flight drops
+        // only this handle: the metastore may still commit, and the task still
+        // publishes the snapshot the catalog then points at, instead of leaving the
+        // in-memory state, the in-memory CDC tier included, on the replaced one.
+        let table = self.table.table_name().to_string();
+        tokio::spawn(async move {
+            prepared
+                .apply_owned_txn()
+                .await
+                .map_err(super::Error::from)?;
+            prepared.finish().await
+        })
+        .await
+        .map_err(|source| super::Error::TaskPanicked { table, source })?
     }
 }
 

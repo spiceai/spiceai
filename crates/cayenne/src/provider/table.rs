@@ -5657,17 +5657,41 @@ impl CayenneTableProvider {
     /// `new_snapshot_id` (whose directory is then empty). It re-seeds the inline
     /// counters that [`Self::invalidate_inlined_cache`] zeroes, so the flip lands
     /// on the exact corpus the catalog holds.
+    ///
+    /// Returns the source epoch of the in-memory CDC tier the flip discarded, if it
+    /// held rows. The caller hands it to [`Self::fire_slot_advancer`], which
+    /// releases the source commits that were waiting on those rows, once it has
+    /// armed everything the flip owes (see `PreparedOverwrite::finish`).
     pub(crate) async fn publish_overwrite_snapshot(
         &self,
         new_snapshot_id: &str,
         inlined_rows: Option<InlinedOverwritePublish>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
-        let _fence = self.listing_fence.write().await;
-        self.publish_overwrite_snapshot_fenced(new_snapshot_id, new_listing_table, inlined_rows);
-        Ok(())
+        let discarded_epoch = {
+            let _fence = self.listing_fence.write().await;
+            // An overwrite replaces every row, including the rows still in the
+            // in-memory CDC tier: left there, they would be read over the new
+            // snapshot and made durable by the next checkpoint (the CDC rebuild
+            // after `history_unavailable` is such an overwrite). Under the fence, so
+            // a scan sees either the old snapshot with its in-memory rows or the new
+            // snapshot without them. The caller holds `write_lock` and
+            // `mem_checkpoint_lock` (see `begin_overwrite`), so neither an apply nor
+            // a checkpoint can change the tier.
+            let discarded_epoch = self.discard_mem_tier().await?;
+            // The overwrite's catalog commit deleted every inline row of this table,
+            // any seal shadow included, so no bake has a shadow left to clear.
+            self.mem_tier_shadow_present.store(false, Ordering::Release);
+            self.publish_overwrite_snapshot_fenced(
+                new_snapshot_id,
+                new_listing_table,
+                inlined_rows,
+            );
+            discarded_epoch
+        };
+        Ok(discarded_epoch)
     }
 
     /// Make an inlined overwrite's replacement rows readable BEFORE its catalog
@@ -25866,11 +25890,10 @@ impl CayenneTableProvider {
     ///
     /// The sole caller is the post-write maintenance loop (see
     /// [`Self::run_maintenance_state`]), which runs outside any writer's
-    /// `write_lock`. The deletion sink is built with
-    /// `Some(Arc::clone(&self.write_lock))` so the sink itself serializes
-    /// against concurrent inserts / listing refreshes for the duration of the
-    /// scan — same exclusion guarantee the inline-retention path used to
-    /// provide, just held inside the sink rather than the writer.
+    /// `write_lock`. The pass takes `write_lock` itself and holds it across making
+    /// the in-memory CDC tier durable, building the deletion sink and running it,
+    /// so no insert or listing refresh lands between what the sink scans and what
+    /// it deletes.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<RetentionPass> {
         let table_name = self.table_metadata.table_name.as_str();
         if self.retention_filters.is_empty() {
@@ -26005,33 +26028,39 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
-        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
-        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
-        // caller that passes the `write_lock` INTO the sink rather than holding it,
-        // and the wrapper takes that same non-reentrant lock itself. The consequence
-        // is that `retention_sql` does not reach a `mode: memory` tier, which the
-        // accelerator warns about at registration.
-        let sink = self
-            .build_deletion_vector_sink(
-                &filters,
-                Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::User,
-            )
+        //
+        // Rows still in the in-memory CDC tier are not among the sink's scan sources,
+        // so a key whose durable version matches `retention_sql` would be tombstoned
+        // while its newer version sits in RAM — and the tombstone would hide that live
+        // row too. So the tier is made durable first, and the sink built from the
+        // snapshot that checkpoint published, inside ONE `write_lock` hold that also
+        // covers the delete: the same treatment a user DELETE gets in
+        // `InlineAwareDeletionSink` (#13828). The sink is built without a lock of its
+        // own because this hold is it. `retention_sql` still does not reach a
+        // `mode: memory` tier, which has no durable tier to checkpoint into; the
+        // accelerator warns about that at registration.
+        let retention_failed = |err: Box<dyn std::error::Error + Send + Sync>| {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::Retention,
+                MaintenanceOutcome::Failed,
+            );
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                    self.table_metadata.table_name
+                ),
+                source: err,
+            }
+        };
+        let write_guard = self.write_lock.lock().await;
+        self.checkpoint_mem_tier_for_delete()
             .await
-            .map_err(|err| {
-                maintenance_metrics::track_maintenance(
-                    table_name,
-                    MaintenanceOp::Retention,
-                    MaintenanceOutcome::Failed,
-                );
-                CatalogError::InvalidOperation {
-                    message: format!(
-                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                        self.table_metadata.table_name
-                    ),
-                    source: Box::new(err),
-                }
-            })?;
+            .map_err(|err| retention_failed(Box::new(err)))?;
+        let sink = self
+            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+            .await
+            .map_err(|err| retention_failed(Box::new(err)))?;
         // Nothing on this path re-derives `num_rows` from the rows about to be removed,
         // and a caller may have just `Set` an authoritative count (an overwrite
         // re-baselines one, and that restores exactness), so an untainted flag would let
@@ -26040,10 +26069,11 @@ impl CayenneTableProvider {
         // before the durable delete for the reason documented on it.
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
-        let deleted_count = match sink
+        let deleted = sink
             .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
-            .await
-        {
+            .await;
+        drop(write_guard);
+        let deleted_count = match deleted {
             Ok(deleted) => deleted,
             Err(err) => {
                 maintenance_metrics::track_maintenance(
@@ -31781,9 +31811,35 @@ impl CayenneTableProvider {
         if self.mem_tier.is_empty() {
             return Ok(0);
         }
-        // Capture each shard's full segment prefix under no append (write_lock held
-        // by the caller). Count the visible rows removed, and read the source-slot
-        // epoch to ack BEFORE the clear empties the segments.
+        // Count the visible rows removed BEFORE the clear empties the segments
+        // (write_lock held by the caller, so no append lands in between).
+        let mut removed_rows: u64 = 0;
+        for shard in self.mem_tier.shards().iter().map(ArcSwap::load_full) {
+            if shard.is_empty() || shard.segments.is_empty() {
+                continue;
+            }
+            for batch in self.visible_mem_tier_batches(&shard, None)? {
+                removed_rows = removed_rows.saturating_add(batch.num_rows() as u64);
+            }
+        }
+        if let Some(source_epoch) = self.discard_mem_tier().await? {
+            self.fire_slot_advancer(source_epoch).await;
+        }
+        Ok(removed_rows)
+    }
+
+    /// Clear every shard of the in-memory CDC tier, returning the source-slot
+    /// epoch every discarded row is at or below, or `None` when the tier was
+    /// already empty. The caller MUST hold `write_lock`, so no CDC apply mutates
+    /// the tier between the capture and the clear, and must then call
+    /// [`Self::fire_slot_advancer`] with the epoch: the rows are discarded rather
+    /// than made durable, but every deferred source committer at or below it
+    /// still has to be released, or the deferred-commit queue stalls the changes
+    /// stream (#11644).
+    async fn discard_mem_tier(&self) -> Result<Option<u64>> {
+        if self.mem_tier.is_empty() {
+            return Ok(None);
+        }
         let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
             .mem_tier
             .shards()
@@ -31791,35 +31847,24 @@ impl CayenneTableProvider {
             .map(ArcSwap::load_full)
             .collect();
         let flushed_counts: Vec<usize> = shard_snapshots.iter().map(|s| s.segments.len()).collect();
-        let mut removed_rows: u64 = 0;
-        for shard in &shard_snapshots {
-            if shard.is_empty() || shard.segments.is_empty() {
-                continue;
-            }
-            for batch in self.visible_mem_tier_batches(shard, None)? {
-                removed_rows = removed_rows.saturating_add(batch.num_rows() as u64);
-            }
-        }
         // The source-slot epoch every discarded row is at/below — mirrors
         // `checkpoint_mem_tier_inner` (MAX over shards of the per-apply
         // `source_position`, falling back to the N==1 shard's `epoch` currency).
-        // The rows are DISCARDED, not made durable, so every deferred source
-        // committer at/below this epoch must still be released via the advancer
-        // below or the deferred-commit queue stalls the changes stream (#11644).
         let durable_epoch = shard_snapshots
             .iter()
             .zip(flushed_counts.iter())
             .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
             .max();
-        let epoch =
+        let source_epoch =
             durable_epoch.unwrap_or_else(|| shard_snapshots.first().map_or(0, |shard| shard.epoch));
         // Clearing each shard's FULL prefix leaves an empty tier. `false`: the
-        // inline corpus is deleted by the caller's inline/file sink, not here, so
-        // this must not also run the checkpoint-time inline-metadata clear.
+        // inline corpus is deleted by the caller (a delete's inline/file sink, or
+        // an overwrite's catalog commit), not here, so this must not also run the
+        // checkpoint-time inline-metadata clear — which is also what makes this
+        // step unable to fail.
         self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false)
             .await?;
-        self.fire_slot_advancer(epoch).await;
-        Ok(removed_rows)
+        Ok(Some(source_epoch))
     }
 
     /// Remove every mem-tier row matching `filters` on a `mode: memory` table, and
@@ -32017,7 +32062,7 @@ impl CayenneTableProvider {
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
-    async fn fire_slot_advancer(&self, durable_epoch: u64) {
+    pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
         // Record the durable high-watermark (encoded `epoch + 1`, monotone via
         // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
         // a source committer queued after this flush already drained its epoch —
