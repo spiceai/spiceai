@@ -117,7 +117,8 @@ pub(super) enum EngineDependentSyntax {
     /// across all of Unicode when it factors an alternation (`([Kk]|a)`
     /// matches the Kelvin sign remotely and not locally).
     CaseFoldPair,
-    /// A `$` or a `\` in a replacement — see [`engine_neutral_replacement`].
+    /// A `$` in a replacement, or a `\` that is not a one-digit reference to
+    /// a group the pattern has — see [`engine_neutral_replacement`].
     RewriteTemplate,
 }
 
@@ -155,7 +156,7 @@ impl fmt::Display for EngineDependentSyntax {
                 "it spells a counted repetition with a leading zero or a space, which RE2 reads as literal text"
             }
             Self::RewriteTemplate => {
-                "it holds a `$` or a `\\`, and DataFusion reads a capture group as `$1` where RE2 reads it as `\\1`"
+                "it holds a `$`, or a `\\` other than a one-digit reference to a capture group of the pattern, and DataFusion and RE2 build different text from those"
             }
         })
     }
@@ -163,26 +164,57 @@ impl fmt::Display for EngineDependentSyntax {
 
 /// Whether the two engines build the same string out of `replacement` — the
 /// other half of the agreement question, for a call that rewrites what it
-/// matches rather than only finding it.
+/// matches rather than only finding it. `capture_groups` is the number of
+/// capture groups in the call's pattern.
 ///
 /// The rewrite templates are different languages. The kernel reads `$1` (and
 /// `${name}`, and `$$` for a literal `$`); RE2 reads `\1` and treats `$` as
 /// ordinary text, so `regexp_replace('ab', '(a)(b)', '$2$1')` is `ba` locally
 /// and the literal text `$2$1` federated (measured on the bundled `DuckDB`).
-/// Only a replacement holding neither character is admitted.
+/// A replacement holding a `$` is refused.
 ///
-/// `\1` is refused along with the rest even though it was measured to agree —
-/// `DataFusion` rewrites the POSIX spelling into its own before it runs, so
-/// the two engines happen to meet there. `\10` is where they part again: group
-/// 10 to the kernel, group 1 followed by `0` to RE2, whose rewrite grammar
-/// reads one digit. The line is drawn around the whole backslash form rather
-/// than through the middle of it.
-pub(super) fn engine_neutral_replacement(replacement: &str) -> Result<(), EngineDependentSyntax> {
-    if replacement.contains(['$', '\\']) {
-        Err(EngineDependentSyntax::RewriteTemplate)
-    } else {
-        Ok(())
+/// The one backslash form the two engines read alike is a single `\` and a
+/// single digit naming a group the pattern has (`\0` is the whole match).
+/// `DataFusion` rewrites `\{1,2}(\d+)` into its own `${N}` before it runs, and
+/// RE2's rewrite grammar is `\` plus one digit, so they meet at `\1` and part
+/// everywhere around it:
+///
+/// - `\10` is group 10 to the kernel and group 1 followed by `0` to RE2. The
+///   kernel's `\d` is Unicode-aware, so `\1١` (ARABIC-INDIC DIGIT ONE) parts
+///   the same way; any numeric character after the digit is refused.
+/// - `\\1` is group 1 to the kernel and a literal backslash followed by `1`
+///   to RE2.
+/// - A group the pattern does not have is the empty string to the kernel and
+///   a rewrite error to RE2.
+/// - Any other escape (`\q`, `\n`) is left in the text by the kernel and is
+///   a rewrite error to RE2.
+///
+/// That form is what an extraction idiom such as ClickBench's
+/// `regexp_replace(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1')` spells,
+/// and refusing it evaluates the whole aggregate above the scan locally.
+pub(super) fn engine_neutral_replacement(
+    replacement: &str,
+    capture_groups: usize,
+) -> Result<(), EngineDependentSyntax> {
+    if replacement.contains('$') {
+        return Err(EngineDependentSyntax::RewriteTemplate);
     }
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        let group = chars
+            .next()
+            .filter(char::is_ascii_digit)
+            .and_then(|digit| digit.to_digit(10))
+            .ok_or(EngineDependentSyntax::RewriteTemplate)?;
+        let names_a_group = usize::try_from(group).is_ok_and(|group| group <= capture_groups);
+        if !names_a_group || chars.peek().is_some_and(|next| next.is_numeric()) {
+            return Err(EngineDependentSyntax::RewriteTemplate);
+        }
+    }
+    Ok(())
 }
 
 /// Parses `pattern` as the kernel would and returns its syntax tree if every
