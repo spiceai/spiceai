@@ -2476,15 +2476,15 @@ jobs:
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
-  # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
-  # skipped and this lightweight gate reports the required context. In the merge
-  # queue it succeeds only if every E2E job above succeeded (or was skipped), so
-  # the whole matrix is gated by one ruleset entry rather than dozens of shifting
-  # matrix names.
+  # Stable, matrix-proof summary check. It succeeds only if every E2E job above
+  # succeeded (or was skipped), so the whole matrix is gated by one ruleset entry
+  # rather than dozens of shifting matrix names. On a pull request it is skipped
+  # along with every job it summarises, so the required check reads `skipped`,
+  # not a `success` nothing ran for (#13841).
   e2e-gate:
     name: E2E Test CI
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     # The gate only reads the results it already has. Bounding it matters because it is
     # the required check: a stuck gate blocks the queue even when every job it summarises
     # has finished.
