@@ -1234,7 +1234,7 @@ impl HttpTableProvider {
                             status: status.as_u16(),
                             message: format!(
                                 "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
-                                self.base_url,
+                                endpoint,
                                 test_url.path()
                             ),
                         });
@@ -5389,6 +5389,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A health probe that answers non-2xx names the endpoint's origin, not the configured
+    /// URL with its userinfo and query (regression test for #13534).
+    #[tokio::test]
+    async fn http_health_probe_failure_does_not_render_configured_url() {
+        let (origin_url, _, server) =
+            retry_test_server(vec![(404, String::new())], Duration::ZERO).await;
+        let origin = endpoint_label(&origin_url);
+        let url = Url::parse(&format!(
+            "http://user:pass-secret@{}/path-secret?api_key=query-secret",
+            origin.trim_start_matches("http://")
+        ))
+        .expect("valid URL");
+        let (provider, _) = retry_test_provider(url, 0, Duration::from_secs(2));
+        let provider = provider
+            .with_health_probe(Some("/health".to_string()))
+            .expect("valid health probe");
+
+        let error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("a 404 health probe should fail validation");
+        let message = error.to_string();
+        assert!(message.contains(&origin), "names the origin: {message}");
+        for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
+            assert!(!message.contains(secret), "leaks {secret}: {message}");
+        }
+        server.abort();
     }
 
     #[tokio::test]
