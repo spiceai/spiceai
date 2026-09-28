@@ -983,15 +983,8 @@ async fn ensure_publication(
         ensure_publish_via_partition_root(client, publication_name).await?;
 
         // Verify the publication includes our table; if not, add it.
-        let has_table: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_publication_tables \
-                 WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
-                &[&publication_name, &schema_name, &table_name],
-            )
-            .await
-            .context(SetupExecSnafu)?
-            .get(0);
+        let has_table =
+            publication_has_table(client, publication_name, schema_name, table_name).await?;
         if !has_table {
             let stmt = format!(
                 "ALTER PUBLICATION {pub} ADD TABLE {schema}.{table}",
@@ -1108,6 +1101,25 @@ async fn list_publication_tables(
         .collect())
 }
 
+/// Whether `publication_name` publishes `schema_name.table_name`, however it
+/// includes it — named, `FOR ALL TABLES`, or `FOR TABLES IN SCHEMA`.
+async fn publication_has_table(
+    client: &tokio_postgres::Client,
+    publication_name: &str,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication_tables \
+             WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
+            &[&publication_name, &schema_name, &table_name],
+        )
+        .await
+        .context(SetupExecSnafu)?
+        .get(0))
+}
+
 /// What [`remove_table_from_publication`] left the table as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicationRemoval {
@@ -1166,15 +1178,9 @@ pub async fn remove_table_from_publication(
                     .is_some_and(|db| matches!(db.code().code(), "42704" | "42P01")) => {}
             Err(e) => return Err(e).context(SetupExecSnafu),
         }
-        let still_published: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_publication_tables \
-                 WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
-                &[&params.publication_name, &schema_name, &table_name],
-            )
-            .await
-            .context(SetupExecSnafu)?
-            .get(0);
+        let still_published =
+            publication_has_table(&client, &params.publication_name, schema_name, table_name)
+                .await?;
         Ok(if still_published {
             PublicationRemoval::StillPublished
         } else {

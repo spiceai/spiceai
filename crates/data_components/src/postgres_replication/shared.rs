@@ -2150,14 +2150,15 @@ impl SharedSource {
                     // is loaded from the source — neither resumes over the
                     // changes acknowledged here.
                     Ok(slot::PublicationRemoval::StillPublished) => {
+                        let table = format_member(&key);
                         tracing::warn!(
-                            table = %format_member(&key),
+                            table = %table,
                             slot = %slot_name,
                             publication = %publication,
                             grace_secs,
                             "{}",
                             implicitly_published_release_message(
-                                &format_member(&key),
+                                &table,
                                 &slot_name,
                                 &publication,
                                 grace_secs,

@@ -1244,6 +1244,56 @@ async fn slot_acked_past(
     Ok((row.get(0), row.get(1)))
 }
 
+/// Write to `mate_table` and commit `mate`'s envelopes (idle heartbeats included,
+/// which is what carries the slot's acknowledgement forward) until the slot is
+/// acknowledged past `lsn`, for up to a minute. Returns whether it got there and
+/// the last `confirmed_flush_lsn` seen.
+async fn churn_until_acked_past(
+    source: &tokio_postgres::Client,
+    mate: &mut ChangesStream,
+    mate_table: &str,
+    lsn: &str,
+) -> Result<(bool, String), anyhow::Error> {
+    let insert = format!("INSERT INTO public.{mate_table} (id, name) VALUES ($1, 'mate-churn')");
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut confirmed = String::new();
+    let mut churn_id = 100;
+    while std::time::Instant::now() < deadline {
+        churn_id += 1;
+        source.execute(&insert, &[&churn_id]).await?;
+        if let Ok(envelope) = next_envelope(mate, "mate churn").await {
+            envelope.commit().await?;
+        }
+        let (past, at) = slot_acked_past(source, lsn).await?;
+        confirmed = at;
+        if past {
+            return Ok((true, confirmed));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok((false, confirmed))
+}
+
+/// Commit `stream`'s envelopes for up to 45s until one either carries row
+/// `missed_id` or reports that the history needed to replay it is gone — the two
+/// correct outcomes for a dataset rejoining over a gap. Idle heartbeats carry no
+/// rows and are not an answer either way.
+async fn replays_or_rebuilds(
+    stream: &mut ChangesStream,
+    missed_id: i32,
+) -> Result<bool, anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while std::time::Instant::now() < deadline {
+        let envelope = next_envelope(stream, "re-added dataset envelope").await?;
+        let recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&missed_id);
+        envelope.commit().await?;
+        if recovered {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Regression for #11896: a durable acceleration whose CDC bootstrap was lost to
 /// a crash before it became durable must be re-loaded, not resumed over.
 ///
@@ -2281,27 +2331,8 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
     // Committing the mate's envelopes — including its idle heartbeats — is what
     // carries the slot's acknowledgement forward; the reservation for the absent
     // table has to lapse first, which is why the grace is shortened above.
-    let deadline = std::time::Instant::now() + Duration::from_mins(1);
-    let mut acked_past = false;
-    let mut churn_id = 100;
-    while std::time::Instant::now() < deadline {
-        churn_id += 1;
-        source
-            .execute(
-                "INSERT INTO public.lapsed_mate (id, name) VALUES ($1, 'mate-churn')",
-                &[&churn_id],
-            )
-            .await?;
-        if let Ok(envelope) = next_envelope(&mut mate, "mate churn").await {
-            envelope.commit().await?;
-        }
-        let (past, _) = slot_acked_past(&source, &missed_lsn).await?;
-        if past {
-            acked_past = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let (acked_past, _) =
+        churn_until_acked_past(&source, &mut mate, "lapsed_mate", &missed_lsn).await?;
     anyhow::ensure!(
         acked_past,
         "the test could not reach the state it exists to cover: the slot never acknowledged past \
@@ -2332,16 +2363,7 @@ async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_
     // Idle heartbeats carry no rows and are not an answer either way, so commit
     // past them and wait for one of the two acceptable outcomes: the missed change
     // replayed, or a report that the history needed to replay it is gone.
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
-    let mut recovered = false;
-    while std::time::Instant::now() < deadline {
-        let envelope = next_envelope(&mut re_added, "re-added dataset envelope").await?;
-        recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&2);
-        envelope.commit().await?;
-        if recovered {
-            break;
-        }
-    }
+    let recovered = replays_or_rebuilds(&mut re_added, 2).await?;
     anyhow::ensure!(
         recovered,
         "a dataset re-added after its reservation lapsed neither received the change committed \
@@ -2441,29 +2463,8 @@ async fn an_unclaimed_table_in_a_for_all_tables_publication_does_not_pin_the_slo
     // table lapses, the survivor's own traffic must carry the acknowledgement
     // past that table's change. ---
     let mut mate = start_replication_stream(short_grace(input_for(port, "all_tables_mate")));
-    let deadline = std::time::Instant::now() + Duration::from_mins(1);
-    let mut acked_past = false;
-    let mut confirmed = String::new();
-    let mut churn_id = 100;
-    while std::time::Instant::now() < deadline {
-        churn_id += 1;
-        source
-            .execute(
-                "INSERT INTO public.all_tables_mate (id, name) VALUES ($1, 'mate-churn')",
-                &[&churn_id],
-            )
-            .await?;
-        if let Ok(envelope) = next_envelope(&mut mate, "mate churn").await {
-            envelope.commit().await?;
-        }
-        let (past, at) = slot_acked_past(&source, &missed_lsn).await?;
-        confirmed = at;
-        if past {
-            acked_past = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let (acked_past, confirmed) =
+        churn_until_acked_past(&source, &mut mate, "all_tables_mate", &missed_lsn).await?;
     anyhow::ensure!(
         acked_past,
         "the slot's confirmed_flush_lsn stayed at {confirmed}, below {missed_lsn}, for a minute of \
@@ -2490,16 +2491,7 @@ async fn an_unclaimed_table_in_a_for_all_tables_publication_does_not_pin_the_slo
         "all_tables_absent",
         &InMemoryAppliedLsnStore::seeded(recorded),
     )));
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
-    let mut recovered = false;
-    while std::time::Instant::now() < deadline {
-        let envelope = next_envelope(&mut re_added, "re-added dataset envelope").await?;
-        recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&2);
-        envelope.commit().await?;
-        if recovered {
-            break;
-        }
-    }
+    let recovered = replays_or_rebuilds(&mut re_added, 2).await?;
     anyhow::ensure!(
         recovered,
         "a dataset re-added after its FOR ALL TABLES hold was released neither received the \
