@@ -105,8 +105,8 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `22ff09c419766c9e3b1ecb8d911fb3a9abf723b3` | `spiceai-58` |
+| [arrow-adbc](#arrow-adbc) | `fe5f49581968880c664a1466f234fec2301ca7bf` | `spiceai-maint-24-patches` (TEMPORARY: spiceai/arrow-adbc spiceai-maint-24-patches → spiceai-maint-24 fork PR) |
+| [arrow-rs](#arrow-rs) | `16974504b7f1776971f4fb20bbe355b09d090a0d` | `spiceai-59-patches` (TEMPORARY: spiceai/arrow-rs spiceai-59-patches → spiceai-59 fork PR)|
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -114,28 +114,28 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `11624fb82dc5460d201d0379d269a4613e82f9c7` | `spiceai-54` |
-| [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
+| [datafusion](#datafusion) | `5979a0fe3376e2b79dcbda28fc459ab72dae57a3` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion spiceai-55-patches → spiceai-55 fork PR)|
+| [datafusion-ballista](#datafusion-ballista) | `72781d6d5267fd52756f57e3cc670272f3de4872` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-ballista spiceai-55-patches → spiceai-55 fork PR) |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `40fefe6426addce7864b80261bdf771ddb19d8ab` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-federation spiceai-55-patches → spiceai-55 fork PR) |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `14fdd18233daab646859eb9ea115873a445b3df3` | `spiceai-54` |
-| [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `9845ca1d539a8c071a4d04197e9081dff62a3990` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-table-providers spiceai-55-patches → spiceai-55 fork PR)|
+| [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27`|
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `875974763e847eb4dc4e071f875f5bbecdd63b47` | `spiceai-1.4.4-patches` (TEMPORARY: spiceai/duckdb-rs spiceai-1.4.4-patches → spiceai-1.4.4 fork PR) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
+| [iceberg-rust](#iceberg-rust) | `b4e000b62c1477bf5a6479c8196040677134509c` | `spiceai-0.10.0-df-55-patches` (TEMPORARY: spiceai/iceberg-rust spiceai-0.10.0-df-55-patches → spiceai-0.10.0-df-55 fork PR)|
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
-| [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
-| [snowflake-rs](#snowflake-rs) | `e1542cc4320cd08b0e50b3d2270f38ba3f0ccd68` | `spiceai-58` |
-| [spark-connect-rs](#spark-connect-rs) | `5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad` | `spiceai` |
+| [sea-query](#sea-query) | `985eec78d1a4417b5933e57aac1f39e4470f9473` | `spiceai-1.0.1-patches` (TEMPORARY: spiceai/sea-query spiceai-1.0.1-patches → spiceai-1.0.1 fork PR)|
+| [snowflake-rs](#snowflake-rs) | `354f35c414c89c7dca5c2ce5e000bd7a2948ad39` | `spiceai-59-patches` (TEMPORARY: spiceai/snowflake-rs spiceai-59-patches → spiceai-59 fork PR)|
+| [spark-connect-rs](#spark-connect-rs) | `9d452dc9015cf11d096dd49a6d7dda94e8b28ede` | `spiceai-59-patches` (TEMPORARY: spiceai/spark-connect-rs spiceai-59-patches → spiceai-59 fork PR) |
 | [text-embeddings-inference](#mistralrs-and-text-embeddings-inference) | `ac4e457936bc11c9b4fee453f2be33133d3146d8` | `spiceai` |
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `5e477a52254a670bd51a24d8e6fad5b464f4b41f` | `spiceai-54` |
+| [vortex](#vortex) | `806e48da24401eab673ef88ea93863cf8b1035e7` | `spiceai-55` |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
@@ -403,7 +403,7 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 ## iceberg-rust
 
 Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
-`spiceai-0.10.1-df-54`.
+`spiceai-0.10.0-df-55` (v0.10.0, one release behind upstream's latest).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
@@ -577,12 +577,12 @@ Upstream [sjrusso8/spark-connect-rs](https://github.com/sjrusso8/spark-connect-r
 ## delta-kernel-rs
 
 Upstream [delta-io/delta-kernel-rs](https://github.com/delta-io/delta-kernel-rs),
-branch `spiceai-0.23.0`.
+branch `spiceai-0.27` (v0.27.1, one release behind upstream's latest).
 
 **No Spice patches.** Both patches that existed on the earlier 0.18.x fork line —
 timestamp-column file skipping, and `ParquetObjectReader` Azure suffix-range handling
-— landed upstream and are present unmodified in v0.23.0. The pin is byte-identical to
-upstream v0.23.0 plus the fork's own `SPICE_PATCHES.md`.
+— landed upstream and are present unmodified in v0.27.1. The pin is upstream v0.27.1 plus
+the fork's `SPICE_PATCHES.md` and a CI-only change.
 
 Re-confirm this at the next bump rather than assuming it: if a Spice patch becomes
 necessary again, it needs a row here and a guard.

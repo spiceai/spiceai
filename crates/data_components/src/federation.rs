@@ -808,6 +808,28 @@ mod tests {
             .to_string()
     }
 
+    /// Like `unparse_with`, but `None` where MySQL or SQLite refuses a filter on a volatile derived
+    /// output. Their engines merge the derived table and evaluates the expression again for the
+    /// predicate, so the unparser declines the pushdown rather than emit SQL that can select
+    /// rows the projection never produced. Any other refusal, or a refusal from another
+    /// dialect, still fails the caller.
+    fn unparse_or_flattening_refusal(
+        dialect_name: &str,
+        dialect: &dyn Dialect,
+        plan: &LogicalPlan,
+    ) -> Option<String> {
+        match Unparser::new(dialect).plan_to_sql(plan) {
+            Ok(sql) => Some(sql.to_string()),
+            Err(datafusion::error::DataFusionError::NotImplemented(message))
+                if matches!(dialect_name, "mysql" | "sqlite")
+                    && message.contains("cannot be repeated") =>
+            {
+                None
+            }
+            Err(error) => panic!("{dialect_name} dialect should unparse the plan: {error}"),
+        }
+    }
+
     /// Byte offset of the first `needle`, or a failure naming what was looked for.
     fn first_offset_of(sql: &str, needle: &str) -> usize {
         let Some(at) = sql.find(needle) else {
@@ -1565,7 +1587,16 @@ mod tests {
             for (scope_kind, plan, relation) in derived_scope_shapes(&inner, output_name) {
                 for (dialect_name, dialect) in federation_dialects() {
                     let arm = format!("{dialect_name}/{output_kind}/{scope_kind}");
-                    let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                    let sql = if output_kind == "volatile" {
+                        let Some(sql) =
+                            unparse_or_flattening_refusal(dialect_name, dialect.as_ref(), &plan)
+                        else {
+                            continue;
+                        };
+                        sql
+                    } else {
+                        unparse_with(dialect_name, dialect.as_ref(), &plan)
+                    };
 
                     // The shape the issue is about only exists once the projection is a
                     // derived table. Without this the guard would pass on a statement
@@ -1618,7 +1649,10 @@ mod tests {
             Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
         for (scope_kind, plan, _) in derived_scope_shapes(&volatile, "random()") {
             for (dialect_name, dialect) in federation_dialects() {
-                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                let Some(sql) = unparse_or_flattening_refusal(dialect_name, dialect.as_ref(), &plan)
+                else {
+                    continue;
+                };
                 // The call renders as `random()`; a reference to its output renders as
                 // a quoted identifier, so counting the unquoted call counts evaluations.
                 let quoted =
