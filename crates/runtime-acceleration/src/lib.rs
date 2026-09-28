@@ -134,7 +134,7 @@ impl BootstrapStatus {
             // A zero refresh interval must still back off when there is no data,
             // as the regular refresh task does after a failed first refresh.
             let delay = if poll_interval.is_zero() {
-                backoff.next_duration().unwrap_or(Duration::from_secs(300))
+                backoff.next_duration().unwrap_or(Duration::from_mins(5))
             } else {
                 poll_interval
             };

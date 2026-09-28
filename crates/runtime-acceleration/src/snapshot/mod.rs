@@ -3844,7 +3844,7 @@ mod tests {
                     manager,
                     subscription: notify.then_some(subscription),
                     poll_interval: if notify {
-                        Duration::from_secs(3600)
+                        Duration::from_hours(1)
                     } else {
                         Duration::ZERO
                     },
@@ -3889,11 +3889,9 @@ mod tests {
                 } else {
                     // Time is the contract here: 0s must not retry an empty store in
                     // a tight loop. The first Fibonacci delay is at least 700ms.
-                    assert!(
-                        tokio::time::timeout(Duration::from_millis(200), &mut bootstrap)
-                            .await
-                            .is_err()
-                    );
+                    tokio::time::timeout(Duration::from_millis(200), &mut bootstrap)
+                        .await
+                        .expect_err("zero polling interval must back off before checking again");
                 }
                 let status = tokio::time::timeout(Duration::from_secs(5), &mut bootstrap)
                     .await
