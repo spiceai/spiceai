@@ -8094,10 +8094,7 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
-        let refresh = Arc::new(RwLock::new(Refresh {
-            mode: RefreshMode::Changes,
-            ..Refresh::default()
-        }));
+        let refresh = Arc::new(RwLock::new(Refresh::new(RefreshMode::Changes)));
         let mut context = ApplyContext {
             refresh_sql: Some("SELECT id FROM listing_rebuild_projected_schema"),
             refresh: &refresh,
@@ -8192,10 +8189,7 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
-        let refresh = Arc::new(RwLock::new(Refresh {
-            mode: RefreshMode::Changes,
-            ..Refresh::default()
-        }));
+        let refresh = Arc::new(RwLock::new(Refresh::new(RefreshMode::Changes)));
         let mut context = ApplyContext {
             refresh_sql: None,
             refresh: &refresh,
@@ -8286,10 +8280,7 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
-        let refresh = Arc::new(RwLock::new(Refresh {
-            mode: RefreshMode::Changes,
-            ..Refresh::default()
-        }));
+        let refresh = Arc::new(RwLock::new(Refresh::new(RefreshMode::Changes)));
         let mut context = ApplyContext {
             refresh_sql: None,
             refresh: &refresh,
