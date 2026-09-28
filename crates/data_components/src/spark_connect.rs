@@ -762,9 +762,8 @@ mod tests {
              something. Got: {unguarded_sql:?}"
         );
 
-        // No `with_function_support`: the connection defaults to the Spice
-        // deny-list, which is what every connector gets, and what the
-        // stand-in UDF below is registered as a member of.
+        // A deny-list naming only the stand-in UDF, so this half does not
+        // depend on which functions the default Spice set contains.
         let guarded = SparkConnect::from_connection(&remote)
             .await
             .expect("connect to the Spark Connect server")
