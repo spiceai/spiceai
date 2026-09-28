@@ -31,7 +31,7 @@ use datafusion::physical_plan::execution_plan::{
 };
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::physical_plan::execute_stream;
-use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
@@ -97,20 +97,24 @@ pub fn stream_plan(stream: SendableRecordBatchStream) -> Arc<dyn ExecutionPlan> 
 
 /// Order `input` by `sort_columns` as a plan with one output partition.
 ///
-/// Each partition of `input` is sorted by its own spilling `SortExec`, and a
-/// `SortPreservingMergeExec` combines the sorted partitions. The merge polls
-/// each input partition from its own task, so everything below it — each sort,
-/// and whatever `input` computes per partition — runs concurrently, not on the
-/// one task that drains the result. A partition `input` already delivers in
-/// this order (its advertised ordering satisfies the sort) is merged without
-/// being sorted again. The order equals a single sort of all of `input`'s rows;
-/// only the relative order of rows with equal keys may differ.
+/// When `context`'s memory pool can give every partition of `input` a sort of
+/// its own (see [`max_sort_partitions`]), each partition is sorted by its own
+/// spilling `SortExec` and a `SortPreservingMergeExec` combines them. The merge
+/// polls each input partition from its own task, so everything below it — each
+/// sort, and whatever `input` computes per partition — runs concurrently, not
+/// on the one task that drains the result. Otherwise the partitions are
+/// coalesced into one spilling `SortExec`, the plan a single sort always used.
 ///
-/// Every sorting partition needs memory of its own to make progress, so the
-/// partitions are first round-robined down to as many as a bounded pool can
-/// give that memory (see [`max_sort_partitions`]); an unbounded pool keeps
-/// them all. A pool too small for two sorts gets one, which is the single
-/// spilling sort this replaces.
+/// It is all partitions or one, never a subset: sorts sharing a pool too small
+/// for them fail ("Not enough memory to continue external sort") where one
+/// sort spills and finishes, and re-partitioning the input down to fewer sorts
+/// with a round-robin `RepartitionExec` can deadlock a spilling sort under
+/// memory pressure.
+///
+/// Partitions `input` already delivers in this order (its advertised ordering
+/// satisfies the sort) are merged without being sorted again. The order equals
+/// a single sort of all of `input`'s rows; only the relative order of rows with
+/// equal keys may differ.
 ///
 /// `sort_columns` follows [`sort_stream`]: an empty list, or one that does not
 /// resolve against `input`'s schema (logged), returns `input` unchanged, with
@@ -131,25 +135,33 @@ pub fn sort_plan(
         .properties()
         .equivalence_properties()
         .ordering_satisfy(ordering.clone())?;
+    let partitions = input.properties().output_partitioning().partition_count();
+    if partitions == 0 {
+        // No partitions, no rows: nothing to order, and a sort would execute a
+        // partition the input does not have.
+        return Ok(input);
+    }
     let sorted: Arc<dyn ExecutionPlan> = if already_ordered {
         input
-    } else {
-        let partitions = input.properties().output_partitioning().partition_count();
-        let limit = max_sort_partitions(context);
-        let input: Arc<dyn ExecutionPlan> = if partitions > limit {
-            Arc::new(RepartitionExec::try_new(
-                input,
-                Partitioning::RoundRobinBatch(limit),
-            )?)
-        } else {
-            input
-        };
+    } else if partitions > 1 && partitions <= max_sort_partitions(context) {
         tracing::debug!(
-            partitions = input.properties().output_partitioning().partition_count(),
-            "Sorting data by columns {:?} using DataFusion SortExec per partition and SortPreservingMergeExec",
+            partitions,
+            "Sorting data by columns {:?} using a DataFusion SortExec per partition and SortPreservingMergeExec",
             sort_columns
         );
         Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true))
+    } else {
+        tracing::debug!(
+            partitions,
+            "Sorting data by columns {:?} using one DataFusion SortExec",
+            sort_columns
+        );
+        let input: Arc<dyn ExecutionPlan> = if partitions > 1 {
+            Arc::new(CoalescePartitionsExec::new(input))
+        } else {
+            input
+        };
+        Arc::new(SortExec::new(ordering.clone(), input))
     };
     if sorted.properties().output_partitioning().partition_count() <= 1 {
         return Ok(sorted);
@@ -168,10 +180,11 @@ pub fn sort_plan(
 /// past 10 MiB).
 pub const SORT_PARTITION_WORKING_BYTES: usize = 128 * 1024 * 1024;
 
-/// The most partitions [`sort_plan`] sorts at once under `context`: as many as
-/// half a bounded memory pool gives each its `sort_spill_reservation_bytes`
+/// The most partitions [`sort_plan`] sorts separately under `context`: as many
+/// as half a bounded memory pool gives each its `sort_spill_reservation_bytes`
 /// plus [`SORT_PARTITION_WORKING_BYTES`], and at least one. The other half is
-/// left to the scan and the merge. An unbounded pool imposes no cap.
+/// left to the scan and the merge. An unbounded pool imposes no cap. An input
+/// with more partitions than this is sorted as one.
 #[must_use]
 pub fn max_sort_partitions(context: &TaskContext) -> usize {
     let per_sort = context

@@ -17503,23 +17503,13 @@ impl CayenneTableProvider {
             order = ?order,
             "Ordering whole-table replace before writing the new snapshot"
         );
-        // The replace arrives as one stream. Deal it round-robin over the
-        // session's partitions so the key and the sort run on all of them, as
-        // they do for a rewrite's scan partitions; the merge restores one order.
-        // Deal it straight to as many partitions as the pool lets sort at once,
-        // so `sort_plan` need not repartition a second time.
+        // The replace arrives as one stream, so this is one spilling sort, as
+        // it always was: dealing it over more partitions would need a
+        // round-robin `RepartitionExec` in front of the sorts, which can
+        // deadlock a spilling sort under memory pressure.
         let ctx = self.create_session_context();
         let task_ctx = ctx.task_ctx();
-        let partitions = ctx
-            .state()
-            .config()
-            .target_partitions()
-            .min(util::stream_utils::max_sort_partitions(&task_ctx));
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(datafusion_physical_plan::repartition::RepartitionExec::try_new(
-                util::stream_utils::stream_plan(data),
-                datafusion_physical_plan::Partitioning::RoundRobinBatch(partitions),
-            )?);
+        let input = util::stream_utils::stream_plan(data);
         let ordered = self.order_rewrite_plan(input, &order, &task_ctx)?;
         Ok((
             datafusion_physical_plan::execute_stream(ordered, task_ctx)?,
@@ -22255,12 +22245,13 @@ impl CayenneTableProvider {
 
     /// Order `plan` for a rewrite, as one output partition when ordered.
     ///
-    /// The key (for a curve) and the sort run in each of `plan`'s partitions,
-    /// concurrently, and a merge combines the sorted partitions — see
-    /// `util::stream_utils::sort_plan`. A whole-table pass therefore uses every
-    /// core of its runtime rather than the one draining the result, which is
-    /// what bounds how long the rewrite of a position-delete table holds
-    /// `write_lock`. The order equals a single sort of every row; only rows with
+    /// The key (for a curve) is projected in each of `plan`'s partitions,
+    /// concurrently. When the memory pool has room, the sort runs in each
+    /// partition too and a merge combines them; otherwise one spilling sort
+    /// takes the coalesced partitions — see `util::stream_utils::sort_plan`. A
+    /// whole-table pass therefore uses every core of its runtime rather than
+    /// the one draining the result where memory allows, which is what bounds
+    /// how long the rewrite of a position-delete table holds `write_lock`. The order equals a single sort of every row; only rows with
     /// equal keys may land in a different relative order.
     ///
     /// `task_ctx` must be the rewrite session's own: its memory pool is the

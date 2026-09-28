@@ -258,22 +258,65 @@ fn sort_width_is_what_half_the_pool_gives_each_sort() {
     assert_eq!(max_sort_partitions(&TaskContext::default()), usize::MAX);
 }
 
-/// A bounded pool caps how many partitions sort at once; the capped plan still
-/// orders every row.
+/// A pool with room for a sort per partition sorts them separately and merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bounded_pool_caps_the_sorting_partitions() {
+async fn a_roomy_pool_sorts_every_partition_separately() {
+    let reservation = 1024 * 1024;
+    let parts = partitions();
+    let ctx = bounded_context(2 * parts.len() * (reservation + SORT_PARTITION_WORKING_BYTES), reservation);
+    let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
+    let text = plan_text(&plan);
+    assert!(
+        text.contains("SortPreservingMergeExec") && !text.contains("CoalescePartitionsExec"),
+        "every partition fits, so each is sorted and they are merged:\n{text}"
+    );
+    assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
+}
+
+/// A pool without room for a sort per partition sorts them as one, over the
+/// coalesced input — never a subset of sorts, and never a repartition, which
+/// can deadlock a spilling sort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tight_pool_sorts_all_partitions_as_one() {
     let reservation = 1024 * 1024;
     let ctx = bounded_context(4 * (reservation + SORT_PARTITION_WORKING_BYTES) + 1, reservation);
     assert_eq!(max_sort_partitions(&ctx), 2);
-
     let parts = partitions();
     let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
     let text = plan_text(&plan);
     assert!(
-        text.contains("RoundRobinBatch(2)"),
-        "five partitions must be round-robined down to two before sorting:\n{text}"
+        text.contains("CoalescePartitionsExec")
+            && !text.contains("SortPreservingMergeExec")
+            && !text.contains("RepartitionExec"),
+        "five partitions do not fit two sorts, so they are sorted as one:\n{text}"
     );
     assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
+}
+
+/// Under a pool several times smaller than its input, `sort_plan` must still
+/// finish — spilling — and order every row. Regression guard: a plan that
+/// round-robined the partitions down in front of a spilling sort deadlocked
+/// here, and separate sorts sharing the small pool failed with "Not enough
+/// memory to continue external sort".
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn finishes_under_memory_pressure() {
+    let payload = "x".repeat(200);
+    let parts: Vec<Vec<Row>> = (0..18_u64)
+        .map(|p| {
+            scrambled(40_000, p + 11)
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| (k, format!("{payload}-{p}-{i}")))
+                .collect()
+        })
+        .collect();
+    // ~170 MB of rows against a 32 MB pool.
+    let ctx = bounded_context(32 * 1024 * 1024, 1024 * 1024);
+    let plan = sort_plan(source(&parts, 4_096), &["k".to_string()], &ctx).expect("plan builds");
+    let out = tokio::time::timeout(std::time::Duration::from_secs(120), run(plan, &ctx))
+        .await
+        .expect("a spilling sort under memory pressure must finish, not hang");
+    assert_ordered(&parts, &out, asc_nulls_last);
 }
 
 /// Partitions that already arrive in the requested order are merged, not
