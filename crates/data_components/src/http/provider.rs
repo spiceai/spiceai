@@ -65,7 +65,7 @@ use util::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    /// Build with [`Error::http_request`], which strips the request URL from `source`.
+    /// Build with [`Error::http_request`].
     #[snafu(display("HTTP request to {endpoint} failed: {source}"))]
     HttpRequest {
         endpoint: String,
@@ -105,24 +105,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The part of a *configured* endpoint that is safe to put in an error or a log line:
-/// scheme, host and port, and nothing else.
-///
-/// A request URL can carry secrets in its userinfo, path and query — an API key or signed
-/// parameter from the dataset's `from`, or a value a query supplied through
-/// `request_query_filters` — and the reader of a query error need not be the operator who
-/// wrote the spicepod. `Origin::ascii_serialization` renders only scheme, host and a
-/// non-default port, so the redaction is a property of the type rather than of remembering
-/// to clear each field.
+/// The part of an endpoint that is safe to put in an error or a log line: its origin.
+/// Userinfo, path and query can carry an API key, a signed parameter or a query-supplied
+/// filter value, and whoever reads a query error need not be the spicepod's operator.
 fn endpoint_label(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
 impl Error {
-    /// A transport failure on a request to `endpoint`.
-    ///
-    /// `reqwest::Error`'s `Display` appends `for url (...)` with the full request URL, so the
-    /// URL is stripped here and only the [`endpoint_label`] of `endpoint` is named.
+    /// A transport failure on a request to `endpoint`. `reqwest::Error`'s `Display` appends
+    /// the full request URL, so it is stripped and only [`endpoint_label`] is named.
     fn http_request(endpoint: &Url, source: reqwest::Error) -> Self {
         Error::HttpRequest {
             endpoint: endpoint_label(endpoint),
@@ -157,11 +149,12 @@ impl From<Error> for DataFusionError {
                 std::io::Error::other(format!("HTTP request was rate limited: {message}")),
             )),
             // All other errors are internal/external errors
-            err @ Error::HttpRequest { .. } => DataFusionError::External(Box::new(err)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ Error::JsonNesting { .. } => DataFusionError::External(Box::new(err)),
+            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
+                DataFusionError::External(Box::new(err))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -1233,8 +1226,7 @@ impl HttpTableProvider {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
-                                endpoint,
+                                "Failed to validate HTTP endpoint {endpoint}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
                                 test_url.path()
                             ),
                         });
@@ -1583,6 +1575,7 @@ impl HttpTableProvider {
                 let status_code = response.status().as_u16();
                 Self::extract_response(
                     response,
+                    &self.base_url,
                     status_code,
                     path_label,
                     attempt_started,
@@ -1679,6 +1672,7 @@ impl HttpTableProvider {
         // 2xx, 3xx, 4xx: valid response; 4xx may be a business response.
         Self::extract_response(
             response,
+            &self.base_url,
             status_code,
             path_label,
             attempt_started,
@@ -1697,6 +1691,7 @@ impl HttpTableProvider {
     /// Extract content and metadata from an HTTP response.
     async fn extract_response(
         response: reqwest::Response,
+        endpoint: &Url,
         status_code: u16,
         path_label: &str,
         attempt_started: Instant,
@@ -1816,11 +1811,10 @@ impl HttpTableProvider {
         // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
-        let request_url = response.url().clone();
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::transient(Error::http_request(&request_url, e)))?;
+            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -3197,8 +3191,8 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
         return Err(Error::Pagination {
             message: format!(
                 "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                resolved.origin().ascii_serialization(),
-                base_url.origin().ascii_serialization(),
+                endpoint_label(&resolved),
+                endpoint_label(base_url),
             ),
         });
     }
@@ -5383,10 +5377,7 @@ mod tests {
             assert!(matches!(&error, Error::HttpRequest { source, .. } if source.is_connect()));
             let rendered = [error.to_string(), DataFusionError::from(error).to_string()];
             for message in rendered {
-                assert!(message.contains(&origin), "names the origin: {message}");
-                for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
-                    assert!(!message.contains(secret), "leaks {secret}: {message}");
-                }
+                assert_names_only_origin(&message, &origin);
             }
         }
     }
@@ -5395,14 +5386,13 @@ mod tests {
     /// URL with its userinfo and query (regression test for #13534).
     #[tokio::test]
     async fn http_health_probe_failure_does_not_render_configured_url() {
-        let (origin_url, _, server) =
+        let (mut url, _, server) =
             retry_test_server(vec![(404, String::new())], Duration::ZERO).await;
-        let origin = endpoint_label(&origin_url);
-        let url = Url::parse(&format!(
-            "http://user:pass-secret@{}/path-secret?api_key=query-secret",
-            origin.trim_start_matches("http://")
-        ))
-        .expect("valid URL");
+        let origin = endpoint_label(&url);
+        url.set_username("user").expect("set username");
+        url.set_password(Some("pass-secret")).expect("set password");
+        url.set_path("/path-secret");
+        url.set_query(Some("api_key=query-secret"));
         let (provider, _) = retry_test_provider(url, 0, Duration::from_secs(2));
         let provider = provider
             .with_health_probe(Some("/health".to_string()))
@@ -5412,12 +5402,15 @@ mod tests {
             .validate_endpoint()
             .await
             .expect_err("a 404 health probe should fail validation");
-        let message = error.to_string();
-        assert!(message.contains(&origin), "names the origin: {message}");
+        assert_names_only_origin(&error.to_string(), &origin);
+        server.abort();
+    }
+
+    fn assert_names_only_origin(message: &str, origin: &str) {
+        assert!(message.contains(origin), "names the origin: {message}");
         for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
             assert!(!message.contains(secret), "leaks {secret}: {message}");
         }
-        server.abort();
     }
 
     #[tokio::test]
