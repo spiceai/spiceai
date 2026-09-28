@@ -298,24 +298,21 @@ impl<'a> FunctionSupportBuilder<'a> {
 
     /// The denied scalar-function names, in the order the deny-list is built:
     /// Spice functions minus the native carve-out, then user functions, then
-    /// any backend-specific additions, then the [`DATAFUSION_CAST_BUILTINS`],
-    /// which no carve-out reaches because no backend evaluates them as `DataFusion` does.
+    /// any backend-specific additions, then the [`DATAFUSION_CAST_BUILTINS`].
     #[must_use]
     pub fn denied_names(self) -> Vec<String> {
         let spice = excluding_native(spice_function_names(), self.native);
         let user = user_function_names();
-        let mut denied = Vec::with_capacity(
-            spice.len() + user.len() + self.deny_also.len() + DATAFUSION_CAST_BUILTINS.len(),
-        );
-        denied.extend(spice);
-        denied.extend(user);
-        denied.extend(self.deny_also);
-        denied.extend(
-            DATAFUSION_CAST_BUILTINS
-                .iter()
-                .map(|name| (*name).to_string()),
-        );
-        denied
+        spice
+            .into_iter()
+            .chain(user)
+            .chain(self.deny_also)
+            .chain(
+                DATAFUSION_CAST_BUILTINS
+                    .iter()
+                    .map(|name| (*name).to_string()),
+            )
+            .collect()
     }
 
     /// The [`FunctionSupport`] to hand a federated provider or table-provider
@@ -520,7 +517,7 @@ mod tests {
             ));
             assert!(
                 !support.supports(&cast, None),
-                "{name} casts by Arrow's rules, so no remote may be asked to evaluate it"
+                "{name} must not federate, whatever the backend carves out"
             );
         }
     }

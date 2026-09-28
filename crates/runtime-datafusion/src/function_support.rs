@@ -284,7 +284,7 @@ mod tests {
         arrow_cast, arrow_try_cast, cast_to_type, try_cast_to_type,
     };
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
-    use datafusion::logical_expr::{LogicalPlan, table_scan};
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, table_scan};
     use datafusion::prelude::{Expr, col, lit};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
@@ -293,16 +293,28 @@ mod tests {
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
     fn plan_projecting(expr: Expr) -> LogicalPlan {
-        let schema = Schema::new(vec![
-            Field::new("s", DataType::Utf8, true),
-            Field::new("start", DataType::Int64, true),
-        ]);
-        table_scan(Some("t"), &schema, None)
-            .expect("scan t")
+        scan_t()
             .project(vec![expr])
             .expect("project")
             .build()
             .expect("build plan")
+    }
+
+    /// A scan of `t(s, start)` filtered by `predicate`.
+    fn plan_filtering(predicate: Expr) -> LogicalPlan {
+        scan_t()
+            .filter(predicate)
+            .expect("filter")
+            .build()
+            .expect("build plan")
+    }
+
+    fn scan_t() -> LogicalPlanBuilder {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, true),
+        ]);
+        table_scan(Some("t"), &schema, None).expect("scan t")
     }
 
     /// Regression test for #14444. `DataFusion`'s own cast built-ins must be
@@ -312,12 +324,23 @@ mod tests {
     /// `cast_to_type`, casts by its own rules rather than Arrow's.
     #[test]
     fn a_datafusion_cast_builtin_stays_local_on_every_backend() {
-        let casts = [
+        let plans: Vec<(&str, LogicalPlan)> = [
             ("arrow_cast", arrow_cast(col("start"), lit("LargeUtf8"))),
             ("arrow_try_cast", arrow_try_cast(col("s"), lit("Int64"))),
             ("cast_to_type", cast_to_type(col("start"), lit(1_i32))),
             ("try_cast_to_type", try_cast_to_type(col("s"), lit(1_i64))),
-        ];
+        ]
+        .into_iter()
+        .flat_map(|(name, cast)| {
+            [
+                (name, plan_projecting(cast.clone())),
+                (name, plan_filtering(cast.is_not_null())),
+            ]
+        })
+        .collect();
+        // The column itself still federates: the refusal costs only the casts
+        // it is about.
+        let plain_column = plan_projecting(col("start"));
         let policies = [
             ("plain", function_support()),
             ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
@@ -338,33 +361,15 @@ mod tests {
         ];
 
         for (policy, support) in &policies {
-            for (name, cast) in &casts {
-                let filtered = table_scan(
-                    Some("t"),
-                    &Schema::new(vec![
-                        Field::new("s", DataType::Utf8, true),
-                        Field::new("start", DataType::Int64, true),
-                    ]),
-                    None,
-                )
-                .expect("scan t")
-                .filter(cast.clone().is_not_null())
-                .expect("filter")
-                .build()
-                .expect("build plan");
-                for plan in [plan_projecting(cast.clone()), filtered] {
-                    assert!(
-                        contains_unsupported_functions(&plan, support)
-                            .expect("the support check must not error"),
-                        "{name} casts by Arrow's rules, so the {policy} policy must evaluate it \
-                         locally rather than federate it:\n{plan}"
-                    );
-                }
+            for (name, plan) in &plans {
+                assert!(
+                    contains_unsupported_functions(plan, support)
+                        .expect("the support check must not error"),
+                    "the {policy} policy must evaluate {name} locally rather than federate it:\n{plan}"
+                );
             }
-            // The column itself still federates: the refusal costs only the
-            // casts it is about.
             assert!(
-                !contains_unsupported_functions(&plan_projecting(col("start")), support)
+                !contains_unsupported_functions(&plain_column, support)
                     .expect("the support check must not error"),
                 "the {policy} policy must still federate a plain column"
             );
