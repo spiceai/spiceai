@@ -21,23 +21,25 @@ use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGe
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
-        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
-        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
-        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
+        ChatChoiceStream, ChatCompletionAllowedToolsChoice, ChatCompletionMessageToolCallChunk,
+        ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+        ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
+        StopConfiguration, ToolChoiceAllowedMode, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::core::{
-    AdapterPaths, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
-    ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType, MultimodalSpecificConfig,
-    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Pipeline, RequestMessage,
-    TokenSource,
+    AdapterPaths, AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice,
+    AllowedToolsToolChoiceType, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
+    MistralRsBuilder, ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType,
+    MultimodalSpecificConfig, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig,
+    Pipeline, RequestMessage, TokenSource,
 };
 use mistralrs::{
     ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
@@ -591,9 +593,13 @@ impl MistralLlama {
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
+    ///
+    /// `tool_choice` is converted by the caller ([`convert_tool_choice`]) so a choice this
+    /// pipeline cannot enforce is refused as an invalid argument before anything is sent.
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
+        tool_choice: Option<ToolChoice>,
     ) -> Result<Receiver<MistralResponse>> {
         let message = RequestMessage::Chat {
             messages: req
@@ -606,7 +612,6 @@ impl MistralLlama {
         };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
-        let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
 
         let sampling = SamplingParams {
             temperature: req.temperature.map(f64::from),
@@ -765,7 +770,12 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let recver = self.send_message(req).await.map_err(|e| {
+        let tool_choice = req
+            .tool_choice
+            .as_ref()
+            .map(convert_tool_choice)
+            .transpose()?;
+        let recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -780,7 +790,12 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut recver = self.send_message(req).await.map_err(|e| {
+        let tool_choice = req
+            .tool_choice
+            .as_ref()
+            .map(convert_tool_choice)
+            .transpose()?;
+        let mut recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -945,16 +960,73 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
     })
 }
 
-fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
+/// Maps a request's `tool_choice` onto the one `mistral.rs` enforces.
+///
+/// Every choice either maps to the constraint it asks for or is refused: a choice mapped to a
+/// weaker one (`required` answered as `auto`, `allowed_tools` as `none`) returns a normal
+/// completion that silently ignores what the caller asked for.
+fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> Result<ToolChoice, OpenAIError> {
     match x {
-        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => Ok(ToolChoice::None),
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => Ok(ToolChoice::Auto),
         ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
-            unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
+            Ok(ToolChoice::Required)
         }
-        ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
-        // None, AllowedTools, or Custom not supported
-        _ => ToolChoice::None,
+        ChatCompletionToolChoiceOption::Function(t) => Ok(ToolChoice::Tool(convert_named_tool(t))),
+        ChatCompletionToolChoiceOption::AllowedTools(choice) => convert_allowed_tools(choice),
+        ChatCompletionToolChoiceOption::Custom(_) => Err(OpenAIError::InvalidArgument(
+            "tool_choice of type 'custom' is not supported by locally hosted models. Use 'none', 'auto', 'required', 'allowed_tools', or a named 'function' tool. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
+        )),
     }
+}
+
+/// Maps an `allowed_tools` choice onto `mistral.rs`'s single-mode equivalent. `mistral.rs` takes
+/// one mode over one tool list, so a choice carrying several entries is refused unless they
+/// agree on the mode.
+fn convert_allowed_tools(
+    choice: &ChatCompletionAllowedToolsChoice,
+) -> Result<ToolChoice, OpenAIError> {
+    let invalid = |reason: &str| {
+        OpenAIError::InvalidArgument(format!(
+            "tool_choice 'allowed_tools' {reason}. See: https://spiceai.org/docs/components/models/huggingface"
+        ))
+    };
+
+    let mut mode = None;
+    let mut tools = Vec::new();
+    for entry in &choice.allowed_tools {
+        let entry_mode = match entry.mode {
+            ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
+            ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
+        };
+        if mode.is_some_and(|m| m != entry_mode) {
+            return Err(invalid(
+                "mixes 'auto' and 'required' modes, which locally hosted models cannot combine",
+            ));
+        }
+        mode = Some(entry_mode);
+
+        for tool in &entry.tools {
+            let name = (tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+                .then(|| tool.pointer("/function/name").and_then(serde_json::Value::as_str))
+                .flatten()
+                .ok_or_else(|| {
+                    invalid("lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to")
+                })?;
+            tools.push(AllowedToolChoice::Function {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    let Some(mode) = mode else {
+        return Err(invalid("lists no tools"));
+    };
+    Ok(ToolChoice::AllowedTools(AllowedToolsToolChoice {
+        tp: AllowedToolsToolChoiceType::AllowedTools,
+        mode,
+        tools,
+    }))
 }
 
 /// [`MistralRs`] uses `Tool` for both choosing a tool, and defining a tool.
@@ -1010,5 +1082,113 @@ fn parse_tool_call_response(
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(json: serde_json::Value) -> ChatCompletionToolChoiceOption {
+        serde_json::from_value(json).expect("tool_choice should deserialize")
+    }
+
+    fn invalid_argument(result: Result<ToolChoice, OpenAIError>) -> String {
+        match result {
+            Err(OpenAIError::InvalidArgument(message)) => message,
+            other => panic!("expected an invalid-argument error, got {other:?}"),
+        }
+    }
+
+    // regression test for #14230: `required` reached an `unimplemented!` and aborted the request.
+    #[test]
+    fn required_maps_to_required() {
+        let converted = convert_tool_choice(&choice(serde_json::json!("required")))
+            .expect("required is supported");
+        assert!(matches!(converted, ToolChoice::Required), "{converted:?}");
+    }
+
+    #[test]
+    fn modes_map_to_the_same_mode() {
+        let none = convert_tool_choice(&choice(serde_json::json!("none"))).expect("none");
+        assert!(matches!(none, ToolChoice::None), "{none:?}");
+        let auto = convert_tool_choice(&choice(serde_json::json!("auto"))).expect("auto");
+        assert!(matches!(auto, ToolChoice::Auto), "{auto:?}");
+    }
+
+    #[test]
+    fn named_function_maps_to_that_tool() {
+        let converted = convert_tool_choice(&choice(serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather" }
+        })))
+        .expect("a named function is supported");
+        let ToolChoice::Tool(tool) = converted else {
+            panic!("expected a forced tool, got {converted:?}");
+        };
+        assert_eq!(tool.function.name, "get_weather");
+    }
+
+    /// `allowed_tools` was mapped to `none`, so a request restricting the model to — or requiring
+    /// — a subset of its tools was answered with tools disabled altogether.
+    #[test]
+    fn allowed_tools_keeps_its_mode_and_tools() {
+        let converted = convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": [{
+                "mode": "required",
+                "tools": [
+                    { "type": "function", "function": { "name": "get_weather" } },
+                    { "type": "function", "function": { "name": "get_time" } }
+                ]
+            }]
+        })))
+        .expect("function tools with one mode are supported");
+        let ToolChoice::AllowedTools(allowed) = converted else {
+            panic!("expected allowed tools, got {converted:?}");
+        };
+        assert_eq!(allowed.mode, AllowedToolsMode::Required);
+        let names: Vec<_> = allowed
+            .tools
+            .iter()
+            .map(|tool| match tool {
+                AllowedToolChoice::Function { name } => name.as_str(),
+                other => panic!("expected a function tool, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["get_weather", "get_time"]);
+    }
+
+    #[test]
+    fn allowed_tools_that_cannot_be_enforced_are_refused() {
+        let mixed = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": [
+                { "mode": "auto", "tools": [{ "type": "function", "function": { "name": "a" } }] },
+                { "mode": "required", "tools": [{ "type": "function", "function": { "name": "b" } }] }
+            ]
+        }))));
+        assert!(mixed.contains("mixes 'auto' and 'required'"), "{mixed}");
+
+        let hosted = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": [{ "mode": "auto", "tools": [{ "type": "web_search" }] }]
+        }))));
+        assert!(hosted.contains("not a named 'function' tool"), "{hosted}");
+
+        let empty = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": []
+        }))));
+        assert!(empty.contains("lists no tools"), "{empty}");
+    }
+
+    #[test]
+    fn custom_is_refused() {
+        let message = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
+            "type": "custom",
+            "custom": { "name": "grammar_tool" }
+        }))));
+        assert!(message.contains("'custom' is not supported"), "{message}");
     }
 }
