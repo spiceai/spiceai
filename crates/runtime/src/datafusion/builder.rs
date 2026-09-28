@@ -1121,8 +1121,8 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc` and
-        // `date_trunc` (scalar) and `avg` (aggregate): `register_all` would register
+        // Register Spark-compatible functions, but skip Spark's `trunc`,
+        // `date_trunc` and `date_part` (scalar) and `avg` (aggregate): `register_all` would register
         // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
         // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
         // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
@@ -1138,7 +1138,15 @@ impl DataFusionBuilder {
             // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
             // federated filter comparing a timestamp against one loses the type
             // its comparison needs and is pushed down as a pair BigQuery refuses.
-            if matches!(udf.name(), "trunc" | "date_trunc") {
+            //
+            // Spark `date_part` counts `dow` from Sunday = 1, where the built-in
+            // counts from Sunday = 0 as the SQL reference documents — and so does
+            // `EXTRACT(DOW FROM …)`, which the planner binds straight to the
+            // built-in, never through the registry. Registered over the built-in,
+            // the two spellings of one weekday answered a day apart
+            // (spiceai/spiceai#13920). Spark's also takes only a timestamp or a
+            // date, so `date_part('hour', <time>)` stopped planning.
+            if matches!(udf.name(), "trunc" | "date_trunc" | "date_part") {
                 continue;
             }
             let name = udf.name().to_string();
@@ -2645,14 +2653,90 @@ mod tests {
         );
 
         // Spark's *other* functions must still be there — the skip is meant to
-        // be two names, not a disabled registration.
+        // be three names, not a disabled registration.
         assert!(
             df.ctx
                 .state()
                 .scalar_functions()
                 .contains_key("array_append"),
-            "only `trunc` and `date_trunc` are skipped; the rest of the Spark \
-             functions must still register"
+            "only `trunc`, `date_trunc` and `date_part` are skipped; the rest of \
+             the Spark functions must still register"
+        );
+    }
+
+    /// The built session keeps the **built-in** `date_part`, not Spark's.
+    ///
+    /// Spark's `date_part` counts `dow` from Sunday = 1. The built-in counts
+    /// from Sunday = 0, as the SQL reference documents, and so does
+    /// `EXTRACT(DOW FROM …)`, which the planner binds straight to the built-in
+    /// and never through the registry. Registered over the built-in, the two
+    /// spellings of one weekday answered a day apart; and Spark's signature
+    /// takes only a timestamp or a date, so `date_part` over a time stopped
+    /// planning (regression test for #13920).
+    ///
+    /// Through `DataFusionBuilder::build` for the same reason as the
+    /// `date_trunc` guard above: the thing that can regress is the registration
+    /// loop's skip.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_date_part() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        // 2026-01-04 is a Sunday: the one weekday the two conventions name
+        // differently at a glance, 0 documented and 1 under Spark's.
+        let weekday = df
+            .ctx
+            .sql(
+                "SELECT date_part('dow', DATE '2026-01-04') AS via_date_part, \
+                 EXTRACT(DOW FROM DATE '2026-01-04') AS via_extract",
+            )
+            .await
+            .expect("plan the weekday extraction")
+            .collect()
+            .await
+            .expect("run the weekday extraction");
+        datafusion::assert_batches_eq!(
+            [
+                "+---------------+-------------+",
+                "| via_date_part | via_extract |",
+                "+---------------+-------------+",
+                "| 0             | 0           |",
+                "+---------------+-------------+",
+            ],
+            &weekday
+        );
+
+        // Spark's overload takes only a timestamp or a date, so a time and an
+        // interval are the arguments that stop planning if the built-in is
+        // shadowed; and Spark's declares `Int32` for every field where the
+        // built-in returns `Float64` for `epoch`, which the shadowed session
+        // reports as an internal schema-assertion failure.
+        let other_shapes = df
+            .ctx
+            .sql(
+                "SELECT date_part('hour', TIME '12:34:56') AS over_a_time, \
+                 date_part('hour', INTERVAL '5 hours') AS over_an_interval, \
+                 date_part('epoch', TIMESTAMP '1970-01-01T00:01:00') AS epoch_seconds",
+            )
+            .await
+            .expect("plan date_part over a time, an interval and for epoch")
+            .collect()
+            .await
+            .expect("run date_part over a time, an interval and for epoch");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------------+------------------+---------------+",
+                "| over_a_time | over_an_interval | epoch_seconds |",
+                "+-------------+------------------+---------------+",
+                "| 12          | 5                | 60.0          |",
+                "+-------------+------------------+---------------+",
+            ],
+            &other_shapes
         );
     }
 
