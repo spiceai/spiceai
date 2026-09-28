@@ -4749,10 +4749,24 @@ mod tests {
         let zero_row = create_test_change_batch(vec![], &[], vec![], vec![])
             .with_source_commit_ts_ms(Some(1_700_000_099_000));
         assert!(zero_row.is_heartbeat());
+        // Arrival order is not commit order: the last row-bearing constituent
+        // carries an OLDER stamp than an earlier one, so taking the last stamp
+        // (rather than the max) would be wrong.
+        let oldest_last =
+            create_test_change_batch(vec!["c"], &[vec!["4"]], vec![4], vec![Some("d")])
+                .with_source_commit_ts_ms(Some(1_699_999_000_000));
 
-        let combined =
-            concat_change_batches(&[older, newest, unstamped, zero_row]).expect("concat");
-        assert_eq!(combined.record.num_rows(), 3, "every row is carried");
+        let combined = concat_change_batches(&[older, newest, unstamped, zero_row, oldest_last])
+            .expect("concat");
+        assert_eq!(combined.record.num_rows(), 4, "every row is carried");
+        let data = combined.data_batch();
+        let ids = data
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .expect("id column is Int32")
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 2, 3, 4], "rows keep their arrival order");
         assert_eq!(
             combined.source_commit_ts_ms(),
             Some(1_700_000_005_000),
