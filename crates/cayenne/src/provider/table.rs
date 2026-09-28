@@ -55413,6 +55413,155 @@ mod tests {
         );
     }
 
+    /// The full-snapshot compaction rewrite sorts each scan partition on its
+    /// own and merges them, so the files it writes must still hold one global
+    /// order: each output file one contiguous run of ids, the files disjoint,
+    /// and together every input row. Every input file here interleaves with
+    /// every other (file `b` holds the ids congruent to `b` mod 8, descending),
+    /// so a partition written out without the merge would put ids from across
+    /// the whole range into one file.
+    ///
+    /// The rewrite is called directly with every automatic trigger off, so no
+    /// post-write pass can race the inserts. Each file is read on its own:
+    /// the order in which a snapshot lists its files is not specified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_sorted_compaction_rewrite_writes_one_global_order_across_files() {
+        use arrow::array::{Int64Array, StringArray};
+        use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _dir) = create_cayenne_table_with_config(
+            "sorted_rewrite_global_order",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["id".to_string()],
+                target_vortex_file_size_mb: 1,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 0,
+                compaction_trigger_files: usize::MAX,
+                compaction_trigger_protected_snapshots: usize::MAX,
+                compaction_trigger_snapshot_age_ms: u64::MAX,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let files = 8_i64;
+        let rows_per_file = 20_000_i64;
+        for file in 0..files {
+            let ids: Vec<i64> = (0..rows_per_file).rev().map(|i| i * files + file).collect();
+            // Wide, poorly compressible values, so the rewrite spans several
+            // 1 MiB output files.
+            let values: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    let id = id.unsigned_abs();
+                    format!(
+                        "v_{id:020}_{:016x}_{:016x}",
+                        id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        id.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                    )
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch");
+            insert_batch(&provider, batch).await;
+        }
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction_tracked()
+                .await
+                .expect("rewrite succeeds"),
+            "the rewrite must commit a new snapshot"
+        );
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let snapshot_dir = provider.snapshot_dir_path_for(&snapshot_id);
+        let written = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("list snapshot files");
+        assert!(
+            written.len() > 1,
+            "the rewrite must span several files for the order to be tested across them, got {}",
+            written.len()
+        );
+
+        // (min, max, rows) of each file, read on its own.
+        let mut ranges: Vec<(i64, i64, i64)> = Vec::new();
+        for (i, (name, _size)) in written.iter().enumerate() {
+            let path = snapshot_dir.join(name);
+            let url = ListingTableUrl::parse(format!("file://{}", path.display())).expect("url");
+            let options = ListingOptions::new(Arc::clone(provider.context.file_format())
+                as Arc<dyn datafusion::datasource::file_format::FileFormat>)
+            .with_file_extension(".vortex");
+            let table = format!("rewritten_{i}");
+            ctx.register_listing_table(
+                &table,
+                url.as_str(),
+                options,
+                Some(Arc::clone(&schema)),
+                None,
+            )
+            .await
+            .expect("register file");
+            let out = ctx
+                .sql(&format!("SELECT min(id), max(id), count(*) FROM {table}"))
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("read file");
+            let col = |c: usize| {
+                out[0]
+                    .column(c)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64")
+                    .value(0)
+            };
+            ranges.push((col(0), col(1), col(2)));
+        }
+        ranges.sort_unstable();
+        for &(lo, hi, rows) in &ranges {
+            assert_eq!(
+                rows,
+                hi - lo + 1,
+                "a file must hold one contiguous run of ids, but [{lo}, {hi}] holds {rows} rows"
+            );
+        }
+        for pair in ranges.windows(2) {
+            assert_eq!(
+                pair[0].1 + 1,
+                pair[1].0,
+                "files must tile the ids without overlap or gaps: {pair:?}"
+            );
+        }
+        assert_eq!(
+            ranges.first().map(|r| r.0),
+            Some(0),
+            "the first file starts at id 0"
+        );
+        assert_eq!(
+            ranges.last().map(|r| r.1),
+            Some(files * rows_per_file - 1),
+            "the last file ends at the last id"
+        );
+    }
+
     #[tokio::test]
     async fn test_curve_ordered_rewrite_does_not_advertise_output_ordering() {
         use arrow::array::Int64Array;
