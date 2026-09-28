@@ -275,14 +275,20 @@ mod tests {
         deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
+        deny_spice_functions_for_mysql_table_providers,
+        deny_spice_functions_for_postgres_table_providers,
+        deny_spice_functions_for_sqlite_table_providers,
     };
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions::core::expr_fn::{
+        arrow_cast, arrow_try_cast, cast_to_type, try_cast_to_type,
+    };
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
     use datafusion::prelude::{Expr, col, lit};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
-    use runtime_udfs_api::{add_user_function, remove_user_function};
+    use runtime_udfs_api::{add_user_function, function_support, remove_user_function};
 
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
@@ -297,6 +303,72 @@ mod tests {
             .expect("project")
             .build()
             .expect("build plan")
+    }
+
+    /// Regression test for #14444. `DataFusion`'s own cast built-ins must be
+    /// evaluated locally under every backend policy — as a projection and as a
+    /// filter — because each backend either lacks the function (`DuckDB` and
+    /// `SQLite` failed the query as an unknown function) or, like `DuckDB`'s
+    /// `cast_to_type`, casts by its own rules rather than Arrow's.
+    #[test]
+    fn a_datafusion_cast_builtin_stays_local_on_every_backend() {
+        let casts = [
+            ("arrow_cast", arrow_cast(col("start"), lit("LargeUtf8"))),
+            ("arrow_try_cast", arrow_try_cast(col("s"), lit("Int64"))),
+            ("cast_to_type", cast_to_type(col("start"), lit(1_i32))),
+            ("try_cast_to_type", try_cast_to_type(col("s"), lit(1_i64))),
+        ];
+        let policies = [
+            ("plain", function_support()),
+            ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "DuckLake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ];
+
+        for (policy, support) in &policies {
+            for (name, cast) in &casts {
+                let filtered = table_scan(
+                    Some("t"),
+                    &Schema::new(vec![
+                        Field::new("s", DataType::Utf8, true),
+                        Field::new("start", DataType::Int64, true),
+                    ]),
+                    None,
+                )
+                .expect("scan t")
+                .filter(cast.clone().is_not_null())
+                .expect("filter")
+                .build()
+                .expect("build plan");
+                for plan in [plan_projecting(cast.clone()), filtered] {
+                    assert!(
+                        contains_unsupported_functions(&plan, support)
+                            .expect("the support check must not error"),
+                        "{name} casts by Arrow's rules, so the {policy} policy must evaluate it \
+                         locally rather than federate it:\n{plan}"
+                    );
+                }
+            }
+            // The column itself still federates: the refusal costs only the
+            // casts it is about.
+            assert!(
+                !contains_unsupported_functions(&plan_projecting(col("start")), support)
+                    .expect("the support check must not error"),
+                "the {policy} policy must still federate a plain column"
+            );
+        }
     }
 
     /// Whether federation would push this plan into `DuckDB`, which is what

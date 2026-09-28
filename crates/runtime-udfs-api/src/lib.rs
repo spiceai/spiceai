@@ -213,6 +213,25 @@ pub fn datafusion_nested_function_names() -> &'static [String] {
     &NAMES
 }
 
+/// `DataFusion`'s own cast built-ins: `arrow_cast(expr, 'LargeUtf8')` and
+/// `arrow_try_cast` cast to an Arrow type named by a string, `cast_to_type` and
+/// `try_cast_to_type` to the type of their second argument, and the `try_`
+/// forms answer NULL where the cast fails. Every [`FunctionSupportBuilder`]
+/// denies them, and no backend's native carve-out re-admits them, so they are
+/// evaluated above the federated scan by `DataFusion`'s cast kernel.
+///
+/// Most SQL engines define none of these names, so a federated call failed
+/// remotely as an unknown function (issue #14444). `DuckDB` does define a
+/// `cast_to_type`, but it casts by `DuckDB`'s rules rather than Arrow's —
+/// `cast_to_type(1.5, 1)` is `2` there and `1` locally — so federating it is not
+/// faithful either.
+pub const DATAFUSION_CAST_BUILTINS: &[&str] = &[
+    "arrow_cast",
+    "arrow_try_cast",
+    "cast_to_type",
+    "try_cast_to_type",
+];
+
 /// Removes from `names` everything the backend declares native.
 fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) -> Vec<String> {
     if native.is_empty() {
@@ -228,7 +247,8 @@ fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) ->
 /// Builds the [`FunctionSupport`] for one backend.
 ///
 /// Defaults to denying every Spice function (link-time set plus user-registered)
-/// and nothing else — correct for a source whose dialect rewrites none of them.
+/// and the [`DATAFUSION_CAST_BUILTINS`], and nothing else — correct for a
+/// source whose dialect rewrites none of the Spice functions.
 #[derive(Default)]
 pub struct FunctionSupportBuilder<'a> {
     native: &'a [&'a str],
@@ -278,15 +298,23 @@ impl<'a> FunctionSupportBuilder<'a> {
 
     /// The denied scalar-function names, in the order the deny-list is built:
     /// Spice functions minus the native carve-out, then user functions, then
-    /// any backend-specific additions.
+    /// any backend-specific additions, then the [`DATAFUSION_CAST_BUILTINS`],
+    /// which no carve-out reaches because no backend evaluates them as `DataFusion` does.
     #[must_use]
     pub fn denied_names(self) -> Vec<String> {
         let spice = excluding_native(spice_function_names(), self.native);
         let user = user_function_names();
-        let mut denied = Vec::with_capacity(spice.len() + user.len() + self.deny_also.len());
+        let mut denied = Vec::with_capacity(
+            spice.len() + user.len() + self.deny_also.len() + DATAFUSION_CAST_BUILTINS.len(),
+        );
         denied.extend(spice);
         denied.extend(user);
         denied.extend(self.deny_also);
+        denied.extend(
+            DATAFUSION_CAST_BUILTINS
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
         denied
     }
 
@@ -459,6 +487,42 @@ mod tests {
             support.supports(&call("some_remote_fn_udfs_api", 1), None),
             "the deny-list must not refuse a name it has no reason to"
         );
+    }
+
+    /// Regression test for #14444: each name in [`DATAFUSION_CAST_BUILTINS`] is
+    /// the canonical name of a `DataFusion` built-in whose every alias is listed
+    /// too — so a rename cannot leave the real function federating — and a call
+    /// of it is refused even by a backend that claims the name as native.
+    #[test]
+    fn a_datafusion_cast_builtin_is_denied_whatever_the_backend_carves_out() {
+        let state = SessionContext::new().state();
+        let support = FunctionSupportBuilder::new()
+            .native(DATAFUSION_CAST_BUILTINS)
+            .build();
+
+        for name in DATAFUSION_CAST_BUILTINS {
+            let builtin = state
+                .scalar_functions()
+                .get(*name)
+                .unwrap_or_else(|| panic!("{name} must be a DataFusion built-in"));
+            for alias in builtin.aliases() {
+                assert!(
+                    DATAFUSION_CAST_BUILTINS.contains(&alias.as_str()),
+                    "{name}'s alias {alias} must be denied alongside it"
+                );
+            }
+            let cast = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(builtin),
+                vec![
+                    Expr::Literal(ScalarValue::from(1_i64), None),
+                    Expr::Literal(ScalarValue::from("LargeUtf8"), None),
+                ],
+            ));
+            assert!(
+                !support.supports(&cast, None),
+                "{name} casts by Arrow's rules, so no remote may be asked to evaluate it"
+            );
+        }
     }
 
     /// A backend's own per-call check and the live user-function check are both
