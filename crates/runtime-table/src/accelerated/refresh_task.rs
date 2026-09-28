@@ -814,7 +814,7 @@ impl RefreshTask {
             Err(e) => {
                 // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
                 // This is expected and should not be logged as an error.
-                // A canceled write may be partial, so report it as `Refreshed`.
+                // Report `Refreshed` so a canceled refresh never keeps cached results.
                 if self.runtime_status.is_shutdown() {
                     return Ok(RefreshOutcome::Refreshed);
                 }
@@ -860,7 +860,7 @@ impl RefreshTask {
         {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
-            // A canceled write may be partial, so report it as `Refreshed`.
+            // Report `Refreshed` so a canceled refresh never keeps cached results.
             if self.runtime_status.is_shutdown() {
                 return Ok(RefreshOutcome::Refreshed);
             }
