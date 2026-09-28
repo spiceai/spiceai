@@ -687,9 +687,25 @@ impl ChangeEnvelope {
     /// the signal must be safely droppable (they are dropped unacked), and the
     /// position it resumes from afterwards must be at or after them, so the
     /// re-read genuinely subsumes what was discarded.
+    ///
+    /// A source that already holds the replacement snapshot (the same listing
+    /// it will record as applied) sets [`ChangeBatch::rebuild_from_this_batch`]
+    /// so the consumer overwrites from those rows instead of scanning the
+    /// source a second time. A later scan can see objects the captured listing
+    /// did not, which would duplicate on the next backfill; an earlier scan can
+    /// miss objects the listing then marks applied, which would drop them
+    /// forever if their notification is missed.
     #[must_use]
     pub fn history_unavailable(&self) -> bool {
         self.history_unavailable
+    }
+
+    /// Whether the consumer should overwrite from this envelope's batch instead
+    /// of re-reading the federated table. See [`ChangeBatch::rebuild_from_this_batch`].
+    #[must_use]
+    pub fn rebuild_from_this_batch(&self) -> bool {
+        self.change_batch()
+            .is_ok_and(ChangeBatch::rebuild_from_this_batch)
     }
 
     /// Returns `true` if processing this envelope means the dataset can be
@@ -1042,6 +1058,12 @@ pub struct ChangeBatch {
     /// connectors that carry a source timestamp (Debezium, Postgres logical
     /// replication, `MongoDB` change streams); left `None` by sources that don't.
     source_commit_ts_ms: Option<i64>,
+    /// When set with [`ChangeEnvelope::history_unavailable`], the consumer must
+    /// replace the accelerator from this batch's `data` (atomic overwrite) rather
+    /// than re-reading the federated table. That keeps the replacement rows and
+    /// the source's applied-key / position commit on the same snapshot. Copied
+    /// by [`replace_change_batch_data`] so wrappers cannot drop it.
+    rebuild_from_this_batch: bool,
 }
 
 pub enum ChangeOperation {
@@ -1103,6 +1125,7 @@ impl ChangeBatch {
             data_idx,
             before_idx,
             source_commit_ts_ms: None,
+            rebuild_from_this_batch: false,
         })
     }
 
@@ -1121,6 +1144,22 @@ impl ChangeBatch {
     #[must_use]
     pub fn source_commit_ts_ms(&self) -> Option<i64> {
         self.source_commit_ts_ms
+    }
+
+    /// Mark this batch as the replacement snapshot for a
+    /// [`ChangeEnvelope::history_unavailable`] signal. The consumer overwrites
+    /// the accelerator from [`Self::data_batch`] instead of scanning the source.
+    #[must_use]
+    pub fn with_rebuild_from_this_batch(mut self, rebuild_from_this_batch: bool) -> Self {
+        self.rebuild_from_this_batch = rebuild_from_this_batch;
+        self
+    }
+
+    /// Whether [`ChangeEnvelope::history_unavailable`] should overwrite from
+    /// this batch rather than re-read the federated table.
+    #[must_use]
+    pub fn rebuild_from_this_batch(&self) -> bool {
+        self.rebuild_from_this_batch
     }
 
     /// Whether this is a zero-row envelope — a keepalive/heartbeat carrying only a
@@ -1455,6 +1494,11 @@ pub fn replace_change_batch_data(
     RecordBatch::try_new(schema.into(), cols)
         .map_err(|source| ChangeBatchError::Arrow { source })
         .and_then(ChangeBatch::try_new)
+        .map(|batch| {
+            batch
+                .with_source_commit_ts_ms(change.source_commit_ts_ms())
+                .with_rebuild_from_this_batch(change.rebuild_from_this_batch())
+        })
 }
 
 #[cfg(test)]
@@ -2343,5 +2387,26 @@ mod deferred_tests {
             "the default must be the conservative answer, so a caller that never probes cannot \
              accidentally opt out of the rebuild"
         );
+    }
+
+    #[test]
+    fn replace_change_batch_data_preserves_rebuild_from_this_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .expect("data batch");
+        let original = wrap_data_as_change_batch(&schema, &data)
+            .expect("wrap")
+            .with_source_commit_ts_ms(Some(1_700_000_000_000))
+            .with_rebuild_from_this_batch(true);
+        let replaced =
+            replace_change_batch_data(&data, &original).expect("replace should copy batch flags");
+        assert!(
+            replaced.rebuild_from_this_batch(),
+            "wrappers that rewrite `data` must keep the listing-rebuild flag"
+        );
+        assert_eq!(replaced.source_commit_ts_ms(), Some(1_700_000_000_000));
     }
 }

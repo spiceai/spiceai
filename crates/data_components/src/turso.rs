@@ -111,14 +111,18 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{SchemaExt, utils::quote_identifier},
+    common::{
+        SchemaExt,
+        tree_node::{TreeNode, TreeNodeRecursion},
+        utils::quote_identifier,
+    },
     datasource::{
         TableProvider,
         sink::{DataSink, DataSinkExec},
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -1229,23 +1233,6 @@ impl TursoTableProvider {
             Ok(ast)
         })
     }
-
-    /// Returns `true` if the expression contains any subquery or outer reference column.
-    fn contains_subquery_or_outer_ref(expr: &Expr) -> bool {
-        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-        let mut found = false;
-        let _ = expr.apply(|e| match e {
-            Expr::ScalarSubquery(_)
-            | Expr::InSubquery(_)
-            | Expr::Exists(_)
-            | Expr::OuterReferenceColumn(_, _) => {
-                found = true;
-                Ok(TreeNodeRecursion::Stop)
-            }
-            _ => Ok(TreeNodeRecursion::Continue),
-        });
-        found
-    }
 }
 
 #[async_trait]
@@ -1267,12 +1254,16 @@ impl TableProvider for TursoTableProvider {
 
         let mut filter_push_down = vec![];
         for filter in filters {
-            // Expressions containing subqueries or outer references must not be pushed down.
-            // For federated providers, subqueries are handled at the plan level and pushing them
-            // into `TableScan.full_filters` is not beneficial. Subqueries may also reference tables
-            // in other databases not accessible from this Turso connection, and outer references
-            // refer to columns from an enclosing query that the table provider cannot resolve.
-            let pushdown = if Self::contains_subquery_or_outer_ref(filter) {
+            // An expression the scan cannot evaluate — a subquery in any of its
+            // forms, an outer reference, an unnest — must stay above the scan for
+            // decorrelation. The federation analyzer runs filter pushdown over the
+            // whole plan before decorrelation, so a subquery accepted here is written
+            // into the scan and rendered as Turso SQL verbatim: `v > ANY (SELECT …)`
+            // is a syntax error there (issue #14041), and a subquery may also name a
+            // table this connection cannot reach. The shared helper is exhaustive
+            // over `Expr`, so a new variant is a build failure rather than a filter
+            // the unparser happens to render and Turso then rejects.
+            let pushdown = if util::expr::cannot_be_evaluated_at_scan(filter) {
                 TableProviderFilterPushDown::Unsupported
             } else {
                 match unparser.expr_to_sql(filter) {
@@ -1373,6 +1364,23 @@ impl TursoTableProvider {
     }
 }
 
+/// Whether any expression of `plan`, including those of the subqueries nested in
+/// its expressions, is a quantified comparison (`ANY`/`ALL`).
+fn plan_contains_set_comparison(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            found = expr.exists(|e| Ok(matches!(e, Expr::SetComparison(_))))?;
+            if found {
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
 #[async_trait]
 impl SQLExecutor for TursoTableProvider {
     fn name(&self) -> &str {
@@ -1381,6 +1389,17 @@ impl SQLExecutor for TursoTableProvider {
 
     fn compute_context(&self) -> Option<String> {
         Some(self.pool.db_path().to_string())
+    }
+
+    /// A quantified comparison (`ANY`/`ALL`) has no spelling in Turso's SQL
+    /// grammar, and the federation analyzer resolves the subqueries under
+    /// `EXISTS`, `IN` and scalar subqueries but not the one under a
+    /// `SetComparison`, so a plan carrying one would be rendered verbatim and
+    /// rejected with a syntax error (issue #14041). Refusing the plan makes the
+    /// analyzer federate its children instead and leaves the comparison to
+    /// `DataFusion`, which rewrites it into `EXISTS` form and decorrelates it.
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        !plan_contains_set_comparison(plan)
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
@@ -3090,6 +3109,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int8Type, Schema};
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::prelude::SessionContext;
     use datafusion::sql::sqlparser::parser::Parser;
 
     async fn create_turso_sink(table_name: &str) -> (Arc<TursoConnectionPool>, TursoDataSink) {
@@ -3196,6 +3216,211 @@ mod tests {
             let _ = stmt.visit(&mut visitor);
         }
         stmts[0].to_string()
+    }
+
+    /// The quantified comparisons #14041 reports, each paired with the ids it
+    /// returns over [`quantified_comparison_fixture`]. The expected ids are the
+    /// ones the same fixture yields through every other accelerator.
+    const QUANTIFIED_COMPARISON_QUERIES: &[(&str, &[i64])] = &[
+        (
+            "SELECT id FROM items WHERE v > ANY (SELECT val FROM details)",
+            &[1, 2, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details)",
+            &[2, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE id > ALL (SELECT item_id FROM details)",
+            &[],
+        ),
+        (
+            "SELECT id FROM items WHERE v > ALL (SELECT val FROM details WHERE val > 100)",
+            &[1, 2, 3, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE v > ANY (SELECT val FROM details WHERE item_id = id)",
+            &[2],
+        ),
+        (
+            "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details WHERE item_id = id)",
+            &[2, 3, 4],
+        ),
+    ];
+
+    /// Two Turso tables registered through the federation analyzer, the way the
+    /// runtime registers an accelerator. The analyzer runs filter pushdown over
+    /// the whole plan before decorrelation, so a `WHERE` the provider accepts
+    /// as `Exact` is written into the scan and rendered as Turso SQL verbatim.
+    async fn quantified_comparison_fixture() -> (Arc<TursoConnectionPool>, SessionContext) {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        for sql in [
+            "CREATE TABLE items (id INTEGER, v INTEGER)",
+            "INSERT INTO items VALUES (1, 10), (2, 20), (3, NULL), (4, 40)",
+            "CREATE TABLE details (item_id INTEGER, val INTEGER)",
+            "INSERT INTO details VALUES (1, 10), (1, 20), (2, 5), (NULL, 7)",
+        ] {
+            conn.execute(sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+
+        let ctx = SessionContext::new_with_state(datafusion_federation::default_session_state());
+        for (table, schema) in [
+            ("items", items_schema()),
+            (
+                "details",
+                Arc::new(Schema::new(vec![
+                    Field::new("item_id", DataType::Int64, true),
+                    Field::new("val", DataType::Int64, false),
+                ])),
+            ),
+        ] {
+            let provider = Arc::new(TursoTableProvider::new(
+                schema,
+                table.to_string(),
+                Arc::clone(&pool),
+            ));
+            let federated = provider
+                .create_federated_table_provider()
+                .expect("federated table provider should be created");
+            ctx.register_table(table, Arc::new(federated))
+                .expect("table should register");
+        }
+        (pool, ctx)
+    }
+
+    fn items_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]))
+    }
+
+    fn sorted_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("the query returns BIGINT ids")
+                    .iter()
+                    .flatten()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn quantified_comparisons_are_answered_rather_than_pushed_into_turso_sql() {
+        let (_pool, ctx) = quantified_comparison_fixture().await;
+        let mut failures = Vec::new();
+        for &(query, expected) in QUANTIFIED_COMPARISON_QUERIES {
+            let result = async { ctx.sql(query).await?.collect().await }.await;
+            match result {
+                Ok(batches) => {
+                    let ids = sorted_ids(&batches);
+                    if ids != expected {
+                        failures.push(format!("{query}: expected {expected:?}, got {ids:?}"));
+                    }
+                }
+                Err(error) => failures.push(format!("{query}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "an ANY/ALL comparison must stay above the scan for decorrelation, not be rendered \
+             as Turso SQL:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_comparison_filter_is_declined_for_pushdown() {
+        let (pool, ctx) = quantified_comparison_fixture().await;
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT id FROM items WHERE v > ANY (SELECT val FROM details)")
+            .await
+            .expect("the statement should plan");
+        let mut predicate = None;
+        plan.apply(|node| {
+            if let LogicalPlan::Filter(filter) = node {
+                predicate = Some(filter.predicate.clone());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("the plan walk cannot fail");
+        let predicate = predicate.expect("the statement has a WHERE clause");
+        assert!(
+            matches!(predicate, Expr::SetComparison(_)),
+            "the premise: the planner keeps ANY/ALL as a SetComparison, got {predicate}"
+        );
+
+        let provider = TursoTableProvider::new(items_schema(), "items".to_string(), pool);
+        let support = TableProvider::supports_filters_pushdown(&provider, &[&predicate])
+            .expect("pushdown support should be reported");
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported],
+            "a filter the scan cannot evaluate must be declined, not claimed Exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_carrying_a_set_comparison_is_refused_for_federation() {
+        let (pool, ctx) = quantified_comparison_fixture().await;
+        let provider = TursoTableProvider::new(items_schema(), "items".to_string(), pool);
+        let plan_for = |sql: &'static str| {
+            let state = ctx.state();
+            async move {
+                state
+                    .create_logical_plan(sql)
+                    .await
+                    .expect("the statement should plan")
+            }
+        };
+
+        let quantified =
+            plan_for("SELECT id FROM items WHERE v > ANY (SELECT val FROM details)").await;
+        assert!(
+            !SQLExecutor::can_execute_plan(&provider, &quantified),
+            "Turso has no ANY/ALL, so the plan must stay with DataFusion:\n{}",
+            quantified.display_indent()
+        );
+
+        // Nested one level down, where a walk that ignores subqueries misses it.
+        let nested = plan_for(
+            "SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val > ANY (SELECT v FROM items))",
+        )
+        .await;
+        assert!(
+            !SQLExecutor::can_execute_plan(&provider, &nested),
+            "a comparison inside a subquery is rendered too:\n{}",
+            nested.display_indent()
+        );
+
+        // The control: the shapes the analyzer does resolve keep federating.
+        let control =
+            plan_for("SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id) AND v > 5")
+                .await;
+        assert!(
+            SQLExecutor::can_execute_plan(&provider, &control),
+            "EXISTS and plain filters are still federated:\n{}",
+            control.display_indent()
+        );
     }
 
     #[tokio::test]

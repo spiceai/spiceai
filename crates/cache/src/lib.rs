@@ -67,6 +67,7 @@ pub use utils::batches_boundable;
 pub use utils::batches_cacheable;
 pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
+pub use utils::plan_saw_transient_http_failure;
 pub use utils::to_cached_record_batch_stream;
 
 /// Stable [`datafusion::logical_expr::UserDefinedLogicalNodeCore::name`] values for

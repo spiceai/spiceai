@@ -42,7 +42,7 @@ proc test_invalid_http_endpoint {} {
     puts "Command output: $output"
 
     # Check for expected error messages in the output
-    if {[regexp {ERROR.*could not list models.*no such host} $output]} {
+    if {[regexp {ERROR.*Failed to connect to.*dns error} $output]} {
         puts "✓ Error message about invalid host detected"
     } else {
         puts "✗ Missing error about invalid host"
@@ -50,7 +50,7 @@ proc test_invalid_http_endpoint {} {
     }
 
     # Check for the specific host name in the error
-    if {[regexp {lookup data.spicea: no such host} $output]} {
+    if {[regexp {failed to lookup address information} $output] && [regexp {data\.spicea} $output]} {
         puts "✓ Invalid hostname correctly reported in error"
     } else {
         puts "✗ Invalid hostname not correctly reported"
