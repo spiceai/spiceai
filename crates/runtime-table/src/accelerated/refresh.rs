@@ -24,7 +24,7 @@ use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId};
-use crate::accelerated::refresh_task::RefreshTask;
+use crate::accelerated::refresh_task::{RefreshOutcome, RefreshTask};
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
     create_periodic_snapshot_callback, spawn_snapshot_interval_task,
@@ -1124,9 +1124,11 @@ impl Refresher {
                     Some((request_id, res)) = on_refresh_complete.recv() => {
                         tracing::debug!("Received refresh task completion callback for request {request_id}: {res:?}");
 
-                        let refresh_succeeded = matches!(&res, Ok(()));
+                        let refresh_succeeded = res.is_ok();
                         // A retention failure can happen after a successful write, so cached
                         // query results must be invalidated even though the refresh reports an error.
+                        // A refresh that found nothing new (unchanged source, no newer snapshot)
+                        // leaves the accelerator as it was, so its cached results stay valid.
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
                         if refresh_succeeded {
@@ -1295,10 +1297,10 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
         .as_nanos()
 }
 
-fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
+fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) -> bool {
     matches!(
         result,
-        Ok(()) | Err(super::Error::FailedToApplyRetentionSql { .. })
+        Ok(RefreshOutcome::Changed) | Err(super::Error::FailedToApplyRetentionSql { .. })
     )
 }
 
@@ -1495,7 +1497,12 @@ mod tests {
 
     #[test]
     fn test_refresh_result_changed_accelerator() {
-        assert!(refresh_result_changed_accelerator(&Ok(())));
+        assert!(refresh_result_changed_accelerator(&Ok(
+            RefreshOutcome::Changed
+        )));
+        assert!(!refresh_result_changed_accelerator(&Ok(
+            RefreshOutcome::Unchanged
+        )));
 
         assert!(refresh_result_changed_accelerator(&Err(
             super::super::Error::FailedToApplyRetentionSql {
