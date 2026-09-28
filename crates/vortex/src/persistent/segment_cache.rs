@@ -1010,27 +1010,6 @@ mod tests {
         }
     }
 
-    /// Waits for the last strong reference to a cache the test has dropped.
-    ///
-    /// The metric callbacks walk the process-wide [`REGISTERED_CACHES`], so a
-    /// sibling test collecting its own harness at the instant this one drops its
-    /// handles upgrades this cache too, for the length of that callback. That
-    /// reference is correct and transient; one that outlives the deadline is the
-    /// leak the caller exists to catch. Asserting the instant the handles drop
-    /// instead fails whenever `cargo test` overlaps two collections (#13295).
-    async fn wait_until_freed(cache: &Weak<SharedSegmentCache>) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while cache.strong_count() > 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "observable callbacks must not keep the cache alive: {} strong \
-                 reference(s) remain after 10s",
-                cache.strong_count()
-            );
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-
     #[derive(Clone, Debug)]
     struct SharedManualReader(Arc<ManualReader>);
 
@@ -1617,7 +1596,13 @@ mod tests {
 
         drop(cache);
         drop(shared);
-        wait_until_freed(&weak).await;
+        // Every harness's callbacks walk the process-wide `REGISTERED_CACHES`, so
+        // a sibling test collecting right now briefly holds this cache too; only a
+        // reference that outlives the bound is a leak.
+        wait_for("the metric callbacks to release the dropped cache", || {
+            weak.strong_count() == 0
+        })
+        .await;
 
         // Every series stops, counters included. The process cache lives in a
         // `OnceLock` for the process lifetime, so this only happens to a private
@@ -1651,7 +1636,10 @@ mod tests {
         drop(cache);
         drop(shared);
         // Until it is freed, this harness's own next collection still reports it.
-        wait_until_freed(&weak).await;
+        wait_for("the metric callbacks to release the dropped cache", || {
+            weak.strong_count() == 0
+        })
+        .await;
         // A callback run for one reader writes observations to every SDK
         // pipeline, so the other reader may still hold one buffered sample; its
         // first collection drains it.
