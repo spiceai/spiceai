@@ -1113,10 +1113,7 @@ impl Runtime {
                 .await
             {
                 manager.set_indexes(indexes).await;
-                if let Err(error) = manager
-                    .restore_indexes_from_snapshot(info)
-                    .await
-                {
+                if let Err(error) = manager.restore_indexes_from_snapshot(info).await {
                     // A restored dataset with `refresh_mode: full` and no `refresh_check_interval`
                     // takes `NextRefresh::Disabled` on startup, so nothing will rebuild this index
                     // on its own. Surface the degraded status below rather than registering as
