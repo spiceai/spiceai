@@ -48,6 +48,7 @@ use mistralrs::{
 };
 
 use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
@@ -952,6 +953,9 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
     })
 }
 
+/// Where a refused `tool_choice` points the caller.
+const TOOL_CHOICE_DOCS: &str = "https://spiceai.org/docs/components/models/huggingface";
+
 /// The `tool_choice` to hand `mistral.rs` for `req`, or an invalid-argument error when the
 /// request asks for a constraint that cannot be enforced — including a tool call required of a
 /// request that offers no tools, which `mistral.rs` would otherwise answer in prose.
@@ -966,15 +970,18 @@ fn request_tool_choice(
     else {
         return Ok(None);
     };
-    let requires_call = match &choice {
-        ToolChoice::Required => true,
-        ToolChoice::AllowedTools(allowed) => allowed.mode == AllowedToolsMode::Required,
-        _ => false,
-    };
+    let requires_call = matches!(
+        &choice,
+        ToolChoice::Required
+            | ToolChoice::AllowedTools(AllowedToolsToolChoice {
+                mode: AllowedToolsMode::Required,
+                ..
+            })
+    );
     if requires_call && req.tools.as_ref().is_none_or(Vec::is_empty) {
-        return Err(OpenAIError::InvalidArgument(
-            "tool_choice requires a tool call, but the request lists no tools. Add the tools the model may call to 'tools', or use tool_choice 'auto'. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
-        ));
+        return Err(OpenAIError::InvalidArgument(format!(
+            "tool_choice requires a tool call, but the request lists no tools. Add the tools the model may call to 'tools', or use tool_choice 'auto'. See: {TOOL_CHOICE_DOCS}"
+        )));
     }
     Ok(Some(choice))
 }
@@ -993,9 +1000,9 @@ fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> Result<ToolChoice,
         }
         ChatCompletionToolChoiceOption::Function(t) => Ok(ToolChoice::Tool(convert_named_tool(t))),
         ChatCompletionToolChoiceOption::AllowedTools(choice) => convert_allowed_tools(choice),
-        ChatCompletionToolChoiceOption::Custom(_) => Err(OpenAIError::InvalidArgument(
-            "tool_choice of type 'custom' is not supported by locally hosted models. Use 'none', 'auto', 'required', 'allowed_tools', or a named 'function' tool. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
-        )),
+        ChatCompletionToolChoiceOption::Custom(_) => Err(OpenAIError::InvalidArgument(format!(
+            "tool_choice of type 'custom' is not supported by locally hosted models. Use 'none', 'auto', 'required', 'allowed_tools', or a named 'function' tool. See: {TOOL_CHOICE_DOCS}"
+        ))),
     }
 }
 
@@ -1007,7 +1014,7 @@ fn convert_allowed_tools(
 ) -> Result<ToolChoice, OpenAIError> {
     let invalid = |reason: &str| {
         OpenAIError::InvalidArgument(format!(
-            "tool_choice 'allowed_tools' {reason}. See: https://spiceai.org/docs/components/models/huggingface"
+            "tool_choice 'allowed_tools' {reason}. See: {TOOL_CHOICE_DOCS}"
         ))
     };
 
@@ -1026,14 +1033,14 @@ fn convert_allowed_tools(
         mode = Some(entry_mode);
 
         for tool in &entry.tools {
-            let name = (tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
-                .then(|| tool.pointer("/function/name").and_then(serde_json::Value::as_str))
-                .flatten()
-                .ok_or_else(|| {
-                    invalid("lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to")
-                })?;
+            let Ok(ChatCompletionTools::Function(tool)) = ChatCompletionTools::deserialize(tool)
+            else {
+                return Err(invalid(
+                    "lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to",
+                ));
+            };
             tools.push(AllowedToolChoice::Function {
-                name: name.to_string(),
+                name: tool.function.name,
             });
         }
     }
@@ -1112,7 +1119,7 @@ mod tests {
         serde_json::from_value(json).expect("tool_choice should deserialize")
     }
 
-    fn invalid_argument(result: Result<ToolChoice, OpenAIError>) -> String {
+    fn invalid_argument<T: std::fmt::Debug>(result: Result<T, OpenAIError>) -> String {
         match result {
             Err(OpenAIError::InvalidArgument(message)) => message,
             other => panic!("expected an invalid-argument error, got {other:?}"),
@@ -1217,12 +1224,9 @@ mod tests {
                 "allowed_tools": [{ "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }]
             }),
         ] {
-            let message = invalid_argument(
-                request_tool_choice(&request(serde_json::json!({
-                    "model": "m", "messages": messages, "tool_choice": tool_choice
-                })))
-                .map(|choice| choice.expect("a tool choice was given")),
-            );
+            let message = invalid_argument(request_tool_choice(&request(serde_json::json!({
+                "model": "m", "messages": messages, "tool_choice": tool_choice
+            }))));
             assert!(message.contains("lists no tools"), "{message}");
         }
 
