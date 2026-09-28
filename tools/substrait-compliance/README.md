@@ -15,7 +15,7 @@ fails the job.
 |------|--------|
 | Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `43d31411c69ef7594887c7d759037bcf8244eeed` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the TPC-H q01 shipdate-cutoff correction, the only difference from upstream |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `lukim/spiceai-54-wrong-results-backports` @ `d1815c2a37edbde7ae177067f1707d9222bcff03` (workspace `[patch.crates-io]`; spiceai/datafusion#235 on top of `spiceai-54`, which merged #220, #221 and #226 and includes #215) |
+| spiceai/datafusion fork | `spiceai-54` @ `e9dc1dd4deede689576f6c91aace44caba781a88` (workspace `[patch.crates-io]`; merged spiceai/datafusion#235; spiceai-54 also merged #220, #221 and #226 and includes #215) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1** and is the layout Mode A
