@@ -134,12 +134,12 @@ where
 /// Returns how long to sleep to land `wait` seconds after the next wall-clock second that
 /// is a multiple of `nearest_second`.
 ///
-/// Every caller has one shape: change something a cron-scheduled refresh should pick up,
-/// sleep here, then assert the refresh happened. That only holds when the boundary this
-/// targets is one whose tick has not fired yet, so the boundary is always strictly in the
-/// future. A reading that already sits on a boundary second therefore counts as a whole
-/// period away: that second's tick fired before the caller's change existed, so only the
-/// following tick can pick it up (#13759).
+/// Most callers change something a cron-scheduled refresh should pick up, sleep here, then
+/// assert the refresh happened. That only holds when the boundary this targets is one whose
+/// tick has not fired yet, so the boundary is always strictly in the future. A reading that
+/// already sits on a boundary second therefore counts as a whole period away: that second's
+/// tick fired before the caller's change existed, so only the following tick can pick it up
+/// (#13759).
 ///
 /// The reading is truncated to whole seconds, so the sleep can end up to a second past
 /// the boundary rather than before it. That direction spends none of the caller's grace.
@@ -159,8 +159,7 @@ fn time_till_second_at(now_second: u32, nearest_second: u32, wait: Option<u32>) 
         "nearest_second must divide 60"
     );
 
-    // In `1..=nearest_second`: a reading anywhere inside a boundary second yields a whole
-    // period, because that boundary's tick has already run.
+    // In `1..=nearest_second`.
     let till_boundary = nearest_second - now_second % nearest_second;
 
     Duration::from_secs(u64::from(till_boundary) + u64::from(wait.unwrap_or(0)))
