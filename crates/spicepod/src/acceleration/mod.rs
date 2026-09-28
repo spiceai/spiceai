@@ -270,10 +270,12 @@ pub enum SnapshotsConsistency {
     /// refused the same way: it cannot be shown to have come from a single read.
     #[default]
     ConsistentRead,
-    /// Publish or restore regardless, accepting that the stored rows may span several
-    /// source positions. Choose this only when the view's consumers tolerate that.
-    /// Archives published under this setting are stamped `accept_skew` and a default
-    /// `consistent_read` consumer will not restore them.
+    /// Publish or restore a materialization that reads its sources more than once,
+    /// accepting that the stored rows may span several source positions. Choose this
+    /// only when the view's consumers tolerate that. Only the single-read requirement
+    /// is waived: a publish is still withheld while a dependency the view read was not
+    /// at its configured definition. Archives published under this setting are stamped
+    /// `accept_skew` and a default `consistent_read` consumer will not restore them.
     AcceptSkew,
 }
 
