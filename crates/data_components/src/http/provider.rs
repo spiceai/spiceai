@@ -1504,11 +1504,13 @@ impl HttpTableProvider {
             url.set_query(Some(q));
         }
 
-        let final_url = url.as_str().to_owned();
-        final_url
+        url.as_str()
             .parse::<Uri>()
             .map_err(|err| Error::FilterRejected {
-                message: format!("Constructed request URI '{final_url}' is invalid: {err}"),
+                message: format!(
+                    "Constructed request URI for {} is invalid: {err}",
+                    endpoint_label(&url)
+                ),
             })?;
 
         Ok(url)
