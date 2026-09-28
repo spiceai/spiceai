@@ -70,6 +70,11 @@ use reqwest::{
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
+
+/// The `client_timeout` an HTTPS dataset gets when it sets none. Also the
+/// default bound for the rate-control acquire wait, so it must stay equal to
+/// the GraphQL client's timeout for datasets that share an origin.
+pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {

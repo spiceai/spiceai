@@ -1302,6 +1302,7 @@ fn build_shared_rate_controller(
     }
 
     let mut builder = RateController::builder()
+        .with_origin(origin_key)
         .with_jitter(JitterConfig::new(config.jitter_min, config.jitter_max));
     if let Some(persisted_state) = persisted_state {
         builder = builder.with_object_store_persistence_for_instance(
@@ -1332,8 +1333,7 @@ fn build_shared_rate_controller(
         builder = builder.with_adaptive(control);
     }
     // A zero timeout means "no bound" (wait indefinitely), matching the param
-    // docs; `fundu` also parses "inf" to a saturated max, which is likewise
-    // effectively unbounded.
+    // docs. It is the only spelling for that: parsing rejects 'inf'.
     if let Some(acquire_timeout) = config.acquire_timeout
         && !acquire_timeout.is_zero()
     {
@@ -1553,7 +1553,7 @@ fn parse_optional_duration_param<S: BuildHasher>(
         return Ok(None);
     }
 
-    fundu::parse_duration(trimmed).map(Some).map_err(|source| {
+    let value = fundu::parse_duration(trimmed).map_err(|source| {
         DataConnectorError::InvalidConfiguration {
             dataconnector: dataconnector.to_string(),
             message: format!(
@@ -1562,7 +1562,21 @@ fn parse_optional_duration_param<S: BuildHasher>(
             connector_component: connector_component.clone(),
             source: source.into(),
         }
-    })
+    })?;
+
+    // `fundu` parses 'inf'/'infinity' into a saturated duration. Refuse it, so
+    // '0' stays the one spelling for "no bound".
+    if value == Duration::MAX {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            message: format!(
+                "The '{display_name}' parameter must be a finite duration such as '10ms' or '1s'. Use '0' for no limit."
+            ),
+            connector_component: connector_component.clone(),
+        });
+    }
+
+    Ok(Some(value))
 }
 
 fn with_jitter<S: BuildHasher>(
@@ -1709,7 +1723,7 @@ fn conflicting_config_error<T>(
         dataconnector: dataconnector.to_string(),
         connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, adaptive_rate_control, adaptive_rate_control_failure_threshold and adaptive_rate_control_window values for components sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, rate_control_acquire_timeout, adaptive_rate_control, adaptive_rate_control_failure_threshold and adaptive_rate_control_window values for components sharing an origin."
         ),
     })
 }

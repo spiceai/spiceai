@@ -46,6 +46,7 @@ use governor::{
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 mod adaptive;
 mod leased;
@@ -94,9 +95,95 @@ pub enum Error {
     InsufficientCapacity { weight: u32 },
 
     #[snafu(display(
-        "Timed out after {waited:?} waiting for rate-control capacity to admit the request. The configured rate limit could not free a slot in time. Increase the rate limit, raise `rate_control_acquire_timeout`, or lower request concurrency, then try again. See: https://spiceai.org/docs/reference/spicepod/runtime#http-rate-control"
+        "Timed out after {waited:?} waiting for rate-control capacity{target} to admit the request. The configured rate limit could not free a slot in time. Increase the rate limit, raise `rate_control_acquire_timeout`, or lower request concurrency, then try again. See: https://spiceai.org/docs/reference/spicepod/runtime#http-rate-control"
     ))]
-    AcquireTimeout { waited: Duration },
+    AcquireTimeout {
+        target: RateControlTarget,
+        waited: Duration,
+    },
+}
+
+/// The rate-limited upstream named in user-facing errors. HTTP rate control
+/// knows the origin; other callers (models, UDFs) have none to name, so the
+/// type — not the message — decides whether the clause appears.
+///
+/// [`Display`](std::fmt::Display) writes a leading-space clause (` for origin
+/// 'x'`), or nothing when the origin is unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RateControlTarget(Option<String>);
+
+impl RateControlTarget {
+    /// A target with no known origin.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self(None)
+    }
+
+    /// The origin this controller limits, e.g. `https://api.example.com`.
+    #[must_use]
+    pub fn origin(origin: impl Into<String>) -> Self {
+        Self(Some(origin.into()))
+    }
+
+    /// The origin, when one is known.
+    #[must_use]
+    pub fn as_origin(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl std::fmt::Display for RateControlTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(origin) => write!(formatter, " for origin '{origin}'"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One deadline for the whole rate-control wait of a single request: the
+/// concurrency semaphore, the quotas, the cluster leased buckets, jitter, and
+/// any later [`Permit::until_ready`] re-check on a retry path. Created once per
+/// request, so a deferred wait cannot extend the configured bound.
+#[derive(Debug, Clone, Copy)]
+enum AcquireDeadline {
+    /// No bound; every wait source may block indefinitely.
+    Unbounded,
+    /// The instant every wait source of this request shares, with the
+    /// configured bound that produced it (reported in the timeout error).
+    At { at: Instant, bound: Duration },
+}
+
+/// The shared deadline passed before the future finished.
+#[derive(Debug, Clone, Copy)]
+struct DeadlineExpired {
+    bound: Duration,
+}
+
+impl AcquireDeadline {
+    fn start(bound: Option<Duration>) -> Self {
+        match bound {
+            // A bound that overflows the clock is effectively no bound.
+            Some(bound) => match Instant::now().checked_add(bound) {
+                Some(at) => Self::At { at, bound },
+                None => Self::Unbounded,
+            },
+            None => Self::Unbounded,
+        }
+    }
+
+    /// Run `future` under this deadline.
+    async fn run<T, F>(self, future: F) -> std::result::Result<T, DeadlineExpired>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match self {
+            Self::Unbounded => Ok(future.await),
+            Self::At { at, bound } => tokio::time::timeout_at(at, future)
+                .await
+                .map_err(|_elapsed| DeadlineExpired { bound }),
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -186,6 +273,7 @@ pub struct RateControllerBuilder {
     persistence: Option<PersistenceConfig>,
     adaptive: Option<AdaptiveRateControl>,
     acquire_timeout: Option<Duration>,
+    origin: Option<String>,
 }
 
 impl RateControllerBuilder {
@@ -212,12 +300,26 @@ impl RateControllerBuilder {
         self
     }
 
-    /// Bound how long any `acquire*` call may wait for capacity (semaphore,
-    /// per-second/minute quotas, and cluster leased buckets combined) before
-    /// failing with [`Error::AcquireTimeout`]. Unset means wait indefinitely.
+    /// Bound how long one request may wait for capacity before failing with
+    /// [`Error::AcquireTimeout`]. The bound starts one deadline that covers
+    /// every wait source of that request — the semaphore, the quotas, the
+    /// cluster leased buckets, jitter, and any later [`Permit::until_ready`] —
+    /// so the total wait can never exceed it. Unset means wait indefinitely.
+    ///
+    /// Cluster mode: leased-bucket tokens already spent when the deadline fires
+    /// are not returned to the window, so the bound is exact for single-node
+    /// (local) rate control and best-effort for cluster rate control.
     #[must_use]
     pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
         self.acquire_timeout = Some(timeout);
+        self
+    }
+
+    /// Name the upstream origin this controller limits, so user-facing errors
+    /// can identify it. Cluster mode supplies it from the persistence config.
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
         self
     }
 
@@ -384,7 +486,11 @@ impl RateControllerBuilder {
             }
         }
 
-        let persistence_origin = self.persistence.as_ref().map(|p| p.origin.clone());
+        // An explicit origin wins; cluster mode already carries one.
+        let target = self
+            .origin
+            .or_else(|| self.persistence.as_ref().map(|p| p.origin.clone()))
+            .map_or_else(RateControlTarget::unknown, RateControlTarget::origin);
 
         let adaptive = self
             .adaptive
@@ -397,7 +503,7 @@ impl RateControllerBuilder {
             weighted_rate_limiter,
             semaphore,
             metrics,
-            persistence_origin,
+            target,
             adaptive,
             resolution,
             self.acquire_timeout,
@@ -485,8 +591,8 @@ pub struct RateController {
     weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
     semaphore: Option<MaxCapacityLimits<Semaphore>>,
     metrics: Arc<RateControllerMetrics>,
-    /// Origin string used for log/error context when in cluster mode.
-    persistence_origin: Option<String>,
+    /// The upstream this controller limits, named in user-facing errors.
+    target: RateControlTarget,
     /// When present, scales each limit down by an admission coefficient in
     /// `[0, 1.0]` based on recent [`RequestOutcome`]. See [`Self::record_outcome`].
     /// Buckets, semaphores and limits stay static; each request charges an
@@ -498,10 +604,12 @@ pub struct RateController {
     /// is scaled by). [`ADAPTIVE_WEIGHT_RESOLUTION`] with adaptive control, else
     /// `1`. Purely internal — divided back out of any logical metric.
     resolution: u32,
-    /// Upper bound on how long any `acquire*` call waits for capacity before
-    /// returning [`Error::AcquireTimeout`]. `None` = wait indefinitely (the
-    /// legacy behaviour). Bounds the whole acquire — semaphore, governor quotas,
-    /// and leased buckets — as one deadline.
+    /// Upper bound on how long one request waits for capacity before returning
+    /// [`Error::AcquireTimeout`]. `None` = wait indefinitely (the legacy
+    /// behaviour). Each `acquire*` call turns this into one
+    /// [`AcquireDeadline`] that the permit keeps, so the semaphore, the
+    /// governor quotas, the leased buckets, jitter and any later
+    /// [`Permit::until_ready`] all share it.
     acquire_timeout: Option<Duration>,
 }
 
@@ -518,7 +626,7 @@ impl std::fmt::Debug for RateController {
             )
             .field("semaphore", &self.semaphore.is_some())
             .field("metrics", &self.metrics)
-            .field("persistence_origin", &self.persistence_origin)
+            .field("target", &self.target)
             .field("adaptive", &self.adaptive.is_some())
             .field("resolution", &self.resolution)
             .field("acquire_timeout", &self.acquire_timeout)
@@ -531,6 +639,10 @@ pub struct Permit {
     semaphore: Option<OwnedSemaphorePermit>,
     weight: Option<u32>,
     rate_controller: Arc<RateController>,
+    /// The deadline opened when this request started to acquire. Shared with
+    /// [`Permit::until_ready`] so the configured bound covers both phases once,
+    /// rather than once each.
+    deadline: AcquireDeadline,
 }
 
 impl Drop for Permit {
@@ -546,18 +658,26 @@ impl Permit {
     /// Re-check the quotas from an existing permit. The caller retains its
     /// permit but acquires fresh rate-limit budget — used on retry paths.
     ///
+    /// This wait shares the deadline that the original acquire opened, so a
+    /// request cannot wait longer than `rate_control_acquire_timeout` in total.
+    /// A retry started after that deadline therefore fails at once instead of
+    /// queueing again.
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`RateController::acquire`].
     pub async fn until_ready(&self) -> Result<()> {
-        let wait_start = tokio::time::Instant::now();
-        let wait_fut = self.rate_controller.wait_for_rate_limiters(self.weight);
-        let result = match self.rate_controller.acquire_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, wait_fut).await {
-                Ok(inner) => inner,
-                Err(_elapsed) => Err(Error::AcquireTimeout { waited: timeout }),
-            },
-            None => wait_fut.await,
+        let wait_start = Instant::now();
+        let result = match self
+            .deadline
+            .run(self.rate_controller.wait_for_rate_limiters(self.weight))
+            .await
+        {
+            Ok(inner) => inner,
+            Err(DeadlineExpired { bound }) => Err(Error::AcquireTimeout {
+                target: self.rate_controller.target.clone(),
+                waited: bound,
+            }),
         };
 
         let wait_duration = wait_start.elapsed();
@@ -712,7 +832,7 @@ impl RateController {
         weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
         semaphore: Option<(Arc<Semaphore>, u32)>,
         metrics: Arc<RateControllerMetrics>,
-        persistence_origin: Option<String>,
+        target: RateControlTarget,
         adaptive: Option<Arc<AdaptiveController>>,
         resolution: u32,
         acquire_timeout: Option<Duration>,
@@ -729,7 +849,7 @@ impl RateController {
             weighted_rate_limiter,
             semaphore,
             metrics,
-            persistence_origin,
+            target,
             adaptive,
             resolution,
             acquire_timeout,
@@ -803,30 +923,37 @@ impl RateController {
     /// [`Error::AcquireTimeout`] if a bound is configured and the wait for
     /// capacity exceeds it.
     pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
-        let Some(timeout) = self.acquire_timeout else {
-            return self.acquire_inner(weight).await;
-        };
-        let wait_start = tokio::time::Instant::now();
-        match tokio::time::timeout(timeout, self.acquire_inner(weight)).await {
+        // One deadline for this request. The permit carries it, so a later
+        // `Permit::until_ready` continues the same bound instead of starting a
+        // second one of equal length.
+        let deadline = AcquireDeadline::start(self.acquire_timeout);
+        let wait_start = Instant::now();
+        match deadline.run(self.acquire_inner(weight, deadline)).await {
             Ok(result) => result,
-            Err(_elapsed) => {
+            Err(DeadlineExpired { bound }) => {
                 // The inner future is cancelled at the await it was parked on, so
                 // it records no outcome — attribute the failure here.
-                // NOTE (cluster mode): `acquire_inner` consumes leased-bucket
-                // tokens one at a time (`for _ in 0..weight { bucket.acquire() }`);
-                // a deadline that fires mid-loop drops the future after some
-                // tokens are already spent. Verify partial-consumption behaviour
-                // against a 2-node setup before relying on the bound in cluster
-                // mode. Local (governor/semaphore) mode has no such state.
+                // Cluster mode: `acquire_inner` consumes leased-bucket tokens one
+                // at a time, and tokens already spent when the deadline fires are
+                // not returned to the window. The bound is therefore exact for
+                // local (single-node) rate control and best-effort for cluster
+                // rate control until a weighted leased acquire lands.
                 self.metrics.record_acquire_error(wait_start.elapsed());
-                Err(Error::AcquireTimeout { waited: timeout })
+                Err(Error::AcquireTimeout {
+                    target: self.target.clone(),
+                    waited: bound,
+                })
             }
         }
     }
 
-    async fn acquire_inner(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
+    async fn acquire_inner(
+        self: &Arc<Self>,
+        weight: Option<u32>,
+        deadline: AcquireDeadline,
+    ) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
-        let wait_start = tokio::time::Instant::now();
+        let wait_start = Instant::now();
 
         // Snapshot the adaptive weight once for this acquire. A rounded charge
         // above the healthy baseline (`resolution` cells) means adaptive is
@@ -869,6 +996,7 @@ impl RateController {
             semaphore,
             weight,
             rate_controller: self_cloned,
+            deadline,
         })
     }
 }
@@ -1128,5 +1256,62 @@ mod tests {
         assert_eq!(controller.available_permits(), Some(7));
         drop(permit);
         assert_eq!(controller.available_permits(), Some(8));
+    }
+
+    /// The configured bound is one deadline for the whole request, not one per
+    /// wait. A `Permit::until_ready` that starts part-way through the bound
+    /// gets only the time that is left.
+    #[tokio::test(start_paused = true)]
+    async fn one_deadline_covers_the_acquire_and_the_retry_recheck() {
+        let bound = Duration::from_secs(10);
+        let controller = RateControllerBuilder::new()
+            .with_jitter(JitterConfig::zero())
+            // One request per minute: the first passes, the next must wait.
+            .add_quota(Quota::per_minute(NonZeroU32::new(1).expect("non-zero")))
+            .with_acquire_timeout(bound)
+            .with_origin("https://api.example.com")
+            .build();
+
+        let permit = controller
+            .acquire()
+            .await
+            .expect("the first request passes");
+
+        // Spend most of the bound doing the request itself, then retry.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let recheck_start = Instant::now();
+        let error = permit
+            .until_ready()
+            .await
+            .expect_err("the quota is empty, so the re-check must hit the bound");
+
+        assert!(
+            recheck_start.elapsed() < Duration::from_secs(5),
+            "the re-check must inherit the remaining deadline, not start a second one"
+        );
+        let message = error.to_string();
+        let Error::AcquireTimeout { target, waited } = &error else {
+            panic!("expected an acquire timeout, got {error:?}");
+        };
+        assert_eq!(target.as_origin(), Some("https://api.example.com"));
+        assert_eq!(*waited, bound);
+        assert!(
+            message.contains("api.example.com"),
+            "the error must name the origin: {message}"
+        );
+    }
+
+    /// Without an origin the message stays grammatical: the clause is dropped.
+    #[test]
+    fn an_unknown_target_leaves_the_message_grammatical() {
+        let message = Error::AcquireTimeout {
+            target: RateControlTarget::unknown(),
+            waited: Duration::from_secs(5),
+        }
+        .to_string();
+        assert!(
+            message.contains("rate-control capacity to admit the request"),
+            "unexpected message: {message}"
+        );
     }
 }

@@ -166,6 +166,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+    ParameterSpec::runtime("rate_control_acquire_timeout")
+        .description("Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Use '0' for no limit. If both are unset, the request waits with no limit."),
 
     ParameterSpec::component("token")
         .secret()
@@ -1472,6 +1474,7 @@ mod tests {
             "requests_per_minute_limit",
             "rate_control_jitter_min",
             "rate_control_jitter_max",
+            "rate_control_acquire_timeout",
         ] {
             assert!(
                 PARAMETERS

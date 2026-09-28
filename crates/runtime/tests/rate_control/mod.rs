@@ -260,3 +260,119 @@ mod adaptive_config_validation {
             .expect("disabled adaptive control requires no static limit");
     }
 }
+
+/// One origin must resolve to one rate-control configuration, whichever
+/// HTTP-based connector reaches it first.
+///
+/// `rate_control_acquire_timeout` defaults to the connector's client timeout,
+/// so every connector in the family must fill an unset value. A connector that
+/// did not would leave `None` where its neighbour holds the default, and the
+/// shared-origin check would reject two datasets the user configured the same
+/// way.
+mod shared_origin_acquire_timeout {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    use data_connector_api::{
+        ConnectorComponent, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnectorError,
+    };
+    use data_http_rate_control::{HttpRateControlConfig, HttpRateControlRegistry};
+    use runtime::dataconnector::https::DEFAULT_CLIENT_TIMEOUT as HTTPS_DEFAULT_CLIENT_TIMEOUT;
+    use runtime_component::dataset::DatasetSpec;
+    use url::Url;
+
+    const SHARED_ORIGIN: &str = "https://shared-origin.example.com/v1";
+
+    fn component(name: &str) -> ConnectorComponent {
+        ConnectorComponent::Dataset(Arc::new(DatasetSpec::new(SHARED_ORIGIN, name.into())))
+    }
+
+    fn origin_url() -> Url {
+        Url::parse(SHARED_ORIGIN).expect("test origin should parse")
+    }
+
+    /// A limited config, as a dataset that sets `requests_per_second_limit` and
+    /// nothing else resolves to.
+    fn limited_config() -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            requests_per_second: NonZeroU32::new(10),
+            ..HttpRateControlConfig::disabled()
+        }
+    }
+
+    #[tokio::test]
+    async fn https_and_graphql_agree_on_the_default_acquire_timeout() {
+        let mut https_config = limited_config();
+        https_config.apply_default_acquire_timeout(HTTPS_DEFAULT_CLIENT_TIMEOUT);
+        let mut graphql_config = limited_config();
+        graphql_config.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
+
+        assert_eq!(
+            https_config, graphql_config,
+            "the two connectors must derive the same acquire bound for a shared origin"
+        );
+
+        let registry = HttpRateControlRegistry::default();
+        let url = origin_url();
+        registry
+            .shared_rate_controller_for_component(
+                &url,
+                &https_config,
+                "spicepod",
+                &component("https_dataset"),
+                "https",
+            )
+            .await
+            .expect("the first dataset on the origin defines its rate control");
+        registry
+            .shared_rate_controller_for_component(
+                &url,
+                &graphql_config,
+                "spicepod",
+                &component("graphql_dataset"),
+                "graphql",
+            )
+            .await
+            .expect("a GraphQL dataset with the same settings shares that rate control");
+    }
+
+    /// The failure a connector that skipped the default would cause, and the
+    /// message that must name the parameter to explain it.
+    #[tokio::test]
+    async fn an_unfilled_acquire_timeout_conflicts_on_a_shared_origin() {
+        let mut https_config = limited_config();
+        https_config.apply_default_acquire_timeout(HTTPS_DEFAULT_CLIENT_TIMEOUT);
+
+        let registry = HttpRateControlRegistry::default();
+        let url = origin_url();
+        registry
+            .shared_rate_controller_for_component(
+                &url,
+                &https_config,
+                "spicepod",
+                &component("https_dataset"),
+                "https",
+            )
+            .await
+            .expect("the first dataset on the origin defines its rate control");
+
+        let error = registry
+            .shared_rate_controller_for_component(
+                &url,
+                &limited_config(),
+                "spicepod",
+                &component("graphql_dataset"),
+                "graphql",
+            )
+            .await
+            .expect_err("an unbounded wait conflicts with a bounded one");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => assert!(
+                message.contains("rate_control_acquire_timeout"),
+                "the conflict message must name the parameter: {message}"
+            ),
+            other => panic!("expected an invalid-configuration error, got {other:?}"),
+        }
+    }
+}
