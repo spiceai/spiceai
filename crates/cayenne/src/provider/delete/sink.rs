@@ -48,10 +48,12 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::Error;
+use super::super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
 use super::super::memory_account::CayenneMemoryAccount;
+use super::super::on_conflict::{PkDeletionSnapshot, pk_deletion_snapshot_for_strategy};
 use super::super::pk_validation::null_primary_key_message;
 use super::super::utils::{bytes_key, convert_to_u64_box, i64_key};
 use super::filter_exec::{InsertRecordHandling, is_pk_visible_i64, is_pk_visible_row_key};
@@ -307,6 +309,19 @@ pub(crate) struct DeleteScanSource {
     /// Whether a key re-inserted after its delete reads as live again.
     pub(crate) insert_records: InsertRecordHandling,
     pub(crate) table: Arc<ListingTable>,
+    /// The deletion index as it stood when `table` was captured, taken under the same
+    /// `listing_fence` read. `None` for a source captured without one (the cold tier).
+    ///
+    /// A row's liveness is only meaningful against the index its source was captured
+    /// with. A seq-prefix bake or a current-snapshot compaction folds the rows a
+    /// tombstone hides out of the files and then prunes that tombstone, both under
+    /// `listing_fence.write()`, so a source captured before that publish still holds the
+    /// superseded version while the live index no longer says it is superseded. Judged
+    /// by the live index alone, a predicate matching the retired value then tombstones
+    /// the KEY and deletes the replacement that never matched (#13913). The live index
+    /// is still consulted as well, because a tombstone added after the capture — an
+    /// upsert that superseded the version in between — must hide it too.
+    pub(crate) tombstones_at_capture: Option<PkDeletionSnapshot>,
 }
 
 impl StagedPkDelete {
@@ -498,6 +513,33 @@ pub struct CayenneDeletionSink {
     /// bypassed so the scan-based path returns an exact count of the live rows
     /// actually removed.
     count_exact: bool,
+    /// The owning table's `listing_fence` and `scan_state_lock`, taken in that order —
+    /// the pairing `scan` uses — to capture the main listing together with the deletion
+    /// index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]). `None` on
+    /// internal persist-only helpers, which capture without them.
+    capture_locks: Option<CaptureLocks>,
+}
+
+/// The locks a coherent (listing, deletion index) capture holds, outer first.
+#[derive(Clone)]
+pub(crate) struct CaptureLocks {
+    pub(crate) listing_fence: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) scan_state_lock: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl CaptureLocks {
+    /// Both read guards, taken in `scan`'s order: `listing_fence`, then
+    /// `scan_state_lock`.
+    pub(crate) async fn read(
+        &self,
+    ) -> (
+        tokio::sync::RwLockReadGuard<'_, ()>,
+        tokio::sync::RwLockReadGuard<'_, ()>,
+    ) {
+        let fence = self.listing_fence.read().await;
+        let state = self.scan_state_lock.read().await;
+        (fence, state)
+    }
 }
 
 impl CayenneDeletionSink {
@@ -538,6 +580,32 @@ impl CayenneDeletionSink {
             seq_allocator,
             count_exact: false,
             scan_input_version: None,
+            capture_locks: None,
+        }
+    }
+
+    /// Wire the owning table's capture locks, so the main listing is captured with the
+    /// deletion index it is judged by.
+    #[must_use]
+    pub(crate) fn with_capture_locks(mut self, capture_locks: CaptureLocks) -> Self {
+        self.capture_locks = Some(capture_locks);
+        self
+    }
+
+    /// The main listing as a scan source, captured together with the deletion index
+    /// under the same read guards `scan` captures the same rows under.
+    async fn capture_main_scan_source(&self) -> DeleteScanSource {
+        let _guards = match &self.capture_locks {
+            Some(locks) => Some(locks.read().await),
+            None => None,
+        };
+        let table = self.listing_table.load_full();
+        let tombstones_at_capture = pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy);
+        DeleteScanSource {
+            min_delete_seq: None,
+            insert_records: self.live_main_insert_records(),
+            table,
+            tombstones_at_capture: Some(tombstones_at_capture),
         }
     }
 
@@ -601,11 +669,7 @@ impl CayenneDeletionSink {
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
-                        let projected_sink = Self {
-                            pk_column_indices: vec![0],
-                            ..self.clone()
-                        };
-                        pending_pk_values.extend(projected_sink.extract_int64_pk_values(&batch)?);
+                        pending_pk_values.extend(self.extract_int64_pk_values(&batch, &[0])?);
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let row_keys = pending_pk_values.drain().map(i64_key).collect();
                             let results = self
@@ -715,23 +779,21 @@ impl CayenneDeletionSink {
 
     // NOTE: delete_filtered_rows_streaming_position_based is implemented in sink/position_based.rs
 
-    /// Extract Int64 primary key values from a batch.
+    /// Extract Int64 primary key values from a batch whose key is at `pk_indices`.
     fn extract_int64_pk_values(
         &self,
         batch: &arrow::array::RecordBatch,
+        pk_indices: &[usize],
     ) -> super::super::Result<Vec<i64>> {
         use arrow::array::Int64Array;
 
         let table_name = &self.table_metadata.table_name;
 
         // For Int64 PK strategy, we only have one PK column
-        let pk_column_index = self
-            .pk_column_indices
-            .first()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message: "Int64 PK strategy requires exactly one PK column index".to_string(),
-            })?;
+        let pk_column_index = pk_indices.first().ok_or_else(|| Error::Internal {
+            table: table_name.clone(),
+            message: "Int64 PK strategy requires exactly one PK column index".to_string(),
+        })?;
 
         let pk_column = batch.column(*pk_column_index);
         let pk_array = pk_column
@@ -806,43 +868,68 @@ impl CayenneDeletionSink {
     /// Delegates to the read path's own predicate rather than probing the index directly:
     /// a bare `get_with_min_seq(..).is_none()` is only half the rule, and misses that a
     /// tombstoned key re-inserted after its delete is visible again.
+    ///
+    /// Live only if live under BOTH the index captured with the source and the current
+    /// one — see [`DeleteScanSource::tombstones_at_capture`] for why neither alone is
+    /// enough. The second probe is skipped while the two are the same index, which is
+    /// every row unless a prune landed after the capture.
     fn is_live_int64_pk(&self, pk: i64, source: &DeleteScanSource) -> bool {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => is_pk_visible_i64(
-                pk,
-                &deletion_snapshot.load().tombstones,
-                source.insert_records,
-                source.min_delete_seq,
-            ),
-            _ => true,
-        }
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return true;
+        };
+        let visible = |tombstones: &DeletionIndex| {
+            is_pk_visible_i64(pk, tombstones, source.insert_records, source.min_delete_seq)
+        };
+        let current = deletion_snapshot.load();
+        visible(&current.tombstones)
+            && match &source.tombstones_at_capture {
+                Some(PkDeletionSnapshot::Int64Pk { tombstones })
+                    if !Arc::ptr_eq(tombstones, &current.tombstones) =>
+                {
+                    visible(tombstones)
+                }
+                _ => true,
+            }
     }
 
     /// [`Self::is_live_int64_pk`] for composite / non-integer primary keys.
     fn is_live_row_key(&self, key: &[u8], source: &DeleteScanSource) -> bool {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => is_pk_visible_row_key(
+        let PkDeletionStrategyWithCache::RowConverterBased {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return true;
+        };
+        let visible = |tombstones: &KeyDeletionIndex| {
+            is_pk_visible_row_key(
                 key,
-                &deletion_snapshot.load().tombstones,
+                tombstones,
                 source.insert_records,
                 source.min_delete_seq,
-            ),
-            _ => true,
-        }
+            )
+        };
+        let current = deletion_snapshot.load();
+        visible(&current.tombstones)
+            && match &source.tombstones_at_capture {
+                Some(PkDeletionSnapshot::RowConverterBased { tombstones })
+                    if !Arc::ptr_eq(tombstones, &current.tombstones) =>
+                {
+                    visible(tombstones)
+                }
+                _ => true,
+            }
     }
 
-    /// Extract row keys from a batch using the `RowConverter`.
+    /// Extract row keys from a batch whose key is at `pk_indices`, using the `RowConverter`.
     fn extract_row_keys(
-        &self,
         batch: &arrow::array::RecordBatch,
+        pk_indices: &[usize],
         row_converter: &RowConverter,
     ) -> super::super::Result<Vec<Box<[u8]>>> {
-        let pk_columns: Vec<ArrayRef> = self
-            .pk_column_indices
+        let pk_columns: Vec<ArrayRef> = pk_indices
             .iter()
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
@@ -939,7 +1026,12 @@ impl CayenneDeletionSink {
             }
         }
 
-        let physical_filters = self.build_physical_filters(&coerced_filters)?;
+        // Read only the key and filter columns. Filters are pushed to the scan for
+        // pruning only and are re-applied exactly below.
+        let (scan_projection, scan_schema) = self.filtered_delete_projection(&coerced_filters)?;
+        let physical_filters = Self::build_physical_filters(&coerced_filters, &scan_schema)?;
+        // Key columns lead the projected batch.
+        let projected_pk_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
 
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
@@ -949,7 +1041,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -966,7 +1061,7 @@ impl CayenneDeletionSink {
                         // One bloom-prefiltered probe per row: no second scan, and nothing
                         // held that the raw scan did not already hold.
                         pending_pk_values.extend(
-                            self.extract_int64_pk_values(&batch)?
+                            self.extract_int64_pk_values(&batch, &projected_pk_indices)?
                                 .into_iter()
                                 .filter(|pk| self.is_live_int64_pk(*pk, source)),
                         );
@@ -1021,7 +1116,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -1034,7 +1132,7 @@ impl CayenneDeletionSink {
                         // See the Int64 branch: this snapshot's threshold is what tells
                         // a superseded version from the row that replaced it.
                         pending_row_keys.extend(
-                            self.extract_row_keys(&batch, row_converter)?
+                            Self::extract_row_keys(&batch, &projected_pk_indices, row_converter)?
                                 .into_iter()
                                 .filter(|key| self.is_live_row_key(key, source)),
                         );
@@ -1097,12 +1195,7 @@ impl CayenneDeletionSink {
             SessionConfig::default(),
             Arc::clone(&self.runtime_env),
         );
-        let listing_table = self.listing_table.load_full();
-        let mut all_tables = vec![DeleteScanSource {
-            min_delete_seq: None,
-            insert_records: self.live_main_insert_records(),
-            table: Arc::clone(&listing_table),
-        }];
+        let mut all_tables = vec![self.capture_main_scan_source().await];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
         if self.filters.is_empty() {
             // Delete-all removes every row, so no version is preferred over another and
@@ -1195,11 +1288,30 @@ impl CayenneDeletionSink {
         Ok(coerced_filters)
     }
 
-    fn build_physical_filters(
+    /// Projection for a filtered delete scan: key columns first, then any other
+    /// column the filters reference.
+    fn filtered_delete_projection(
         &self,
         filters: &[Expr],
+    ) -> super::super::Result<(Vec<usize>, SchemaRef)> {
+        let mut projection = self.pk_column_indices.clone();
+        for filter in filters {
+            for column in filter.column_refs() {
+                let index = self.schema.index_of(&column.name)?;
+                if !projection.contains(&index) {
+                    projection.push(index);
+                }
+            }
+        }
+        let schema = Arc::new(self.schema.project(&projection)?);
+        Ok((projection, schema))
+    }
+
+    fn build_physical_filters(
+        filters: &[Expr],
+        schema: &SchemaRef,
     ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
-        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let df_schema = DFSchema::try_from(Arc::clone(schema))?;
         let execution_props = ExecutionProps::new();
 
         let physical_filters = filters
@@ -1342,19 +1454,9 @@ impl DeletionSink for CayenneDeletionSink {
             Arc::clone(&self.runtime_env),
         );
 
-        // Wait-free ArcSwap snapshot. Concurrent listing-table refreshes are
-        // serialized against this code path by `self.write_lock`, which the
-        // caller holds (or, for sub-sinks, is held by the orchestrating
-        // operation), so we never observe a torn swap here.
-        let listing_table = self.listing_table.load_full();
-
         // Collect all tables to scan: main listing table + the extra tables
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
-        let mut all_tables = vec![DeleteScanSource {
-            min_delete_seq: None,
-            insert_records: self.live_main_insert_records(),
-            table: Arc::clone(&listing_table),
-        }];
+        let mut all_tables = vec![self.capture_main_scan_source().await];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
 
         let prepared = if self.filters.is_empty() {

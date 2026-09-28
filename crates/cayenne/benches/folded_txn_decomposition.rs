@@ -270,7 +270,7 @@ async fn run_folded_per_statement(
 
     // snapshot sequence
     tx.execute(ExecuteParams {
-        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+        sql: "INSERT INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3) ON CONFLICT(table_id, snapshot_id) DO UPDATE SET sequence_number = excluded.sequence_number",
         params: vec![
             MetastoreValue::Text(TABLE_ID.to_string()),
             MetastoreValue::Text(format!("snap-{snapshot_seq}")),
@@ -354,7 +354,7 @@ async fn run_one_closure_batch(
     // snapshot sequence
     let _ = write!(
         sql,
-        "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES ('{TABLE_ID}', 'snap-{snapshot_seq}', {snapshot_seq}); "
+        "INSERT INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES ('{TABLE_ID}', 'snap-{snapshot_seq}', {snapshot_seq}) ON CONFLICT(table_id, snapshot_id) DO UPDATE SET sequence_number = excluded.sequence_number; "
     );
 
     // inline tombstone (large blob as hex literal)
