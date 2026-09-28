@@ -11,6 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use snafu::Snafu;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 pub mod acceleration;
 pub mod acceleration_source;
@@ -45,6 +50,12 @@ pub enum Error {
 /// during initialization, and carries any metadata from the snapshot.
 #[derive(Debug, Clone)]
 pub enum BootstrapStatus {
+    /// A snapshot reader whose first download belongs to its cancellable load task.
+    Pending {
+        manager: Arc<snapshot::SnapshotManager>,
+        subscription: Option<snapshot::notifications::Subscription>,
+        poll_interval: Duration,
+    },
     Bootstrapped {
         info: SnapshotDownloadInfo,
         subscription: Option<snapshot::notifications::Subscription>,
@@ -58,6 +69,18 @@ impl PartialEq for BootstrapStatus {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::None, Self::None) => true,
+            (
+                Self::Pending {
+                    manager: left,
+                    poll_interval: left_interval,
+                    ..
+                },
+                Self::Pending {
+                    manager: right,
+                    poll_interval: right_interval,
+                    ..
+                },
+            ) => Arc::ptr_eq(left, right) && left_interval == right_interval,
             (Self::Bootstrapped { info: left, .. }, Self::Bootstrapped { info: right, .. }) => {
                 left == right
             }
@@ -69,6 +92,68 @@ impl PartialEq for BootstrapStatus {
 impl Eq for BootstrapStatus {}
 
 impl BootstrapStatus {
+    /// Complete a reader's bootstrap before constructing its table. The caller
+    /// must run this inside its dataset load task's shutdown cancellation scope,
+    /// without holding the application lock or a dataset load permit.
+    pub async fn complete(self) -> Self {
+        let Self::Pending {
+            manager,
+            mut subscription,
+            poll_interval,
+        } = self
+        else {
+            return self;
+        };
+        let start = Instant::now();
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+        loop {
+            match manager.download_latest_snapshot().await {
+                Ok(Some(info)) => {
+                    snapshot::metrics::record_bootstrap_metrics(
+                        manager.dataset_name(),
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        info.bytes_downloaded,
+                        &info.checksum,
+                    );
+                    return Self::bootstrapped(info, subscription);
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "Dataset '{}' is waiting for its first snapshot and cannot be queried. Ensure the snapshot location '{}' is correct and that the writer has published a snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots",
+                        manager.dataset_name(),
+                        manager.snapshot_location()
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to bootstrap dataset '{}' from a snapshot, so it cannot be queried and will retry. Cause: {error}",
+                        manager.dataset_name()
+                    );
+                }
+            }
+            // A zero refresh interval must still back off when there is no data,
+            // as the regular refresh task does after a failed first refresh.
+            let delay = if poll_interval.is_zero() {
+                backoff.next_duration().unwrap_or(Duration::from_secs(300))
+            } else {
+                poll_interval
+            };
+            if let Some(notifications) = subscription.as_mut() {
+                tokio::select! {
+                    announced = notifications.next_snapshot() => {
+                        if announced.is_none() {
+                            subscription = None;
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
     #[must_use]
     pub const fn bootstrapped(
         info: SnapshotDownloadInfo,
@@ -90,7 +175,7 @@ impl BootstrapStatus {
     #[must_use]
     pub const fn last_updated_at(&self) -> Option<i64> {
         match self {
-            Self::None => None,
+            Self::None | Self::Pending { .. } => None,
             Self::Bootstrapped { info, .. } => info.last_updated_at,
         }
     }
@@ -100,7 +185,7 @@ impl BootstrapStatus {
     #[must_use]
     pub const fn loaded_snapshot_id(&self) -> Option<u64> {
         match self {
-            Self::None => None,
+            Self::None | Self::Pending { .. } => None,
             Self::Bootstrapped { info, .. } => Some(info.snapshot_id),
         }
     }
@@ -110,7 +195,7 @@ impl BootstrapStatus {
     pub fn take_snapshot_subscription(&mut self) -> Option<snapshot::notifications::Subscription> {
         match self {
             Self::Bootstrapped { subscription, .. } => subscription.take(),
-            Self::None => None,
+            Self::None | Self::Pending { .. } => None,
         }
     }
 }

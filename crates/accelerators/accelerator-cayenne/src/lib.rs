@@ -5821,6 +5821,80 @@ mod tests {
         assert_eq!(path_exists(&missing).await, missing.exists());
     }
 
+    #[tokio::test]
+    async fn snapshot_bootstrap_checks_the_table_in_a_shared_catalog() {
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use runtime_secrets::Secrets;
+        use spicepod::component::snapshot::Snapshots;
+        use tokio::sync::RwLock;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let metadata_dir = temp.path().join("metadata");
+        let data_dir = temp.path().join("orders");
+        let snapshots_dir = temp.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).expect("snapshot directory");
+        let accelerator = CayenneAccelerator::new();
+        let catalog = accelerator
+            .get_or_create_catalog(&metadata_dir.to_string_lossy(), "sqlite")
+            .await
+            .expect("shared catalog");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        catalog
+            .create_table(cayenne::metadata::CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("existing local orders table");
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let acceleration = Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Snapshot),
+            params: HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]),
+            snapshot_behavior: SnapshotBehavior::BootstrapOnly(
+                Arc::new(Snapshots {
+                    enabled: true,
+                    location: Some(format!("file://{}/", snapshots_dir.display())),
+                    ..Default::default()
+                }),
+                Arc::downgrade(&secrets),
+                tokio::runtime::Handle::current(),
+            ),
+            ..Default::default()
+        };
+        let orders = TestAccelerationSource::new("orders").with_acceleration(acceleration.clone());
+        assert_eq!(
+            accelerator.init(&orders).await.expect("open local table"),
+            BootstrapStatus::None
+        );
+        let customers = TestAccelerationSource::new("customers").with_acceleration(acceleration);
+        assert!(
+            matches!(
+                accelerator
+                    .init(&customers)
+                    .await
+                    .expect("prepare missing table"),
+                BootstrapStatus::Pending { .. }
+            ),
+            "an existing shared catalog must not suppress bootstrap of a missing table"
+        );
+    }
+
     /// `mode: file_create` must refuse the configuration at open time, before the
     /// recreate reaches `remove_dir_all`. Regression test for #13055 / #13068.
     #[tokio::test]

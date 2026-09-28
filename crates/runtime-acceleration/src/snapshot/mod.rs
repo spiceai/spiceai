@@ -3817,6 +3817,115 @@ mod tests {
         assert_eq!(downloaded.as_slice(), contents.as_ref());
     }
 
+    #[tokio::test]
+    async fn reader_bootstrap_waits_for_publication_and_hands_off_notifications() {
+        use super::notifications::TestAnnouncer;
+        use crate::BootstrapStatus;
+
+        for behavior in [
+            BootstrapOnFailureBehavior::Warn,
+            BootstrapOnFailureBehavior::Retry,
+            BootstrapOnFailureBehavior::Fallback,
+        ] {
+            for notify in [false, true] {
+                let store = Arc::new(InMemory::new());
+                let temp_dir = TempDir::new().expect("create temp dir");
+                let local_path = temp_dir.path().join("reader.db");
+                let schema = sample_schema();
+                let manager = Arc::new(build_manager(
+                    Arc::clone(&store),
+                    local_path.clone(),
+                    behavior,
+                    &schema,
+                    false,
+                ));
+                let (announcer, subscription) = TestAnnouncer::subscribe(DATASET_NAME);
+                let pending = BootstrapStatus::Pending {
+                    manager,
+                    subscription: notify.then_some(subscription),
+                    poll_interval: if notify {
+                        Duration::from_secs(3600)
+                    } else {
+                        Duration::ZERO
+                    },
+                };
+                let bootstrap = pending.complete();
+                tokio::pin!(bootstrap);
+                // Start the real download against an empty store. No table may be
+                // constructed before the first snapshot supplies its schema and data.
+                assert!(futures::poll!(&mut bootstrap).is_pending());
+                assert!(!local_path.exists());
+
+                let base = Path::from(SNAPSHOT_BASE_PATH);
+                let location = base.clone().join("orders.duckdb");
+                let contents = b"snapshot published after reader startup";
+                store
+                    .put(&location, contents.to_vec().into())
+                    .await
+                    .expect("publish snapshot");
+                let entry = SnapshotEntry {
+                    snapshot_id: 7,
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    snapshot: snapshot_uri(&location),
+                    snapshot_checksum: compute_sha256_hex(contents),
+                    snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                    snapshot_size: contents.len() as u64,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
+                    snapshot_last_updated_at_ms: None,
+                };
+                let metadata = SnapshotMetadata {
+                    format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+                    location: SNAPSHOT_URI_PREFIX.to_string(),
+                    last_updated_ms: Utc::now().timestamp_millis(),
+                    datasets: HashMap::from([(
+                        DATASET_NAME.to_string(),
+                        dataset_metadata(&schema, vec![entry], Some(7)),
+                    )]),
+                };
+                write_metadata(&store, &base.join(METADATA_FILE_NAME), &metadata).await;
+                if notify {
+                    announcer.announce(DATASET_NAME, 7);
+                } else {
+                    // Time is the contract here: 0s must not retry an empty store in
+                    // a tight loop. The first Fibonacci delay is at least 700ms.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(200), &mut bootstrap)
+                            .await
+                            .is_err()
+                    );
+                }
+                let status = tokio::time::timeout(Duration::from_secs(5), &mut bootstrap)
+                    .await
+                    .expect("bootstrap completes on a notification or bounded backoff");
+                assert_eq!(status.loaded_snapshot_id(), Some(7));
+                assert_eq!(
+                    fs::read(&local_path).await.expect("restored file"),
+                    contents
+                );
+
+                if !notify {
+                    assert!(status.clone().take_snapshot_subscription().is_none());
+                    continue;
+                }
+                // A publication between download and table registration must reach
+                // the refresh subscription, including when registration retries.
+                announcer.announce(DATASET_NAME, 8);
+                let mut retry_status = status.clone();
+                drop(status);
+                let mut refresh = retry_status
+                    .take_snapshot_subscription()
+                    .expect("bootstrap hands off the live subscription");
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), refresh.next_snapshot())
+                        .await
+                        .expect("publication survives the handoff"),
+                    Some(8)
+                );
+            }
+        }
+    }
+
     /// Regression test for the first reload of a `refresh_mode: snapshot`
     /// `SQLite` reader: the restore replaces a live WAL-mode database whose
     /// connection is still open, and the replaced database's `-wal` must not be

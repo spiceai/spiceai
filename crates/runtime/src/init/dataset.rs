@@ -741,32 +741,39 @@ impl Runtime {
 
         let runtime = Arc::clone(&self);
         let shutdown_token = runtime.status.shutdown_token();
-        let retry_fut = retry(retry_strategy, || async {
-            // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
-            if runtime.status.is_shutdown() {
-                return Err(RetryError::permanent(
-                    crate::Error::UnableToInitializeDataConnector {
-                        source: "Runtime is shutting down".into(),
-                    },
-                ));
+        let retry_fut = async {
+            let bootstrap_status = bootstrap_status.complete().await;
+            if bootstrap_status.is_bootstrapped() {
+                update_cached_dataset_timestamps(ds.as_ref()).await;
             }
-
-            match runtime
-                .try_load_dataset_once(
-                    Arc::clone(&ds),
-                    bootstrap_status.clone(),
-                    Some(Arc::clone(&load_semaphore)),
-                )
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(err) if runtime.status.is_shutdown() => Err(RetryError::permanent(err)),
-                Err(err) if matches!(err, Error::PermanentDatasetFailure { .. }) => {
-                    Err(RetryError::permanent(err))
+            let _ = retry(retry_strategy, || async {
+                // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
+                if runtime.status.is_shutdown() {
+                    return Err(RetryError::permanent(
+                        crate::Error::UnableToInitializeDataConnector {
+                            source: "Runtime is shutting down".into(),
+                        },
+                    ));
                 }
-                Err(err) => Err(RetryError::transient(err)),
-            }
-        });
+
+                match runtime
+                    .try_load_dataset_once(
+                        Arc::clone(&ds),
+                        bootstrap_status.clone(),
+                        Some(Arc::clone(&load_semaphore)),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(err) if runtime.status.is_shutdown() => Err(RetryError::permanent(err)),
+                    Err(err) if matches!(err, Error::PermanentDatasetFailure { .. }) => {
+                        Err(RetryError::permanent(err))
+                    }
+                    Err(err) => Err(RetryError::transient(err)),
+                }
+            })
+            .await;
+        };
 
         // Use tokio::select! so that backoff sleeps inside `retry` are immediately
         // interrupted when the runtime begins shutting down (e.g. on ctrl-c).
@@ -1960,8 +1967,17 @@ impl Runtime {
                     continue;
                 }
 
-                Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
-                continue;
+                if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                    Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
+                    continue;
+                }
+                // A changed file-backed reader with no local table needs its
+                // first snapshot before registration, just like an added reader.
+                self.df.clear_cached_plans().await;
+                self.invalidate_cached_results_for(&ds.name).await;
+                Arc::clone(&self)
+                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .await;
             }
 
             self.status
@@ -4514,3 +4530,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 }
+
+#[cfg(all(test, feature = "snapshots", feature = "duckdb"))]
+#[path = "dataset_snapshot_bootstrap_tests.rs"]
+mod snapshot_bootstrap_tests;

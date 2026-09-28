@@ -36,7 +36,6 @@ use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
 };
 use snafu::Snafu;
-use spicepod::component::snapshot::BootstrapOnFailureBehavior;
 
 use crate::{AcceleratorEngineRegistry, acceleration_file_path};
 
@@ -152,7 +151,7 @@ pub async fn download_snapshot(
         let manager = Arc::new(manager);
         let start_time = Instant::now();
         let snapshot_reader = resolved_refresh_mode(source, acceleration) == RefreshMode::Snapshot;
-        let mut subscription =
+        let subscription =
             if snapshot_reader && let Some(notifications) = source.snapshot_notifications() {
                 notifications
                     .subscribe_for_behavior(&acceleration.snapshot_behavior, &manager)
@@ -160,50 +159,31 @@ pub async fn download_snapshot(
             } else {
                 None
             };
-        let wait_for_snapshot = snapshot_reader
-            && matches!(
-                &acceleration.snapshot_behavior,
-                SnapshotBehavior::Enabled(config, ..) | SnapshotBehavior::BootstrapOnly(config, ..)
-                    if config.bootstrap_on_failure_behavior == BootstrapOnFailureBehavior::Retry
-            );
-        let poll_interval = acceleration
-            .refresh_check_interval
-            .unwrap_or(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL);
-        loop {
-            match manager.download_latest_snapshot().await {
-                Ok(Some(info)) => {
-                    let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                    metrics::record_bootstrap_metrics(
-                        &dataset_name,
-                        duration_ms,
-                        info.bytes_downloaded,
-                        &info.checksum,
-                    );
-                    return Ok(BootstrapStatus::bootstrapped(info, subscription));
-                }
-                Ok(None) if wait_for_snapshot => {
-                    // A snapshot reader has no source from which to create its initial
-                    // schema. Keep initialization pending until a publisher supplies it.
-                    tracing::debug!(dataset = %dataset_name, "Waiting for the first snapshot");
-                    if let Some(notifications) = subscription.as_mut() {
-                        tokio::select! {
-                            announced = notifications.next_snapshot() => {
-                                if announced.is_none() {
-                                    subscription = None;
-                                    tokio::time::sleep(poll_interval).await;
-                                }
-                            }
-                            () = tokio::time::sleep(poll_interval) => {}
-                        }
-                    } else {
-                        tokio::time::sleep(poll_interval).await;
-                    }
-                }
-                Ok(None) => return Ok(BootstrapStatus::none()),
-                Err(e) => {
-                    tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
-                    return Ok(BootstrapStatus::none());
-                }
+        if snapshot_reader {
+            // Dataset load tasks own potentially unbounded bootstrap waits. Shared
+            // accelerator initialization must finish before any dataset can load.
+            return Ok(BootstrapStatus::Pending {
+                manager,
+                subscription,
+                poll_interval: acceleration
+                    .refresh_check_interval
+                    .unwrap_or(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL),
+            });
+        }
+        match manager.download_latest_snapshot().await {
+            Ok(Some(info)) => {
+                metrics::record_bootstrap_metrics(
+                    &dataset_name,
+                    start_time.elapsed().as_secs_f64() * 1000.0,
+                    info.bytes_downloaded,
+                    &info.checksum,
+                );
+                Ok(BootstrapStatus::bootstrapped(info, subscription))
+            }
+            Ok(None) => Ok(BootstrapStatus::none()),
+            Err(e) => {
+                tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
+                Ok(BootstrapStatus::none())
             }
         }
     } else {
