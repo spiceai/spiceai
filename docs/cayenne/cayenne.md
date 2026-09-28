@@ -1074,7 +1074,7 @@ Compaction bounds read amplification by consolidating small Vortex files into ta
 
 ```mermaid
 flowchart TB
-    TRIG{"Trigger"} -->|"post-write (best-effort, AcqRel dedup)"| PICK
+    TRIG{"Trigger"} -->|"post-write (one pass per table; a mid-pass request re-runs it)"| PICK
     TRIG -->|"per-table background compactor (shared semaphore)"| PICK
     TRIG -->|"inline flush (cumulative gate)"| FLUSH["drain cayenne_inlined_data → Vortex file"]
 
@@ -1086,6 +1086,8 @@ flowchart TB
     REWRITE --> COMMIT["atomic snapshot-pointer flip (commit_compaction, subset: set_current_snapshot)<br/>old dir retired + swept"]
     FLUSH --> FPUB["under listing fence: publish new protected snapshot (PK) / write current dir (no PK), clear inline rows"]
 ```
+
+**A post-write request raised during a pass is recorded, not dropped.** At most one post-write pass runs per table. A write that asks for one while it runs marks the pass dirty, and the pass re-checks its trigger before it exits (spiceai/spiceai#13906). That write is usually the append that made the running pass abort on a concurrent change; dropping it left the aborted seed unconsolidated until the next write or background tick, and permanently on a table whose `compaction_background_interval_ms` is 0.
 
 Compaction runs only for tables that accumulate files. A **bulk-overwrite** table (`refresh_mode: full`) gets `compaction_background_interval_ms = 0` and so never spawns a background compactor at all: its refresh publishes a fresh snapshot and `update_current_snapshot_id` resets the small-file counter, it never creates a protected snapshot, and its deletion index stays empty — so every trigger would early-out anyway. An operator who mixes in-place writes with full refreshes can set the interval explicitly to turn it back on. That is also why such a table has to establish its own order. Compaction is the only other path that sorts, so with it off a configured `cayenne_sort_columns` would never reach the data: the snapshot would keep arrival order however the column is set, every file's zone maps would span the whole key range, and a selective scan would prune nothing. `begin_overwrite` therefore orders the replacement stream before writing it and pins the encode to one writer, which costs a single-writer sort of the whole table on every refresh — the price of the pruning it buys, and paid only by a table that asks for the order.
 
