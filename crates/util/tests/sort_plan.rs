@@ -52,7 +52,7 @@ fn scrambled(n: usize, seed: u64) -> Vec<Option<i64>> {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            (x % 97 != 0).then(|| i64::try_from(x % 10_000).expect("small key"))
+            (!x.is_multiple_of(97)).then(|| i64::try_from(x % 10_000).expect("small key"))
         })
         .collect()
 }
@@ -328,7 +328,7 @@ async fn finishes_under_memory_pressure() {
     // ~170 MB of rows against a 32 MB pool.
     let ctx = bounded_context(32 * 1024 * 1024, 1024 * 1024);
     let plan = sort_plan(source(&parts, 4_096), &["k".to_string()], &ctx).expect("plan builds");
-    let out = tokio::time::timeout(std::time::Duration::from_secs(120), run(plan, &ctx))
+    let out = tokio::time::timeout(std::time::Duration::from_mins(2), run(plan, &ctx))
         .await
         .expect("a spilling sort under memory pressure must finish, not hang");
     assert_ordered(&parts, &out, asc_nulls_last);
@@ -351,7 +351,7 @@ async fn already_ordered_partitions_are_only_merged() {
     .expect("non-empty ordering");
     let input = MemorySourceConfig::try_new(&partitions, schema(), None)
         .and_then(|s| s.try_with_sort_information(vec![ordering]))
-        .map(|s| datafusion::datasource::source::DataSourceExec::from_data_source(s))
+        .map(datafusion::datasource::source::DataSourceExec::from_data_source)
         .expect("ordered memory source");
     let ctx = Arc::new(TaskContext::default());
     // A bare column name sorts NULLs last; the source's default ordering is

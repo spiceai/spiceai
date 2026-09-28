@@ -131,7 +131,7 @@ pub fn sort_plan(
     sort_columns: &[String],
     context: &TaskContext,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let Some(ordering) = build_lex_ordering(&input.schema(), sort_columns)? else {
+    let Some(ordering) = build_lex_ordering(&input.schema(), sort_columns) else {
         return Ok(input);
     };
     let already_ordered = input
@@ -205,7 +205,7 @@ pub fn max_sort_partitions(context: &TaskContext) -> usize {
 /// The `LexOrdering` for `sort_columns` over `schema`, or `None` when the list
 /// is empty or — after a warning — an entry is malformed or names a column
 /// `schema` lacks.
-fn build_lex_ordering(schema: &SchemaRef, sort_columns: &[String]) -> Result<Option<LexOrdering>> {
+fn build_lex_ordering(schema: &SchemaRef, sort_columns: &[String]) -> Option<LexOrdering> {
     // Build sort expressions from configured sort_columns
     let mut sort_exprs = Vec::with_capacity(sort_columns.len());
     for entry in sort_columns {
@@ -227,7 +227,7 @@ fn build_lex_ordering(schema: &SchemaRef, sort_columns: &[String]) -> Result<Opt
                 "Invalid sort column specification '{}', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'. Skipping sort.",
                 entry
             );
-            return Ok(None);
+            return None;
         };
 
         // Validate column exists in schema and get its index
@@ -236,7 +236,7 @@ fn build_lex_ordering(schema: &SchemaRef, sort_columns: &[String]) -> Result<Opt
                 "Sort column '{}' not found in schema. Skipping sort.",
                 col_name
             );
-            return Ok(None);
+            return None;
         };
 
         sort_exprs.push(PhysicalSortExpr {
@@ -246,7 +246,7 @@ fn build_lex_ordering(schema: &SchemaRef, sort_columns: &[String]) -> Result<Opt
     }
 
     // Empty only for an empty list, which means "do not sort".
-    Ok(LexOrdering::new(sort_exprs))
+    LexOrdering::new(sort_exprs)
 }
 
 /// Parse one sort specification of the form
