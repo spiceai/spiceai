@@ -2164,7 +2164,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
@@ -2371,7 +2375,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
