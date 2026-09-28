@@ -4747,18 +4747,34 @@ impl RewriteLayout {
     }
 }
 
-/// How a clustering sort consumes its input.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ClusterSortSpan {
-    /// Sort the whole stream as one run, so the output is globally ordered by
-    /// the curve key. Required wherever the resulting files are read back
-    /// through the ordinary scan path.
-    Global,
-    /// Split into byte-capped runs, each sorted independently. Caps per-run
-    /// memory and first-batch latency, but curve key ranges overlap ACROSS runs,
-    /// so the result is not globally ordered — only safe where the files
-    /// advertise no ordering, as cold-tier files do.
-    BoundedRuns,
+/// The order a rewrite writes its rows in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RewriteOrder {
+    /// Whatever order the scan produces.
+    Unordered,
+    /// Lexicographic, by `sort_columns` entries (see
+    /// `util::stream_utils::sort_plan`).
+    Sorted(Vec<String>),
+    /// Along the Hilbert curve over the columns at these schema indices.
+    Curve(Vec<usize>),
+}
+
+impl RewriteOrder {
+    /// A curve over `curve_indices` when there are any, else a sort by
+    /// `sort_columns` when there are any, else no order.
+    fn new(curve_indices: Vec<usize>, sort_columns: Vec<String>) -> Self {
+        if !curve_indices.is_empty() {
+            Self::Curve(curve_indices)
+        } else if !sort_columns.is_empty() {
+            Self::Sorted(sort_columns)
+        } else {
+            Self::Unordered
+        }
+    }
+
+    fn is_ordered(&self) -> bool {
+        !matches!(self, Self::Unordered)
+    }
 }
 
 /// In-memory bytes of rows each shard of a whole-table replace sorts by the
@@ -10129,8 +10145,8 @@ impl CayenneTableProvider {
         // A sorted write must still go through ONE writer, or the global order
         // is scattered across shard files and each file's zone maps span the
         // whole range — forfeiting exactly the pruning the sort was for. Every
-        // stream that goes through `sort_stream_by_columns` or
-        // `cluster_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // stream ordered by `order_rewrite_plan` or clustered by
+        // `cluster_runs_stream` states that with [`EncodeFanOut::Serial`], which
         // is handled above. A low `session_target_partitions` is NOT a
         // substitute: it bounds only the unset default, while a configured
         // `cayenne_write_concurrency` is honored above it (see
@@ -17436,67 +17452,6 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Sort a record batch stream using `DataFusion`'s `SortExec` for optimal performance.
-    ///
-    /// This is used during refresh operations to sort the **entire refresh corpus** before it's
-    /// chunked and written to files, ensuring optimal zone map statistics across all Vortex files.
-    ///
-    /// # External Sort with Disk Spilling
-    ///
-    /// Uses `DataFusion`'s `SortExec` which provides:
-    /// - **Automatic disk spilling**: Handles datasets larger than available memory
-    /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
-    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2 on amd64)
-    /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
-    /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
-    ///
-    /// # Configuration
-    ///
-    /// Spill behavior is controlled by runtime configuration:
-    /// - `sort_spill_reservation_bytes`: Memory reserved for merge operations (default: 10MB)
-    /// - `sort_in_place_threshold_bytes`: Size below which data is sorted in-place (default: 1MB)
-    /// - `spill_compression`: Compression codec for spill files (uncompressed, `lz4_frame`, zstd)
-    /// - `temp_directory`: Directory for spill files (configured in runtime)
-    ///
-    /// # Performance
-    ///
-    /// - Small datasets (<1MB): Sorted in-place in memory, no allocations
-    /// - Medium datasets (1MB-available memory): In-memory sort with single merge
-    /// - Large datasets (>available memory): External merge sort with disk spilling
-    /// - All cases use SIMD-optimized Arrow kernels and parallel sorting via rayon
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if the sort execution itself fails. Columns missing
-    /// from the stream schema (or otherwise unparseable) are skipped with a
-    /// warning and the stream is returned unsorted (see
-    /// `util::stream_utils::sort_stream`) — never surfaced as an error.
-    pub(crate) fn sort_stream_by_columns(
-        &self,
-        stream: SendableRecordBatchStream,
-        sort_columns: &[String],
-        task_ctx: &Arc<datafusion_execution::TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if sort_columns.is_empty() {
-            return Ok(stream);
-        }
-
-        // Reuse the caller's task context — the bounded compaction/query memory
-        // pool (and spill dir) the rewrite scan already runs under. Building a
-        // fresh `TaskContext::default()` here would use an UNBOUNDED memory pool,
-        // so `SortExec` would never spill and a large default-on rewrite could OOM
-        // the process, bypassing the `runtime.query.memory_limit` contract.
-        tracing::debug!(
-            "Sorting data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
-            sort_columns,
-            self.table_metadata.table_name
-        );
-
-        let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, task_ctx)?;
-
-        Ok(sorted_stream)
-    }
-
     /// Orders a whole-table replace by the table's configured `sort_columns`,
     /// returning the stream to write and the write fan-out that order allows.
     ///
@@ -17522,8 +17477,8 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error only if the sort execution itself fails; see
-    /// [`Self::sort_stream_by_columns`] for how unusable columns are handled.
+    /// Returns an error only if the ordering plan fails to build or execute;
+    /// see `util::stream_utils::sort_plan` for how unusable columns are handled.
     pub(crate) fn sort_overwrite_input(
         &self,
         data: SendableRecordBatchStream,
@@ -17533,29 +17488,38 @@ impl CayenneTableProvider {
         usize,
         super::delta_encoding::WritePolicy,
     )> {
-        if self.context.has_cluster_by() {
-            let ctx = self.create_session_context();
-            let clustered = self.cluster_sort_stream(
-                data,
-                self.configured_clustering_indices(),
-                &ctx.task_ctx(),
-                ClusterSortSpan::Global,
-            )?;
-            return Ok((clustered, 1, rewrite_write_policy(true)));
-        }
-        if !self.context.sort_columns_are_authoritative() {
+        let order = if self.context.has_cluster_by() {
+            RewriteOrder::Curve(self.configured_clustering_indices())
+        } else if self.context.sort_columns_are_authoritative() {
+            RewriteOrder::Sorted(self.context.sort_columns().to_vec())
+        } else {
+            RewriteOrder::Unordered
+        };
+        if !order.is_ordered() {
             return Ok((data, target_partitions, rewrite_write_policy(false)));
         }
-
-        let sort_columns = self.context.sort_columns().to_vec();
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
-            sort_columns = ?sort_columns,
-            "Sorting whole-table replace before writing the new snapshot"
+            order = ?order,
+            "Ordering whole-table replace before writing the new snapshot"
         );
+        // The replace arrives as one stream. Deal it round-robin over the
+        // session's partitions so the key and the sort run on all of them, as
+        // they do for a rewrite's scan partitions; the merge restores one order.
         let ctx = self.create_session_context();
-        let sorted = self.sort_stream_by_columns(data, &sort_columns, &ctx.task_ctx())?;
-        Ok((sorted, 1, rewrite_write_policy(true)))
+        let task_ctx = ctx.task_ctx();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(datafusion_physical_plan::repartition::RepartitionExec::try_new(
+            util::stream_utils::stream_plan(data),
+            datafusion_physical_plan::Partitioning::RoundRobinBatch(
+                ctx.state().config().target_partitions(),
+            ),
+        )?);
+        let ordered = self.order_rewrite_plan(input, &order, &task_ctx)?;
+        Ok((
+            datafusion_physical_plan::execute_stream(ordered, task_ctx)?,
+            1,
+            rewrite_write_policy(true),
+        ))
     }
 
     /// How a whole-table replace routes its rows into key-range files instead of
@@ -18151,22 +18115,18 @@ impl CayenneTableProvider {
             !self.context.has_sort_columns()
         );
 
+        // Configured sort_columns win; default empty uses hottest observed filters (F4).
+        // An empty list resolves to no key at all, and the rows are then written
+        // in scan order — so whether this rewrite is sorted is a property of the
+        // resolved list, not of the entry point.
+        let order = RewriteOrder::new(clustering, rewrite_sort_columns);
+        let rewrite_is_sorted = order.is_ordered();
+
         // Create a session context and scan the logical table view to get all
         // currently visible rows. The rewrite commit clears deletion/protected
         // snapshot state, so the input stream must have already applied it.
         let ctx = self.create_session_context();
-        let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
-
-        // Configured sort_columns win; default empty uses hottest observed filters (F4).
-        // An empty list resolves to no key at all, and `sort_stream_by_columns`
-        // then hands the stream back untouched — so whether this rewrite is
-        // sorted is a property of the resolved list, not of the entry point.
-        let rewrite_is_sorted = !clustering.is_empty() || !rewrite_sort_columns.is_empty();
-        let sorted_stream = if clustering.is_empty() {
-            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?
-        } else {
-            self.cluster_sort_stream(stream, clustering, &ctx.task_ctx(), ClusterSortSpan::Global)?
-        };
+        let (sorted_stream, _) = self.visible_file_stream_for_rewrite(&ctx, &order).await?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -21682,89 +21642,6 @@ impl CayenneTableProvider {
         // `write_lock` only for its capture and publishes under `listing_fence`
         // alone), so a blind protected-snapshot clear would drop rows the scan
         // never folded in.
-        let (mut stream, scope, generation_before, snapshot_id_before): (
-            SendableRecordBatchStream,
-            RewriteScope,
-            u64,
-            String,
-        ) = if uses_position_deletes {
-            let snapshot_id_before = self.get_current_snapshot_id();
-            // Drain the inline memtable FIRST, for the same reason the
-            // key-delete arm does: `visible_file_stream_for_rewrite` also
-            // checkpoints inline data internally, which would publish a
-            // protected snapshot BETWEEN the two folded-set reads below and
-            // spuriously abort every pass on a table with inline data. After
-            // this the internal checkpoint is a no-op. Safe under the
-            // `write_lock` this arm already holds for the whole rewrite.
-            if self.cached_inlined_row_count() > 0 {
-                self.checkpoint_inlined_data().await?;
-            }
-            let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
-            if folded_before != self.protected_snapshot_ids() {
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: protected-snapshot set changed during scan \
-                     (concurrent checkpoint); will retry on the next trigger",
-                );
-                maintenance_metrics::track_compaction(
-                    table_name,
-                    CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
-                );
-                return Ok(false);
-            }
-            (
-                stream,
-                RewriteScope::AllTombstonesFoldedSnapshots {
-                    folded: folded_before,
-                },
-                generation_before,
-                snapshot_id_before,
-            )
-        } else {
-            let _capture_guard = self.write_lock_arc().lock_owned().await;
-            // Defense-in-depth for table replacement while this pass encodes.
-            // Promotion is serialized by `compaction_lock`; overwrite/reopened
-            // providers may still flip `current_snapshot_id` without moving the
-            // current-dir generation, so revalidate before catalog publish.
-            let snapshot_id_before = self.get_current_snapshot_id();
-            if self.cached_inlined_row_count() > 0 {
-                self.checkpoint_inlined_data().await?;
-            }
-            let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
-            let cutoff = self.sequence_high_water().await;
-            let folded_after = self.protected_snapshot_ids();
-            if folded_before != folded_after {
-                // A concurrent finalize published a protected snapshot during the
-                // scan; we can no longer tell which snapshots the scan folded.
-                // Abort before any new snapshot dir is created; retry next trigger.
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: protected-snapshot set changed during scan \
-                     (concurrent finalize); will retry on the next trigger",
-                );
-                maintenance_metrics::track_compaction(
-                    table_name,
-                    CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
-                );
-                return Ok(false);
-            }
-            (
-                stream,
-                RewriteScope::Fenced {
-                    cutoff,
-                    folded: folded_before,
-                },
-                generation_before,
-                snapshot_id_before,
-            )
-        };
-
         // Configured sort_columns win; otherwise (default empty) sort by the
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
@@ -21819,40 +21696,124 @@ impl CayenneTableProvider {
         } else {
             explicit_curve_indices
         };
-        let rewrite_is_curve_ordered = !curve_indices.is_empty();
-        let rewrite_is_sorted = rewrite_is_curve_ordered || !rewrite_sort_columns.is_empty();
-
-        if rewrite_is_curve_ordered {
-            let clustering_columns = if self.context.has_cluster_by() {
-                self.context.cluster_by()
-            } else {
-                &rewrite_sort_columns
-            };
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                clustering_columns = ?clustering_columns,
-                "Clustering compaction rewrite along a curve before writing consolidated output files"
-            );
-            // Global span, NOT byte-bounded runs: this snapshot's files are read
-            // back through the ordinary scan path, and `bounded_sort_stream`
-            // only orders within a run.
-            stream = self.cluster_sort_stream(
-                stream,
-                curve_indices,
-                &ctx.task_ctx(),
-                ClusterSortSpan::Global,
-            )?;
-        } else if rewrite_is_sorted {
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                sort_columns = ?rewrite_sort_columns,
-                auto_from_filters = !self.context.has_sort_columns(),
-                "Sorting compaction rewrite before writing consolidated output files"
-            );
-            stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
+        let order = RewriteOrder::new(curve_indices, rewrite_sort_columns.clone());
+        let rewrite_is_sorted = order.is_ordered();
+        match &order {
+            RewriteOrder::Curve(_) => {
+                let clustering_columns = if self.context.has_cluster_by() {
+                    self.context.cluster_by()
+                } else {
+                    &rewrite_sort_columns
+                };
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    clustering_columns = ?clustering_columns,
+                    "Clustering compaction rewrite along a curve before writing consolidated output files"
+                );
+            }
+            RewriteOrder::Sorted(_) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    sort_columns = ?rewrite_sort_columns,
+                    auto_from_filters = !self.context.has_sort_columns(),
+                    "Sorting compaction rewrite before writing consolidated output files"
+                );
+            }
+            RewriteOrder::Unordered => {}
         }
+        // A global order, NOT byte-bounded runs: this snapshot's files are read
+        // back through the ordinary scan path, which may advertise their order.
+        //
+        // The order is resolved before the scan below so that the scan's stream
+        // is the ordered one: executing it executes the scan, so the rewrite
+        // pins its inputs exactly where the fenced scan does.
+
+        let (stream, scope, generation_before, snapshot_id_before): (
+            SendableRecordBatchStream,
+            RewriteScope,
+            u64,
+            String,
+        ) = if uses_position_deletes {
+            let snapshot_id_before = self.get_current_snapshot_id();
+            // Drain the inline memtable FIRST, for the same reason the
+            // key-delete arm does: `visible_file_stream_for_rewrite` also
+            // checkpoints inline data internally, which would publish a
+            // protected snapshot BETWEEN the two folded-set reads below and
+            // spuriously abort every pass on a table with inline data. After
+            // this the internal checkpoint is a no-op. Safe under the
+            // `write_lock` this arm already holds for the whole rewrite.
+            if self.cached_inlined_row_count() > 0 {
+                self.checkpoint_inlined_data().await?;
+            }
+            let folded_before = self.protected_snapshot_ids();
+            let (stream, generation_before) =
+                self.visible_file_stream_for_rewrite(&ctx, &order).await?;
+            if folded_before != self.protected_snapshot_ids() {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: protected-snapshot set changed during scan \
+                     (concurrent checkpoint); will retry on the next trigger",
+                );
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::AbortedConcurrentChange,
+                );
+                return Ok(false);
+            }
+            (
+                stream,
+                RewriteScope::AllTombstonesFoldedSnapshots {
+                    folded: folded_before,
+                },
+                generation_before,
+                snapshot_id_before,
+            )
+        } else {
+            let _capture_guard = self.write_lock_arc().lock_owned().await;
+            // Defense-in-depth for table replacement while this pass encodes.
+            // Promotion is serialized by `compaction_lock`; overwrite/reopened
+            // providers may still flip `current_snapshot_id` without moving the
+            // current-dir generation, so revalidate before catalog publish.
+            let snapshot_id_before = self.get_current_snapshot_id();
+            if self.cached_inlined_row_count() > 0 {
+                self.checkpoint_inlined_data().await?;
+            }
+            let folded_before = self.protected_snapshot_ids();
+            let (stream, generation_before) =
+                self.visible_file_stream_for_rewrite(&ctx, &order).await?;
+            let cutoff = self.sequence_high_water().await;
+            let folded_after = self.protected_snapshot_ids();
+            if folded_before != folded_after {
+                // A concurrent finalize published a protected snapshot during the
+                // scan; we can no longer tell which snapshots the scan folded.
+                // Abort before any new snapshot dir is created; retry next trigger.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: protected-snapshot set changed during scan \
+                     (concurrent finalize); will retry on the next trigger",
+                );
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::AbortedConcurrentChange,
+                );
+                return Ok(false);
+            }
+            (
+                stream,
+                RewriteScope::Fenced {
+                    cutoff,
+                    folded: folded_before,
+                },
+                generation_before,
+                snapshot_id_before,
+            )
+        };
 
         // Compaction is the file-count reduction path. Ordinary appends shard
         // across the session's target partitions for encode throughput, but a
@@ -22161,7 +22122,7 @@ impl CayenneTableProvider {
             // order the scan would advertise. Comparing the lists would pass and
             // claim an ordering the files do not have.
             if !rewrite_sort_columns.is_empty()
-                && !rewrite_is_curve_ordered
+                && !matches!(order, RewriteOrder::Curve(_))
                 && rewrite_sort_columns == self.context.sort_columns()
             {
                 self.current_sorted_snapshot
@@ -22257,17 +22218,74 @@ impl CayenneTableProvider {
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
+        order: &RewriteOrder,
     ) -> Result<(SendableRecordBatchStream, u64)> {
+        let (plan, generation_before) = self.rewrite_scan_plan(ctx).await?;
+        let task_ctx = ctx.task_ctx();
+        let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
+        // Executing the ordered plan executes the scan beneath it (each
+        // operator executes its input when it is executed), so the stream
+        // pins the same scan inputs, at the same point, as the scan alone did.
+        let stream = datafusion_physical_plan::execute_stream(ordered, task_ctx)?;
+        Ok((stream, generation_before))
+    }
+
+    /// The scan plan [`Self::visible_file_stream_for_rewrite`] reads, and the
+    /// current-dir generation sampled before it listed its files. Flushes the
+    /// inline memtable first, so the plan covers every visible row.
+    async fn rewrite_scan_plan(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
         if self.cached_inlined_row_count() > 0 {
             self.checkpoint_inlined_data().await?;
         }
 
         let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
 
-        let state = ctx.state();
-        let plan = TableProvider::scan(self, &state, None, &[], None).await?;
-        let stream = datafusion_physical_plan::execute_stream(plan, state.task_ctx())?;
-        Ok((stream, generation_before))
+        let plan = TableProvider::scan(self, &ctx.state(), None, &[], None).await?;
+        Ok((plan, generation_before))
+    }
+
+    /// Order `plan` for a rewrite, as one output partition when ordered.
+    ///
+    /// The key (for a curve) and the sort run in each of `plan`'s partitions,
+    /// concurrently, and a merge combines the sorted partitions — see
+    /// `util::stream_utils::sort_plan`. A whole-table pass therefore uses every
+    /// core of its runtime rather than the one draining the result, which is
+    /// what bounds how long the rewrite of a position-delete table holds
+    /// `write_lock`. The order equals a single sort of every row; only rows with
+    /// equal keys may land in a different relative order.
+    ///
+    /// `task_ctx` must be the rewrite session's own: its memory pool is the
+    /// bounded compaction/query pool the scan runs under, which is what makes
+    /// the sorts spill instead of growing past `runtime.query.memory_limit`
+    /// (a fresh `TaskContext::default()` has an unbounded pool).
+    fn order_rewrite_plan(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        order: &RewriteOrder,
+        task_ctx: &datafusion_execution::TaskContext,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        match order {
+            RewriteOrder::Unordered => Ok(plan),
+            RewriteOrder::Sorted(sort_columns) => {
+                Ok(util::stream_utils::sort_plan(plan, sort_columns, task_ctx)?)
+            }
+            RewriteOrder::Curve(indices) => {
+                let columns = plan.schema().fields().len();
+                // One set of bounds for every partition, so all keys share one
+                // coordinate scale and order against each other.
+                let (keyed, key) = super::clustering::with_cluster_key(
+                    plan,
+                    indices,
+                    self.cluster_column_bounds(indices),
+                )?;
+                let sorted =
+                    util::stream_utils::sort_plan(keyed, std::slice::from_ref(&key), task_ctx)?;
+                Ok(super::clustering::without_cluster_key(sorted, columns)?)
+            }
+        }
     }
 
     /// Resolve the explicitly configured clustering columns to schema indices.
@@ -22411,67 +22429,51 @@ impl CayenneTableProvider {
             .collect()
     }
 
-    /// Cluster a stream along a Hilbert curve over `clustering_indices` by
-    /// appending a transient key column, sorting on it with a pool-accounted,
-    /// disk-spilling `SortExec`, then stripping the key. `span` picks how the
-    /// sort consumes the stream; see [`ClusterSortSpan`].
-    /// Empty `clustering_indices` returns the stream unchanged.
+    /// Cluster `plan`'s rows along the Hilbert curve over `clustering_indices`
+    /// in byte-capped runs, each sorted on its own: the key is projected in
+    /// every partition of `plan` concurrently, the partitions are coalesced,
+    /// and `bounded_sort_stream` sorts the runs, capping per-run memory and
+    /// first-batch latency. Key ranges overlap ACROSS runs, so the result is
+    /// not globally ordered — only safe where the files advertise no ordering,
+    /// as cold-tier files do. The key column is stripped again. Empty
+    /// `clustering_indices` returns the rows unclustered.
     ///
     /// # Errors
     ///
-    /// Returns an error if a [`ClusterSortSpan::Global`] sort fails to execute.
-    fn cluster_sort_stream(
+    /// Returns an error if the keyed plan fails to build or execute.
+    fn cluster_runs_stream(
         &self,
-        stream: SendableRecordBatchStream,
-        clustering_indices: Vec<usize>,
+        plan: Arc<dyn ExecutionPlan>,
+        clustering_indices: &[usize],
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-        span: ClusterSortSpan,
     ) -> Result<SendableRecordBatchStream> {
         if clustering_indices.is_empty() {
-            return Ok(stream);
+            return Ok(datafusion_physical_plan::execute_stream(
+                plan,
+                Arc::clone(task_ctx),
+            )?);
         }
-        let original_schema = stream.schema();
-        let key_name = super::clustering::cluster_key_column_name(&original_schema);
-        let augmented_schema =
-            super::clustering::cluster_augmented_schema(&original_schema, &key_name);
-        // Resolved once for the whole rewrite: per-batch bounds would put each
-        // batch on its own coordinate scale, and keys from different scales do
-        // not order against each other.
-        let bounds = self.cluster_column_bounds(&clustering_indices);
-        let idx = clustering_indices;
-        let appended_key_name = key_name.clone();
-        let augmented = stream.map(move |res| {
-            res.and_then(|b| {
-                super::clustering::append_cluster_key_column(&b, &idx, &bounds, &appended_key_name)
-            })
-        });
-        let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&augmented_schema),
-            augmented,
-        ));
-        let key_column = vec![key_name];
-        let sorted = match span {
-            ClusterSortSpan::Global => {
-                util::stream_utils::sort_stream(augmented_stream, &key_column, task_ctx)?
-            }
-            ClusterSortSpan::BoundedRuns => super::streaming::bounded_sort_stream(
-                &self.table_metadata.table_name,
-                augmented_stream,
-                key_column,
-                task_ctx,
-                self.table_metadata
-                    .vortex_config
-                    .cold_clustering_run_size_bytes(),
-            ),
-        };
-        let orig = Arc::clone(&original_schema);
+        let original_schema = plan.schema();
+        let (keyed, key) = super::clustering::with_cluster_key(
+            plan,
+            clustering_indices,
+            self.cluster_column_bounds(clustering_indices),
+        )?;
+        let keyed = datafusion_physical_plan::execute_stream(keyed, Arc::clone(task_ctx))?;
+        let sorted = super::streaming::bounded_sort_stream(
+            &self.table_metadata.table_name,
+            keyed,
+            vec![key],
+            task_ctx,
+            self.table_metadata
+                .vortex_config
+                .cold_clustering_run_size_bytes(),
+        );
+        let schema = Arc::clone(&original_schema);
         let stripped = sorted.map(move |res| {
-            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &orig))
+            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &original_schema))
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            original_schema,
-            stripped,
-        )))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stripped)))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -23193,7 +23195,7 @@ impl CayenneTableProvider {
                 super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
-        let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
+        let (plan, _generation_before) = self.rewrite_scan_plan(&ctx).await?;
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -23206,8 +23208,7 @@ impl CayenneTableProvider {
         let task_ctx = ctx.task_ctx();
         // Bounded runs: cold files advertise no ordering, so trading a global
         // order for capped per-run memory is a clustering-quality choice only.
-        let stream =
-            self.cluster_sort_stream(stream, clustering, &task_ctx, ClusterSortSpan::BoundedRuns)?;
+        let stream = self.cluster_runs_stream(plan, &clustering, &task_ctx)?;
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -23216,7 +23217,7 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
-                // `cluster_sort_stream` returned the stream untouched when no
+                // `cluster_runs_stream` left the rows unclustered when no
                 // clustering key resolved; otherwise sharding would scatter the
                 // clustering this promotion exists to create.
                 if clustering_is_empty {
@@ -54631,7 +54632,7 @@ mod tests {
     /// must not be sorted in its place: the rows must come out in the same curve
     /// order as for a table without that column.
     #[tokio::test]
-    async fn test_cluster_sort_stream_ignores_a_column_named_like_the_key() {
+    async fn test_curve_order_ignores_a_column_named_like_the_key() {
         use arrow::array::{AsArray, Int64Array};
         use arrow::datatypes::Int64Type;
 
@@ -54671,10 +54672,19 @@ mod tests {
                 Arc::clone(&schema),
                 stream::iter(vec![Ok(batch)]),
             ));
+            let task_ctx = ctx.task_ctx();
             let sorted = provider
-                .cluster_sort_stream(input, vec![0, 1], &ctx.task_ctx(), ClusterSortSpan::Global)
+                .order_rewrite_plan(
+                    util::stream_utils::stream_plan(input),
+                    &RewriteOrder::Curve(vec![0, 1]),
+                    &task_ctx,
+                )
                 .expect("cluster sort");
-            let batches: Vec<RecordBatch> = sorted.try_collect().await.expect("sorted rows");
+            let batches: Vec<RecordBatch> = datafusion_physical_plan::execute_stream(sorted, task_ctx)
+                .expect("plan executes")
+                .try_collect()
+                .await
+                .expect("sorted rows");
             batches
                 .iter()
                 .flat_map(|batch| {
@@ -54697,6 +54707,95 @@ mod tests {
             "the fixture must actually be reordered by clustering"
         );
         assert_eq!(cluster_order(&rows, true).await, plain);
+    }
+
+    /// The curve order is keyed and sorted in each input partition and merged,
+    /// so it must come out in non-decreasing curve-key order across the whole
+    /// output — the order one sort of every row gives — with every input row,
+    /// however the rows are spread over the partitions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_curve_order_is_global_across_partitions() {
+        use arrow::array::{Array, BinaryArray, Int64Array, StringArray};
+        use datafusion::datasource::memory::MemorySourceConfig;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _dir) = create_cayenne_table_with_config(
+            "curve_partitions",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // A permutation of 0..rows; `s` is a function of `id` with some NULLs.
+        let rows = 30_000_usize;
+        let ids: Vec<i64> = (0..rows).map(|i| scrambled(i, rows)).collect();
+        let text = |id: i64| (id % 53 != 0).then(|| format!("{:08x}", id.wrapping_mul(2_654_435_761) & 0xffff_ffff));
+        let batches: Vec<RecordBatch> = ids
+            .chunks(700)
+            .map(|chunk| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(chunk.to_vec())),
+                        Arc::new(StringArray::from(chunk.iter().map(|&id| text(id)).collect::<Vec<_>>())),
+                    ],
+                )
+                .expect("valid batch")
+            })
+            .collect();
+        // Five partitions of uneven size, plus an empty one.
+        let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); 6];
+        for (n, batch) in batches.into_iter().enumerate() {
+            partitions[(n * n) % 5].push(batch);
+        }
+        let input = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)
+            .expect("memory source");
+
+        let task_ctx = ctx.task_ctx();
+        let ordered = provider
+            .order_rewrite_plan(input, &RewriteOrder::Curve(vec![0, 1]), &task_ctx)
+            .expect("plan builds");
+        assert_eq!(ordered.schema(), schema, "the curve key column must be projected away");
+        let out: Vec<RecordBatch> = datafusion_physical_plan::execute_stream(ordered, task_ctx)
+            .expect("plan executes")
+            .try_collect()
+            .await
+            .expect("sort succeeds");
+
+        let bounds = provider.cluster_column_bounds(&[0, 1]);
+        let mut previous: Option<Vec<u8>> = None;
+        let mut seen: Vec<i64> = Vec::with_capacity(rows);
+        for batch in &out {
+            let keys: BinaryArray = super::super::clustering::cluster_keys(
+                &[Arc::clone(batch.column(0)), Arc::clone(batch.column(1))],
+                &bounds,
+            )
+            .expect("keys compute");
+            for key in keys.iter().flatten() {
+                if let Some(p) = &previous {
+                    assert!(p.as_slice() <= key, "curve order broken across the merge");
+                }
+                previous = Some(key.to_vec());
+            }
+            let id = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id");
+            let s = batch.column(1).as_any().downcast_ref::<StringArray>().expect("s");
+            for i in 0..batch.num_rows() {
+                assert_eq!(
+                    s.is_valid(i).then(|| s.value(i).to_string()),
+                    text(id.value(i)),
+                    "a row's columns must stay together"
+                );
+                seen.push(id.value(i));
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..i64::try_from(rows).expect("fits")).collect::<Vec<_>>(), "rows changed");
     }
 
     #[tokio::test]

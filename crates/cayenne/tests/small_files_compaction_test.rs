@@ -463,6 +463,87 @@ async fn compaction_runs_for_sort_column_tables(
     Ok(())
 }
 
+test_with_backends!(sort_column_compaction_orders_rows_across_interleaved_files);
+/// The full-snapshot rewrite sorts each scan partition on its own and merges
+/// them, so its output must still be one global order across every file it
+/// writes. Each input file here interleaves with every other one (file `b`
+/// holds the ids congruent to `b` mod 8, descending), so no file's rows form a
+/// contiguous range and any partition that is written out without the merge
+/// breaks the sequence.
+async fn sort_column_compaction_orders_rows_across_interleaved_files(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let files = 8_i64;
+    let rows_per_file = 20_000_i64;
+    let (table, _ctx, _table_id) = build_table(
+        &fixture,
+        "compaction_interleaved",
+        Arc::clone(&schema),
+        None,
+        VortexConfig {
+            // Fire exactly once, after the last file, so one rewrite folds all 8.
+            compaction_trigger_files: usize::try_from(files).expect("fits usize"),
+            ..aggressive_sorted_compaction_config()
+        },
+    )
+    .await;
+
+    for file in 0..files {
+        let ids: Vec<i64> = (0..rows_per_file).rev().map(|i| i * files + file).collect();
+        common::insert_batch(&table, make_batch_from_ids(&schema, ids)).await?;
+    }
+
+    let Some((_snapshot_id, file_count)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "compaction_interleaved",
+        usize::try_from(files).expect("fits usize"),
+    )
+    .await?
+    else {
+        panic!("sort-column compaction should commit a rewrite");
+    };
+    assert!(
+        file_count > 1,
+        "the rewrite must span several output files for the order to be tested across them, got {file_count}"
+    );
+
+    // One partition reads the snapshot's files in order as a single stream, so
+    // this is the physical order the rewrite wrote.
+    let ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+    );
+    ctx.register_table(
+        "compaction_interleaved",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+    let batches = ctx
+        .sql("SELECT id FROM compaction_interleaved")
+        .await?
+        .collect()
+        .await?;
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    let expected: Vec<i64> = (0..files * rows_per_file).collect();
+    assert_eq!(ids.len(), expected.len(), "row count changed");
+    assert!(
+        ids == expected,
+        "rows are not in one global id order across the rewrite's {file_count} files"
+    );
+
+    Ok(())
+}
+
 test_with_backends!(compaction_preserves_pk_upsert_semantics);
 async fn compaction_preserves_pk_upsert_semantics(
     fixture: common::TestFixture,
