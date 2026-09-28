@@ -179,7 +179,7 @@ pub struct RateControllerBuilder {
     weighted_quota: Option<QuotaDefinition>,
     metrics: Option<Arc<RateControllerMetrics>>,
     persistence: Option<PersistenceConfig>,
-    adaptive: Option<AdaptiveRateControl>,
+    adaptive: Option<(AdaptiveRateControl, String)>,
 }
 
 impl RateControllerBuilder {
@@ -207,10 +207,15 @@ impl RateControllerBuilder {
     }
 
     /// Attach an adaptive controller that dynamically scales every configured
-    /// limit by its admission coefficient.
+    /// limit by its admission coefficient. `origin` names the upstream in the
+    /// controller's throttling and recovery log lines.
     #[must_use]
-    pub fn with_adaptive(mut self, control: AdaptiveRateControl) -> Self {
-        self.adaptive = Some(control);
+    pub fn with_adaptive(
+        mut self,
+        control: AdaptiveRateControl,
+        origin: impl Into<String>,
+    ) -> Self {
+        self.adaptive = Some((control, origin.into()));
         self
     }
 
@@ -332,36 +337,30 @@ impl RateControllerBuilder {
         //
         // No-persistence path: each quota becomes a local governor limiter.
         let mut local_limiters: Vec<(Arc<GovernorRateLimiter>, u32)> = Vec::new();
-        let mut leased_buckets: Vec<(Arc<LeasedBucket>, u32)> = Vec::new();
+        let mut leased_buckets: Vec<Arc<LeasedBucket>> = Vec::new();
 
         for (index, quota_def) in self.quotas.into_iter().enumerate() {
             let fallback_name = format!("quota-{index}");
             let limiter_key = quota_def.persistence_key(&fallback_name);
 
             if let Some(persistence) = &self.persistence {
-                // NOTE: leased buckets are deliberately NOT `resolution`-scaled.
-                // Their `acquire()` registers one unit of cluster demand per call
-                // and is consumed in a loop, so charging `resolution` tokens would
-                // inflate the demand-weighted lease sharing across replicas M×.
-                // The cluster path therefore keeps integer (logical) adaptive
-                // weights; the local governor limiters and semaphore get the fine
-                // resolution. A proper fix needs a weighted `LeasedBucket` acquire
-                // that registers demand once and consumes N tokens.
+                // Leased buckets are deliberately NOT `resolution`-scaled. Their
+                // `acquire()` registers one unit of cluster demand per call, so
+                // charging `resolution` tokens would inflate the demand-weighted
+                // lease sharing across replicas. Adaptive mode is rejected at
+                // configuration time when cluster rate control is set, so a leased
+                // bucket never has an adaptive weight to apply.
                 let burst_per_window = quota_def.burst_per_window(persistence.window_duration);
-                let capacity = u32::try_from(burst_per_window).unwrap_or(u32::MAX);
-                leased_buckets.push((
-                    LeasedBucket::new(LeasedBucketConfig {
-                        store: Arc::clone(&persistence.store),
-                        prefix: persistence.prefix.clone(),
-                        object_key: persistence.object_key.clone(),
-                        origin: persistence.origin.clone(),
-                        instance_id: persistence.instance_id.clone(),
-                        window_duration: persistence.window_duration,
-                        limiter_key,
-                        burst_per_window,
-                    }),
-                    capacity,
-                ));
+                leased_buckets.push(LeasedBucket::new(LeasedBucketConfig {
+                    store: Arc::clone(&persistence.store),
+                    prefix: persistence.prefix.clone(),
+                    object_key: persistence.object_key.clone(),
+                    origin: persistence.origin.clone(),
+                    instance_id: persistence.instance_id.clone(),
+                    window_duration: persistence.window_duration,
+                    limiter_key,
+                    burst_per_window,
+                }));
             } else {
                 let quota = scale_quota_rate(quota_def.quota, resolution);
                 let capacity = quota.burst_size().get();
@@ -373,7 +372,7 @@ impl RateControllerBuilder {
 
         let adaptive = self
             .adaptive
-            .map(|control| Arc::new(AdaptiveController::new(control)));
+            .map(|(control, origin)| Arc::new(AdaptiveController::new(control, origin)));
 
         RateController::new(
             jitter,
@@ -465,7 +464,7 @@ pub struct RateController {
     /// Local-only governor limiters (in-memory mode).
     local_limiters: Vec<MaxCapacityLimits<GovernorRateLimiter>>,
     /// Cluster-wide leased token buckets (cluster mode).
-    leased_buckets: Vec<MaxCapacityLimits<LeasedBucket>>,
+    leased_buckets: Vec<Arc<LeasedBucket>>,
     weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
     semaphore: Option<MaxCapacityLimits<Semaphore>>,
     metrics: Arc<RateControllerMetrics>,
@@ -569,7 +568,7 @@ impl RateController {
     pub fn leased_bucket_metrics(&self) -> Vec<(String, Arc<LeasedBucketMetrics>)> {
         self.leased_buckets
             .iter()
-            .map(|(bucket, _)| (bucket.limiter_key().to_string(), bucket.metrics()))
+            .map(|bucket| (bucket.limiter_key().to_string(), bucket.metrics()))
             .collect()
     }
 
@@ -593,7 +592,7 @@ impl RateController {
     /// Returns the first error encountered. Other buckets are still attempted.
     pub async fn refresh_and_persist_state_snapshot(&self) -> Result<()> {
         let mut first_error: Option<Error> = None;
-        for (bucket, _) in &self.leased_buckets {
+        for bucket in &self.leased_buckets {
             if let Err(e) = bucket.refresh_lease().await {
                 let origin = bucket.origin().to_string();
                 tracing::warn!(
@@ -636,23 +635,16 @@ impl RateController {
             }
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
-        // A weighted request consumes `weight` tokens from the cluster budget.
-        // Leased buckets are not `resolution`-scaled (see `build`), so charge the
-        // logical integer weight `round(1/coefficient)` = `desired / resolution`.
-        let leased_desired = desired / f64::from(self.resolution);
-        for (bucket, capacity) in &self.leased_buckets {
-            let weight = clamp_weight(leased_desired, *capacity);
-            for _ in 0..weight {
-                bucket.acquire().await.map_err(|e| match e {
-                    leased::Error::FailClosed { origin } => {
-                        Error::ClusterBudgetExhausted { origin }
-                    }
-                    other => Error::LeaseRefresh {
-                        origin: other_origin(&other),
-                        source: Box::new(other),
-                    },
-                })?;
-            }
+        // Adaptive mode and cluster rate control are mutually exclusive (rejected
+        // at configuration time), so each request charges exactly one token.
+        for bucket in &self.leased_buckets {
+            bucket.acquire().await.map_err(|e| match e {
+                leased::Error::FailClosed { origin } => Error::ClusterBudgetExhausted { origin },
+                other => Error::LeaseRefresh {
+                    origin: other_origin(&other),
+                    source: Box::new(other),
+                },
+            })?;
         }
         Ok(())
     }
@@ -682,7 +674,7 @@ impl RateController {
     fn new(
         jitter: Option<JitterConfig>,
         local_limiters: Vec<(Arc<GovernorRateLimiter>, u32)>,
-        leased_buckets: Vec<(Arc<LeasedBucket>, u32)>,
+        leased_buckets: Vec<Arc<LeasedBucket>>,
         weighted_rate_limiter: Option<Arc<GovernorRateLimiter>>,
         semaphore: Option<(Arc<Semaphore>, u32)>,
         metrics: Arc<RateControllerMetrics>,
@@ -1019,7 +1011,7 @@ mod tests {
         let controller = RateControllerBuilder::new()
             .with_jitter(JitterConfig::zero())
             .add_quota(Quota::per_second(NonZeroU32::new(100).expect("non-zero")))
-            .with_adaptive(control)
+            .with_adaptive(control, "https://origin.example.com")
             .build();
 
         for i in 0..1000 {
@@ -1053,6 +1045,17 @@ mod tests {
         );
     }
 
+    /// However deep the throttle, a request never charges more than a limiter's
+    /// whole capacity: the origin still gets one request per full-bucket period,
+    /// so recovery is always probed.
+    #[test]
+    fn weights_are_floored_at_one_and_capped_at_capacity() {
+        assert_eq!(clamp_weight(1.0, 100), 1);
+        assert_eq!(clamp_weight(0.0, 100), 1);
+        assert_eq!(clamp_weight(150.0, 100), 100);
+        assert_eq!(clamp_weight(f64::INFINITY, 100), 100);
+    }
+
     /// The concurrency semaphore is built at `M`x and a healthy request holds `M`
     /// permits, but `available_permits` must report the LOGICAL count the user
     /// configured — never the internal scaled value.
@@ -1064,7 +1067,7 @@ mod tests {
             .with_jitter(JitterConfig::zero())
             .with_max_concurrent_requests(8)
             .add_quota(Quota::per_second(NonZeroU32::new(100).expect("non-zero")))
-            .with_adaptive(control)
+            .with_adaptive(control, "https://origin.example.com")
             .build();
 
         // Healthy origin, nothing held: logical 8, not the scaled 800.

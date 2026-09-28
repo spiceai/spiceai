@@ -51,10 +51,26 @@ limitations under the License.
 //! limit has nothing to modify, so the caller rejects that configuration before
 //! building a controller.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::time::Instant;
+
+/// Documentation for the rate-control parameters, linked from the throttling log
+/// line so an operator can act on it.
+const RATE_CONTROL_DOCS_URL: &str =
+    "https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control";
+
+/// The controller reports that it throttles the origin below this admission
+/// coefficient, and that the origin recovered at
+/// [`FULL_ADMISSION_COEFFICIENT`]. The gap between the two is hysteresis: an
+/// error rate that hovers at the failure threshold moves the coefficient in the
+/// gap and logs nothing.
+const THROTTLING_ENTRY_COEFFICIENT: f64 = 0.99;
+
+/// The coefficient of a healthy origin: every configured limit applies in full.
+const FULL_ADMISSION_COEFFICIENT: f64 = 1.0;
 
 /// Default failure threshold.
 pub const DEFAULT_ADAPTIVE_FAILURE_THRESHOLD: f64 = 0.1;
@@ -81,6 +97,9 @@ pub enum AdaptiveRateControlError {
 /// [`AdaptiveController`] is built from it via [`AdaptiveController::new`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdaptiveRateControl {
+    /// The error rate above which throttling begins, as a fraction in `(0, 1)`.
+    /// Kept alongside `k` so user-facing messages can quote the configured value.
+    failure_threshold: f64,
     /// Derived from the failure threshold (`k = 1 / (1 - threshold)`).
     k: f64,
     /// Decaying-window half-life.
@@ -107,9 +126,16 @@ impl AdaptiveRateControl {
             return Err(AdaptiveRateControlError::WindowInvalid { window });
         }
         Ok(Self {
+            failure_threshold,
             k: 1.0 / (1.0 - failure_threshold),
             window,
         })
+    }
+
+    /// The configured error rate above which throttling begins, as a fraction.
+    #[must_use]
+    pub fn failure_threshold(&self) -> f64 {
+        self.failure_threshold
     }
 }
 
@@ -132,19 +158,39 @@ pub enum RequestOutcome {
 pub struct AdaptiveController {
     /// Derived from the failure threshold (`k = 1 / (1 - threshold)`).
     k: f64,
+    /// The configured failure threshold, quoted in the throttling log line.
+    failure_threshold: f64,
     /// Decaying-window half-life.
     half_life: Duration,
+    /// The origin this controller governs, named in the log lines.
+    origin: String,
+    /// Whether the origin is currently reported as throttled. Drives the one
+    /// entry line and the one recovery line per episode.
+    throttling: AtomicBool,
 
     window: Mutex<DecayWindow>,
 }
 
+/// A change in the reported throttling state of an origin. One log line each way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThrottleTransition {
+    /// The origin started to fail more than the failure threshold.
+    Entered,
+    /// The origin recovered, and gets the full configured limits again.
+    Recovered,
+}
+
 impl AdaptiveController {
-    /// Build a live controller from a validated [`AdaptiveRateControl`].
+    /// Build a live controller from a validated [`AdaptiveRateControl`] for
+    /// `origin`, which the throttling log lines name.
     #[must_use]
-    pub fn new(control: AdaptiveRateControl) -> Self {
+    pub fn new(control: AdaptiveRateControl, origin: impl Into<String>) -> Self {
         Self {
             k: control.k,
+            failure_threshold: control.failure_threshold,
             half_life: control.window,
+            origin: origin.into(),
+            throttling: AtomicBool::new(false),
             window: Mutex::new(DecayWindow {
                 requests: 0.0,
                 accepts: 0.0,
@@ -155,12 +201,46 @@ impl AdaptiveController {
 
     /// Record the outcome of one request.
     pub fn record(&self, outcome: RequestOutcome) {
-        let mut window = self.window.lock();
-        window.decay_to(Instant::now(), self.half_life);
-        window.requests += 1.0;
-        if outcome == RequestOutcome::Success {
-            window.accepts += 1.0;
+        let coefficient = {
+            let mut window = self.window.lock();
+            window.decay_to(Instant::now(), self.half_life);
+            window.requests += 1.0;
+            if outcome == RequestOutcome::Success {
+                window.accepts += 1.0;
+            }
+            self.coefficient_of(window.requests, window.accepts)
+        };
+
+        match self.note_transition(coefficient) {
+            Some(ThrottleTransition::Entered) => tracing::warn!(
+                "Upstream '{}' is failing more than the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
+                self.origin,
+                format_percentage(self.failure_threshold),
+            ),
+            Some(ThrottleTransition::Recovered) => tracing::info!(
+                "Upstream '{}' has recovered, so adaptive rate control is sending it the full configured limits again.",
+                self.origin,
+            ),
+            None => {}
         }
+    }
+
+    /// Move the reported throttling state for `coefficient` and report the
+    /// transition, if any. Coefficients between [`THROTTLING_ENTRY_COEFFICIENT`]
+    /// and [`FULL_ADMISSION_COEFFICIENT`] hold the current state, so an error
+    /// rate that hovers at the failure threshold does not flap the log.
+    fn note_transition(&self, coefficient: f64) -> Option<ThrottleTransition> {
+        if coefficient < THROTTLING_ENTRY_COEFFICIENT {
+            return (!self.throttling.swap(true, Ordering::Relaxed))
+                .then_some(ThrottleTransition::Entered);
+        }
+        if coefficient >= FULL_ADMISSION_COEFFICIENT {
+            return self
+                .throttling
+                .swap(false, Ordering::Relaxed)
+                .then_some(ThrottleTransition::Recovered);
+        }
+        None
     }
 
     /// The fraction of requests the controller currently wants to admit, in
@@ -177,14 +257,19 @@ impl AdaptiveController {
             (window.requests, window.accepts)
         };
 
-        // Both `+1`s live inside the fraction: numerator `k*accepts + 1`,
-        // denominator `requests + 1`. At 100% success (accepts == requests) the
-        // ratio is `(k*r + 1) / (r + 1) >= 1` for `k > 1` and any finite `r`, so
-        // a healthy origin is never throttled. The coefficient falls below 1
-        // exactly when `accepts/requests < 1/k`, i.e. the error rate exceeds the
-        // configured failure threshold.
-        let coefficient = (self.k * accepts + 1.0) / (requests + 1.0);
-        coefficient.clamp(0.0, 1.0)
+        self.coefficient_of(requests, accepts)
+    }
+
+    /// The admission coefficient for a decayed window.
+    ///
+    /// Both `+1`s live inside the fraction: numerator `k*accepts + 1`,
+    /// denominator `requests + 1`. At 100% success (accepts == requests) the
+    /// ratio is `(k*r + 1) / (r + 1) >= 1` for `k > 1` and any finite `r`, so a
+    /// healthy origin is never throttled. The coefficient falls below 1 exactly
+    /// when `accepts/requests < 1/k`, i.e. the error rate exceeds the configured
+    /// failure threshold.
+    fn coefficient_of(&self, requests: f64, accepts: f64) -> f64 {
+        ((self.k * accepts + 1.0) / (requests + 1.0)).clamp(0.0, 1.0)
     }
 
     /// The real-valued weight one request should charge right now: `1 /
@@ -204,6 +289,15 @@ impl AdaptiveController {
         }
         1.0 / coefficient
     }
+}
+
+/// Format a fraction as a percentage for a user-facing message: `0.1` reads as
+/// `10%`, `0.125` as `12.5%`.
+fn format_percentage(fraction: f64) -> String {
+    let percentage = fraction * 100.0;
+    let text = format!("{percentage:.2}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    format!("{text}%")
 }
 
 #[derive(Debug)]
@@ -244,7 +338,7 @@ mod tests {
     }
 
     fn enabled(failure_threshold: f64) -> AdaptiveController {
-        AdaptiveController::new(control(failure_threshold))
+        AdaptiveController::new(control(failure_threshold), "https://origin.example.com")
     }
 
     #[test]
@@ -271,6 +365,7 @@ mod tests {
             let controller = AdaptiveController::new(
                 AdaptiveRateControl::new(0.10, DEFAULT_ADAPTIVE_WINDOW)
                     .expect("a 10% failure threshold is valid"),
+                "https://origin.example.com",
             );
             for request in 1..=8000u32 {
                 let failed = fail_every != 0 && request % fail_every == 0;
@@ -399,6 +494,51 @@ mod tests {
             "error rate above the threshold must throttle, got {}",
             controller.admission_coefficient()
         );
+    }
+
+    /// One entry line and one recovery line per episode, and nothing while the
+    /// coefficient stays in the hysteresis band.
+    #[test]
+    fn throttle_transitions_are_reported_once_each_way() {
+        let controller = enabled(0.1);
+
+        assert_eq!(controller.note_transition(1.0), None);
+        assert_eq!(
+            controller.note_transition(0.5),
+            Some(ThrottleTransition::Entered)
+        );
+        // Still throttled, so no second entry line.
+        assert_eq!(controller.note_transition(0.4), None);
+        // The hysteresis band holds the reported state.
+        assert_eq!(controller.note_transition(0.995), None);
+        assert_eq!(
+            controller.note_transition(1.0),
+            Some(ThrottleTransition::Recovered)
+        );
+        // Still healthy, so no second recovery line.
+        assert_eq!(controller.note_transition(1.0), None);
+    }
+
+    /// An error rate that hovers at the failure threshold moves the coefficient
+    /// in the hysteresis band only, so the log does not flap.
+    #[test]
+    fn coefficients_in_the_hysteresis_band_do_not_flap() {
+        let controller = enabled(0.1);
+
+        for coefficient in [1.0, 0.999, 1.0, 0.995, 1.0, 0.99] {
+            assert_eq!(
+                controller.note_transition(coefficient),
+                None,
+                "coefficient {coefficient} must not report a transition"
+            );
+        }
+    }
+
+    #[test]
+    fn percentages_read_as_the_configured_value() {
+        assert_eq!(format_percentage(0.1), "10%");
+        assert_eq!(format_percentage(0.25), "25%");
+        assert_eq!(format_percentage(0.125), "12.5%");
     }
 
     #[test]
