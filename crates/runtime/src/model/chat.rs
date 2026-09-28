@@ -138,7 +138,7 @@ pub async fn try_to_chat_model(
 /// Deserializes the source's typed params from the (already secret-resolved)
 /// spicepod params map, mapping a [`ParamsError`](runtime_parameters_typed::ParamsError)
 /// to [`LlmError::ModelParameterFailed`].
-async fn typed_params<P: TypedParams>(
+pub(crate) async fn typed_params<P: TypedParams>(
     component: &Model,
     params: &HashMap<String, SecretString>,
     source: ModelSource,
@@ -164,6 +164,9 @@ pub async fn construct_model(
     })?;
 
     let model = match source {
+        ModelSource::TypeSafe => Err(LlmError::EvaluateOnlyModel {
+            model: component.name.clone(),
+        }),
         #[cfg(feature = "models")]
         ModelSource::HuggingFace => {
             let p =
@@ -371,7 +374,7 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hf_token = params.token.as_ref();
+    let hf_token = params.hf_token.as_ref();
 
     // For GGUF models, we require user specify via `.files[].path`
     let gguf_path = component

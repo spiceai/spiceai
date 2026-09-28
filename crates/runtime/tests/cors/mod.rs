@@ -103,7 +103,7 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
                 .headers()
                 .get("access-control-allow-methods")
                 .expect("cors header is present");
-            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH,OPTIONS");
+            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH,DELETE,OPTIONS");
 
             Ok(())
         })

@@ -23,9 +23,11 @@ limitations under the License.
 //! untouched rows.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use arrow::array::{BooleanArray, RecordBatch};
-use arrow::compute::filter_record_batch;
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+use arrow::compute::{cast, filter_record_batch};
+use arrow::row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use datafusion::error::DataFusionError;
 
@@ -141,35 +143,121 @@ impl MemoryVectorStore {
 
         let delete_keys: HashSet<&str> = keys.iter().map(String::as_str).collect();
 
-        // Filter every overlapping batch before touching the stored ones. This store holds
-        // the only copy of the rows it is filtering, so a partially applied delete would
-        // lose the batches it had already consumed. `None` marks a batch with no overlap.
-        let target = self.write_target();
-        let mut filtered: Vec<Option<RecordBatch>> = Vec::with_capacity(target.len());
-        for stored in target.iter() {
+        self.retain_rows(|stored| {
+            // `None` marks a batch with no overlap, which is kept untouched.
             if !stored
                 .keys
                 .iter()
                 .any(|key| delete_keys.contains(key.as_str()))
             {
-                filtered.push(None);
-                continue;
+                return Ok(None);
             }
-            let mask: BooleanArray = stored
-                .keys
-                .iter()
-                .map(|key| Some(!delete_keys.contains(key.as_str())))
-                .collect();
-            let kept = filter_record_batch(&stored.batch, &mask)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            filtered.push(Some(kept));
+            Ok(Some(
+                stored
+                    .keys
+                    .iter()
+                    .map(|key| Some(!delete_keys.contains(key.as_str())))
+                    .collect(),
+            ))
+        })
+    }
+
+    /// Remove every stored row that agrees with a row of `members` on `group_columns` but whose
+    /// formatted primary key is not in `member_keys` — the rest of each group `members` names,
+    /// with the members themselves kept. The store half of
+    /// [`spice_table::Index::delete_group_remainder`].
+    ///
+    /// Group membership is decided on the Arrow values of `group_columns`, compared through the
+    /// row encoding after casting `members` to the stored types, so it holds for any key type
+    /// and does not depend on how a composite key is formatted. All-or-nothing, like
+    /// [`Self::delete_by_keys`].
+    pub(crate) fn delete_group_remainder(
+        &mut self,
+        group_columns: &[String],
+        members: &RecordBatch,
+        member_keys: &HashSet<&str>,
+    ) -> Result<(), DataFusionError> {
+        if members.num_rows() == 0 || group_columns.is_empty() {
+            return Ok(());
         }
 
-        // Every fallible step is done, so the store can be rebuilt without dropping rows.
+        let stored_schema = Arc::clone(&self.stored_schema);
+        let group_indices = group_columns
+            .iter()
+            .map(|name| stored_schema.index_of(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let converter = RowConverter::new(
+            group_indices
+                .iter()
+                .map(|&i| SortField::new(stored_schema.field(i).data_type().clone()))
+                .collect(),
+        )?;
+
+        let member_columns = group_columns
+            .iter()
+            .zip(&group_indices)
+            .map(|(name, &i)| {
+                let column = members.column_by_name(name).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "the rows handed to the memory vector index do not carry the key column '{name}' its entries are grouped by"
+                    ))
+                })?;
+                let stored_type = stored_schema.field(i).data_type();
+                if column.data_type() == stored_type {
+                    Ok(Arc::clone(column))
+                } else {
+                    Ok(cast(column, stored_type)?)
+                }
+            })
+            .collect::<Result<Vec<ArrayRef>, DataFusionError>>()?;
+        let member_rows = converter.convert_columns(&member_columns)?;
+        let groups: HashSet<_> = member_rows.iter().collect();
+
+        self.retain_rows(|stored| {
+            let stored_rows =
+                converter.convert_columns(stored.batch.project(&group_indices)?.columns())?;
+            let mask: BooleanArray = (0..stored.batch.num_rows())
+                .map(|i| {
+                    let doomed = groups.contains(&stored_rows.row(i))
+                        && !stored
+                            .keys
+                            .get(i)
+                            .is_some_and(|key| member_keys.contains(key.as_str()));
+                    Some(!doomed)
+                })
+                .collect();
+            Ok((mask.false_count() > 0).then_some(mask))
+        })
+    }
+
+    /// Rebuild the write target from `keep`'s answer for each stored batch: `Ok(None)` leaves a
+    /// batch untouched (zero-copy), `Ok(Some(mask))` keeps the rows the mask selects.
+    ///
+    /// Every batch is filtered before any is replaced. This store holds the only copy of the
+    /// rows it is filtering, so a partially applied pass would lose the batches it had already
+    /// consumed; on `Err` the store holds exactly the rows it held before the call.
+    fn retain_rows(
+        &mut self,
+        mut keep: impl FnMut(&StoredBatch) -> Result<Option<BooleanArray>, DataFusionError>,
+    ) -> Result<(), DataFusionError> {
         let target = self.write_target();
+        let mut filtered: Vec<Option<(RecordBatch, BooleanArray)>> =
+            Vec::with_capacity(target.len());
+        for stored in target.iter() {
+            let Some(mask) = keep(stored)? else {
+                filtered.push(None);
+                continue;
+            };
+            let batch = filter_record_batch(&stored.batch, &mask)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            filtered.push(Some((batch, mask)));
+        }
+
+        // Every fallible step is done, so the store can be rebuilt without dropping rows — and
+        // now that the batches are owned, the surviving keys move rather than clone.
         let mut retained = Vec::with_capacity(target.len());
         for (stored, filtered) in target.drain(..).zip(filtered) {
-            let Some(batch) = filtered else {
+            let Some((batch, mask)) = filtered else {
                 // No overlap — keep the batch untouched (zero-copy).
                 retained.push(stored);
                 continue;
@@ -177,15 +265,14 @@ impl MemoryVectorStore {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let kept_keys = stored
+            let keys = stored
                 .keys
                 .into_iter()
-                .filter(|key| !delete_keys.contains(key.as_str()))
-                .collect::<Vec<_>>();
-            retained.push(StoredBatch {
-                batch,
-                keys: kept_keys,
-            });
+                .zip(mask.iter())
+                .filter(|(_, kept)| *kept == Some(true))
+                .map(|(key, _)| key)
+                .collect();
+            retained.push(StoredBatch { batch, keys });
         }
         *target = retained;
         Ok(())
@@ -204,6 +291,7 @@ impl MemoryVectorStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use arrow::array::{Array, Int64Array, StringArray};
@@ -248,11 +336,17 @@ mod tests {
 
     /// The ids the store currently holds, one inner `Vec` per batch.
     fn stored_ids(store: &MemoryVectorStore) -> Vec<Vec<i64>> {
-        store
-            .batches()
+        stored_ids_of(&store.batches)
+    }
+
+    /// The ids of `batches`, one inner `Vec` per batch.
+    fn stored_ids_of(batches: &[StoredBatch]) -> Vec<Vec<i64>> {
+        batches
             .iter()
-            .map(|b| {
-                b.column(0)
+            .map(|stored| {
+                stored
+                    .batch
+                    .column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("column 0 is the id column")
@@ -285,6 +379,83 @@ mod tests {
             stored_ids(&store),
             vec![vec![2, 3]],
             "a batch with no rows left should not be retained"
+        );
+    }
+
+    #[test]
+    fn a_group_remainder_delete_drops_the_named_groups_but_keeps_their_members() {
+        let mut store = store_of(&[&[1, 2, 3], &[4, 5]]);
+
+        // Groups 2 and 4 are named; "4" is a member, so only row 2 is the remainder.
+        let member_keys: HashSet<&str> = ["4"].into_iter().collect();
+        store
+            .delete_group_remainder(&["id".to_string()], &batch(&[2, 4]), &member_keys)
+            .expect("the group columns are in the stored schema");
+
+        assert_eq!(stored_ids(&store), vec![vec![1, 3], vec![4, 5]]);
+    }
+
+    #[test]
+    fn a_group_remainder_delete_casts_the_members_to_the_stored_key_type() {
+        let mut store = store_of(&[&[1, 2, 3]]);
+
+        // Members carry the key as Int32 where the store holds Int64.
+        let narrow = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![2]))],
+        )
+        .expect("valid member batch");
+        store
+            .delete_group_remainder(&["id".to_string()], &narrow, &HashSet::new())
+            .expect("a member key type the stored type can be cast from is accepted");
+
+        assert_eq!(stored_ids(&store), vec![vec![1, 3]]);
+    }
+
+    #[test]
+    fn a_group_remainder_delete_of_no_members_leaves_the_store_alone() {
+        let mut store = store_of(&[&[1, 2]]);
+
+        store
+            .delete_group_remainder(&["id".to_string()], &batch(&[]), &HashSet::new())
+            .expect("deleting the remainder of no group succeeds");
+
+        assert_eq!(stored_ids(&store), vec![vec![1, 2]]);
+    }
+
+    /// A group-remainder delete compares the group columns through a row encoding built from
+    /// the stored schema, so a stored batch whose column at the group position has another type
+    /// cannot be compared and fails the pass. Deliberately violates the invariant that every
+    /// stored batch conforms to [`MemoryVectorStore::stored_schema`]: it is the only way to make
+    /// that pass fail, and the point is what the store does when it does — the batches masked
+    /// before the failure must survive it.
+    #[test]
+    fn a_failed_group_remainder_delete_leaves_every_stored_row_in_place() {
+        let mut store = store_of(&[&[1, 2], &[3, 4]]);
+        store.batches.push(StoredBatch {
+            batch: RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
+                vec![Arc::new(StringArray::from(vec!["row-5", "row-6"]))],
+            )
+            .expect("valid batch"),
+            keys: keys(&[5, 6]),
+        });
+
+        // Group 3 overlaps the second batch, so it is masked successfully before the third
+        // batch's mismatched column fails the pass.
+        store
+            .delete_group_remainder(&["id".to_string()], &batch(&[3, 5]), &HashSet::new())
+            .expect_err("a stored batch whose group column has another type cannot be compared");
+
+        assert_eq!(
+            store.batches.len(),
+            3,
+            "a delete that could not be applied must not remove any batch"
+        );
+        assert_eq!(
+            stored_ids_of(&store.batches[..2]),
+            vec![vec![1, 2], vec![3, 4]],
+            "a delete that could not be applied must not remove any row"
         );
     }
 

@@ -37,10 +37,9 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::ident;
-use futures::future::try_join_all;
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
-use spice_table::{Index, WriteWindow, build_key_match_predicate};
+use spice_table::{GroupPruning, Index, WriteWindow, build_key_match_predicate};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
 /// Additional primary key column to uniquely identify chunks within a single database row.
@@ -73,7 +72,7 @@ pub struct ChunkedSearchIndex {
     /// [`SearchIndex::primary_fields`], which clones every `Field`, on every write.
     base_key_names: Vec<String>,
     /// Set for the duration of a [`WriteWindow::ReplaceAll`] window. See
-    /// [`Self::evict_rows_chunked_to_nothing`], which is where it is read and why it exists.
+    /// [`Self::remove_superseded_chunks`], which is where it is read and why it exists.
     ///
     /// Behind an [`Arc`] so a clone of this index observes the same window: a clone wraps the
     /// same inner index, so a window opened against either of them is open for both. (Callers do
@@ -86,6 +85,11 @@ pub struct ChunkedSearchIndex {
     /// is open therefore evicts nothing and leaves that row's previous chunks searchable; #13727
     /// owns scoping the suppression to the replacing write's own batches.
     replace_window: Arc<AtomicBool>,
+    /// Set once [`Self::remove_superseded_chunks`] has told the user that the inner index cannot
+    /// remove the chunks a shorter text no longer produces, so the write path says it once per
+    /// index rather than on every write. Shared by clones for the same reason as
+    /// [`Self::replace_window`].
+    superseded_chunks_unreachable_warned: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -104,18 +108,26 @@ impl Index for ChunkedSearchIndex {
         cols
     }
 
+    /// One batch after another, in the order given — not concurrently. A write is an upsert of
+    /// the chunks it produced followed by the removal of what it superseded
+    /// ([`Self::remove_superseded_chunks`]), and the inner index guards each of those operations
+    /// on its own, not their sequence: two batches carrying the same key, in flight at once, let
+    /// the earlier batch's removal land after the later batch's upsert and take a chunk only the
+    /// later text produced. Running them in order is also what makes the outcome match the
+    /// table, which applies the batches in that order and keeps the last one.
     async fn compute_index(
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches
-            .into_iter()
-            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
+        let mut out = Vec::with_capacity(batches.len());
+        for rb in batches {
+            out.push(self.write(rb).await.map_err(DataFusionError::External)?);
+        }
+        Ok(out)
     }
 
     /// Records whether this window replaces the table's contents before forwarding, so
-    /// [`ChunkedSearchIndex::evict_rows_chunked_to_nothing`] can skip a window where the inner
+    /// [`ChunkedSearchIndex::remove_superseded_chunks`] can skip a window where the inner
     /// index is staging rather than serving what it is about to hold.
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         self.replace_window
@@ -169,6 +181,21 @@ impl Index for ChunkedSearchIndex {
 
     fn deletes_by_partial_key(&self) -> bool {
         self.inner.deletes_by_partial_key()
+    }
+
+    /// This index's key is its inner index's key, so the inner index answers.
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> DataFusionResult<()> {
+        self.inner
+            .delete_group_remainder(group_columns, members)
+            .await
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        self.inner.group_pruning()
     }
 
     fn write_start_failure_is_fatal(&self) -> bool {
@@ -246,6 +273,19 @@ async fn delete_chunked_vector_by_outer_keys(
 fn unreachable_chunk_eviction_warning(index: &str, search_column: &str) -> String {
     format!(
         "Failed to remove the search index entries for a row whose '{search_column}' value is now empty, so that row's previous text stays searchable and a search can still return content the row no longer has. The `{index}` index can only be addressed by a complete key and cannot list what it holds, so those entries cannot be found to remove them. Re-create the search index to rebuild it from the rows the dataset holds now. See: https://spiceai.org/docs/features/search"
+    )
+}
+
+/// The warning a write emits, once per index, when the inner index cannot remove the chunks a
+/// row's previous text produced after that text is rewritten to something shorter — the index
+/// can only be addressed by a complete key, and the chunk ids a shorter text no longer produces
+/// are not knowable without listing what it holds.
+///
+/// A pure function so the wording is asserted in a unit test: it is the only account a user gets
+/// of why a search can still return text a row no longer has.
+fn superseded_chunks_unreachable_warning(index: &str, search_column: &str) -> String {
+    format!(
+        "The `{index}` search index cannot remove the entries a row's previous '{search_column}' text produced when that text is rewritten to something shorter, so such a row can stay searchable by content it no longer has and a search can return it. The index can only be addressed by a complete key, and the entries a shorter text no longer produces are not known to it. Re-create the search index to rebuild it from the rows the dataset holds now. See: https://spiceai.org/docs/features/search"
     )
 }
 
@@ -359,6 +399,7 @@ impl ChunkedSearchIndex {
             inner,
             chunker,
             replace_window: Arc::new(AtomicBool::new(false)),
+            superseded_chunks_unreachable_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -368,36 +409,18 @@ impl ChunkedSearchIndex {
         &self.inner
     }
 
-    /// The rows of `record` whose chunks the inner index has to be told to drop, or `None` when
-    /// there are none.
+    /// The base-key columns of `record`, and for each row whether it is the *last* row in the
+    /// batch for its key — the one that survives downstream and so decides what the index
+    /// should hold under that key. `None` when the index has no key columns, so no group can
+    /// be addressed at all.
     ///
-    /// Those are the rows this write chunked into nothing — a NULL search value, an empty one,
-    /// or text the chunker yields no chunk for — **minus** any row whose key this same write
-    /// also produced chunks for. A row that chunked into nothing contributes no rows *at all* to
-    /// the batch the inner index receives, so the inner index never sees that key on this write
-    /// and nothing tells it to drop what the row's previous text produced.
-    ///
-    /// A key is judged on its **last** row in the batch, which is the one that survives
-    /// downstream: one batch can carry the same key more than once, and the eviction has to
-    /// agree with the row the table will end up holding. So a key whose last row still chunks
-    /// keeps what this write wrote for it, and a key whose last row chunked into nothing loses
-    /// everything under it — including chunks an earlier row of the same batch just produced.
-    /// (A batch carrying one key twice with text *both* times is a different, unresolved
-    /// problem: #13713.)
-    ///
-    /// `repeats` is parallel to `record`'s rows and holds each row's chunk count.
-    fn rows_to_evict(
+    /// Whole key tuples are compared through Arrow's row encoding, so this holds for any key
+    /// column type.
+    fn deciding_key_rows(
         &self,
         record: &RecordBatch,
-        repeats: &[usize],
-    ) -> DataFusionResult<Option<RecordBatch>> {
-        // Short-circuit before anything is allocated: on an ordinary write every row chunks into
-        // something, and this is the only work that write should pay for.
-        if !repeats.contains(&0) {
-            return Ok(None);
-        }
-
-        // A key of no columns addresses nothing, so there is no group to evict.
+    ) -> DataFusionResult<Option<(RecordBatch, Vec<bool>)>> {
+        // A key of no columns addresses nothing.
         if self.base_key_names.is_empty() {
             return Ok(None);
         }
@@ -410,22 +433,20 @@ impl ChunkedSearchIndex {
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Failed to update the search index on '{}': the rows being written do not \
-                     carry the key column(s) {:?} the index is addressed by, so a row whose \
-                     value is now empty cannot have its previous entries removed and a search \
-                     would keep returning them.",
+                     carry the key column(s) {:?} the index is addressed by, so the entries a \
+                     rewritten row no longer produces cannot be removed and a search would keep \
+                     returning them.",
                     self.search_column(),
                     self.base_key_names
                 ))
             })?;
 
-        // `delete_by_keys` reads the key columns out of whatever batch it is handed and ignores
-        // the rest, so narrow to them first: `project` re-slices the column vec without copying,
-        // where filtering the whole batch would run a kernel over the search text and the
-        // embedding vectors only to discard them.
+        // `delete_by_keys` and `delete_group_remainder` read the key columns out of whatever
+        // batch they are handed and ignore the rest, so narrow to them first: `project`
+        // re-slices the column vec without copying, where filtering the whole batch would run a
+        // kernel over the search text and the embedding vectors only to discard them.
         let keys = record.project(&key_indices)?;
 
-        // Compare whole key tuples, whatever their column types, through Arrow's comparable row
-        // encoding.
         let converter = RowConverter::new(
             keys.columns()
                 .iter()
@@ -434,55 +455,136 @@ impl ChunkedSearchIndex {
         )?;
         let rows = converter.convert_columns(keys.columns())?;
 
-        // A key's *last* row in the batch is the one that survives downstream, so that is the
-        // row that decides. Later inserts overwrite earlier ones, leaving each key mapped to its
+        // A later row for the same key demotes the earlier one, leaving each key decided by its
         // final occurrence.
+        let mut decides = vec![true; record.num_rows()];
         let mut last_occurrence = HashMap::with_capacity(record.num_rows());
         for i in 0..record.num_rows() {
-            last_occurrence.insert(rows.row(i), i);
+            if let Some(earlier) = last_occurrence.insert(rows.row(i), i) {
+                decides[earlier] = false;
+            }
         }
 
-        // Evict a key exactly once, on its deciding row, and only when that row chunked into
-        // nothing. A key whose last row still has text keeps what this write wrote for it; a key
-        // whose last row is empty loses everything under it, including chunks an earlier row of
-        // the same batch just produced — which is the state the surviving row calls for.
+        Ok(Some((keys, decides)))
+    }
+
+    /// The keys this write has to tell the inner index to drop entirely, or `None` when there
+    /// are none: the deciding rows that chunked into nothing — a NULL search value, an empty
+    /// one, or text the chunker yields no chunk for. Such a row contributes no rows *at all* to
+    /// the batch the inner index receives, so the inner index never sees that key on this write
+    /// and nothing tells it to drop what the row's previous text produced.
+    ///
+    /// Judging on the deciding row is what makes a batch carrying one key twice come out right:
+    /// a key whose last row still chunks keeps what this write wrote for it, and a key whose
+    /// last row chunked into nothing loses everything under it — including chunks an earlier
+    /// row of the same batch just produced, which is the state the surviving row calls for. (A
+    /// batch carrying one key twice with text *both* times is a different, unresolved problem:
+    /// #13713.)
+    ///
+    /// `keys` and `decides` are [`Self::deciding_key_rows`]; `repeats` holds each row's chunk
+    /// count, parallel to both.
+    fn rows_to_evict(
+        keys: &RecordBatch,
+        decides: &[bool],
+        repeats: &[usize],
+    ) -> DataFusionResult<Option<RecordBatch>> {
         let evict = BooleanArray::new(
-            BooleanBuffer::collect_bool(keys.num_rows(), |i| {
-                repeats[i] == 0 && last_occurrence.get(&rows.row(i)) == Some(&i)
-            }),
+            BooleanBuffer::collect_bool(keys.num_rows(), |i| repeats[i] == 0 && decides[i]),
             None,
         );
         if evict.true_count() == 0 {
             return Ok(None);
         }
 
-        filter_record_batch(&keys, &evict)
+        filter_record_batch(keys, &evict)
             .map(Some)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
-    /// Tell the inner index to drop what it still holds for [`Self::rows_to_evict`], so a row
-    /// whose text went away stops answering searches with content it no longer has.
+    /// The chunk-keyed rows this write leaves the index holding for every key it rewrote to
+    /// text that still chunks — each deciding row's base key once per chunk it produced, with
+    /// the chunk id — or `None` when no row of the batch qualifies. These are the `members` an
+    /// [`Index::delete_group_remainder`] keeps. A key whose deciding row chunked into nothing is
+    /// [`Self::rows_to_evict`]'s and has no surviving chunk to name.
+    fn surviving_chunk_keys(
+        keys: &RecordBatch,
+        decides: &[bool],
+        repeats: &[usize],
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        // A row that does not decide its key contributes no member, which `repeat` expresses as
+        // a count of zero.
+        let counts: Vec<usize> = repeats
+            .iter()
+            .zip(decides)
+            .map(|(&n, &decides)| if decides { n } else { 0 })
+            .collect();
+        if counts.iter().all(|&n| n == 0) {
+            return Ok(None);
+        }
+
+        let mut columns: Vec<ArrayRef> = keys
+            .columns()
+            .iter()
+            .map(|column| repeat(column, &counts))
+            .collect::<Result<_, ArrowError>>()?;
+        columns.push(Arc::new(UInt64Array::from(
+            counts
+                .iter()
+                .flat_map(|&n| 0..(n as u64))
+                .collect::<Vec<_>>(),
+        )));
+
+        let mut fields = keys.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            CHUNKED_INDEX_CHUNK_KEY,
+            DataType::UInt64,
+            false,
+        )));
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map(Some)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    /// Once every chunk of a write has landed, drop what the write superseded, so a row whose
+    /// text went away or got shorter stops answering searches with content it no longer has.
     ///
-    /// Runs **after** this write's chunks have landed, not before: the deletion is externally
-    /// visible and nothing restores it, so ordering it first would let a failed embedding or
-    /// bulk write leave the row present and its old chunks already gone. That narrows the window
-    /// rather than closing it — the row write itself commits later still, and there is no
-    /// post-commit index hook on the CDC path to hang this on (#13715).
+    /// Two things can be superseded, and the inner index is reached differently for each:
     ///
-    /// Skipped inside a [`WriteWindow::ReplaceAll`] window (see [`Self::replace_window`] for the
-    /// CDC writes that window also suppresses, #13727), where it would be destructive: an
-    /// index that stages a replacing write keeps serving its *previous* rows until it commits,
-    /// so an eviction resolved against that listing resolves the previous contents' keys and
-    /// applies the delete to the staged rows — removing rows this same write just wrote. The
-    /// backends that *don't* stage discard nothing at all for that window, including entries for
-    /// rows the refresh dropped outright, which is #12413 rather than this path.
+    /// - A row that chunked into **nothing** ([`Self::rows_to_evict`]) leaves no entry to name,
+    ///   so its whole group goes through [`Index::delete_by_keys`]: straight to an inner index
+    ///   that deletes by partial key, or by resolving its chunk-keyed entries first from a
+    ///   listable vector index. An inner index that can do neither has no way to reach those
+    ///   chunks at all; that is asked up front, so the write reports it and stands — failing it
+    ///   after the chunks have landed would not remove the stale entries either.
+    /// - A row that chunked into **fewer** pieces than before was upserted under chunk ids
+    ///   `0..n` and nothing above them, leaving `(key, n..)` in place at the old text. The write
+    ///   knows the chunks it produced but not how many the previous text had, and finding out
+    ///   would mean enumerating the inner index on every write; so the inner index is handed the
+    ///   surviving chunk keys ([`Self::surviving_chunk_keys`]) and asked to remove the rest of
+    ///   each group ([`Index::delete_group_remainder`]), which a store can do from what it
+    ///   already holds. An inner index that cannot ([`Index::group_pruning`]) leaves them in
+    ///   place — what the write would have done without this step — and the user is told once
+    ///   per index which index that is; a compound inner index is still asked for the half
+    ///   that can.
     ///
-    /// An inner index that can neither delete by partial key nor be enumerated as a vector index
-    /// has no way to reach those chunks at all. That is asked up front, so the write reports it
-    /// and stands — failing it after the chunks have landed would not remove the stale entries
-    /// either — and every error from the delete itself stays an error.
-    async fn evict_rows_chunked_to_nothing(
+    /// Both run **after** this write's chunks have landed, not before: each deletion is
+    /// externally visible and nothing restores it, so ordering them first would let a failed
+    /// embedding or bulk write leave the row present and its old chunks already gone. That
+    /// narrows the window rather than closing it — the row write itself commits later still,
+    /// and there is no post-commit index hook on the CDC path to hang this on (#13715).
+    ///
+    /// Both are skipped inside a [`WriteWindow::ReplaceAll`] window (see [`Self::replace_window`]
+    /// for the CDC writes that window also suppresses, #13727), where they would be
+    /// destructive: an index that stages a replacing write keeps serving its *previous* rows
+    /// until it commits, so an eviction resolved against that listing resolves the previous
+    /// contents' keys and applies the delete to the staged rows — removing rows this same write
+    /// just wrote — and a pruning would remove members of groups the store is still receiving.
+    /// The backends that *don't* stage discard nothing at all for that window, including entries
+    /// for rows the refresh dropped outright, which is #12413 rather than this path.
+    ///
+    /// Every error from a delete itself stays an error.
+    async fn remove_superseded_chunks(
         &self,
         record: &RecordBatch,
         repeats: &[usize],
@@ -491,34 +593,73 @@ impl ChunkedSearchIndex {
             return Ok(());
         }
 
-        // Ask the capability rather than inferring it from the shape of a failure: a
-        // `NotImplemented` raised deeper down is a real failure of a supported path, and
-        // reporting it as "this index cannot be addressed" would tell the user a story the
-        // error never told.
-        if !self.deletes_by_partial_key() && Arc::clone(&self.inner).as_vector_index().is_none() {
-            // Warn for an eviction that is actually owed, not merely for a batch that
-            // contains an empty row. A key is judged on its last row, so an `empty -> text`
-            // pair for one key resolves to no eviction at all — and the warning tells the
-            // user their previous text stays searchable and the index must be re-created,
-            // which for that batch is false and asks them to rebuild for nothing.
+        // Capabilities are asked, not inferred from the shape of a failure: a `NotImplemented`
+        // raised deeper down is a real failure of a supported path, and reporting it as "this
+        // index cannot be addressed" would tell the user a story the error never told.
+        let pruning = self.inner.group_pruning();
+        let prunes = pruning != GroupPruning::Unsupported;
+        let cannot = pruning.gaps(self.inner.name());
+        if !cannot.is_empty()
+            && !self
+                .superseded_chunks_unreachable_warned
+                .swap(true, Ordering::AcqRel)
+        {
+            tracing::warn!(
+                "{}",
+                superseded_chunks_unreachable_warning(&cannot.join("`, `"), &self.search_column())
+            );
+        }
+
+        // An ordinary write — every row chunks, and the inner index cannot prune — pays for
+        // none of what follows.
+        let emptied = repeats.contains(&0);
+        if !emptied && !prunes {
+            return Ok(());
+        }
+
+        let evicts =
+            self.deletes_by_partial_key() || Arc::clone(&self.inner).as_vector_index().is_some();
+        if emptied && !evicts {
+            // Warn for an eviction that is actually owed, not merely for a batch that contains
+            // an empty row. A key is judged on its last row, so an `empty -> text` pair for one
+            // key resolves to no eviction at all — and the warning tells the user their previous
+            // text stays searchable and the index must be re-created, which for that batch is
+            // false and asks them to rebuild for nothing.
             //
-            // `rows_to_evict`'s error is deliberately dropped rather than propagated: an
-            // index that cannot be addressed could not act on the answer either way, so
-            // raising it here would fail writes that this branch has always let through.
-            if matches!(self.rows_to_evict(record, repeats), Ok(Some(_))) {
+            // Errors are deliberately dropped rather than propagated here: an index that cannot
+            // be addressed could not act on the answer either way, so raising them would fail
+            // writes that this branch has always let through.
+            let owed = matches!(
+                self.deciding_key_rows(record),
+                Ok(Some((keys, decides)))
+                    if matches!(Self::rows_to_evict(&keys, &decides, repeats), Ok(Some(_)))
+            );
+            if owed {
                 tracing::warn!(
                     "{}",
                     unreachable_chunk_eviction_warning(self.inner.name(), &self.search_column())
                 );
             }
-            return Ok(());
+            if !prunes {
+                return Ok(());
+            }
         }
 
-        let Some(keys) = self.rows_to_evict(record, repeats)? else {
+        let Some((keys, decides)) = self.deciding_key_rows(record)? else {
             return Ok(());
         };
-
-        self.delete_by_keys(keys).await
+        if emptied
+            && evicts
+            && let Some(evicted) = Self::rows_to_evict(&keys, &decides, repeats)?
+        {
+            self.delete_by_keys(evicted).await?;
+        }
+        if prunes && let Some(members) = Self::surviving_chunk_keys(&keys, &decides, repeats)? {
+            self.inner
+                .delete_group_remainder(&self.base_key_names, members)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
@@ -819,11 +960,11 @@ impl SearchIndex for ChunkedSearchIndex {
             }
         }
 
-        // Every chunk this write produces has landed, so the rows it chunked into nothing can
-        // now have their previous chunks dropped — see `evict_rows_chunked_to_nothing` for why
-        // this is ordered after the writes rather than before them.
-        self.evict_rows_chunked_to_nothing(&record, &repeats)
-            .await?;
+        // Every chunk this write produces has landed, so what it superseded — the previous
+        // chunks of a row that chunked into nothing, and the chunks past the end of a row that
+        // chunked into fewer pieces — can now go; see `remove_superseded_chunks` for why this is
+        // ordered after the writes rather than before them.
+        self.remove_superseded_chunks(&record, &repeats).await?;
 
         // From the concatenated inner outputs we need {}_embedding and {}_offset, then convert
         // them from `<inner_type>` -> `List(<inner_type>)` (one list per original row, length
@@ -1116,6 +1257,21 @@ impl Index for ChunkedVectorIndex {
         self.inner.deletes_by_partial_key()
     }
 
+    /// This index's key is its inner index's key, so the inner index answers.
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> DataFusionResult<()> {
+        self.inner
+            .delete_group_remainder(group_columns, members)
+            .await
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        self.inner.group_pruning()
+    }
+
     fn write_start_failure_is_fatal(&self) -> bool {
         self.inner.write_start_failure_is_fatal()
     }
@@ -1157,6 +1313,33 @@ impl SearchIndex for ChunkedVectorIndex {
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
         Some(self as Arc<dyn VectorIndex>)
+    }
+}
+
+/// A [`Chunker`] that splits on a single delimiter — for tests that want deterministic,
+/// observable chunk boundaries without pulling in tokenizer config.
+#[cfg(test)]
+pub(crate) struct DelimChunker {
+    pub(crate) delim: char,
+}
+
+#[cfg(test)]
+impl Chunker for DelimChunker {
+    fn chunk_indices<'a>(&self, text: &'a str) -> Box<dyn Iterator<Item = (usize, &'a str)> + 'a> {
+        let mut out: Vec<(usize, &'a str)> = Vec::new();
+        let mut start = 0usize;
+        for (i, c) in text.char_indices() {
+            if c == self.delim {
+                if i > start {
+                    out.push((start, &text[start..i]));
+                }
+                start = i + c.len_utf8();
+            }
+        }
+        if start < text.len() {
+            out.push((start, &text[start..]));
+        }
+        Box::new(out.into_iter())
     }
 }
 
@@ -1329,34 +1512,6 @@ mod tests {
         assert_eq!(groups, vec![(0, 5)]);
     }
 
-    /// A [`Chunker`] that splits on a single delimiter — used for tests where we want
-    /// deterministic, observable chunk boundaries without pulling in tokenizer config.
-    struct DelimChunker {
-        delim: char,
-    }
-
-    impl Chunker for DelimChunker {
-        fn chunk_indices<'a>(
-            &self,
-            text: &'a str,
-        ) -> Box<dyn Iterator<Item = (usize, &'a str)> + 'a> {
-            let mut out: Vec<(usize, &'a str)> = Vec::new();
-            let mut start = 0usize;
-            for (i, c) in text.char_indices() {
-                if c == self.delim {
-                    if i > start {
-                        out.push((start, &text[start..i]));
-                    }
-                    start = i + c.len_utf8();
-                }
-            }
-            if start < text.len() {
-                out.push((start, &text[start..]));
-            }
-            Box::new(out.into_iter())
-        }
-    }
-
     /// A pass-through [`SearchIndex`] that records how many times `write` is called and the size
     /// of each input. It also appends a fake `<col>_embedding` column (4-dim FixedSizeList of
     /// Float32) and an `<col>_offset` column copied from the input. The chunking layer reads
@@ -1400,6 +1555,11 @@ mod tests {
         /// enumeration of everything the index holds, which is what resolving a chunked delete
         /// against an exact-key index costs.
         listings: AtomicUsize,
+        /// Makes [`Index::group_pruning`] report [`GroupPruning::Unsupported`], the shape of an
+        /// index that can only be addressed by a complete key.
+        group_remainder_unsupported: bool,
+        /// Member batches handed to [`Index::delete_group_remainder`].
+        remainders: std::sync::Mutex<Vec<RecordBatch>>,
     }
 
     impl RecordingInner {
@@ -1418,6 +1578,8 @@ mod tests {
                 listed: None,
                 deleted: std::sync::Mutex::new(Vec::new()),
                 listings: AtomicUsize::new(0),
+                group_remainder_unsupported: false,
+                remainders: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1451,6 +1613,17 @@ mod tests {
 
         fn listings(&self) -> usize {
             self.listings.load(Ordering::SeqCst)
+        }
+
+        /// The `(id, chunk_id)` rows handed to [`Index::delete_group_remainder`] so far, in the
+        /// order they were handed over.
+        fn remainders(&self) -> Vec<(i64, u64)> {
+            self.remainders
+                .lock()
+                .expect("mutex")
+                .iter()
+                .flat_map(chunk_keyed_pairs)
+                .collect()
         }
 
         /// The key batches passed to [`Index::delete_by_keys`], as
@@ -1495,6 +1668,26 @@ mod tests {
         }
         fn deletes_by_partial_key(&self) -> bool {
             self.deletes_partial_key
+        }
+        async fn delete_group_remainder(
+            &self,
+            group_columns: &[String],
+            members: RecordBatch,
+        ) -> DataFusionResult<()> {
+            assert!(
+                !self.group_remainder_unsupported,
+                "an index that said it cannot prune a group is not asked to"
+            );
+            assert_eq!(group_columns, ["id".to_string()], "grouped on the base key");
+            self.remainders.lock().expect("mutex").push(members);
+            Ok(())
+        }
+        fn group_pruning(&self) -> GroupPruning {
+            if self.group_remainder_unsupported {
+                GroupPruning::Unsupported
+            } else {
+                GroupPruning::Complete
+            }
         }
         async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
             if self.start_fails {
@@ -1745,6 +1938,25 @@ mod tests {
             vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
         )
         .expect("valid batch")
+    }
+
+    /// The `(id, chunk_id)` pairs of a chunk-keyed batch, in row order.
+    fn chunk_keyed_pairs(batch: &RecordBatch) -> Vec<(i64, u64)> {
+        let ids = batch
+            .column_by_name("id")
+            .expect("the batch carries the base key")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        let chunks = batch
+            .column_by_name(CHUNKED_INDEX_CHUNK_KEY)
+            .expect("the batch carries the chunk id")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("chunk id is UInt64");
+        (0..batch.num_rows())
+            .map(|r| (ids.value(r), chunks.value(r)))
+            .collect()
     }
 
     /// The chunk-keyed entries an inner index stores: one row per `(id, chunk_id)`.
@@ -2315,6 +2527,9 @@ mod tests {
     struct StatefulChunkInner {
         rows: std::sync::Mutex<Vec<(i64, u64)>>,
         deletes_partial_key: bool,
+        /// Yield to the runtime after storing a batch's rows, so two writes in flight at once
+        /// interleave the way a real inner index's awaited embedding call lets them.
+        yield_on_write: bool,
     }
 
     impl StatefulChunkInner {
@@ -2322,7 +2537,13 @@ mod tests {
             Self {
                 rows: std::sync::Mutex::new(rows.to_vec()),
                 deletes_partial_key,
+                yield_on_write: false,
             }
+        }
+
+        fn yielding(mut self) -> Self {
+            self.yield_on_write = true;
+            self
         }
 
         fn remaining(&self) -> Vec<(i64, u64)> {
@@ -2365,6 +2586,27 @@ mod tests {
                     (0..keys.num_rows()).map(|r| ids.value(r)).collect();
                 rows.retain(|(id, _)| !doomed.contains(id));
             }
+            Ok(())
+        }
+        fn group_pruning(&self) -> GroupPruning {
+            GroupPruning::Complete
+        }
+        /// Drops every row in a named group that is not itself a member — what a store does
+        /// from what it already holds.
+        async fn delete_group_remainder(
+            &self,
+            group_columns: &[String],
+            members: RecordBatch,
+        ) -> DataFusionResult<()> {
+            assert_eq!(group_columns, ["id".to_string()], "grouped on the base key");
+            let members = chunk_keyed_pairs(&members);
+            let groups: std::collections::HashSet<i64> =
+                members.iter().map(|(id, _)| *id).collect();
+            let keep: std::collections::HashSet<(i64, u64)> = members.into_iter().collect();
+            self.rows
+                .lock()
+                .expect("mutex")
+                .retain(|pair| !groups.contains(&pair.0) || keep.contains(pair));
             Ok(())
         }
         fn deletes_by_partial_key(&self) -> bool {
@@ -2436,6 +2678,9 @@ mod tests {
                         rows.push(pair);
                     }
                 }
+            }
+            if self.yield_on_write {
+                tokio::task::yield_now().await;
             }
 
             let n = record.num_rows();
@@ -2684,6 +2929,239 @@ mod tests {
             "nothing landed, so nothing may be removed: {:?}",
             inner.deletes()
         );
+    }
+
+    /// A row rewritten to text that chunks into *fewer* pieces names only the chunk ids it still
+    /// produces, so an upsert overwrites those and leaves every higher chunk id from the
+    /// superseded text in place — the row stays searchable by a word its current text does not
+    /// contain, and the hit carries content the table no longer holds.
+    ///
+    /// Regression test for #13717, over both inner-index shapes: the store is told which chunks
+    /// of the row survive and drops the rest of the group, however it addresses its entries.
+    #[tokio::test]
+    async fn a_row_rewritten_to_fewer_chunks_loses_the_chunks_it_no_longer_produces() {
+        for partial_key in [false, true] {
+            let inner = Arc::new(StatefulChunkInner::new(&[], partial_key));
+            let idx =
+                ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+            idx.write(build_input(&[("a b c", 1), ("d e", 2)]))
+                .await
+                .expect("first write ok");
+            idx.write(build_input(&[("f", 1)]))
+                .await
+                .expect("rewrite ok");
+
+            assert_eq!(
+                inner.remaining(),
+                vec![(1, 0), (2, 0), (2, 1)],
+                "id 1 keeps only the chunk its new text produces (partial-key inner: \
+                 {partial_key}); id 2 is untouched"
+            );
+        }
+    }
+
+    /// What the inner index is handed is the set of chunk keys the write leaves under each key
+    /// it rewrote — the deciding row's chunks, once per chunk — and nothing else: no listing of
+    /// the inner index (an enumeration of everything it holds, which must stay off the ordinary
+    /// write path) and no `delete_by_keys`.
+    #[tokio::test]
+    async fn a_write_hands_the_inner_index_the_chunk_keys_that_survive_it() {
+        let inner = Arc::new(RecordingInner::chunked(vec![]));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        // Key 1 appears twice; its last row ("d", one chunk) is the one that survives.
+        idx.write(build_input(&[("a b", 1), ("c", 2), ("d", 1)]))
+            .await
+            .expect("write ok");
+
+        assert_eq!(
+            inner.remainders(),
+            vec![(2, 0), (1, 0)],
+            "each rewritten key's surviving chunks, judged on its deciding row"
+        );
+        assert_eq!(
+            inner.listings(),
+            0,
+            "an ordinary write never enumerates the inner index"
+        );
+        assert!(
+            inner.deletes().is_empty(),
+            "nothing was emptied, so nothing is evicted"
+        );
+    }
+
+    /// A key whose deciding row chunked into nothing has no surviving chunks to name: it is the
+    /// eviction's to handle, and it must not appear among the members the inner index keeps.
+    #[tokio::test]
+    async fn a_key_whose_last_row_is_empty_is_left_to_the_eviction() {
+        let inner = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.write(build_input_opt(&[
+            (Some("a b"), 1),
+            (None, 1),
+            (Some("c"), 2),
+        ]))
+        .await
+        .expect("write ok");
+
+        assert_eq!(inner.remainders(), vec![(2, 0)]);
+        assert_eq!(
+            resolved_ids(&inner.deletes()),
+            vec![1],
+            "the emptied key is evicted, not pruned"
+        );
+    }
+
+    /// A replacing write reproduces every row, so nothing it stages is superseded, and a store
+    /// that stages it would be asked to prune groups it is still receiving. Closing the window
+    /// puts the index back on the pruning path.
+    #[tokio::test]
+    async fn a_replacing_write_prunes_no_group() {
+        let inner = Arc::new(RecordingInner::chunked(vec![]));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("window opens");
+        idx.write(build_input(&[("a", 1)])).await.expect("write ok");
+        assert!(
+            inner.remainders().is_empty(),
+            "a replacing write hands nothing over: {:?}",
+            inner.remainders()
+        );
+
+        idx.on_write_complete().await.expect("window closes");
+        idx.write(build_input(&[("b", 1)])).await.expect("write ok");
+        assert_eq!(
+            inner.remainders(),
+            vec![(1, 0)],
+            "an append after the window prunes again"
+        );
+    }
+
+    /// An inner index that can only be addressed by a complete key cannot prune a group. The
+    /// write has already landed, so it stands, and the user is told — once per index, not on
+    /// every write, since the second telling adds nothing to the first.
+    #[tokio::test]
+    async fn an_inner_index_that_cannot_prune_a_group_is_reported_once() {
+        let logs = capture_logs();
+        let inner = Arc::new(RecordingInner {
+            group_remainder_unsupported: true,
+            ..RecordingInner::chunked(vec![])
+        });
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.write(build_input(&[("a b", 1)]))
+            .await
+            .expect("the write lands even though the pruning cannot");
+        idx.write(build_input(&[("c", 1)]))
+            .await
+            .expect("so does the next one");
+
+        assert_eq!(
+            logs.occurrences_of("rewritten to something shorter"),
+            1,
+            "the inability is reported once for the life of the index"
+        );
+        assert!(
+            inner.remainders().is_empty(),
+            "an index that cannot prune is never handed members to keep"
+        );
+    }
+
+    /// A write's upsert and its pruning are two operations on the inner index, so two writes for
+    /// the same key in flight at once can interleave them: the older write's pruning, keyed on
+    /// the chunks *it* produced, removes a chunk the newer write just stored, and the newer
+    /// write's own pruning cannot restore it. `compute_index` is where more than one batch is
+    /// handed over at a time, so it has to run them in order — which is also the order the table
+    /// applies them in, so the last batch's text is what stays searchable.
+    ///
+    /// The inner index yields after storing, the way a real one yields on its embedding call;
+    /// run concurrently, batch A's pruning would land after batch B's store and take `(1, 1)`.
+    #[tokio::test]
+    async fn batches_of_one_compute_index_call_do_not_interleave_their_pruning() {
+        let inner = Arc::new(StatefulChunkInner::new(&[], false).yielding());
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.compute_index(vec![build_input(&[("x", 1)]), build_input(&[("y z", 1)])])
+            .await
+            .expect("both batches land");
+
+        assert_eq!(
+            inner.remaining(),
+            vec![(1, 0), (1, 1)],
+            "the later batch's text is complete in the index; the earlier batch's pruning must \
+             not have removed a chunk it never produced"
+        );
+    }
+
+    /// The production warm index is a compound: a memory primary that prunes, paired with an
+    /// S3 Vectors or Elasticsearch secondary that cannot. The compound is still asked, so the
+    /// memory half loses the chunks a shorter text no longer produces; the half that cannot is
+    /// named in the one-time warning and is never handed members.
+    #[tokio::test]
+    async fn a_compound_inner_still_prunes_the_half_that_can() {
+        let logs = capture_logs();
+        let warm = Arc::new(StatefulChunkInner::new(&[], false));
+        let durable = Arc::new(RecordingInner {
+            group_remainder_unsupported: true,
+            ..RecordingInner::chunked(vec![])
+        });
+        let inner = Arc::new(
+            CompoundVectorIndex::try_new(
+                Arc::clone(&warm) as Arc<dyn VectorIndex>,
+                Arc::clone(&durable) as Arc<dyn VectorIndex>,
+                CompoundReadMode::PrimaryOnly,
+            )
+            .expect("the two doubles share a search column, primary key and dimension"),
+        );
+        let idx = ChunkedSearchIndex::new(inner as Arc<dyn SearchIndex>, chunker());
+
+        idx.write(build_input(&[("a b c", 1), ("d e", 2)]))
+            .await
+            .expect("first write ok");
+        idx.write(build_input(&[("f", 1)]))
+            .await
+            .expect("rewrite ok");
+
+        assert_eq!(
+            warm.remaining(),
+            vec![(1, 0), (2, 0), (2, 1)],
+            "the half that prunes drops the chunks id 1 no longer produces"
+        );
+        assert!(
+            durable.remainders().is_empty(),
+            "the half that cannot prune is never handed members"
+        );
+        assert_eq!(
+            logs.occurrences_of("The `RecordingInner` search index cannot remove"),
+            1,
+            "the warning names the half that cannot, once"
+        );
+    }
+
+    /// The warning is the only account a user gets of why a search can still return text a row
+    /// no longer has, so a reword must not quietly drop the column, the consequence, or the fix.
+    #[test]
+    fn the_superseded_chunk_warning_says_what_the_user_will_see() {
+        let msg = superseded_chunks_unreachable_warning("SomeIndex", "content");
+        assert!(msg.contains("'content'"), "names the search column: {msg}");
+        assert!(msg.contains("`SomeIndex`"), "names the index: {msg}");
+        assert!(
+            msg.contains("searchable by content it no longer has"),
+            "says what the user will observe: {msg}"
+        );
+        assert!(
+            msg.contains("Re-create the search index"),
+            "gives an actionable fix: {msg}"
+        );
+        assert!(
+            msg.contains("https://spiceai.org/docs/features/search"),
+            "links the docs: {msg}"
+        );
+        assert!(!msg.contains('\n'), "stays on one line: {msg}");
     }
 
     /// The warning is the only account a user gets of why a search still returns text a row no

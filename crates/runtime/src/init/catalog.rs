@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::{
@@ -229,18 +230,57 @@ impl Runtime {
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(new_app, LogErrors(true));
         let existing_catalogs = Arc::clone(&self).get_valid_catalogs(current_app, LogErrors(false));
 
+        // A DataFusion catalog registration outlives the declaration that created it: the
+        // removal branch below can only warn, so a provider an earlier reload registered stays
+        // registered after its declaration is dropped or stops validating. `existing_catalogs`
+        // is the *valid* subset of one app revision, so it under-reports what is registered —
+        // a name missing from it can still have a live provider that cached plans resolved
+        // through. Both remaining signals are consulted before deciding a catalog is new:
+        // the raw declarations of the current app (which include ones that failed to
+        // validate), and what DataFusion currently has registered. The second reads the
+        // session's catalog registry, so a *deferred* catalog — which `register_catalog`
+        // holds in its own map rather than the session — is answered by the declaration
+        // check, not by that one. See #13910.
+        let declared_by_current_app: HashSet<&str> = current_app
+            .catalogs
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+
+        let mut replaced_a_catalog = false;
+
         for catalog in &valid_catalogs {
             if let Some(current_catalog) = existing_catalogs.iter().find(|c| c.name == catalog.name)
             {
                 if catalog != current_catalog {
                     // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
                     Arc::clone(&self).load_catalog(catalog).await;
+                    replaced_a_catalog = true;
                 }
             } else {
+                // Checked before the load, which is what registers the provider.
+                let replaces_a_registered_provider = declared_by_current_app
+                    .contains(catalog.name.as_str())
+                    || self.df.catalog_exists(&catalog.name);
+
                 self.status
                     .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
                 Arc::clone(&self).load_catalog(catalog).await;
+
+                if replaces_a_registered_provider {
+                    replaced_a_catalog = true;
+                }
             }
+        }
+
+        // A cached logical plan embeds the `TableSource` it was planned against, and so keeps
+        // reading through the provider the *previous* declaration built. Reloading a catalog
+        // registers a fresh provider under the same name, so every plan that resolved a table in
+        // it is now stale and must be replanned — the same reason dataset and view registration
+        // discard cached plans. Registering a catalog that was never registered before
+        // invalidates nothing: no cached plan can have resolved a table in it.
+        if replaced_a_catalog {
+            self.df.clear_cached_plans().await;
         }
 
         // Process catalogs that are no longer in the app
@@ -486,6 +526,153 @@ mod tests {
         assert!(
             !is_permanent_catalog_failure(&err),
             "registering into DataFusion can fail transiently"
+        );
+    }
+
+    fn app_with_catalog(from: &str) -> Arc<App> {
+        Arc::new(
+            app::AppBuilder::new("catalog_reload")
+                .with_catalog(spicepod::component::catalog::Catalog::new(
+                    from.to_string(),
+                    "reloaded".to_string(),
+                ))
+                .build(),
+        )
+    }
+
+    /// The same catalog name, declared so `CatalogBuilder::try_from` rejects it: an
+    /// uncompilable glob in `include` fails before any of the later validation, so the
+    /// declaration is present in the raw app but absent from `get_valid_catalogs`.
+    fn app_with_invalid_catalog(from: &str) -> Arc<App> {
+        let mut catalog =
+            spicepod::component::catalog::Catalog::new(from.to_string(), "reloaded".to_string());
+        catalog.include = vec!["[".to_string()];
+        Arc::new(
+            app::AppBuilder::new("catalog_reload")
+                .with_catalog(catalog)
+                .build(),
+        )
+    }
+
+    /// #13910: a cached logical plan embeds the `TableSource` the *previous* declaration built,
+    /// so a reload that re-registers a catalog under the same name leaves every plan that
+    /// resolved a table in it reading through the connector the user just stopped pointing at.
+    ///
+    /// The declaration is what decides this, not the outcome of the load: `load_catalog`
+    /// retries a transient failure internally and only returns once it has either registered a
+    /// provider or failed permanently, so discarding plans for a permanent failure — as this
+    /// test's unregistered provider is — only costs a replan.
+    #[tokio::test]
+    async fn replacing_a_catalog_discards_cached_plans() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &app_with_catalog("not_a_real_catalog_connector:before"),
+                &app_with_catalog("not_a_real_catalog_connector:after"),
+            )
+            .await;
+
+        assert_eq!(
+            runtime.df.cached_plan_count().await,
+            Some(0),
+            "a catalog whose declaration changed is re-registered with a fresh provider, so every cached plan holding the old one is stale"
+        );
+    }
+
+    /// The other half of #13910's acceptance: a reload that leaves the catalog set untouched
+    /// must not throw the plan cache away.
+    #[tokio::test]
+    async fn a_reload_that_changes_no_catalog_keeps_cached_plans() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &app_with_catalog("not_a_real_catalog_connector:same"),
+                &app_with_catalog("not_a_real_catalog_connector:same"),
+            )
+            .await;
+
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+    }
+
+    /// Registering a catalog that did not exist before invalidates nothing: no cached plan can
+    /// have resolved a table in a catalog that was not there when it was planned.
+    #[tokio::test]
+    async fn adding_a_catalog_keeps_cached_plans() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &Arc::new(app::AppBuilder::new("catalog_reload").build()),
+                &app_with_catalog("not_a_real_catalog_connector:added"),
+            )
+            .await;
+
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+    }
+
+    /// #13910, second gap: a declaration that stops validating does not deregister the
+    /// provider an earlier reload put in `DataFusion` — the removal branch can only warn. So a
+    /// name absent from `existing_catalogs` because its *declaration* was rejected still has a
+    /// live provider with cached plans resolved through it, and the reload that corrects the
+    /// declaration overwrites that provider. That is a replacement, not an addition.
+    ///
+    /// Before the fix this took the `else` branch as "new" and left `replaced_a_catalog`
+    /// false, so the assertion below read `Some(1)`.
+    #[tokio::test]
+    async fn correcting_an_invalid_catalog_declaration_discards_cached_plans() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &app_with_invalid_catalog("not_a_real_catalog_connector:before"),
+                &app_with_catalog("not_a_real_catalog_connector:after"),
+            )
+            .await;
+
+        assert_eq!(
+            runtime.df.cached_plan_count().await,
+            Some(0),
+            "the previous declaration failing to validate does not unregister the provider it left behind, so re-registering under that name still strands every plan holding it"
+        );
+    }
+
+    /// The premise the test above rests on: the invalid declaration really is dropped from
+    /// `get_valid_catalogs`, so it is the raw-declaration check — not `existing_catalogs` —
+    /// that classifies the reload as a replacement.
+    #[tokio::test]
+    async fn an_invalid_catalog_declaration_is_not_a_valid_catalog() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let valid = Arc::clone(&runtime).get_valid_catalogs(
+            &app_with_invalid_catalog("not_a_real_catalog_connector:before"),
+            LogErrors(false),
+        );
+        assert!(
+            valid.is_empty(),
+            "an uncompilable include glob must make the declaration invalid for this test to mean anything"
         );
     }
 }

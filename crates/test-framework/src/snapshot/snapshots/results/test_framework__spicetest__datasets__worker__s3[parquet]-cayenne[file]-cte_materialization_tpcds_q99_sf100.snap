@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q99"
+---
++-------------------------------------------------------+---------+-----------------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type | cc_name         | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+---------+-----------------+---------+------------+------------+-------------+-----------+
+| Certainly fede                                        | EXPRESS | California      | 8238    | 8690       | 8428       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | California_1    | 8152    | 8461       | 8588       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | Hawaii/Alaska   | 8138    | 8340       | 8567       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | Hawaii/Alaska_1 | 8241    | 8312       | 8335       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | Mid Atlantic    | 8294    | 8650       | 8511       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | Mid Atlantic_1  | 8392    | 8403       | 8435       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | Mid Atlantic_2  | 8209    | 8326       | 8580       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | NY Metro        | 8352    | 8432       | 8449       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | NY Metro_1      | 8341    | 8515       | 8405       | 0           | 0         |
+| Certainly fede                                        | EXPRESS | NY Metro_2      | 8186    | 8448       | 8241       | 0           | 0         |
++-------------------------------------------------------+---------+-----------------+---------+------------+------------+-------------+-----------+

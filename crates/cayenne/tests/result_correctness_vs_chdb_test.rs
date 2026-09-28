@@ -251,10 +251,12 @@ async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
     write_coverage_report(&coverage_path, &results).expect("coverage");
     eprintln!("{}", summary_line(&results));
 
-    let micro_fails: Vec<_> = results
+    let micro: Vec<RunResult> = results
         .iter()
-        .filter(|r| r.suite == "micro" && !r.outcome.is_pass_or_excluded())
+        .filter(|r| r.suite == "micro")
+        .cloned()
         .collect();
+    let micro_fails = support::report::unexplained(&micro, &build_inventory());
     assert!(
         micro_fails.is_empty(),
         "chDB micro-bench full-result parity failures: {micro_fails:#?}\nsee {}",
@@ -468,10 +470,12 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
     write_coverage_report(&scratch.join("parity_coverage_chdb.md"), &results).ok();
     eprintln!("{}", summary_line(&results));
 
-    let sl_fails: Vec<_> = results
+    let sqllancer: Vec<RunResult> = results
         .iter()
-        .filter(|r| r.suite == "sqllancer" && !r.outcome.is_pass_or_excluded())
+        .filter(|r| r.suite == "sqllancer")
+        .cloned()
         .collect();
+    let sl_fails = support::report::unexplained(&sqllancer, &build_inventory());
     assert!(
         sl_fails.is_empty(),
         "SQLLancer Cayenne↔chDB failures: {sl_fails:#?}\nsee {}",

@@ -93,8 +93,7 @@ mod tests {
     #[test]
     fn test_from_headers_empty() {
         let headers = HeaderMap::new();
-        let baggage = from_headers(&headers).collect::<Vec<_>>();
-        assert!(baggage.is_empty());
+        assert!(from_headers(&headers).next().is_none());
     }
 
     #[test]
@@ -104,8 +103,7 @@ mod tests {
             BAGGAGE_HEADER,
             HeaderValue::from_bytes(&[0xFF]).expect("Failed to create header value"),
         );
-        let baggage = from_headers(&headers).collect::<Vec<_>>();
-        assert!(baggage.is_empty());
+        assert!(from_headers(&headers).next().is_none());
     }
 
     #[test]
@@ -165,7 +163,6 @@ mod tests {
     fn test_from_headers_invalid_format() {
         let mut headers = HeaderMap::new();
         headers.insert(BAGGAGE_HEADER, HeaderValue::from_static("invalid_format"));
-        let baggage = from_headers(&headers).collect::<Vec<_>>();
-        assert!(baggage.is_empty());
+        assert!(from_headers(&headers).next().is_none());
     }
 }

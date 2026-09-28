@@ -86,11 +86,18 @@ pub struct MetricsCollector {
     /// Why this dataset's acceleration was rebuilt from the source instead of
     /// resumed, as [`super::RebuildCause::label`], or `None` when it resumed.
     ///
-    /// A rebuild is a full re-read nobody asked for, and the causes call for
-    /// different responses — a restored source, a repointed endpoint, a broken
-    /// sidecar, a slot lifecycle problem. Reporting only "rebuilt" would make
-    /// them indistinguishable without scraping log text. Set at attach; a member
-    /// classifies once, so this is a label rather than a counter.
+    /// The machine-readable twin of the warning `attach_member` logs. Kept
+    /// because the decision is worth asserting and the log line is not practical
+    /// to assert on: a `tracing` callsite's interest is cached process-wide and
+    /// the runtime test harness installs a thread-local subscriber, so a test
+    /// cannot reliably observe a line emitted on another thread. The runtime's
+    /// Postgres replication suite reads this to pin *which* rebuild arm fired —
+    /// every arm loads the acceleration, so without it a case stays green with
+    /// the arm it exists for removed.
+    ///
+    /// Deliberately NOT a metric dimension. A rebuild is an event, so a per-cause
+    /// series would carry a single point per dataset; the log line is what an
+    /// operator reads, and this is how a test reads the same fact.
     rebuild_cause: RwLock<Option<&'static str>>,
     /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
     /// committed changes into this member's mailbox because its sink was not
@@ -172,14 +179,12 @@ impl MetricsCollector {
     }
 
     /// Record why this dataset's acceleration is being rebuilt, or clear the
-    /// cause on a resume. Called once per attach, with `None` on every path but
-    /// a rebuild — a collector is reused across reattaches, so a cause left set
-    /// from an earlier attach would otherwise keep exporting a stale
-    /// `replication_acceleration_rebuilt{cause=...}` after a later attach
-    /// resumes cleanly.
+    /// cause on a resume. Called once per attach, with `None` on every path but a
+    /// rebuild — a collector is reused across reattaches, so a cause left set by
+    /// an earlier attach would read as if this one had rebuilt.
     pub fn set_rebuild_cause(&self, cause: Option<&'static str>) {
         // Recover through poisoning, as `set_slot_name` does: an unrelated panic must
-        // not leave a rebuild unattributed in the analysis.
+        // not leave the last attach's decision unreadable.
         let mut guard = self
             .rebuild_cause
             .write()
@@ -543,7 +548,8 @@ impl Metrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-    /// Why this dataset's acceleration was rebuilt, or `None` when it resumed.
+    /// Why this dataset's acceleration was rebuilt on its last attach, or `None`
+    /// when it resumed. Not a metric — see the field for why it is recorded.
     #[must_use]
     pub fn rebuild_cause(&self) -> Option<&'static str> {
         // Recover through poisoning, as `slot_name` does.

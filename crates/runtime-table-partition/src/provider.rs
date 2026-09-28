@@ -95,6 +95,12 @@ pub struct PartitionTableProvider {
     partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
     schema: SchemaRef,
     insert_strategy: Arc<dyn InsertStrategy>,
+    /// Held for the whole of any write that stages more than one partition
+    /// before committing them. Each partition's writer holds that partition's
+    /// write lock from staging to commit, and a writer reaches partitions in the
+    /// order its input does, so two such writes running at once could each hold
+    /// a partition the other is waiting for.
+    write_coordinator: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl PartitionTableProvider {
@@ -216,7 +222,16 @@ impl PartitionTableProvider {
             partitions,
             schema,
             insert_strategy: Arc::new(DefaultInsertStrategy),
+            write_coordinator: Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// The lock a write that stages more than one partition must hold from its
+    /// first partition to its commit. Every such writer on this table shares it:
+    /// the insert strategy's coordinators and the accelerated dual-write path.
+    #[must_use]
+    pub fn write_coordinator(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.write_coordinator)
     }
 
     /// Sets a custom data insertion strategy for this [`PartitionTableProvider`].

@@ -56,6 +56,16 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
                 code: Some("invalid_request_error".to_string()),
             })))
         }
+        ResponsesApiSupport::EvaluateOnly { provider } => {
+            Some(openai_error_to_response(OpenAIError::ApiError(ApiError {
+                message: format!(
+                    "Model '{model_id}' uses provider '{provider}' which is evaluation-only and does not support the OpenAI Responses API or chat completions. Use POST /v1/evaluate instead."
+                ),
+                r#type: Some("invalid_request_error".to_string()),
+                param: Some("model".to_string()),
+                code: Some("invalid_request_error".to_string()),
+            })))
+        }
         ResponsesApiSupport::Unavailable => {
             let error_response = serde_json::json!({
                 "message": format!("model '{model_id}' is unavailable via /v1/responses"),
@@ -520,5 +530,38 @@ mod tests {
         );
         assert_eq!(body_json["param"].as_str(), Some("model"));
         assert_eq!(body_json["code"].as_str(), Some("service_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_only_provider_directs_to_evaluate() {
+        let response = responses_support_gate(
+            "jev_model",
+            &ResponsesApiSupport::EvaluateOnly {
+                provider: "typesafe".to_string(),
+            },
+        )
+        .expect("evaluate-only provider should produce an early response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body should be valid json");
+
+        assert_eq!(body_json["type"].as_str(), Some("invalid_request_error"));
+        assert_eq!(body_json["param"].as_str(), Some("model"));
+        let message = body_json["message"].as_str().expect("message");
+        assert!(
+            message.contains("/v1/evaluate"),
+            "message should direct callers to /v1/evaluate: {message}"
+        );
+        assert!(
+            !message.contains("/v1/chat/completions"),
+            "message must not suggest chat for evaluate-only providers: {message}"
+        );
     }
 }

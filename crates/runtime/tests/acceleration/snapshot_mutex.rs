@@ -64,6 +64,13 @@ impl DatasetCheckpointer for MockCheckpointer {
         Ok(None)
     }
 
+    async fn set_schema(
+        &self,
+        _schema: &arrow::datatypes::SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        Ok(())
+    }
+
     async fn last_checkpoint_time(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SystemTime>> {

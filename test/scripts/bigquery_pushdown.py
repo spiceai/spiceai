@@ -221,6 +221,45 @@ ORDER BY tok""",
 FROM union_values u
 WHERE u.value = 3
 ORDER BY u.value""",
+    # A recursive CTE that generates a series and joins it to a BigQuery table.
+    # BigQuery accepts `WITH RECURSIVE` only at the top level of a statement, so
+    # every layer between the plan and the driver has to leave it there: the
+    # unparser hoists it out of the derived table it plans into, and the ADBC
+    # schema fetch must not wrap the statement it is about to describe.
+    "recursive-cte-joined-to-a-table": """WITH RECURSIVE steps(n) AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT steps.n, COUNT(union_values.value) AS matches
+FROM steps
+LEFT JOIN union_values ON union_values.value = steps.n
+GROUP BY steps.n
+ORDER BY steps.n""",
+    "filtered-recursive-self-join": """WITH RECURSIVE steps AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT a.n, COUNT(union_values.value) AS matches
+FROM steps a
+JOIN steps b ON a.n = b.n
+JOIN union_values ON union_values.value = a.n
+WHERE a.n > 1 AND b.n < 3
+GROUP BY a.n
+ORDER BY a.n""",
+    # BigQuery has no ILIKE operator. The residual filter must run in spiced
+    # before LIMIT; pushing LIMIT into the scan would return id 1 (`alpha`),
+    # which the local filter removes, instead of the correct id 2 (`Upper`).
+    "ilike-before-limit-local": """SELECT id
+FROM ilike_values
+WHERE CAST(val AS VARCHAR) ILIKE 'u%'
+ORDER BY id
+LIMIT 1""",
+    "not-ilike-local": """SELECT id
+FROM ilike_values
+WHERE val NOT ILIKE 'u%'
+ORDER BY id""",
 }
 
 EXPECTED_ROWS = {
@@ -360,6 +399,17 @@ EXPECTED_ROWS = {
         {"tok": "c", "running": 3},
         {"tok": "d", "running": 4},
     ],
+    # `union_values` holds [1, 1, 2, 2, 3], so the generated series meets two
+    # rows at 1, two at 2 and one at 3.
+    "recursive-cte-joined-to-a-table": [
+        {"n": 1, "matches": 2},
+        {"n": 2, "matches": 2},
+        {"n": 3, "matches": 1},
+    ],
+    "filtered-recursive-self-join": [{"n": 2, "matches": 2}],
+    "ilike-before-limit-local": [{"id": 2}],
+    "not-ilike-local": [{"id": 1}, {"id": 3}],
+    "ilike-catalog-before-limit-local": [{"id": 2}],
 }
 
 
@@ -485,6 +535,16 @@ FROM UNNEST([
   STRUCT(5, CAST(NULL AS STRING), CAST(NULL AS STRING)),
   STRUCT(6, 'zzR03', '42')
 ]);
+
+CREATE OR REPLACE TABLE {prefix}.ilike_values` AS
+SELECT *
+FROM UNNEST([
+  STRUCT(1 AS id, 'alpha' AS val),
+  STRUCT(2, 'Upper'),
+  STRUCT(3, 'über'),
+  STRUCT(4, CAST(NULL AS STRING)),
+  STRUCT(5, 'under_score')
+]);
 """
 
 
@@ -516,6 +576,16 @@ datasets:
     params: *bigquery_params
   - from: adbc:temporal_values
     name: temporal_values
+    params: *bigquery_params
+  - from: adbc:ilike_values
+    name: ilike_values
+    params: *bigquery_params
+
+catalogs:
+  - from: adbc
+    name: bigquery_catalog
+    include:
+      - '{dataset}.ilike_values'
     params: *bigquery_params
 """
 
@@ -565,7 +635,7 @@ def wait_until_ready(
     )
 
 
-def initial_physical_sql(explain_body: str) -> str:
+def initial_physical_plan(explain_body: str) -> str:
     plans = json.loads(explain_body)
     plan = next(
         (
@@ -575,7 +645,14 @@ def initial_physical_sql(explain_body: str) -> str:
         ),
         None,
     )
-    if plan is None or "base_sql=" not in plan:
+    if plan is None:
+        raise HarnessError("EXPLAIN VERBOSE did not contain an initial physical plan")
+    return plan
+
+
+def initial_physical_sql(explain_body: str) -> str:
+    plan = initial_physical_plan(explain_body)
+    if "base_sql=" not in plan:
         raise HarnessError(
             "EXPLAIN VERBOSE did not contain an initial physical base_sql plan"
         )
@@ -609,6 +686,25 @@ def pushed_statement_count(explain_body: str) -> int:
 
 
 def assert_generated_sql(name: str, sql: str) -> None:
+    if name in {
+        "ilike-before-limit-local",
+        "not-ilike-local",
+        "ilike-catalog-before-limit-local",
+    }:
+        upper = sql.upper()
+        if re.search(r"\b(?:NOT\s+)?ILIKE\b", upper):
+            raise HarnessError(f"ILIKE leaked into BigQuery SQL: {sql}")
+        if "`ID`" not in upper or "`VAL`" not in upper:
+            raise HarnessError(
+                f"the local ILIKE residual did not fetch both id and val: {sql}"
+            )
+        if name in {
+            "ilike-before-limit-local",
+            "ilike-catalog-before-limit-local",
+        } and "LIMIT" in upper:
+            raise HarnessError(
+                f"LIMIT ran remotely before the local ILIKE residual: {sql}"
+            )
     if name == "date-difference":
         if "DATE_DIFF(" not in sql or re.search(r"`d` - `e`|`e` - `d`", sql):
             raise HarnessError(
@@ -729,6 +825,46 @@ def assert_generated_sql(name: str, sql: str) -> None:
             raise HarnessError(
                 f"{name} binds as one SELECT for BigQuery, so it must not be scoped: {sql}"
             )
+    if name in {"recursive-cte-joined-to-a-table", "filtered-recursive-self-join"}:
+        if not sql.lstrip().upper().startswith("WITH RECURSIVE"):
+            raise HarnessError(
+                f"the recursive CTE is not at the top level of the pushed statement, "
+                f"which is the only place BigQuery accepts one: {sql}"
+            )
+        if sql.upper().count("WITH RECURSIVE") != 1:
+            raise HarnessError(
+                f"the recursive CTE was hoisted more than once, so BigQuery is asked "
+                f"to define the same name twice: {sql}"
+            )
+
+
+def assert_physical_plan(name: str, plan: str) -> None:
+    if name not in {
+        "ilike-before-limit-local",
+        "not-ilike-local",
+        "ilike-catalog-before-limit-local",
+    }:
+        return
+    upper = plan.upper()
+    filter_position = upper.find("FILTEREXEC")
+    remote_position = upper.find("BASE_SQL=")
+    if filter_position < 0 or remote_position < 0 or filter_position > remote_position:
+        raise HarnessError(
+            f"ILIKE must remain in a local filter above the BigQuery scan:\n{plan}"
+        )
+    if re.search(r"\b(?:NOT\s+)?ILIKE\b", upper) is None:
+        raise HarnessError(f"the local filter no longer contains ILIKE:\n{plan}")
+    if name in {
+        "ilike-before-limit-local",
+        "ilike-catalog-before-limit-local",
+    }:
+        limit_position = upper.find("GLOBALLIMITEXEC")
+        if limit_position < 0:
+            limit_position = upper.find("FETCH=1")
+        if limit_position < 0 or limit_position > filter_position:
+            raise HarnessError(
+                f"LIMIT must remain local above the ILIKE filter:\n{plan}"
+            )
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -788,6 +924,7 @@ def main() -> int:
     dataset_ref = bigquery.Dataset(f"{project}.{dataset}")
     dataset_ref.location = location
     dataset_ref.labels = {"purpose": "spice-bigquery-pushdown"}
+    dataset_ref.default_table_expiration_ms = 86_400_000
     created_dataset = False
     succeeded = False
     process: subprocess.Popen[bytes] | None = None
@@ -846,17 +983,30 @@ def main() -> int:
                 "false",
                 str(pod_path),
             ],
-            cwd=ROOT,
+            cwd=output,
             env=environment,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
         wait_until_ready(process, http_port, timeout=180)
 
+        queries = dict(QUERIES)
+        queries["ilike-catalog-before-limit-local"] = f"""SELECT id
+FROM bigquery_catalog.{dataset}.ilike_values
+WHERE CAST(val AS VARCHAR) ILIKE 'u%'
+ORDER BY id
+LIMIT 1"""
+
         generated_sql: dict[str, str] = {}
-        for name, query in QUERIES.items():
+        executions: dict[str, dict[str, str]] = {}
+        for name, query in queries.items():
             (output / f"{name}.sql").write_text(query + ";\n", encoding="utf-8")
+            query_started = datetime.now(timezone.utc)
             status, headers, body = http_sql(http_port, query)
+            executions[name] = {
+                "started": query_started.isoformat(),
+                "ended": datetime.now(timezone.utc).isoformat(),
+            }
             write_json(output / f"{name}.headers.json", headers)
             (output / f"{name}.body").write_text(body, encoding="utf-8")
             if status != 200:
@@ -879,30 +1029,27 @@ def main() -> int:
             statements = pushed_statement_count(explain_body)
             if statements != 1:
                 raise HarnessError(
-                    f"{name} reaches BigQuery as {statements} statements, not one; "
-                    f"every extra one is another BigQuery job:\n{explain_body[:2000]}"
+                    f"{name} reaches BigQuery as {statements} statements, not one:\n"
+                    f"{explain_body[:2000]}"
                 )
+            assert_physical_plan(name, initial_physical_plan(explain_body))
             pushed_sql = initial_physical_sql(explain_body)
             assert_generated_sql(name, pushed_sql)
             generated_sql[name] = pushed_sql
             print(f"{name}: ok ({statements} statement)")
 
         write_json(output / "generated-sql.json", generated_sql)
+        write_json(output / "executions.json", executions)
         jobs = []
         for job in sorted(
-            client.list_jobs(min_creation_time=started, max_results=100),
+            client.list_jobs(min_creation_time=started),
             key=lambda item: item.created,
         ):
             query = getattr(job, "query", None)
-            if query and not any(
-                table in query
-                for table in (
-                    "union_values",
-                    "json_values",
-                    "window_values",
-                    "regexp_values",
-                    "bucket_values",
-                )
+            default_dataset = getattr(job, "default_dataset", None)
+            if not query or (
+                dataset not in query
+                and (default_dataset is None or default_dataset.dataset_id != dataset)
             ):
                 continue
             jobs.append(
@@ -913,9 +1060,21 @@ def main() -> int:
                     "state": job.state,
                     "error_result": job.error_result,
                     "query": query,
+                    "default_dataset": str(default_dataset) if default_dataset else None,
                 }
             )
         write_json(output / "bigquery-jobs.json", jobs)
+        counts = {
+            name: [
+                job["job_id"] for job in jobs
+                if execution["started"] <= job["created"] <= execution["ended"]
+            ]
+            for name, execution in executions.items()
+        }
+        write_json(output / "query-job-ids.json", counts)
+        for name, job_ids in counts.items():
+            if len(job_ids) != 1:
+                raise HarnessError(f"{name} created {len(job_ids)} BigQuery jobs: {job_ids}")
         succeeded = True
         print(f"PASS evidence={output}")
         return 0

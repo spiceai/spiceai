@@ -25,6 +25,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::duckdb::with_utc_session_timezone;
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -97,7 +98,7 @@ impl DuckDB {
     ///
     /// Returns an error if the in-memory `DuckDB` connection cannot be established.
     pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
+        let pool = Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
@@ -109,7 +110,7 @@ impl DuckDB {
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        );
+        ));
 
         Ok(Self::with_spice_deny_list(
             DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
@@ -122,7 +123,7 @@ impl DuckDB {
     ///
     /// Returns an error if the file-based `DuckDB` connection cannot be established.
     pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(
+        let pool = Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
@@ -134,7 +135,7 @@ impl DuckDB {
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        );
+        ));
 
         Ok(Self::with_spice_deny_list(
             DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),

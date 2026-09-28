@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn error_fields_handles_truncated_payload() {
         // Missing null terminator for value
-        let payload = [b'M', b'h', b'e', b'l', b'l', b'o'];
+        let payload = *b"Mhello";
         let fields = ErrorFields::parse(&payload);
         // Should not panic, just skip incomplete field
         assert!(fields.message.is_none());

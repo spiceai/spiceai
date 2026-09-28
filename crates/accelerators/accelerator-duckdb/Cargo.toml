@@ -62,6 +62,7 @@ tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["duckdb", "test-support"] }
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+datafusion-spark.workspace = true
 
 [lints]
 workspace = true

@@ -25,7 +25,10 @@ limitations under the License.
 use crate::identity::push_identity_fields;
 use crate::nested_connection::{NestedConnection, fan_out, flatten_login, flatten_member};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext, Result, client::UnnestBehavior};
+use connector_graphql::graphql::{
+    ErrorChecker, GraphQLContext, Result,
+    client::{NestedConnectionPager, UnnestBehavior},
+};
 use data_connector_api::ConnectorComponent;
 use serde_json::Value;
 use std::sync::Arc;
@@ -53,11 +56,20 @@ const REVIEWS_CONNECTION: NestedConnection<'static> = NestedConnection {
 /// well below the 100 GitHub allows to keep a single response a sane size.
 const PULL_REQUESTS_PAGE_SIZE: u32 = 25;
 
-/// Reviews fetched per pull request. 100 is GitHub's per-connection maximum and
-/// a nested connection cannot be paginated, so a pull request with more reviews
-/// than this has reviews the scan cannot reach, so the fan-out fails by name rather
-/// than returning a partial set.
+/// Reviews fetched per pull request. 100 is GitHub's per-connection maximum.
+/// Remaining reviews are loaded via `node(id:)` follow-up pages.
 const REVIEWS_PER_PULL_REQUEST: u32 = 100;
+
+const REVIEW_NODE_SELECTION: &str = r"
+    id
+    state
+    body
+    url
+    submitted_at: submittedAt
+    author_association: authorAssociation
+    author { login }
+    commit { oid }
+";
 
 // https://docs.github.com/en/graphql/reference/objects#pullrequestreview
 #[derive(Debug)]
@@ -79,9 +91,7 @@ impl GraphQLContext for ReviewsTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (pullRequests) + 100 (reviews per pull request)
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1 + REVIEWS_PER_PULL_REQUEST)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -108,15 +118,12 @@ impl GitHubTableArgs for ReviewsTableArgs {
                             {pull_request_number}: number
                             reviews(first: {reviews_per_pull_request}) {{
                                 totalCount
+                                pageInfo {{
+                                    hasNextPage
+                                    endCursor
+                                }}
                                 nodes {{
-                                    id
-                                    state
-                                    body
-                                    url
-                                    submitted_at: submittedAt
-                                    author_association: authorAssociation
-                                    author {{ login }}
-                                    commit {{ oid }}
+                                    {review_node_selection}
                                 }}
                             }}
                         }}
@@ -129,6 +136,7 @@ impl GitHubTableArgs for ReviewsTableArgs {
             reviews_per_pull_request = REVIEWS_PER_PULL_REQUEST,
             pull_request_id = PULL_REQUEST_ID_KEY,
             pull_request_number = PULL_REQUEST_NUMBER_KEY,
+            review_node_selection = REVIEW_NODE_SELECTION,
         );
 
         let owner = self.owner.clone();
@@ -145,6 +153,13 @@ impl GitHubTableArgs for ReviewsTableArgs {
             })),
             Some(gql_schema()),
         )
+        .with_nested_pager(NestedConnectionPager {
+            connection_key: "reviews",
+            parent_id_key: PULL_REQUEST_ID_KEY,
+            type_condition: "PullRequest",
+            node_selection: REVIEW_NODE_SELECTION,
+            page_size: REVIEWS_PER_PULL_REQUEST,
+        })
     }
 }
 
@@ -218,6 +233,11 @@ mod tests {
     }
 
     #[test]
+    fn query_requests_page_info_so_overflow_reviews_can_be_paginated() {
+        crate::test_util::assert_nested_pager_wired(&args().get_graphql_values(), "reviews(first:");
+    }
+
+    #[test]
     fn unnest_flattens_a_pull_request_into_one_row_per_review() {
         let params = args().get_graphql_values();
         let UnnestBehavior::Custom(unnest) = &params.unnest_behavior else {
@@ -266,6 +286,35 @@ mod tests {
         assert_eq!(rows[1]["commit_sha"], serde_json::Value::Null);
     }
 
+    /// GitHub returns `nodes: null` rather than `[]` for some resources, and the
+    /// `pageInfo` this query now selects says nothing about whether the page's
+    /// nodes arrived. Emitting no rows for a pull request that reported 110
+    /// reviews would leave every count over it short with nothing to say so.
+    #[test]
+    fn unnest_fails_when_a_terminal_page_reports_reviews_but_returns_no_node_list() {
+        let params = args().get_graphql_values();
+        let UnnestBehavior::Custom(unnest) = &params.unnest_behavior else {
+            panic!("reviews must fan out its rows with a custom unnest");
+        };
+
+        let error = unnest(&json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 13435,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor"},
+                "nodes": null
+            }
+        }))
+        .expect_err("a page reporting 110 reviews and returning none must fail the scan");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("110") && message.contains("pull request '13435'"),
+            "the error must name the pull request and the count it reported, got: {message}"
+        );
+    }
+
     #[test]
     fn every_emitted_key_is_declared_in_the_schema() {
         // A key the schema does not declare is silently dropped by the Arrow JSON
@@ -297,11 +346,12 @@ mod tests {
 
     #[test]
     fn query_cost_stays_within_the_github_secondary_rate_limit_burst() {
-        // The rate controller's weighted quota is 2000 points per minute; a cost
-        // above the burst capacity fails the acquire outright instead of waiting.
         let cost = args()
             .query_cost()
             .expect("reviews to declare a query cost");
-        assert!(cost <= 2000, "reviews query cost {cost} exceeds the burst");
+        assert_eq!(
+            cost,
+            crate::rate_limit::GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
+        );
     }
 }

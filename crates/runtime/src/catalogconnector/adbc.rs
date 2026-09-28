@@ -44,6 +44,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
+use runtime_datafusion::function_support::bigquery_can_evaluate_expression;
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
@@ -52,6 +53,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub const PREFIX: &str = "adbc";
+const BIGQUERY_DRIVER: &str = "bigquery";
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("driver")
@@ -184,7 +186,8 @@ impl CatalogConnector for AdbcCatalog {
                 }
             })?;
 
-        let table_factory = build_table_factory(Arc::clone(&pool), federation_enabled);
+        let table_factory =
+            build_table_factory(Arc::clone(&pool), federation_enabled, &driver_name);
 
         let provider = Arc::new(AdbcCatalogProvider::new(
             pool,
@@ -207,7 +210,8 @@ impl CatalogConnector for AdbcCatalog {
 }
 
 /// Builds the [`AdbcTableFactory`] for a catalog, with the Spice function
-/// deny-list installed and the `query_federation` setting applied.
+/// deny-list, driver-specific expression restrictions, and the
+/// `query_federation` setting applied.
 ///
 /// A bare `AdbcTableFactory::new(pool)` federates unconditionally and installs
 /// no deny-list, so every Spice-only UDF — `json_get_str` and the rest of the
@@ -215,7 +219,9 @@ impl CatalogConnector for AdbcCatalog {
 /// unparsed verbatim into the SQL sent to the remote database, which has no
 /// such function and answers with an unknown-function error. Installing the
 /// deny-list makes the table's `can_execute_plan` refuse those plans so
-/// `DataFusion` evaluates the affected expressions locally instead.
+/// `DataFusion` evaluates the affected expressions locally instead. The exact
+/// lowercase `bigquery` driver also rejects case-insensitive `LIKE`, which
+/// `GoogleSQL` cannot evaluate.
 ///
 /// This mirrors the ADBC *dataset* connector's `build_table_factory`; see
 /// issues #10703 and #13664.
@@ -231,6 +237,7 @@ impl CatalogConnector for AdbcCatalog {
 pub fn build_table_factory<D>(
     pool: Arc<ADBCPool<D>>,
     federation_enabled: bool,
+    driver_name: &str,
 ) -> AdbcTableFactory<D>
 where
     D: adbc_core::Database + Send + 'static,
@@ -238,9 +245,16 @@ where
     <D::ConnectionType as adbc_core::Connection>::StatementType:
         datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
+    let function_support = deny_spice_functions_for_table_providers();
+    let function_support = match driver_name {
+        BIGQUERY_DRIVER => {
+            function_support.with_expression_support(Arc::new(bigquery_can_evaluate_expression))
+        }
+        _ => function_support,
+    };
     AdbcTableFactory::new(pool)
         .with_federation_enabled(federation_enabled)
-        .with_function_support(deny_spice_functions_for_table_providers())
+        .with_function_support(function_support)
 }
 
 /// Maximum number of concurrent ADBC table provider creation tasks during catalog discovery.

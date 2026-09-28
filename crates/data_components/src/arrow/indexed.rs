@@ -1063,6 +1063,35 @@ impl ExecutionPlan for IndexedLookupExec {
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+
+    /// An exact row count: a primary-key probe returns the one row it matched or
+    /// nothing at all, and `output_rows` is set from that outcome at
+    /// construction, so `Precision::Exact` is provable here rather than an
+    /// estimate.
+    ///
+    /// It has to be reported for the optimizer to act on it. `EnforceDistribution`
+    /// decides whether round-robin repartitioning is worthwhile from
+    /// `partition_statistics().num_rows`, and reads `Precision::Absent` as
+    /// "worthwhile" — so a plan that does not answer fans a single-row scan
+    /// across every partition, paying task spawns at execution and extra
+    /// planning time in each pass that walks the larger tree.
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Arc<datafusion::common::Statistics>> {
+        if let Some(idx) = partition {
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return Err(DataFusionError::Internal(format!(
+                    "Invalid partition index {idx}, the partition count is {partition_count}"
+                )));
+            }
+        }
+
+        let mut statistics = datafusion::common::Statistics::new_unknown(&self.schema);
+        statistics.num_rows = datafusion::common::stats::Precision::Exact(self.output_rows);
+        Ok(Arc::new(statistics))
+    }
 }
 
 #[cfg(test)]
@@ -1735,6 +1764,62 @@ mod tests {
         SessionContext::new_with_config(
             datafusion::prelude::SessionConfig::new().with_target_partitions(4),
         )
+    }
+
+    /// A primary-key probe knows its own cardinality, and the optimizer relies
+    /// on it: see `partition_statistics` on `IndexedLookupExec`.
+    #[tokio::test]
+    async fn test_indexed_lookup_reports_exact_row_count() {
+        let batch = create_large_test_batch(300);
+        let table = create_test_indexed_table_force_index(
+            batch.schema(),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        for (id, expected) in [(7_i64, 1_usize), (30_000_i64, 0_usize)] {
+            let filter = col("id").eq(lit(id));
+            let plan = table
+                .scan(&session_state, None, std::slice::from_ref(&filter), None)
+                .await
+                .expect("scan");
+            let stats = plan.partition_statistics(None).expect("statistics");
+            assert_eq!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Exact(expected),
+                "id = {id} should report exactly {expected} row(s)"
+            );
+        }
+    }
+
+    /// The reason the row count above is worth reporting: without it
+    /// `EnforceDistribution` repartitions a single-row scan across every
+    /// partition.
+    #[tokio::test]
+    async fn test_point_lookup_plan_has_no_repartition() {
+        let batch = create_large_test_batch(300);
+        let table = create_test_indexed_table_force_index(
+            batch.schema(),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+        ctx.register_table("test_table", Arc::new(table))
+            .expect("failed to register");
+
+        let plan = explain_plan(&ctx, "SELECT * FROM test_table WHERE id = 7").await;
+        assert!(
+            plan.contains("IndexedLookupExec"),
+            "expected the primary-key probe to survive planning. Got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("RepartitionExec"),
+            "a single-row probe should not be repartitioned across partitions. Got:\n{plan}"
+        );
     }
 
     async fn explain_plan(ctx: &SessionContext, sql: &str) -> String {

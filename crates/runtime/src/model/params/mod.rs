@@ -35,6 +35,7 @@ pub mod google;
 pub mod huggingface;
 pub mod openai;
 pub mod spiceai;
+pub mod typesafe;
 pub mod xai;
 
 use std::sync::LazyLock;
@@ -58,6 +59,7 @@ source_specs!(XAI_SPEC, xai::XaiModelParams);
 source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
 source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
 source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
+source_specs!(TYPESAFE_SPEC, typesafe::TypeSafeModelParams);
 
 /// Returns the parameter specifications for a given model source, generated
 /// from that source's `#[derive(TypedParams)]` struct (the single source of
@@ -76,6 +78,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
         ModelSource::Bedrock => &BEDROCK_SPEC,
         ModelSource::SpiceAI => &SPICEAI_SPEC,
         ModelSource::Google => &GOOGLE_SPEC,
+        ModelSource::TypeSafe => &TYPESAFE_SPEC,
     }
 }
 
@@ -144,17 +147,19 @@ mod tests {
         );
     }
 
+    /// Regression test for #13932: `hf_token` is the documented key, shared with
+    /// the embeddings and reranker components.
     #[tokio::test]
-    async fn huggingface_accepts_prefixed_token_and_runtime_model_type() {
+    async fn huggingface_accepts_hf_token_and_runtime_model_type() {
         let typed = huggingface::HuggingFaceModelParams::try_from_params(
             "model huggingface",
-            params(&[("huggingface_token", "hf_abc"), ("model_type", "llama")]),
+            params(&[("hf_token", "hf_abc"), ("model_type", "llama")]),
             &empty_secrets(),
         )
         .await
         .expect("huggingface params should deserialize");
         assert_eq!(
-            typed.token.as_ref().map(ExposeSecret::expose_secret),
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
             Some("hf_abc")
         );
         assert_eq!(typed.model_type.as_deref(), Some("llama"));
@@ -162,6 +167,75 @@ mod tests {
             typed.distributed_backend,
             llms::chat::DistributedBackendSetting::None
         );
+    }
+
+    #[tokio::test]
+    async fn huggingface_accepts_huggingface_token_alias() {
+        let typed = huggingface::HuggingFaceModelParams::try_from_params(
+            "model huggingface",
+            params(&[("huggingface_token", "hf_abc")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+    }
+
+    #[test]
+    fn huggingface_spec_advertises_hf_token() {
+        // The schema generator renders this spec list, so the key it advertises
+        // must be the key `try_from_params` reads.
+        let specs = get_params_spec(&ModelSource::HuggingFace);
+        let token = specs
+            .iter()
+            .find(|s| s.name == "hf_token")
+            .expect("spec for hf_token");
+        assert_eq!(token.r#type, ParameterType::Runtime);
+        assert!(
+            specs.iter().all(|s| s.name != "token"),
+            "only one spec may render to the `hf_token` key"
+        );
+    }
+
+    /// `construct_model` and the responses API read the prefixed passthrough
+    /// overrides (`{prefix}_temperature`, `{prefix}_tools`, …) through
+    /// `get_openai_request_overrides(component, source.short_name())`, while
+    /// `try_from_params` consumes them under the struct's `prefix`. When the two
+    /// disagree, an override spelled the documented way is warned about as unknown
+    /// and one spelled the struct's way is consumed but never applied (#13932).
+    #[test]
+    fn model_param_prefixes_match_the_source_short_name() {
+        for (source, prefix) in [
+            (ModelSource::OpenAi, openai::OpenAiModelParams::PREFIX),
+            (ModelSource::Azure, azure::AzureModelParams::PREFIX),
+            (ModelSource::File, file::FileModelParams::PREFIX),
+            (
+                ModelSource::Databricks,
+                databricks::DatabricksModelParams::PREFIX,
+            ),
+            (
+                ModelSource::HuggingFace,
+                huggingface::HuggingFaceModelParams::PREFIX,
+            ),
+            (
+                ModelSource::Anthropic,
+                anthropic::AnthropicModelParams::PREFIX,
+            ),
+            (ModelSource::Xai, xai::XaiModelParams::PREFIX),
+            (ModelSource::Bedrock, bedrock::BedrockModelParams::PREFIX),
+            (ModelSource::SpiceAI, spiceai::SpiceAiModelParams::PREFIX),
+            (ModelSource::Google, google::GoogleModelParams::PREFIX),
+            (ModelSource::TypeSafe, typesafe::TypeSafeModelParams::PREFIX),
+        ] {
+            assert_eq!(
+                prefix,
+                source.short_name(),
+                "params struct prefix for {source:?} must match the source short name"
+            );
+        }
     }
 
     #[tokio::test]

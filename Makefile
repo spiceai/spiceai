@@ -149,6 +149,22 @@ endif
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
+#
+# `spiced`'s `dependency_logging` uses a loopback S3 endpoint to exercise
+# Iceberg retries through the runtime's dependency logger without credentials.
+# Select it explicitly so the gate checks the diagnostic emitted by the pinned
+# storage dependency as well as the formatter's unit tests.
+#
+# `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
+# name for the same reason: each stands a local one-shot HTTP server up on an
+# ephemeral port and drives a provider adapter against it, so they exercise the
+# real client's error mapping with no credentials and no external service.
+# `model2vec_hf_cache` is selected for a different reason: it is its own binary
+# because it sets a process-wide environment variable, which is only sound with
+# one test in the process.
+# `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
+# provider APIs and needs a `.env`, so it stays in the nightly gate.
+#
 # `--features` here, not a per-crate default, because the result-correctness
 # lanes are the only reason the gate links an engine at all. Cargo skips a test
 # target whose `required-features` are unmet *without saying so*, so before this
@@ -173,7 +189,25 @@ endif
 # one did not run.
 NEXTEST_SELECTION := --all --exclude libnfs \
 	--features cayenne/result-correctness-duckdb
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
+# `spice-substrait-compliance` is a binary crate: its unit tests, including the
+# fork-ledger guards (docs/dev/fork_patches.md), live in its bin target, which
+# `kind(=lib)` does not select. `testoperator` is the same: the dispatch-file
+# oracle guard lives in its bin tests. nextest's `test(=…)` is an exact match
+# on the rustc `--test` name, which is module-qualified
+# (`commands::tests::…`); the leaf name matches nothing and would leave
+# `make nextest` green after a dispatch dropped validation.
+#
+# The last three are fork-ledger guards as well, in integration-test targets
+# `kind(=lib)` cannot reach, and they ran nowhere before being named here:
+# `json_semantics` holds the three `datafusion-functions-json` guards,
+# `adbc_cancellation` the one guard shared by the `arrow-adbc` fork PR #4 and #65
+# rows, and `cpu_budget` the guard for vortex's `set_available_parallelism` —
+# six ledger rows across the three. Each is self-contained — a fake
+# in-process ADBC driver, a spicepod written to a temp dir, arrow built in
+# memory — needing no credentials and no service, and `--all --tests` compiles
+# all three whether or not they are selected, so leaving them out saved only the
+# seconds of running them and cost the coverage the ledger claimed.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin)) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -325,6 +359,10 @@ lint-rust:
 	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
 	$(PYTHON) scripts/test_check_fork_patches.py
 	$(PYTHON) scripts/check_fork_patches.py
+	## MySQL bench-loader NULL guard (fast, no compile): a pipe-delimited bench file spells NULL as an empty field, which MySQL's LOAD DATA reads as 0 unless it is rendered as `\N` first
+	## Its parser is exercised first, together with the transform itself: nothing else in CI executes that sed program, and a guard matching no loader would report success
+	$(PYTHON) scripts/test_check_bench_mysql_load_nulls.py
+	$(PYTHON) scripts/check_bench_mysql_load_nulls.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \

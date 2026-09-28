@@ -17,6 +17,7 @@ limitations under the License.
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{Array, UInt64Array};
 use datafusion::arrow::compute;
+use datafusion::catalog::TableProvider;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::ColumnarValue;
@@ -259,6 +260,37 @@ impl ExecutionPlan for PartitionerExec {
                                 "failed to send a RecordBatch to a partition".into(),
                             )
                         })?;
+                    }
+                }
+
+                // An overwrite replaces the whole table, so a partition the input
+                // never reached is overwritten with nothing — otherwise its
+                // previous rows stay visible. With an empty input, that is every
+                // partition.
+                if insert_op == InsertOp::Overwrite {
+                    let unreached: Vec<Arc<dyn TableProvider>> = partition_providers
+                        .read()
+                        .await
+                        .iter()
+                        .filter(|(key, _)| !partition_senders.contains_key(key.as_str()))
+                        .map(|(_, partition)| Arc::clone(&partition.table_provider))
+                        .collect();
+                    for provider in unreached {
+                        // Closing the only sender ends the partition's input at once.
+                        let (_, rx) = channel(1);
+                        let state = ctx.state();
+                        let context = Arc::clone(&context);
+                        let exec = PartitionInputExec::new(rx, Arc::clone(&schema));
+                        handles.push(tokio::spawn(async move {
+                            let plan = provider
+                                .insert_into(&state, Arc::new(exec), InsertOp::Overwrite)
+                                .await?;
+                            let mut stream = execute_stream(plan, context)?;
+                            while let Some(batch) = stream.next().await {
+                                batch?;
+                            }
+                            Result::<(), DataFusionError>::Ok(())
+                        }));
                     }
                 }
 

@@ -815,10 +815,9 @@ fn oauth_host(host: &str) -> Option<String> {
 
     if let Some(api_index) = labels.iter().position(|label| *label == "api") {
         labels.remove(api_index);
-    } else if let Some(label) = labels.iter_mut().find(|label| label.ends_with("-api")) {
-        *label = label.trim_end_matches("-api");
     } else {
-        return None;
+        let label = labels.iter_mut().find(|label| label.ends_with("-api"))?;
+        *label = label.trim_end_matches("-api");
     }
 
     let rewritten_host = labels.join(".");

@@ -246,6 +246,12 @@ impl FileBasedDeletionSink {
         let mut retired_cache_paths = HashSet::new();
         let mut delete_error = None;
 
+        if !eligible_files.is_empty() {
+            // The write lock and listing fence keep new captures out until the
+            // deletion finishes. Reject cached views before unlinking any file.
+            self.provider.invalidate_scan_views_before_file_removal();
+        }
+
         for (meta, num_rows) in eligible_files {
             let row_count = num_rows.unwrap_or(0);
             let Ok(rows) = u64::try_from(row_count) else {

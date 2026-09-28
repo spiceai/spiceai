@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
-use cayenne::CayennePartitionCreator;
+use cayenne::{CayennePartitionCreator, ScanViewReuse};
 // The by-name half of the metastore-collision check is shared with the Cayenne catalog
 // connector, so both configuration surfaces refuse the same overlap. The delete-path
 // half — a metastore on disk that no parameter names — stays in this file, beside the
@@ -52,7 +52,7 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use data_accelerator_api::snapshots::{download_snapshot, should_download_snapshot};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -752,43 +752,46 @@ fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bo
     true
 }
 
-/// Default read-current freshness (bounded staleness), in ms, for a READ-ONLY Cayenne
-/// CDC replica (`access: read` + `refresh_mode: changes`). Such a replica's data
-/// streams in only via CDC and is eventually-consistent by design, so a scan need not
-/// be read-your-writes; serving a recently-built `ScanView` within this lag lets
-/// concurrent analytical scans share one build (the demand cache's reuse lever) while
-/// staying far inside the freshness SLO. Every other table uses 0 (read-your-writes):
-/// read-write datasets, and read-only NON-CDC tables (full-refresh/snapshot/append),
-/// which must reflect their last refresh immediately and can still take a direct
-/// `delete_from` via the accelerator. 1 s is a conservative bounded-staleness default,
-/// far inside the freshness SLO; tune as the A/B data lands.
-const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
+/// Default `WithinLag` for `refresh_mode: changes`, in milliseconds.
+const DEFAULT_CHANGES_SCAN_VIEW_LAG_MS: u64 = 1000;
 
-/// The read-current lag applied to a READ-ONLY Cayenne CDC replica:
-/// [`DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS`], overridable via the
-/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` environment variable (a process-wide operational
-/// knob, not per-table data config, so it stays out of `configuration_matches`).
-/// Setting it to `0` opts CDC replicas back into read-your-writes (the A/B no-reuse
-/// baseline). Never affects any other table, which always uses 0.
-///
-/// Parsed once into a process-global `LazyLock`: the env var is a process-wide knob, so
-/// caching avoids re-parsing on every provider/partition construction AND emits the
-/// invalid-value warning at most once (rather than per construction).
-fn read_only_scan_freshness() -> std::time::Duration {
-    static READ_ONLY_SCAN_FRESHNESS: LazyLock<std::time::Duration> = LazyLock::new(|| {
+/// Process-wide `WithinLag` for **read-only** `refresh_mode: changes`, from
+/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` (default [`DEFAULT_CHANGES_SCAN_VIEW_LAG_MS`];
+/// `0` recaptures every scan). Cached so the env var is parsed — and an invalid
+/// value warned — once per process. Writable `changes` datasets (write-back)
+/// do not use this lag — see [`scan_view_reuse_for`].
+fn changes_scan_view_lag() -> Duration {
+    static CHANGES_SCAN_VIEW_LAG: LazyLock<Duration> = LazyLock::new(|| {
         let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
-            Err(_) => DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS,
+            Err(_) => DEFAULT_CHANGES_SCAN_VIEW_LAG_MS,
             // A set-but-invalid value is a misconfiguration; warn (don't silently
             // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
             // escapes control characters so untrusted input cannot inject log lines.
             Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
-                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
-                DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
+                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms.");
+                DEFAULT_CHANGES_SCAN_VIEW_LAG_MS
             }),
         };
-        std::time::Duration::from_millis(ms)
+        Duration::from_millis(ms)
     });
-    *READ_ONLY_SCAN_FRESHNESS
+    *CHANGES_SCAN_VIEW_LAG
+}
+
+/// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
+/// replicas that batch applies). Everything else — `full` / `append` /
+/// `snapshot` / `caching`, and **writable** `changes` (write-back UPDATE/DML)
+/// — is [`ScanViewReuse::UntilInvalidated`], so a mutation cannot read a
+/// lag-cached view of its own table.
+fn scan_view_reuse_for(source: &dyn AccelerationSource) -> ScanViewReuse {
+    let is_readonly_changes = !source.allows_write()
+        && source.acceleration().is_some_and(|acceleration| {
+            resolved_refresh_mode(source, acceleration) == RefreshMode::Changes
+        });
+    if is_readonly_changes {
+        ScanViewReuse::WithinLag(changes_scan_view_lag())
+    } else {
+        ScanViewReuse::UntilInvalidated
+    }
 }
 
 /// How a dataset's refresh mode writes to its Cayenne table. The three shapes want
@@ -1090,9 +1093,13 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
         // live — which is the same loss as a catalog directly inside the directory, and
         // is refused the same way.
         Ok(metadata) if metadata.is_symlink() => match tokio::fs::canonicalize(data_dir).await {
-            Ok(resolved) if resolved.is_dir() => resolved,
-            // Dangling, or naming a file: no catalog is reachable through it.
-            Ok(_) => return Ok(None),
+            Ok(resolved) => match tokio::fs::metadata(&resolved).await {
+                Ok(resolved_meta) if resolved_meta.is_dir() => resolved,
+                // Dangling, or naming a file: no catalog is reachable through it.
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         },
@@ -1184,6 +1191,13 @@ async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>
         }
     }
     Ok(None)
+}
+
+/// Async equivalent of [`Path::exists`]: `true` only when the path is present.
+/// I/O errors (including permission denied) are `false`, matching `Path::exists`,
+/// so converting the accelerator's existence gates does not change who proceeds.
+async fn path_exists(path: impl AsRef<Path>) -> bool {
+    matches!(tokio::fs::try_exists(path).await, Ok(true))
 }
 
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
@@ -1453,7 +1467,7 @@ impl CayenneAccelerator {
     /// proof describe a different tree from the one that gets deleted: `is_local_path` is
     /// a substring test, so a local directory whose name merely contains `://` would be
     /// waved through while `remove_dir_all` still walked it; and `remove_dir_all` — like
-    /// the `exists()` test each delete is gated on — is handed the string itself. A path that
+    /// the existence test each delete is gated on — is handed the string itself. A path that
     /// is genuinely remote is simply absent from the filesystem, and the walk answers
     /// `None` for it at the cost of one `stat`.
     async fn ensure_no_catalog_under_data_dir(
@@ -1976,11 +1990,8 @@ impl CayenneAccelerator {
                     config.cold_tier_location = Some(loc.to_string());
                 }
             }
-            if let Some(cols) = acceleration
-                .params
-                .get("cayenne_datalake_clustering_columns")
-            {
-                config.cold_clustering_columns = cols
+            if let Some(cols) = acceleration.params.get("cayenne_cluster_by") {
+                config.cluster_by = cols
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -2411,15 +2422,16 @@ impl CayenneAccelerator {
         Ok(Arc::new(transformed_schema))
     }
 
-    fn ensure_directory(dir_path: &str) -> Result<PathBuf> {
+    async fn ensure_directory(dir_path: &str) -> Result<PathBuf> {
         // Skip directory creation for S3 object store URLs
         if dir_path.starts_with("s3://") {
             return Ok(PathBuf::from(dir_path));
         }
 
         let path_buf = PathBuf::from(dir_path);
-        if !path_buf.exists() {
-            std::fs::create_dir_all(&path_buf)
+        if !path_exists(&path_buf).await {
+            tokio::fs::create_dir_all(&path_buf)
+                .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
         }
@@ -2605,7 +2617,8 @@ impl CayenneAccelerator {
             self.get_or_create_memory_catalog().await?
         } else {
             // Ensure metadata directory exists
-            std::fs::create_dir_all(&metadata_dir)
+            tokio::fs::create_dir_all(&metadata_dir)
+                .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
@@ -2689,26 +2702,7 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(Acceleration::resolves_to_durable_write_back);
 
-        // Default per-scan freshness. Bounded staleness is only in-contract for a
-        // read-only CDC *replica* (`refresh_mode: changes`): its data streams in
-        // continuously and is eventually-consistent by design, so a read tolerates a
-        // bounded lag — and there the demand cache's cross-query reuse lever pays off
-        // (concurrent analytical scans share one build). Read-only alone is NOT enough:
-        // a full-refresh / snapshot / append table is expected to reflect its last
-        // refresh immediately (refresh-then-query reads its own writes), and a read-only
-        // table can still take direct `delete_from`/DML via the accelerator — so serving
-        // a pre-mutation view there is a stale (wrong) result. Any table we cannot prove
-        // is a read-only CDC replica therefore uses 0 = read-your-writes, so a scan
-        // always sees the latest state. (A read-write dataset requires BOTH a ReadWrite
-        // API key and `access: read_write`.)
-        let is_cdc_replica = source
-            .acceleration()
-            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
-        let default_scan_freshness = if is_cdc_replica && !source.allows_write() {
-            read_only_scan_freshness()
-        } else {
-            std::time::Duration::ZERO
-        };
+        let scan_view_reuse = scan_view_reuse_for(source);
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -2716,7 +2710,8 @@ impl CayenneAccelerator {
             .with_retention_filters(retention_filters)
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
-            .with_default_scan_freshness(default_scan_freshness);
+            .with_scan_view_reuse(scan_view_reuse)
+            .with_secondary_indexes(secondary_index_columns(source));
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -2873,10 +2868,33 @@ fn validate_datalake_table_options(
     options: &cayenne::metadata::CreateTableOptions,
 ) -> Result<Vec<String>, String> {
     let vc = &options.vortex_config;
-    if !vc.cold_tier_enabled() {
-        return Ok(Vec::new());
-    }
     let mut warnings = Vec::new();
+
+    if !vc.cluster_by.is_empty()
+        && !vc.sort_columns.is_empty()
+        && vc.sort_columns_origin == cayenne::metadata::SortColumnsOrigin::User
+    {
+        return Err(format!(
+            "Failed to register dataset '{table_name}' (cayenne): `cayenne_cluster_by` cannot be combined with `cayenne_sort_columns`. Remove one of these parameters. Sorting within clusters is not supported yet. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        ));
+    }
+    for column in &vc.cluster_by {
+        let Some((_, field)) = options.schema.column_with_name(column) else {
+            return Err(format!(
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` does not exist. Update `cayenne_cluster_by` to use an existing column. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            ));
+        };
+        if !cayenne::is_clusterable_type(field.data_type()) {
+            return Err(format!(
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from `cayenne_cluster_by`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                field.data_type()
+            ));
+        }
+    }
+
+    if !vc.cold_tier_enabled() {
+        return Ok(warnings);
+    }
     if options.primary_key.is_empty() {
         // Promotion classifies and rewrites cold files by primary key, and
         // deletes against cold-resident rows are key-based, so the promoter
@@ -2916,16 +2934,6 @@ fn validate_datalake_table_options(
             Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
             defaults.cold_tier_gc_interval_ms
         ));
-    }
-    // Unknown clustering columns are dropped by the engine at promotion time
-    // (falling back to sort columns, then the primary key) — surface the
-    // misconfiguration instead of silently clustering by something else.
-    for column in &vc.cold_clustering_columns {
-        if options.schema.column_with_name(column).is_none() {
-            warnings.push(format!(
-                "Dataset '{table_name}': 'cayenne_datalake_clustering_columns' entry '{column}' does not exist in the schema and is ignored; datalake clustering falls back to cayenne_sort_columns, then the primary key."
-            ));
-        }
     }
     Ok(warnings)
 }
@@ -3033,17 +3041,45 @@ fn memory_mode_retention_warning(table_name: &str) -> String {
     )
 }
 
-/// The warning an acceleration gets when it configures `indexes`.
+/// The column sets of the acceleration's `indexes`, one per entry, in a stable
+/// order: the entries arrive as a map, and a lookup is answered by the first
+/// index whose columns it pins.
+fn secondary_index_columns(source: &dyn AccelerationSource) -> Vec<Vec<String>> {
+    let mut indexes: Vec<Vec<String>> = source
+        .acceleration()
+        .map(|acceleration| {
+            acceleration
+                .indexes
+                .keys()
+                .map(|columns| columns.iter().map(str::to_string).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    indexes.sort();
+    indexes
+}
+
+/// Whether the acceleration declares an index as `unique`.
+fn declares_unique_index(source: &dyn AccelerationSource) -> bool {
+    source.acceleration().is_some_and(|acceleration| {
+        acceleration.indexes.values().any(|index_type| {
+            matches!(
+                index_type,
+                runtime_acceleration::acceleration::IndexType::Unique
+            )
+        })
+    })
+}
+
+/// The warning an acceleration gets when it declares a `unique` index.
 ///
-/// Every other accelerator turns `indexes` into a real secondary index; Cayenne has
-/// none to create — it prunes from the zone maps and primary-key index it derives from
-/// the data — so the setting reaches the engine and does nothing. A `unique` entry is
-/// the half that matters: on the other engines it constrains writes, and here it does
-/// not, which is the kind of difference an operator has to be told about rather than
-/// discover from duplicate rows.
-fn ignored_indexes_warning(table_name: &str) -> String {
+/// Cayenne builds the index and uses it for lookups, but on the other engines a
+/// `unique` entry also constrains writes, and here it does not — the kind of
+/// difference an operator has to be told about rather than discover from
+/// duplicate rows.
+fn unique_index_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): `indexes` is not applied to a Cayenne acceleration, which prunes with the zone maps and primary-key index it builds from the data itself, so a `unique` entry here does not constrain writes and duplicate rows are not rejected. Remove `indexes`, or set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3116,9 +3152,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["true", "false"])
             .default("true"),
         ParameterSpec::component("datalake_location")
-            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
-        ParameterSpec::component("datalake_clustering_columns")
-            .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Hilbert-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+        ParameterSpec::component("cluster_by")
+            .description("Comma-separated columns used to Hilbert-cluster both warm and datalake files, e.g. 'tenant_id,ts'. Every column must exist and have a supported scalar type. Cannot be combined with cayenne_sort_columns. When set, automatic and inferred sort columns are not applied."),
         ParameterSpec::component("datalake_s3_auth")
             .description("Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.")
             .one_of(&["iam_role", "key"])
@@ -3422,9 +3458,7 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
-            if open_option == OpenOption::OpenExisting
-                && !std::path::Path::new(&metadata_db_path).exists()
-            {
+            if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
                 return Err(CheckpointError::Store {
                     source: format!(
                         "Cayenne metadata directory does not exist at {metadata_db_path}"
@@ -3645,7 +3679,7 @@ impl DataAccelerator for CayenneAccelerator {
             && acceleration.mode == Mode::FileCreate
         {
             let path_buf = PathBuf::from(&dir_path);
-            if path_buf.exists() {
+            if path_exists(&path_buf).await {
                 let metadata_dir_for_snapshot =
                     PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
@@ -3704,7 +3738,7 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            if path_buf.exists() {
+            if path_exists(&path_buf).await {
                 // The proofs run here rather than earlier because
                 // `snapshot_before_recreate` creates both directories, so an overlap
                 // only a symlink reveals is resolvable now even though the open-time
@@ -3719,7 +3753,7 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
-        if !path_buf.exists() {
+        if !path_exists(&path_buf).await {
             tokio::fs::create_dir_all(&path_buf)
                 .await
                 .boxed()
@@ -3732,6 +3766,17 @@ impl DataAccelerator for CayenneAccelerator {
                 metadata_dir.clone(),
                 path_buf.clone(),
             );
+            let refresh_mode = resolved_refresh_mode(source, acceleration);
+
+            // Decide whether to bootstrap from a snapshot before `get_or_create_catalog`
+            // below opens the local metastore: that call creates `metadata_dir` as a
+            // side effect (it's a fresh SQLite connection), and this decision's "does an
+            // acceleration already exist here" check reads that same directory's
+            // existence. Deciding first means the check sees the true pre-startup state
+            // instead of a directory the catalog open just created.
+            let should_bootstrap =
+                should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode);
+
             // Build a CayenneSnapshotEngine so the snapshot tar uses the
             // per-dataset metastore-slice format (no raw cayenne.db file)
             // and so `download_latest_snapshot` imports the slice into the
@@ -3741,6 +3786,8 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str)
                 .to_string();
+            // The catalog is opened unconditionally: normal operation needs it
+            // regardless of the snapshot decision above.
             let snapshot_engine = match self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
                 .await
@@ -3759,13 +3806,17 @@ impl DataAccelerator for CayenneAccelerator {
                     None
                 }
             };
-            Ok(download_snapshot_if_needed(
+
+            if !should_bootstrap {
+                return Ok(BootstrapStatus::none());
+            }
+
+            Ok(download_snapshot(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
-                resolved_refresh_mode(source, acceleration),
             )
             .await)
         } else {
@@ -3813,7 +3864,7 @@ impl DataAccelerator for CayenneAccelerator {
             Self::resolve_default_data_path(&source.name().to_string().replace(['.', '/'], "_"))
         } else {
             let dir_path = self.resolve_storage_config(source).boxed()?;
-            let _ = Self::ensure_directory(&dir_path).boxed()?;
+            Self::ensure_directory(&dir_path).await.boxed()?;
             dir_path
         };
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
@@ -3857,11 +3908,8 @@ impl DataAccelerator for CayenneAccelerator {
             tracing::warn!("{}", memory_mode_retention_warning(&table_name));
         }
 
-        if source
-            .acceleration()
-            .is_some_and(|acceleration| !acceleration.indexes.is_empty())
-        {
-            tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        if declares_unique_index(source) {
+            tracing::warn!("{}", unique_index_warning(&table_name));
         }
 
         if source.acceleration().is_some_and(|acceleration| {
@@ -3949,7 +3997,8 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
             // Ensure metadata directory exists
-            std::fs::create_dir_all(&metadata_dir)
+            tokio::fs::create_dir_all(&metadata_dir)
+                .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
 
@@ -4072,24 +4121,27 @@ impl DataAccelerator for CayenneAccelerator {
                 // one budget, and an accelerated partitioned table is a target for
                 // the dual-write path.
                 .with_background_compaction(Arc::clone(&self.compaction_semaphore))
-                .with_direct_partition_writes(),
+                .with_direct_partition_writes()
+                .with_scan_view_reuse(scan_view_reuse_for(source))
+                .with_secondary_indexes(secondary_index_columns(source)),
             );
 
             // Wrap the base table provider with partitioning logic, installing
             // the Cayenne-specific cross-partition insert strategy so that
             // overwrite-mode writes batch every partition's catalog mutation
             // into a single MetastoreTransaction (#10125).
-            let insert_strategy = Arc::new(
-                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
-                    Arc::clone(&catalog_concrete),
-                    PathBuf::from(&dir_path),
-                ),
-            );
             let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?;
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                    partition_provider.write_coordinator(),
+                ),
+            );
             let partition_table_providers = partition_provider.partition_table_providers().await;
             insert_strategy
                 .recover_partitioned_wals(&partition_table_providers)
@@ -4249,7 +4301,7 @@ impl DataAccelerator for CayenneAccelerator {
             catalog.drop_table(table_name).await.boxed()?;
         }
 
-        if path_buf.exists() {
+        if path_exists(&path_buf).await {
             Self::remove_acceleration_data_dir(source, &dir_path).await?;
             tracing::info!(
                 "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
@@ -4352,10 +4404,17 @@ impl DataAccelerator for CayenneAccelerator {
             }
         }
 
-        catalog
-            .update_table_schema(&table.table_id, &evolved)
-            .await
-            .boxed()?;
+        if plan.changes_decimal_scale() {
+            catalog
+                .update_table_schema_dropping_statistics(&table.table_id, &evolved)
+                .await
+                .boxed()?;
+        } else {
+            catalog
+                .update_table_schema(&table.table_id, &evolved)
+                .await
+                .boxed()?;
+        }
         tracing::info!(
             dataset = %source.name(),
             "Evolved Cayenne table schema: {}",
@@ -4906,7 +4965,7 @@ mod tests {
     fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
         for warning in [
             memory_mode_retention_warning("events"),
-            ignored_indexes_warning("events"),
+            unique_index_warning("events"),
             retention_period_never_reclaimed_warning("events"),
         ] {
             assert!(
@@ -5023,8 +5082,8 @@ mod tests {
     }
 
     #[test]
-    fn ignored_indexes_warning_states_the_impact_and_the_alternative() {
-        let warning = ignored_indexes_warning("events");
+    fn unique_index_warning_states_the_impact_and_the_alternative() {
+        let warning = unique_index_warning("events");
 
         assert!(
             warning.contains("does not constrain writes"),
@@ -5738,6 +5797,46 @@ mod tests {
             "`://` inside a metadata path does not put it on object storage, and the \
              delete still reaches it"
         );
+    }
+
+    /// `ensure_directory` is the `create_external_table` mkdir. Creating a missing
+    /// local path, repeating that create, and leaving an `s3://` URL untouched are
+    /// the three cases that path handles — and must not block a Tokio worker.
+    #[tokio::test]
+    async fn ensure_directory_creates_a_missing_local_path_and_skips_object_stores() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let dir = base.path().join("vortex").join("nested");
+
+        assert!(
+            !path_exists(&dir).await,
+            "the test directory must start absent"
+        );
+
+        let created = CayenneAccelerator::ensure_directory(&dir.to_string_lossy())
+            .await
+            .expect("create a missing local directory");
+        assert_eq!(created, dir);
+        assert!(dir.is_dir(), "ensure_directory must create the local path");
+
+        CayenneAccelerator::ensure_directory(&dir.to_string_lossy())
+            .await
+            .expect("creating an existing directory is a no-op");
+
+        let s3 = CayenneAccelerator::ensure_directory("s3://bucket/prefix")
+            .await
+            .expect("object-store URLs are not created on disk");
+        assert_eq!(s3, PathBuf::from("s3://bucket/prefix"));
+    }
+
+    #[tokio::test]
+    async fn path_exists_matches_std_path_exists() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let present = base.path().join("present");
+        std::fs::create_dir_all(&present).expect("present dir");
+        let missing = base.path().join("missing");
+
+        assert_eq!(path_exists(&present).await, present.exists());
+        assert_eq!(path_exists(&missing).await, missing.exists());
     }
 
     /// `mode: file_create` must refuse the configuration at open time, before the
@@ -7609,19 +7708,78 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_datalake_warns_on_unknown_clustering_column() {
+    fn test_validate_cluster_by_rejects_unknown_column() {
         let config = cayenne::metadata::VortexConfig {
-            cold_clustering_columns: vec!["id".to_string(), "no_such_column".to_string()],
+            cluster_by: vec!["id".to_string(), "no_such_column".to_string()],
             ..datalake_enabled_config()
         };
         let options = datalake_test_options(vec!["id".to_string()], config);
-        let warnings = validate_datalake_table_options("dl_t", &options)
-            .expect("unknown clustering column is a warning, not an error");
-        assert_eq!(warnings.len(), 1, "exactly the unknown column is flagged");
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("unknown clustering column must fail registration");
         assert!(
-            warnings[0].contains("no_such_column"),
-            "unexpected warning: {}",
-            warnings[0]
+            error.contains("no_such_column") && error.contains("does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_cluster_by_rejects_explicit_sort_columns() {
+        let config = cayenne::metadata::VortexConfig {
+            cluster_by: vec!["id".to_string()],
+            sort_columns: vec!["value".to_string()],
+            ..Default::default()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("cluster_by and explicit sort columns must conflict");
+        assert!(
+            error.contains("cayenne_cluster_by") && error.contains("cayenne_sort_columns"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_cluster_by_ignores_inferred_sort_columns() {
+        let config = cayenne::metadata::VortexConfig {
+            cluster_by: vec!["id".to_string()],
+            sort_columns: vec!["value".to_string()],
+            sort_columns_origin: cayenne::metadata::SortColumnsOrigin::Inferred,
+            ..Default::default()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("inferred sort columns must not conflict with explicit clustering");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_cluster_by_rejects_unsupported_type() {
+        let config = cayenne::metadata::VortexConfig {
+            cluster_by: vec!["items".to_string()],
+            ..Default::default()
+        };
+        let options = cayenne::metadata::CreateTableOptions {
+            table_name: "dl_t".to_string(),
+            schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "items",
+                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Int64,
+                    true,
+                ))),
+                true,
+            )])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/dl_t".to_string(),
+            partition_column: None,
+            vortex_config: config,
+        };
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("unsupported clustering type must fail registration");
+        assert!(
+            error.contains("items") && error.contains("unsupported type"),
+            "unexpected error: {error}"
         );
     }
 
@@ -7949,6 +8107,60 @@ mod tests {
         assert!(
             validate_snapshot_consistency(&agreeing).is_ok(),
             "datasets that agree may share a metadata directory"
+        );
+    }
+
+    /// [`scan_view_reuse_for`]: `WithinLag` only for read-only `refresh_mode: changes`.
+    /// Every other refresh mode, plus writable `changes` (write-back), invalidates
+    /// on write. An unset mode uses the connector's default; no acceleration
+    /// configured uses `UntilInvalidated`.
+    #[test]
+    fn scan_view_reuse_for_all_refresh_modes_and_writability() {
+        let modes = [
+            None,
+            Some(RefreshMode::Disabled),
+            Some(RefreshMode::Full),
+            Some(RefreshMode::Append),
+            Some(RefreshMode::Changes),
+            Some(RefreshMode::Caching),
+            Some(RefreshMode::Snapshot),
+        ];
+        let connectors = [
+            (None, RefreshMode::Full),
+            (Some("file"), RefreshMode::Full),
+            (Some("cdc"), RefreshMode::Changes),
+            (Some("debezium"), RefreshMode::Changes),
+            (Some("sink"), RefreshMode::Disabled),
+        ];
+        for (connector, default_mode) in connectors {
+            for mode in modes {
+                for allows_write in [false, true] {
+                    let expect_lag =
+                        mode.unwrap_or(default_mode) == RefreshMode::Changes && !allows_write;
+                    let mut source = TestAccelerationSource::new("t")
+                        .with_allows_write(allows_write)
+                        .with_acceleration(Acceleration {
+                            refresh_mode: mode,
+                            ..Acceleration::default()
+                        });
+                    if let Some(connector) = connector {
+                        source = source.with_connector_name(connector);
+                    }
+                    let reuse = scan_view_reuse_for(&source);
+                    assert_eq!(
+                        matches!(reuse, ScanViewReuse::WithinLag(_)),
+                        expect_lag,
+                        "connector={connector:?}, mode={mode:?}, write={allows_write}: {reuse:?}"
+                    );
+                }
+            }
+        }
+
+        let no_accel = TestAccelerationSource::new("bare").with_allows_write(false);
+        assert_eq!(
+            scan_view_reuse_for(&no_accel),
+            ScanViewReuse::UntilInvalidated,
+            "no acceleration configured is not read-only changes"
         );
     }
 }

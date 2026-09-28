@@ -20,7 +20,7 @@ limitations under the License.
 
 use cache::{
     AsTableRefs, CacheMetrics, CacheProvider, EvictionReason, HashBuilder, InvalidationMode,
-    LruCache, SimpleCache, Sizeable, StaleRejectionReason, get_hash_builder,
+    KeyHasher, LruCache, SimpleCache, Sizeable, StaleRejectionReason, get_hash_builder,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
@@ -29,7 +29,6 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use spicepod::component::caching::{CacheEngine, CachingPolicy, HashingAlgorithm};
 use std::collections::HashSet;
-use std::hash::Hasher;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,6 +89,7 @@ fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
 fn all_caching_policies() -> Vec<(&'static str, CachingPolicy)> {
     vec![
         ("lru", CachingPolicy::Lru),
+        ("lfu", CachingPolicy::Lfu),
         ("tinylfu", CachingPolicy::TinyLfu),
     ]
 }
@@ -121,13 +121,12 @@ fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
                 let hash_builder = hash_builder.clone();
                 b.iter_batched(
                     || {
-                        let cache: Arc<
-                            SimpleCache<String, HashBuilder, Box<dyn Hasher + Send + Sync>>,
-                        > = Arc::new(SimpleCache::new(
-                            CACHE_WEIGHT,
-                            Duration::from_mins(1),
-                            hash_builder.clone(),
-                        ));
+                        let cache: Arc<SimpleCache<String, HashBuilder, KeyHasher>> =
+                            Arc::new(SimpleCache::new(
+                                CACHE_WEIGHT,
+                                Duration::from_mins(1),
+                                hash_builder.clone(),
+                            ));
                         let mut rng = StdRng::seed_from_u64(42);
                         handle.block_on(async {
                             for i in 0..5000 {
@@ -186,12 +185,10 @@ fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
                 let hash_builder = hash_builder.clone();
                 b.iter_batched(
                     || {
-                        Arc::new(SimpleCache::<
-                            String,
-                            HashBuilder,
-                            Box<dyn Hasher + Send + Sync>,
-                        >::new(
-                            CACHE_WEIGHT, Duration::from_mins(1), hash_builder.clone()
+                        Arc::new(SimpleCache::<String, HashBuilder, KeyHasher>::new(
+                            CACHE_WEIGHT,
+                            Duration::from_mins(1),
+                            hash_builder.clone(),
                         ))
                     },
                     |cache| {
@@ -243,13 +240,12 @@ fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
                 let hash_builder = hash_builder.clone();
                 b.iter_batched(
                     || {
-                        let cache: Arc<
-                            SimpleCache<String, HashBuilder, Box<dyn Hasher + Send + Sync>>,
-                        > = Arc::new(SimpleCache::new(
-                            CACHE_WEIGHT,
-                            Duration::from_mins(1),
-                            hash_builder.clone(),
-                        ));
+                        let cache: Arc<SimpleCache<String, HashBuilder, KeyHasher>> =
+                            Arc::new(SimpleCache::new(
+                                CACHE_WEIGHT,
+                                Duration::from_mins(1),
+                                hash_builder.clone(),
+                            ));
                         let mut rng = StdRng::seed_from_u64(42);
                         handle.block_on(async {
                             for i in 0..5000 {
@@ -317,19 +313,14 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                         let hash_builder = hash_builder.clone();
                         b.iter_batched(
                             || {
-                                let cache: Arc<
-                                    LruCache<
-                                        BenchValue,
-                                        HashBuilder,
-                                        Box<dyn Hasher + Send + Sync>,
-                                    >,
-                                > = Arc::new(LruCache::new(
-                                    CACHE_WEIGHT,
-                                    Duration::from_mins(1),
-                                    hash_builder.clone(),
-                                    policy,
-                                    CacheEngine::Moka,
-                                ));
+                                let cache: Arc<LruCache<BenchValue, HashBuilder, KeyHasher>> =
+                                    Arc::new(LruCache::new(
+                                        CACHE_WEIGHT,
+                                        Duration::from_mins(1),
+                                        hash_builder.clone(),
+                                        policy,
+                                        CacheEngine::Moka,
+                                    ));
                                 let mut rng = StdRng::seed_from_u64(42);
                                 handle.block_on(async {
                                     for i in 0..5000 {
@@ -394,11 +385,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                         let hash_builder = hash_builder.clone();
                         b.iter_batched(
                             || {
-                                Arc::new(LruCache::<
-                                    BenchValue,
-                                    HashBuilder,
-                                    Box<dyn Hasher + Send + Sync>,
-                                >::new(
+                                Arc::new(LruCache::<BenchValue, HashBuilder, KeyHasher>::new(
                                     CACHE_WEIGHT,
                                     Duration::from_mins(1),
                                     hash_builder.clone(),
@@ -461,19 +448,14 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                         let hash_builder = hash_builder.clone();
                         b.iter_batched(
                             || {
-                                let cache: Arc<
-                                    LruCache<
-                                        BenchValue,
-                                        HashBuilder,
-                                        Box<dyn Hasher + Send + Sync>,
-                                    >,
-                                > = Arc::new(LruCache::new(
-                                    CACHE_WEIGHT,
-                                    Duration::from_mins(1),
-                                    hash_builder.clone(),
-                                    policy,
-                                    CacheEngine::Moka,
-                                ));
+                                let cache: Arc<LruCache<BenchValue, HashBuilder, KeyHasher>> =
+                                    Arc::new(LruCache::new(
+                                        CACHE_WEIGHT,
+                                        Duration::from_mins(1),
+                                        hash_builder.clone(),
+                                        policy,
+                                        CacheEngine::Moka,
+                                    ));
                                 let mut rng = StdRng::seed_from_u64(42);
                                 handle.block_on(async {
                                     for i in 0..5000 {

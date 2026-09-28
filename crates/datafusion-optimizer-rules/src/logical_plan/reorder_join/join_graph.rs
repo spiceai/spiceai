@@ -30,7 +30,7 @@ use datafusion_expr::{
 
 use super::{
     cost::JoinCostEstimator,
-    left_deep_join_plan::{ReorderOutcome, optimal_left_deep_join_plan},
+    left_deep_join_plan::{ReorderOutcome, is_wide_join_island, optimal_left_deep_join_plan},
 };
 
 /// Reorder the inner-join island(s) inside the inputs of a node that is about to
@@ -70,6 +70,11 @@ fn reorder_opaque_inputs(
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<Transformed<LogicalPlan>> {
     plan.map_children(|child| {
+        // Same bound as `ReorderJoinRule`: a wide island behind a semi/anti
+        // boundary (or `MaterializedCte`) must not enter the enumerator.
+        if is_wide_join_island(&child) {
+            return Ok(Transformed::no(child));
+        }
         // Capture the child's original output schema before reordering.
         let original_schema = Arc::clone(child.schema());
         Ok(match optimal_left_deep_join_plan(child, cost_estimator) {

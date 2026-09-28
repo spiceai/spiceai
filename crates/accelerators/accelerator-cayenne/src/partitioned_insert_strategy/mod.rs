@@ -322,12 +322,19 @@ impl CayennePartitionedInsertStrategy {
     /// creator was built against. `table_root` is the absolute path of the
     /// partitioned table's data directory; it's used by the append
     /// coordinator to write top-level WAL files at
-    /// `<table_root>/_partitioned_wal/`.
+    /// `<table_root>/_partitioned_wal/`. `coordinator_lock` must be the
+    /// partition table's `PartitionTableProvider::write_coordinator`, so these
+    /// coordinators also serialize with every other multi-partition writer on
+    /// the table.
     #[must_use]
-    pub fn new(catalog: Arc<CayenneCatalog>, table_root: PathBuf) -> Self {
+    pub fn new(
+        catalog: Arc<CayenneCatalog>,
+        table_root: PathBuf,
+        coordinator_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
         Self {
             catalog,
-            coordinator_lock: Arc::new(tokio::sync::Mutex::new(())),
+            coordinator_lock,
             table_root,
         }
     }

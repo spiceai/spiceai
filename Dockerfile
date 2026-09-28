@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.96.1
+ARG RUST_VERSION=1.97.1
 FROM rust:${RUST_VERSION}-slim-trixie as build
 
 # cache mounts below may already exist and owned by root
@@ -136,6 +136,10 @@ RUN echo 'nobody:x:65534:65534:nobody:/app:/usr/sbin/nologin' > /spice_sandbox/e
 RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
 
+# Create a writable temp directory so std::env::temp_dir() (e.g. an
+# acceleration-snapshot upload) has somewhere to write on this scratch image.
+RUN mkdir -p /spice_sandbox/app/tmp
+
 # Give the nobody user ownership of app dir
 RUN chown -R 65534:65534 /spice_sandbox/app
 
@@ -159,5 +163,6 @@ ENV HF_HOME=/.cache/huggingface
 ENV HF_HUB_CACHE=/.cache/huggingface/hub
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV TMPDIR=/app/tmp
 
 ENTRYPOINT ["/usr/local/bin/spiced"]

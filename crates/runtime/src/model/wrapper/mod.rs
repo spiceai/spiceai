@@ -498,3 +498,67 @@ fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
     };
     ast::has_variables_in_ast(&tt.ast)
 }
+
+/// Guards the null-suppression patch the `spiceai/async-openai` fork carries:
+/// `ChatCompletionStreamOptions` skips `include_usage` and `include_obfuscation`
+/// when they are `None`.
+///
+/// [`ChatWrapper::with_stream_usage`] sets `include_usage` on every streaming
+/// request and leaves `include_obfuscation` unset, so this shape is what Spice puts
+/// on the wire for *all* streamed chat completions. Without the patch each of them
+/// carries `"include_obfuscation": null`, and the `OpenAI`-compatible servers that
+/// reject fields they do not know — NVIDIA NIM is the one the fork names — refuse
+/// the request outright rather than degrading.
+///
+/// The fork's own `ser_de.rs` test leaves with the branch at the next re-cut, which
+/// is why the guard lives here. `docs/dev/fork_patches.md` is the ledger it is named
+/// in.
+#[cfg(test)]
+mod stream_options_null_suppression {
+    use async_openai::types::chat::{ChatCompletionStreamOptions, CreateChatCompletionRequestArgs};
+    use serde_json::json;
+
+    use super::ChatWrapper;
+
+    /// The request Spice actually streams: `with_stream_usage` fills in
+    /// `include_usage` and nothing else, so the serialized options must carry that
+    /// one field and no null beside it.
+    #[test]
+    fn a_streamed_request_carries_no_null_stream_option() {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("test-model")
+            .messages(Vec::new())
+            .stream(true)
+            .build()
+            .expect("a streaming request with no stream options");
+        assert!(
+            request.stream_options.is_none(),
+            "the fixture has to start with no stream options, or it is not the shape `with_stream_usage` fills in"
+        );
+
+        let request = ChatWrapper::with_stream_usage(request);
+        let options = request
+            .stream_options
+            .expect("a streaming request gets stream options");
+
+        assert_eq!(
+            serde_json::to_value(options).expect("stream options serialize"),
+            json!({ "include_usage": true }),
+            "a field left unset must be absent, not null: a server that rejects fields it does not know refuses the whole request"
+        );
+    }
+
+    /// The same property at the type, so the guard still holds if the wrapper stops
+    /// being the only place stream options are built.
+    #[test]
+    fn unset_stream_options_serialize_to_an_empty_object() {
+        let options = ChatCompletionStreamOptions {
+            include_usage: None,
+            include_obfuscation: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&options).expect("stream options serialize"),
+            "{}"
+        );
+    }
+}

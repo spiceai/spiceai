@@ -86,6 +86,7 @@ use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -144,6 +145,13 @@ impl Drop for StagedPkDelete {
     }
 }
 
+/// Bump `scan_input_version` so [`crate::ScanViewReuse::UntilInvalidated`] recaptures.
+fn bump_scan_input_version(version: Option<&AtomicU64>) {
+    if let Some(version) = version {
+        version.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub(crate) struct PreparedDeletionPublish {
     strategy: PkDeletionStrategyWithCache,
     table_memory: Arc<CayenneMemoryAccount>,
@@ -151,6 +159,7 @@ pub(crate) struct PreparedDeletionPublish {
     publish: PreparedDeletionCache,
     deleted_count: u64,
     cleanup_armed: bool,
+    scan_input_version: Option<Arc<AtomicU64>>,
 }
 
 enum PreparedDeletionCache {
@@ -240,6 +249,7 @@ impl PreparedDeletionPublish {
         }
         self.table_memory
             .set_deletion_bytes(self.strategy.approx_resident_bytes());
+        bump_scan_input_version(self.scan_input_version.as_deref());
         Ok(())
     }
 
@@ -472,6 +482,11 @@ pub struct CayenneDeletionSink {
     /// allocations through the SAME allocator as every other writer of this
     /// table, so memory and the DB `current_sequence_number` never diverge.
     seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    /// The owning table's `scan_input_version`. Bumped when this sink publishes
+    /// a deletion so [`crate::ScanViewReuse::UntilInvalidated`] recaptures
+    /// rather than serving the pre-delete view. `None` on internal persist-only
+    /// helpers that are not a user-visible delete.
+    scan_input_version: Option<Arc<AtomicU64>>,
     /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
     /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
     /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
@@ -522,7 +537,20 @@ impl CayenneDeletionSink {
             write_lock,
             seq_allocator,
             count_exact: false,
+            scan_input_version: None,
         }
+    }
+
+    /// Wire the owning table's scan-input version so a published delete
+    /// invalidates the demand scan-view cache.
+    #[must_use]
+    pub(crate) fn with_scan_input_version(mut self, version: Arc<AtomicU64>) -> Self {
+        self.scan_input_version = Some(version);
+        self
+    }
+
+    pub(super) fn notify_scan_input_change(&self) {
+        bump_scan_input_version(self.scan_input_version.as_deref());
     }
 
     /// Set whether this sink must return an exact, verified deleted-row count.
@@ -573,11 +601,7 @@ impl CayenneDeletionSink {
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
-                        let projected_sink = Self {
-                            pk_column_indices: vec![0],
-                            ..self.clone()
-                        };
-                        pending_pk_values.extend(projected_sink.extract_int64_pk_values(&batch)?);
+                        pending_pk_values.extend(self.extract_int64_pk_values(&batch, &[0])?);
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let row_keys = pending_pk_values.drain().map(i64_key).collect();
                             let results = self
@@ -687,23 +711,21 @@ impl CayenneDeletionSink {
 
     // NOTE: delete_filtered_rows_streaming_position_based is implemented in sink/position_based.rs
 
-    /// Extract Int64 primary key values from a batch.
+    /// Extract Int64 primary key values from a batch whose key is at `pk_indices`.
     fn extract_int64_pk_values(
         &self,
         batch: &arrow::array::RecordBatch,
+        pk_indices: &[usize],
     ) -> super::super::Result<Vec<i64>> {
         use arrow::array::Int64Array;
 
         let table_name = &self.table_metadata.table_name;
 
         // For Int64 PK strategy, we only have one PK column
-        let pk_column_index = self
-            .pk_column_indices
-            .first()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message: "Int64 PK strategy requires exactly one PK column index".to_string(),
-            })?;
+        let pk_column_index = pk_indices.first().ok_or_else(|| Error::Internal {
+            table: table_name.clone(),
+            message: "Int64 PK strategy requires exactly one PK column index".to_string(),
+        })?;
 
         let pk_column = batch.column(*pk_column_index);
         let pk_array = pk_column
@@ -807,14 +829,13 @@ impl CayenneDeletionSink {
         }
     }
 
-    /// Extract row keys from a batch using the `RowConverter`.
+    /// Extract row keys from a batch whose key is at `pk_indices`, using the `RowConverter`.
     fn extract_row_keys(
-        &self,
         batch: &arrow::array::RecordBatch,
+        pk_indices: &[usize],
         row_converter: &RowConverter,
     ) -> super::super::Result<Vec<Box<[u8]>>> {
-        let pk_columns: Vec<ArrayRef> = self
-            .pk_column_indices
+        let pk_columns: Vec<ArrayRef> = pk_indices
             .iter()
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
@@ -911,7 +932,12 @@ impl CayenneDeletionSink {
             }
         }
 
-        let physical_filters = self.build_physical_filters(&coerced_filters)?;
+        // Read only the key and filter columns. Filters are pushed to the scan for
+        // pruning only and are re-applied exactly below.
+        let (scan_projection, scan_schema) = self.filtered_delete_projection(&coerced_filters)?;
+        let physical_filters = Self::build_physical_filters(&coerced_filters, &scan_schema)?;
+        // Key columns lead the projected batch.
+        let projected_pk_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
 
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
@@ -921,7 +947,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -938,7 +967,7 @@ impl CayenneDeletionSink {
                         // One bloom-prefiltered probe per row: no second scan, and nothing
                         // held that the raw scan did not already hold.
                         pending_pk_values.extend(
-                            self.extract_int64_pk_values(&batch)?
+                            self.extract_int64_pk_values(&batch, &projected_pk_indices)?
                                 .into_iter()
                                 .filter(|pk| self.is_live_int64_pk(*pk, source)),
                         );
@@ -993,7 +1022,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -1006,7 +1038,7 @@ impl CayenneDeletionSink {
                         // See the Int64 branch: this snapshot's threshold is what tells
                         // a superseded version from the row that replaced it.
                         pending_row_keys.extend(
-                            self.extract_row_keys(&batch, row_converter)?
+                            Self::extract_row_keys(&batch, &projected_pk_indices, row_converter)?
                                 .into_iter()
                                 .filter(|key| self.is_live_row_key(key, source)),
                         );
@@ -1167,11 +1199,30 @@ impl CayenneDeletionSink {
         Ok(coerced_filters)
     }
 
-    fn build_physical_filters(
+    /// Projection for a filtered delete scan: key columns first, then any other
+    /// column the filters reference.
+    fn filtered_delete_projection(
         &self,
         filters: &[Expr],
+    ) -> super::super::Result<(Vec<usize>, SchemaRef)> {
+        let mut projection = self.pk_column_indices.clone();
+        for filter in filters {
+            for column in filter.column_refs() {
+                let index = self.schema.index_of(&column.name)?;
+                if !projection.contains(&index) {
+                    projection.push(index);
+                }
+            }
+        }
+        let schema = Arc::new(self.schema.project(&projection)?);
+        Ok((projection, schema))
+    }
+
+    fn build_physical_filters(
+        filters: &[Expr],
+        schema: &SchemaRef,
     ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
-        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let df_schema = DFSchema::try_from(Arc::clone(schema))?;
         let execution_props = ExecutionProps::new();
 
         let physical_filters = filters
@@ -1286,6 +1337,7 @@ impl CayenneDeletionSink {
             publish,
             deleted_count,
             cleanup_armed: true,
+            scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
         })
     }
 

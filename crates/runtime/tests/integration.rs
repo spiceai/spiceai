@@ -328,6 +328,9 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Spark Connect plans include Databricks connection details. Those identify
+                // the test fixture, not the plan being asserted.
+                (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),
             ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);

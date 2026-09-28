@@ -492,8 +492,8 @@ steps — **one seam per PR**:
   `DataConnectorError` → `ConnectorComponent` → `Arc<Dataset>`/`Arc<Catalog>`, which
   drags heavy runtime types along and must be decoupled before the error can move.)
 - **Interface traits are `dyn`-safe.** They are used as `Arc<dyn Trait>`, so keep
-  them object-safe and `#[async_trait]` (see CLAUDE.md → Async & blocking). The
-  *trait-evolution & wrapper-delegation* rule (CLAUDE.md) applies with force here: a
+  them object-safe and `#[async_trait]` (see AGENTS.md → Async & blocking). The
+  *trait-evolution & wrapper-delegation* rule (AGENTS.md) applies with force here: a
   new method on an interface trait must be **forwarded through every wrapper** impl
   (`AcceleratedTable`, `FederatedTable`, …), never left as a defaulted no-op.
 
@@ -637,7 +637,7 @@ and only worth it if runtime plug-ability becomes a product requirement.
 - [`docs/EXTENSIBILITY.md`](../EXTENSIBILITY.md) — the extension points (Data
   Connector, Accelerator, Catalog, Secret Store, Model, Embedding). The `-api`
   interface crates *are* these extension points; keep the two aligned.
-- **CLAUDE.md** — the *trait evolution & wrapper delegation* rule (forward new trait
+- **AGENTS.md** — the *trait evolution & wrapper delegation* rule (forward new trait
   methods through every wrapper) and the async/`dyn`-safety rules that interface
   traits must satisfy.
 

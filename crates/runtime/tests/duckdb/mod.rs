@@ -22,6 +22,7 @@ use crate::{
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
+use arrow::array::{Array, Float64Array};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -1364,6 +1365,353 @@ async fn duckdb_acceleration_null_typed_parquet_column() -> Result<(), String> {
                     "+-------------+-----------+-------------+",
                 ],
                 &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A federated `inner_product` must answer what the kernel answers for a row
+/// whose dot product is not a finite number. (Finite results are a separate,
+/// unclosed question — #13893 — so this asserts only the non-finite contract.)
+///
+/// `array_inner_product` hands back the `inf` or `nan` it computed, where
+/// Spice's kernel calls an undefined dot product NULL — and `DuckDB` sorts
+/// `nan` above every real number under `ORDER BY … DESC`, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// (issue #13787). The dialect now screens the pushed-down call with
+/// `isfinite`.
+///
+/// The `EXPLAIN` assertion is the half a unit test cannot reach: it pins that
+/// the screen is in the SQL `DuckDB` actually receives, rather than an
+/// expression the runtime happened to evaluate locally.
+#[tokio::test]
+async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            // A TempDir rather than a NamedTempFile: `duckdb::Connection::open`
+            // wants to create the database itself, and the directory guard is
+            // what removes it (and DuckDB's `.wal` sidecar) when the test ends.
+            let db_dir = tempfile::tempdir().expect("should create temp dir");
+            let db_path = db_dir.path().join("vecs.db");
+
+            {
+                let conn = duckdb::Connection::open(&db_path)
+                    .map_err(|e| format!("failed to open duckdb file: {e}"))?;
+                conn.execute_batch(
+                    "CREATE TABLE vecs (id INTEGER, emb FLOAT[3], q FLOAT[3]);
+                     INSERT INTO vecs VALUES
+                       (1, [1.0, 2.0, 3.0]::FLOAT[3],        [4.0, 5.0, 6.0]::FLOAT[3]),
+                       (2, [1e20, 0.0, 0.0]::FLOAT[3],       [1e20, 0.0, 0.0]::FLOAT[3]),
+                       (3, ['nan'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (4, ['inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (5, ['-inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (6, [0.0, 0.0, 0.0]::FLOAT[3],        [1.0, 2.0, 3.0]::FLOAT[3]);",
+                )
+                .map_err(|e| format!("failed to seed duckdb file: {e}"))?;
+            }
+
+            let mut dataset = Dataset::new("duckdb:vecs", "vecs");
+            // `duckdb_open`, not `duckdb_file`: the latter is the accelerator's
+            // parameter, and the connector ignores it with a warning and then
+            // fails to load the dataset for want of a database to open.
+            dataset.params = Some(spicepod::param::Params::from_string_map(
+                vec![("duckdb_open".to_string(), db_path.display().to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+
+            let app = AppBuilder::new("duckdb_inner_product_non_finite")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = "SELECT id, inner_product(emb, q) AS ip FROM vecs ORDER BY id";
+            let result: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("query `{query}` collect failed: {e}"))?;
+
+            // Rows 2-5 overflow or carry a non-finite element; the kernel calls
+            // each of those undefined, so the federated answer must be NULL too.
+            // Rows 1 and 6 are ordinary and must survive the screen.
+            //
+            // Both infinities are rows because they fail a screen in opposite
+            // directions: `-inf` sorts below every real number under `ORDER BY
+            // … DESC`, so it never surfaced as the top row that made #13787
+            // visible, and an upper-bound screen would reject `+inf` while
+            // letting `-inf` through.
+            //
+            // Asserted per value rather than against a rendered table: a NULL
+            // and a `nan` are both blank in the pretty-printed form, which is
+            // exactly the difference this test exists to catch.
+            let expected = vec![Some(32.0_f64), None, None, None, None, Some(0.0_f64)];
+            let scores: Vec<Option<f64>> = result
+                .iter()
+                .flat_map(|batch| {
+                    let scores = batch
+                        .column_by_name("ip")
+                        .expect("result carries an `ip` column")
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("`ip` is the kernel's Float64 return type")
+                        .clone();
+                    (0..scores.len())
+                        .map(|row| (!scores.is_null(row)).then(|| scores.value(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                scores, expected,
+                "a federated inner_product must match the kernel wherever the result \
+                 is not a finite number: NULL for the overflow (id 2), the NaN \
+                 element (id 3) and the positive and negative infinite elements \
+                 (ids 4 and 5). Finite results are not claimed to agree exactly \
+                 — see #13893"
+            );
+
+            let explain: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("explain for `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("explain for `{query}` collect failed: {e}"))?;
+            let plan = arrow::util::pretty::pretty_format_batches(&explain)
+                .map_err(|e| format!("failed to format explain: {e}"))?
+                .to_string();
+
+            let federated_sql: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains("base_sql=") || line.contains("DuckSqlExec sql="))
+                .collect();
+            assert!(
+                !federated_sql.is_empty(),
+                "expected the scan to be pushed down to DuckDB; plan was:\n{plan}"
+            );
+            for line in federated_sql {
+                assert!(
+                    line.contains("array_inner_product"),
+                    "inner_product must still push down to DuckDB:\n{line}"
+                );
+                assert!(
+                    line.contains("isfinite"),
+                    "the pushed-down inner_product must be screened by isfinite, so a \
+                     non-finite result comes back NULL rather than topping the ranking:\n{line}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// `EXPLAIN` a statement and return the formatted plan.
+async fn formatted_explain(rt: &Runtime, sql: &str) -> Result<String, String> {
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(&format!("EXPLAIN {sql}"))
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("explain for `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("explain for `{sql}` collect failed: {e}"))?;
+
+    Ok(arrow::util::pretty::pretty_format_batches(&batches)
+        .map_err(|e| format!("failed to format the plan for `{sql}`: {e}"))?
+        .to_string())
+}
+
+/// Run a statement and return its single `Int64` column, sorted.
+async fn sorted_int64_column(rt: &Runtime, sql: &str) -> Result<Vec<i64>, String> {
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| format!("`{sql}` did not return an Int64 column"))?;
+        values.extend(column.iter().flatten());
+    }
+    values.sort_unstable();
+    Ok(values)
+}
+
+/// A `DuckDB` accelerator with an `indexes` entry must rewrite a scan whose
+/// `WHERE` covers the indexed column plus at least one other column into a
+/// materialized CTE bound to that index.
+///
+/// `DuckDBIntermediateIndexMaterializationOptimizer` reads the index list off the
+/// `DuckSqlExec` the accelerator's table builds, and returns the plan untouched
+/// when that list is empty. So the rule can be switched off end to end by a change
+/// on either side of the table/exec boundary, with nothing to show for it but a
+/// slower plan — no error, no wrong rows, and no failing test until this one.
+///
+/// Three things about the query shape are load-bearing:
+///
+/// * `query_federation: disabled` is what puts a `DuckSqlExec` in the plan at all.
+///   With acceleration federation on, the scan is handed to the federation
+///   provider's own SQL executor and there is no exec node for the rule to rewrite.
+/// * Two predicates, only one of them on the indexed column. A single predicate on
+///   the indexed column alone is the already-optimal case the rule declines.
+/// * No `ORDER BY`: the materialization is not currently supported alongside a
+///   sort that reaches the scan, so a sorted query would not exercise the rewrite.
+///
+/// The unindexed dataset is the control: it pins that the CTE comes from the index
+/// rather than from something the accelerator does to every query, and that the
+/// rewrite returns the same rows as the plan it replaces.
+#[tokio::test]
+async fn duckdb_accelerator_materializes_an_indexed_filter_into_a_cte() -> Result<(), String> {
+    use spicepod::acceleration::IndexType;
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+
+    fn accelerated_csv_dataset(
+        ds_name: &str,
+        csv_path: &std::path::Path,
+        indexes: HashMap<String, IndexType>,
+    ) -> Dataset {
+        let mut dataset = Dataset::new(format!("file:{}", csv_path.display()), ds_name.to_string());
+        dataset.name = ds_name.to_string();
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            mode: Mode::Memory,
+            refresh_mode: Some(RefreshMode::Full),
+            indexes,
+            params: Some(Params::from_string_map(HashMap::from([(
+                "query_federation".to_string(),
+                "disabled".to_string(),
+            )]))),
+            ..Acceleration::default()
+        });
+        dataset
+    }
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = std::env::temp_dir().join("spiced_duckdb_index_cte_test");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+            defer! {
+                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
+            }
+
+            let csv_path = temp_dir.join("trips.csv");
+            let rows = (0..200)
+                .map(|id| {
+                    let city = if id % 2 == 0 { "sf" } else { "nyc" };
+                    let status = if id % 3 == 0 { "open" } else { "closed" };
+                    format!("{id},{city},{status}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&csv_path, format!("id,city,status\n{rows}\n"))
+                .expect("failed to write csv");
+
+            let app = AppBuilder::new("duckdb_index_cte_test")
+                .with_dataset(accelerated_csv_dataset(
+                    "trips_indexed",
+                    &csv_path,
+                    HashMap::from([("city".to_string(), IndexType::Enabled)]),
+                ))
+                .with_dataset(accelerated_csv_dataset(
+                    "trips_unindexed",
+                    &csv_path,
+                    HashMap::new(),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = |table: &str| {
+                format!("SELECT id FROM {table} WHERE city = 'sf' AND status = 'open'")
+            };
+
+            let indexed_plan = formatted_explain(&rt, &query("trips_indexed")).await?;
+            assert!(
+                indexed_plan.contains("DuckSqlExec"),
+                "the accelerated scan must reach DuckDB through a DuckSqlExec, which is the node \
+                 carrying the index list; plan was:\n{indexed_plan}"
+            );
+            assert!(
+                indexed_plan.contains("_intermediate_materialize"),
+                "the filter on the indexed column must be materialized into a CTE; \
+                 plan was:\n{indexed_plan}"
+            );
+
+            let unindexed_plan = formatted_explain(&rt, &query("trips_unindexed")).await?;
+            assert!(
+                !unindexed_plan.contains("_intermediate_materialize"),
+                "a dataset with no index must not get the CTE, or the assertion above \
+                 says nothing about the index; plan was:\n{unindexed_plan}"
+            );
+
+            // The rewrite must not change the answer.
+            let indexed_rows = sorted_int64_column(&rt, &query("trips_indexed")).await?;
+            let unindexed_rows = sorted_int64_column(&rt, &query("trips_unindexed")).await?;
+            assert_eq!(
+                unindexed_rows, indexed_rows,
+                "the CTE rewrite returned different rows than the plan it replaced"
+            );
+            assert!(
+                !indexed_rows.is_empty(),
+                "the query must match rows, or neither plan is exercised"
             );
 
             Ok(())

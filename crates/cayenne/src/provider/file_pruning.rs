@@ -90,6 +90,32 @@ pub(crate) fn should_prune_partitioned_file(
     pruner.should_prune()
 }
 
+/// Fast path for `col = i64` listing prune: compare against Exact/Inexact
+/// footer min/max without building a `FilePruner`. Returns `true` when the
+/// file cannot contain `value`. Conservative: missing stats keep the file.
+pub(crate) fn should_prune_i64_eq(file: &PartitionedFile, column_idx: usize, value: i64) -> bool {
+    let Some(stats) = file.statistics.as_ref() else {
+        return false;
+    };
+    let Some(col) = stats.column_statistics.get(column_idx) else {
+        return false;
+    };
+    let min = i64_bound(&col.min_value);
+    let max = i64_bound(&col.max_value);
+    match (min, max) {
+        (Some(lo), Some(hi)) => value < lo || value > hi,
+        _ => false,
+    }
+}
+
+fn i64_bound(precision: &datafusion_common::stats::Precision<ScalarValue>) -> Option<i64> {
+    match precision {
+        datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(v)))
+        | datafusion_common::stats::Precision::Inexact(ScalarValue::Int64(Some(v))) => Some(*v),
+        _ => None,
+    }
+}
+
 /// Build `pk NOT IN (hidden keys)` for sparse Int64 tombstone sets so Vortex and
 /// listing-time pruning can skip rows/files before the deletion filter exec runs.
 /// Returns `None` when the set is empty, too large, or not single-column Int64.

@@ -749,3 +749,95 @@ async fn a_pk_point_lookup_ordered_by_the_pk_plans_after_a_transactional_commit(
         })
         .await
 }
+
+/// Durable delivery preserves both wall-clock timestamps and timestamp instants
+/// at `PostgreSQL` microsecond precision, including the upsert UPDATE path.
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamp_microseconds_survive_write_back_and_echo() -> Result<(), anyhow::Error> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::TimestampNanosecondType;
+
+    let _tracing = init_tracing(Some(tracing_filter()));
+    test_request_context().scope(async {
+        let (port, _container) = common::replication_test_database().await?;
+        let source = connect(port).await?;
+        let slot = "spice_wb_precision";
+        crate::postgres::replication::drop_replication_slot_when_inactive(&source, slot).await?;
+        exec(&source, "DROP TABLE IF EXISTS public.wb_precision; CREATE TABLE public.wb_precision (id int PRIMARY KEY, wall timestamp, instant timestamptz, n int); INSERT INTO public.wb_precision VALUES (0,NULL,NULL,0)").await?;
+        let accel = tempfile::tempdir()?;
+        let rt = build_runtime("write_back_precision", vec![write_back_dataset(port, "wb_precision", slot, accel.path())]).await?;
+        wait_for_bootstrap(&rt, "wb_precision").await?;
+        let cases = [
+            ("2026-01-02 03:04:05.000001", "2026-01-02T03:04:05.000001Z"),
+            ("2026-01-02 03:04:05.123456", "2026-01-02T03:04:05.123456+09:00"),
+            ("1969-12-31 23:59:59.123456", "1969-12-31T23:59:59.123456-07:00"),
+            ("2026-01-02 03:04:05", "2026-01-02T03:04:05Z"),
+        ];
+        for phase in 1..=2 {
+            for (index, (wall, instant)) in cases.iter().enumerate() {
+                let id = index + 1;
+                let wall = if phase == 2 { wall.replace("2026-01-02", "2026-02-03") } else { (*wall).to_string() };
+                let instant = if phase == 2 { instant.replace("2026-01-02", "2026-02-03") } else { (*instant).to_string() };
+                let values = format!("CAST('{wall}' AS TIMESTAMP),CAST('{instant}' AS TIMESTAMP WITH TIME ZONE)");
+                let statement = if phase == 1 {
+                    format!("INSERT INTO wb_precision VALUES ({id},{values},{phase})")
+                } else {
+                    format!("UPDATE wb_precision SET wall=CAST('{wall}' AS TIMESTAMP),instant=CAST('{instant}' AS TIMESTAMP WITH TIME ZONE),n={phase} WHERE id={id}")
+                };
+                run_txn(&rt, &format!("BEGIN; {statement}; COMMIT;")).await.map_err(|e| anyhow!("{}", describe(&e)))?;
+                let probe = format!("SELECT n FROM public.wb_precision WHERE id={id}");
+                wait_for("timestamp source delivery", Some(phase), || source_value(&source, &probe)).await?;
+                let query = format!("SELECT wall,instant FROM wb_precision WHERE id={id}");
+                let before = run_query(&rt, &query).await?;
+                let source_row = source.query_one(&format!("SELECT (extract(epoch FROM wall)*1000000)::bigint,(extract(epoch FROM instant)*1000000)::bigint FROM public.wb_precision WHERE id={id}"), &[]).await?;
+                for column in 0..2 {
+                    let local = before[0].column(column).as_primitive::<TimestampNanosecondType>();
+                    assert!(!local.is_null(0));
+                    let nanos = local.value(0);
+                    assert_eq!(nanos % 1000, 0, "microsecond fixture must not conceal rounding");
+                    let expected_micros = if column == 0 {
+                        chrono::NaiveDateTime::parse_from_str(&wall, "%Y-%m-%d %H:%M:%S%.f")?.and_utc().timestamp_micros()
+                    } else {
+                        chrono::DateTime::parse_from_rfc3339(&instant)?.timestamp_micros()
+                    };
+                    assert_eq!(nanos / 1000, expected_micros, "acknowledged timestamp changed the requested value");
+                    let source_micros: i64 = source_row.get(column);
+                    assert_eq!(nanos / 1000, source_micros, "phase={phase} id={id} column={column}");
+                }
+                // A later foreign source write is a WAL ordering barrier for the own echo.
+                exec(&source, "UPDATE public.wb_precision SET n=n+1 WHERE id=0").await?;
+                let barrier = source_value(&source, "SELECT n FROM public.wb_precision WHERE id=0").await?;
+                wait_for("timestamp CDC barrier", barrier, || accel_scalar(&rt, "SELECT n FROM wb_precision WHERE id=0")).await?;
+                assert_eq!(run_query(&rt, &query).await?, before, "own echo changed the acknowledged timestamp");
+            }
+        }
+        // The time formatter emits six fractional digits for a naive timestamp;
+        // Chrono retains all digits and PostgreSQL rounds them to microseconds.
+        // The authoritative accelerator keeps the acknowledged nanoseconds.
+        run_txn(&rt, "BEGIN; INSERT INTO wb_precision VALUES (7,CAST('2026-01-02 03:04:05.123456789' AS TIMESTAMP),CAST('2026-01-02T03:04:05.123456789Z' AS TIMESTAMP WITH TIME ZONE),1); COMMIT;").await.map_err(|e| anyhow!("{}", describe(&e)))?;
+        wait_for("nanosecond input delivery", Some(1), || source_value(&source, "SELECT n FROM public.wb_precision WHERE id=7")).await?;
+        let finer = source.query_one("SELECT to_char(wall,'US'),to_char(instant,'US') FROM public.wb_precision WHERE id=7", &[]).await?;
+        assert_eq!(finer.get::<_, String>(0), "123456");
+        assert_eq!(finer.get::<_, String>(1), "123457");
+        exec(&source, "UPDATE public.wb_precision SET n=n+1 WHERE id=0").await?;
+        let barrier = source_value(&source, "SELECT n FROM public.wb_precision WHERE id=0").await?;
+        wait_for("timestamp CDC barrier", barrier, || accel_scalar(&rt, "SELECT n FROM wb_precision WHERE id=0")).await?;
+        let local = run_query(&rt, "SELECT wall,instant FROM wb_precision WHERE id=7").await?;
+        for column in 0..2 {
+            assert_eq!(local[0].column(column).as_primitive::<TimestampNanosecondType>().value(0) % 1_000_000_000, 123_456_789);
+        }
+        run_txn(&rt, "BEGIN; UPDATE wb_precision SET wall=NULL,instant=NULL,n=3 WHERE id=1; COMMIT;").await.map_err(|e| anyhow!("{}", describe(&e)))?;
+        wait_for("timestamp NULL delivery", Some(3), || source_value(&source, "SELECT n FROM public.wb_precision WHERE id=1")).await?;
+        let nulls: bool = source.query_one("SELECT wall IS NULL AND instant IS NULL FROM public.wb_precision WHERE id=1", &[]).await?.get(0);
+        assert!(nulls);
+        exec(&source, "UPDATE public.wb_precision SET n=n+1 WHERE id=0").await?;
+        let barrier = source_value(&source, "SELECT n FROM public.wb_precision WHERE id=0").await?;
+        wait_for("timestamp CDC barrier", barrier, || accel_scalar(&rt, "SELECT n FROM wb_precision WHERE id=0")).await?;
+        let local = run_query(&rt, "SELECT wall,instant FROM wb_precision WHERE id=1").await?;
+        assert!(local[0].columns().iter().all(|column| column.is_null(0)));
+        rt.shutdown().await;
+        drop(rt);
+        crate::postgres::replication::drop_replication_slot_when_inactive(&source, slot).await?;
+        Ok(())
+    }).await
+}

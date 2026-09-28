@@ -549,13 +549,10 @@ mod tests {
     #[test]
     fn creation_rewrite_rules_match_vortex_for_all_supported_type_families() {
         // Only the families Cayenne accepts: the rest are refused before any rewrite runs.
-        let types: Vec<DataType> = arrow_type_families()
-            .into_iter()
-            .filter(is_vortex_supported_type)
-            .collect();
         let schema = Schema::new(
-            types
+            arrow_type_families()
                 .into_iter()
+                .filter(is_vortex_supported_type)
                 .enumerate()
                 .map(|(index, data_type)| Field::new(format!("column_{index}"), data_type, true))
                 .collect::<Vec<_>>(),

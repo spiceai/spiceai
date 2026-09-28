@@ -950,3 +950,125 @@ fn print_query_help() {
     println!("  - Press Ctrl+D or type .exit to quit");
     println!();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Deadline;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    const API_KEY: &str = "cli-api-key-must-not-leak";
+
+    fn submitted() -> ResponseTemplate {
+        ResponseTemplate::new(202).set_body_json(json!({
+            "query_id": "query-1",
+            "status": "PENDING",
+            "status_url": "/v1/queries/query-1/status",
+            "results_url": "/v1/queries/query-1/results"
+        }))
+    }
+
+    /// A 307 keeps the method and the body, so a hop that is followed replays the
+    /// credentialed `POST` verbatim to `location`.
+    fn redirect_to(location: &str) -> ResponseTemplate {
+        ResponseTemplate::new(307).insert_header("location", location)
+    }
+
+    fn context_for(runtime: &MockServer) -> RuntimeContext {
+        RuntimeContext::with_deadlines_for_test(
+            &runtime.uri(),
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(Duration::from_secs(30)),
+        )
+        .with_api_key_for_test(API_KEY)
+    }
+
+    fn api_key_header(request: &Request) -> Option<String> {
+        request
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// `spice query` builds its client from the SDK rather than from
+    /// `RuntimeContext::http_client`, so the CLI's own same-origin redirect policy does not
+    /// reach it: the SDK has to refuse to leave the origin itself. The key travels as
+    /// `X-API-Key`, which `reqwest` does not strip on a cross-origin hop the way it strips
+    /// `Authorization`, so a runtime, proxy or ingress answering with an off-origin
+    /// `Location` would otherwise be handed the key.
+    /// <https://github.com/spiceai/spiceai/issues/12502>
+    #[tokio::test]
+    async fn the_query_client_does_not_carry_the_api_key_off_its_origin() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/queries"))
+            .respond_with(submitted())
+            .mount(&elsewhere)
+            .await;
+
+        let runtime = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/queries"))
+            .respond_with(redirect_to(&format!("{}/v1/queries", elsewhere.uri())))
+            .mount(&runtime)
+            .await;
+
+        let client = build_client(&context_for(&runtime))
+            .await
+            .expect("building the client dials nothing");
+        let submitted = client.query("SELECT 1").await;
+
+        let leaked = elsewhere
+            .received_requests()
+            .await
+            .expect("the mock server records its requests");
+        assert!(
+            leaked.is_empty(),
+            "the redirect target received {} request(s); the first carried X-API-Key = {:?}",
+            leaked.len(),
+            leaked.first().and_then(api_key_header)
+        );
+        assert!(
+            submitted.is_err(),
+            "a refused redirect must not read as a submitted query"
+        );
+    }
+
+    /// The policy is about the origin, not about redirects: a hop that stays on the
+    /// configured origin is followed, and the key goes with it.
+    #[tokio::test]
+    async fn the_query_client_follows_a_same_origin_redirect_with_the_api_key() {
+        let runtime = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/queries"))
+            .respond_with(redirect_to(&format!("{}/v1/queries/moved", runtime.uri())))
+            .mount(&runtime)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/queries/moved"))
+            .respond_with(submitted())
+            .mount(&runtime)
+            .await;
+
+        let client = build_client(&context_for(&runtime))
+            .await
+            .expect("building the client dials nothing");
+        client
+            .query("SELECT 1")
+            .await
+            .expect("a same-origin redirect is followed through to the submission");
+
+        let requests = runtime
+            .received_requests()
+            .await
+            .expect("the mock server records its requests");
+        let moved = requests
+            .iter()
+            .find(|request| request.url.path() == "/v1/queries/moved")
+            .expect("the redirected submission reached the runtime");
+        assert_eq!(api_key_header(moved).as_deref(), Some(API_KEY));
+    }
+}

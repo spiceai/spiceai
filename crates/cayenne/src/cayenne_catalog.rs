@@ -35,6 +35,7 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use turso_shared::{
     DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, is_retryable_write_conflict_message, retry_backoff_delay,
 };
@@ -104,13 +105,45 @@ fn ensure_reinsert_keys_have_key_based_delete_file(
 
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
-pub(crate) enum MetastoreImpl {
+enum MetastoreBackendImpl {
     Sqlite(SqliteMetastore),
     #[cfg(feature = "turso")]
     Turso(TursoMetastore),
 }
 
+/// Pluggable metastore plus a process-local op counter. Query / execute / begin
+/// increment the counter; shutdown / WAL checkpoint / vacuum do not (those are
+/// maintenance, not scan-path catalog I/O).
+#[derive(Debug)]
+struct MetastoreImpl {
+    backend: MetastoreBackendImpl,
+    query_count: AtomicU64,
+}
+
 impl MetastoreImpl {
+    fn sqlite(metastore: SqliteMetastore) -> Self {
+        Self {
+            backend: MetastoreBackendImpl::Sqlite(metastore),
+            query_count: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(feature = "turso")]
+    fn turso(metastore: TursoMetastore) -> Self {
+        Self {
+            backend: MetastoreBackendImpl::Turso(metastore),
+            query_count: AtomicU64::new(0),
+        }
+    }
+
+    fn note_query(&self) {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn query_count(&self) -> u64 {
+        self.query_count.load(Ordering::Relaxed)
+    }
+
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -121,28 +154,31 @@ impl MetastoreImpl {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.query_row(params, f).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.query_row(params, f).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.query_row(params, f).await,
+            MetastoreBackendImpl::Turso(m) => m.query_row(params, f).await,
         }
     }
 
     /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute(params).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.execute(params).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute(params).await,
+            MetastoreBackendImpl::Turso(m) => m.execute(params).await,
         }
     }
 
     /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute_transaction_batch(sql).await,
+            MetastoreBackendImpl::Turso(m) => m.execute_transaction_batch(sql).await,
         }
     }
 
@@ -156,36 +192,37 @@ impl MetastoreImpl {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.query(params, f).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.query(params, f).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.query(params, f).await,
+            MetastoreBackendImpl::Turso(m) => m.query(params, f).await,
         }
     }
 
     /// Shutdown the metastore, performing any necessary cleanup.
     pub(crate) async fn shutdown(&self) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.shutdown().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.shutdown().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.shutdown().await,
+            MetastoreBackendImpl::Turso(m) => m.shutdown().await,
         }
     }
 
     /// Run a non-blocking WAL checkpoint off the hot path (cycle-5 TASK 2b).
     pub(crate) async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.checkpoint_wal().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.checkpoint_wal().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.checkpoint_wal().await,
+            MetastoreBackendImpl::Turso(m) => m.checkpoint_wal().await,
         }
     }
 
     pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.incremental_vacuum().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
+            MetastoreBackendImpl::Turso(m) => m.incremental_vacuum().await,
         }
     }
 
@@ -197,10 +234,11 @@ impl MetastoreImpl {
     pub(crate) async fn begin_transaction(
         &self,
     ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.begin_transaction().await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.begin_transaction().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.begin_transaction().await,
+            MetastoreBackendImpl::Turso(m) => m.begin_transaction().await,
         }
     }
 }
@@ -245,20 +283,29 @@ impl CayenneCatalog {
         let metastore = if connection_string.starts_with("libsql://") {
             #[cfg(feature = "turso")]
             {
-                MetastoreImpl::Turso(TursoMetastore::new(&connection_string))
+                MetastoreImpl::turso(TursoMetastore::new(&connection_string))
             }
             #[cfg(not(feature = "turso"))]
             {
                 return Err(CatalogError::TursoNotEnabled);
             }
         } else {
-            MetastoreImpl::Sqlite(SqliteMetastore::new(&connection_string))
+            MetastoreImpl::sqlite(SqliteMetastore::new(&connection_string))
         };
 
         Ok(Self {
             connection_string,
             metastore,
         })
+    }
+
+    /// Number of metastore query / execute / begin operations this catalog has
+    /// issued. Tests and benches use this to prove a scan-view cache hit does
+    /// not round-trip the metastore. WAL checkpoint, vacuum, and shutdown are
+    /// not counted (maintenance, not scan-path I/O).
+    #[must_use]
+    pub fn metastore_query_count(&self) -> u64 {
+        self.metastore.query_count()
     }
 
     /// Get the database file path from the connection string.
@@ -301,6 +348,72 @@ impl CayenneCatalog {
     /// connection failure, busy timeout).
     pub async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         self.metastore.begin_transaction().await
+    }
+
+    /// Persist `schema` for `table_id`. When `drop_statistics` is true, also
+    /// drop table, snapshot-file, and cold-tier statistics in the same
+    /// transaction so a decimal scale change cannot decode leftover unscaled
+    /// min/max with the new scale.
+    async fn persist_table_schema(
+        &self,
+        table_id: &str,
+        schema: &arrow_schema::SchemaRef,
+        drop_statistics: bool,
+    ) -> CatalogResult<()> {
+        let schema_json = serialize_schema_ipc_base64(schema.as_ref())?;
+        let schema_err = |source: CatalogError| CatalogError::InvalidOperation {
+            message: format!("Failed to update schema for table {table_id}"),
+            source: Box::new(source),
+        };
+        if !drop_statistics {
+            return self
+                .metastore
+                .execute_helper(ExecuteParams {
+                    sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
+                    params: vec![
+                        MetastoreValue::Text(schema_json),
+                        MetastoreValue::Text(table_id.to_string()),
+                    ],
+                })
+                .await
+                .map_err(schema_err);
+        }
+
+        let txn = self.begin_transaction().await?;
+        let table_id_owned = table_id.to_string();
+        txn.execute(ExecuteParams {
+            sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
+            params: vec![
+                MetastoreValue::Text(schema_json),
+                MetastoreValue::Text(table_id_owned.clone()),
+            ],
+        })
+        .await
+        .map_err(schema_err)?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id_owned.clone())],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id_owned.clone())],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "UPDATE cayenne_cold_tier_file SET statistics_blob = ?1 WHERE table_id = ?2",
+            params: vec![
+                MetastoreValue::Blob(Vec::new()),
+                MetastoreValue::Text(table_id_owned),
+            ],
+        })
+        .await?;
+        txn.commit().await?;
+        tracing::debug!(
+            table_id,
+            "Dropped persisted column statistics because a decimal column's scale changed"
+        );
+        Ok(())
     }
 
     /// Return the durable current-snapshot pointer for a table ID.
@@ -444,7 +557,7 @@ impl CayenneCatalog {
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
         txn.execute(ExecuteParams {
-            sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+            sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
             params: vec![
                 MetastoreValue::Text(table_id.to_string()),
                 MetastoreValue::Text(target_snapshot_id.to_string()),
@@ -516,23 +629,11 @@ impl CayenneCatalog {
             ],
         })
         .await?;
-        for file in files {
-            txn.execute(ExecuteParams {
-                sql: "INSERT INTO cayenne_snapshot_file (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
-                    MetastoreValue::Text(file.table_id.clone()),
-                    MetastoreValue::Text(file.snapshot_id.clone()),
-                    MetastoreValue::Text(file.file_path.clone()),
-                    MetastoreValue::Integer(file.row_count),
-                    MetastoreValue::Integer(file.file_size_bytes),
-                    MetastoreValue::Integer(file.min_sequence),
-                    MetastoreValue::Integer(file.max_sequence),
-                    file.digest.clone().map_or(MetastoreValue::Null, MetastoreValue::Text),
-                ],
-            })
-            .await?;
-        }
-        Ok(())
+        txn.execute_many(
+            SNAPSHOT_FILE_INSERT_SQL,
+            files.iter().map(snapshot_file_params).collect(),
+        )
+        .await
     }
 
     async fn existing_delete_file_record(
@@ -848,9 +949,10 @@ impl CayenneCatalog {
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
              DELETE FROM cayenne_snapshot_file_statistics \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
-             INSERT OR REPLACE INTO cayenne_snapshot_sequence \
+             INSERT INTO cayenne_snapshot_sequence \
                 (table_id, snapshot_id, sequence_number) \
-                VALUES ({table_id_literal}, {new_snapshot_id_literal}, {new_sequence_number});"
+                VALUES ({table_id_literal}, {new_snapshot_id_literal}, {new_sequence_number}) \
+                ON CONFLICT(table_id, snapshot_id) DO UPDATE SET sequence_number = excluded.sequence_number;"
         );
         txn.execute_batch(&batch_sql).await?;
         Ok(true)
@@ -918,11 +1020,14 @@ impl CayenneCatalog {
         // tier's inline corpus along with everything else keyed on the old snapshot.
         self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
             .await?;
+        // One statement per file rather than `execute_many`: each row carries
+        // a statistics blob and a primary-key bloom of up to
+        // `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, so binding them all at once would
+        // hold a second copy of every bloom for the whole write transaction,
+        // while a round trip per file is noise beside writing its blobs.
         for f in cold_files {
             txn.execute(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_cold_tier_file \
-                      (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob, pk_bloom_blob) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                sql: COLD_TIER_FILE_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(f.table_id.clone()),
                     MetastoreValue::Text(f.file_url.clone()),
@@ -1150,8 +1255,8 @@ impl CayenneCatalog {
 
     /// Reconcile a reopened table's stored `VortexConfig` with the currently
     /// configured options, for the fields that describe how the table is RUN
-    /// rather than how its data is written: the datalake (cold tier) settings
-    /// and the scan concurrency.
+    /// rather than whether existing files remain readable: clustering and
+    /// datalake settings plus scan concurrency.
     ///
     /// These are deliberately excluded from [`configuration_matches`] (changing
     /// them never recreates the table), and the provider runs with the STORED
@@ -1194,7 +1299,7 @@ impl CayenneCatalog {
         let new_vc = &options.vortex_config;
         let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
             || stored_vc.cold_tier_location != new_vc.cold_tier_location
-            || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
+            || stored_vc.cluster_by != new_vc.cluster_by
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
@@ -1213,8 +1318,8 @@ impl CayenneCatalog {
             .clone_from(&new_vc.cold_tier_location);
         stored
             .vortex_config
-            .cold_clustering_columns
-            .clone_from(&new_vc.cold_clustering_columns);
+            .cluster_by
+            .clone_from(&new_vc.cluster_by);
         stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
         stored.vortex_config.cold_clustering_run_size_mb = new_vc.cold_clustering_run_size_mb;
         stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
@@ -1349,8 +1454,17 @@ impl CayenneCatalog {
             SchemaEvolution::Widening(plan)
                 if options.vortex_config.schema_evolution.allows(&plan) =>
             {
-                self.update_table_schema(&stored_metadata.table_id, &plan.evolved_schema)
-                    .await?;
+                // A scale change and leftover stats blobs cannot be committed
+                // separately: the blobs store unscaled integers decoded with
+                // the *current* schema's scale (123.45 at scale 2 becomes
+                // 1.2345 at scale 4). One transaction publishes the schema
+                // and drops table, snapshot-file, and cold-tier stats.
+                self.persist_table_schema(
+                    &stored_metadata.table_id,
+                    &plan.evolved_schema,
+                    plan.changes_decimal_scale(),
+                )
+                .await?;
                 tracing::info!(
                     table = table_name,
                     "Cayenne table schema evolved in place: {}",
@@ -1728,7 +1842,7 @@ impl CayenneCatalog {
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
                     .execute(ExecuteParams {
-                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
                         params: vec![
                             MetastoreValue::Text(table_id.to_string()),
                             MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
@@ -2142,10 +2256,10 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Initialize schema using the appropriate metastore backend
-        match &self.metastore {
-            MetastoreImpl::Sqlite(metastore) => metastore.init_schema().await?,
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(metastore) => metastore.init_schema().await?,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(metastore) => metastore.init_schema().await?,
+            MetastoreBackendImpl::Turso(metastore) => metastore.init_schema().await?,
         }
 
         Ok(())
@@ -2449,20 +2563,15 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         schema: &arrow_schema::SchemaRef,
     ) -> CatalogResult<()> {
-        let schema_json = serialize_schema_ipc_base64(schema.as_ref())?;
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
-                params: vec![
-                    MetastoreValue::Text(schema_json),
-                    MetastoreValue::Text(table_id.to_string()),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to update schema for table {table_id}"),
-                source: Box::new(e),
-            })
+        self.persist_table_schema(table_id, schema, false).await
+    }
+
+    async fn update_table_schema_dropping_statistics(
+        &self,
+        table_id: &str,
+        schema: &arrow_schema::SchemaRef,
+    ) -> CatalogResult<()> {
+        self.persist_table_schema(table_id, schema, true).await
     }
 
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
@@ -3031,7 +3140,7 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
@@ -3569,9 +3678,7 @@ impl MetadataCatalog for CayenneCatalog {
     async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
-                      VALUES (?1, ?2, ?3, ?4, ?5)",
+                sql: TABLE_STATISTICS_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
@@ -3630,9 +3737,7 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file_statistics \
-                      (table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                sql: SNAPSHOT_FILE_STATISTICS_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Text(stats.snapshot_id.clone()),
@@ -3737,21 +3842,8 @@ impl MetadataCatalog for CayenneCatalog {
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
-                    MetastoreValue::Text(file.table_id.clone()),
-                    MetastoreValue::Text(file.snapshot_id.clone()),
-                    MetastoreValue::Text(file.file_path.clone()),
-                    MetastoreValue::Integer(file.row_count),
-                    MetastoreValue::Integer(file.file_size_bytes),
-                    MetastoreValue::Integer(file.min_sequence),
-                    MetastoreValue::Integer(file.max_sequence),
-                    file.digest
-                        .clone()
-                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
-                ],
+                sql: SNAPSHOT_FILE_UPSERT_SQL,
+                params: snapshot_file_params(file),
             })
             .await
     }
@@ -3762,6 +3854,19 @@ impl MetadataCatalog for CayenneCatalog {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
+        // Validate before taking the write lock: a rejected replacement then
+        // never touches the stored manifest.
+        if let Some(file) = files
+            .iter()
+            .find(|file| file.table_id != table_id || file.snapshot_id != snapshot_id)
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Snapshot manifest replacement row does not match target table/snapshot: expected {table_id}/{snapshot_id}, found {}/{}",
+                    file.table_id, file.snapshot_id
+                ),
+            });
+        }
         let txn = self.begin_transaction().await?;
         txn.execute(ExecuteParams {
             sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
@@ -3771,34 +3876,11 @@ impl MetadataCatalog for CayenneCatalog {
             ],
         })
         .await?;
-        for file in files {
-            if file.table_id != table_id || file.snapshot_id != snapshot_id {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Snapshot manifest replacement row does not match target table/snapshot: expected {table_id}/{snapshot_id}, found {}/{}",
-                        file.table_id, file.snapshot_id
-                    ),
-                });
-            }
-            txn.execute(ExecuteParams {
-                sql: "INSERT INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params: vec![
-                    MetastoreValue::Text(file.table_id.clone()),
-                    MetastoreValue::Text(file.snapshot_id.clone()),
-                    MetastoreValue::Text(file.file_path.clone()),
-                    MetastoreValue::Integer(file.row_count),
-                    MetastoreValue::Integer(file.file_size_bytes),
-                    MetastoreValue::Integer(file.min_sequence),
-                    MetastoreValue::Integer(file.max_sequence),
-                    file.digest
-                        .clone()
-                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
-                ],
-            })
-            .await?;
-        }
+        txn.execute_many(
+            SNAPSHOT_FILE_INSERT_SQL,
+            files.iter().map(snapshot_file_params).collect(),
+        )
+        .await?;
         txn.commit().await
     }
 
@@ -3986,9 +4068,7 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_pk_index \
-                      (table_id, snapshot_id, index_blob) \
-                      VALUES (?1, ?2, ?3)",
+                sql: PK_INDEX_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
@@ -4836,7 +4916,7 @@ impl MetadataCatalog for CayenneCatalog {
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
                     .execute(ExecuteParams {
-                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
                         params: vec![
                             MetastoreValue::Text(table_id.to_string()),
                             MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
@@ -5080,12 +5160,12 @@ impl MetadataCatalog for CayenneCatalog {
         dataset_name: &str,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
-        match &self.metastore {
-            MetastoreImpl::Sqlite(m) => {
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => {
+            MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
         }
@@ -5096,12 +5176,12 @@ impl MetadataCatalog for CayenneCatalog {
         slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<()> {
-        match &self.metastore {
-            MetastoreImpl::Sqlite(m) => {
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => {
+            MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
         }
@@ -5335,6 +5415,83 @@ fn insert_record_table_id_blob_literal(table_id: &str) -> String {
     hex
 }
 
+/// The one statement that inserts a `cayenne_snapshot_file` manifest row, bound by
+/// [`snapshot_file_params`]. Every manifest write path shares it so the column list
+/// and parameter order cannot drift between them.
+const SNAPSHOT_FILE_INSERT_SQL: &str = "INSERT INTO cayenne_snapshot_file \
+     (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+
+/// Bind one manifest row in [`SNAPSHOT_FILE_INSERT_SQL`] /
+/// [`SNAPSHOT_FILE_UPSERT_SQL`] column order.
+fn snapshot_file_params(file: &SnapshotFile) -> Vec<MetastoreValue> {
+    vec![
+        MetastoreValue::Text(file.table_id.clone()),
+        MetastoreValue::Text(file.snapshot_id.clone()),
+        MetastoreValue::Text(file.file_path.clone()),
+        MetastoreValue::Integer(file.row_count),
+        MetastoreValue::Integer(file.file_size_bytes),
+        MetastoreValue::Integer(file.min_sequence),
+        MetastoreValue::Integer(file.max_sequence),
+        file.digest
+            .clone()
+            .map_or(MetastoreValue::Null, MetastoreValue::Text),
+    ]
+}
+
+// Every upsert into a child of `cayenne_table` is `INSERT … ON CONFLICT … DO
+// UPDATE`, not `INSERT OR REPLACE`. REPLACE resolves the conflict by deleting the
+// stored row and inserting a new one, and on a table with a foreign key that
+// delete runs SQLite's delete-side foreign-key processing. DO UPDATE rewrites the
+// row in place and never changes `table_id`, so it does no foreign-key work. Each
+// DO UPDATE sets every non-key column from the new row, so the stored row is the
+// one REPLACE would have written (`test_upserts_set_every_non_key_column`).
+
+/// Upsert of one `cayenne_snapshot_sequence` row.
+const SNAPSHOT_SEQUENCE_UPSERT_SQL: &str = "INSERT INTO cayenne_snapshot_sequence \
+     (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(table_id, snapshot_id) DO UPDATE SET sequence_number = excluded.sequence_number";
+
+/// Upsert of a table's `cayenne_table_statistics` row.
+const TABLE_STATISTICS_UPSERT_SQL: &str = "INSERT INTO cayenne_table_statistics \
+     (table_id, statistics_blob, num_rows, ndv_sketches, num_rows_exact) \
+     VALUES (?1, ?2, ?3, ?4, ?5) \
+     ON CONFLICT(table_id) DO UPDATE SET statistics_blob = excluded.statistics_blob, \
+     num_rows = excluded.num_rows, ndv_sketches = excluded.ndv_sketches, \
+     num_rows_exact = excluded.num_rows_exact";
+
+/// Upsert of one file's `cayenne_snapshot_file_statistics` row.
+const SNAPSHOT_FILE_STATISTICS_UPSERT_SQL: &str = "INSERT INTO cayenne_snapshot_file_statistics \
+     (table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     ON CONFLICT(table_id, snapshot_id, file_path) DO UPDATE SET \
+     file_size_bytes = excluded.file_size_bytes, num_rows = excluded.num_rows, \
+     statistics_blob = excluded.statistics_blob";
+
+/// Upsert form of [`SNAPSHOT_FILE_INSERT_SQL`], bound by [`snapshot_file_params`].
+const SNAPSHOT_FILE_UPSERT_SQL: &str = "INSERT INTO cayenne_snapshot_file \
+     (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+     ON CONFLICT(table_id, snapshot_id, file_path) DO UPDATE SET \
+     row_count = excluded.row_count, file_size_bytes = excluded.file_size_bytes, \
+     min_sequence = excluded.min_sequence, max_sequence = excluded.max_sequence, \
+     digest = excluded.digest";
+
+/// Upsert of a table's `cayenne_pk_index` row.
+const PK_INDEX_UPSERT_SQL: &str = "INSERT INTO cayenne_pk_index \
+     (table_id, snapshot_id, index_blob) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(table_id) DO UPDATE SET snapshot_id = excluded.snapshot_id, \
+     index_blob = excluded.index_blob";
+
+/// Upsert of one `cayenne_cold_tier_file` row.
+const COLD_TIER_FILE_UPSERT_SQL: &str = "INSERT INTO cayenne_cold_tier_file \
+     (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob, pk_bloom_blob) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+     ON CONFLICT(table_id, file_url) DO UPDATE SET row_count = excluded.row_count, \
+     file_size_bytes = excluded.file_size_bytes, min_sequence = excluded.min_sequence, \
+     max_sequence = excluded.max_sequence, statistics_blob = excluded.statistics_blob, \
+     pk_bloom_blob = excluded.pk_bloom_blob";
+
 /// The one statement that appends a row to `cayenne_inlined_data`. Shared by
 /// every inline write path so the column list and parameter order cannot drift
 /// between them; see [`inlined_data_insert`].
@@ -5487,6 +5644,39 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
                 options.table_name
             ),
         });
+    }
+
+    let config = &options.vortex_config;
+    if !config.cluster_by.is_empty()
+        && !config.sort_columns.is_empty()
+        && config.sort_columns_origin == super::metadata::SortColumnsOrigin::User
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Failed to create Cayenne table '{}': `cluster_by` cannot be combined with `sort_columns`. Remove one configuration; sorting within clusters is not supported yet.",
+                options.table_name
+            ),
+        });
+    }
+
+    for column in &config.cluster_by {
+        let Some((_, field)) = options.schema.column_with_name(column) else {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to create Cayenne table '{}': clustering column '{column}' does not exist. Update `CLUSTER BY` or `cayenne_cluster_by` to use an existing column.",
+                    options.table_name
+                ),
+            });
+        };
+        if !crate::provider::clustering::is_clusterable(field.data_type()) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to create Cayenne table '{}': clustering column '{column}' has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from the cluster key.",
+                    options.table_name,
+                    field.data_type()
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -5657,6 +5847,295 @@ mod tests {
         // Tests will be added once implementation is complete
     }
 
+    /// The upserts replaced `INSERT OR REPLACE`, which rewrote the whole row.
+    /// `DO UPDATE` writes only the columns it names, so each upsert must insert
+    /// every column of its table and set every non-key column from the new row —
+    /// otherwise a column the table gains later keeps its stale value.
+    #[test]
+    fn test_upserts_set_every_non_key_column() {
+        use std::collections::BTreeSet;
+
+        fn between<'a>(sql: &'a str, open: &str, close: &str) -> &'a str {
+            let start = sql.find(open).expect("opening token") + open.len();
+            let end = start + sql[start..].find(close).expect("closing token");
+            &sql[start..end]
+        }
+        fn column_set(list: &str) -> BTreeSet<String> {
+            list.split(',').map(|c| c.trim().to_string()).collect()
+        }
+
+        for sql in [
+            SNAPSHOT_SEQUENCE_UPSERT_SQL,
+            TABLE_STATISTICS_UPSERT_SQL,
+            SNAPSHOT_FILE_STATISTICS_UPSERT_SQL,
+            SNAPSHOT_FILE_UPSERT_SQL,
+            PK_INDEX_UPSERT_SQL,
+            COLD_TIER_FILE_UPSERT_SQL,
+        ] {
+            let table = between(sql, "INSERT INTO ", " ");
+            let expected = crate::metastore::EXPECTED_TABLES
+                .iter()
+                .find(|t| t.name == table)
+                .expect("the upsert targets a metastore table");
+            let all: BTreeSet<String> = expected.columns.iter().map(|c| (*c).to_string()).collect();
+            assert_eq!(
+                column_set(between(sql, "(", ")")),
+                all,
+                "{table}: the upsert must insert every column"
+            );
+
+            let key = column_set(between(sql, "ON CONFLICT(", ")"));
+            let (_, assignments) = sql
+                .split_once("DO UPDATE SET ")
+                .expect("an ON CONFLICT DO UPDATE upsert");
+            let mut set = BTreeSet::new();
+            for assignment in assignments.split(',') {
+                let (column, value) = assignment.split_once('=').expect("column = value");
+                let column = column.trim();
+                assert_eq!(
+                    value.trim(),
+                    format!("excluded.{column}"),
+                    "{table}: {column} must be set from the new row"
+                );
+                set.insert(column.to_string());
+            }
+            let non_key: BTreeSet<String> = all.difference(&key).cloned().collect();
+            assert_eq!(
+                set, non_key,
+                "{table}: DO UPDATE must set exactly the non-key columns"
+            );
+        }
+    }
+
+    type ManifestRow = (String, String, String, i64, i64, i64, i64, Option<String>);
+
+    fn manifest_row(f: &SnapshotFile) -> ManifestRow {
+        (
+            f.table_id.clone(),
+            f.snapshot_id.clone(),
+            f.file_path.clone(),
+            f.row_count,
+            f.file_size_bytes,
+            f.min_sequence,
+            f.max_sequence,
+            f.digest.clone(),
+        )
+    }
+
+    async fn stored_manifest(
+        catalog: &CayenneCatalog,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> Vec<ManifestRow> {
+        let mut rows: Vec<ManifestRow> = catalog
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
+            .expect("read manifest")
+            .iter()
+            .map(manifest_row)
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A catalog in its own temporary directory with one table; returns the
+    /// catalog, the table's id and current snapshot id, and the guards that keep
+    /// the database and table root alive.
+    async fn catalog_with_table(
+        table_name: &str,
+    ) -> (
+        CayenneCatalog,
+        String,
+        String,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let (table_root, base_path) = test_table_root();
+        let db_dir = tempfile::tempdir().expect("database directory");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            db_dir.path().join("cayenne.db").display()
+        ))
+        .expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path,
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+        let snapshot_id = catalog
+            .get_table(table_name)
+            .await
+            .expect("get table")
+            .current_snapshot_id;
+        (catalog, table_id, snapshot_id, db_dir, table_root)
+    }
+
+    /// A second upsert of a stored key leaves exactly the second row's values —
+    /// `NULL`s included — which is what `INSERT OR REPLACE` stored.
+    #[tokio::test]
+    async fn test_upserts_overwrite_every_column_of_a_stored_row() {
+        let (catalog, table_id, snapshot_id, _db, _root) =
+            catalog_with_table("upsert_overwrite").await;
+
+        let first = SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "a.vortex".to_string(),
+            row_count: 1,
+            file_size_bytes: 2,
+            min_sequence: 3,
+            max_sequence: 4,
+            digest: Some("xxh3-128:01".to_string()),
+        };
+        let second = SnapshotFile {
+            row_count: 10,
+            file_size_bytes: 20,
+            min_sequence: 30,
+            max_sequence: 40,
+            digest: None,
+            ..first.clone()
+        };
+        catalog
+            .upsert_snapshot_file(&first)
+            .await
+            .expect("first upsert");
+        catalog
+            .upsert_snapshot_file(&second)
+            .await
+            .expect("second upsert");
+        assert_eq!(
+            stored_manifest(&catalog, &table_id, &snapshot_id).await,
+            vec![manifest_row(&second)]
+        );
+
+        let stats = |file_size_bytes, num_rows, blob: &[u8]| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "a.vortex".to_string(),
+            file_size_bytes,
+            num_rows,
+            statistics_blob: blob.to_vec(),
+        };
+        catalog
+            .upsert_snapshot_file_statistics(&stats(1, 2, &[1, 2, 3]))
+            .await
+            .expect("first file stats upsert");
+        catalog
+            .upsert_snapshot_file_statistics(&stats(10, 20, &[9]))
+            .await
+            .expect("second file stats upsert");
+        let stored = catalog
+            .get_snapshot_file_statistics(&table_id, &snapshot_id, "a.vortex")
+            .await
+            .expect("read file stats")
+            .expect("file stats row");
+        assert_eq!(
+            (
+                stored.file_size_bytes,
+                stored.num_rows,
+                stored.statistics_blob
+            ),
+            (10, 20, vec![9])
+        );
+
+        catalog
+            .upsert_pk_index(&table_id, "snapshot-a", &[1, 2, 3])
+            .await
+            .expect("first pk index upsert");
+        catalog
+            .upsert_pk_index(&table_id, "snapshot-b", &[4])
+            .await
+            .expect("second pk index upsert");
+        assert_eq!(
+            catalog
+                .get_pk_index(&table_id)
+                .await
+                .expect("read pk index"),
+            Some(("snapshot-b".to_string(), vec![4]))
+        );
+
+        catalog
+            .set_snapshot_sequence(&table_id, &snapshot_id, 5)
+            .await
+            .expect("first sequence upsert");
+        catalog
+            .set_snapshot_sequence(&table_id, &snapshot_id, 9)
+            .await
+            .expect("second sequence upsert");
+        assert_eq!(
+            catalog
+                .get_snapshot_sequence(&table_id, &snapshot_id)
+                .await
+                .expect("read sequence"),
+            Some(9)
+        );
+    }
+
+    /// Both manifest rewrites write the whole manifest in one batch; every row
+    /// must land, with its values.
+    #[tokio::test]
+    async fn test_replace_snapshot_files_writes_every_row() {
+        let (catalog, table_id, snapshot_id, _db, _root) =
+            catalog_with_table("manifest_batch").await;
+        let files: Vec<SnapshotFile> = (0..2_500_i64)
+            .map(|i| SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: format!("{i:05}.vortex"),
+                row_count: i,
+                file_size_bytes: i * 2,
+                min_sequence: i,
+                max_sequence: i + 1,
+                digest: (i % 2 == 0).then(|| format!("xxh3-128:{i:032x}")),
+            })
+            .collect();
+
+        catalog
+            .replace_snapshot_files(&table_id, &snapshot_id, &files)
+            .await
+            .expect("replace manifest");
+        let mut expected: Vec<ManifestRow> = files.iter().map(manifest_row).collect();
+        expected.sort();
+        assert_eq!(
+            stored_manifest(&catalog, &table_id, &snapshot_id).await,
+            expected
+        );
+
+        // The caller-owned-transaction form, replacing it with a smaller set.
+        let replacement: Vec<SnapshotFile> = files
+            .iter()
+            .take(1_200)
+            .map(|f| SnapshotFile {
+                row_count: 7,
+                ..f.clone()
+            })
+            .collect();
+        let mut txn = catalog.begin_transaction().await.expect("begin");
+        catalog
+            .replace_snapshot_files_in_txn(txn.as_mut(), &table_id, &snapshot_id, &replacement)
+            .await
+            .expect("replace manifest in transaction");
+        txn.commit().await.expect("commit");
+        let mut expected: Vec<ManifestRow> = replacement.iter().map(manifest_row).collect();
+        expected.sort();
+        assert_eq!(
+            stored_manifest(&catalog, &table_id, &snapshot_id).await,
+            expected
+        );
+    }
+
     /// The per-cold-file `pk_bloom` blob must survive the manifest write/read
     /// round-trip (the `commit_overwrite_to_cold` INSERT and `list_cold_tier_files`
     /// SELECT column wiring), and a `None` bloom must round-trip as SQL NULL →
@@ -5739,6 +6218,131 @@ mod tests {
         drop(catalog);
 
         // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// A decimal scale change must drop every persisted statistics blob in the
+    /// same step as the schema update: table aggregate, snapshot-file cache,
+    /// and cold-tier manifests. Vortex stores unscaled integers and decodes
+    /// them with the current schema's scale, so a leftover blob from scale 2
+    /// would prune 123.45 as 1.2345 after widening to scale 4.
+    #[tokio::test]
+    async fn decimal_scale_change_drops_table_snapshot_and_cold_statistics() {
+        use crate::metadata::SchemaEvolutionMode;
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_decimal_scale_stats_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let scale2 = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Decimal128(10, 2), true),
+        ]));
+        let scale4 = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Decimal128(14, 4), true),
+        ]));
+        let options = |schema: arrow_schema::SchemaRef| CreateTableOptions {
+            table_name: "decimal_scale_stats".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                schema_evolution: SchemaEvolutionMode::Widen,
+                ..crate::metadata::VortexConfig::default()
+            },
+        };
+
+        let table_id = catalog
+            .create_table(options(Arc::clone(&scale2)))
+            .await
+            .expect("create table");
+
+        let cold = ColdTierFile {
+            table_id: table_id.clone(),
+            file_url: "s3://bucket/t/data/p1/c.vortex".to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: 0,
+            max_sequence: 1,
+            statistics_blob: vec![7, 8, 9],
+            pk_bloom: None,
+        };
+        catalog
+            .commit_overwrite_to_cold(
+                &table_id,
+                &uuid::Uuid::now_v7().to_string(),
+                std::slice::from_ref(&cold),
+            )
+            .await
+            .expect("seed a cold file whose statistics blob is the scale-2 bound");
+
+        // Overwrite clears table/snapshot stats, so seed them after the cold row.
+        catalog
+            .upsert_table_statistics(&TableStatistics {
+                table_id: table_id.clone(),
+                statistics_blob: vec![1, 2, 3],
+                num_rows: 10,
+                ndv_sketches: None,
+                num_rows_exact: true,
+            })
+            .await
+            .expect("seed table stats");
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: "f.vortex".to_string(),
+                file_size_bytes: 100,
+                num_rows: 10,
+                statistics_blob: vec![4, 5, 6],
+            })
+            .await
+            .expect("seed snapshot file stats");
+
+        catalog
+            .create_table(options(scale4))
+            .await
+            .expect("re-create with a wider decimal scale");
+
+        assert!(
+            catalog
+                .get_table_statistics(&table_id)
+                .await
+                .expect("read table stats")
+                .is_none(),
+            "table aggregate stats must be dropped so they cannot decode at the new scale"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &snapshot_id, "f.vortex")
+                .await
+                .expect("read snapshot file stats")
+                .is_none(),
+            "snapshot-file stats must be dropped so listing-time pruning cannot use the old scale"
+        );
+        let cold_files = catalog
+            .list_cold_tier_files(&table_id)
+            .await
+            .expect("list cold files");
+        assert_eq!(cold_files.len(), 1, "the cold file itself must survive");
+        assert!(
+            cold_files[0].statistics_blob.is_empty(),
+            "cold-tier statistics_blob must be cleared, got {} bytes",
+            cold_files[0].statistics_blob.len()
+        );
+
+        drop(catalog);
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

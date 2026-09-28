@@ -125,12 +125,12 @@ impl ResolvedTableAwareAllowlist {
             Token::EOF => {
                 return Err(ParserError::ParserError(
                     "Empty input when parsing identifier".to_string(),
-                ))?;
+                ));
             }
             token => {
                 return Err(ParserError::ParserError(format!(
                     "Unexpected token in identifier: {token}"
-                )))?;
+                )));
             }
         }
 
@@ -143,19 +143,19 @@ impl ResolvedTableAwareAllowlist {
                     Token::EOF => {
                         return Err(ParserError::ParserError(
                             "Trailing period in identifier".to_string(),
-                        ))?;
+                        ));
                     }
                     token => {
                         return Err(ParserError::ParserError(format!(
                             "Unexpected token following period in identifier: {token}"
-                        )))?;
+                        )));
                     }
                 },
                 Token::EOF => break,
                 token => {
                     return Err(ParserError::ParserError(format!(
                         "Unexpected token in identifier: {token}"
-                    )))?;
+                    )));
                 }
             }
         }

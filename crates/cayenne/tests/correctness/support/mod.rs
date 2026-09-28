@@ -78,6 +78,48 @@ use test_framework::queries::{
     get_tpch_test_queries,
 };
 
+/// Whether `dir` already holds a fixture that *this* generator finished writing.
+///
+/// The scratch tree (`target/cayenne_parity_scratch` by default) outlives
+/// builds, branch switches and self-hosted CI jobs, so "some parquet is here"
+/// says nothing about which generator produced it. Reusing on that alone lets a
+/// fixture written before a generator change quietly revert whatever the change
+/// was for — and a suite comparing two engines against the same stale rows still
+/// agrees with itself, so nothing turns red.
+///
+/// The stamp closes both halves. It is written only after every file lands, so
+/// an interrupted run leaves no stamp and is regenerated rather than reused
+/// half-written; and it records `revision`, so a fixture from an older generator
+/// no longer matches.
+#[must_use]
+pub fn fixture_is_current(dir: &Path, revision: &str) -> bool {
+    std::fs::read_to_string(dir.join(FIXTURE_STAMP)).is_ok_and(|stamp| stamp.trim() == revision)
+}
+
+/// Record that `dir` now holds a complete fixture built by `revision`.
+///
+/// Call only once every file is written: the stamp is what a later run trusts.
+pub fn mark_fixture_complete(dir: &Path, revision: &str) {
+    std::fs::write(dir.join(FIXTURE_STAMP), revision).expect("write fixture stamp");
+}
+
+/// Digest of a generator's own source, used as its fixture revision.
+///
+/// Derived from the source rather than a hand-maintained constant because the
+/// constant is what gets forgotten: the edit that changes the generated rows is
+/// exactly the moment someone is thinking about the data, not the version.
+#[must_use]
+pub fn generator_revision(source: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Name of the stamp file. Dotted so directory scans that collect `*.parquet`
+/// table names never pick it up.
+const FIXTURE_STAMP: &str = ".fixture-complete";
+
 /// Outcome for one inventory query on one engine pair.
 /// Outcome of the **harness** after executing SQL and comparing actual batches.
 #[derive(Debug, Clone)]
@@ -104,12 +146,18 @@ pub enum ParityOutcome {
 }
 
 impl ParityOutcome {
+    /// Whether this outcome needs no explanation.
+    ///
+    /// `OrderUnchecked` is deliberately absent. It means the rows matched and
+    /// the order they came back in was never verified, which is the outcome the
+    /// sort check exists to surface — counting it here would let a resolver
+    /// regression, or an `ORDER BY` the projection stops carrying, settle into a
+    /// summary bucket instead of turning a lane red. A hole that has been looked
+    /// at is named in the inventory and accepted by [`report::unexplained`]; one
+    /// that has not fails.
     #[must_use]
     pub fn is_pass_or_excluded(&self) -> bool {
-        matches!(
-            self,
-            Self::Pass | Self::Excluded { .. } | Self::OrderUnchecked { .. }
-        )
+        matches!(self, Self::Pass | Self::Excluded { .. })
     }
 }
 

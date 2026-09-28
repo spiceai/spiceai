@@ -514,3 +514,246 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
         _ => Error::Unknown { source: e },
     }
 }
+
+/// Guards the pinned snapshot read `spiceai/iceberg-rust` fork PR #45 adds to
+/// [`IcebergTableProvider`].
+///
+/// `with_snapshot_id` is the only way to read an Iceberg table as of anything but
+/// its current snapshot, and it is how the distributed path plans every task of one
+/// query against the snapshot the scheduler chose (the Iceberg arm of the runtime's
+/// physical extension codec).
+///
+/// The fork branch is re-cut per Iceberg and `DataFusion` version, and the loss this
+/// guards is the quietest shape a dropped patch can take: a re-cut that keeps the
+/// builder and drops the snapshot id it feeds into the table scan still compiles and
+/// still scans — it just reads the table's *current* snapshot. Time travel and a
+/// repeatable read then return live data, with no error and no difference in the plan
+/// a reader would notice. `docs/dev/fork_patches.md` is the ledger this guard is
+/// named in.
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::AsArray as _;
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    use iceberg::{CatalogBuilder, TableCreation};
+
+    use super::*;
+
+    const NAMESPACE: &str = "guard_ns";
+    const TABLE: &str = "pinned";
+
+    /// A catalog holding one empty single-column table, entirely in memory: the
+    /// memory catalog's default storage keeps the metadata and the data files in a
+    /// `HashMap`, so this needs no warehouse on disk and no credentials.
+    async fn catalog_with_empty_table() -> (Arc<dyn Catalog>, TableIdent) {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:/warehouse".to_string(),
+                )]),
+            )
+            .await
+            .expect("memory catalog loads");
+
+        let namespace = NamespaceIdent::new(NAMESPACE.to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("namespace is created");
+
+        let schema = iceberg::spec::Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema builds");
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name(TABLE.to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .expect("table is created");
+
+        (
+            Arc::new(catalog),
+            TableIdent::new(namespace, TABLE.to_string()),
+        )
+    }
+
+    async fn provider_for(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> IcebergTableProvider {
+        IcebergTableProvider::try_new(
+            Arc::clone(catalog),
+            ident.namespace().clone(),
+            ident.name().to_string(),
+        )
+        .await
+        .expect("provider is constructed")
+    }
+
+    /// Register `table` under `name` and return the `id` column of
+    /// `SELECT id FROM <name> ORDER BY id`.
+    async fn ids_visible_to(
+        ctx: &SessionContext,
+        name: &str,
+        table: IcebergTableProvider,
+    ) -> Vec<i64> {
+        ctx.register_table(name, Arc::new(table))
+            .expect("provider registers");
+        let batches = ctx
+            .sql(&format!("SELECT id FROM {name} ORDER BY id"))
+            .await
+            .expect("scan plans")
+            .collect()
+            .await
+            .expect("scan executes");
+
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|value| value.expect("id is not null"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The `id` column of a scan taken straight off the provider, so the rows counted
+    /// are the ones the Iceberg scan itself emits rather than the ones a
+    /// `GlobalLimitExec` above it would have trimmed anyway.
+    async fn ids_from_scan(
+        ctx: &SessionContext,
+        provider: &IcebergTableProvider,
+        limit: Option<usize>,
+    ) -> Vec<i64> {
+        let plan = provider
+            .scan(&ctx.state(), None, &[], limit)
+            .await
+            .expect("scan plans");
+        let batches = collect(plan, ctx.task_ctx()).await.expect("scan executes");
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|value| value.expect("id is not null"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Guards the limit push-down `spiceai/iceberg-rust` fork PR #19 adds to
+    /// [`IcebergTableProvider`]: the scan carries the limit into file planning and
+    /// truncates the stream it emits, instead of reading the table and leaving the
+    /// trimming to the operator above.
+    ///
+    /// Asserted at the provider rather than through SQL because SQL cannot see it: a
+    /// `GlobalLimitExec` sits above the scan and returns the right rows either way,
+    /// so the only observable difference is how many rows the scan itself produced.
+    /// A single partition is what makes that count exact — the limit the fork applies
+    /// is per-partition, so several partitions would each be entitled to it.
+    ///
+    /// The distributed path cannot lose this quietly (the cluster codec refuses to
+    /// serialise a scan whose limit it cannot carry); the single-node scan can, which
+    /// is the half this covers.
+    #[tokio::test]
+    async fn a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for() {
+        let (catalog, ident) = catalog_with_empty_table().await;
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+
+        ctx.register_table("writable", Arc::new(provider_for(&catalog, &ident).await))
+            .expect("provider registers");
+        ctx.sql("INSERT INTO writable VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)")
+            .await
+            .expect("append plans")
+            .collect()
+            .await
+            .expect("append commits");
+
+        let provider = provider_for(&catalog, &ident).await;
+
+        // The control: with no limit the scan emits the whole table, so the count
+        // below is a limit being applied rather than a table that was already short.
+        assert_eq!(
+            ids_from_scan(&ctx, &provider, None).await.len(),
+            10,
+            "an unlimited scan reads the whole table"
+        );
+
+        assert_eq!(
+            ids_from_scan(&ctx, &provider, Some(3)).await.len(),
+            3,
+            "a scan given a limit must stop at it, not read the table and let the operator \
+             above trim the result"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one() {
+        let (catalog, ident) = catalog_with_empty_table().await;
+        let ctx = SessionContext::new();
+
+        ctx.register_table("writable", Arc::new(provider_for(&catalog, &ident).await))
+            .expect("provider registers");
+
+        ctx.sql("INSERT INTO writable VALUES (1)")
+            .await
+            .expect("first append plans")
+            .collect()
+            .await
+            .expect("first append commits");
+        let pinned_snapshot = catalog
+            .load_table(&ident)
+            .await
+            .expect("table loads")
+            .metadata()
+            .current_snapshot_id()
+            .expect("the first append published a snapshot");
+
+        ctx.sql("INSERT INTO writable VALUES (2)")
+            .await
+            .expect("second append plans")
+            .collect()
+            .await
+            .expect("second append commits");
+
+        // The control: an unpinned provider follows the table, so it sees the row
+        // the second append added.
+        assert_eq!(
+            ids_visible_to(&ctx, "current", provider_for(&catalog, &ident).await).await,
+            vec![1, 2],
+            "an unpinned scan reads the current snapshot"
+        );
+
+        // The guard: pinned to the first snapshot, the same scan must not see it.
+        assert_eq!(
+            ids_visible_to(
+                &ctx,
+                "at_pin",
+                provider_for(&catalog, &ident)
+                    .await
+                    .with_snapshot_id(Some(pinned_snapshot)),
+            )
+            .await,
+            vec![1],
+            "a scan pinned to a snapshot must read that snapshot, not the current one"
+        );
+    }
+}

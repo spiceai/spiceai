@@ -27,6 +27,15 @@ use crate::datafusion::{DataFusion, query::QueryMethod};
 
 use super::{Query, ResultsCacheMode, tracker::QueryTracker};
 
+/// A random (version 4) query id drawn from the thread-local generator.
+///
+/// `Uuid::new_v4` reads the operating system's entropy source, a system call on
+/// every query. The thread-local generator is a cryptographic generator seeded from
+/// that same source, so ids stay unpredictable without a system call each.
+pub(crate) fn new_query_id() -> Uuid {
+    uuid::Builder::from_random_bytes(rand::random()).into_uuid()
+}
+
 enum SqlOrPlan {
     Sql(Arc<str>),
     /// Pre-parsed plan with the original SQL retained for cache key compatibility.
@@ -50,7 +59,7 @@ impl QueryBuilder {
             df,
             method: SqlOrPlan::Sql(Arc::from(sql)),
             parameters: None,
-            query_id: Uuid::new_v4(),
+            query_id: new_query_id(),
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
@@ -68,7 +77,7 @@ impl QueryBuilder {
             df,
             method: SqlOrPlan::Sql(sql),
             parameters: None,
-            query_id: Uuid::new_v4(),
+            query_id: new_query_id(),
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
@@ -89,7 +98,7 @@ impl QueryBuilder {
             df,
             method: SqlOrPlan::Plan(Box::new(plan), sql.into()),
             parameters: None,
-            query_id: Uuid::new_v4(),
+            query_id: new_query_id(),
             table_allowlist: None,
             read_only: false,
             cancellation_token: None,
@@ -159,6 +168,7 @@ impl QueryBuilder {
         // built — `runtime.task_history.enabled` only controls what it reports.
         let tracker = Some(QueryTracker {
             task_history_enabled: self.df.task_history_enabled,
+            captured_output_enabled: self.df.task_history_captured_output,
             schema: None,
             query_duration_secs: None,
             query_execution_duration_secs: None,
@@ -247,5 +257,22 @@ mod tests {
             .tracker
             .expect("tracker must be built when task history is enabled");
         assert!(tracker.task_history_enabled);
+    }
+
+    /// Query ids come from the thread-local generator rather than a system call per
+    /// query, and must still be distinct random (version 4) UUIDs.
+    #[test]
+    fn query_ids_are_distinct_version_4_uuids() {
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            (0..10_000).map(|_| super::new_query_id()).collect();
+        assert_eq!(ids.len(), 10_000, "query ids must not repeat");
+        for id in &ids {
+            assert_eq!(id.get_version_num(), 4, "{id} is not a version 4 UUID");
+            assert_eq!(
+                id.get_variant(),
+                uuid::Variant::RFC4122,
+                "{id} is not an RFC 4122 UUID"
+            );
+        }
     }
 }

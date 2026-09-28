@@ -53,7 +53,8 @@
         { "name": "command_id", "number": 16, "type": "string", "presence": "implicit" },
         { "name": "target", "number": 17, "type": "message:spice.cloud.v1.WorkloadRef", "presence": "explicit" },
         { "name": "execute_query", "number": 18, "type": "message:spice.cloud.v1.ExecuteQuery", "presence": "explicit", "oneof": "body" },
-        { "name": "attach_app", "number": 19, "type": "message:spice.cloud.v1.AttachApp", "presence": "explicit", "oneof": "body" }
+        { "name": "attach_app", "number": 19, "type": "message:spice.cloud.v1.AttachApp", "presence": "explicit", "oneof": "body" },
+        { "name": "get_datasets", "number": 20, "type": "message:spice.cloud.v1.GetDatasets", "presence": "explicit", "oneof": "body" }
       ]
     },
     "Heartbeat": {

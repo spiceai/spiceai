@@ -37,7 +37,7 @@ mod tests {
         HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     };
     use futures::{Stream, StreamExt};
-    use runtime::flight::KEEPALIVE_APP_METADATA;
+    use runtime::flight::{KEEPALIVE_APP_METADATA, keepalive};
 
     use std::pin::Pin;
     use std::sync::Arc;
@@ -341,11 +341,7 @@ mod tests {
         let keepalive_task = tokio::spawn(async move {
             for _ in 0..8 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let keepalive = FlightData {
-                    app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
-                    ..Default::default()
-                };
-                if keepalive_tx.send(keepalive).await.is_err() {
+                if keepalive_tx.send(keepalive()).await.is_err() {
                     break;
                 }
             }

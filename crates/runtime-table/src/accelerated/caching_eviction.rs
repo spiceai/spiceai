@@ -23,13 +23,24 @@ limitations under the License.
 //! disagree with the table the moment a row was evicted by anything else.
 //! Asking costs one aggregate per sweep and cannot drift.
 //!
-//! Three bounds are applied, in order:
+//! One assumption underlies everything here: `_fetched_at` is the instant a row
+//! was fetched. `caching_ttl`, stale-while-revalidate, the read-path freshness
+//! check and this eviction all read it that way. The range delete below relies
+//! on it too — a row written after a sweep ranks the table carries a newer
+//! `_fetched_at`, so the range cannot reach it (see [`partition_doomed`]).
 //!
-//! 1. **Expiry** — rows fetched longer ago than `caching_ttl` plus the
+//! These bounds are applied, in order. Each is judged per entry, because a
+//! row-level delete could take part of a multi-row response and leave the rest
+//! to be served as though it were whole:
+//!
+//! 1. **Expiry** — entries fetched longer ago than `caching_ttl` plus the
 //!    stale-while-revalidate window are deleted. They can no longer be served,
 //!    so keeping them only consumes budget.
-//! 2. **Item count** — `caching_max_items`.
-//! 3. **Byte budget** — `caching_max_size`, measured by summing each row's
+//! 2. **Configured retention** — entries the dataset's own `retention_period`
+//!    or `retention_sql` matches. A caching accelerator may set these too, and
+//!    they evict entries the cache budgets know nothing about.
+//! 3. **Item count** — `caching_max_items`.
+//! 4. **Byte budget** — `caching_max_size`, measured by summing each row's
 //!    payload bytes.
 //!
 //! ## What a sweep costs
@@ -45,11 +56,35 @@ limitations under the License.
 //! That is the price of the trade below, and it is a real one: a measured run
 //! swept a 2,500,000-entry `DuckDB` acceleration every five minutes for 84
 //! minutes without failing, but the ranking materialises one record per entry
-//! while it runs. Deferring each entry's key strings until the delete actually
-//! names it — at most [`MAX_ENTRIES_PER_SWEEP`] of them, and none at all on the
-//! [`bulk_range`] path — would remove most of that, and is the identified next
-//! step. Keeping a running tally beside the table instead is the alternative
-//! this module exists to avoid; see below.
+//! while it runs. Each entry's key strings are deferred until a delete
+//! predicate actually names it, at most [`MAX_ENTRIES_PER_SWEEP`] of them, and
+//! none at all for the doomed entries the range clears (see [`EntryKey`],
+//! [`DoomedSplit::delete_terms`]), so ranking itself avoids allocating per
+//! entry beyond the `EntryCost` record. Keeping a running tally beside the
+//! table instead is the alternative this module exists to avoid; see below.
+//!
+//! ## How a sweep deletes
+//!
+//! A sweep never splits a cache entry: a delete takes all of an entry's rows or
+//! none, because a paginated response left half-present would be served as
+//! though it were whole. Working within that, the doomed entries are cleared by
+//! **one** predicate that combines two shapes (see [`partition_doomed`]):
+//!
+//! * a single `floor <= _fetched_at <= ceiling` range that clears every doomed entry
+//!   lying wholly below the oldest row of anything the sweep keeps or that
+//!   straddles the boundary — unbounded in how many entries it covers, so this
+//!   carries the bulk of a large eviction; and
+//! * a per-entry `OR` naming the few entries that straddle that boundary in
+//!   fetch time, capped at [`MAX_ENTRIES_PER_SWEEP`].
+//!
+//! Combining them is what lets a cache ingesting faster than the naming cap
+//! still converge (#13994). Naming alone caps eviction at
+//! [`MAX_ENTRIES_PER_SWEEP`] entries per sweep, and a coarse fetch clock makes
+//! that the usual path rather than the exception: the HTTP connector stamps
+//! `_fetched_at` from the response `Date` header at one-second resolution, so a
+//! burst of concurrent fetches shares one timestamp and the budget boundary
+//! lands inside that tie. The range is not bounded by the cap, so it carries the
+//! bulk; naming only mops up the tie at the boundary.
 //!
 //! Both the deadline and the size are *derived* rather than stored. A row's
 //! deadline is `_fetched_at + caching_ttl`, and `caching_ttl` is dataset
@@ -63,7 +98,6 @@ limitations under the License.
 //! Expiry runs first because it is free capacity: evicting a live entry while
 //! an expired one still occupies the budget would be a straight loss.
 
-use std::ops::Not;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -73,12 +107,12 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::functions::expr_fn::octet_length;
 use datafusion::functions_aggregate::expr_fn::{bool_or, count, max, min, sum};
-use datafusion::prelude::{Expr, SessionContext, cast, coalesce, col, lit};
+use datafusion::prelude::{DataFrame, Expr, SessionContext, cast, coalesce, col, lit};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use tokio::runtime::Handle;
 
-use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::{LogicalPlanBuilder, LogicalPlanBuilderOptions, Operator};
 use util::timestamp_filter::TimestampFilterConvert;
 
 use super::caching::{
@@ -86,11 +120,12 @@ use super::caching::{
 };
 use super::retention::create_timestamp_filter_converter;
 use super::{Retention, RetentionPredicate};
+use runtime_acceleration::acceleration::StaleIfError;
 use runtime_datafusion::session_config::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 use util::expr::combine_exprs_balanced;
 
-/// The most entries one sweep will name in a single `DELETE` predicate.
+/// The most entries one sweep will explicitly name in a single `DELETE` predicate.
 ///
 /// The predicate is an `OR` over per-entry equality tests, so it grows with the
 /// number of entries evicted; past some width the plan costs more than the
@@ -105,10 +140,8 @@ use util::expr::combine_exprs_balanced;
 /// name. Width is not free regardless: every term is translated and evaluated by
 /// the accelerator's own delete planner.
 ///
-/// It is deliberately not the mechanism that keeps a large cache within its
-/// budget — see [`bulk_cutoff`], which evicts any number of entries in one small
-/// predicate whenever it is provably safe to do so. This cap only bounds the
-/// fallback.
+/// More than [`MAX_ENTRIES_PER_SWEEP`] rows can be evicted if they can be evicted
+/// in bulk (e.g. via a `where _fetched_at < X` predicate).
 const MAX_ENTRIES_PER_SWEEP: usize = 512;
 
 /// The `Map` of response headers the HTTP connector stores beside every body.
@@ -179,24 +212,28 @@ pub struct CacheLimits {
     /// `caching_stale_while_revalidate_ttl`: how long past its TTL an entry
     /// may still be served, and so how long past it the entry must be kept.
     pub stale_while_revalidate: Option<Duration>,
-    /// `caching_stale_if_error`: whether an expired entry may still be served
-    /// when the origin is failing.
+    /// `caching_stale_if_error`: how long an expired entry may still be served
+    /// when the origin is failing (never, a finite window, or unbounded).
     ///
-    /// This is why expiry alone cannot bound the cache. An entry kept as
-    /// error-fallback material is one the expiry sweep must not delete, so with
-    /// this enabled the byte and item budgets are the only thing standing
-    /// between the cache and unbounded growth.
-    pub stale_if_error: bool,
+    /// This is why expiry alone cannot always bound the cache. Only
+    /// `StaleIfError::Enabled` keeps entries with no upper bound on their age, so
+    /// only then are the byte and item budgets the sole thing standing between
+    /// the cache and unbounded growth. A finite `For(d)` keeps an entry for at
+    /// most `caching_ttl + max(d, swr)`, which the expiry sweep still enforces.
+    pub stale_if_error: StaleIfError,
 }
 
 impl CacheLimits {
-    /// True when a sweep would do something. With `stale_if_error` disabled the
-    /// expiry sweep alone is worth running; with it enabled, only a configured
-    /// budget can remove anything — so a dataset for which this is false is one
-    /// nothing will ever evict from, the configuration #13525 describes.
+    /// True when a sweep would do something. With a finite `stale_if_error`
+    /// (`Disabled` or `For(d)`) the expiry sweep alone is worth running; only
+    /// `Enabled` keeps entries indefinitely, so there a configured budget is the
+    /// one thing that can remove anything — and a dataset for which this is false
+    /// is one nothing will ever evict from, the configuration #13525 describes.
     #[must_use]
     pub fn is_enforced(&self) -> bool {
-        self.max_size_bytes.is_some() || self.max_items.is_some() || !self.stale_if_error
+        self.max_size_bytes.is_some()
+            || self.max_items.is_some()
+            || !matches!(self.stale_if_error, StaleIfError::Enabled)
     }
 }
 
@@ -285,9 +322,13 @@ impl CacheEvictionPredicate {
             );
         }
 
+        // Only `stale_if_error: enabled` reaches here: `is_enforced()` is false
+        // solely for the unbounded case (a finite `For(d)` is enforced by the
+        // expiry sweep). The hint steers toward a finite duration, which bounds
+        // the acceleration on its own.
         if !self.limits.is_enforced() && !has_user_retention {
             tracing::warn!(
-                "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` with no `caching_max_size` or `caching_max_items`, so no cached entry is ever evicted and the acceleration will grow without bound — expired entries are deliberately kept as fallback for a failing origin. Set a budget to bound it. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes"
+                "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` with no `caching_max_size` or `caching_max_items`, so no cached entry is ever evicted and the acceleration will grow without bound — expired entries are deliberately kept as fallback for a failing origin. Prefer a finite `caching_stale_if_error: <duration>` (for example '10m') to keep the fallback for a bounded window and evict past it, or set a budget. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes"
             );
         }
     }
@@ -324,15 +365,11 @@ impl RetentionPredicate for CacheEvictionPredicate {
             None,
         );
 
-        // With `stale_if_error` an expired entry is deliberately kept as
-        // fallback for a failing origin, so there is no deadline to apply.
-        let cutoff = self
-            .limits
-            .stale_if_error
-            .not()
-            .then(|| expiry_cutoff(&self.limits))
-            .flatten()
-            .filter(|_| refreshed_at.is_some());
+        // With `stale_if_error: enabled` an expired entry is deliberately kept
+        // as fallback for a failing origin, with no upper bound on its age, so
+        // there is no deadline to apply — `expiry_cutoff` returns `None`. A
+        // finite `For(d)` still has a deadline (`caching_ttl + max(d, swr)`).
+        let cutoff = expiry_cutoff(&self.limits).filter(|_| refreshed_at.is_some());
 
         if key_columns.is_empty() {
             // Nothing identifies an entry, so nothing can be evicted as one.
@@ -340,14 +377,14 @@ impl RetentionPredicate for CacheEvictionPredicate {
             // entry to leave half of. The dataset's own retention predicate is
             // row-level already and passes through unchanged.
             let expired =
-                cutoff.and_then(|cutoff| row_level_expiry_expr(refreshed_at.as_ref(), cutoff));
+                cutoff.and_then(|cutoff| fetched_at_at_most(refreshed_at.as_ref(), cutoff));
             return Ok(combine_exprs_balanced(
                 [configured, expired].into_iter().flatten().collect(),
                 Expr::or,
             ));
         }
 
-        let entries = rank_entries(
+        let (entries, batches) = rank_entries(
             accelerator,
             &self.io_runtime,
             &key_columns,
@@ -402,54 +439,79 @@ impl RetentionPredicate for CacheEvictionPredicate {
             return Ok(None);
         }
 
-        // One range predicate when the doomed and surviving entries do not
-        // overlap in fetch time: exact, and not bounded by how many entries it
-        // covers.
-        if let Some((from, to)) = bulk_range(&doomed, &survivors)
-            && let Some(expr) = fetched_at_between(refreshed_at.as_ref(), from, to)
-        {
-            return Ok(Some(expr));
-        }
+        // Split the doomed set at the survivor cutoff — one range predicate for
+        // the entries cleanly older than anything kept, the straddlers and the
+        // over-budget tail of a boundary tie named individually — then render
+        // both into one `DELETE` predicate. Combining them is what lets a cache
+        // ingesting faster than the naming cap can evict still converge: the
+        // bounded range carries the bulk and naming only mops up the boundary.
+        let (terms, deferred) = partition_doomed(&doomed, &survivors).delete_terms(
+            refreshed_at.as_ref(),
+            &doomed,
+            &batches,
+            &key_columns,
+        );
 
-        // Otherwise name each entry, bounded to the rows it held when ranked.
-        // Oldest first, since the cap may not reach all of them this sweep.
-        let (naming, deferred) = nameable(&doomed);
         if deferred > 0 {
             tracing::info!(
-                "Cache eviction for dataset '{dataset}' cannot separate {total} over-budget entries from the ones it keeps by fetch time, so it is naming {naming} individually and leaving {deferred} for the next sweep.",
+                "Cache eviction for dataset '{dataset}' has more entries to name individually than one sweep may, so it is naming {naming} of them and leaving {deferred} for the next sweep.",
                 dataset = self.dataset_name,
-                total = doomed.len(),
-                naming = naming.len(),
+                naming = MAX_ENTRIES_PER_SWEEP,
             );
         }
-        let predicates: Vec<Expr> = naming
-            .iter()
-            .filter_map(|entry| entry_predicate(&entry.key, entry.newest, refreshed_at.as_ref()))
-            .collect();
-        Ok(combine_exprs_balanced(predicates, Expr::or))
+        Ok(combine_exprs_balanced(terms, Expr::or))
     }
 }
 
-/// Deletes rows past their window without regard to which entry they belong to.
+/// `_fetched_at <= t`, built for the column's stored type, or `None` when the
+/// column is not filter-convertible.
 ///
-/// Everywhere else in this module a range delete is exactly what must not
-/// happen. It is safe *here* only because the caller has established there are
-/// no request columns, so there is no entry to leave half of, and a row past its
-/// window is unservable on its own terms. A row with no fetch time goes too:
-/// there is no deadline to hold it to, and the read path already treats a null
-/// timestamp as expired.
-fn row_level_expiry_expr(
+/// Selects every row at or older than `t` regardless of which entry it belongs
+/// to. Three callers rely on that: the no-request-column expiry path (safe there
+/// because with no key there is no entry to leave half of, and a row past its
+/// window is unservable on its own terms — a row with no fetch time is treated
+/// as expired too); the range term in [`partition_doomed`] (safe because its
+/// ceiling sits below every kept or straddling entry's oldest row); and the
+/// per-entry `<= ranked_newest` guard in [`entry_predicate`].
+fn fetched_at_at_most(refreshed_at: Option<&TimestampFilterConvert>, t: i64) -> Option<Expr> {
+    let converter = refreshed_at?;
+    Some(converter.convert(u128::try_from(t).ok()?, Operator::LtEq))
+}
+
+/// `from <= _fetched_at <= to`, built for the column's stored type.
+///
+/// Unlike [`fetched_at_at_most`], this can only reach timestamps the ranking
+/// observed in its range bucket. The lower bound keeps a response written after
+/// ranking with an older origin-provided `Date` out of this sweep.
+fn fetched_at_between(
     refreshed_at: Option<&TimestampFilterConvert>,
-    cutoff: i64,
+    from: i64,
+    to: i64,
 ) -> Option<Expr> {
     let converter = refreshed_at?;
-    Some(converter.convert(u128::try_from(cutoff).ok()?, Operator::LtEq))
+    Some(
+        converter
+            .convert(u128::try_from(from).ok()?, Operator::GtEq)
+            .and(converter.convert(u128::try_from(to).ok()?, Operator::LtEq)),
+    )
 }
 
 /// The instant before which an entry can no longer be served: `caching_ttl`
-/// plus the stale-while-revalidate grace, ago.
+/// plus the error-retention grace, ago.
+///
+/// The grace is the larger of the stale-while-revalidate window and a finite
+/// `stale_if_error` window (see [`StaleIfError::error_retention_window`]).
+/// Returns `None` for `stale_if_error: enabled`, whose fallback has no upper
+/// bound on age and so no deadline at which an entry becomes unservable — and
+/// for a deadline that does not fit a `Duration`. The Spicepod parser rejects
+/// caching windows whose sum overflows, so a loaded dataset never hits that
+/// case; a caller that bypassed the parser gets "no deadline" rather than a
+/// panic in the sweep.
 fn expiry_cutoff(limits: &CacheLimits) -> Option<i64> {
-    let window = effective_max_age(limits.ttl) + limits.stale_while_revalidate.unwrap_or_default();
+    let grace = limits
+        .stale_if_error
+        .error_retention_window(limits.stale_while_revalidate)?;
+    let window = effective_max_age(limits.ttl).checked_add(grace)?;
     nanos_since_epoch(SystemTime::now().checked_sub(window)?)
 }
 
@@ -556,10 +618,45 @@ fn unmeasurable_payload_columns(schema: &arrow::datatypes::Schema) -> Vec<String
         .collect()
 }
 
+/// Where a ranked entry's key strings live.
+///
+/// Ranking needs `rows`/`bytes`/`oldest`/`newest`/`matches_configured` for
+/// every entry the aggregate returns, but only for per-key delete predicates (
+/// generally a small fraction of entries). `EntryKey` instead keeps a pointer back
+/// to the [`RecordBatch`], so [`read_utf8`]'s allocation only happens for the entries a
+/// delete predicate actually names.
+#[derive(Debug)]
+struct EntryKey {
+    batch: usize,
+    row: usize,
+}
+
+impl EntryKey {
+    /// Reads this entry's key columns out of `batches`, allocating a `String`
+    /// per column only now, at the one place the result is used.
+    fn resolve(
+        &self,
+        batches: &[RecordBatch],
+        key_columns: &[String],
+    ) -> Vec<(String, Option<String>)> {
+        #[cfg(test)]
+        tests::count_key_extraction();
+        key_columns
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    read_utf8(&batches[self.batch], name, self.row),
+                )
+            })
+            .collect()
+    }
+}
+
 /// One cache entry as the ranking query sees it: its key values and what it
 /// costs against each budget.
 struct EntryCost {
-    key: Vec<(String, Option<String>)>,
+    key: EntryKey,
     rows: u64,
     bytes: u64,
     /// `min(_fetched_at)` over the entry's rows, or `None` where they carry no
@@ -601,59 +698,207 @@ fn nameable<'a>(doomed: &'a [&'a EntryCost]) -> (&'a [&'a EntryCost], usize) {
     (&doomed[deferred..], deferred)
 }
 
-/// The `_fetched_at` window that holds exactly `doomed` and no survivor, when
-/// one exists.
-///
-/// Eviction normally names each entry by key, because a cached response can span
-/// rows with different fetch times and a range delete could cut one in half. But
-/// when every doomed entry's newest row is older than every survivor's oldest
-/// row, no entry straddles the boundary and a range over the doomed entries'
-/// own fetch times selects them exactly — one small predicate instead of an
-/// `OR` per entry.
-///
-/// That matters because predicate width is capped ([`MAX_ENTRIES_PER_SWEEP`]),
-/// so naming entries individually cannot evict faster than a few hundred per
-/// sweep — which a cache ingesting hundreds per second outruns forever. A
-/// workload that fetches new keys over time separates cleanly in fetch order,
-/// so this is the ordinary case and the per-key fallback is for the interleaved
-/// one.
-///
-/// The window is closed at **both** ends, which is what makes it safe to build
-/// from a ranking taken without the write lock. An open `_fetched_at <= cutoff`
-/// would also select anything arriving after the ranking with a fetch time
-/// below that cutoff — a row this sweep never measured and never decided about,
-/// and if it belonged to an entry whose other rows are newer, half of that entry
-/// would go and the rest would be served as though it were the whole response.
-/// Bounding below at the oldest row the ranking actually saw means the delete
-/// can only reach rows that were there when the decision was made.
-///
-/// Returns `None` if either side lacks a fetch time, or if the two overlap.
-fn bulk_range(doomed: &[&EntryCost], survivors: &[&EntryCost]) -> Option<(i64, i64)> {
-    // `try_fold` on both sides: one pass each, and a missing fetch time on
-    // either stops it rather than being folded away.
-    let (oldest_doomed, newest_doomed) = doomed
-        .iter()
-        .try_fold((i64::MAX, i64::MIN), |(oldest, newest), entry| {
-            Some((oldest.min(entry.oldest?), newest.max(entry.newest?)))
-        })?;
-    let oldest_survivor = survivors
-        .iter()
-        .try_fold(i64::MAX, |acc, e| e.oldest.map(|o| acc.min(o)))?;
-    (newest_doomed < oldest_survivor).then_some((oldest_doomed, newest_doomed))
+/// A doomed set split into the part one range predicate clears and the part
+/// that must be named. Both are applied — the sweep's `DELETE` predicate is
+/// their `OR`.
+struct DoomedSplit<'a> {
+    /// Bounds of a `floor <= _fetched_at <= ceiling` range that deletes every
+    /// doomed entry lying wholly below the survivor cutoff, in one predicate
+    /// unbounded in how many entries it covers. `None` when no entry is cleanly
+    /// rangeable.
+    range_floor: Option<i64>,
+    range_ceiling: Option<i64>,
+    /// The straddlers and the over-budget tail of the boundary tie: the doomed
+    /// entries the range cannot cover. [`entry_predicate`] names each by key,
+    /// bounded to the rows it held when ranked, capped at
+    /// [`MAX_ENTRIES_PER_SWEEP`].
+    named: Vec<&'a EntryCost>,
 }
 
-/// `from <= _fetched_at <= to`, built for the column's stored type.
-fn fetched_at_between(
-    refreshed_at: Option<&TimestampFilterConvert>,
-    from: i64,
-    to: i64,
-) -> Option<Expr> {
-    let converter = refreshed_at?;
-    Some(
-        converter
-            .convert(u128::try_from(from).ok()?, Operator::GtEq)
-            .and(converter.convert(u128::try_from(to).ok()?, Operator::LtEq)),
-    )
+impl<'a> DoomedSplit<'a> {
+    /// Renders the split into the `DELETE` predicate terms to be `OR`-combined:
+    /// the `floor <= _fetched_at <= ceiling` range term, when both bounds exist
+    /// and can be built for the column, followed by one named-entry term per
+    /// capped entry.
+    ///
+    /// `doomed` is the full doomed set, used only as the fallback for when the
+    /// range term cannot be rendered for the column's stored type — then every
+    /// doomed entry is named instead, so the range-bucket is not left undeleted.
+    ///
+    /// Returns the terms and how many named entries the per-sweep cap deferred to
+    /// the next sweep; the caller logs the shortfall.
+    ///
+    /// `batches` and `key_columns` exist here only to resolve [`EntryKey`]: this
+    /// is the one place a key is ever read back, after `nameable` has already
+    /// capped how many entries need one, so a doomed set the range clears whole
+    /// (`self.named` empty) resolves none at all.
+    fn delete_terms(
+        mut self,
+        refreshed_at: Option<&TimestampFilterConvert>,
+        doomed: &[&'a EntryCost],
+        batches: &[RecordBatch],
+        key_columns: &[String],
+    ) -> (Vec<Expr>, usize) {
+        let mut terms: Vec<Expr> = Vec::new();
+        if let Some((floor, ceiling)) = self.range_floor.zip(self.range_ceiling) {
+            match fetched_at_between(refreshed_at, floor, ceiling) {
+                Some(expr) => terms.push(expr),
+                None => self.named = doomed.to_vec(),
+            }
+        }
+
+        // Name the entries the range does not cover, bounded to the rows each
+        // held when ranked. Oldest first, since the cap may not reach all of
+        // them this sweep.
+        let (naming, deferred) = nameable(&self.named);
+        terms.extend(naming.iter().filter_map(|entry| {
+            entry_predicate(
+                &entry.key.resolve(batches, key_columns),
+                entry.newest,
+                refreshed_at,
+            )
+        }));
+        (terms, deferred)
+    }
+}
+
+/// Splits the doomed set at the survivor cutoff into the part one range
+/// predicate can clear and the part that must be named.
+///
+/// Eviction would ideally clear the whole doomed set with a single
+/// `_fetched_at <= ceiling` range: one small predicate instead of an `OR` per
+/// entry, and unbounded in how many entries it covers. That is exact only when
+/// the doomed and surviving entries do not overlap in fetch time — but that
+/// almost never holds when the fetch clock is coarse. The HTTP connector stamps
+/// `_fetched_at` from the response `Date` header at one-second resolution, so a
+/// burst of concurrent fetches shares one timestamp, the budget boundary lands
+/// inside that tie, and `newest_doomed == oldest_survivor`. Falling back to
+/// naming every doomed entry then caps eviction at [`MAX_ENTRIES_PER_SWEEP`], so
+/// a cache ingesting faster than that cap never catches up (#13994).
+///
+/// This partitions instead of choosing one shape for the whole set. It places
+/// the range's ceiling `X` below the oldest row of any entry that **survives or
+/// straddles** the cutoff, so the range can never clip one:
+///
+/// ```text
+///   C = min(oldest) over survivors                 // the cutoff to protect
+///   straddler = doomed entry whose newest >= X     // overlaps the ceiling itself
+///   X = largest value <= C that no doomed entry straddles (oldest < X <= newest)
+/// ```
+///
+/// `X` is a **fixed point**, not a single pass over the entries crossing `C`.
+/// Lowering the ceiling below one straddler can expose another entry that
+/// crosses only the *lowered* ceiling without ever crossing `C`; such an entry
+/// is named, and if the naming cap defers it while the range deletes its older
+/// rows below the ceiling, the entry is split (#13994 review). Descending to a
+/// fixed point makes every doomed entry lie either wholly below `X` or wholly at
+/// or above it — so no named entry, deferred or not, has a row the range reaches.
+///
+/// The range-bucket is every doomed entry lying wholly below `X` (`newest < X`),
+/// and the returned [`DoomedSplit::range_ceiling`] is `max(newest)` over that
+/// bucket — a `floor <= _fetched_at <= ceiling` range that selects exactly those
+/// entries, unbounded in count. `floor` is the oldest row of that bucket, so a
+/// row written after ranking with an origin-provided older fetch time is not
+/// swept up. Everything else doomed — the straddlers and the
+/// over-budget tail of the boundary tie — goes to [`DoomedSplit::named`], which
+/// [`entry_predicate`] names by key. When the doomed set is cleanly older than
+/// everything kept there are no straddlers, so the whole set falls in the
+/// range-bucket and nothing is named — the ordinary case for a cache fetching
+/// new keys over time. Where entries genuinely interleave in fetch time (wide
+/// multi-row responses), the fixed point pulls `X` down until nothing is safely
+/// rangeable and the whole set is named, capped — correct, if slower, for a case
+/// no time cutoff can separate.
+///
+/// Correctness this preserves:
+/// * **No entry is split.** After the fixed point every doomed entry is wholly
+///   below `X` (ranged) or has `oldest >= X` (named). So
+///   `floor = min(oldest of range-bucket)`,
+///   `ceiling = max(newest of range-bucket) < X <= oldest of every named entry`,
+///   and the bounded range reaches no row of any named entry —
+///   even one the cap defers to a later sweep — while the named entry's key
+///   predicate takes all of its rows. No entry is left half-present.
+/// * **No survivor is touched.** Survivors have `oldest >= C >= X > ceiling`, so
+///   no survivor row is `<= ceiling`, and no survivor is named.
+/// * **Post-ranking older writes are protected.** HTTP may stamp `_fetched_at`
+///   from an origin-provided `Date`, rather than the local write time. Bounding
+///   below at the oldest ranged row means a response written after lock-free
+///   ranking with an older origin timestamp cannot match this sweep's range.
+/// * **A survivor with no fetch time is unknowable**, so the cutoff cannot be
+///   placed and every doomed entry is named rather than risk a range clipping
+///   one. A timestampless doomed entry is likewise always named.
+fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -> DoomedSplit<'a> {
+    // C: the oldest fetch time of any surviving entry, and the ceiling the range
+    // must stay under. No survivors means no ceiling to respect. A survivor with
+    // no fetch time makes the ceiling unknowable, so nothing may be
+    // range-deleted and every doomed entry is named.
+    let cutoff = if survivors.is_empty() {
+        i64::MAX
+    } else {
+        match survivors
+            .iter()
+            .try_fold(i64::MAX, |acc, e| e.oldest.map(|o| acc.min(o)))
+        {
+            Some(cutoff) => cutoff,
+            None => {
+                return DoomedSplit {
+                    range_floor: None,
+                    range_ceiling: None,
+                    named: doomed.to_vec(),
+                };
+            }
+        }
+    };
+
+    // X: the exclusive ceiling the range must stay under. It sits below the
+    // oldest row of every doomed entry that straddles it, so no straddler — and
+    // in particular no *named* entry — has a row the range can reach. Lowering
+    // the ceiling below one straddler can expose another that only crosses the
+    // lowered ceiling, so this is a fixed point, not a single pass: descend until
+    // no doomed entry straddles the ceiling (#13994 review — a single pass left a
+    // named entry whose older rows the range deleted while the naming cap
+    // deferred the entry, splitting it).
+    //
+    // Processed newest-first: an entry whose newest still reaches the ceiling
+    // pulls it down to at most that entry's oldest; once an entry's newest falls
+    // below the ceiling, so does every later entry, and the ceiling is final.
+    // A row with no fetch time cannot straddle and is always named, so only
+    // fully-timestamped entries take part.
+    let mut spanning: Vec<(i64, i64)> = doomed
+        .iter()
+        .filter_map(|entry| Some((entry.oldest?, entry.newest?)))
+        .collect();
+    spanning.sort_unstable_by_key(|&(_, newest)| std::cmp::Reverse(newest));
+    let mut upper = cutoff;
+    for (oldest, newest) in spanning {
+        if newest >= upper {
+            upper = upper.min(oldest);
+        } else {
+            break;
+        }
+    }
+
+    // Range-bucket vs name-bucket at X. An entry is rangeable only when both its
+    // bounds are known and its whole extent lies below X; everything else is
+    // named, which deletes it whole by key. The ceiling is the newest row the
+    // range must reach — `min(oldest)` and `max(newest)` over the range-bucket.
+    let mut range_floor: Option<i64> = None;
+    let mut range_ceiling: Option<i64> = None;
+    let mut named: Vec<&EntryCost> = Vec::new();
+    for entry in doomed {
+        match (entry.oldest, entry.newest) {
+            (Some(oldest), Some(newest)) if newest < upper => {
+                range_floor = Some(range_floor.map_or(oldest, |floor| floor.min(oldest)));
+                range_ceiling = Some(range_ceiling.map_or(newest, |c| c.max(newest)));
+            }
+            _ => named.push(entry),
+        }
+    }
+
+    DoomedSplit {
+        range_floor,
+        range_ceiling,
+        named,
+    }
 }
 
 /// Chooses which entries to evict from `entries`, which must be ordered
@@ -691,7 +936,11 @@ fn select_doomed_refs(entries: &[&EntryCost], budget: Budget) -> usize {
 ///
 /// This is the sweep's only pass over the accelerator, so it collects
 /// everything both budgets need at once: a row count, a payload-byte total, and
-/// the key to name the entry in a `DELETE`.
+/// where to find the key that would name the entry in a `DELETE` — the key
+/// itself is not read here, only recorded as a `(batch, row)` pointer, since
+/// almost nothing ranking returns is ever named individually. The batches are
+/// returned alongside the entries because that pointer is only good for as
+/// long as they stay alive.
 async fn rank_entries(
     accelerator: &Arc<dyn TableProvider>,
     io_runtime: &Handle,
@@ -699,7 +948,7 @@ async fn rank_entries(
     schema: &arrow::datatypes::Schema,
     configured: Option<Expr>,
     max_size_bytes: Option<u64>,
-) -> DataFusionResult<Vec<EntryCost>> {
+) -> DataFusionResult<(Vec<EntryCost>, Vec<RecordBatch>)> {
     // Only measured when something charges against it. Summing `octet_length`
     // over the payload means reading every cached response body off disk, and
     // for a dataset with a TTL and no byte budget the figure is discarded.
@@ -729,9 +978,22 @@ async fn rank_entries(
         get_df_default_config(),
         default_runtime_env(io_runtime.clone()),
     );
-    let mut df = ctx
-        .read_table(Arc::clone(accelerator))?
-        .aggregate(key_columns.iter().map(col).collect(), aggregates)?;
+    // The group key is exactly `key_columns`, and has to stay that way.
+    // `DataFrame::aggregate` opts into appending every column the group key
+    // functionally determines, so an accelerator carrying a primary-key or
+    // unique constraint over the request columns has it widened to the whole
+    // stored row -- which puts the payload, and the `Map` a response's headers
+    // are stored in, into a group key that then has to be row-encoded, and the
+    // sweep fails on every pass. Adding `_fetched_at` to the key would be worse
+    // than failing: it splits a paginated entry into one group per page.
+    let plan = LogicalPlanBuilder::from(
+        ctx.read_table(Arc::clone(accelerator))?
+            .into_unoptimized_plan(),
+    )
+    .with_options(LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(false))
+    .aggregate(key_columns.iter().map(col), aggregates)?
+    .build()?;
+    let mut df = DataFrame::new(ctx.state(), plan);
 
     if has_fetched_at {
         df = df.sort(vec![col("oldest").sort(false, false)])?;
@@ -740,17 +1002,16 @@ async fn rank_entries(
     let batches = df.collect().await?;
 
     let mut entries = Vec::new();
-    for batch in &batches {
+    for (batch_index, batch) in batches.iter().enumerate() {
         for row in 0..batch.num_rows() {
-            let key = key_columns
-                .iter()
-                .map(|name| (name.clone(), read_utf8(batch, name, row)))
-                .collect();
             // Every reader resolves its column by name and answers `None` for
             // one the aggregate did not produce, so an absent aggregate needs
             // no flag of its own here.
             entries.push(EntryCost {
-                key,
+                key: EntryKey {
+                    batch: batch_index,
+                    row,
+                },
                 rows: read_u64_at(batch, "rows", row).unwrap_or(0),
                 bytes: read_u64_at(batch, "bytes", row).unwrap_or(0),
                 oldest: read_timestamp_nanos(batch, "oldest", row),
@@ -760,7 +1021,7 @@ async fn rank_entries(
         }
     }
 
-    Ok(entries)
+    Ok((entries, batches))
 }
 
 /// Builds `col = value AND ...` identifying exactly one cache entry, bounded to
@@ -801,7 +1062,7 @@ fn entry_predicate(
         .into_iter()
         .reduce(Expr::and)?;
 
-    let Some(bound) = ranked_newest.and_then(|newest| row_level_expiry_expr(refreshed_at, newest))
+    let Some(bound) = ranked_newest.and_then(|newest| fetched_at_at_most(refreshed_at, newest))
     else {
         return Some(identity);
     };
@@ -912,6 +1173,26 @@ mod tests {
     use crate::federated::FederatedTable;
     use arrow::datatypes::{Field, Schema, TimeUnit};
 
+    // A count of how many times `EntryKey::resolve` has read a key off a
+    // `RecordBatch` in the current test. Thread-local because `#[tokio::test]`
+    // runs a test's whole body on one OS thread by default, so a concurrent
+    // test's sweep cannot add to this one's count.
+    thread_local! {
+        static KEY_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_key_extraction() {
+        KEY_EXTRACTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    fn reset_key_extractions() {
+        KEY_EXTRACTIONS.with(|c| c.set(0));
+    }
+
+    fn key_extractions() -> usize {
+        KEY_EXTRACTIONS.with(std::cell::Cell::get)
+    }
+
     fn http_cache_schema() -> Schema {
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
@@ -953,9 +1234,12 @@ mod tests {
         assert!(entry_key_columns(&schema).is_empty());
     }
 
+    /// An entry for tests that never resolve a key — only `partition_doomed`'s
+    /// range/name split, never `named_paths`/`doomed_paths`. The `(batch, row)`
+    /// pointer is never dereferenced by those tests.
     fn cost(oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
         EntryCost {
-            key: vec![("request_path".to_string(), Some("/x".to_string()))],
+            key: EntryKey { batch: 0, row: 0 },
             rows: 1,
             bytes: 1,
             oldest,
@@ -967,93 +1251,113 @@ mod tests {
     #[test]
     fn a_clean_separation_in_fetch_time_yields_one_range_predicate() {
         // The ordinary case: entries fetched over time do not overlap, so the
-        // whole doomed set goes in one predicate rather than one per entry.
+        // whole doomed set goes in one range and nothing is named. The ceiling
+        // is the newest row of the doomed set.
         let doomed = [cost(Some(10), Some(20)), cost(Some(5), Some(15))];
         let survivors = [cost(Some(30), Some(40)), cost(Some(50), Some(60))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
-        assert_eq!(bulk_range(&d, &s), Some((5, 20)));
+
+        let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(5));
+        assert_eq!(split.range_ceiling, Some(20));
+        assert!(split.named.is_empty(), "a clean separation names nothing");
     }
 
     #[test]
-    fn the_bulk_window_is_closed_below_the_oldest_row_the_ranking_saw() {
-        // The ranking is taken without the write lock, so rows can arrive after
-        // it. An open `_fetched_at <= cutoff` would select one stamped below
-        // that cutoff even though this sweep never measured it — and if its
-        // entry's other rows are newer, half the entry would go and the rest
-        // would be served as though it were the whole response.
+    fn the_range_stays_inside_the_ranked_window() {
+        // The range must stay strictly below every survivor and straddler, and
+        // must not reach below the oldest doomed row the ranking observed. HTTP
+        // can use an origin-provided `Date` for `_fetched_at`, so a response
+        // written after ranking can have an older timestamp.
         let doomed = [cost(Some(10), Some(20)), cost(Some(14), Some(18))];
         let survivors = [cost(Some(30), Some(40))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
-        let (from, to) = bulk_range(&d, &s).expect("range");
-        assert_eq!(
-            (from, to),
-            (10, 20),
-            "the window spans exactly the rows the ranking saw"
+        let split = partition_doomed(&d, &s);
+        let floor = split.range_floor.expect("range");
+        let ceiling = split.range_ceiling.expect("range");
+        assert_eq!(floor, 10, "the floor is the oldest row the ranking saw");
+        assert_eq!(ceiling, 20, "the ceiling is the newest row the ranking saw");
+        assert!(split.named.is_empty(), "a clean separation names nothing");
+
+        let oldest_survivor_row = 30;
+        assert!(
+            ceiling < oldest_survivor_row,
+            "the range must stop below anything kept: {ceiling} !< {oldest_survivor_row}"
         );
 
-        let arrived_after_the_ranking = 5;
+        let post_ranking_origin_timestamp = 5;
         assert!(
-            arrived_after_the_ranking < from,
-            "a row stamped before anything this sweep ranked is outside the window"
+            post_ranking_origin_timestamp < floor,
+            "a post-ranking row with an older origin timestamp must fall below the range"
         );
     }
 
     #[test]
-    fn the_bulk_predicate_bounds_both_ends() {
-        // Asserted on the predicate's shape rather than on what a permissive
-        // test double does with it: the lower bound is the whole guarantee, and
-        // dropping it would still pass every eviction test in this file.
+    fn the_range_predicate_bounds_both_ends() {
+        // The lower bound is what protects post-ranking writes carrying an
+        // older HTTP `Date`; the upper bound protects kept and named entries.
         let rendered = fetched_at_between(refreshed_at_converter().as_ref(), 10, 20)
             .expect("predicate")
             .to_string();
         assert!(
             rendered.contains(">="),
-            "the window must be closed below: {rendered}"
+            "the range must be closed below: {rendered}"
         );
         assert!(
             rendered.contains("<="),
-            "the window must be closed above: {rendered}"
+            "the range must be bounded above: {rendered}"
         );
     }
 
     #[test]
     fn an_overlapping_survivor_refuses_the_range_predicate() {
-        // A survivor with a row older than the newest doomed row would be
-        // caught by `_fetched_at <= cutoff`, so the range delete is not exact
-        // and must not be used.
+        // A doomed entry with a row newer than the oldest survivor straddles the
+        // cutoff, so a range would clip it. It is named whole instead, and with
+        // no other doomed entry there is nothing to range.
         let doomed = [cost(Some(10), Some(30))];
         let survivors = [cost(Some(20), Some(40))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
-        assert_eq!(bulk_range(&d, &s), None);
+
+        let split = partition_doomed(&d, &s);
+        assert_eq!(
+            split.range_ceiling, None,
+            "an overlapping entry is not ranged"
+        );
+        assert_eq!(split.named.len(), 1, "it is named instead");
     }
 
     #[test]
-    fn a_missing_fetch_time_on_either_side_refuses_the_range_predicate() {
+    fn a_missing_fetch_time_refuses_the_range_predicate() {
         // Without a timestamp there is no boundary to reason about, and a row
-        // that cannot be placed must not be swept up by a range.
+        // that cannot be placed must not be swept up by a range — the entry is
+        // named whole instead.
         let d1 = [cost(Some(10), None)];
         let s1 = [cost(Some(30), Some(40))];
-        assert_eq!(
-            bulk_range(
-                &d1.iter().collect::<Vec<_>>(),
-                &s1.iter().collect::<Vec<_>>()
-            ),
-            None
+        let split1 = partition_doomed(
+            &d1.iter().collect::<Vec<_>>(),
+            &s1.iter().collect::<Vec<_>>(),
         );
+        assert_eq!(
+            split1.range_ceiling, None,
+            "a doomed entry with no fetch time is not ranged"
+        );
+        assert_eq!(split1.named.len(), 1, "it is named instead");
 
         let d2 = [cost(Some(10), Some(20))];
         let s2 = [cost(None, Some(40))];
-        assert_eq!(
-            bulk_range(
-                &d2.iter().collect::<Vec<_>>(),
-                &s2.iter().collect::<Vec<_>>()
-            ),
-            None
+        let split2 = partition_doomed(
+            &d2.iter().collect::<Vec<_>>(),
+            &s2.iter().collect::<Vec<_>>(),
         );
+        assert_eq!(
+            split2.range_ceiling, None,
+            "a survivor with no fetch time leaves the cutoff unknowable, so nothing is ranged"
+        );
+        assert_eq!(split2.named.len(), 1, "every doomed entry is named instead");
     }
 
     #[test]
@@ -1061,7 +1365,289 @@ mod tests {
         // No survivors means no boundary to violate.
         let doomed = [cost(Some(1), Some(2)), cost(Some(3), Some(4))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
-        assert_eq!(bulk_range(&d, &[]), Some((1, 4)));
+
+        let split = partition_doomed(&d, &[]);
+        assert_eq!(split.range_floor, Some(1));
+        assert_eq!(split.range_ceiling, Some(4));
+        assert!(
+            split.named.is_empty(),
+            "with no survivors the whole set is ranged"
+        );
+    }
+
+    /// The key columns `named_cost`/`ranked` build their `RecordBatch` under.
+    fn key_columns() -> Vec<String> {
+        vec!["request_path".to_string()]
+    }
+
+    /// Builds the single-column `request_path` `RecordBatch` an `EntryKey`
+    /// resolves against, one row per path pushed onto it in order.
+    #[derive(Default)]
+    struct KeyBatchBuilder(Vec<String>);
+
+    impl KeyBatchBuilder {
+        /// Records `path` as the next row and returns its row index.
+        fn push(&mut self, path: &str) -> usize {
+            self.0.push(path.to_string());
+            self.0.len() - 1
+        }
+
+        fn build(&self) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "request_path",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![Arc::new(StringArray::from(self.0.clone())) as _],
+            )
+            .expect("build key batch")
+        }
+    }
+
+    /// One entry costed at `(oldest, newest)` and named by its request path, so a
+    /// partition test can tell which entries the range covers from which it
+    /// names. `b` must outlive the returned `EntryCost` — call `b.build()` only
+    /// once every entry has been pushed.
+    fn named_cost(
+        b: &mut KeyBatchBuilder,
+        path: &str,
+        oldest: Option<i64>,
+        newest: Option<i64>,
+    ) -> EntryCost {
+        EntryCost {
+            key: EntryKey {
+                batch: 0,
+                row: b.push(path),
+            },
+            rows: 1,
+            bytes: 1,
+            oldest,
+            newest,
+            matches_configured: false,
+        }
+    }
+
+    /// The request paths in a name-bucket, for asserting which entries a
+    /// partition names rather than ranges.
+    fn named_paths(bucket: &[&EntryCost], batches: &[RecordBatch]) -> Vec<String> {
+        bucket
+            .iter()
+            .filter_map(|e| {
+                e.key
+                    .resolve(batches, &key_columns())
+                    .first()
+                    .and_then(|(_, v)| v.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fetch_time_tie_at_the_boundary_ranges_the_cleanly_older_and_names_the_tie() {
+        // The #13994 case: a coarse fetch clock ties the entries at the budget
+        // boundary, so `newest_doomed == oldest_survivor` and the single-range
+        // gate cannot fire. The cleanly-older doomed entries must still go in one
+        // range, and only the boundary tie is named — otherwise the naming cap
+        // ceilings eviction and a fast-filling cache never converges.
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s1", Some(1000), Some(1000))];
+        let doomed = [
+            named_cost(&mut b, "/d_tie", Some(1000), Some(1000)),
+            named_cost(&mut b, "/d_998", Some(998), Some(998)),
+            named_cost(&mut b, "/d_999", Some(999), Some(999)),
+        ];
+        let batches = [b.build()];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+
+        let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(998));
+        assert_eq!(
+            split.range_ceiling,
+            Some(999),
+            "the two cleanly-older entries go in one range whose ceiling is below the tie"
+        );
+        assert_eq!(
+            named_paths(&split.named, &batches),
+            vec!["/d_tie".to_string()],
+            "only the doomed entry tied with a survivor is named"
+        );
+    }
+
+    #[test]
+    fn a_straddler_is_named_never_ranged() {
+        // A doomed entry whose rows span the survivor cutoff (a partially
+        // refreshed or paginated response) must be named whole, never clipped by
+        // the range — while a doomed entry lying wholly below it is still ranged.
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s", Some(50), Some(50))];
+        let doomed = [
+            named_cost(&mut b, "/straddler", Some(5), Some(100)),
+            named_cost(&mut b, "/clean", Some(1), Some(2)),
+        ];
+        let batches = [b.build()];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+
+        let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(1));
+        assert_eq!(
+            split.range_ceiling,
+            Some(2),
+            "the cleanly-older entry is ranged; the ceiling sits below the straddler's oldest row"
+        );
+        assert_eq!(
+            named_paths(&split.named, &batches),
+            vec!["/straddler".to_string()],
+            "the straddler is named so its rows above the cutoff are not left behind"
+        );
+    }
+
+    #[test]
+    fn evicting_everything_ranges_the_timestamped_and_names_the_timestampless() {
+        // No survivors, so there is no cutoff to protect — but an entry with no
+        // fetch time cannot be placed in a range and is named instead, deleting
+        // it whole by key.
+        let mut b = KeyBatchBuilder::default();
+        let doomed = [
+            named_cost(&mut b, "/a", Some(1), Some(2)),
+            named_cost(&mut b, "/b", Some(3), Some(4)),
+            named_cost(&mut b, "/no_time", None, None),
+        ];
+        let batches = [b.build()];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+
+        let split = partition_doomed(&d, &[]);
+        assert_eq!(split.range_floor, Some(1));
+        assert_eq!(
+            split.range_ceiling,
+            Some(4),
+            "the timestamped entries are ranged"
+        );
+        assert_eq!(
+            named_paths(&split.named, &batches),
+            vec!["/no_time".to_string()],
+            "the timestampless entry is named, not ranged"
+        );
+    }
+
+    #[test]
+    fn a_survivor_without_a_fetch_time_forces_every_doomed_entry_to_be_named() {
+        // The cutoff is unknowable, so nothing may be range-deleted: a range
+        // could clip the survivor's untimed rows. Every doomed entry is named.
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s", None, None)];
+        let doomed = [
+            named_cost(&mut b, "/a", Some(1), Some(2)),
+            named_cost(&mut b, "/b", Some(3), Some(4)),
+        ];
+        let batches = [b.build()];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+
+        let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_ceiling, None, "no safe boundary, so no range");
+        assert_eq!(
+            named_paths(&split.named, &batches).len(),
+            2,
+            "every doomed entry named"
+        );
+    }
+
+    #[test]
+    fn a_deferred_named_entry_is_never_reached_by_the_range() {
+        // Regression for the #13994 review split. The range deletes rows by time,
+        // so a named entry with rows at or below the range ceiling that the
+        // naming cap defers would have its older rows deleted while its newer
+        // rows survive — a half-present entry served as whole. A single-pass
+        // ceiling only steps below entries crossing the survivor cutoff, leaving
+        // entries that cross the *lowered* ceiling in the name bucket with rows
+        // under it; the fixed-point ceiling pulls those out too.
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s", Some(100), Some(100))];
+
+        let mut doomed_owned: Vec<EntryCost> = Vec::new();
+        // Over the naming cap, so at least one is deferred. Each spans [10, 90]:
+        // oldest below the ceiling a single pass would pick, newest below the
+        // survivor cutoff so it does not lower that single-pass ceiling.
+        for i in 0..=MAX_ENTRIES_PER_SWEEP {
+            doomed_owned.push(named_cost(
+                &mut b,
+                &format!("/overlap{i}"),
+                Some(10),
+                Some(90),
+            ));
+        }
+        // A straddler above the cutoff, and a cleanly-older entry a single pass
+        // would range with ceiling 40 — exactly the ceiling that split the
+        // overlaps.
+        doomed_owned.push(named_cost(&mut b, "/straddler", Some(50), Some(120)));
+        doomed_owned.push(named_cost(&mut b, "/clean", Some(1), Some(40)));
+
+        let doomed: Vec<&EntryCost> = doomed_owned.iter().collect();
+        let survivors_ref: Vec<&EntryCost> = survivors.iter().collect();
+        let split = partition_doomed(&doomed, &survivors_ref);
+
+        // Whatever ceiling is chosen, no entry the cap defers may hold a row at
+        // or below it. On the buggy single-pass ceiling (40) the deferred
+        // overlaps had rows at 10 and this fails.
+        let (_, deferred) = nameable(&split.named);
+        if let Some(ceiling) = split.range_ceiling {
+            for entry in &split.named[..deferred] {
+                assert!(
+                    entry.oldest.is_none_or(|oldest| oldest > ceiling),
+                    "deferred named entry {key:?} has a row <= range ceiling {ceiling}; \
+                     the range would delete its older rows while it waits to be named",
+                    key = entry.key,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_coarse_boundary_tie_over_the_cap_still_ranges_the_bulk() {
+        // The fixed-point ceiling must not over-pull in the ordinary coarse-clock
+        // case: single-timestamp entries never straddle, so the older buckets are
+        // still cleared by one range and only the boundary tie is named — the
+        // convergence property #13994 restored.
+        let mut b = KeyBatchBuilder::default();
+        let mut doomed_owned: Vec<EntryCost> = Vec::new();
+        for bucket in [24_i64, 25, 26] {
+            for i in 0..300 {
+                doomed_owned.push(named_cost(
+                    &mut b,
+                    &format!("/b{bucket}_{i}"),
+                    Some(bucket),
+                    Some(bucket),
+                ));
+            }
+        }
+        // Over-budget overflow sharing the survivor's timestamp.
+        let overflow = MAX_ENTRIES_PER_SWEEP + 50;
+        for i in 0..overflow {
+            doomed_owned.push(named_cost(
+                &mut b,
+                &format!("/b27d_{i}"),
+                Some(27),
+                Some(27),
+            ));
+        }
+        let survivors = [named_cost(&mut b, "/s", Some(27), Some(27))];
+        let doomed: Vec<&EntryCost> = doomed_owned.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+        let split = partition_doomed(&doomed, &s);
+
+        assert_eq!(split.range_floor, Some(24));
+        assert_eq!(
+            split.range_ceiling,
+            Some(26),
+            "the three older buckets range in one predicate"
+        );
+        assert!(
+            split.named.iter().all(|e| e.oldest == Some(27)),
+            "only the boundary-tie overflow is named, not the older bulk"
+        );
+        assert_eq!(split.named.len(), overflow);
     }
 
     #[tokio::test]
@@ -1125,7 +1711,7 @@ mod tests {
             entry_predicate(&key, Some(1_700_000_000), converter.as_ref())
                 .expect("ranked")
                 .to_string(),
-            row_level_expiry_expr(converter.as_ref(), 1_700_000_000)
+            fetched_at_at_most(converter.as_ref(), 1_700_000_000)
                 .expect("expiry")
                 .to_string(),
         ];
@@ -1188,7 +1774,7 @@ mod tests {
         // Regression guard for #13525: `stale_if_error` keeps expired entries
         // servable, so with no budget nothing can ever remove one.
         let limits = CacheLimits {
-            stale_if_error: true,
+            stale_if_error: StaleIfError::Enabled,
             ..Default::default()
         };
         assert!(
@@ -1199,17 +1785,99 @@ mod tests {
         // A budget makes it bounded again — and enforced.
         for bounded in [
             CacheLimits {
-                stale_if_error: true,
+                stale_if_error: StaleIfError::Enabled,
                 max_items: Some(10),
                 ..Default::default()
             },
             CacheLimits {
-                stale_if_error: true,
+                stale_if_error: StaleIfError::Enabled,
                 max_size_bytes: Some(1024),
                 ..Default::default()
             },
         ] {
             assert!(bounded.is_enforced());
+        }
+    }
+
+    #[test]
+    fn a_finite_stale_if_error_is_enforced_without_a_budget() {
+        // Unlike `Enabled`, a finite window leaves a deadline the expiry sweep
+        // enforces, so a sweep is worth running even with no byte/item budget.
+        let limits = CacheLimits {
+            stale_if_error: StaleIfError::For(Duration::from_mins(1)),
+            ..Default::default()
+        };
+        assert!(
+            limits.is_enforced(),
+            "a finite stale-if-error is bounded by expiry"
+        );
+    }
+
+    #[test]
+    fn a_finite_stale_if_error_extends_the_expiry_cutoff_by_the_error_window() {
+        // The deadline is `caching_ttl + max(window, swr)` ago. With ttl=10s,
+        // window=60s and no swr, the cutoff is ~70s in the past.
+        let ttl = Duration::from_secs(10);
+        let window = Duration::from_mins(1);
+        let limits = CacheLimits {
+            ttl: Some(ttl),
+            stale_if_error: StaleIfError::For(window),
+            ..Default::default()
+        };
+
+        let cutoff = expiry_cutoff(&limits).expect("a finite window has a cutoff");
+        let now = nanos_since_epoch(SystemTime::now()).expect("now");
+        let expected_age = (effective_max_age(Some(ttl)) + window).as_nanos();
+
+        // Allow a small slack for the time elapsed between the two `now` reads.
+        let observed_age = i128::from(now) - i128::from(cutoff);
+        let slack = Duration::from_secs(1).as_nanos();
+        assert!(
+            (observed_age - i128::try_from(expected_age).expect("fits")).unsigned_abs() < slack,
+            "cutoff should sit ~{expected_age}ns in the past, was {observed_age}ns"
+        );
+    }
+
+    /// A grace so long that `caching_ttl + grace` does not fit a `Duration` is
+    /// rejected by the Spicepod parser; should one reach the sweep anyway, it
+    /// yields no deadline rather than a panic.
+    #[test]
+    fn an_expiry_deadline_that_overflows_yields_no_cutoff() {
+        let limits = CacheLimits {
+            ttl: Some(Duration::from_secs(30)),
+            stale_if_error: StaleIfError::For(Duration::MAX.saturating_sub(Duration::from_secs(1))),
+            ..Default::default()
+        };
+        assert!(expiry_cutoff(&limits).is_none());
+    }
+
+    #[test]
+    fn only_enabled_stale_if_error_has_no_expiry_cutoff() {
+        // `Enabled` keeps entries with no upper bound, so there is no deadline.
+        let enabled = CacheLimits {
+            stale_if_error: StaleIfError::Enabled,
+            ttl: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        assert!(
+            expiry_cutoff(&enabled).is_none(),
+            "an unbounded fallback has no deadline"
+        );
+
+        // `Disabled` and a finite window both have one.
+        for limits in [
+            CacheLimits {
+                stale_if_error: StaleIfError::Disabled,
+                ttl: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+            CacheLimits {
+                stale_if_error: StaleIfError::For(Duration::from_mins(1)),
+                ttl: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        ] {
+            assert!(expiry_cutoff(&limits).is_some());
         }
     }
 
@@ -1234,12 +1902,15 @@ mod tests {
     }
 
     /// Entries as `rank_entries` hands them over: most-recently-fetched first.
-    fn ranked(costs: &[(u64, u64)]) -> Vec<EntryCost> {
+    fn ranked(b: &mut KeyBatchBuilder, costs: &[(u64, u64)]) -> Vec<EntryCost> {
         costs
             .iter()
             .enumerate()
             .map(|(i, (rows, bytes))| EntryCost {
-                key: vec![("request_path".to_string(), Some(format!("/{i}")))],
+                key: EntryKey {
+                    batch: 0,
+                    row: b.push(&format!("/{i}")),
+                },
                 rows: *rows,
                 bytes: *bytes,
                 // Newest-first ordering is the caller's contract, so the value
@@ -1251,12 +1922,17 @@ mod tests {
             .collect()
     }
 
-    fn doomed_paths(entries: &[EntryCost], budget: Budget) -> Vec<String> {
+    fn doomed_paths(entries: &[EntryCost], budget: Budget, batches: &[RecordBatch]) -> Vec<String> {
         let refs: Vec<&EntryCost> = entries.iter().collect();
         let keep = select_doomed_refs(&refs, budget);
         refs[keep..]
             .iter()
-            .filter_map(|e| e.key.first().and_then(|(_, v)| v.clone()))
+            .filter_map(|e| {
+                e.key
+                    .resolve(batches, &key_columns())
+                    .first()
+                    .and_then(|(_, v)| v.clone())
+            })
             .collect()
     }
 
@@ -1264,21 +1940,24 @@ mod tests {
     fn selection_keeps_a_contiguous_most_recent_prefix() {
         // Entries are newest-first, so /0 is newest. A budget of 2 rows keeps
         // /0 and /1 and dooms the rest — not whichever happen to fit.
-        let entries = ranked(&[(1, 10), (1, 10), (1, 10), (1, 10)]);
-        let doomed = doomed_paths(&entries, Budget::Items(2));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 10), (1, 10), (1, 10), (1, 10)]);
+        let doomed = doomed_paths(&entries, Budget::Items(2), &[b.build()]);
         assert_eq!(doomed, vec!["/2".to_string(), "/3".to_string()]);
     }
 
     #[test]
     fn selection_charges_bytes_against_a_byte_budget() {
-        let entries = ranked(&[(1, 100), (1, 100), (1, 100)]);
-        let doomed = doomed_paths(&entries, Budget::Bytes(250));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 100), (1, 100), (1, 100)]);
+        let doomed = doomed_paths(&entries, Budget::Bytes(250), &[b.build()]);
         assert_eq!(doomed, vec!["/2".to_string()]);
     }
 
     #[test]
     fn selection_evicts_nothing_when_everything_fits() {
-        let entries = ranked(&[(1, 10), (1, 10)]);
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 10), (1, 10)]);
         let refs: Vec<&EntryCost> = entries.iter().collect();
         assert_eq!(select_doomed_refs(&refs, Budget::Items(10)), refs.len());
         assert_eq!(select_doomed_refs(&refs, Budget::Bytes(1024)), refs.len());
@@ -1288,8 +1967,9 @@ mod tests {
     fn a_single_entry_larger_than_the_whole_budget_is_evicted() {
         // Otherwise one oversized response would pin the cache over its budget
         // for good.
-        let entries = ranked(&[(1, 5_000)]);
-        let doomed = doomed_paths(&entries, Budget::Bytes(1_000));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 5_000)]);
+        let doomed = doomed_paths(&entries, Budget::Bytes(1_000), &[b.build()]);
         assert_eq!(doomed, vec!["/0".to_string()]);
     }
 
@@ -1300,8 +1980,9 @@ mod tests {
         // where they overlapped the doomed in fetch time and forced the
         // per-entry path forever — so a large cache could never converge.
         let count = MAX_ENTRIES_PER_SWEEP + 10;
-        let entries = ranked(&vec![(1_u64, 10_u64); count]);
-        let doomed = doomed_paths(&entries, Budget::Items(0));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &vec![(1_u64, 10_u64); count]);
+        let doomed = doomed_paths(&entries, Budget::Items(0), &[b.build()]);
         assert_eq!(doomed.len(), count, "every over-budget entry is doomed");
     }
 
@@ -1312,13 +1993,20 @@ mod tests {
         // trimming the other end would keep the least valuable entries and
         // re-doom the same ones every sweep.
         let count = MAX_ENTRIES_PER_SWEEP + 10;
-        let entries = ranked(&vec![(1_u64, 10_u64); count]);
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &vec![(1_u64, 10_u64); count]);
+        let batches = [b.build()];
         let refs: Vec<&EntryCost> = entries.iter().collect();
 
         let (naming, deferred) = nameable(&refs);
         assert_eq!(naming.len(), MAX_ENTRIES_PER_SWEEP);
         assert_eq!(deferred, 10);
-        let path = |e: &EntryCost| e.key[0].1.clone().unwrap_or_default();
+        let path = |e: &EntryCost| {
+            e.key.resolve(&batches, &key_columns())[0]
+                .1
+                .clone()
+                .unwrap_or_default()
+        };
         assert_eq!(path(naming[naming.len() - 1]), format!("/{}", count - 1));
         assert_eq!(
             path(naming[0]),
@@ -1401,6 +2089,236 @@ mod tests {
         let accelerator = Arc::new(table) as Arc<dyn TableProvider>;
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         (accelerator, federated)
+    }
+
+    /// Builds an accelerator whose rows carry the exact `_fetched_at` nanos
+    /// given, so a test can put many entries at the *same* timestamp — the
+    /// fetch-time tie a coarse clock produces. `cache_table` derives each row's
+    /// time from `SystemTime::now()`, which drifts between rows and so cannot
+    /// reproduce an exact tie.
+    fn cache_table_at(entries: &[(String, i64)]) -> (Arc<dyn TableProvider>, Arc<FederatedTable>) {
+        use arrow::array::{StringArray, TimestampNanosecondArray};
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(http_cache_schema());
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(paths.clone())) as _,
+                Arc::new(StringArray::from(vec![""; entries.len()])) as _,
+                Arc::new(StringArray::from(vec![""; entries.len()])) as _,
+                Arc::new(StringArray::from(vec!["body"; entries.len()])) as _,
+                Arc::new(TimestampNanosecondArray::from(
+                    entries.iter().map(|(_, ns)| Some(*ns)).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(StringArray::from(vec!["public"; entries.len()])) as _,
+            ],
+        )
+        .expect("batch");
+
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        let accelerator = Arc::new(table) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        (accelerator, federated)
+    }
+
+    #[tokio::test]
+    async fn a_fetch_time_tie_at_the_budget_boundary_converges_in_one_sweep() {
+        // Regression test for #13994. A coarse fetch clock clusters entries at a
+        // few timestamps; the item budget falls inside the newest cluster, so
+        // `newest_doomed == oldest_survivor` and the single-range gate never
+        // fires. The pre-fix code fell to naming, capped at MAX_ENTRIES_PER_SWEEP,
+        // and a cache filling faster than the cap never caught up. The range must
+        // now clear the cleanly-older clusters in one predicate, leaving only the
+        // boundary tie to be named, so one sweep brings the cache to budget.
+        let now = nanos_since_epoch(SystemTime::now()).expect("clock");
+        let second = 1_000_000_000_i64;
+
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        // Three older clusters, all cleanly below the boundary — deliberately
+        // more than the naming cap could reach on its own.
+        for (cluster, count) in [(3_i64, 600), (2, 600), (1, 600)] {
+            for i in 0..count {
+                entries.push((format!("/c{cluster}_{i}"), now - cluster * second));
+            }
+        }
+        // The boundary cluster: 200 entries sharing one timestamp. A budget of
+        // 100 keeps 100 of them and dooms the other 100 — the tie the range
+        // cannot cover.
+        for i in 0..200 {
+            entries.push((format!("/boundary_{i}"), now));
+        }
+        let over_the_cap = 1800; // the three older clusters
+        assert!(
+            over_the_cap > MAX_ENTRIES_PER_SWEEP,
+            "the older clusters must exceed the naming cap, or the test cannot \
+             distinguish the fix from the capped fallback"
+        );
+
+        let (accelerator, federated) = cache_table_at(&entries);
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(100),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            deleted, 1900,
+            "one sweep removes every over-budget entry: the 1800 cleanly-older by \
+             range and the 100 boundary tie by name"
+        );
+        assert_eq!(
+            remaining(&accelerator).await.len(),
+            100,
+            "the cache is at its item budget after a single sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_range_delete_resolves_no_entry_keys() {
+        // 2,000 entries fetched long ago and 50 fetched just now, kept under a
+        // budget of 50: the 2,000 clear as a single `_fetched_at` range, with no
+        // entry named individually.
+        reset_key_extractions();
+        let now = nanos_since_epoch(SystemTime::now()).expect("clock");
+        let second = 1_000_000_000_i64;
+
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        for i in 0..2_000 {
+            entries.push((format!("/old{i}"), now - 10 * second));
+        }
+        for i in 0..50 {
+            entries.push((format!("/new{i}"), now));
+        }
+
+        let (accelerator, federated) = cache_table_at(&entries);
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(50),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(deleted, 2_000, "the whole doomed set clears by one range");
+        assert_eq!(
+            key_extractions(),
+            0,
+            "a clean range delete must resolve no entry's key at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_delete_resolves_keys_only_for_the_entries_it_actually_names() {
+        // 2,000 entries fetched a second ago and 100 sharing the survivor's
+        // exact timestamp, kept under a budget of 50: the tie at that timestamp
+        // cannot be covered by a range, so the 50 over budget are named
+        // individually while the 2,000 older entries clear as a range.
+        reset_key_extractions();
+        let now = nanos_since_epoch(SystemTime::now()).expect("clock");
+        let second = 1_000_000_000_i64;
+
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        for i in 0..2_000 {
+            entries.push((format!("/old{i}"), now - second));
+        }
+        // 100 entries sharing the survivor's exact timestamp: a clean range
+        // cannot cover them, so they must be named individually.
+        for i in 0..100 {
+            entries.push((format!("/boundary{i}"), now));
+        }
+
+        let (accelerator, federated) = cache_table_at(&entries);
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(50), // keeps 50 of the 100 boundary entries
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            deleted, 2_050,
+            "the 2,000 cleanly-older by range plus the 50 over-budget of the tie by name"
+        );
+        assert_eq!(
+            key_extractions(),
+            50,
+            "only the 50 named boundary entries ever resolve a key — none of the \
+             2,000 the range cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_byte_budget_at_a_fetch_time_tie_also_converges_in_one_sweep() {
+        // The byte budget partitions the same way the item budget does: it only
+        // changes which entries survive, and the range/name split at the cutoff
+        // is identical. Every fixture entry is one equal-sized row, so a byte
+        // budget of 100 rows' worth keeps 100 entries.
+        let now = nanos_since_epoch(SystemTime::now()).expect("clock");
+        let second = 1_000_000_000_i64;
+
+        // Constant-width paths so every row charges the same byte cost, and a
+        // budget of exactly 100 rows' worth keeps exactly 100 entries.
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        for i in 0..1500 {
+            entries.push((format!("/o{i:05}"), now - second));
+        }
+        for i in 0..200 {
+            entries.push((format!("/b{i:05}"), now));
+        }
+
+        let (accelerator, federated) = cache_table_at(&entries);
+        let one_row = payload_bytes_for(&accelerator, "/b00000").await;
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_size_bytes: Some(one_row * 100),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            remaining(&accelerator).await.len(),
+            100,
+            "the cache is at its byte budget after a single sweep"
+        );
+        assert_eq!(
+            deleted, 1600,
+            "one sweep removes the 1500 cleanly-older by range and the 100 \
+             boundary tie by name"
+        );
+    }
+
+    /// The payload bytes the size expression charges the one entry named `path`,
+    /// read back from the accelerator so a byte-budget test states its budget in
+    /// entries rather than a magic number.
+    async fn payload_bytes_for(accelerator: &Arc<dyn TableProvider>, path: &str) -> u64 {
+        let schema = accelerator.schema();
+        let size_expr = payload_bytes_expr(&schema).expect("measurable");
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(accelerator))
+            .expect("read")
+            .filter(col("request_path").eq(lit(path)))
+            .expect("filter")
+            .aggregate(vec![], vec![sum(size_expr).alias("bytes")])
+            .expect("aggregate")
+            .collect()
+            .await
+            .expect("collect");
+        read_u64_at(&batches[0], "bytes", 0).expect("bytes")
     }
 
     /// The `(request_path, request_query)` pairs still stored, sorted.
@@ -1514,7 +2432,7 @@ mod tests {
         let schema = accelerator.schema();
         let key_columns = entry_key_columns(&schema);
         let dataset_name = TableReference::bare("http_cache");
-        let entries = rank_entries(
+        let (entries, batches) = rank_entries(
             &accelerator,
             &Handle::current(),
             &key_columns,
@@ -1526,7 +2444,12 @@ mod tests {
         .expect("rank");
         let doomed: Vec<&EntryCost> = entries
             .iter()
-            .filter(|e| e.key.iter().any(|(_, v)| v.as_deref() == Some("/oldest")))
+            .filter(|e| {
+                e.key
+                    .resolve(&batches, &key_columns)
+                    .iter()
+                    .any(|(_, v)| v.as_deref() == Some("/oldest"))
+            })
             .collect();
         assert_eq!(doomed.len(), 1, "one entry should be chosen");
 
@@ -1546,7 +2469,11 @@ mod tests {
             doomed
                 .iter()
                 .filter_map(|entry| {
-                    entry_predicate(&entry.key, entry.newest, refreshed_at_converter().as_ref())
+                    entry_predicate(
+                        &entry.key.resolve(&batches, &key_columns),
+                        entry.newest,
+                        refreshed_at_converter().as_ref(),
+                    )
                 })
                 .collect(),
             Expr::or,
@@ -1930,7 +2857,7 @@ mod tests {
         let (accelerator, federated) = cache_table(&rows);
         let expired = CacheLimits {
             ttl: Some(Duration::from_mins(5)),
-            stale_if_error: true,
+            stale_if_error: StaleIfError::Enabled,
             ..Default::default()
         };
 

@@ -31,6 +31,22 @@ use test_framework::queries::Query;
 pub const SSB_TABLES: &[&str] = &["lineorder", "customer", "supplier", "part", "date"];
 
 /// Write all SSB tables as `{table}.parquet` under `out_dir`.
+/// Generate the SSB fixture into `out_dir` unless this generator already
+/// finished writing one there.
+///
+/// Shared by every SSB lane so the reuse rule is decided once. A bare
+/// `if !lineorder.parquet.exists()` is not that rule: it accepts a fixture an
+/// older generator wrote, and this one's rows are what the ORDER BY checks are
+/// calibrated against.
+pub fn ensure_ssb_fixture(out_dir: &Path, scale: i64) {
+    let revision = super::generator_revision(include_str!("ssb_data.rs"));
+    if super::fixture_is_current(out_dir, &revision) {
+        return;
+    }
+    write_ssb_parquet(out_dir, scale);
+    super::mark_fixture_complete(out_dir, &revision);
+}
+
 pub fn write_ssb_parquet(out_dir: &Path, scale: i64) {
     std::fs::create_dir_all(out_dir).expect("ssb out dir");
     let scale = scale.max(1);

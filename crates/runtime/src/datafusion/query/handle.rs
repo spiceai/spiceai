@@ -941,6 +941,7 @@ impl QueryHandle {
                 cache_key,
                 Arc::clone(datasets),
                 self.query_start,
+                None,
             )
         } else {
             Box::pin(stream)

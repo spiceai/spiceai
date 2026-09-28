@@ -3,6 +3,7 @@ tests:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
     runner_type: spiceai-dev-runners
+    validate_results: true
   throughput:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
