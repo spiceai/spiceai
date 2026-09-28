@@ -21688,6 +21688,18 @@ impl CayenneTableProvider {
         // exit below reports itself, so the two together account for each pass
         // exactly once.
         let table_name = self.table_metadata.table_name.as_str();
+        // A `mode: memory` table keeps every row in the RAM tier and has no
+        // durable snapshot to consolidate. The scan below would read the tier
+        // into a new snapshot while the tier stays visible, so every row would
+        // come back twice.
+        if self.is_memory_resident_mode() {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::Full,
+                CompactionOutcome::DeclinedNotConfigured,
+            );
+            return Ok(false);
+        }
         let compaction_start = std::time::Instant::now();
 
         // CONVERGENCE FENCE — prevents a delete/upsert that races this rewrite
@@ -21799,6 +21811,7 @@ impl CayenneTableProvider {
             // spuriously abort every pass on a table with inline data. After
             // this the internal checkpoint is a no-op. Safe under the
             // `write_lock` this arm already holds for the whole rewrite.
+            self.drain_mem_tier_before_rewrite_scan().await?;
             if self.cached_inlined_row_count() > 0 {
                 self.checkpoint_inlined_data().await?;
             }
@@ -21833,6 +21846,7 @@ impl CayenneTableProvider {
             // providers may still flip `current_snapshot_id` without moving the
             // current-dir generation, so revalidate before catalog publish.
             let snapshot_id_before = self.get_current_snapshot_id();
+            self.drain_mem_tier_before_rewrite_scan().await?;
             if self.cached_inlined_row_count() > 0 {
                 self.checkpoint_inlined_data().await?;
             }
@@ -22384,6 +22398,24 @@ impl CayenneTableProvider {
     /// deliberately tracks ONLY current-dir publishes — not the rewrite's own
     /// output write or background mem-tier checkpoints — so the fence does not
     /// abort on changes that leave the current dir untouched.
+    /// Checkpoint the in-memory CDC tier (`cdc_durability: memory`) before a
+    /// full rewrite captures its scan.
+    ///
+    /// The rewrite scan reads the tier along with the durable files, but its
+    /// commit replaces only the durable snapshot. A row still in the tier would
+    /// therefore stay visible beside its copy in the new snapshot, and no later
+    /// checkpoint removes the copy. Draining first leaves the tier empty when
+    /// the scan captures its inputs. The caller holds `write_lock`, so no apply
+    /// can refill the tier in between, and `mem_checkpoint_lock` is taken after
+    /// it, the order cold promotion uses. The checkpoint publishes a protected
+    /// snapshot, which is why this runs before the folded-set bracket.
+    async fn drain_mem_tier_before_rewrite_scan(&self) -> Result<()> {
+        if self.is_cdc_memory_mode() && !self.mem_tier.is_empty() {
+            self.checkpoint_mem_tier_holding_write_lock().await?;
+        }
+        Ok(())
+    }
+
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
@@ -44480,6 +44512,208 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// Seeds a durable `[1, 2, 3]` and leaves `[4]` in the RAM tier, then runs a
+    /// full rewrite, the state `run_one_compaction_pass` reaches when the
+    /// protected-snapshot trigger fires between two mem-tier checkpoints.
+    async fn rewrite_with_a_resident_mem_segment(
+        provider: &CayenneTableProvider,
+        batch: impl Fn(&[i64]) -> RecordBatch,
+    ) {
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let no_deletions = OnConflictDeletions::default();
+        let seed = batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("flush maintenance");
+        let late = batch(&[4]);
+        let late_bytes = late.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![late], &no_deletions, late_bytes, 0)
+            .await
+            .expect("late append");
+        assert_eq!(scan_sorted_ids(provider).await, vec![1, 2, 3, 4]);
+        assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
+
+        // Bounded: the drain takes `mem_checkpoint_lock` while the rewrite holds
+        // `write_lock`, so a lock-order regression shows up as a timeout.
+        let committed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.rewrite_current_snapshot_for_compaction(),
+        )
+        .await
+        .expect("rewrite must not deadlock")
+        .expect("rewrite");
+        assert!(committed, "the rewrite commits");
+        assert_eq!(
+            scan_sorted_ids(provider).await,
+            vec![1, 2, 3, 4],
+            "the RAM-tier row must not appear both in the new snapshot and in the tier"
+        );
+        assert_eq!(
+            provider.mem_tier.total_rows(),
+            0,
+            "the rewrite drained the tier"
+        );
+        let stats_rows = provider
+            .optimizer_table_statistics()
+            .map(|s| s.num_rows)
+            .expect("statistics present");
+        assert_eq!(stats_rows.get_value(), Some(&4));
+
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("later checkpoint");
+        assert_eq!(scan_sorted_ids(provider).await, vec![1, 2, 3, 4]);
+    }
+
+    /// Regression test for #14450 on a key-delete table.
+    #[tokio::test]
+    async fn full_rewrite_does_not_duplicate_resident_mem_tier_rows() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("rewrite_resident_mem_segment", runtime_env).await;
+        rewrite_with_a_resident_mem_segment(&provider, int64_id_batch).await;
+    }
+
+    /// Regression test for #14450 on a `deletion_mode: position` table, which
+    /// takes the rewrite's position arm (writers and visibility flips excluded
+    /// for the whole pass) and still runs the in-memory CDC tier.
+    #[tokio::test]
+    async fn position_mode_full_rewrite_does_not_duplicate_resident_mem_tier_rows() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "position_rewrite_resident_mem_segment",
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                deletion_mode: crate::metadata::DeletionMode::Position,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "premise: in-memory CDC tier");
+        assert!(
+            provider.should_capture_positions(),
+            "premise: the rewrite takes its position arm"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        rewrite_with_a_resident_mem_segment(&provider, |ids| {
+            id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()])
+        })
+        .await;
+    }
+
+    /// #14450 through the background compaction entry point: a mem-tier
+    /// checkpoint publishes a protected snapshot, which fires the count trigger
+    /// while the next apply's rows are still in the RAM tier.
+    #[tokio::test]
+    async fn protected_snapshot_trigger_pass_does_not_duplicate_resident_mem_tier_rows() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "trigger_pass_resident_mem_segment",
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_min_flush_bytes: 0,
+                compaction_trigger_protected_snapshots: 1,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let no_deletions = OnConflictDeletions::default();
+        for (ids, checkpoint) in [(&[1_i64, 2, 3][..], true), (&[4][..], false)] {
+            let batch = id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()]);
+            let bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("append");
+            if checkpoint {
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+            }
+        }
+        assert!(
+            provider.protected_snapshot_maintenance_trigger().is_some(),
+            "premise: the checkpoint's protected snapshot fires the trigger"
+        );
+        assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
+
+        assert!(
+            provider.run_one_compaction_pass().await.expect("pass"),
+            "the triggered pass commits a full rewrite"
+        );
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4]);
+    }
+
+    /// A `mode: memory` table has no durable snapshot to consolidate, so a full
+    /// rewrite declines instead of copying the RAM tier into one.
+    #[tokio::test]
+    async fn full_rewrite_declines_on_memory_resident_table() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+        let options = CreateTableOptions {
+            table_name: "rewrite_memory_resident".to_string(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                memory_mode: true,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        assert!(provider.is_memory_resident_mode(), "premise: mode: memory");
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
+            .await
+            .expect("append");
+
+        let committed = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("rewrite");
+        assert!(!committed, "nothing durable to rewrite");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
     }
 
     /// A key re-inserted after its delete was checkpointed must stay visible even
