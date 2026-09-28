@@ -3795,8 +3795,8 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     /// The metric statics are `LazyLock`s that bind to whichever provider is global
     /// when they are first touched, and that binding survives a later
     /// `set_meter_provider`. So this rewires the meter for the whole process and only
-    /// the first caller in it wins -- keep it to a single test, as
-    /// `tests/metrics.rs` does.
+    /// the first caller in it wins -- keep it to a single test, and run that test in
+    /// a process of its own (see `run_in_own_process`).
     fn install_prometheus_meter_provider() -> prometheus::Registry {
         let registry = prometheus::Registry::new();
 
@@ -4189,8 +4189,58 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     /// and that guard only ever suppressed the duplicate -- the callee counted
     /// regardless -- so a failure during teardown counted exactly one before this
     /// change and must still count exactly one.
-    #[tokio::test]
-    async fn a_dataset_connector_failure_counts_one_load_error() {
+    ///
+    /// It runs in a process of its own (regression test for #13085): under
+    /// `cargo test` the sibling tests share this process, so `LOAD_ERROR` could be
+    /// bound to the no-op provider before this test installed its own (reading 0),
+    /// or, once bound, siblings that fail a load on purpose add to the same
+    /// unlabeled counter inside this test's window (reading 3 or 4).
+    #[test]
+    fn a_dataset_connector_failure_counts_one_load_error() {
+        if run_in_own_process("a_dataset_connector_failure_counts_one_load_error") {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("to build a test runtime")
+                .block_on(assert_a_dataset_connector_failure_counts_one_load_error());
+        }
+    }
+
+    /// Set on the child process `run_in_own_process` spawns.
+    const OWN_PROCESS_ENV: &str = "SPICE_RUNTIME_TEST_OWN_PROCESS";
+
+    /// Re-runs the test `name` (in this module) alone in a fresh process of this
+    /// test binary and asserts it passed there. Returns `true` only inside that
+    /// child, where the caller runs the test body; returns `false` in the parent
+    /// once the child has passed.
+    fn run_in_own_process(name: &str) -> bool {
+        if std::env::var_os(OWN_PROCESS_ENV).is_some() {
+            return true;
+        }
+
+        // libtest names tests by module path without the crate name.
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, module)| module);
+        let test = format!("{module}::{name}");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("to locate the test binary"))
+                .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env(OWN_PROCESS_ENV, "1")
+                .output()
+                .expect("to run the test binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test} failed in its own process ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        false
+    }
+
+    async fn assert_a_dataset_connector_failure_counts_one_load_error() {
         let registry = install_prometheus_meter_provider();
         let runtime = Arc::new(crate::Runtime::builder().build().await);
 
