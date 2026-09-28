@@ -153,16 +153,16 @@ async fn run_small_file_workload(name: &str, deletion_mode: DeletionMode) {
     }
 
     // Let the compactor catch up on what the last appends left behind.
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(Duration::from_mins(1), async {
         while table.last_small_file_compact_path() == LastSmallFileCompactPath::None {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("no small-file compaction committed within 60 s");
-    tokio::time::timeout(Duration::from_secs(60), table.flush_pending_maintenance())
+    .expect("no small-file compaction committed within 1 min");
+    tokio::time::timeout(Duration::from_mins(1), table.flush_pending_maintenance())
         .await
-        .expect("post-write maintenance did not finish within 60 s")
+        .expect("post-write maintenance did not finish within 1 min")
         .expect("flush pending maintenance");
 
     assert_eq!(
