@@ -1158,6 +1158,15 @@ jobs:
         run: |
           # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
           brew update
+          # The macos-15 image points bin/openssl at the deprecated openssl@1.1 with a plain
+          # symlink that Homebrew does not own, so `brew unlink openssl@1.1` leaves it in
+          # place. When a mysql@8.4 bottle needs a newer openssl@3, brew upgrades it but
+          # cannot link bin/openssl over that symlink, and `brew install` exits 1 even
+          # though MySQL installed. Removing the symlink first lets the upgrade link.
+          openssl_link="$(brew --prefix)/bin/openssl"
+          if [[ "$(readlink "$openssl_link")" == */openssl@1.1/* ]]; then
+            rm "$openssl_link"
+          fi
           brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
           brew services start mysql@8.4
