@@ -34,9 +34,10 @@ limitations under the License.
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
-    CayenneDeletionSink, DeleteScanSource, DeletionIdentifier, DeletionVectorWriteResult,
-    DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling,
-    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
+    DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
+    FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec,
 };
 use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
@@ -37146,13 +37147,27 @@ impl CayenneTableProvider {
         // the live row with it.
         // A protected snapshot ignores re-inserts AND carries a cutoff — the pairing
         // `apply_partial_deletion_filter` gives these same rows on the scan path.
-        let mut snapshot_tables: Vec<DeleteScanSource> = self
-            .build_protected_snapshot_listing_tables()?
+        //
+        // The protected set is captured with the deletion index it is judged by — see
+        // [`DeleteScanSource::tombstones_at_capture`].
+        let capture_locks = CaptureLocks {
+            listing_fence: Arc::clone(&self.listing_fence),
+            scan_state_lock: Arc::clone(&self.scan_state_lock),
+        };
+        let (protected_tables, tombstones_at_capture) = {
+            let _guards = capture_locks.read().await;
+            (
+                self.build_protected_snapshot_listing_tables()?,
+                self.pk_deletion_snapshot(),
+            )
+        };
+        let mut snapshot_tables: Vec<DeleteScanSource> = protected_tables
             .into_iter()
             .map(|(_, max_delete_seq_at_creation, table)| DeleteScanSource {
                 min_delete_seq: Some(max_delete_seq_at_creation),
                 insert_records: InsertRecordHandling::Ignore,
                 table,
+                tombstones_at_capture: Some(tombstones_at_capture.clone()),
             })
             .collect();
         // Main's own re-insert handling is decided HERE, on the same condition `scan`
@@ -37187,6 +37202,7 @@ impl CayenneTableProvider {
                     min_delete_seq: None,
                     insert_records: InsertRecordHandling::Ignore,
                     table,
+                    tombstones_at_capture: None,
                 }),
         );
 
@@ -37208,6 +37224,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         )
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
+        .with_capture_locks(capture_locks)
         .with_exact_count(source.requires_exact_count());
 
         Ok(sink)
@@ -58810,6 +58827,88 @@ mod tests {
             "the live row does not match `value < 50`; a sink still scanning main with \
              the captured `Apply` would tombstone key 7 from the superseded (7, 10) and \
              take the replacement with it"
+        );
+    }
+
+    /// Regression test for #13913. A DELETE judges each captured scan source against a
+    /// deletion index, and a seq-prefix bake can run between the capture and the scan:
+    /// it folds the protected snapshots, then prunes the tombstones those rows no longer
+    /// need. A snapshot captured before the bake still holds the superseded version, so
+    /// judging it by the pruned index makes that version look live — a predicate
+    /// matching its retired value then tombstones the KEY and deletes the replacement.
+    #[tokio::test]
+    async fn a_bake_between_the_delete_capture_and_its_scan_keeps_the_replacement() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_capture_bake_prune",
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[90])).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[40])).await;
+        // The bake keeps the newest snapshots unbaked; these give it an older prefix —
+        // the two versions of key 7 — to fold.
+        for key in 1..=3_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[key], &[key * 10]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+        let expected = vec![(1, 10), (2, 20), (3, 30), (7, 40)];
+        assert_eq!(
+            scan_id_values(&provider).await,
+            expected,
+            "precondition: the upsert superseded (7, 90), so only (7, 40) is live"
+        );
+
+        // Capture the scan sources, then let a bake fold them and prune the index.
+        let sink = provider
+            .build_deletion_vector_sink(
+                &[datafusion_expr::col("value").gt_eq(datafusion_expr::lit(80_i64))],
+                None,
+                DeletionRequestSource::User,
+            )
+            .await
+            .expect("deletion sink built");
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake ran"),
+            "precondition: the bake must fold the captured snapshots"
+        );
+        let PkDeletionSnapshot::Int64Pk { tombstones } = provider.pk_deletion_snapshot() else {
+            panic!("an Int64 primary key uses the Int64 deletion index");
+        };
+        assert!(
+            tombstones.get_with_min_seq(7, None).is_none(),
+            "precondition: the bake must prune the tombstone that hid (7, 90) — the state \
+             whose mismatch with the captured snapshot is under test"
+        );
+
+        sink.delete_from(ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            expected,
+            "the live row does not match `value >= 80`; judging the captured snapshot by \
+             the pruned index matches the superseded (7, 90) and deletes key 7"
         );
     }
 
