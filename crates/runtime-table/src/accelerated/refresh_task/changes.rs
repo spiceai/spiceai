@@ -3465,14 +3465,27 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
     let records: Vec<&RecordBatch> = batches.iter().map(|b| &b.record).collect();
     let combined = arrow::compute::concat_batches(&schema, records)
         .context(crate::accelerated::FailedToBuildRecordBatchSnafu)?;
-    ChangeBatch::try_new(combined).map_err(|e| {
-        // ChangeBatchError isn't part of the AcceleratedTable Error enum;
-        // wrap it in FailedToBuildRecordBatch so the caller's status path
-        // doesn't have to learn about a new variant.
-        crate::accelerated::Error::FailedToBuildRecordBatch {
-            source: arrow::error::ArrowError::ExternalError(Box::new(e)),
-        }
-    })
+    // The coalesced batch keeps the newest constituent commit timestamp: it rides
+    // the batch into the accelerator (`write_cdc_append_stream_with_source_commit_ts`),
+    // where it feeds the replication-lag and freshness signals the adaptive tuner's
+    // goals are stated against. Same rule as the burst frontier in `apply_burst`:
+    // the max is the most recent, and zero-row envelopes are excluded because their
+    // timestamp is not evidence that data up to that point was received.
+    let source_commit_ts_ms = batches
+        .iter()
+        .filter(|batch| !batch.is_heartbeat())
+        .filter_map(ChangeBatch::source_commit_ts_ms)
+        .max();
+    ChangeBatch::try_new(combined)
+        .map(|batch| batch.with_source_commit_ts_ms(source_commit_ts_ms))
+        .map_err(|e| {
+            // ChangeBatchError isn't part of the AcceleratedTable Error enum;
+            // wrap it in FailedToBuildRecordBatch so the caller's status path
+            // doesn't have to learn about a new variant.
+            crate::accelerated::Error::FailedToBuildRecordBatch {
+                source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+            }
+        })
 }
 
 fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
@@ -4712,6 +4725,49 @@ mod tests {
             .expect("Failed to create RecordBatch");
 
         ChangeBatch::try_new(record).expect("Failed to create ChangeBatch")
+    }
+
+    /// A coalesced burst keeps the newest source-commit timestamp of its
+    /// constituents. Without it every multi-envelope burst reached the
+    /// accelerator with `None`, so Cayenne's replication-lag goal read nothing
+    /// (`cayenne_ingest_replication_lag_seconds` had no series in eight 3-node
+    /// SF-1 lab arms on 2026-09-27, while the runtime's own
+    /// `dataset_acceleration_cdc_received_commit_unix_time_ms`, computed from
+    /// the envelopes before concatenation, was populated) and its freshness goal
+    /// fell back to a wall-clock age.
+    #[test]
+    fn concat_change_batches_keeps_the_newest_source_commit_ts() {
+        let older = create_test_change_batch(vec!["c"], &[vec!["1"]], vec![1], vec![Some("a")])
+            .with_source_commit_ts_ms(Some(1_700_000_000_000));
+        let newest = create_test_change_batch(vec!["u"], &[vec!["2"]], vec![2], vec![Some("b")])
+            .with_source_commit_ts_ms(Some(1_700_000_005_000));
+        let unstamped = create_test_change_batch(vec!["d"], &[vec!["3"]], vec![3], vec![None]);
+        // A zero-row envelope that survived the no-op-heartbeat retain (it rides a
+        // real committer) is not evidence of received data, so its newer stamp
+        // must not advance the coalesced batch's timestamp — the same exclusion
+        // the runtime's received/applied frontier applies.
+        let zero_row = create_test_change_batch(vec![], &[], vec![], vec![])
+            .with_source_commit_ts_ms(Some(1_700_000_099_000));
+        assert!(zero_row.is_heartbeat());
+
+        let combined =
+            concat_change_batches(&[older, newest, unstamped, zero_row]).expect("concat");
+        assert_eq!(combined.record.num_rows(), 3, "every row is carried");
+        assert_eq!(
+            combined.source_commit_ts_ms(),
+            Some(1_700_000_005_000),
+            "the coalesced batch carries the newest row-bearing constituent commit timestamp"
+        );
+
+        // A burst with no stamped constituent stays unstamped: no lag information.
+        let a = create_test_change_batch(vec!["c"], &[vec!["1"]], vec![1], vec![Some("a")]);
+        let b = create_test_change_batch(vec!["c"], &[vec!["2"]], vec![2], vec![Some("b")]);
+        assert_eq!(
+            concat_change_batches(&[a, b])
+                .expect("concat")
+                .source_commit_ts_ms(),
+            None
+        );
     }
 
     #[test]
