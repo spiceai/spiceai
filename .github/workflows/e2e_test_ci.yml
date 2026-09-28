@@ -1158,6 +1158,15 @@ jobs:
         run: |
           # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
           brew update
+          # The macos-15 image points bin/openssl at the deprecated openssl@1.1 with a plain
+          # symlink that Homebrew does not own, so `brew unlink openssl@1.1` leaves it in
+          # place. When a mysql@8.4 bottle needs a newer openssl@3, brew upgrades it but
+          # cannot link bin/openssl over that symlink, and `brew install` exits 1 even
+          # though MySQL installed. Removing the symlink first lets the upgrade link.
+          openssl_link="$(brew --prefix)/bin/openssl"
+          if [[ "$(readlink "$openssl_link")" == */openssl@1.1/* ]]; then
+            rm "$openssl_link"
+          fi
           brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
           brew services start mysql@8.4
@@ -2164,7 +2173,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
@@ -2371,7 +2384,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
+          # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+            -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
+          echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
           ./oha --version
 
@@ -2468,15 +2485,15 @@ jobs:
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
-  # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
-  # skipped and this lightweight gate reports the required context. In the merge
-  # queue it succeeds only if every E2E job above succeeded (or was skipped), so
-  # the whole matrix is gated by one ruleset entry rather than dozens of shifting
-  # matrix names.
+  # Stable, matrix-proof summary check. It succeeds only if every E2E job above
+  # succeeded (or was skipped), so the whole matrix is gated by one ruleset entry
+  # rather than dozens of shifting matrix names. On a pull request it is skipped
+  # along with every job it summarises, so the required check reads `skipped`,
+  # not a `success` nothing ran for (#13841).
   e2e-gate:
     name: E2E Test CI
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     # The gate only reads the results it already has. Bounding it matters because it is
     # the required check: a stuck gate blocks the queue even when every job it summarises
     # has finished.
