@@ -568,13 +568,6 @@ pub enum Error {
         name: String,
     },
 
-    #[snafu(display("{message}"))]
-    SnapshotsIdentityUnresolvedParam {
-        component: &'static str,
-        name: String,
-        message: String,
-    },
-
     #[snafu(display(
         "Failed to enable acceleration snapshots for view '{view_name}': {reason}. \
          Set `snapshots: disabled` on the view, reduce its query to a single table scan, \
@@ -647,7 +640,6 @@ impl Error {
                 | Self::SnapshotsRequireFileAcceleration { .. }
                 | Self::SnapshotsUnsupportedForPartitionedCayenne { .. }
                 | Self::SnapshotsCayenneMetastoreUnavailable { .. }
-                | Self::SnapshotsIdentityUnresolvedParam { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -666,13 +658,25 @@ impl Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 enum ViewSnapshotConsistencyDecision {
-    /// The operator set `accept_skew`. No single-read gate; a create-enabled view
-    /// publishes unconditionally, and each archive is stamped `accept_skew`.
+    /// The operator set `accept_skew`. No single-read gate. A create-enabled view
+    /// still installs the publish gate, which waives only the read-shape check and
+    /// keeps requiring that every dependency was at its configured definition when
+    /// the view refreshed. Each archive is stamped `accept_skew`.
     AcceptSkew,
     /// The compiled plan reads once today. A create-enabled view still installs a
     /// publish-time re-check because the compiled plan can change. Archives it
     /// publishes are stamped `consistent_read`.
     ConsistentSingleRead,
+}
+
+impl ViewSnapshotConsistencyDecision {
+    /// The consistency the publish gate enforces for this decision.
+    fn consistency(self) -> SnapshotsConsistency {
+        match self {
+            Self::AcceptSkew => SnapshotsConsistency::AcceptSkew,
+            Self::ConsistentSingleRead => SnapshotsConsistency::ConsistentRead,
+        }
+    }
 }
 
 #[must_use]
@@ -732,57 +736,6 @@ fn validate_distributed_engine(
         return UnsupportedDistributedAccelerationEngineSnafu {
             dataset_name: dataset_name.to_string(),
             engine: engine.to_string(),
-        }
-        .fail();
-    }
-    Ok(())
-}
-
-/// Refuses snapshot enablement when an identity `params` value is a
-/// `${ store:key }` reference this sync path cannot resolve.
-///
-/// See [`crate::view::first_unresolved_snapshot_identity_param`].
-fn ensure_snapshot_identity_params(
-    component: &'static str,
-    name: &str,
-    params: &HashMap<String, String>,
-) -> Result<()> {
-    if let Some(unresolved) = crate::view::first_unresolved_snapshot_identity_param(params) {
-        let found = crate::view::UnresolvedClosureIdentityParam {
-            source_component: component.to_string(),
-            source_name: name.to_string(),
-            param_field: "params",
-            unresolved,
-        };
-        return SnapshotsIdentityUnresolvedParamSnafu {
-            component,
-            name: name.to_string(),
-            message: found.refusal_message(component, name),
-        }
-        .fail();
-    }
-    Ok(())
-}
-
-/// Refuses snapshot enablement when any identity `params` in a view's
-/// definition closure is a `${ store:key }` reference — the root view or a
-/// transitive dataset, view, or catalog.
-///
-/// See [`crate::view::first_unresolved_snapshot_identity_param_in_view_closure`].
-fn ensure_view_snapshot_identity_params(
-    name: &TableReference,
-    sql: &str,
-    params: &HashMap<String, String>,
-    app: &app::App,
-) -> Result<()> {
-    if let Some(found) = crate::view::first_unresolved_snapshot_identity_param_in_view_closure(
-        name, sql, params, app,
-    ) {
-        let view_name = name.to_string();
-        return SnapshotsIdentityUnresolvedParamSnafu {
-            component: "view",
-            message: found.refusal_message("view", &view_name),
-            name: view_name,
         }
         .fail();
     }
@@ -3559,7 +3512,6 @@ impl DataFusion {
         // and finds out otherwise at the one moment it matters. Applies to bootstrap-only
         // too — an acceleration with nothing on disk has nothing to restore into either.
         if !acceleration_settings.snapshot_behavior.is_disabled() {
-            ensure_snapshot_identity_params("dataset", &dataset.name.to_string(), &dataset.params)?;
             ensure!(
                 acceleration_layout
                     .as_ref()
@@ -5048,22 +5000,27 @@ impl DataFusion {
 
     /// The publish veto for a view that will write archives.
     ///
-    /// `None` is `accept_skew` (the operator opted out) or a view that does not
-    /// publish. `Some(gate)` consumes the read-shape attested from the plan that
-    /// executed the refresh — it does not re-plan at publish time — and withholds
-    /// while any accelerated dataset dependency has an unpersisted refresh override.
+    /// `None` is a view that does not publish. `Some(gate)` consumes the stamp
+    /// attested from the plan that executed the refresh — it does not re-plan at
+    /// publish time — and withholds while any accelerated dataset dependency was
+    /// not at its configured definition when the view refreshed. Under
+    /// `accept_skew` the gate skips only the read-shape check.
     async fn view_snapshot_publish_gate(
         &self,
         table: &TableReference,
         view: &View,
-        refresh_attestation: Option<crate::view::ViewRefreshReadAttestation>,
+        refresh_attestation: Option<(
+            crate::view::ViewRefreshReadAttestation,
+            SnapshotsConsistency,
+        )>,
     ) -> Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>> {
-        let attestation = refresh_attestation?;
+        let (attestation, consistency) = refresh_attestation?;
         let dependency_refreshes = self.accelerated_dependency_refreshes(view).await;
         Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
             table.clone(),
             attestation,
             dependency_refreshes,
+            consistency,
         ))
             as Arc<
                 dyn runtime_acceleration::snapshot::SnapshotPublishGate,
@@ -5127,46 +5084,39 @@ impl DataFusion {
             &table.to_string(),
         )?;
 
-        // Refuse a multi-read view, and a view whose identity `params` are
-        // `${ store:key }` references, before engine `init` restores anything.
+        // Refuse a multi-read view before engine `init` restores anything.
         // `initialize_views_accelerators` skips bootstrap-enabled views for this
-        // reason; running either check after a restore would leave the archive's
+        // reason; running the check after a restore would leave the archive's
         // rows (and a local checkpoint of them) on disk for a later start.
-        // Identity `params` are hashed as declared, so a rotated secret would
-        // otherwise restore the old archive and then abort registration.
         let mut refresh_attestation = None;
         let mut materialization_identity = None;
         if !acceleration.snapshot_behavior.is_disabled() {
-            ensure_view_snapshot_identity_params(table, &view.sql, &view.params, &view.app)?;
-            match view_snapshot_consistency_decision(
+            let decision = view_snapshot_consistency_decision(
                 &self.ctx,
                 table,
                 &view.sql,
                 acceleration.snapshots_consistency,
             )
-            .await?
-            {
-                ViewSnapshotConsistencyDecision::AcceptSkew => {}
-                ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
-                    if acceleration.snapshot_behavior.create_enabled() {
-                        let identity = crate::accelerated::MaterializationIdentity::new();
-                        let attestation = crate::view::ViewRefreshReadAttestation::with_identity(
-                            identity.clone(),
-                        );
-                        // Sampled again into the publish gate; captured here so the
-                        // refresh scan stamps the same dependency generations the gate
-                        // will require at publish.
-                        let dependency_refreshes =
-                            self.accelerated_dependency_refreshes(view).await;
-                        view_table = crate::view::wrap_view_refresh_attestation(
-                            view_table,
-                            attestation.clone(),
-                            dependency_refreshes,
-                        );
-                        refresh_attestation = Some(attestation);
-                        materialization_identity = Some(identity);
-                    }
-                }
+            .await?;
+            // Attested under `accept_skew` too. It waives the single-read requirement
+            // only: rows read from a dependency that was not at its configured
+            // definition are still refused, because the archive would carry a
+            // fingerprint that does not describe them.
+            if acceleration.snapshot_behavior.create_enabled() {
+                let identity = crate::accelerated::MaterializationIdentity::new();
+                let attestation =
+                    crate::view::ViewRefreshReadAttestation::with_identity(identity.clone());
+                // Sampled again into the publish gate; captured here so the
+                // refresh scan stamps the same dependency generations the gate
+                // will require at publish.
+                let dependency_refreshes = self.accelerated_dependency_refreshes(view).await;
+                view_table = crate::view::wrap_view_refresh_attestation(
+                    view_table,
+                    attestation.clone(),
+                    dependency_refreshes,
+                );
+                refresh_attestation = Some((attestation, decision.consistency()));
+                materialization_identity = Some(identity);
             }
         }
 
@@ -5274,9 +5224,7 @@ impl DataFusion {
         // Acceleration snapshots. A view's accelerated rows are the *result* of its
         // query, which brings two obligations a dataset does not have. A bootstrap must
         // only load an archive materialized from this same SQL — carried by
-        // `View::definition_fingerprint`, checked inside the snapshot manager.
-        // Identity `params` were already refused above, before `init`, rather
-        // than stamping a definition that cannot see a secret rotation. And a
+        // `View::definition_fingerprint`, checked inside the snapshot manager. And a
         // publish must only capture a materialization that came from a single read,
         // because a query that reads its sources twice captures them at two different
         // positions and can store rows that never existed together; publishing that
@@ -8085,122 +8033,6 @@ mod tests {
                 outcome,
                 DeferredRefreshOutcome::Abandoned,
                 "no refresh was ever recorded, and none can be now the table is gone"
-            );
-        }
-    }
-
-    #[test]
-    fn literal_view_params_do_not_refuse_snapshots() {
-        let params = HashMap::from([("json_pointer".to_string(), "/us".to_string())]);
-        super::ensure_snapshot_identity_params("view", "orders_us", &params)
-            .expect("a literal row-shaping param must accept snapshots");
-    }
-
-    #[test]
-    fn secret_ref_view_params_refuse_snapshots() {
-        let params =
-            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]);
-        let err = super::ensure_snapshot_identity_params("view", "orders_us", &params)
-            .expect_err("a secret-referenced row-shaping param must refuse snapshots");
-        let message = err.to_string();
-        assert!(
-            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
-            "expected an unresolved-param refusal, got: {err}"
-        );
-        for expected in [
-            "view",
-            "'orders_us'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "`snapshots: disabled`",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the refusal must contain {expected:?}: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn secret_ref_on_a_dependency_dataset_refuses_view_snapshots() {
-        let mut docs =
-            spicepod::component::dataset::Dataset::new("s3://docs".to_string(), "docs".to_string());
-        docs.params = Some(spicepod::param::Params::from_string_map(HashMap::from([(
-            "json_pointer".to_string(),
-            "${secrets:pointer}".to_string(),
-        )])));
-        let app = app::AppBuilder::new("closure_test")
-            .with_dataset(docs)
-            .build();
-        let err = super::ensure_view_snapshot_identity_params(
-            &TableReference::bare("orders_us"),
-            "SELECT * FROM docs",
-            &HashMap::new(),
-            &app,
-        )
-        .expect_err("a transitive dataset secret ref must refuse the view's snapshots");
-        let message = err.to_string();
-        assert!(
-            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
-            "expected an unresolved-param refusal, got: {err}"
-        );
-        for expected in [
-            "view",
-            "'orders_us'",
-            "dataset",
-            "'docs'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "`snapshots: disabled` on view 'orders_us'",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the refusal must contain {expected:?}: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn env_ref_view_params_refuse_snapshots() {
-        let params = HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]);
-        let err = super::ensure_snapshot_identity_params("view", "orders_us", &params)
-            .expect_err("an env-referenced row-shaping param must refuse snapshots");
-        assert!(
-            err.to_string().contains("${env:POINTER}"),
-            "the refusal must name the env reference: {err}"
-        );
-    }
-
-    #[test]
-    fn snapshot_identity_unresolved_param_refusal_names_the_view_and_a_way_out() {
-        let found = crate::view::UnresolvedClosureIdentityParam {
-            source_component: "view".to_string(),
-            source_name: "orders_us".to_string(),
-            param_field: "params",
-            unresolved: crate::view::UnresolvedSnapshotIdentityParam {
-                param: "json_pointer".to_string(),
-                store: "secrets".to_string(),
-                key: "pointer".to_string(),
-            },
-        };
-        let message = SnapshotsIdentityUnresolvedParamSnafu {
-            component: "view",
-            name: "orders_us".to_string(),
-            message: found.refusal_message("view", "orders_us"),
-        }
-        .build()
-        .to_string();
-        for expected in [
-            "view",
-            "'orders_us'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "`snapshots: disabled`",
-            "https://spiceai.org/docs/components/data-accelerators/snapshots",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the refusal must contain {expected:?}: {message}"
             );
         }
     }

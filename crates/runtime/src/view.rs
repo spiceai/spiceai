@@ -38,6 +38,7 @@ use runtime_table::accelerated::refresh::Refresh;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use spice_table::TableLayer;
+use spicepod::acceleration::SnapshotsConsistency;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{
     borrow::Cow,
@@ -76,6 +77,11 @@ use tokio::sync::RwLock as TokioRwLock;
 /// Refusing skips one publish; it does not fail the view or the refresh. The accelerated
 /// table stays correct and keeps serving — it just does not add a snapshot this cycle,
 /// and a cold start bootstraps whatever was last published.
+///
+/// `accept_skew` waives the read-shape check and nothing else. The operator accepted
+/// rows captured at several source positions; they did not accept rows derived from a
+/// dependency definition the archive's fingerprint does not describe, so the stamp, its
+/// epoch, and every dependency check still apply.
 pub(crate) struct ViewSnapshotPublishGate {
     view_name: TableReference,
     attestation: ViewRefreshReadAttestation,
@@ -87,6 +93,9 @@ pub(crate) struct ViewSnapshotPublishGate {
     /// diverge from the Spicepod definition this view's fingerprint describes.
     /// Publication is withheld while any of them is not proven configured.
     dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
+    /// Whether a multi-read stamp refuses the publish (`consistent_read`) or is
+    /// accepted (`accept_skew`).
+    consistency: SnapshotsConsistency,
 }
 
 impl ViewSnapshotPublishGate {
@@ -94,25 +103,48 @@ impl ViewSnapshotPublishGate {
         view_name: TableReference,
         attestation: ViewRefreshReadAttestation,
         dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
+        consistency: SnapshotsConsistency,
     ) -> Self {
         Self {
             view_name,
             attestation,
             expected_epoch: parking_lot::Mutex::new(None),
             dependency_refreshes,
+            consistency,
         }
     }
 }
 
-fn missing_refresh_attestation_reason(view_name: &TableReference) -> String {
+/// What an unattested materialization cannot be vouched for, worded for the
+/// consistency the view asked for.
+fn unconfirmed_rows_clause(consistency: SnapshotsConsistency) -> &'static str {
+    match consistency {
+        SnapshotsConsistency::ConsistentRead => {
+            "Spice cannot confirm these rows came from a single consistent read of its sources"
+        }
+        SnapshotsConsistency::AcceptSkew => {
+            "Spice cannot confirm these rows came from the configured definitions of its sources"
+        }
+    }
+}
+
+fn missing_refresh_attestation_reason(
+    view_name: &TableReference,
+    consistency: SnapshotsConsistency,
+) -> String {
     format!(
-        "view '{view_name}' has no refresh-plan attestation, so Spice cannot confirm these rows came from a single consistent read of its sources"
+        "view '{view_name}' has no refresh-plan attestation, so {}",
+        unconfirmed_rows_clause(consistency)
     )
 }
 
-fn attestation_epoch_mismatch_reason(view_name: &TableReference) -> String {
+fn attestation_epoch_mismatch_reason(
+    view_name: &TableReference,
+    consistency: SnapshotsConsistency,
+) -> String {
     format!(
-        "view '{view_name}' has a refresh-plan attestation from a later materialization than the rows being archived, so Spice cannot confirm these rows came from a single consistent read of its sources"
+        "view '{view_name}' has a refresh-plan attestation from a later materialization than the rows being archived, so {}",
+        unconfirmed_rows_clause(consistency)
     )
 }
 
@@ -150,12 +182,18 @@ fn dependency_unconfigured_at_scan_reason(
 impl SnapshotPublishGate for ViewSnapshotPublishGate {
     async fn check_publish(&self) -> Result<(), String> {
         match self.attestation.last_stamped() {
-            None => Err(missing_refresh_attestation_reason(&self.view_name)),
+            None => Err(missing_refresh_attestation_reason(
+                &self.view_name,
+                self.consistency,
+            )),
             Some(stamp) => {
                 if let Some(expected) = *self.expected_epoch.lock()
                     && stamp.epoch != expected
                 {
-                    return Err(attestation_epoch_mismatch_reason(&self.view_name));
+                    return Err(attestation_epoch_mismatch_reason(
+                        &self.view_name,
+                        self.consistency,
+                    ));
                 }
                 // Bind each dependency to the generation the view refresh actually read.
                 // Checking only "configured now" would allow: refresh under override B →
@@ -183,7 +221,12 @@ impl SnapshotPublishGate for ViewSnapshotPublishGate {
                         return Err(dependency_override_reason(&self.view_name, dependency));
                     }
                 }
-                stamp.shape.refusal_reason().map_or(Ok(()), Err)
+                match self.consistency {
+                    SnapshotsConsistency::ConsistentRead => {
+                        stamp.shape.refusal_reason().map_or(Ok(()), Err)
+                    }
+                    SnapshotsConsistency::AcceptSkew => Ok(()),
+                }
             }
         }
     }
@@ -784,9 +827,7 @@ pub(crate) fn view_definition_closure_with_live_refresh_sql(
     definition
 }
 
-/// A declared Spicepod component that [`view_definition_closure`] hashes and
-/// that [`first_unresolved_snapshot_identity_param_in_view_closure`] checks
-/// for secret or env references.
+/// A declared Spicepod component that [`view_definition_closure`] hashes.
 enum ViewClosureMember<'a> {
     View {
         spec: &'a spicepod::component::view::View,
@@ -1006,16 +1047,16 @@ fn push_len_prefixed(out: &mut String, value: &str) {
 /// to shape rows (a timeout, a pool size) only costs a refused snapshot and a refresh from
 /// source.
 ///
-/// These are the Spicepod parameters, so a `${secrets:...}` value is hashed as the
-/// *reference*. Rotating a credential would leave the identity alone (the rows did not
-/// change), but a row-shaping parameter read from a secret, `json_pointer:
-/// ${secrets:pointer}`, can move from `/us` to `/eu` with the reference — and therefore
-/// the identity — unchanged. This sync, secret-less path cannot see the resolved value
-/// (`get_params_with_secrets` runs where the connector is constructed), so a
-/// snapshot-enabled source whose identity `params` contain a `${ store:key }` reference
-/// is refused at load rather than accepting a stamp that cannot see that change. A
-/// snapshot-enabled view walks the same dependency closure this identity hashes —
-/// see [`first_unresolved_snapshot_identity_param_in_view_closure`].
+/// These are the Spicepod parameters, so a `${secrets:...}` or `${env:...}` value is
+/// hashed as the *reference*, never the resolved value. Rotating a credential therefore
+/// leaves the identity alone, which is right: the rows did not change. What it leaves
+/// uncovered is a row-shaping value held outside the Spicepod. `json_pointer:
+/// ${secrets:pointer}` can move from `/us` to `/eu` with the identity unchanged, and a
+/// parameter the connector autoloads from a secret store when the Spicepod omits it never
+/// appears here at all, so a bootstrap can restore the previous value's rows until a
+/// refresh replaces them. This sync path cannot see resolved values
+/// (`get_params_with_secrets` runs where the connector is constructed); covering them is
+/// tracked in #14466.
 ///
 /// The cost of including params in full falls on SHARING a snapshot series between
 /// deployments, and it is significant: two spiced instances that materialize identical rows
@@ -1057,9 +1098,9 @@ pub(crate) fn dataset_definition_identity(from: &str, fields: &BTreeMap<String, 
 /// change which tables are visible.
 ///
 /// Secret and env references are hashed as the *reference*, the same way a
-/// dataset's are — see [`first_unresolved_snapshot_identity_param_in_view_closure`].
-/// They are not stripped from the identity: dropping them would make two
-/// catalogs that bind through different secret keys look the same.
+/// dataset's are — see [`dataset_definition_identity`] for what that leaves
+/// uncovered. They are not stripped from the identity: dropping them would make
+/// two catalogs that bind through different secret keys look the same.
 #[must_use]
 pub(crate) fn catalog_definition_identity(from: &str, fields: &BTreeMap<String, String>) -> String {
     dataset_definition_identity(from, fields)
@@ -1524,207 +1565,6 @@ pub(crate) fn definition_fingerprint(definition: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(definition.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
-}
-
-/// A Spicepod `params` value that is a `${ store:key }` reference.
-///
-/// Snapshot identity hashes the reference, not the resolved value, so a row-shaping
-/// parameter such as `json_pointer: ${secrets:pointer}` can move from `/us` to `/eu`
-/// without changing the stamp.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnresolvedSnapshotIdentityParam {
-    pub param: String,
-    pub store: String,
-    pub key: String,
-}
-
-/// An identity `params` entry that is a secret or env reference, located in a
-/// view's definition closure — the root view or a transitive dataset, view, or
-/// catalog it reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnresolvedClosureIdentityParam {
-    pub source_component: String,
-    pub source_name: String,
-    pub param_field: &'static str,
-    pub unresolved: UnresolvedSnapshotIdentityParam,
-}
-
-impl UnresolvedClosureIdentityParam {
-    fn is_on(&self, component: &str, name: &str) -> bool {
-        self.source_component == component && self.source_name == name
-    }
-
-    /// User-facing refusal when snapshots are enabled and this identity param
-    /// is a secret or env reference. Built as a pure function so a reword
-    /// cannot drop the resource, the consequence, or the docs link.
-    #[must_use]
-    pub(crate) fn refusal_message(&self, component: &str, name: &str) -> String {
-        let hashed = if self.is_on(component, name) {
-            format!("Spicepod `{}.{}`", self.param_field, self.unresolved.param)
-        } else {
-            format!(
-                "{} '{}' `{}.{}`",
-                self.source_component, self.source_name, self.param_field, self.unresolved.param
-            )
-        };
-        let fix = if self.is_on(component, name) {
-            format!(
-                "Set a literal value for `{}.{}`, or set `snapshots: disabled`",
-                self.param_field, self.unresolved.param
-            )
-        } else {
-            format!(
-                "Set a literal value for {} '{}' `{}.{}`, or set `snapshots: disabled` on {component} '{name}'",
-                self.source_component, self.source_name, self.param_field, self.unresolved.param
-            )
-        };
-        format!(
-            "Failed to enable acceleration snapshots for {component} '{name}': its snapshot identity hashes {hashed} as the `${{{}:{}}}` reference, so a change to the resolved value would not change the stamp and a cold start could restore rows that no longer match. {fix}. See: https://spiceai.org/docs/components/data-accelerators/snapshots",
-            self.unresolved.store, self.unresolved.key
-        )
-    }
-}
-
-/// The first identity `params` entry that is a secret or env reference, if any.
-///
-/// Uses the same `${ store:key }` grammar as `Spicepod` secret expansion
-/// ([`runtime_secrets::iter_secret_references`]), including whitespace variants such as
-/// `${ secrets:pointer }` and `${env:POINTER}`. Any matching store is refused — `secrets`,
-/// `env`, and a user-defined store have the same hole. Keys are considered in sorted
-/// order so the named parameter does not depend on `HashMap` iteration.
-#[must_use]
-pub(crate) fn first_unresolved_snapshot_identity_param(
-    params: &HashMap<String, String>,
-) -> Option<UnresolvedSnapshotIdentityParam> {
-    params
-        .iter()
-        .filter_map(|(param, value)| {
-            runtime_secrets::iter_secret_references(value)
-                .next()
-                .map(|reference| UnresolvedSnapshotIdentityParam {
-                    param: param.clone(),
-                    store: reference.store,
-                    key: reference.key,
-                })
-        })
-        .min_by(|left, right| left.param.cmp(&right.param))
-}
-
-/// The first secret or env reference in a view's snapshot-identity closure.
-///
-/// Walks the same dependency set [`view_definition_closure`] hashes — the root
-/// view's `params` and every transitive view, dataset, and catalog — so a
-/// row-shaping `${secrets:pointer}` on a dependency cannot rotate without a
-/// refusal. Prefers the root view's own param when several match, then a
-/// stable `(component, name, field, param)` order.
-#[must_use]
-pub(crate) fn first_unresolved_snapshot_identity_param_in_view_closure(
-    name: &TableReference,
-    sql: &str,
-    params: &HashMap<String, String>,
-    app: &app::App,
-) -> Option<UnresolvedClosureIdentityParam> {
-    let root_name = name.to_string();
-    let mut found = Vec::new();
-
-    push_unresolved_identity_params(&mut found, "view", &root_name, "params", params);
-
-    visit_view_definition_closure(name, sql, app, |member| match member {
-        ViewClosureMember::View { spec, .. } => {
-            let params = spicepod_params_map(spec.params.as_ref());
-            push_unresolved_identity_params(&mut found, "view", &spec.name, "params", &params);
-        }
-        ViewClosureMember::Dataset(dataset) => {
-            let params = spicepod_params_map(dataset.params.as_ref());
-            push_unresolved_identity_params(
-                &mut found,
-                "dataset",
-                &dataset.name,
-                "params",
-                &params,
-            );
-        }
-        ViewClosureMember::Catalog(catalog) => {
-            let params = spicepod_params_map(catalog.params.as_ref());
-            push_unresolved_identity_params(
-                &mut found,
-                "catalog",
-                &catalog.name,
-                "params",
-                &params,
-            );
-            let dataset_params = spicepod_params_map(catalog.dataset_params.as_ref());
-            push_unresolved_identity_params(
-                &mut found,
-                "catalog",
-                &catalog.name,
-                "dataset_params",
-                &dataset_params,
-            );
-        }
-    });
-
-    found.into_iter().min_by(|left, right| {
-        closure_unresolved_sort_key(left, &root_name)
-            .cmp(&closure_unresolved_sort_key(right, &root_name))
-    })
-}
-
-fn closure_unresolved_sort_key<'a>(
-    found: &'a UnresolvedClosureIdentityParam,
-    root_name: &'a str,
-) -> (u8, &'a str, &'a str, &'a str, &'a str) {
-    let is_root = found.source_component == "view"
-        && found.source_name == root_name
-        && found.param_field == "params";
-    (
-        u8::from(!is_root),
-        found.source_component.as_str(),
-        found.source_name.as_str(),
-        found.param_field,
-        found.unresolved.param.as_str(),
-    )
-}
-
-fn push_unresolved_identity_params(
-    found: &mut Vec<UnresolvedClosureIdentityParam>,
-    source_component: &str,
-    source_name: &str,
-    param_field: &'static str,
-    params: &HashMap<String, String>,
-) {
-    if let Some(unresolved) = first_unresolved_snapshot_identity_param(params) {
-        found.push(UnresolvedClosureIdentityParam {
-            source_component: source_component.to_string(),
-            source_name: source_name.to_string(),
-            param_field,
-            unresolved,
-        });
-    }
-}
-
-/// User-facing refusal when snapshots are enabled and an identity param is a secret or
-/// env reference. Built as a pure function so a reword cannot drop the resource, the
-/// consequence, or the docs link.
-#[must_use]
-pub(crate) fn snapshot_identity_unresolved_param_message(
-    component: &str,
-    name: &str,
-    param: &str,
-    store: &str,
-    key: &str,
-) -> String {
-    UnresolvedClosureIdentityParam {
-        source_component: component.to_string(),
-        source_name: name.to_string(),
-        param_field: "params",
-        unresolved: UnresolvedSnapshotIdentityParam {
-            param: param.to_string(),
-            store: store.to_string(),
-            key: key.to_string(),
-        },
-    }
-    .refusal_message(component, name)
 }
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
@@ -2213,6 +2053,7 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation.clone(),
                 vec![],
+                SnapshotsConsistency::ConsistentRead,
             );
 
             let missing = gate
@@ -2284,6 +2125,7 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation.clone(),
                 vec![(dep_name.clone(), Arc::clone(&dep_refresh))],
+                SnapshotsConsistency::ConsistentRead,
             );
 
             let withheld = gate
@@ -2339,6 +2181,7 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation.clone(),
                 vec![],
+                SnapshotsConsistency::ConsistentRead,
             );
             gate.bind_materialization_epoch(sampled.epoch);
 
@@ -2385,6 +2228,7 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation,
                 vec![],
+                SnapshotsConsistency::ConsistentRead,
             );
             gate.bind_materialization_epoch(epoch);
             gate.check_publish()
@@ -2395,7 +2239,8 @@ mod tests {
         #[test]
         fn attestation_epoch_mismatch_names_the_view() {
             let name = TableReference::bare("orders_us");
-            let message = attestation_epoch_mismatch_reason(&name);
+            let message =
+                attestation_epoch_mismatch_reason(&name, SnapshotsConsistency::ConsistentRead);
             assert!(
                 message.contains("view 'orders_us'"),
                 "must name the view, got {message}"
@@ -2408,6 +2253,84 @@ mod tests {
                 message.contains("single consistent read"),
                 "must state the impact, got {message}"
             );
+        }
+
+        /// `accept_skew` waives the read-shape check and nothing else. A multi-read
+        /// stamp publishes, but rows refreshed while a dependency was not at its
+        /// configured definition are refused exactly as under `consistent_read`:
+        /// the archive would carry a fingerprint that does not describe them.
+        #[tokio::test]
+        async fn accept_skew_gate_waives_only_the_read_shape_check() {
+            use runtime_component::dataset::acceleration::RefreshMode;
+            use runtime_table::accelerated::refresh::Refresh;
+            use tokio::sync::RwLock;
+
+            let dep_name = TableReference::bare("orders");
+            let dep_identity = MaterializationIdentity::new();
+            let dep_refresh = Arc::new(RwLock::new(
+                Refresh::new(RefreshMode::Full).with_materialization_identity(dep_identity.clone()),
+            ));
+            let multi_read = ViewReadShape::MultipleReads {
+                reads: 2,
+                exact_count: true,
+                tables: vec![dep_name.clone(), dep_name.clone()],
+            };
+
+            // The dependency's rows came from a refresh override: not configured.
+            let override_epoch = dep_identity.begin_refresh();
+            dep_identity.set_configured(false);
+
+            let view_identity = MaterializationIdentity::new();
+            let attestation = ViewRefreshReadAttestation::with_identity(view_identity.clone());
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation.clone(),
+                vec![(dep_name.clone(), Arc::clone(&dep_refresh))],
+                SnapshotsConsistency::AcceptSkew,
+            );
+
+            let missing = gate
+                .check_publish()
+                .await
+                .expect_err("accept_skew must still refuse a publish no refresh attested");
+            assert!(missing.contains("configured definitions"), "{missing}");
+
+            let view_epoch = view_identity.begin_refresh();
+            attestation.record_with_dependencies(
+                multi_read.clone(),
+                vec![(
+                    dep_name.clone(),
+                    MaterializationSample {
+                        epoch: override_epoch,
+                        configured: false,
+                    },
+                )],
+            );
+            gate.bind_materialization_epoch(view_epoch);
+            let refused = gate
+                .check_publish()
+                .await
+                .expect_err("accept_skew must not publish rows read from an overridden dependency");
+            assert!(refused.contains("dependency 'orders'"), "{refused}");
+
+            // The dependency refreshes from its configured definition, then the view does.
+            let configured_epoch = dep_identity.begin_refresh();
+            dep_identity.set_configured(true);
+            let view_epoch = view_identity.begin_refresh();
+            attestation.record_with_dependencies(
+                multi_read,
+                vec![(
+                    dep_name,
+                    MaterializationSample {
+                        epoch: configured_epoch,
+                        configured: true,
+                    },
+                )],
+            );
+            gate.bind_materialization_epoch(view_epoch);
+            gate.check_publish()
+                .await
+                .expect("accept_skew must publish a multi-read stamp over configured dependencies");
         }
 
         #[tokio::test]
@@ -2597,6 +2520,7 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation.clone(),
                 vec![(dep_name, dep_refresh)],
+                SnapshotsConsistency::ConsistentRead,
             );
             gate.bind_materialization_epoch(view_identity.epoch());
             let refused = gate
@@ -2641,6 +2565,7 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation.clone(),
                 vec![],
+                SnapshotsConsistency::ConsistentRead,
             );
             gate.bind_materialization_epoch(sampled.epoch);
 
@@ -2971,9 +2896,8 @@ mod tests {
 
         #[test]
         fn catalog_secret_ref_params_are_hashed_as_the_reference() {
-            // Identity hashes the Spicepod reference, not the resolved value — the
-            // same hole `first_unresolved_snapshot_identity_param` refuses on the
-            // snapshot-enabled component. Different keys must not share a fingerprint.
+            // Identity hashes the Spicepod reference, not the resolved value, so
+            // two different secret keys must not share a fingerprint.
             let v = TableReference::bare("v");
             let sql = "SELECT * FROM sales.public.orders";
             let closure_for = |value: &str| {
@@ -2992,194 +2916,6 @@ mod tests {
                 definition_fingerprint(&closure_for("${secrets:new_host}")),
                 "distinct secret-reference keys in catalog params must move the identity"
             );
-            let params = catalog_params(&[("pg_host", "${secrets:pg_host}")]).as_string_map();
-            let unresolved = first_unresolved_snapshot_identity_param(&params)
-                .expect("a catalog identity param that is a secret reference must be detected");
-            assert_eq!(unresolved.param, "pg_host");
-            assert_eq!(unresolved.store, "secrets");
-            assert_eq!(unresolved.key, "pg_host");
-        }
-
-        fn view_with_params(
-            name: &str,
-            sql: &str,
-            params: &[(&str, &str)],
-        ) -> spicepod::component::view::View {
-            let mut view = spicepod::component::view::View::new(name.to_string());
-            view.sql = Some(sql.to_string());
-            view.params = Some(catalog_params(params));
-            view
-        }
-
-        fn named_dataset_with_params(
-            from: &str,
-            name: &str,
-            params: &[(&str, &str)],
-        ) -> spicepod::component::dataset::Dataset {
-            let mut dataset =
-                spicepod::component::dataset::Dataset::new(from.to_string(), name.to_string());
-            dataset.params = Some(catalog_params(params));
-            dataset
-        }
-
-        fn app_from(
-            views: Vec<spicepod::component::view::View>,
-            datasets: Vec<spicepod::component::dataset::Dataset>,
-            catalogs: Vec<spicepod::component::catalog::Catalog>,
-        ) -> app::App {
-            let mut builder = app::AppBuilder::new("closure_test");
-            for view in views {
-                builder = builder.with_view(view);
-            }
-            for dataset in datasets {
-                builder = builder.with_dataset(dataset);
-            }
-            for catalog in catalogs {
-                builder = builder.with_catalog(catalog);
-            }
-            builder.build()
-        }
-
-        /// Copilot `discussion_r4012714290`: the fingerprint hashes dependency
-        /// params as declared, so a secret on a transitive dataset is invisible
-        /// unless the load-time check walks the same closure.
-        #[test]
-        fn closure_detects_a_dependency_dataset_secret_ref() {
-            let outer = TableReference::bare("orders_us");
-            let app = app_from(
-                vec![],
-                vec![named_dataset_with_params(
-                    "s3://docs",
-                    "docs",
-                    &[("json_pointer", "${secrets:pointer}")],
-                )],
-                vec![],
-            );
-            let found = first_unresolved_snapshot_identity_param_in_view_closure(
-                &outer,
-                "SELECT * FROM docs",
-                &HashMap::new(),
-                &app,
-            )
-            .expect("a dependency dataset secret ref must be detected");
-            assert_eq!(found.source_component, "dataset");
-            assert_eq!(found.source_name, "docs");
-            assert_eq!(found.param_field, "params");
-            assert_eq!(found.unresolved.param, "json_pointer");
-            assert_eq!(found.unresolved.store, "secrets");
-            assert_eq!(found.unresolved.key, "pointer");
-        }
-
-        #[test]
-        fn closure_detects_a_transitive_view_secret_ref() {
-            let outer = TableReference::bare("orders_us");
-            let mid = view_with_params("mid", "SELECT * FROM inner", &[]);
-            let inner = view_with_params(
-                "inner",
-                "SELECT 1",
-                &[("json_pointer", "${secrets:pointer}")],
-            );
-            let app = app_from(vec![mid, inner], vec![], vec![]);
-            let found = first_unresolved_snapshot_identity_param_in_view_closure(
-                &outer,
-                "SELECT * FROM mid",
-                &HashMap::new(),
-                &app,
-            )
-            .expect("a two-hop dependency view secret ref must be detected");
-            assert_eq!(found.source_component, "view");
-            assert_eq!(found.source_name, "inner");
-            assert_eq!(found.unresolved.param, "json_pointer");
-        }
-
-        #[test]
-        fn closure_detects_a_dependency_catalog_secret_ref() {
-            let outer = TableReference::bare("orders_us");
-            let mut sales = catalog("postgres:sales", "sales");
-            sales.params = Some(catalog_params(&[("pg_host", "${secrets:pg_host}")]));
-            let app = app_from(vec![], vec![], vec![sales]);
-            let found = first_unresolved_snapshot_identity_param_in_view_closure(
-                &outer,
-                "SELECT * FROM sales.public.orders",
-                &HashMap::new(),
-                &app,
-            )
-            .expect("a dependency catalog secret ref must be detected");
-            assert_eq!(found.source_component, "catalog");
-            assert_eq!(found.source_name, "sales");
-            assert_eq!(found.param_field, "params");
-            assert_eq!(found.unresolved.param, "pg_host");
-        }
-
-        #[test]
-        fn closure_detects_a_catalog_dataset_params_secret_ref() {
-            let outer = TableReference::bare("orders_us");
-            let mut sales = catalog("postgres:sales", "sales");
-            sales.dataset_params = Some(catalog_params(&[("json_pointer", "${env:POINTER}")]));
-            let app = app_from(vec![], vec![], vec![sales]);
-            let found = first_unresolved_snapshot_identity_param_in_view_closure(
-                &outer,
-                "SELECT * FROM sales.public.orders",
-                &HashMap::new(),
-                &app,
-            )
-            .expect("a catalog dataset_params secret ref must be detected");
-            assert_eq!(found.source_component, "catalog");
-            assert_eq!(found.param_field, "dataset_params");
-            assert_eq!(found.unresolved.store, "env");
-            assert_eq!(found.unresolved.key, "POINTER");
-        }
-
-        #[test]
-        fn closure_allows_literal_params_on_dependencies() {
-            let outer = TableReference::bare("orders_us");
-            let app = app_from(
-                vec![view_with_params(
-                    "inner",
-                    "SELECT 1",
-                    &[("file_format", "parquet")],
-                )],
-                vec![named_dataset_with_params(
-                    "s3://docs",
-                    "docs",
-                    &[("json_pointer", "/us")],
-                )],
-                vec![],
-            );
-            assert!(
-                first_unresolved_snapshot_identity_param_in_view_closure(
-                    &outer,
-                    "SELECT * FROM inner, docs",
-                    &HashMap::from([("file_format".to_string(), "parquet".to_string())]),
-                    &app,
-                )
-                .is_none(),
-                "literal identity params throughout the closure must accept snapshots"
-            );
-        }
-
-        #[test]
-        fn closure_prefers_the_root_view_secret_ref() {
-            let outer = TableReference::bare("orders_us");
-            let app = app_from(
-                vec![],
-                vec![named_dataset_with_params(
-                    "s3://docs",
-                    "docs",
-                    &[("json_pointer", "${secrets:docs_pointer}")],
-                )],
-                vec![],
-            );
-            let found = first_unresolved_snapshot_identity_param_in_view_closure(
-                &outer,
-                "SELECT * FROM docs",
-                &HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]),
-                &app,
-            )
-            .expect("a root view secret ref must be detected");
-            assert_eq!(found.source_component, "view");
-            assert_eq!(found.source_name, "orders_us");
-            assert_eq!(found.unresolved.key, "pointer");
         }
 
         #[test]
@@ -3687,135 +3423,6 @@ mod tests {
                 "column metadata that can change stored values is part of the definition"
             );
         }
-    }
-
-    #[test]
-    fn literal_identity_params_are_not_unresolved_snapshot_refs() {
-        let params = HashMap::from([
-            ("json_pointer".to_string(), "/us".to_string()),
-            ("file_format".to_string(), "parquet".to_string()),
-        ]);
-        assert!(
-            first_unresolved_snapshot_identity_param(&params).is_none(),
-            "a literal row-shaping param is visible to the stamp and must not refuse snapshots"
-        );
-    }
-
-    /// Conservative refuse for Copilot `discussion_r4012511570`: identity hashes
-    /// the Spicepod reference, so a row-shaping secret can change without the stamp.
-    #[test]
-    fn secret_ref_in_a_row_shaping_param_is_an_unresolved_snapshot_ref() {
-        let params =
-            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]);
-        let unresolved = first_unresolved_snapshot_identity_param(&params)
-            .expect("a ${secrets:...} row-shaping param must be detected");
-        assert_eq!(unresolved.param, "json_pointer");
-        assert_eq!(unresolved.store, "secrets");
-        assert_eq!(unresolved.key, "pointer");
-    }
-
-    #[test]
-    fn env_ref_in_a_row_shaping_param_is_an_unresolved_snapshot_ref() {
-        let params = HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]);
-        let unresolved = first_unresolved_snapshot_identity_param(&params)
-            .expect("a ${env:...} row-shaping param must be detected");
-        assert_eq!(unresolved.param, "json_pointer");
-        assert_eq!(unresolved.store, "env");
-        assert_eq!(unresolved.key, "POINTER");
-    }
-
-    #[test]
-    fn spaced_secret_ref_matches_the_spicepod_grammar() {
-        let params = HashMap::from([(
-            "json_pointer".to_string(),
-            "${ secrets:pointer }".to_string(),
-        )]);
-        let unresolved = first_unresolved_snapshot_identity_param(&params)
-            .expect("whitespace inside ${ store:key } is still a secret reference");
-        assert_eq!(unresolved.store, "secrets");
-        assert_eq!(unresolved.key, "pointer");
-    }
-
-    #[test]
-    fn snapshot_identity_unresolved_param_refusal_names_the_view_and_a_way_out() {
-        let message = snapshot_identity_unresolved_param_message(
-            "view",
-            "orders_us",
-            "json_pointer",
-            "secrets",
-            "pointer",
-        );
-        for expected in [
-            "view",
-            "'orders_us'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "would not change the stamp",
-            "cold start could restore rows",
-            "`snapshots: disabled`",
-            "https://spiceai.org/docs/components/data-accelerators/snapshots",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the refusal must contain {expected:?}: {message}"
-            );
-        }
-        assert!(
-            !message.contains('\n'),
-            "a user-facing refusal must stay on one line: {message:?}"
-        );
-    }
-
-    #[test]
-    fn snapshot_identity_unresolved_dependency_param_refusal_names_both_components() {
-        let message = UnresolvedClosureIdentityParam {
-            source_component: "dataset".to_string(),
-            source_name: "docs".to_string(),
-            param_field: "params",
-            unresolved: UnresolvedSnapshotIdentityParam {
-                param: "json_pointer".to_string(),
-                store: "secrets".to_string(),
-                key: "pointer".to_string(),
-            },
-        }
-        .refusal_message("view", "orders_us");
-        for expected in [
-            "view",
-            "'orders_us'",
-            "dataset",
-            "'docs'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "would not change the stamp",
-            "`snapshots: disabled` on view 'orders_us'",
-            "https://spiceai.org/docs/components/data-accelerators/snapshots",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the dependency refusal must contain {expected:?}: {message}"
-            );
-        }
-        assert!(
-            !message.contains('\n'),
-            "a user-facing refusal must stay on one line: {message:?}"
-        );
-    }
-
-    #[test]
-    fn snapshot_identity_unresolved_param_refusal_names_the_dataset() {
-        let message = snapshot_identity_unresolved_param_message(
-            "dataset",
-            "docs",
-            "json_pointer",
-            "env",
-            "POINTER",
-        );
-        assert!(
-            message.contains("dataset")
-                && message.contains("'docs'")
-                && message.contains("${env:POINTER}"),
-            "the dataset refusal must name the component and the env reference: {message}"
-        );
     }
 
     #[tokio::test]

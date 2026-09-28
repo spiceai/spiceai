@@ -37,10 +37,10 @@ use crate::{
     DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
     DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
     HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, SnapshotsConsistencyNotForDatasetSnafu, SnapshotsIdentityUnresolvedParamSnafu,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    Result, Runtime, SnapshotsConsistencyNotForDatasetSnafu, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
@@ -2356,8 +2356,7 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::DurableWriteBackCompositePrimaryKey { .. }
         | Error::DurableWriteBackUndeclaredPrimaryKey { .. }
         | Error::DurableWriteBackPrerequisitesUnmet { .. }
-        | Error::DurableWriteBackUnsupportedBySource { .. }
-        | Error::SnapshotsIdentityUnresolvedParam { .. } => true,
+        | Error::DurableWriteBackUnsupportedBySource { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
         Error::UnableToInitializeDataConnector { source } => {
@@ -2502,23 +2501,6 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
         return Err(SnapshotsConsistencyNotForDatasetSnafu {
             dataset_name: ds.name.to_string(),
             connector: ds.source().to_string(),
-        }
-        .build());
-    }
-
-    // Snapshot identity hashes Spicepod `params` as written, and this path cannot
-    // see resolved secret/env values. A row-shaping parameter such as
-    // `json_pointer: ${secrets:pointer}` can move without changing the stamp, so
-    // accepting `snapshots: enabled` would restore the old rows. Refuse rather
-    // than stamp a definition this context cannot see.
-    if !acceleration.snapshot_behavior.is_disabled()
-        && let Some(unresolved) = crate::view::first_unresolved_snapshot_identity_param(&ds.params)
-    {
-        return Err(SnapshotsIdentityUnresolvedParamSnafu {
-            dataset_name: ds.name.to_string(),
-            param: unresolved.param,
-            store: unresolved.store,
-            key: unresolved.key,
         }
         .build());
     }
@@ -3098,67 +3080,32 @@ mod tests {
         );
     }
 
+    /// Credentials are read from a secret store and hosts are templated from the
+    /// environment in most deployments. The snapshot identity hashes such a param as
+    /// the reference, so it must load with snapshots on exactly as it does with them
+    /// off.
     #[tokio::test]
-    async fn validate_dataset_refuses_secret_ref_in_a_row_shaping_param() {
+    async fn validate_dataset_allows_secret_and_env_refs_with_snapshots() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
-        let dataset = snapshot_dataset_with_params(
-            &runtime,
-            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]),
-            true,
-        );
-        let err = validate_dataset(&dataset)
-            .expect_err("a secret-referenced row-shaping param must refuse snapshots");
-        assert!(
-            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
-            "expected an unresolved-param refusal, got: {err}"
-        );
-        for expected in [
-            "dataset",
-            "'docs'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "`snapshots: disabled`",
-            "https://spiceai.org/docs/components/data-accelerators/snapshots",
-        ] {
+        let params = HashMap::from([
+            (
+                "s3_key".to_string(),
+                "${secrets:aws_access_key_id}".to_string(),
+            ),
+            (
+                "s3_secret".to_string(),
+                "${ secrets:aws_secret_access_key }".to_string(),
+            ),
+            ("s3_endpoint".to_string(), "${env:S3_ENDPOINT}".to_string()),
+            ("json_pointer".to_string(), "${secrets:pointer}".to_string()),
+        ]);
+        for snapshots_enabled in [true, false] {
+            let dataset = snapshot_dataset_with_params(&runtime, params.clone(), snapshots_enabled);
             assert!(
-                err.to_string().contains(expected),
-                "the refusal must contain {expected:?}: {err}"
+                validate_dataset(&dataset).is_ok(),
+                "secret and env references must load (snapshots enabled: {snapshots_enabled})"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn validate_dataset_refuses_env_ref_in_a_row_shaping_param() {
-        let runtime = Arc::new(crate::Runtime::builder().build().await);
-        let dataset = snapshot_dataset_with_params(
-            &runtime,
-            HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]),
-            true,
-        );
-        let err = validate_dataset(&dataset)
-            .expect_err("an env-referenced row-shaping param must refuse snapshots");
-        assert!(
-            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
-            "expected an unresolved-param refusal, got: {err}"
-        );
-        assert!(
-            err.to_string().contains("${env:POINTER}"),
-            "the refusal must name the env reference: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_dataset_allows_secret_refs_when_snapshots_are_disabled() {
-        let runtime = Arc::new(crate::Runtime::builder().build().await);
-        let dataset = snapshot_dataset_with_params(
-            &runtime,
-            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]),
-            false,
-        );
-        assert!(
-            validate_dataset(&dataset).is_ok(),
-            "secret-referenced params are ordinary when snapshots are off"
-        );
     }
 
     #[tokio::test]
@@ -3217,31 +3164,6 @@ mod tests {
             "the write would be lost",
             "acceleration.write_mode",
             "https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the rejection must contain {expected:?}: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_snapshot_identity_unresolved_param_rejection_names_the_param_and_a_way_out() {
-        let message = SnapshotsIdentityUnresolvedParamSnafu {
-            dataset_name: "docs".to_string(),
-            param: "json_pointer".to_string(),
-            store: "secrets".to_string(),
-            key: "pointer".to_string(),
-        }
-        .build()
-        .to_string();
-        for expected in [
-            "dataset",
-            "'docs'",
-            "`params.json_pointer`",
-            "${secrets:pointer}",
-            "`snapshots: disabled`",
-            "https://spiceai.org/docs/components/data-accelerators/snapshots",
         ] {
             assert!(
                 message.contains(expected),
@@ -4082,21 +4004,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             !DfError::SnapshotCreationBatchesShouldBePositive.is_retriable(),
             "an out-of-range Spicepod value needs an operator to change it"
-        );
-        assert!(
-            !DfError::SnapshotsIdentityUnresolvedParam {
-                component: "dataset",
-                name: "docs".to_string(),
-                message: crate::view::snapshot_identity_unresolved_param_message(
-                    "dataset",
-                    "docs",
-                    "json_pointer",
-                    "secrets",
-                    "pointer",
-                ),
-            }
-            .is_retriable(),
-            "a secret-referenced identity param needs an operator to change it"
         );
         assert!(
             DfError::TableAlreadyExists {}.is_retriable(),
