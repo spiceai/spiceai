@@ -54,15 +54,19 @@ struct Counting;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 
+/// Adds `delta` to the live-byte count when the allocation succeeded.
+fn track(ptr: *mut u8, delta: isize) -> *mut u8 {
+    if !ptr.is_null() {
+        LIVE.fetch_add(delta, Ordering::Relaxed);
+    }
+    ptr
+}
+
 // SAFETY: delegates every call to `System` and only adds bookkeeping.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded unchanged.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            LIVE.fetch_add(layout.size().cast_signed(), Ordering::Relaxed);
-        }
-        ptr
+        track(unsafe { System.alloc(layout) }, layout.size().cast_signed())
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -73,23 +77,18 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded unchanged.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            LIVE.fetch_add(layout.size().cast_signed(), Ordering::Relaxed);
-        }
-        ptr
+        track(
+            unsafe { System.alloc_zeroed(layout) },
+            layout.size().cast_signed(),
+        )
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: forwarded unchanged.
-        let new = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new.is_null() {
-            LIVE.fetch_add(
-                new_size.cast_signed() - layout.size().cast_signed(),
-                Ordering::Relaxed,
-            );
-        }
-        new
+        track(
+            unsafe { System.realloc(ptr, layout, new_size) },
+            new_size.cast_signed() - layout.size().cast_signed(),
+        )
     }
 }
 
@@ -184,21 +183,15 @@ impl Shape {
         match self {
             Shape::Flat { groups } => {
                 for g in 0..groups {
-                    columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(int(r * (g + 1))))
-                            .collect::<Int64Array>(),
-                    ));
-                    columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(f64::from(u32::try_from(r).expect("fits u32")) * 0.5))
-                            .collect::<Float64Array>(),
-                    ));
-                    columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(format!("value-{g}-{}", r % 97)))
-                            .collect::<StringArray>(),
-                    ));
+                    columns.push(Arc::new(Int64Array::from_iter_values(
+                        rows().map(|r| int(r * (g + 1))),
+                    )));
+                    columns.push(Arc::new(Float64Array::from_iter_values(
+                        rows().map(|r| f64::from(u32::try_from(r).expect("fits u32")) * 0.5),
+                    )));
+                    columns.push(Arc::new(StringArray::from_iter_values(
+                        rows().map(|r| format!("value-{g}-{}", r % 97)),
+                    )));
                 }
             }
             Shape::Mixed { groups } => {
@@ -206,47 +199,31 @@ impl Shape {
                     columns.push(Arc::new(
                         rows().map(|r| Some(r % 3 == 0)).collect::<BooleanArray>(),
                     ));
+                    columns.push(Arc::new(Int32Array::from_iter_values(
+                        rows().map(|r| i32::try_from(r).expect("fits i32")),
+                    )));
                     columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(i32::try_from(r).expect("fits i32")))
-                            .collect::<Int32Array>(),
-                    ));
-                    columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(i128::from(int(r)) * 7))
-                            .collect::<Decimal128Array>()
+                        Decimal128Array::from_iter_values(rows().map(|r| i128::from(int(r)) * 7))
                             .with_precision_and_scale(18, 4)
                             .expect("valid decimal"),
                     ));
-                    columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(int(r) * 1_000))
-                            .collect::<TimestampMicrosecondArray>(),
-                    ));
-                    columns.push(Arc::new(
-                        rows()
-                            .map(|r| Some(i32::try_from(r % 400).expect("fits i32")))
-                            .collect::<Date32Array>(),
-                    ));
-                    let bytes: Vec<Vec<u8>> = rows()
-                        .map(|r| format!("bin{}", r % 13).into_bytes())
-                        .collect();
-                    columns.push(Arc::new(
-                        bytes
-                            .iter()
-                            .map(|b| Some(b.as_slice()))
-                            .collect::<BinaryArray>(),
-                    ));
+                    columns.push(Arc::new(TimestampMicrosecondArray::from_iter_values(
+                        rows().map(|r| int(r) * 1_000),
+                    )));
+                    columns.push(Arc::new(Date32Array::from_iter_values(
+                        rows().map(|r| i32::try_from(r % 400).expect("fits i32")),
+                    )));
+                    columns.push(Arc::new(BinaryArray::from_iter_values(
+                        rows().map(|r| format!("bin{}", r % 13)),
+                    )));
                     columns.push(Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
                         rows().map(|r| Some(vec![Some(int(r)), Some(int(g))])),
                     )));
                     let a: ArrayRef =
-                        Arc::new(rows().map(|r| Some(int(r * g))).collect::<Int64Array>());
-                    let b: ArrayRef = Arc::new(
-                        rows()
-                            .map(|r| Some(format!("s{}", r % 11)))
-                            .collect::<StringArray>(),
-                    );
+                        Arc::new(Int64Array::from_iter_values(rows().map(|r| int(r * g))));
+                    let b: ArrayRef = Arc::new(StringArray::from_iter_values(
+                        rows().map(|r| format!("s{}", r % 11)),
+                    ));
                     columns.push(Arc::new(StructArray::new(
                         struct_fields(),
                         vec![a, b],
@@ -266,10 +243,14 @@ fn struct_fields() -> Fields {
     ])
 }
 
+fn local_store(dir: &std::path::Path) -> Arc<dyn ObjectStore> {
+    Arc::new(LocalFileSystem::new_with_prefix(dir).expect("local store"))
+}
+
 async fn write_files(shape: Shape, dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("create data dir");
     let session = VortexSession::default();
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(dir).expect("local store"));
+    let store = local_store(dir);
     let schema = shape.schema();
     for file in 0..FILES {
         let arrays: Vec<VortexArrayRef> = (0..CHUNKS)
@@ -296,8 +277,6 @@ async fn write_files(shape: Shape, dir: &std::path::Path) {
 
 fn session_context(dir: &std::path::Path) -> SessionContext {
     let factory = Arc::new(VortexFormatFactory::new());
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(dir).expect("local store"));
     let mut builder = SessionStateBuilder::new()
         .with_default_features()
         .with_table_factory(
@@ -306,7 +285,7 @@ fn session_context(dir: &std::path::Path) -> SessionContext {
         )
         .with_object_store(
             &Url::try_from("file://").expect("file:// should parse as a URL"),
-            store,
+            local_store(dir),
         );
     if let Some(file_formats) = builder.file_formats() {
         file_formats.push(factory as _);
@@ -316,6 +295,7 @@ fn session_context(dir: &std::path::Path) -> SessionContext {
 
 /// What the footer cache said its entries cost, and the heap they held.
 struct Measured {
+    src: &'static str,
     entries: usize,
     accounted: usize,
     freed: usize,
@@ -334,7 +314,7 @@ impl Measured {
 
 /// Clears the footer cache, measuring what it accounted and what clearing it
 /// gave back to the allocator.
-fn measure_and_clear(ctx: &SessionContext, shape: Shape, src: &str) -> Measured {
+fn measure_and_clear(ctx: &SessionContext, shape: Shape, src: &'static str) -> Measured {
     let cache = ctx.runtime_env().cache_manager.get_file_metadata_cache();
     let listed = cache.list_entries();
     let entries = listed.len();
@@ -345,6 +325,7 @@ fn measure_and_clear(ctx: &SessionContext, shape: Shape, src: &str) -> Measured 
     cache.clear();
     let after = LIVE.load(Ordering::SeqCst);
     let measured = Measured {
+        src,
         entries,
         accounted,
         freed: usize::try_from(before - after).unwrap_or_default(),
@@ -378,9 +359,8 @@ async fn drain(ctx: &SessionContext, sql: &str) -> usize {
 /// Footers cached as each population path leaves them: parsed by schema and
 /// statistics inference, the same after a scan has read every column through
 /// them, and handed over by the writer.
-async fn measure_shape(shape: Shape) -> [(&'static str, Measured); 3] {
+async fn measure_shape(shape: Shape) -> [Measured; 3] {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(tmp.path().join("read")).expect("create read dir");
     write_files(shape, &tmp.path().join("read")).await;
     let create = "CREATE EXTERNAL TABLE t STORED AS VORTEX LOCATION '/read/'";
 
@@ -422,11 +402,7 @@ async fn measure_shape(shape: Shape) -> [(&'static str, Measured); 3] {
     let written = measure_and_clear(&ctx, shape, "as written");
     assert!(written.entries > 0, "the write path cached its footers");
 
-    [
-        ("as parsed", parsed),
-        ("after a full scan", scanned),
-        ("as written", written),
-    ]
+    [parsed, scanned, written]
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -436,11 +412,12 @@ async fn the_footer_cache_accounts_for_what_its_entries_retain() {
 
         // The cache evicts on the accounted size, so an entry retaining more
         // than it accounts for lets the cache exceed its limit.
-        for (src, measured) in [&parsed, &scanned, &written] {
+        for measured in [&parsed, &scanned, &written] {
             assert!(
                 measured.freed <= measured.accounted,
-                "{shape:?} footers {src} retain {:.2}x the size they report, so the footer \
+                "{shape:?} footers {} retain {:.2}x the size they report, so the footer \
                  cache can hold {:.2}x its limit",
+                measured.src,
                 measured.retained_per_accounted(),
                 measured.retained_per_accounted(),
             );
@@ -449,7 +426,6 @@ async fn the_footer_cache_accounts_for_what_its_entries_retain() {
         // The accounted size is the fully-expanded one, charged up front. Bound
         // how far that over-charges an entry nothing has scanned yet, so the
         // estimate cannot pass by being arbitrarily large.
-        let (_, parsed) = parsed;
         assert!(
             parsed.accounted <= 4 * parsed.freed,
             "{shape:?} footers as parsed account for {} B but retain {} B: the estimate \
