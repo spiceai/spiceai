@@ -24,6 +24,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use arrow_tools::schema_evolution::is_widening_cast;
 use datafusion::{
     common::DFSchema,
     logical_expr::{Expr, ExprSchemable as _},
@@ -258,9 +259,8 @@ pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) ->
                 return sqlite_cast_is_faithful(&value.data_type(), to)
                     || sqlite_date_literal_is_canonical(value, to);
             }
-            let empty = DFSchema::empty();
             cast.expr
-                .get_type(schema.unwrap_or(&empty))
+                .get_type(schema.unwrap_or_else(|| DFSchema::empty_ref()))
                 .is_ok_and(|from| sqlite_cast_is_faithful(&from, to))
         }
         _ => true,
@@ -295,24 +295,13 @@ fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
         return true;
     }
     if from.is_integer() {
-        return to.is_string() || *to == DataType::Float64 || integer_widens(from, to);
+        // Lossless widening, and only into an integer: `is_widening_cast` also
+        // admits floats, which SQLite stores as a double whatever the width.
+        return to.is_string()
+            || *to == DataType::Float64
+            || (to.is_integer() && is_widening_cast(from, to));
     }
     *from == DataType::Float32 && *to == DataType::Float64
-}
-
-/// Whether every value of the integer type `from` is a value of `to`.
-fn integer_widens(from: &DataType, to: &DataType) -> bool {
-    let (Some(from_width), Some(to_width)) = (from.primitive_width(), to.primitive_width()) else {
-        return false;
-    };
-    if !to.is_integer() {
-        return false;
-    }
-    match (from.is_signed_integer(), to.is_signed_integer()) {
-        (true, true) | (false, false) => to_width >= from_width,
-        (false, true) => to_width > from_width,
-        (true, false) => false,
-    }
 }
 
 /// MySQL-flavored deny-list as a value, for
@@ -376,10 +365,11 @@ mod tests {
         deny_spice_functions_for_duckdb_table_providers,
         deny_spice_functions_for_sqlite_table_providers,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::common::DFSchema;
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
-    use datafusion::prelude::{Expr, col, lit};
+    use datafusion::prelude::{Expr, cast, col, lit, try_cast};
     use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
     use runtime_udfs_api::{add_user_function, remove_user_function};
@@ -452,8 +442,8 @@ mod tests {
         );
     }
 
-    fn sqlite_scope() -> datafusion::common::DFSchema {
-        datafusion::common::DFSchema::try_from(Schema::new(vec![
+    fn sqlite_scope() -> DFSchema {
+        DFSchema::try_from(Schema::new(vec![
             Field::new("bin", DataType::Binary, true),
             Field::new("s", DataType::Utf8, true),
             Field::new("i8", DataType::Int8, true),
@@ -465,11 +455,7 @@ mod tests {
             Field::new("f64", DataType::Float64, true),
             Field::new("b", DataType::Boolean, true),
             Field::new("d", DataType::Date32, true),
-            Field::new(
-                "ts",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                true,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
         ]))
         .expect("scope schema")
     }
@@ -479,7 +465,6 @@ mod tests {
     /// every cast outside the faithful set stays local.
     #[test]
     fn sqlite_keeps_unfaithful_casts_local() {
-        use datafusion::prelude::{cast, try_cast};
         let scope = sqlite_scope();
         let support = deny_spice_functions_for_sqlite_table_providers();
         let mut refused = vec![
@@ -517,10 +502,7 @@ mod tests {
             ("b", DataType::Utf8),
             ("b", DataType::Int32),
             ("d", DataType::Utf8),
-            (
-                "d",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            ),
+            ("d", DataType::Timestamp(TimeUnit::Microsecond, None)),
             ("ts", DataType::Date32),
         ] {
             refused.push(cast(col(operand), target));
@@ -537,7 +519,6 @@ mod tests {
     /// federate, and a node that is not a cast is not this check's to refuse.
     #[test]
     fn sqlite_federates_faithful_casts() {
-        use datafusion::prelude::cast;
         let scope = sqlite_scope();
         let support = deny_spice_functions_for_sqlite_table_providers();
         for (operand, target) in [
@@ -572,7 +553,6 @@ mod tests {
     /// local; a literal carries its own type.
     #[test]
     fn sqlite_refuses_a_cast_whose_operand_type_cannot_be_read() {
-        use datafusion::prelude::cast;
         let support = deny_spice_functions_for_sqlite_table_providers();
         assert!(!support.supports(&cast(col("i32"), DataType::Int64), None));
         assert!(support.supports(&cast(lit(1_i32), DataType::Int64), None));
@@ -583,7 +563,6 @@ mod tests {
     /// text: only a literal already spelled `YYYY-MM-DD` compares the same way.
     #[test]
     fn sqlite_federates_only_a_canonical_date_literal() {
-        use datafusion::prelude::cast;
         let support = deny_spice_functions_for_sqlite_table_providers();
         for canonical in ["1994-01-01", "2024-02-29", "0001-01-01"] {
             assert!(
@@ -606,7 +585,7 @@ mod tests {
             !support.supports(
                 &cast(
                     lit("1994-01-01"),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+                    DataType::Timestamp(TimeUnit::Microsecond, None)
                 ),
                 None
             ),
@@ -622,7 +601,6 @@ mod tests {
     /// which is where a wrong value selects wrong rows.
     #[test]
     fn a_sqlite_plan_filtering_on_an_unfaithful_cast_is_not_federated() {
-        use datafusion::prelude::cast;
         let support = deny_spice_functions_for_sqlite_table_providers();
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
