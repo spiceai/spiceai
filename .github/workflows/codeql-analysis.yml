@@ -191,8 +191,10 @@ jobs:
     needs: analyze
     runs-on: ubuntu-24.04
     # Query evaluation against an already-built Rust database, not an
-    # autobuild. Anything past this is wedged, not a cold cache.
-    timeout-minutes: 60
+    # autobuild. The full code-scanning suite takes just under an hour on a
+    # standard 4-core hosted VM, so this is twice that; anything past it is
+    # wedged, not slow.
+    timeout-minutes: 120
     permissions:
       actions: read
       contents: read
