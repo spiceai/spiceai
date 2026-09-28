@@ -116,7 +116,7 @@ limitations under the License.
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::{JoinType, NullEquality, extensions_options};
+use datafusion::common::{JoinSide, JoinType, NullEquality, extensions_options};
 use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
@@ -126,6 +126,7 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -1026,7 +1027,7 @@ fn finish_sort_merge_rewrite(
         left,
         right,
         hash_join.on().to_vec(),
-        hash_join.filter().cloned(),
+        hash_join.filter().map(left_columns_first).transpose()?,
         *hash_join.join_type(),
         sort_options,
         hash_join.null_equality(),
@@ -1051,6 +1052,71 @@ fn finish_sort_merge_rewrite(
     );
 
     Ok(Some(join))
+}
+
+/// Reorder a join filter so every left-side column precedes every right-side
+/// column, keeping each side's relative order.
+///
+/// `SortMergeJoinExec` builds the filter's intermediate batch as all left columns
+/// followed by all right columns, whatever order `column_indices` lists them in;
+/// `HashJoinExec` follows `column_indices`. `JoinSelection` swaps a hash join's
+/// inputs by flipping each filter column's side in place, so a swapped filter can
+/// list a right column first. Carried onto a sort-merge join unchanged, its batch
+/// no longer matches the filter schema: CH-benCHmark q17's
+/// `CAST(ol_quantity@0 AS Float64) < a@1`, with `ol_quantity` on the right,
+/// failed with "expected Int32 but found Float64 at column index 0" (#14235).
+fn left_columns_first(filter: &JoinFilter) -> Result<JoinFilter, DataFusionError> {
+    let column_indices = filter.column_indices();
+    let order: Vec<usize> = (0..column_indices.len())
+        .filter(|&i| column_indices[i].side == JoinSide::Left)
+        .chain((0..column_indices.len()).filter(|&i| column_indices[i].side != JoinSide::Left))
+        .collect();
+    if order.iter().enumerate().all(|(new, &old)| new == old) {
+        return Ok(filter.clone());
+    }
+
+    // `position[old]` is where the intermediate column at `old` moves to.
+    let mut position = vec![0; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        position[old] = new;
+    }
+    let schema = filter.schema();
+    let reordered_schema = Arc::new(Schema::new_with_metadata(
+        order
+            .iter()
+            .map(|&old| Arc::clone(&schema.fields()[old]))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ));
+    let reordered_indices = order
+        .iter()
+        .map(|&old| ColumnIndex {
+            index: column_indices[old].index,
+            side: column_indices[old].side,
+        })
+        .collect();
+    let expression = Arc::clone(filter.expression())
+        .transform(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let Some(&new) = position.get(column.index()) else {
+                return Err(DataFusionError::Internal(format!(
+                    "join filter column {} is outside the filter's {} columns",
+                    column.index(),
+                    position.len()
+                )));
+            };
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), new)) as Arc<dyn PhysicalExpr>
+            ))
+        })
+        .data()?;
+    Ok(JoinFilter::new(
+        expression,
+        reordered_indices,
+        reordered_schema,
+    ))
 }
 
 /// `HashJoinExec` may embed a column projection that `SortMergeJoinExec` does
