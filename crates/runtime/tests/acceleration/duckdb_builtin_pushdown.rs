@@ -1215,7 +1215,7 @@ fn write_regexp_group_reference_source(path: &Path) -> Result<(), anyhow::Error>
 /// every other backslash form stays local (#13966). The rule is
 /// `re2::engine_neutral_replacement`.
 ///
-/// The first shape is ClickBench q29's, whose `DuckDB` benchmark plans
+/// The first shape is `ClickBench` q29's, whose `DuckDB` benchmark plans
 /// snapshot the aggregate federated; refusing it evaluated the whole
 /// `GROUP BY` above a bare scan.
 #[tokio::test]

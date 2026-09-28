@@ -189,7 +189,7 @@ impl fmt::Display for EngineDependentSyntax {
 /// - Any other escape (`\q`, `\n`) is left in the text by the kernel and is
 ///   a rewrite error to RE2.
 ///
-/// That form is what an extraction idiom such as ClickBench's
+/// That form is what an extraction idiom such as `ClickBench`'s
 /// `regexp_replace(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1')` spells,
 /// and refusing it evaluates the whole aggregate above the scan locally.
 pub(super) fn engine_neutral_replacement(
