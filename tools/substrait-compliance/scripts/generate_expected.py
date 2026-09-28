@@ -48,7 +48,6 @@ import decimal
 import hashlib
 import pathlib
 import re
-import sys
 
 import duckdb
 
@@ -201,4 +200,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
