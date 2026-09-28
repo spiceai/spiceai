@@ -31,7 +31,7 @@ use axum::{
 };
 use datafusion::sql::TableReference;
 use iceberg::{
-    arrow::arrow_schema_to_schema,
+    arrow::{UTC_TIME_ZONE, arrow_schema_to_schema},
     spec::{PartitionSpec, Schema, SortOrder},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -228,12 +228,16 @@ fn iceberg_schema_for(schema: &ArrowSchema) -> iceberg::Result<Schema> {
 /// The Iceberg v2 equivalent of a non-nested Arrow type that `arrow_schema_to_schema`
 /// cannot map directly, or `None` when the type needs no coercion. Each coercion
 /// represents every value of the original type.
+///
+/// This is a superset of the `CREATE TABLE` coercion in `iceberg_ddl`, which writes data
+/// into the schema it creates and so only coerces what its write path casts; this API
+/// only describes a schema.
 fn coerce_leaf_for_iceberg_v2(data_type: &DataType) -> Option<DataType> {
     match data_type {
         // An Arrow timestamp with any time zone holds UTC instants and uses the zone only
         // for display, which is exactly Iceberg's `timestamptz`.
-        DataType::Timestamp(_, Some(tz)) if !matches!(tz.as_ref(), "UTC" | "+00:00") => Some(
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(_, Some(tz)) if !matches!(tz.as_ref(), "UTC" | UTC_TIME_ZONE) => Some(
+            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
         ),
         DataType::Float16 => Some(DataType::Float32),
         DataType::Dictionary(key, value) => coerce_leaf_for_iceberg_v2(value)
@@ -326,6 +330,7 @@ mod tests {
 
     use super::*;
     use iceberg::arrow::arrow_schema_to_schema;
+    use iceberg::spec::{PrimitiveType, Type};
 
     fn get_field_id(field: &Field) -> Option<i32> {
         field
@@ -790,8 +795,6 @@ mod tests {
 
     #[test]
     fn test_coerce_nested_temporal_types() {
-        use iceberg::spec::{PrimitiveType, Type};
-
         let schema = ArrowSchema::new(vec![
             Field::new("dates", DataType::List(element(DataType::Date64)), true),
             Field::new(
@@ -837,32 +840,23 @@ mod tests {
 
         let iceberg_schema = coerce_and_convert(&schema);
 
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "dates.element"),
-            Type::Primitive(PrimitiveType::Date)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "times.element"),
-            Type::Primitive(PrimitiveType::Time)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "event.at"),
-            Type::Primitive(PrimitiveType::Timestamp)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "instants.element"),
-            Type::Primitive(PrimitiveType::Timestamp)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "by_key.value"),
-            Type::Primitive(PrimitiveType::Timestamptz)
-        );
+        for (name, expected) in [
+            ("dates.element", PrimitiveType::Date),
+            ("times.element", PrimitiveType::Time),
+            ("event.at", PrimitiveType::Timestamp),
+            ("instants.element", PrimitiveType::Timestamp),
+            ("by_key.value", PrimitiveType::Timestamptz),
+        ] {
+            assert_eq!(
+                iceberg_type_of(&iceberg_schema, name),
+                Type::Primitive(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn test_coerce_non_utc_timestamps_to_timestamptz() {
-        use iceberg::spec::{PrimitiveType, Type};
-
         let schema = ArrowSchema::new(vec![
             Field::new(
                 "ny",
@@ -902,8 +896,6 @@ mod tests {
 
     #[test]
     fn test_coerce_float16_and_dictionary_values() {
-        use iceberg::spec::{PrimitiveType, Type};
-
         let schema = ArrowSchema::new(vec![
             Field::new("half", DataType::Float16, true),
             Field::new("halves", DataType::List(element(DataType::Float16)), true),
@@ -924,22 +916,18 @@ mod tests {
 
         let iceberg_schema = coerce_and_convert(&schema);
 
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "half"),
-            Type::Primitive(PrimitiveType::Float)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "halves.element"),
-            Type::Primitive(PrimitiveType::Float)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "dict_ts"),
-            Type::Primitive(PrimitiveType::Timestamp)
-        );
-        assert_eq!(
-            iceberg_type_of(&iceberg_schema, "dict_str"),
-            Type::Primitive(PrimitiveType::String)
-        );
+        for (name, expected) in [
+            ("half", PrimitiveType::Float),
+            ("halves.element", PrimitiveType::Float),
+            ("dict_ts", PrimitiveType::Timestamp),
+            ("dict_str", PrimitiveType::String),
+        ] {
+            assert_eq!(
+                iceberg_type_of(&iceberg_schema, name),
+                Type::Primitive(expected),
+                "{name}"
+            );
+        }
     }
 
     /// Types with no Iceberg v2 equivalent that holds every value stay a conversion error.
