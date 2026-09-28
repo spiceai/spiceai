@@ -3178,6 +3178,15 @@ impl MemTierCheckpointGuards {
     }
 }
 
+/// The `write_lock` and `visibility_lock` guards a position-delete full rewrite
+/// holds for its whole pass, so writers and staged visibility flips cannot
+/// interleave with file-scoped tombstones. Acquired in that order; held only
+/// for their `Drop`.
+struct PositionRewriteGuards {
+    _write: tokio::sync::OwnedMutexGuard<()>,
+    _visibility: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// Outcome of a best-effort [`CayenneTableProvider::try_checkpoint_mem_tier`].
 pub(crate) enum CheckpointAttempt {
     /// A checkpoint ran; value is rows flushed (0 = nothing to flush, but the slot
@@ -18472,12 +18481,9 @@ impl CayenneTableProvider {
     /// pass is already in flight (inline or background), we skip this trigger
     /// rather than queueing more work.
     ///
-    /// **Callers are responsible for write-lock coordination.** Inline callers
-    /// (in `mutation_writer`) hold `write_lock` already, so they call this
-    /// directly. The background scheduler's [`super::compaction::CompactionRunner`]
-    /// adapter `try_lock`s `write_lock` before delegating here. Tests use the
-    /// `#[doc(hidden)] pub` exposure for direct access — no concurrent writers
-    /// in single-table test setups.
+    /// **Callers must not hold `write_lock`.** On a position-delete table the
+    /// full rewrite this ends in acquires it, and it is not reentrant. Tests use
+    /// the `#[doc(hidden)] pub` exposure for direct access.
     ///
     /// Returns `Ok(true)` if at least one snapshot rewrite occurred.
     #[doc(hidden)]
@@ -18567,8 +18573,9 @@ impl CayenneTableProvider {
         // append-counter guard does not observe deletes, so a full re-encode must
         // run without a concurrent writer. A continuously-writing position table
         // simply skips this pass (its protected-snapshot path still compacts).
-        let (_position_write_guard, _position_visibility_guard) = if self.should_capture_positions()
-        {
+        // The full rewrite below reuses these guards rather than acquiring its
+        // own (see `rewrite_current_snapshot_for_compaction_holding`).
+        let position_guards = if self.should_capture_positions() {
             let Ok(guard) = self.write_lock_arc().try_lock_owned() else {
                 maintenance_metrics::track_compaction(
                     table_name,
@@ -18582,12 +18589,12 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             };
-            (
-                Some(guard),
-                Some(self.visibility_lock_arc().lock_owned().await),
-            )
+            Some(PositionRewriteGuards {
+                _write: guard,
+                _visibility: self.visibility_lock_arc().lock_owned().await,
+            })
         } else {
-            (None, None)
+            None
         };
 
         let Ok(_guard) = self.compaction_lock.try_write() else {
@@ -18734,7 +18741,7 @@ impl CayenneTableProvider {
         // Full re-encode into a fresh snapshot with the concurrent-append guard.
         // Also folds protected snapshots and clears deletion caches.
         let committed = self
-            .rewrite_current_snapshot_for_compaction_tracked()
+            .rewrite_current_snapshot_for_compaction_tracked(position_guards)
             .await?;
         if committed {
             self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
@@ -20552,7 +20559,7 @@ impl CayenneTableProvider {
         if let Some(trigger) = maintenance_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
             let committed = self
-                .rewrite_current_snapshot_for_compaction_tracked()
+                .rewrite_current_snapshot_for_compaction_tracked(None)
                 .await?;
             if committed {
                 self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
@@ -20678,7 +20685,7 @@ impl CayenneTableProvider {
         }
 
         let committed = self
-            .rewrite_current_snapshot_for_compaction_tracked()
+            .rewrite_current_snapshot_for_compaction_tracked(None)
             .await?;
         if committed {
             self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
@@ -21660,9 +21667,17 @@ impl CayenneTableProvider {
     /// count doubles as the pass counter) and, on a memory-exhaustion failure,
     /// the dedicated-pool exhaustion counter. This is the single entry point the
     /// background and post-write compaction triggers call.
-    async fn rewrite_current_snapshot_for_compaction_tracked(&self) -> Result<bool> {
+    ///
+    /// `held_position_guards` is passed through to
+    /// [`Self::rewrite_current_snapshot_for_compaction_holding`].
+    async fn rewrite_current_snapshot_for_compaction_tracked(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+    ) -> Result<bool> {
         let pass_start = Instant::now();
-        let result = self.rewrite_current_snapshot_for_compaction().await;
+        let result = self
+            .rewrite_current_snapshot_for_compaction_holding(held_position_guards)
+            .await;
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
             "completed"
@@ -21709,6 +21724,13 @@ impl CayenneTableProvider {
         result
     }
 
+    /// [`Self::rewrite_current_snapshot_for_compaction_holding`] without held locks.
+    #[cfg(test)]
+    async fn rewrite_current_snapshot_for_compaction(&self) -> Result<bool> {
+        self.rewrite_current_snapshot_for_compaction_holding(None)
+            .await
+    }
+
     /// Consolidate the full visible row set into a single new current snapshot
     /// dir and atomically flip the current-snapshot pointer to it.
     ///
@@ -21719,7 +21741,15 @@ impl CayenneTableProvider {
     /// the scan** (delete fence) so the folded set could no longer be determined.
     /// All aborts leave the old snapshot current and intact; a later trigger
     /// retries.
-    async fn rewrite_current_snapshot_for_compaction(&self) -> Result<bool> {
+    ///
+    /// On a position-delete table the rewrite holds the write and visibility
+    /// locks for the whole pass. `held_position_guards` is those two locks when
+    /// the caller already holds them, and they are reused instead of acquired.
+    /// Pass `None` unless this task holds both: `write_lock` is not reentrant.
+    async fn rewrite_current_snapshot_for_compaction_holding(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+    ) -> Result<bool> {
         // Committed/failed belong to the tracked wrapper; every non-committed
         // exit below reports itself, so the two together account for each pass
         // exactly once.
@@ -21742,20 +21772,20 @@ impl CayenneTableProvider {
         // safe option is to exclude writers for the whole rewrite (mirrors
         // `compact_protected_snapshots_subset`), via a BLOCKING `write_lock`
         // acquire so the full-snapshot rewrite always makes progress (see below).
-        let (_position_write_guard, _position_visibility_guard) = if uses_position_deletes {
+        let _position_guards = match held_position_guards {
+            Some(held) => Some(held),
             // Blocking acquire (not try_lock): the full-snapshot rewrite must
             // always make progress — a try_lock+defer would starve it on a busy
             // table (the documented "files accumulate unboundedly" failure mode)
             // and would no-op a direct/explicit compaction call. We wait for the
             // current writer instead, then exclude writers for the rest of the
-            // rewrite. Deadlock-safe: the full rewrite is only ever invoked
-            // holding `compaction_lock` (never `write_lock`), so this can't
-            // re-enter the lock.
-            let write_guard = self.write_lock_arc().lock_owned().await;
-            let visibility_guard = self.visibility_lock_arc().lock_owned().await;
-            (Some(write_guard), Some(visibility_guard))
-        } else {
-            (None, None)
+            // rewrite. Deadlock-safe: every other caller holds `compaction_lock`
+            // and never `write_lock`, so this can't re-enter the lock.
+            None if uses_position_deletes => Some(PositionRewriteGuards {
+                _write: self.write_lock_arc().lock_owned().await,
+                _visibility: self.visibility_lock_arc().lock_owned().await,
+            }),
+            None => None,
         };
 
         // Use the dedicated compaction memory environment (carved budget) when
@@ -44792,7 +44822,7 @@ mod tests {
 
         assert!(
             provider
-                .rewrite_current_snapshot_for_compaction_tracked()
+                .rewrite_current_snapshot_for_compaction_tracked(None)
                 .await
                 .expect("full rewrite"),
             "the full rewrite must run"
@@ -63807,7 +63837,7 @@ mod tests {
             .await
             .expect("drain post-write maintenance after seed insert");
         provider
-            .rewrite_current_snapshot_for_compaction_tracked()
+            .rewrite_current_snapshot_for_compaction_tracked(None)
             .await
             .expect("compaction full rewrite into a fresh current snapshot");
 
@@ -64091,7 +64121,7 @@ mod tests {
         }
 
         provider
-            .rewrite_current_snapshot_for_compaction_tracked()
+            .rewrite_current_snapshot_for_compaction_tracked(None)
             .await
             .expect("compaction full rewrite into a fresh current snapshot");
 
