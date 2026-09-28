@@ -44,8 +44,8 @@ use crate::generation::text_search::query::FullTextSearchQuery;
 use crate::generation::text_search::util::{with_json_subset_column, without_columns};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
-    InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
-    TextSearchIndexingSnafu,
+    IndexDirectoryCreationSnafu, InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu,
+    PersistedIndexMissingColumnsSnafu, TextSearchIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
