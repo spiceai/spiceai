@@ -141,48 +141,26 @@ impl std::fmt::Display for RateControlTarget {
     }
 }
 
-/// One deadline for the whole rate-control wait of a single request: the
-/// concurrency semaphore, the quotas, the cluster leased buckets, jitter, and
-/// any later [`Permit::until_ready`] re-check on a retry path. Created once per
-/// request, so a deferred wait cannot extend the configured bound.
-#[derive(Debug, Clone, Copy)]
-enum AcquireDeadline {
-    /// No bound; every wait source may block indefinitely.
-    Unbounded,
-    /// The instant every wait source of this request shares, with the
-    /// configured bound that produced it (reported in the timeout error).
-    At { at: Instant, bound: Duration },
-}
+/// Bound one wait for rate-control capacity. `None` waits indefinitely.
+///
+/// The bound is per attempt: one call covers every wait source inside
+/// `future`, and a later attempt gets the full bound again. This is the only
+/// place [`Error::AcquireTimeout`] is built, so the acquire and the retry
+/// re-check report it the same way.
+async fn within<T, F>(bound: Option<Duration>, target: &RateControlTarget, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let Some(bound) = bound else {
+        return future.await;
+    };
 
-/// The shared deadline passed before the future finished.
-#[derive(Debug, Clone, Copy)]
-struct DeadlineExpired {
-    bound: Duration,
-}
-
-impl AcquireDeadline {
-    fn start(bound: Option<Duration>) -> Self {
-        match bound {
-            // A bound that overflows the clock is effectively no bound.
-            Some(bound) => match Instant::now().checked_add(bound) {
-                Some(at) => Self::At { at, bound },
-                None => Self::Unbounded,
-            },
-            None => Self::Unbounded,
-        }
-    }
-
-    /// Run `future` under this deadline.
-    async fn run<T, F>(self, future: F) -> std::result::Result<T, DeadlineExpired>
-    where
-        F: std::future::Future<Output = T>,
-    {
-        match self {
-            Self::Unbounded => Ok(future.await),
-            Self::At { at, bound } => tokio::time::timeout_at(at, future)
-                .await
-                .map_err(|_elapsed| DeadlineExpired { bound }),
-        }
+    match tokio::time::timeout(bound, future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::AcquireTimeout {
+            target: target.clone(),
+            waited: bound,
+        }),
     }
 }
 
@@ -300,13 +278,13 @@ impl RateControllerBuilder {
         self
     }
 
-    /// Bound how long one request may wait for capacity before failing with
-    /// [`Error::AcquireTimeout`]. The bound starts one deadline that covers
-    /// every wait source of that request — the semaphore, the quotas, the
-    /// cluster leased buckets, jitter, and any later [`Permit::until_ready`] —
-    /// so the total wait can never exceed it. Unset means wait indefinitely.
+    /// Bound how long one acquire attempt may wait for capacity before failing
+    /// with [`Error::AcquireTimeout`]. The bound covers every wait source of
+    /// that attempt — the semaphore, the quotas, the cluster leased buckets and
+    /// jitter. Each attempt gets the bound again, so a caller that retries can
+    /// wait up to the bound per attempt. Unset means wait indefinitely.
     ///
-    /// Cluster mode: leased-bucket tokens already spent when the deadline fires
+    /// Cluster mode: leased-bucket tokens already spent when the bound fires
     /// are not returned to the window, so the bound is exact for single-node
     /// (local) rate control and best-effort for cluster rate control.
     #[must_use]
@@ -604,12 +582,11 @@ pub struct RateController {
     /// is scaled by). [`ADAPTIVE_WEIGHT_RESOLUTION`] with adaptive control, else
     /// `1`. Purely internal — divided back out of any logical metric.
     resolution: u32,
-    /// Upper bound on how long one request waits for capacity before returning
-    /// [`Error::AcquireTimeout`]. `None` = wait indefinitely (the legacy
-    /// behaviour). Each `acquire*` call turns this into one
-    /// [`AcquireDeadline`] that the permit keeps, so the semaphore, the
-    /// governor quotas, the leased buckets, jitter and any later
-    /// [`Permit::until_ready`] all share it.
+    /// Upper bound on how long one acquire attempt waits for capacity before
+    /// returning [`Error::AcquireTimeout`]. `None` = wait indefinitely (the
+    /// legacy behaviour). Applied per attempt: each `acquire*` call, and each
+    /// [`Permit::until_ready`] re-check, gets the whole bound for the
+    /// semaphore, the governor quotas, the leased buckets and jitter.
     acquire_timeout: Option<Duration>,
 }
 
@@ -639,10 +616,6 @@ pub struct Permit {
     semaphore: Option<OwnedSemaphorePermit>,
     weight: Option<u32>,
     rate_controller: Arc<RateController>,
-    /// The deadline opened when this request started to acquire. Shared with
-    /// [`Permit::until_ready`] so the configured bound covers both phases once,
-    /// rather than once each.
-    deadline: AcquireDeadline,
 }
 
 impl Drop for Permit {
@@ -658,27 +631,22 @@ impl Permit {
     /// Re-check the quotas from an existing permit. The caller retains its
     /// permit but acquires fresh rate-limit budget — used on retry paths.
     ///
-    /// This wait shares the deadline that the original acquire opened, so a
-    /// request cannot wait longer than `rate_control_acquire_timeout` in total.
-    /// A retry started after that deadline therefore fails at once instead of
-    /// queueing again.
+    /// This re-check is its own attempt, so it gets the whole
+    /// `rate_control_acquire_timeout` again rather than what an earlier acquire
+    /// left over.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`RateController::acquire`].
     pub async fn until_ready(&self) -> Result<()> {
+        let controller = &self.rate_controller;
         let wait_start = Instant::now();
-        let result = match self
-            .deadline
-            .run(self.rate_controller.wait_for_rate_limiters(self.weight))
-            .await
-        {
-            Ok(inner) => inner,
-            Err(DeadlineExpired { bound }) => Err(Error::AcquireTimeout {
-                target: self.rate_controller.target.clone(),
-                waited: bound,
-            }),
-        };
+        let result = within(
+            controller.acquire_timeout,
+            &controller.target,
+            controller.wait_for_rate_limiters(self.weight),
+        )
+        .await;
 
         let wait_duration = wait_start.elapsed();
         match result {
@@ -923,35 +891,31 @@ impl RateController {
     /// [`Error::AcquireTimeout`] if a bound is configured and the wait for
     /// capacity exceeds it.
     pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
-        // One deadline for this request. The permit carries it, so a later
-        // `Permit::until_ready` continues the same bound instead of starting a
-        // second one of equal length.
-        let deadline = AcquireDeadline::start(self.acquire_timeout);
         let wait_start = Instant::now();
-        match deadline.run(self.acquire_inner(weight, deadline)).await {
-            Ok(result) => result,
-            Err(DeadlineExpired { bound }) => {
-                // The inner future is cancelled at the await it was parked on, so
-                // it records no outcome — attribute the failure here.
-                // Cluster mode: `acquire_inner` consumes leased-bucket tokens one
-                // at a time, and tokens already spent when the deadline fires are
-                // not returned to the window. The bound is therefore exact for
-                // local (single-node) rate control and best-effort for cluster
-                // rate control until a weighted leased acquire lands.
-                self.metrics.record_acquire_error(wait_start.elapsed());
-                Err(Error::AcquireTimeout {
-                    target: self.target.clone(),
-                    waited: bound,
-                })
-            }
+        let result = within(
+            self.acquire_timeout,
+            &self.target,
+            self.acquire_inner(weight),
+        )
+        .await;
+
+        // Only the bound above produces `AcquireTimeout`, and it cancels
+        // `acquire_inner` at the await it was parked on, so the inner call
+        // records no outcome — attribute the failure here.
+        //
+        // Cluster mode: `acquire_inner` consumes leased-bucket tokens one at a
+        // time, and tokens already spent when the bound fires are not returned
+        // to the window. The bound is therefore exact for local (single-node)
+        // rate control and best-effort for cluster rate control until a
+        // weighted leased acquire lands.
+        if matches!(&result, Err(Error::AcquireTimeout { .. })) {
+            self.metrics.record_acquire_error(wait_start.elapsed());
         }
+
+        result
     }
 
-    async fn acquire_inner(
-        self: &Arc<Self>,
-        weight: Option<u32>,
-        deadline: AcquireDeadline,
-    ) -> Result<Permit> {
+    async fn acquire_inner(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
         let wait_start = Instant::now();
 
@@ -996,7 +960,6 @@ impl RateController {
             semaphore,
             weight,
             rate_controller: self_cloned,
-            deadline,
         })
     }
 }
@@ -1258,11 +1221,11 @@ mod tests {
         assert_eq!(controller.available_permits(), Some(8));
     }
 
-    /// The configured bound is one deadline for the whole request, not one per
-    /// wait. A `Permit::until_ready` that starts part-way through the bound
-    /// gets only the time that is left.
+    /// The bound is per attempt. A `Permit::until_ready` re-check gets the whole
+    /// bound of its own, however much time the original acquire used: it never
+    /// inherits a shared, already-spent deadline.
     #[tokio::test(start_paused = true)]
-    async fn one_deadline_covers_the_acquire_and_the_retry_recheck() {
+    async fn until_ready_gets_the_whole_bound_for_its_own_attempt() {
         let bound = Duration::from_secs(10);
         let controller = RateControllerBuilder::new()
             .with_jitter(JitterConfig::zero())
@@ -1286,8 +1249,8 @@ mod tests {
             .expect_err("the quota is empty, so the re-check must hit the bound");
 
         assert!(
-            recheck_start.elapsed() < Duration::from_secs(5),
-            "the re-check must inherit the remaining deadline, not start a second one"
+            recheck_start.elapsed() >= bound,
+            "the re-check must wait its own full bound, not the remainder of an earlier one"
         );
         let message = error.to_string();
         let Error::AcquireTimeout { target, waited } = &error else {
