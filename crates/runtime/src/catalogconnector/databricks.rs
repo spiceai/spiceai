@@ -212,8 +212,12 @@ async fn shared_databricks_catalog_rate_controller(
         }
     })?;
     let connector_component = ConnectorComponent::from(catalog);
-    // The Databricks clients do not report per-request outcomes, so only the
-    // static limits apply.
+    // The Databricks clients do not yet record per-request outcomes, so only
+    // the static limits apply.
+    http_rate_control::log_static_rate_control_once(
+        "databricks",
+        Some(&catalog.app.runtime.params),
+    );
     let mut rate_control = http_rate_control::resolve_static_config_for_component(
         params,
         Some(&catalog.app.runtime.params),

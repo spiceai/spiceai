@@ -858,7 +858,8 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
         }
     })?;
     // The Databricks clients (Unity Catalog, SQL Warehouse, Spark Connect) do
-    // not report per-request outcomes, so only the static limits apply.
+    // not yet record per-request outcomes, so only the static limits apply.
+    http_rate_control::log_static_rate_control_once(CONNECTOR_NAME, runtime_rate_control_params);
     let mut rate_control = http_rate_control::resolve_static_config_for_component(
         params,
         runtime_rate_control_params,
@@ -1657,8 +1658,8 @@ mod tests {
         Some(headers_end.saturating_add(content_length))
     }
 
-    /// Databricks does not declare the `adaptive_rate_control*` parameters, so
-    /// resolving its rate control must not look them up: an undeclared lookup
+    /// Databricks does not declare the `rate_control_mode` family, so resolving
+    /// its rate control must not look those parameters up: an undeclared lookup
     /// panics, which would fail every Databricks dataset at load.
     #[tokio::test]
     async fn databricks_rate_control_resolves_without_adaptive_parameters() {
@@ -1736,10 +1737,10 @@ mod tests {
         );
     }
 
-    /// `runtime.params.http_adaptive_rate_control` is a runtime-wide default for
-    /// the HTTP connectors that observe request outcomes. Databricks cannot, so the
-    /// default must not stop a Databricks dataset from loading — and there is no
-    /// dataset-level `adaptive_rate_control` to escape it with, because Databricks
+    /// `runtime.params.http_rate_control_mode` is a runtime-wide default for the
+    /// HTTP connectors that record request outcomes. Databricks does not yet, so
+    /// the default must not stop a Databricks dataset from loading — and there is
+    /// no dataset-level `rate_control_mode` to escape it with, because Databricks
     /// does not declare that parameter.
     #[tokio::test]
     async fn runtime_adaptive_default_does_not_block_databricks_dataset() {
@@ -1754,10 +1755,6 @@ mod tests {
                     "databricks_requests_per_second_limit".to_string(),
                     secrecy::SecretString::from("10"),
                 ),
-                (
-                    "databricks_adaptive_rate_control".to_string(),
-                    secrecy::SecretString::from("disabled"),
-                ),
             ],
             "databricks",
             Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
@@ -1765,10 +1762,8 @@ mod tests {
         )
         .await
         .expect("databricks parameters should be accepted");
-        let runtime_params = HashMap::from([(
-            "http_adaptive_rate_control".to_string(),
-            "enabled".to_string(),
-        )]);
+        let runtime_params =
+            HashMap::from([("http_rate_control_mode".to_string(), "adaptive".to_string())]);
         let dataset = make_dataset("databricks:catalog.schema.table", "adaptive_default").await;
         let component = ConnectorComponent::from(&dataset);
 

@@ -56,6 +56,19 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
+use crate::phase_change_log::{Damping, PhaseChangeLog};
+
+/// Documentation for the rate-control parameters, linked from the throttling log
+/// line so an operator can act on it.
+const RATE_CONTROL_DOCS_URL: &str =
+    "https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control";
+
+/// The coefficient of a healthy origin: every configured limit applies in full.
+/// The coefficient is exactly this for any error rate at or below the failure
+/// threshold, and strictly below it above the threshold, so it is the whole
+/// throttling test.
+const FULL_ADMISSION_COEFFICIENT: f64 = 1.0;
+
 /// Default failure threshold.
 pub const DEFAULT_ADAPTIVE_FAILURE_THRESHOLD: f64 = 0.1;
 
@@ -81,6 +94,9 @@ pub enum AdaptiveRateControlError {
 /// [`AdaptiveController`] is built from it via [`AdaptiveController::new`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdaptiveRateControl {
+    /// The error rate above which throttling begins, as a fraction in `(0, 1)`.
+    /// Kept alongside `k` so user-facing messages can quote the configured value.
+    failure_threshold: f64,
     /// Derived from the failure threshold (`k = 1 / (1 - threshold)`).
     k: f64,
     /// Decaying-window half-life.
@@ -107,9 +123,16 @@ impl AdaptiveRateControl {
             return Err(AdaptiveRateControlError::WindowInvalid { window });
         }
         Ok(Self {
+            failure_threshold,
             k: 1.0 / (1.0 - failure_threshold),
             window,
         })
+    }
+
+    /// The configured error rate above which throttling begins, as a fraction.
+    #[must_use]
+    pub fn failure_threshold(&self) -> f64 {
+        self.failure_threshold
     }
 }
 
@@ -132,34 +155,163 @@ pub enum RequestOutcome {
 pub struct AdaptiveController {
     /// Derived from the failure threshold (`k = 1 / (1 - threshold)`).
     k: f64,
+    /// The configured failure threshold, quoted in the throttling log line.
+    failure_threshold: f64,
     /// Decaying-window half-life.
     half_life: Duration,
+    /// The origin this controller governs, named in the log lines.
+    origin: String,
 
-    window: Mutex<DecayWindow>,
+    /// The decaying window and the log state it drives, under one lock so the
+    /// coefficient and the transition decision cannot disagree.
+    state: Mutex<ControllerState>,
+}
+
+/// What the origin is doing, as the log reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThrottleState {
+    /// The error rate is at or below the failure threshold: the origin gets the
+    /// full configured limits.
+    Healthy,
+    /// The error rate is above the failure threshold: the configured limits are
+    /// scaled down.
+    Throttling,
+}
+
+impl ThrottleState {
+    /// The state an admission coefficient shows. The coefficient is exactly
+    /// [`FULL_ADMISSION_COEFFICIENT`] at or below the failure threshold, and
+    /// strictly below it above the threshold.
+    fn of(coefficient: f64) -> Self {
+        if coefficient >= FULL_ADMISSION_COEFFICIENT {
+            Self::Healthy
+        } else {
+            Self::Throttling
+        }
+    }
+}
+
+/// Whether one more recorded outcome could flip the observed state back.
+///
+/// A flap is one outcome crossing the boundary, so this is exactly the condition
+/// the log has to damp: a reading a single outcome away from the boundary waits,
+/// and any firmer reading is written at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Confidence {
+    /// No single outcome can flip the state back.
+    Unambiguous,
+    /// One outcome could flip the state back.
+    NearBoundary,
+}
+
+#[derive(Debug)]
+struct ControllerState {
+    window: DecayWindow,
+    /// Damps the throttling log in time: a state that one outcome could flip
+    /// back must hold for one window before it is logged, and a firmer reading
+    /// is logged as soon as it is seen.
+    ///
+    /// A fixed coefficient band would not work, because the coefficient is
+    /// exactly 1 for every error rate up to the failure threshold and falls away
+    /// immediately above it — any band wide enough to damp noise would also hide
+    /// real throttling. How near the boundary a reading sits depends on how much
+    /// traffic the window holds, which [`Confidence`] measures directly.
+    phases: PhaseChangeLog<ThrottleState>,
 }
 
 impl AdaptiveController {
-    /// Build a live controller from a validated [`AdaptiveRateControl`].
+    /// Build a live controller from a validated [`AdaptiveRateControl`] for
+    /// `origin`, which the throttling log lines name.
     #[must_use]
-    pub fn new(control: AdaptiveRateControl) -> Self {
+    pub fn new(control: AdaptiveRateControl, origin: impl Into<String>) -> Self {
         Self {
             k: control.k,
+            failure_threshold: control.failure_threshold,
             half_life: control.window,
-            window: Mutex::new(DecayWindow {
-                requests: 0.0,
-                accepts: 0.0,
-                last_update: None,
+            origin: origin.into(),
+            state: Mutex::new(ControllerState {
+                window: DecayWindow {
+                    requests: 0.0,
+                    accepts: 0.0,
+                    last_update: None,
+                },
+                phases: PhaseChangeLog::new(ThrottleState::Healthy, control.window),
             }),
         }
     }
 
     /// Record the outcome of one request.
     pub fn record(&self, outcome: RequestOutcome) {
-        let mut window = self.window.lock();
-        window.decay_to(Instant::now(), self.half_life);
-        window.requests += 1.0;
+        match self.record_and_evaluate(outcome) {
+            Some(ThrottleState::Throttling) => tracing::warn!(
+                "Upstream '{}' is failing more than the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
+                self.origin,
+                format_percentage(self.failure_threshold),
+            ),
+            Some(ThrottleState::Healthy) => tracing::info!(
+                "Upstream '{}' has recovered, so adaptive rate control is sending it the full configured limits again.",
+                self.origin,
+            ),
+            None => {}
+        }
+    }
+
+    /// Record one outcome and report the throttling state to log, if any.
+    ///
+    /// Evaluation happens here, per recorded outcome, so a throttled origin whose
+    /// traffic stops reports no recovery until later requests arrive. That is
+    /// accepted: with no traffic there is nothing to throttle, and the live
+    /// coefficient is still in the metrics.
+    ///
+    /// A reading one outcome away from the boundary must hold for one window
+    /// before it is logged, so a marginal episode is reported one window after it
+    /// begins. A firmer reading is logged at once.
+    fn record_and_evaluate(&self, outcome: RequestOutcome) -> Option<ThrottleState> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        state.window.decay_to(now, self.half_life);
+        state.window.requests += 1.0;
         if outcome == RequestOutcome::Success {
-            window.accepts += 1.0;
+            state.window.accepts += 1.0;
+        }
+
+        let (requests, accepts) = (state.window.requests, state.window.accepts);
+        let observed = ThrottleState::of(self.coefficient_of(requests, accepts));
+        // A reading one outcome from the boundary has to hold for a window; a
+        // firmer one is reported the moment it is seen.
+        let damping = match self.confidence_of(observed, requests, accepts) {
+            Confidence::Unambiguous => Damping::Immediate,
+            Confidence::NearBoundary => Damping::AfterHold,
+        };
+        state.phases.observe(observed, now, damping)
+    }
+
+    /// Whether one more recorded outcome could flip `observed` back.
+    ///
+    /// Decided on `k · accepts` against `requests`, never on the admission
+    /// coefficient. The coefficient is clamped to 1, so an origin with a large
+    /// success margin and one that is barely healthy both read exactly 1.0: the
+    /// clamped value cannot tell a firm reading from a knife-edge one, and every
+    /// recovery would look marginal.
+    ///
+    /// In coefficient terms the near-boundary band is `(k - 1) / (requests + 1)`
+    /// wide, so it widens as traffic falls — which is where one outcome carries
+    /// the most weight.
+    fn confidence_of(&self, observed: ThrottleState, requests: f64, accepts: f64) -> Confidence {
+        let weighted_accepts = self.k * accepts;
+        let one_outcome_flips_it = match observed {
+            // One success adds a request and `k` weighted accepts, so health
+            // returns when `k · accepts >= requests + 1 - k`.
+            ThrottleState::Throttling => weighted_accepts >= requests + 1.0 - self.k,
+            // One failure adds a request, so health survives only while
+            // `k · accepts >= requests + 1`.
+            ThrottleState::Healthy => weighted_accepts < requests + 1.0,
+        };
+
+        if one_outcome_flips_it {
+            Confidence::NearBoundary
+        } else {
+            Confidence::Unambiguous
         }
     }
 
@@ -172,19 +324,24 @@ impl AdaptiveController {
 
     fn admission_coefficient_at(&self, now: Instant) -> f64 {
         let (requests, accepts) = {
-            let mut window = self.window.lock();
-            window.decay_to(now, self.half_life);
-            (window.requests, window.accepts)
+            let mut state = self.state.lock();
+            state.window.decay_to(now, self.half_life);
+            (state.window.requests, state.window.accepts)
         };
 
-        // Both `+1`s live inside the fraction: numerator `k*accepts + 1`,
-        // denominator `requests + 1`. At 100% success (accepts == requests) the
-        // ratio is `(k*r + 1) / (r + 1) >= 1` for `k > 1` and any finite `r`, so
-        // a healthy origin is never throttled. The coefficient falls below 1
-        // exactly when `accepts/requests < 1/k`, i.e. the error rate exceeds the
-        // configured failure threshold.
-        let coefficient = (self.k * accepts + 1.0) / (requests + 1.0);
-        coefficient.clamp(0.0, 1.0)
+        self.coefficient_of(requests, accepts)
+    }
+
+    /// The admission coefficient for a decayed window.
+    ///
+    /// Both `+1`s live inside the fraction: numerator `k*accepts + 1`,
+    /// denominator `requests + 1`. At 100% success (accepts == requests) the
+    /// ratio is `(k*r + 1) / (r + 1) >= 1` for `k > 1` and any finite `r`, so a
+    /// healthy origin is never throttled. The coefficient falls below 1 exactly
+    /// when `accepts/requests < 1/k`, i.e. the error rate exceeds the configured
+    /// failure threshold.
+    fn coefficient_of(&self, requests: f64, accepts: f64) -> f64 {
+        ((self.k * accepts + 1.0) / (requests + 1.0)).clamp(0.0, 1.0)
     }
 
     /// The real-valued weight one request should charge right now: `1 /
@@ -204,6 +361,15 @@ impl AdaptiveController {
         }
         1.0 / coefficient
     }
+}
+
+/// Format a fraction as a percentage for a user-facing message: `0.1` reads as
+/// `10%`, `0.125` as `12.5%`.
+fn format_percentage(fraction: f64) -> String {
+    let percentage = fraction * 100.0;
+    let text = format!("{percentage:.2}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    format!("{text}%")
 }
 
 #[derive(Debug)]
@@ -244,7 +410,7 @@ mod tests {
     }
 
     fn enabled(failure_threshold: f64) -> AdaptiveController {
-        AdaptiveController::new(control(failure_threshold))
+        AdaptiveController::new(control(failure_threshold), "https://origin.example.com")
     }
 
     #[test]
@@ -271,6 +437,7 @@ mod tests {
             let controller = AdaptiveController::new(
                 AdaptiveRateControl::new(0.10, DEFAULT_ADAPTIVE_WINDOW)
                     .expect("a 10% failure threshold is valid"),
+                "https://origin.example.com",
             );
             for request in 1..=8000u32 {
                 let failed = fail_every != 0 && request % fail_every == 0;
@@ -399,6 +566,178 @@ mod tests {
             "error rate above the threshold must throttle, got {}",
             controller.admission_coefficient()
         );
+    }
+
+    /// The number of accepts that puts a window of `requests` at exactly
+    /// `coefficient`, for reading the near-boundary band in coefficient terms.
+    fn accepts_for_coefficient(
+        controller: &AdaptiveController,
+        requests: f64,
+        coefficient: f64,
+    ) -> f64 {
+        (coefficient * (requests + 1.0) - 1.0) / controller.k
+    }
+
+    /// (a) A throttle deep enough that no single success could restore health is
+    /// reported at once, with no dwell.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_deep_throttle_is_reported_at_once() {
+        // 10% failure threshold => k = 1.1111. One failure alone already sits
+        // below `requests + 1 - k` (0 < 0.8889), so one success cannot undo it.
+        let controller = enabled(0.1);
+
+        assert_eq!(
+            controller.record_and_evaluate(RequestOutcome::Failure),
+            Some(ThrottleState::Throttling),
+            "an unambiguous throttle must be reported without waiting a window"
+        );
+        assert_eq!(
+            controller.record_and_evaluate(RequestOutcome::Failure),
+            None,
+            "the same state must not be reported twice"
+        );
+    }
+
+    /// (d) A recovery with headroom is reported at once. This is the test that
+    /// fails if the decision is routed through the clamped coefficient: the
+    /// clamp hides the headroom, so every recovery would look marginal and wait.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_recovery_with_headroom_is_reported_at_once() {
+        // 10% failure threshold. A failure burst, then the origin recovers.
+        let controller = enabled(0.1);
+        for _ in 0..200 {
+            controller.record_and_evaluate(RequestOutcome::Failure);
+        }
+
+        // Let the burst age out, then drive successes with the clock stopped, so
+        // any report can only come from confidence, never from a dwell elapsing.
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW * 6).await;
+        let reported: Vec<ThrottleState> = (0..200)
+            .filter_map(|_| controller.record_and_evaluate(RequestOutcome::Success))
+            .collect();
+
+        assert_eq!(
+            reported,
+            vec![ThrottleState::Healthy],
+            "recovery must be reported exactly once, and without the clock moving"
+        );
+    }
+
+    /// The confidence test matches `k · accepts` against `requests`, so the
+    /// near-boundary band is the documented `(k - 1) / (requests + 1)` wide.
+    #[test]
+    fn confidence_marks_only_readings_one_outcome_from_the_boundary() {
+        // 10% failure threshold => k = 1.1111. At requests = 10 the boundary is
+        // `k · accepts = requests + 1 - k` = 9.8889, i.e. accepts = 8.9.
+        let controller = enabled(0.1);
+
+        let firm = controller.confidence_of(ThrottleState::Throttling, 10.0, 8.8);
+        let marginal = controller.confidence_of(ThrottleState::Throttling, 10.0, 8.95);
+        assert_eq!(firm, Confidence::Unambiguous);
+        assert_eq!(marginal, Confidence::NearBoundary);
+
+        // The documented band edge at requests = 10 is coefficient 0.98990.
+        assert!(controller.coefficient_of(10.0, 8.8) < 0.989_90);
+        assert!(controller.coefficient_of(10.0, 8.95) > 0.989_90);
+    }
+
+    /// The band must widen as traffic falls, where one outcome carries the most
+    /// weight. The same coefficient is a knife edge on a small window and firm
+    /// on a large one.
+    #[test]
+    fn the_near_boundary_band_widens_as_traffic_falls() {
+        let controller = enabled(0.1);
+        let coefficient = 0.995;
+
+        let quiet = accepts_for_coefficient(&controller, 10.0, coefficient);
+        let busy = accepts_for_coefficient(&controller, 100.0, coefficient);
+
+        assert_eq!(
+            controller.confidence_of(ThrottleState::Throttling, 10.0, quiet),
+            Confidence::NearBoundary,
+            "on little traffic, coefficient 0.995 is one outcome from the boundary"
+        );
+        assert_eq!(
+            controller.confidence_of(ThrottleState::Throttling, 100.0, busy),
+            Confidence::Unambiguous,
+            "on more traffic, the same coefficient is a firm reading"
+        );
+    }
+
+    /// The clamp must stay out of the confidence decision: two healthy windows
+    /// with the same clamped coefficient of exactly 1.0, one with headroom and
+    /// one on the edge, must read differently.
+    #[test]
+    fn recovery_headroom_is_read_before_the_coefficient_is_clamped() {
+        // 50% failure threshold => k = 2.
+        let controller = enabled(0.5);
+
+        // Raw ratio 1.909 and raw ratio 1.0. Both clamp to exactly 1.0.
+        assert!((controller.coefficient_of(10.0, 10.0) - 1.0).abs() < f64::EPSILON);
+        assert!((controller.coefficient_of(10.0, 5.0) - 1.0).abs() < f64::EPSILON);
+
+        assert_eq!(
+            controller.confidence_of(ThrottleState::Healthy, 10.0, 10.0),
+            Confidence::Unambiguous,
+            "a recovery with headroom must not look marginal"
+        );
+        assert_eq!(
+            controller.confidence_of(ThrottleState::Healthy, 10.0, 5.0),
+            Confidence::NearBoundary,
+            "a recovery one failure from the boundary must wait"
+        );
+    }
+
+    /// (e) Known limitation: the state is evaluated per recorded outcome, so a
+    /// throttled origin whose traffic stops reports no recovery until enough
+    /// later requests arrive.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_quiet_origin_reports_recovery_only_when_traffic_returns() {
+        let window = Duration::from_secs(10);
+        let mut phases = PhaseChangeLog::new(ThrottleState::Healthy, window);
+        let start = Instant::now();
+
+        assert_eq!(
+            phases.observe(ThrottleState::Throttling, start, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(
+                ThrottleState::Throttling,
+                start + window,
+                Damping::AfterHold
+            ),
+            Some(ThrottleState::Throttling)
+        );
+
+        // Traffic stops for an hour. Nothing is evaluated, so nothing is
+        // reported, however long the origin has been healthy.
+        let quiet_for = Duration::from_secs(3600);
+        assert_eq!(
+            phases.observe(
+                ThrottleState::Healthy,
+                start + quiet_for,
+                Damping::AfterHold
+            ),
+            None,
+            "the first request back only starts the hold"
+        );
+        assert_eq!(
+            phases.observe(
+                ThrottleState::Healthy,
+                start + quiet_for + window,
+                Damping::AfterHold
+            ),
+            Some(ThrottleState::Healthy),
+            "a marginal recovery is reported one window after traffic returns"
+        );
+    }
+
+    #[test]
+    fn percentages_read_as_the_configured_value() {
+        assert_eq!(format_percentage(0.1), "10%");
+        assert_eq!(format_percentage(0.25), "25%");
+        assert_eq!(format_percentage(0.125), "12.5%");
     }
 
     #[test]
