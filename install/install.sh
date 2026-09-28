@@ -15,9 +15,6 @@ SPICE_BIN=".spice/bin"
 
 # sudo is required to copy binary to SPICE_INSTALL_DIR for linux
 : ${USE_SUDO:="false"}
-# An explicit USE_SUDO=true from the environment always holds; otherwise sudo is
-# decided from the install directory's permissions each time getSystemInfo runs.
-USE_SUDO_REQUESTED="$USE_SUDO"
 
 # Http request CLI
 SPICE_HTTP_REQUEST_CLI=curl
@@ -41,9 +38,7 @@ getSystemInfo() {
 
     OS=$(uname | tr '[:upper:]' '[:lower:]')
 
-    # Determine if sudo is needed based on install directory permissions. Start
-    # from the requested value so a re-check can clear a need that no longer holds.
-    USE_SUDO="$USE_SUDO_REQUESTED"
+    # Determine if sudo is needed based on install directory permissions
     if [[ -d "$SPICE_CLI_INSTALL_DIR" ]]; then
         # Directory exists, check if we can write to it
         if [[ ! -w "$SPICE_CLI_INSTALL_DIR" ]]; then
