@@ -358,7 +358,12 @@ async fn cross_partition_overwrite_aborts_on_apply_failure() {
         // coordinator's apply loop.
         let result = setup
             .catalog
-            .commit_compaction_in_txn(&mut *txn, "not-a-uuid", "also-not-a-uuid")
+            .commit_compaction_in_txn(
+                &mut *txn,
+                "not-a-uuid",
+                "also-not-a-uuid",
+                "also-not-a-uuid",
+            )
             .await;
         assert!(
             result.is_err(),

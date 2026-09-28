@@ -455,17 +455,17 @@ pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
 /// function.
 ///
 /// `dow` is deliberately absent, and its absence is what keeps a weekday off
-/// `BigQuery` rather than sending a wrong one. Two spellings of a weekday arrive
-/// as the *same* call — a `ScalarFunction` named `date_part` — carrying
-/// different functions: `date_part('dow', c)` resolves through the registry to
-/// `datafusion_spark`'s, which counts Sunday as 1, while `EXTRACT(DOW FROM c)` is
-/// planned straight onto `DataFusion`'s, which counts Sunday as 0. Measured on a
-/// Wednesday: `4` and `3`. The name cannot separate them, so any single rendering
-/// answers one of the two a day short. Refusing the call here leaves it above the
-/// federated scan, where each spelling keeps the value it has today — see
-/// [#13920](https://github.com/spiceai/spiceai/issues/13920), which tracks making
-/// the two agree. `doy`, `week` and `quarter` were measured to agree between the
-/// spellings and federate.
+/// `BigQuery` rather than sending a wrong one. Both spellings of a weekday —
+/// `date_part('dow', c)` and `EXTRACT(DOW FROM c)` — reach here as one call, a
+/// `ScalarFunction` named `date_part` on `DataFusion`'s built-in, which counts
+/// Sunday as 0; `BigQuery`'s `DAYOFWEEK` counts Sunday as 1, so the inner
+/// dialect's `EXTRACT(DAYOFWEEK FROM …)` rendering would answer a day high.
+/// Refusing the call here leaves it above the federated scan. Rendering it as
+/// `EXTRACT(DAYOFWEEK FROM …) - 1` is
+/// [#14056](https://github.com/spiceai/spiceai/issues/14056), which needs the
+/// generated SQL and the returned type measured against a live project. `doy`,
+/// `week` and `quarter` were measured to agree between the spellings and
+/// federate.
 fn date_part_field_is_renderable(args: &[Expr]) -> bool {
     let [Expr::Literal(field, _), _operand] = args else {
         // Not a constant field: the inner dialect cannot render it either, and
@@ -2099,10 +2099,10 @@ mod tests {
     /// Every nameable date field federates, except `dow`; a computed field does
     /// not.
     ///
-    /// `dow` is the exception because the two spellings of a weekday carry
-    /// different functions behind the same name — Spark's `date_part` counts
-    /// Sunday as 1, `DataFusion`'s 0, measured on a Wednesday as 4 and 3 — so no
-    /// single rendering serves both and the call has to stay local.
+    /// `dow` is the exception because `BigQuery`'s `DAYOFWEEK` counts Sunday
+    /// as 1 where `DataFusion`'s `dow` counts Sunday as 0, so the dialect's
+    /// rendering would answer a day high and the call has to stay local until
+    /// #14056 renders it a day lower.
     #[test]
     fn every_nameable_date_field_federates_and_a_computed_one_does_not() {
         let field = |name: &str| call("date_part", vec![lit(name), col("d")]);
@@ -2112,14 +2112,14 @@ mod tests {
                 "{pushed} renders through the dialect, so it federates"
             );
         }
-        // `dow` is the one field the dialect will not render, because the two
-        // spellings that reach it disagree by a day (see the doc comment on
+        // `dow` is the one field the dialect will not render, because BigQuery
+        // counts the weekday a day higher (see the doc comment on
         // `date_part_field_is_renderable`). It has to be refused *here* too: a
         // rendering the dialect declines but federation allows is not a local
         // fallback, it is a failed query.
         assert!(
             !translates(&field("dow")),
-            "dow must not federate: no single rendering serves both spellings"
+            "dow must not federate: BigQuery's DAYOFWEEK counts Sunday as 1"
         );
         // A field the dialect cannot name reaches BigQuery as `date_part(…)`,
         // which it has no function for.
