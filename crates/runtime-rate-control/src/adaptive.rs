@@ -712,7 +712,7 @@ mod tests {
 
         // Traffic stops for an hour. Nothing is evaluated, so nothing is
         // reported, however long the origin has been healthy.
-        let quiet_for = Duration::from_secs(3600);
+        let quiet_for = Duration::from_hours(1);
         assert_eq!(
             phases.observe(
                 ThrottleState::Healthy,
