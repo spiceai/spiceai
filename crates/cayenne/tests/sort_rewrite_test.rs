@@ -586,6 +586,9 @@ async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
         sql_insert(&table, "sort_nulls_files", &values.join(", ")).await;
     }
 
+    // The second pass reads the snapshot the first attested as sorted; it must
+    // write the same single order again.
+    table.sort_and_rewrite_data(64 * 1024).await?;
     table.sort_and_rewrite_data(64 * 1024).await?;
 
     // One partition reads the snapshot's files in order as a single stream, so

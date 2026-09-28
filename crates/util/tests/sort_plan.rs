@@ -32,7 +32,7 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use datafusion::prelude::SessionConfig;
 use futures::TryStreamExt;
-use util::stream_utils::{max_sort_partitions, sort_plan};
+use util::stream_utils::{SORT_PARTITION_WORKING_BYTES, max_sort_partitions, sort_plan};
 
 type Row = (Option<i64>, String);
 
@@ -228,25 +228,43 @@ async fn unresolvable_or_empty_sort_columns_keep_every_row() {
     }
 }
 
-/// A bounded pool caps how many partitions sort at once, since each reserves
-/// `sort_spill_reservation_bytes` up front; the capped plan still orders every
-/// row.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bounded_pool_caps_the_sorting_partitions() {
-    let reservation = 1024 * 1024;
+fn bounded_context(pool_bytes: usize, reservation: usize) -> Arc<TaskContext> {
     let mut config = SessionConfig::new();
     config.options_mut().execution.sort_spill_reservation_bytes = reservation;
     let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::new(GreedyMemoryPool::new(8 * reservation + 1)))
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
         .build_arc()
         .expect("runtime");
-    let ctx = Arc::new(
+    Arc::new(
         TaskContext::default()
             .with_session_config(config)
             .with_runtime(runtime),
-    );
-    assert_eq!(max_sort_partitions(&ctx), 2, "a quarter of 8 reservations");
+    )
+}
+
+#[test]
+fn sort_width_is_what_half_the_pool_gives_each_sort() {
+    let reservation = 1024 * 1024;
+    let per_sort = reservation + SORT_PARTITION_WORKING_BYTES;
+    for (pool, width) in [
+        (4 * per_sort + 1, 2),
+        (2 * per_sort, 1),
+        // A pool too small for even one sort still sorts, serially.
+        (per_sort / 3, 1),
+        (40 * per_sort, 20),
+    ] {
+        assert_eq!(max_sort_partitions(&bounded_context(pool, reservation)), width, "pool {pool}");
+    }
     assert_eq!(max_sort_partitions(&TaskContext::default()), usize::MAX);
+}
+
+/// A bounded pool caps how many partitions sort at once; the capped plan still
+/// orders every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_pool_caps_the_sorting_partitions() {
+    let reservation = 1024 * 1024;
+    let ctx = bounded_context(4 * (reservation + SORT_PARTITION_WORKING_BYTES) + 1, reservation);
+    assert_eq!(max_sort_partitions(&ctx), 2);
 
     let parts = partitions();
     let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");

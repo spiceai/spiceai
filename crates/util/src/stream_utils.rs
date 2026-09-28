@@ -106,11 +106,11 @@ pub fn stream_plan(stream: SendableRecordBatchStream) -> Arc<dyn ExecutionPlan> 
 /// being sorted again. The order equals a single sort of all of `input`'s rows;
 /// only the relative order of rows with equal keys may differ.
 ///
-/// Every sorting partition reserves `sort_spill_reservation_bytes` of
-/// `context`'s memory pool up front, which a single sort did not multiply. So
-/// the partitions are first round-robined down to as many as keep those
-/// reservations within a quarter of a bounded pool (see
-/// [`max_sort_partitions`]); an unbounded pool keeps them all.
+/// Every sorting partition needs memory of its own to make progress, so the
+/// partitions are first round-robined down to as many as a bounded pool can
+/// give that memory (see [`max_sort_partitions`]); an unbounded pool keeps
+/// them all. A pool too small for two sorts gets one, which is the single
+/// spilling sort this replaces.
 ///
 /// `sort_columns` follows [`sort_stream`]: an empty list, or one that does not
 /// resolve against `input`'s schema (logged), returns `input` unchanged, with
@@ -157,9 +157,21 @@ pub fn sort_plan(
     Ok(Arc::new(SortPreservingMergeExec::new(ordering, sorted)))
 }
 
-/// The most partitions [`sort_plan`] sorts at once under `context`: enough that
-/// their up-front merge reservations (`sort_spill_reservation_bytes` each) take
-/// at most a quarter of a bounded memory pool, and at least one.
+/// Working memory [`sort_plan`] budgets for each partition it sorts, on top
+/// of that partition's `sort_spill_reservation_bytes`.
+///
+/// A spilling `SortExec` must buffer at least one batch before it can spill,
+/// and it fails ("Not enough memory to continue external sort") rather than
+/// spilling when its pool refuses it while it holds nothing. Sorts sharing one
+/// greedy pool with the scan feeding them can each be left holding nothing, so
+/// each is budgeted room for several wide batches (a batch of wide rows runs
+/// past 10 MiB).
+pub const SORT_PARTITION_WORKING_BYTES: usize = 128 * 1024 * 1024;
+
+/// The most partitions [`sort_plan`] sorts at once under `context`: as many as
+/// half a bounded memory pool gives each its `sort_spill_reservation_bytes`
+/// plus [`SORT_PARTITION_WORKING_BYTES`], and at least one. The other half is
+/// left to the scan and the merge. An unbounded pool imposes no cap.
 #[must_use]
 pub fn max_sort_partitions(context: &TaskContext) -> usize {
     let per_sort = context
@@ -167,9 +179,9 @@ pub fn max_sort_partitions(context: &TaskContext) -> usize {
         .options()
         .execution
         .sort_spill_reservation_bytes
-        .max(1);
+        .saturating_add(SORT_PARTITION_WORKING_BYTES);
     match context.memory_pool().memory_limit() {
-        MemoryLimit::Finite(limit) => (limit / 4 / per_sort).max(1),
+        MemoryLimit::Finite(limit) => (limit / 2 / per_sort).max(1),
         MemoryLimit::Infinite | MemoryLimit::Unknown => usize::MAX,
     }
 }

@@ -17506,14 +17506,20 @@ impl CayenneTableProvider {
         // The replace arrives as one stream. Deal it round-robin over the
         // session's partitions so the key and the sort run on all of them, as
         // they do for a rewrite's scan partitions; the merge restores one order.
+        // Deal it straight to as many partitions as the pool lets sort at once,
+        // so `sort_plan` need not repartition a second time.
         let ctx = self.create_session_context();
         let task_ctx = ctx.task_ctx();
-        let input: Arc<dyn ExecutionPlan> = Arc::new(datafusion_physical_plan::repartition::RepartitionExec::try_new(
-            util::stream_utils::stream_plan(data),
-            datafusion_physical_plan::Partitioning::RoundRobinBatch(
-                ctx.state().config().target_partitions(),
-            ),
-        )?);
+        let partitions = ctx
+            .state()
+            .config()
+            .target_partitions()
+            .min(util::stream_utils::max_sort_partitions(&task_ctx));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion_physical_plan::repartition::RepartitionExec::try_new(
+                util::stream_utils::stream_plan(data),
+                datafusion_physical_plan::Partitioning::RoundRobinBatch(partitions),
+            )?);
         let ordered = self.order_rewrite_plan(input, &order, &task_ctx)?;
         Ok((
             datafusion_physical_plan::execute_stream(ordered, task_ctx)?,
