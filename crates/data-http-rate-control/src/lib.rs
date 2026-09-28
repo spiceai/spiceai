@@ -1633,7 +1633,7 @@ fn parse_optional_failure_threshold_param<S: BuildHasher>(
 /// failing fast is correct. Scales automatically when the user raises
 /// `client_timeout` for a slow origin. Bounds the otherwise-unbounded permit
 /// wait (#14348). `client_timeout` already includes the connect phase, so
-/// connect_timeout is deliberately not added.
+/// `connect_timeout` is deliberately not added.
 #[must_use]
 pub fn default_acquire_timeout(client_timeout: Duration) -> Duration {
     client_timeout
