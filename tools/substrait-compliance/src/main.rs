@@ -17,11 +17,13 @@ limitations under the License.
 //! Substrait compliance harness for Spice.
 //!
 //! Mode A runs the IBM TPC-H suite against the workspace `DataFusion` fork
-//! (`datafusion-substrait` consumer). Mode B encodes `FlightSQL`
-//! `CommandStatementSubstraitPlan` commands and skips execution until a
-//! `spiced` fixture exists.
+//! (`datafusion-substrait` consumer), over the suite's SF 0.01 CSVs or, with
+//! `--scale-factor`, over tables `tpchgen` generates at that scale. Mode B
+//! encodes `FlightSQL` `CommandStatementSubstraitPlan` commands and skips
+//! execution until a `spiced` fixture exists.
 
 mod compare;
+mod datagen;
 mod error;
 mod mode_a;
 mod mode_b;
@@ -29,11 +31,14 @@ mod report;
 mod schema;
 mod suite;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
+use datafusion::prelude::SessionConfig;
+use snafu::{ResultExt, ensure};
 
 use crate::error::Result;
 use crate::report::ComplianceReport;
@@ -109,6 +114,31 @@ struct Args {
     /// `FlightSQL` endpoint used only by Mode B (not contacted yet).
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     flightsql_endpoint: String,
+
+    /// TPC-H scale factor. Omit to run the suite's own SF 0.01 CSVs against
+    /// its goldens; set, Mode A generates the tables in memory with `tpchgen`
+    /// at this scale and compares against `--expected`.
+    #[arg(long)]
+    scale_factor: Option<f64>,
+
+    /// Directory of goldens (`q01.csv` … `q22.csv` in the suite's typed CSV
+    /// format) that replaces the suite's own. Default with `--scale-factor`:
+    /// `tools/substrait-compliance/expected/sf<SF>`.
+    #[arg(long)]
+    expected: Option<PathBuf>,
+
+    /// Write the `--scale-factor` tables into this directory as pipe-delimited
+    /// CSVs (the suite's `data/` layout) and exit without running any case:
+    /// the rows `scripts/generate_expected.py` computes goldens from.
+    #[arg(long, requires = "scale_factor")]
+    write_data: Option<PathBuf>,
+}
+
+/// Where a `--scale-factor` run finds its goldens unless `--expected` says.
+fn default_expected_dir(scale_factor: f64) -> PathBuf {
+    PathBuf::from(format!(
+        "tools/substrait-compliance/expected/sf{scale_factor}"
+    ))
 }
 
 #[tokio::main]
@@ -124,6 +154,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let args = Args::parse();
+    if let (Some(dir), Some(scale_factor)) = (&args.write_data, args.scale_factor) {
+        return write_data(scale_factor, dir).await;
+    }
     let out_json = args
         .out_json
         .clone()
@@ -132,7 +165,17 @@ async fn run() -> Result<ExitCode> {
         .out_csv
         .clone()
         .unwrap_or_else(|| args.mode.default_output("csv"));
-    let suite = load_tpch_suite(&args.suite)?;
+    let expected_dir = args
+        .expected
+        .clone()
+        .or_else(|| args.scale_factor.map(default_expected_dir));
+    if let Some(dir) = &expected_dir {
+        ensure!(
+            dir.is_dir(),
+            error::MissingExpectedDirSnafu { path: dir.clone() }
+        );
+    }
+    let suite = load_tpch_suite(&args.suite, expected_dir.as_deref())?;
     println!(
         "Loaded IBM suite '{}' v{} ({} cases) from {}",
         suite.name,
@@ -140,19 +183,48 @@ async fn run() -> Result<ExitCode> {
         suite.cases.len(),
         suite.root.display()
     );
-    if !suite.description.is_empty() {
+    // The suite's description states its own scale factor, which a generated
+    // run does not use.
+    if args.scale_factor.is_none() && !suite.description.is_empty() {
         println!("{}", suite.description);
     }
     println!("Suite: {SUITE_REF}");
     println!("DataFusion fork rev: {DATAFUSION_FORK_REV}");
+    let expected_source = expected_dir
+        .as_ref()
+        .map_or_else(|| "suite".to_string(), |dir| dir.display().to_string());
+    match &expected_dir {
+        Some(dir) => println!("Expected output: {}", dir.display()),
+        None => println!("Expected output: the suite's goldens"),
+    }
 
     let selected = suite::select_cases(&suite.cases, args.query.as_deref())?;
 
     let start = Utc::now();
     let (engine_name, engine_version, mode_name, results) = match args.mode {
         Mode::ModeA => {
-            let data_dir = suite.root.join("data");
-            let engine = mode_a::ModeAEngine::with_tpch_data(&data_dir).await?;
+            let engine = match args.scale_factor {
+                None => {
+                    let data_dir = suite.root.join("data");
+                    println!("Data: suite CSVs ({})", data_dir.display());
+                    mode_a::ModeAEngine::with_tpch_data(&data_dir).await?
+                }
+                Some(scale_factor) => {
+                    let started = Instant::now();
+                    let (engine, row_counts) =
+                        mode_a::ModeAEngine::with_generated_data(scale_factor).await?;
+                    println!(
+                        "Data: TPC-H SF {scale_factor} generated by tpchgen in {:.1}s ({})",
+                        started.elapsed().as_secs_f64(),
+                        row_counts
+                            .iter()
+                            .map(|(table, rows)| format!("{table} {rows}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    engine
+                }
+            };
             let results = engine.run_suite(&selected).await?;
             (
                 mode_a::ENGINE_NAME.to_string(),
@@ -198,6 +270,14 @@ async fn run() -> Result<ExitCode> {
             mode: mode_name,
             suite_ref: SUITE_REF.to_string(),
             datafusion_pin: format!("spiceai/datafusion@{DATAFUSION_FORK_REV}"),
+            scale_factor: args.scale_factor.or(suite.scale_factor),
+            data_source: match (args.mode, args.scale_factor) {
+                (Mode::ModeB, _) => "none",
+                (Mode::ModeA, None) => "suite",
+                (Mode::ModeA, Some(_)) => "tpchgen",
+            }
+            .to_string(),
+            expected_source,
             start_time: start,
         },
         results,
@@ -223,5 +303,30 @@ async fn run() -> Result<ExitCode> {
 
     // Report-only: never fail the process on a low pass rate. A non-zero
     // exit is reserved for harness I/O / load errors (already returned).
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--write-data`: generate the tables at `scale_factor` and write them as the
+/// suite's `data/` CSVs under `dir`.
+async fn write_data(scale_factor: f64, dir: &Path) -> Result<ExitCode> {
+    let started = Instant::now();
+    let parts = SessionConfig::new().target_partitions();
+    let tables = datagen::generate(scale_factor, parts).await?;
+    let out = dir.to_path_buf();
+    let tables =
+        tokio::task::spawn_blocking(move || datagen::write_csv(&tables, &out).map(|()| tables))
+            .await
+            .context(error::GenerateTaskSnafu)??;
+    for table in &tables {
+        println!(
+            "Wrote {} ({} rows)",
+            dir.join(format!("{}.csv", table.table.file_stem)).display(),
+            table.num_rows()
+        );
+    }
+    println!(
+        "TPC-H SF {scale_factor} generated by tpchgen in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(ExitCode::SUCCESS)
 }
