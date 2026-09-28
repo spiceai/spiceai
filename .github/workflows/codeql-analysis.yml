@@ -225,6 +225,19 @@ jobs:
             echo "::error::CodeQL CLI was not installed, so SARIF was not produced."
             exit 1
           fi
+          # A bare `codeql database analyze` evaluates on one thread inside
+          # the CLI's small default memory budget, and a full Rust database
+          # runs its Java heap out before the suite finishes. The analyze
+          # action sizes both from the VM; do the same here: reserve 1 GiB
+          # plus 5% of the memory above 8 GiB, and use one thread per core.
+          mem_kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+          if [[ ! "${mem_kb}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read MemTotal from /proc/meminfo, so the CodeQL memory budget cannot be sized and SARIF was not produced."
+            exit 1
+          fi
+          mem_mb=$(( mem_kb / 1024 ))
+          ram_mb=$(( mem_mb - 1024 - (mem_mb > 8192 ? (mem_mb - 8192) / 20 : 0) ))
+          echo "Evaluating with --ram=${ram_mb} of ${mem_mb} MB and one thread per core"
           mkdir -p "${SARIF_DIR}"
           found=0
           shopt -s nullglob
@@ -244,6 +257,8 @@ jobs:
             echo "Analyzing ${lang} with ${suite}"
             "${CODEQL_PATH}" database analyze \
               --format=sarifv2.1.0 \
+              --ram="${ram_mb}" \
+              --threads=0 \
               --output="${SARIF_DIR}/${lang}.sarif" \
               -- \
               "${db}" \
