@@ -131,11 +131,20 @@ def lint_recipe() -> str:
     """The recipe lines of the Makefile's `lint-rust` target (tab-indented)."""
     after_target = MAKEFILE.read_text(encoding="utf-8").split("\nlint-rust:", 1)[-1]
     # Drop the rest of the target line (its prerequisites) before reading the recipe.
+    # The recipe ends where make ends it, not at the first line without a tab: a
+    # line continuing a `\`-terminated one belongs to it however it is indented,
+    # and blank lines and column-0 comments may sit between recipe lines without
+    # ending the recipe. Stopping early would drop every guard after that point.
     lines = []
+    continued = False
     for line in after_target.split("\n", 1)[-1].splitlines():
-        if not line.startswith("\t"):
+        if continued or line.startswith("\t"):
+            lines.append(line)
+            continued = line.endswith("\\")
+        elif not line.strip() or line.startswith("#"):
+            continue
+        else:
             break
-        lines.append(line)
     return "\n".join(lines)
 
 

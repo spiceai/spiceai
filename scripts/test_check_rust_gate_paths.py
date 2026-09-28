@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -278,6 +279,46 @@ check(
         "scripts/check_table_layers.py",
     ],
 )
+
+print("lint_recipe")
+
+# The cases above hand `derived_gate_paths` a recipe directly, so they cannot see
+# a guard that `lint_recipe` never extracted from the Makefile. These read a
+# synthetic Makefile through it. Each shape was confirmed by running it through
+# make: every guard in it runs, so every guard in it must derive.
+
+
+def extracted_from(makefile: str) -> list[str]:
+    """Guard paths derived from `makefile` read through `lint_recipe`."""
+    original = check_rust_gate_paths.MAKEFILE
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Makefile"
+        path.write_text(makefile, encoding="utf-8")
+        check_rust_gate_paths.MAKEFILE = path
+        try:
+            paths, _ = derived_gate_paths([])
+        finally:
+            check_rust_gate_paths.MAKEFILE = original
+    return sorted(set(paths) - set(check_rust_gate_paths.RUST_SOURCE_PATHS))
+
+
+RECIPE_SHAPES = {
+    "a space-indented continuation": "\t$(PYTHON) \\\n    scripts/check_crate_layers.py\n",
+    "an unindented continuation": "\t$(PYTHON) \\\nscripts/check_crate_layers.py\n",
+    "a blank line": "\t@echo lint\n\n\t$(PYTHON) scripts/check_crate_layers.py\n",
+    "a make comment": "\t@echo lint\n# comment\n\t$(PYTHON) scripts/check_crate_layers.py\n",
+}
+for name, body in RECIPE_SHAPES.items():
+    check(
+        f"a guard after {name} is extracted",
+        extracted_from(
+            f"lint-rust: deps\n{body}"
+            "\t$(PYTHON) scripts/check_table_layers.py\n"
+            "other:\n"
+            "\t$(PYTHON) scripts/check_fork_patches.py\n"
+        ),
+        ["scripts/check_crate_layers.py", "scripts/check_table_layers.py"],
+    )
 
 check(
     "the clippy config directory derives its clippy.toml",
