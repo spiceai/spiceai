@@ -3002,37 +3002,56 @@ mod tests {
         )
         .build();
 
-        // 2026-01-04 is a Sunday: 0 under the built-in, 1 under Spark's.
-        let batches = df
+        // 2026-01-04 is a Sunday: the one weekday the two conventions name
+        // differently at a glance, 0 documented and 1 under Spark's.
+        let weekday = df
             .ctx
             .sql(
-                "SELECT date_part('dow', DATE '2026-01-04') AS via_date_part,                  EXTRACT(DOW FROM DATE '2026-01-04') AS via_extract",
+                "SELECT date_part('dow', DATE '2026-01-04') AS via_date_part, \
+                 EXTRACT(DOW FROM DATE '2026-01-04') AS via_extract",
             )
             .await
             .expect("plan the weekday extraction")
             .collect()
             .await
             .expect("run the weekday extraction");
-        // Both spellings must count Sunday as 0.
-        let expected = [
-            "+---------------+-------------+",
-            "| via_date_part | via_extract |",
-            "+---------------+-------------+",
-            "| 0             | 0           |",
-            "+---------------+-------------+",
-        ];
-        datafusion::assert_batches_eq!(&expected, &batches);
+        datafusion::assert_batches_eq!(
+            [
+                "+---------------+-------------+",
+                "| via_date_part | via_extract |",
+                "+---------------+-------------+",
+                "| 0             | 0           |",
+                "+---------------+-------------+",
+            ],
+            &weekday
+        );
 
-        // A time argument is what Spark's signature cannot take.
-        let over_a_time = df
+        // Spark's overload takes only a timestamp or a date, so a time and an
+        // interval are the arguments that stop planning if the built-in is
+        // shadowed; and Spark's declares `Int32` for every field where the
+        // built-in returns `Float64` for `epoch`, which the shadowed session
+        // reports as an internal schema-assertion failure.
+        let other_shapes = df
             .ctx
-            .sql("SELECT date_part('hour', TIME '12:34:56') AS h")
+            .sql(
+                "SELECT date_part('hour', TIME '12:34:56') AS over_a_time, \
+                 date_part('hour', INTERVAL '5 hours') AS over_an_interval, \
+                 date_part('epoch', TIMESTAMP '1970-01-01T00:01:00') AS epoch_seconds",
+            )
             .await
-            .and_then(datafusion::dataframe::DataFrame::into_optimized_plan);
-        assert!(
-            over_a_time.is_ok(),
-            "date_part over a time must stay plannable under the built-in: {:?}",
-            over_a_time.err()
+            .expect("plan date_part over a time, an interval and for epoch")
+            .collect()
+            .await
+            .expect("run date_part over a time, an interval and for epoch");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------------+------------------+---------------+",
+                "| over_a_time | over_an_interval | epoch_seconds |",
+                "+-------------+------------------+---------------+",
+                "| 12          | 5                | 60.0          |",
+                "+-------------+------------------+---------------+",
+            ],
+            &other_shapes
         );
     }
 
