@@ -530,7 +530,10 @@ impl DataAccelerator for SqliteAccelerator {
             )
             .await?;
 
-            self.get_shared_pool(source).await?;
+            // A pending bootstrap must restore the file before any connection opens it.
+            if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                self.get_shared_pool(source).await?;
+            }
 
             return Ok(bootstrap_status);
         }

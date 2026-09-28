@@ -119,14 +119,14 @@ impl BootstrapStatus {
                 }
                 Ok(None) => {
                     tracing::warn!(
-                        "Dataset '{}' is waiting for its first snapshot and cannot be queried. Ensure the snapshot location '{}' is correct and that the writer has published a snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots",
+                        "Snapshot acceleration for dataset '{}' is waiting for its first snapshot. Ensure the snapshot location '{}' is correct and that the writer has published a snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots",
                         manager.dataset_name(),
                         manager.snapshot_location()
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Failed to bootstrap dataset '{}' from a snapshot, so it cannot be queried and will retry. Cause: {error}",
+                        "Failed to restore snapshot acceleration for dataset '{}', so snapshot data is unavailable and will be retried. Cause: {error}",
                         manager.dataset_name()
                     );
                 }

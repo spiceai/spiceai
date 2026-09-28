@@ -743,9 +743,11 @@ impl DataAccelerator for TursoAccelerator {
             )
             .await?;
 
-            // Initialize the database file using the shared pool
-            let pool = self.get_shared_pool(source).await?;
-            pool.connect().await?;
+            // A pending bootstrap must restore the file before any connection opens it.
+            if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                let pool = self.get_shared_pool(source).await?;
+                pool.connect().await?;
+            }
 
             return Ok(bootstrap_status);
         }
