@@ -21700,6 +21700,12 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        // Encode the RAM tier before either arm takes `write_lock`, so applies
+        // keep flowing while it is written. The drain under the lock below then
+        // only has to catch rows that landed since.
+        if self.is_cdc_memory_mode() && !self.mem_tier.is_empty() {
+            self.checkpoint_mem_tier().await?;
+        }
         let compaction_start = std::time::Instant::now();
 
         // CONVERGENCE FENCE — prevents a delete/upsert that races this rewrite
@@ -21804,8 +21810,8 @@ impl CayenneTableProvider {
             String,
         ) = if uses_position_deletes {
             let snapshot_id_before = self.get_current_snapshot_id();
-            // Drain the inline memtable FIRST, for the same reason the
-            // key-delete arm does: `visible_file_stream_for_rewrite` also
+            // Drain the RAM tier and the inline memtable FIRST, for the same
+            // reason the key-delete arm does: `visible_file_stream_for_rewrite` also
             // checkpoints inline data internally, which would publish a
             // protected snapshot BETWEEN the two folded-set reads below and
             // spuriously abort every pass on a table with inline data. After
@@ -22388,6 +22394,21 @@ impl CayenneTableProvider {
         Ok(true)
     }
 
+    /// Checkpoint the in-memory CDC tier before a full rewrite captures its
+    /// scan. The scan reads the tier, but the rewrite's commit replaces only the
+    /// durable snapshot, so a row left in the tier would be visible twice.
+    ///
+    /// The caller holds `write_lock`, so no apply refills the tier before the
+    /// scan; `mem_checkpoint_lock` is taken after it, as cold promotion does. The
+    /// checkpoint publishes a protected snapshot, so this must run before the
+    /// folded-set bracket.
+    async fn drain_mem_tier_before_rewrite_scan(&self) -> Result<()> {
+        if self.is_cdc_memory_mode() && !self.mem_tier.is_empty() {
+            self.checkpoint_mem_tier_holding_write_lock().await?;
+        }
+        Ok(())
+    }
+
     /// Build the consolidation input stream (the full visible scan) and capture
     /// the concurrent-append fence value to verify at commit.
     ///
@@ -22398,24 +22419,6 @@ impl CayenneTableProvider {
     /// deliberately tracks ONLY current-dir publishes — not the rewrite's own
     /// output write or background mem-tier checkpoints — so the fence does not
     /// abort on changes that leave the current dir untouched.
-    /// Checkpoint the in-memory CDC tier (`cdc_durability: memory`) before a
-    /// full rewrite captures its scan.
-    ///
-    /// The rewrite scan reads the tier along with the durable files, but its
-    /// commit replaces only the durable snapshot. A row still in the tier would
-    /// therefore stay visible beside its copy in the new snapshot, and no later
-    /// checkpoint removes the copy. Draining first leaves the tier empty when
-    /// the scan captures its inputs. The caller holds `write_lock`, so no apply
-    /// can refill the tier in between, and `mem_checkpoint_lock` is taken after
-    /// it, the order cold promotion uses. The checkpoint publishes a protected
-    /// snapshot, which is why this runs before the folded-set bracket.
-    async fn drain_mem_tier_before_rewrite_scan(&self) -> Result<()> {
-        if self.is_cdc_memory_mode() && !self.mem_tier.is_empty() {
-            self.checkpoint_mem_tier_holding_write_lock().await?;
-        }
-        Ok(())
-    }
-
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
@@ -44514,39 +44517,46 @@ mod tests {
         (provider, catalog, temp_dir)
     }
 
-    /// Seeds a durable `[1, 2, 3]` and leaves `[4]` in the RAM tier, then runs a
-    /// full rewrite, the state `run_one_compaction_pass` reaches when the
-    /// protected-snapshot trigger fires between two mem-tier checkpoints.
-    async fn rewrite_with_a_resident_mem_segment(
+    /// Makes `[1, 2, 3]` durable through a mem-tier checkpoint and leaves `[4]`
+    /// in the RAM tier. `flush` also drains post-write maintenance in between,
+    /// which a test driving the compaction trigger itself must skip.
+    async fn seed_resident_mem_segment(
         provider: &CayenneTableProvider,
         batch: impl Fn(&[i64]) -> RecordBatch,
+        flush: bool,
     ) {
         provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
             std::sync::atomic::AtomicU64::new(0),
         ))));
         let no_deletions = OnConflictDeletions::default();
-        let seed = batch(&[1, 2, 3]);
-        let seed_bytes = seed.get_array_memory_size() as u64;
-        provider
-            .append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
-            .await
-            .expect("seed append");
-        provider
-            .checkpoint_mem_tier()
-            .await
-            .expect("seed checkpoint");
-        provider
-            .flush_pending_maintenance()
-            .await
-            .expect("flush maintenance");
-        let late = batch(&[4]);
-        let late_bytes = late.get_array_memory_size() as u64;
-        provider
-            .append_to_mem_tier(vec![late], &no_deletions, late_bytes, 0)
-            .await
-            .expect("late append");
+        for (ids, checkpoint) in [(&[1_i64, 2, 3][..], true), (&[4][..], false)] {
+            let rows = batch(ids);
+            let bytes = rows.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![rows], &no_deletions, bytes, 0)
+                .await
+                .expect("append");
+            if checkpoint {
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+                if flush {
+                    provider
+                        .flush_pending_maintenance()
+                        .await
+                        .expect("flush maintenance");
+                }
+            }
+        }
         assert_eq!(scan_sorted_ids(provider).await, vec![1, 2, 3, 4]);
         assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
+    }
+
+    /// Runs a full rewrite over [`seed_resident_mem_segment`]'s state and checks
+    /// that the RAM-tier row is neither duplicated nor left behind.
+    async fn rewrite_with_a_resident_mem_segment(
+        provider: &CayenneTableProvider,
+        batch: impl Fn(&[i64]) -> RecordBatch,
+    ) {
+        seed_resident_mem_segment(provider, batch, true).await;
 
         // Bounded: the drain takes `mem_checkpoint_lock` while the rewrite holds
         // `write_lock`, so a lock-order regression shows up as a timeout.
@@ -44636,27 +44646,17 @@ mod tests {
             },
         )
         .await;
-        provider.install_slot_advancer(Arc::new(EpochRecorder(Arc::new(
-            std::sync::atomic::AtomicU64::new(0),
-        ))));
         let schema = Arc::clone(&provider.table_metadata.schema);
-        let no_deletions = OnConflictDeletions::default();
-        for (ids, checkpoint) in [(&[1_i64, 2, 3][..], true), (&[4][..], false)] {
-            let batch = id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()]);
-            let bytes = batch.get_array_memory_size() as u64;
-            provider
-                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
-                .await
-                .expect("append");
-            if checkpoint {
-                provider.checkpoint_mem_tier().await.expect("checkpoint");
-            }
-        }
+        seed_resident_mem_segment(
+            &provider,
+            |ids| id_value_batch(Arc::clone(&schema), ids, &vec![0; ids.len()]),
+            false,
+        )
+        .await;
         assert!(
             provider.protected_snapshot_maintenance_trigger().is_some(),
             "premise: the checkpoint's protected snapshot fires the trigger"
         );
-        assert_eq!(provider.mem_tier.total_rows(), 1, "premise: one row in RAM");
 
         assert!(
             provider.run_one_compaction_pass().await.expect("pass"),
@@ -44670,31 +44670,17 @@ mod tests {
     #[tokio::test]
     async fn full_rewrite_declines_on_memory_resident_table() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let runtime_env = SessionContext::new().runtime_env();
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
-        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
-        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
-            as Arc<dyn MetadataCatalog>;
-        catalog.init().await.expect("init catalog");
-        let options = CreateTableOptions {
-            table_name: "rewrite_memory_resident".to_string(),
-            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_dir,
-            partition_column: None,
-            vortex_config: VortexConfig {
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "rewrite_memory_resident",
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            VortexConfig {
                 memory_mode: true,
                 ..VortexConfig::default()
             },
-        };
-        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .create(options)
-            .await
-            .expect("table created");
+            vec![],
+            SessionContext::new().runtime_env(),
+        )
+        .await;
         assert!(provider.is_memory_resident_mode(), "premise: mode: memory");
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
