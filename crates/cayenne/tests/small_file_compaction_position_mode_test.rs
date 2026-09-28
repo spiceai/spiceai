@@ -67,20 +67,7 @@ fn rows(start: i64, count: i64) -> RecordBatch {
 }
 
 async fn append(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        schema(),
-        None,
-    )
-    .expect("exec");
-    let plan = table
-        .insert_into(&ctx.state(), exec, datafusion_expr::dml::InsertOp::Append)
-        .await
-        .expect("insert plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("insert");
+    common::insert_batch(table, batch).await.expect("insert");
 }
 
 async fn count_rows(table: &Arc<CayenneTableProvider>) -> i64 {
