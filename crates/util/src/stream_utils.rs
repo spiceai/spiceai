@@ -184,10 +184,18 @@ pub fn sort_plan(
 pub const SORT_PARTITION_WORKING_BYTES: usize = 128 * 1024 * 1024;
 
 /// The most partitions [`sort_plan`] sorts separately under `context`: as many
-/// as half a bounded memory pool gives each its `sort_spill_reservation_bytes`
-/// plus [`SORT_PARTITION_WORKING_BYTES`], and at least one. The other half is
-/// left to the scan and the merge. An unbounded pool imposes no cap. An input
-/// with more partitions than this is sorted as one.
+/// as half of what a bounded memory pool has free gives each its
+/// `sort_spill_reservation_bytes` plus [`SORT_PARTITION_WORKING_BYTES`], and at
+/// least one. The other half is left to the scan and the merge. An unbounded
+/// pool imposes no cap. An input with more partitions than this is sorted as
+/// one.
+///
+/// Free, not total: another consumer already holding the pool — a concurrent
+/// rewrite of another table sharing a carved compaction pool, say — leaves
+/// less for these sorts, and planning a full set of them anyway is how they
+/// would run each other out of memory. Consumers that start after planning are
+/// not seen; a sort they starve fails with `DataFusion`'s external-sort error,
+/// as a lone sort starved by them would.
 #[must_use]
 pub fn max_sort_partitions(context: &TaskContext) -> usize {
     let per_sort = context
@@ -196,8 +204,9 @@ pub fn max_sort_partitions(context: &TaskContext) -> usize {
         .execution
         .sort_spill_reservation_bytes
         .saturating_add(SORT_PARTITION_WORKING_BYTES);
-    match context.memory_pool().memory_limit() {
-        MemoryLimit::Finite(limit) => (limit / 2 / per_sort).max(1),
+    let pool = context.memory_pool();
+    match pool.memory_limit() {
+        MemoryLimit::Finite(limit) => (limit.saturating_sub(pool.reserved()) / 2 / per_sort).max(1),
         MemoryLimit::Infinite | MemoryLimit::Unknown => usize::MAX,
     }
 }

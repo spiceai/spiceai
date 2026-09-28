@@ -267,6 +267,35 @@ fn sort_width_is_what_half_the_pool_gives_each_sort() {
     assert_eq!(max_sort_partitions(&TaskContext::default()), usize::MAX);
 }
 
+/// Memory another consumer already holds is not free for these sorts: a pool
+/// with room for every partition's sort when empty sorts them as one once
+/// most of it is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_already_held_counts_against_the_sort_width() {
+    use datafusion::execution::memory_pool::MemoryConsumer;
+    let reservation = 1024 * 1024;
+    let per_sort = reservation + SORT_PARTITION_WORKING_BYTES;
+    let parts = partitions();
+    let ctx = bounded_context(2 * parts.len() * per_sort, reservation);
+    assert_eq!(max_sort_partitions(&ctx), parts.len());
+    let held = MemoryConsumer::new("concurrent rewrite").register(ctx.memory_pool());
+    held.try_grow((2 * parts.len() - 2) * per_sort)
+        .expect("room to hold");
+    assert_eq!(max_sort_partitions(&ctx), 1);
+    let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
+    assert!(
+        !plan_text(&plan).contains("SortPreservingMergeExec"),
+        "with most of the pool held elsewhere, the partitions sort as one:\n{}",
+        plan_text(&plan)
+    );
+    drop(held);
+    assert_eq!(
+        max_sort_partitions(&ctx),
+        parts.len(),
+        "released memory is free again"
+    );
+}
+
 /// A pool with room for a sort per partition sorts them separately and merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_roomy_pool_sorts_every_partition_separately() {
