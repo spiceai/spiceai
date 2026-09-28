@@ -4225,7 +4225,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         let test = format!("{module}::{name}");
         let output =
             std::process::Command::new(std::env::current_exe().expect("to locate the test binary"))
-                .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .args([test.as_str(), "--exact"])
                 .env(OWN_PROCESS_ENV, "1")
                 .output()
                 .expect("to run the test binary");
