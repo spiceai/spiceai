@@ -56,6 +56,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
+use crate::phase_change_log::PhaseChangeLog;
+
 /// Documentation for the rate-control parameters, linked from the throttling log
 /// line so an operator can act on it.
 const RATE_CONTROL_DOCS_URL: &str =
@@ -205,77 +207,16 @@ enum Confidence {
 #[derive(Debug)]
 struct ControllerState {
     window: DecayWindow,
-    transitions: TransitionTracker,
-}
-
-/// Damps the throttling log in time: a state that one outcome could flip back
-/// must hold continuously for one window before it is logged. A firmer reading
-/// is logged as soon as it is seen.
-///
-/// A fixed coefficient band would not work, because the coefficient is exactly 1
-/// for every error rate up to the failure threshold and falls away immediately
-/// above it — any band wide enough to damp noise would also hide real
-/// throttling. How near the boundary a reading sits depends on how much traffic
-/// the window holds, which [`Confidence`] measures directly.
-#[derive(Debug)]
-struct TransitionTracker {
-    /// The state the last log line reported.
-    reported: ThrottleState,
-    /// A different state, and when it was first seen continuously.
-    candidate: Option<(ThrottleState, Instant)>,
-}
-
-impl TransitionTracker {
-    fn new() -> Self {
-        Self {
-            reported: ThrottleState::Healthy,
-            candidate: None,
-        }
-    }
-
-    /// Feed the state observed at `now`, and how firmly, and report the state to
-    /// log, if any.
+    /// Damps the throttling log in time: a state that one outcome could flip
+    /// back must hold for one window before it is logged, and a firmer reading
+    /// is logged as soon as it is seen.
     ///
-    /// A [`Confidence::NearBoundary`] state must hold for `window` before it is
-    /// reported; a [`Confidence::Unambiguous`] one is reported at once, even if
-    /// it was waiting a moment ago. Any return to the reported state discards
-    /// the candidate, so an error rate that crosses the failure threshold faster
-    /// than one window logs nothing.
-    fn observe(
-        &mut self,
-        observed: ThrottleState,
-        confidence: Confidence,
-        now: Instant,
-        window: Duration,
-    ) -> Option<ThrottleState> {
-        if observed == self.reported {
-            self.candidate = None;
-            return None;
-        }
-
-        let hold = match confidence {
-            Confidence::Unambiguous => Duration::ZERO,
-            Confidence::NearBoundary => window,
-        };
-
-        // An ongoing candidate keeps its original timestamp, or it would never
-        // reach `hold`.
-        let since = match self.candidate {
-            Some((candidate, since)) if candidate == observed => since,
-            _ => {
-                self.candidate = Some((observed, now));
-                now
-            }
-        };
-
-        if now.saturating_duration_since(since) < hold {
-            return None;
-        }
-
-        self.reported = observed;
-        self.candidate = None;
-        Some(observed)
-    }
+    /// A fixed coefficient band would not work, because the coefficient is
+    /// exactly 1 for every error rate up to the failure threshold and falls away
+    /// immediately above it — any band wide enough to damp noise would also hide
+    /// real throttling. How near the boundary a reading sits depends on how much
+    /// traffic the window holds, which [`Confidence`] measures directly.
+    phases: PhaseChangeLog<ThrottleState>,
 }
 
 impl AdaptiveController {
@@ -294,7 +235,7 @@ impl AdaptiveController {
                     accepts: 0.0,
                     last_update: None,
                 },
-                transitions: TransitionTracker::new(),
+                phases: PhaseChangeLog::new(ThrottleState::Healthy),
             }),
         }
     }
@@ -336,10 +277,13 @@ impl AdaptiveController {
 
         let (requests, accepts) = (state.window.requests, state.window.accepts);
         let observed = ThrottleState::of(self.coefficient_of(requests, accepts));
-        let confidence = self.confidence_of(observed, requests, accepts);
-        state
-            .transitions
-            .observe(observed, confidence, now, self.half_life)
+        // A reading one outcome from the boundary has to hold for a window; a
+        // firmer one is reported the moment it is seen.
+        let hold = match self.confidence_of(observed, requests, accepts) {
+            Confidence::Unambiguous => Duration::ZERO,
+            Confidence::NearBoundary => self.half_life,
+        };
+        state.phases.observe(observed, now, hold)
     }
 
     /// Whether one more recorded outcome could flip `observed` back.
@@ -744,148 +688,21 @@ mod tests {
         );
     }
 
-    /// An unambiguous change is reported the moment it is seen.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn an_unambiguous_state_change_is_reported_at_once() {
-        let hold = Duration::from_secs(10);
-        let mut tracker = TransitionTracker::new();
-        let start = Instant::now();
-
-        assert_eq!(
-            tracker.observe(
-                ThrottleState::Throttling,
-                Confidence::Unambiguous,
-                start,
-                hold
-            ),
-            Some(ThrottleState::Throttling)
-        );
-        assert_eq!(
-            tracker.observe(
-                ThrottleState::Throttling,
-                Confidence::Unambiguous,
-                start + hold,
-                hold
-            ),
-            None,
-            "the same state must not be reported twice"
-        );
-    }
-
-    /// (b) A marginal state change shorter than one window reports nothing.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_marginal_state_change_shorter_than_a_window_reports_nothing() {
-        let hold = Duration::from_secs(10);
-        let mut tracker = TransitionTracker::new();
-        let start = Instant::now();
-        let marginal = Confidence::NearBoundary;
-
-        assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start, hold),
-            None
-        );
-        assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start + hold / 2, hold),
-            None,
-            "half a window is not enough to report a marginal throttle"
-        );
-        // Back to healthy before the window elapsed: the candidate is discarded.
-        assert_eq!(
-            tracker.observe(ThrottleState::Healthy, marginal, start + hold, hold),
-            None
-        );
-        assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start + hold * 2, hold),
-            None,
-            "the hold restarts after the state returned to healthy"
-        );
-    }
-
-    /// (b) A marginal state held for a full window is reported exactly once,
-    /// each way.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_marginal_state_held_for_a_window_is_reported_once() {
-        let hold = Duration::from_secs(10);
-        let mut tracker = TransitionTracker::new();
-        let start = Instant::now();
-        let marginal = Confidence::NearBoundary;
-
-        assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start, hold),
-            None
-        );
-        assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start + hold, hold),
-            Some(ThrottleState::Throttling),
-            "a marginal throttle held for one window must be reported"
-        );
-        assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start + hold * 3, hold),
-            None,
-            "the same state must not be reported twice"
-        );
-
-        assert_eq!(
-            tracker.observe(ThrottleState::Healthy, marginal, start + hold * 4, hold),
-            None
-        );
-        assert_eq!(
-            tracker.observe(ThrottleState::Healthy, marginal, start + hold * 5, hold),
-            Some(ThrottleState::Healthy),
-            "a marginal recovery held for one window must be reported"
-        );
-        assert_eq!(
-            tracker.observe(ThrottleState::Healthy, marginal, start + hold * 9, hold),
-            None,
-            "recovery must not be reported twice"
-        );
-    }
-
-    /// (c) An error rate that hovers at the failure threshold reads marginal
-    /// each way. Crossing faster than one window reports nothing at all, so the
-    /// log cannot flap.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_marginal_state_oscillating_faster_than_a_window_reports_nothing() {
-        let hold = Duration::from_secs(10);
-        let mut tracker = TransitionTracker::new();
-        let start = Instant::now();
-        let step = hold / 4;
-
-        for tick in 0..20 {
-            let observed = if tick % 2 == 0 {
-                ThrottleState::Throttling
-            } else {
-                ThrottleState::Healthy
-            };
-            assert_eq!(
-                tracker.observe(
-                    observed,
-                    Confidence::NearBoundary,
-                    start + step * tick,
-                    hold
-                ),
-                None,
-                "oscillation faster than the window must report nothing (tick {tick})"
-            );
-        }
-    }
-
     /// (e) Known limitation: the state is evaluated per recorded outcome, so a
     /// throttled origin whose traffic stops reports no recovery until enough
     /// later requests arrive.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_quiet_origin_reports_recovery_only_when_traffic_returns() {
-        let hold = Duration::from_secs(10);
-        let mut tracker = TransitionTracker::new();
+        let window = Duration::from_secs(10);
+        let mut phases = PhaseChangeLog::new(ThrottleState::Healthy);
         let start = Instant::now();
-        let marginal = Confidence::NearBoundary;
 
         assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start, hold),
+            phases.observe(ThrottleState::Throttling, start, window),
             None
         );
         assert_eq!(
-            tracker.observe(ThrottleState::Throttling, marginal, start + hold, hold),
+            phases.observe(ThrottleState::Throttling, start + window, window),
             Some(ThrottleState::Throttling)
         );
 
@@ -893,17 +710,12 @@ mod tests {
         // reported, however long the origin has been healthy.
         let quiet_for = Duration::from_secs(3600);
         assert_eq!(
-            tracker.observe(ThrottleState::Healthy, marginal, start + quiet_for, hold),
+            phases.observe(ThrottleState::Healthy, start + quiet_for, window),
             None,
             "the first request back only starts the hold"
         );
         assert_eq!(
-            tracker.observe(
-                ThrottleState::Healthy,
-                marginal,
-                start + quiet_for + hold,
-                hold
-            ),
+            phases.observe(ThrottleState::Healthy, start + quiet_for + window, window),
             Some(ThrottleState::Healthy),
             "a marginal recovery is reported one window after traffic returns"
         );

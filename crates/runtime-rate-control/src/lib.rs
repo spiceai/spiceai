@@ -49,6 +49,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod adaptive;
 mod leased;
+mod phase_change_log;
 
 pub use adaptive::{
     AdaptiveController, AdaptiveRateControl, AdaptiveRateControlError,
