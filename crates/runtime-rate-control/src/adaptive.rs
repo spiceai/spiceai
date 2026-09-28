@@ -51,7 +51,6 @@ limitations under the License.
 //! limit has nothing to modify, so the caller rejects that configuration before
 //! building a controller.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -62,14 +61,10 @@ use tokio::time::Instant;
 const RATE_CONTROL_DOCS_URL: &str =
     "https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control";
 
-/// The controller reports that it throttles the origin below this admission
-/// coefficient, and that the origin recovered at
-/// [`FULL_ADMISSION_COEFFICIENT`]. The gap between the two is hysteresis: an
-/// error rate that hovers at the failure threshold moves the coefficient in the
-/// gap and logs nothing.
-const THROTTLING_ENTRY_COEFFICIENT: f64 = 0.99;
-
 /// The coefficient of a healthy origin: every configured limit applies in full.
+/// The coefficient is exactly this for any error rate at or below the failure
+/// threshold, and strictly below it above the threshold, so it is the whole
+/// throttling test.
 const FULL_ADMISSION_COEFFICIENT: f64 = 1.0;
 
 /// Default failure threshold.
@@ -164,20 +159,98 @@ pub struct AdaptiveController {
     half_life: Duration,
     /// The origin this controller governs, named in the log lines.
     origin: String,
-    /// Whether the origin is currently reported as throttled. Drives the one
-    /// entry line and the one recovery line per episode.
-    throttling: AtomicBool,
 
-    window: Mutex<DecayWindow>,
+    /// The decaying window and the log state it drives, under one lock so the
+    /// coefficient and the transition decision cannot disagree.
+    state: Mutex<ControllerState>,
 }
 
-/// A change in the reported throttling state of an origin. One log line each way.
+/// What the origin is doing, as the log reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThrottleTransition {
-    /// The origin started to fail more than the failure threshold.
-    Entered,
-    /// The origin recovered, and gets the full configured limits again.
-    Recovered,
+enum ThrottleState {
+    /// The error rate is at or below the failure threshold: the origin gets the
+    /// full configured limits.
+    Healthy,
+    /// The error rate is above the failure threshold: the configured limits are
+    /// scaled down.
+    Throttling,
+}
+
+impl ThrottleState {
+    /// The state an admission coefficient shows. The coefficient is exactly
+    /// [`FULL_ADMISSION_COEFFICIENT`] at or below the failure threshold, and
+    /// strictly below it above the threshold.
+    fn of(coefficient: f64) -> Self {
+        if coefficient >= FULL_ADMISSION_COEFFICIENT {
+            Self::Healthy
+        } else {
+            Self::Throttling
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ControllerState {
+    window: DecayWindow,
+    transitions: TransitionTracker,
+}
+
+/// Damps the throttling log in time: a new state must hold continuously for one
+/// window before it is logged.
+///
+/// A coefficient band would not work, because the coefficient is exactly 1 for
+/// every error rate up to the failure threshold and falls away immediately above
+/// it — any band wide enough to damp noise would also hide real throttling.
+#[derive(Debug)]
+struct TransitionTracker {
+    /// The state the last log line reported.
+    reported: ThrottleState,
+    /// A different state, and when it was first seen continuously.
+    candidate: Option<(ThrottleState, Instant)>,
+}
+
+impl TransitionTracker {
+    fn new() -> Self {
+        Self {
+            reported: ThrottleState::Healthy,
+            candidate: None,
+        }
+    }
+
+    /// Feed the state observed at `now` and report the state to log, if any.
+    ///
+    /// A state that differs from the reported one must hold for `hold` before it
+    /// is reported; any return to the reported state discards the candidate. So
+    /// an error rate that crosses the failure threshold faster than one window
+    /// logs nothing.
+    fn observe(
+        &mut self,
+        observed: ThrottleState,
+        now: Instant,
+        hold: Duration,
+    ) -> Option<ThrottleState> {
+        if observed == self.reported {
+            self.candidate = None;
+            return None;
+        }
+
+        match self.candidate {
+            Some((candidate, since))
+                if candidate == observed && now.saturating_duration_since(since) >= hold =>
+            {
+                self.reported = observed;
+                self.candidate = None;
+                Some(observed)
+            }
+            // Only start the clock when this state is new; an ongoing candidate
+            // keeps its original timestamp, or it would never reach `hold`.
+            Some((candidate, _)) if candidate == observed => None,
+            _ => {
+                self.candidate = Some((observed, now));
+                None
+            }
+        }
+    }
 }
 
 impl AdaptiveController {
@@ -190,34 +263,26 @@ impl AdaptiveController {
             failure_threshold: control.failure_threshold,
             half_life: control.window,
             origin: origin.into(),
-            throttling: AtomicBool::new(false),
-            window: Mutex::new(DecayWindow {
-                requests: 0.0,
-                accepts: 0.0,
-                last_update: None,
+            state: Mutex::new(ControllerState {
+                window: DecayWindow {
+                    requests: 0.0,
+                    accepts: 0.0,
+                    last_update: None,
+                },
+                transitions: TransitionTracker::new(),
             }),
         }
     }
 
     /// Record the outcome of one request.
     pub fn record(&self, outcome: RequestOutcome) {
-        let coefficient = {
-            let mut window = self.window.lock();
-            window.decay_to(Instant::now(), self.half_life);
-            window.requests += 1.0;
-            if outcome == RequestOutcome::Success {
-                window.accepts += 1.0;
-            }
-            self.coefficient_of(window.requests, window.accepts)
-        };
-
-        match self.note_transition(coefficient) {
-            Some(ThrottleTransition::Entered) => tracing::warn!(
+        match self.record_and_evaluate(outcome) {
+            Some(ThrottleState::Throttling) => tracing::warn!(
                 "Upstream '{}' is failing more than the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
                 self.origin,
                 format_percentage(self.failure_threshold),
             ),
-            Some(ThrottleTransition::Recovered) => tracing::info!(
+            Some(ThrottleState::Healthy) => tracing::info!(
                 "Upstream '{}' has recovered, so adaptive rate control is sending it the full configured limits again.",
                 self.origin,
             ),
@@ -225,22 +290,28 @@ impl AdaptiveController {
         }
     }
 
-    /// Move the reported throttling state for `coefficient` and report the
-    /// transition, if any. Coefficients between [`THROTTLING_ENTRY_COEFFICIENT`]
-    /// and [`FULL_ADMISSION_COEFFICIENT`] hold the current state, so an error
-    /// rate that hovers at the failure threshold does not flap the log.
-    fn note_transition(&self, coefficient: f64) -> Option<ThrottleTransition> {
-        if coefficient < THROTTLING_ENTRY_COEFFICIENT {
-            return (!self.throttling.swap(true, Ordering::Relaxed))
-                .then_some(ThrottleTransition::Entered);
+    /// Record one outcome and report the throttling state to log, if any.
+    ///
+    /// Evaluation happens here, per recorded outcome, so a throttled origin whose
+    /// traffic stops reports no recovery until a later request arrives. That is
+    /// accepted: with no traffic there is nothing to throttle, and the live
+    /// coefficient is still in the metrics.
+    ///
+    /// A state must hold for one window before it is logged, so a genuine
+    /// throttling episode is reported one window after it begins.
+    fn record_and_evaluate(&self, outcome: RequestOutcome) -> Option<ThrottleState> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        state.window.decay_to(now, self.half_life);
+        state.window.requests += 1.0;
+        if outcome == RequestOutcome::Success {
+            state.window.accepts += 1.0;
         }
-        if coefficient >= FULL_ADMISSION_COEFFICIENT {
-            return self
-                .throttling
-                .swap(false, Ordering::Relaxed)
-                .then_some(ThrottleTransition::Recovered);
-        }
-        None
+
+        let coefficient = self.coefficient_of(state.window.requests, state.window.accepts);
+        state
+            .transitions
+            .observe(ThrottleState::of(coefficient), now, self.half_life)
     }
 
     /// The fraction of requests the controller currently wants to admit, in
@@ -252,9 +323,9 @@ impl AdaptiveController {
 
     fn admission_coefficient_at(&self, now: Instant) -> f64 {
         let (requests, accepts) = {
-            let mut window = self.window.lock();
-            window.decay_to(now, self.half_life);
-            (window.requests, window.accepts)
+            let mut state = self.state.lock();
+            state.window.decay_to(now, self.half_life);
+            (state.window.requests, state.window.accepts)
         };
 
         self.coefficient_of(requests, accepts)
@@ -496,42 +567,167 @@ mod tests {
         );
     }
 
-    /// One entry line and one recovery line per episode, and nothing while the
-    /// coefficient stays in the hysteresis band.
-    #[test]
-    fn throttle_transitions_are_reported_once_each_way() {
-        let controller = enabled(0.1);
+    /// The reported state must hold for one window before it is logged, so a
+    /// change shorter than a window reports nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_state_change_shorter_than_a_window_reports_nothing() {
+        let hold = Duration::from_secs(10);
+        let mut tracker = TransitionTracker::new();
+        let start = Instant::now();
 
-        assert_eq!(controller.note_transition(1.0), None);
         assert_eq!(
-            controller.note_transition(0.5),
-            Some(ThrottleTransition::Entered)
+            tracker.observe(ThrottleState::Throttling, start, hold),
+            None
         );
-        // Still throttled, so no second entry line.
-        assert_eq!(controller.note_transition(0.4), None);
-        // The hysteresis band holds the reported state.
-        assert_eq!(controller.note_transition(0.995), None);
         assert_eq!(
-            controller.note_transition(1.0),
-            Some(ThrottleTransition::Recovered)
+            tracker.observe(ThrottleState::Throttling, start + hold / 2, hold),
+            None,
+            "half a window is not enough to report throttling"
         );
-        // Still healthy, so no second recovery line.
-        assert_eq!(controller.note_transition(1.0), None);
+        // Back to healthy before the window elapsed: the candidate is discarded.
+        assert_eq!(
+            tracker.observe(ThrottleState::Healthy, start + hold, hold),
+            None
+        );
+        assert_eq!(
+            tracker.observe(ThrottleState::Throttling, start + hold * 2, hold),
+            None,
+            "the hold restarts after the state returned to healthy"
+        );
     }
 
-    /// An error rate that hovers at the failure threshold moves the coefficient
-    /// in the hysteresis band only, so the log does not flap.
-    #[test]
-    fn coefficients_in_the_hysteresis_band_do_not_flap() {
-        let controller = enabled(0.1);
+    /// A state held for a full window is reported exactly once, each way.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_state_held_for_a_window_is_reported_once() {
+        let hold = Duration::from_secs(10);
+        let mut tracker = TransitionTracker::new();
+        let start = Instant::now();
 
-        for coefficient in [1.0, 0.999, 1.0, 0.995, 1.0, 0.99] {
+        assert_eq!(
+            tracker.observe(ThrottleState::Throttling, start, hold),
+            None
+        );
+        assert_eq!(
+            tracker.observe(ThrottleState::Throttling, start + hold, hold),
+            Some(ThrottleState::Throttling),
+            "throttling held for one window must be reported"
+        );
+        assert_eq!(
+            tracker.observe(ThrottleState::Throttling, start + hold * 3, hold),
+            None,
+            "the same state must not be reported twice"
+        );
+
+        assert_eq!(
+            tracker.observe(ThrottleState::Healthy, start + hold * 4, hold),
+            None
+        );
+        assert_eq!(
+            tracker.observe(ThrottleState::Healthy, start + hold * 5, hold),
+            Some(ThrottleState::Healthy),
+            "recovery held for one window must be reported"
+        );
+        assert_eq!(
+            tracker.observe(ThrottleState::Healthy, start + hold * 9, hold),
+            None,
+            "recovery must not be reported twice"
+        );
+    }
+
+    /// An error rate that crosses the failure threshold faster than one window
+    /// reports nothing at all: the log cannot flap.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_state_oscillating_faster_than_a_window_reports_nothing() {
+        let hold = Duration::from_secs(10);
+        let mut tracker = TransitionTracker::new();
+        let start = Instant::now();
+        let step = hold / 4;
+
+        for tick in 0..20 {
+            let observed = if tick % 2 == 0 {
+                ThrottleState::Throttling
+            } else {
+                ThrottleState::Healthy
+            };
             assert_eq!(
-                controller.note_transition(coefficient),
+                tracker.observe(observed, start + step * tick, hold),
                 None,
-                "coefficient {coefficient} must not report a transition"
+                "oscillation faster than the window must report nothing (tick {tick})"
             );
         }
+    }
+
+    /// Known limitation: the state is evaluated per recorded outcome, so a
+    /// throttled origin whose traffic stops reports no recovery until enough
+    /// later requests arrive.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_quiet_origin_reports_recovery_only_when_traffic_returns() {
+        let hold = Duration::from_secs(10);
+        let mut tracker = TransitionTracker::new();
+        let start = Instant::now();
+
+        tracker.observe(ThrottleState::Throttling, start, hold);
+        assert_eq!(
+            tracker.observe(ThrottleState::Throttling, start + hold, hold),
+            Some(ThrottleState::Throttling)
+        );
+
+        // Traffic stops for an hour. Nothing is evaluated, so nothing is
+        // reported, however long the origin has been healthy.
+        let quiet_for = Duration::from_secs(3600);
+        assert_eq!(
+            tracker.observe(ThrottleState::Healthy, start + quiet_for, hold),
+            None,
+            "the first request back only starts the hold"
+        );
+        assert_eq!(
+            tracker.observe(ThrottleState::Healthy, start + quiet_for + hold, hold),
+            Some(ThrottleState::Healthy),
+            "recovery is reported one window after traffic returns"
+        );
+    }
+
+    /// End to end over the controller: a failing origin is reported one window
+    /// after it starts to fail, and its recovery one window after it recovers.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_controller_reports_an_episode_one_window_late() {
+        // 50% failure threshold, 10s window.
+        let controller = enabled(0.5);
+
+        // A burst of failures throttles at once, but is not reported yet.
+        for _ in 0..200 {
+            assert_eq!(
+                controller.record_and_evaluate(RequestOutcome::Failure),
+                None
+            );
+        }
+
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW).await;
+        assert_eq!(
+            controller.record_and_evaluate(RequestOutcome::Failure),
+            Some(ThrottleState::Throttling),
+            "a failing origin must be reported one window after it starts to fail"
+        );
+
+        // The origin recovers. The first healthy outcomes only start the hold.
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW * 6).await;
+        for _ in 0..200 {
+            assert_eq!(
+                controller.record_and_evaluate(RequestOutcome::Success),
+                None
+            );
+        }
+        assert!(
+            (controller.admission_coefficient() - 1.0).abs() < f64::EPSILON,
+            "the origin is healthy again"
+        );
+
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW).await;
+        assert_eq!(
+            controller.record_and_evaluate(RequestOutcome::Success),
+            Some(ThrottleState::Healthy),
+            "recovery must be reported one window after the origin recovers"
+        );
     }
 
     #[test]
