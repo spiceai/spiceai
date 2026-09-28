@@ -46,13 +46,16 @@ permissions:
 jobs:
   analyze:
     name: Analyze
-    # Rust autobuild runs on the EPYC pool. merge_group checks out the queue
-    # merge commit, which contains the queued pull request, so that event does
-    # not receive MinIO credentials. Produce SARIF stays on a fresh hosted VM
-    # and does not check out that tree.
-    runs-on: spiceai-dev-runners
+    # Rust extraction runs on the spiceai-macos pool. The compiler cache is
+    # spiceio, as on the other macOS jobs. MinIO credentials stay on push:
+    # merge_group checks out the queue merge commit, which contains the queued
+    # pull request, and a spiceio miss must not fall through to those
+    # credentials. Produce SARIF stays on a fresh hosted VM and does not check
+    # out that tree.
+    runs-on: spiceai-macos
     env:
       HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     # An unbounded autobuild waits out GitHub's six-hour default (#12717).
     # 150 minutes sits above a cold uncached rust analysis.
     timeout-minutes: 150
@@ -77,17 +80,36 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up sccache with local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
+
+      # spiceio is the macOS cache. MinIO is only passed on push, so a missed
+      # spiceio endpoint on merge_group cannot export those credentials.
+      - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ENDPOINT || '' }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          minio_secret_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_SECRET_KEY || '' }}
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           languages: ${{ matrix.language }}
           db-location: ${{ runner.temp }}/codeql_databases
@@ -107,7 +129,7 @@ jobs:
       # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
       # If this step fails, then you should remove it and run the build manually (see below)
       - name: Autobuild
-        uses: github/codeql-action/autobuild@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/autobuild@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
 
       # ℹ️ Command-line programs to run using the OS shell.
       # 📚 https://git.io/JvXDl
@@ -121,7 +143,7 @@ jobs:
       #   make release
 
       - name: Show sccache stats
-        if: always() && (env.HAS_TEST_MINIO_SECRET == 'true')
+        if: always() && env.SCCACHE_SETUP == 'true'
         # `always()`: this is the one step that reports cache health, and without it
         # it is skipped on exactly the failures it would explain (#12420). The `||`
         # keeps a diagnostic from ever deciding a verdict — when the cache backend is
@@ -132,7 +154,7 @@ jobs:
       # Finalize the database on this VM but do not run queries. Query output
       # would land under runner.temp on the same user as the Cargo build.
       - name: Finalize CodeQL database
-        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           skip-queries: true
           upload: never
@@ -151,6 +173,18 @@ jobs:
           # Artifact names are immutable unless overwrite is set, and the
           # default (`false`) fails that retry with HTTP 409.
           overwrite: true
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: spiceio-codeql-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
 
   sarif:
     name: Produce SARIF
@@ -175,7 +209,7 @@ jobs:
       # reach the SARIF it produces.
       - name: Setup CodeQL CLI
         id: setup-codeql
-        uses: github/codeql-action/setup-codeql@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/setup-codeql@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           languages: rust
 
