@@ -54677,11 +54677,12 @@ mod tests {
                     &task_ctx,
                 )
                 .expect("cluster sort");
-            let batches: Vec<RecordBatch> = datafusion_physical_plan::execute_stream(sorted, task_ctx)
-                .expect("plan executes")
-                .try_collect()
-                .await
-                .expect("sorted rows");
+            let batches: Vec<RecordBatch> =
+                datafusion_physical_plan::execute_stream(sorted, task_ctx)
+                    .expect("plan executes")
+                    .try_collect()
+                    .await
+                    .expect("sorted rows");
             batches
                 .iter()
                 .flat_map(|batch| {
@@ -54732,7 +54733,9 @@ mod tests {
         // A permutation of 0..rows; `s` is a function of `id` with some NULLs.
         let rows = 30_000_usize;
         let ids: Vec<i64> = (0..rows).map(|i| scrambled(i, rows)).collect();
-        let text = |id: i64| (id % 53 != 0).then(|| format!("{:08x}", id.wrapping_mul(2_654_435_761) & 0xffff_ffff));
+        let text = |id: i64| {
+            (id % 53 != 0).then(|| format!("{:08x}", id.wrapping_mul(2_654_435_761) & 0xffff_ffff))
+        };
         let batches: Vec<RecordBatch> = ids
             .chunks(700)
             .map(|chunk| {
@@ -54740,7 +54743,9 @@ mod tests {
                     Arc::clone(&schema),
                     vec![
                         Arc::new(Int64Array::from(chunk.to_vec())),
-                        Arc::new(StringArray::from(chunk.iter().map(|&id| text(id)).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from(
+                            chunk.iter().map(|&id| text(id)).collect::<Vec<_>>(),
+                        )),
                     ],
                 )
                 .expect("valid batch")
@@ -54758,7 +54763,11 @@ mod tests {
         let ordered = provider
             .order_rewrite_plan(input, &RewriteOrder::Curve(vec![0, 1]), &task_ctx)
             .expect("plan builds");
-        assert_eq!(ordered.schema(), schema, "the curve key column must be projected away");
+        assert_eq!(
+            ordered.schema(),
+            schema,
+            "the curve key column must be projected away"
+        );
         let out: Vec<RecordBatch> = datafusion_physical_plan::execute_stream(ordered, task_ctx)
             .expect("plan executes")
             .try_collect()
@@ -54780,8 +54789,16 @@ mod tests {
                 }
                 previous = Some(key.to_vec());
             }
-            let id = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id");
-            let s = batch.column(1).as_any().downcast_ref::<StringArray>().expect("s");
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id");
+            let s = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("s");
             for i in 0..batch.num_rows() {
                 assert_eq!(
                     s.is_valid(i).then(|| s.value(i).to_string()),
@@ -54792,7 +54809,11 @@ mod tests {
             }
         }
         seen.sort_unstable();
-        assert_eq!(seen, (0..i64::try_from(rows).expect("fits")).collect::<Vec<_>>(), "rows changed");
+        assert_eq!(
+            seen,
+            (0..i64::try_from(rows).expect("fits")).collect::<Vec<_>>(),
+            "rows changed"
+        );
     }
 
     #[tokio::test]

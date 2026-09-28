@@ -596,7 +596,10 @@ async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
     let ctx = SessionContext::new_with_config(
         datafusion::prelude::SessionConfig::new().with_target_partitions(1),
     );
-    ctx.register_table("sort_nulls_files", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    ctx.register_table(
+        "sort_nulls_files",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
     let batches = ctx
         .sql("SELECT k, id FROM sort_nulls_files")
         .await?

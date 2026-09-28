@@ -22,16 +22,16 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, OrderingRequirements, PhysicalSortExpr};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
 };
-use datafusion::execution::memory_pool::MemoryLimit;
-use datafusion::physical_plan::execute_stream;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
@@ -83,7 +83,10 @@ pub fn sort_stream(
 
     let schema = stream.schema();
     let input: Arc<dyn ExecutionPlan> = Arc::new(StreamingExec::new(&schema, stream));
-    execute_stream(sort_plan(input, sort_columns, context)?, Arc::clone(context))
+    execute_stream(
+        sort_plan(input, sort_columns, context)?,
+        Arc::clone(context),
+    )
 }
 
 /// Wrap `stream` as a one-partition, bounded `ExecutionPlan` that yields it, so

@@ -86,8 +86,7 @@ fn batches(rows: &[Row], batch_rows: usize) -> Vec<RecordBatch> {
 }
 
 fn source(parts: &[Vec<Row>], batch_rows: usize) -> Arc<dyn ExecutionPlan> {
-    let partitions: Vec<Vec<RecordBatch>> =
-        parts.iter().map(|p| batches(p, batch_rows)).collect();
+    let partitions: Vec<Vec<RecordBatch>> = parts.iter().map(|p| batches(p, batch_rows)).collect();
     MemorySourceConfig::try_new_exec(&partitions, schema(), None).expect("memory source")
 }
 
@@ -195,7 +194,9 @@ async fn orders_by_every_sort_column() {
     // Keys collide often, so the payload tiebreak decides much of the order.
     let parts = partitions();
     let out = sort(&parts, 700, &["k", "payload DESC"]).await;
-    assert_ordered(&parts, &out, |r| (asc_nulls_last(r), std::cmp::Reverse(r.1.clone())));
+    assert_ordered(&parts, &out, |r| {
+        (asc_nulls_last(r), std::cmp::Reverse(r.1.clone()))
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -214,7 +215,11 @@ async fn single_partition_sorts_without_a_merge() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_input_yields_no_rows() {
     assert!(sort(&[], 100, &["k"]).await.is_empty());
-    assert!(sort(&[Vec::new(), Vec::new()], 100, &["k"]).await.is_empty());
+    assert!(
+        sort(&[Vec::new(), Vec::new()], 100, &["k"])
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -253,7 +258,11 @@ fn sort_width_is_what_half_the_pool_gives_each_sort() {
         (per_sort / 3, 1),
         (40 * per_sort, 20),
     ] {
-        assert_eq!(max_sort_partitions(&bounded_context(pool, reservation)), width, "pool {pool}");
+        assert_eq!(
+            max_sort_partitions(&bounded_context(pool, reservation)),
+            width,
+            "pool {pool}"
+        );
     }
     assert_eq!(max_sort_partitions(&TaskContext::default()), usize::MAX);
 }
@@ -263,7 +272,10 @@ fn sort_width_is_what_half_the_pool_gives_each_sort() {
 async fn a_roomy_pool_sorts_every_partition_separately() {
     let reservation = 1024 * 1024;
     let parts = partitions();
-    let ctx = bounded_context(2 * parts.len() * (reservation + SORT_PARTITION_WORKING_BYTES), reservation);
+    let ctx = bounded_context(
+        2 * parts.len() * (reservation + SORT_PARTITION_WORKING_BYTES),
+        reservation,
+    );
     let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
     let text = plan_text(&plan);
     assert!(
@@ -279,7 +291,10 @@ async fn a_roomy_pool_sorts_every_partition_separately() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tight_pool_sorts_all_partitions_as_one() {
     let reservation = 1024 * 1024;
-    let ctx = bounded_context(4 * (reservation + SORT_PARTITION_WORKING_BYTES) + 1, reservation);
+    let ctx = bounded_context(
+        4 * (reservation + SORT_PARTITION_WORKING_BYTES) + 1,
+        reservation,
+    );
     assert_eq!(max_sort_partitions(&ctx), 2);
     let parts = partitions();
     let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");

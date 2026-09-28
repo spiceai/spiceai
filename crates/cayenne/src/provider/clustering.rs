@@ -569,7 +569,7 @@ impl PhysicalExpr for ClusterKeyExpr {
             .map(|c| c.evaluate(batch)?.into_array(rows))
             .collect::<DFResult<Vec<_>>>()?;
         Ok(ColumnarValue::Array(
-            Arc::new(cluster_keys(&columns, &self.bounds)?) as ArrayRef
+            Arc::new(cluster_keys(&columns, &self.bounds)?) as ArrayRef,
         ))
     }
 
@@ -1089,11 +1089,17 @@ mod tests {
             .evaluate(&batch)
             .and_then(|v| v.into_array(batch.num_rows()))
             .expect("key evaluates");
-        let key = key.as_any().downcast_ref::<BinaryArray>().expect("binary key");
+        let key = key
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("binary key");
         assert_eq!(
             key,
-            &cluster_keys(&[Arc::clone(batch.column(0)), Arc::clone(batch.column(1))], &bounds)
-                .expect("kernel"),
+            &cluster_keys(
+                &[Arc::clone(batch.column(0)), Arc::clone(batch.column(1))],
+                &bounds
+            )
+            .expect("kernel"),
             "the expression is the kernel over its columns"
         );
 
@@ -1111,8 +1117,8 @@ mod tests {
         fields.push(Arc::new(Field::new(&key_name, DataType::Binary, false)));
         let mut columns = batch.columns().to_vec();
         columns.push(Arc::new(key.clone()) as ArrayRef);
-        let augmented = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("augmented batch");
+        let augmented =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("augmented batch");
         let stripped = strip_cluster_key_column(&augmented, &schema).expect("strip");
         assert_eq!(stripped, batch);
     }
