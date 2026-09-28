@@ -770,11 +770,7 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let tool_choice = req
-            .tool_choice
-            .as_ref()
-            .map(convert_tool_choice)
-            .transpose()?;
+        let tool_choice = request_tool_choice(&req)?;
         let recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -790,11 +786,7 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let tool_choice = req
-            .tool_choice
-            .as_ref()
-            .map(convert_tool_choice)
-            .transpose()?;
+        let tool_choice = request_tool_choice(&req)?;
         let mut recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -958,6 +950,33 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         finish_reason,
         logprobs: None,
     })
+}
+
+/// The `tool_choice` to hand `mistral.rs` for `req`, or an invalid-argument error when the
+/// request asks for a constraint that cannot be enforced — including a tool call required of a
+/// request that offers no tools, which `mistral.rs` would otherwise answer in prose.
+fn request_tool_choice(
+    req: &CreateChatCompletionRequest,
+) -> Result<Option<ToolChoice>, OpenAIError> {
+    let Some(choice) = req
+        .tool_choice
+        .as_ref()
+        .map(convert_tool_choice)
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let requires_call = match &choice {
+        ToolChoice::Required => true,
+        ToolChoice::AllowedTools(allowed) => allowed.mode == AllowedToolsMode::Required,
+        _ => false,
+    };
+    if requires_call && req.tools.as_ref().is_none_or(Vec::is_empty) {
+        return Err(OpenAIError::InvalidArgument(
+            "tool_choice requires a tool call, but the request lists no tools. Add the tools the model may call to 'tools', or use tool_choice 'auto'. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
+        ));
+    }
+    Ok(Some(choice))
 }
 
 /// Maps a request's `tool_choice` onto the one `mistral.rs` enforces.
@@ -1181,6 +1200,49 @@ mod tests {
             "allowed_tools": []
         }))));
         assert!(empty.contains("lists no tools"), "{empty}");
+    }
+
+    fn request(json: serde_json::Value) -> CreateChatCompletionRequest {
+        serde_json::from_value(json).expect("request should deserialize")
+    }
+
+    /// With no tools to call, `mistral.rs` cannot enforce `required` and answers in prose.
+    #[test]
+    fn a_required_call_needs_tools() {
+        let messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        for tool_choice in [
+            serde_json::json!("required"),
+            serde_json::json!({
+                "type": "allowed_tools",
+                "allowed_tools": [{ "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }]
+            }),
+        ] {
+            let message = invalid_argument(
+                request_tool_choice(&request(serde_json::json!({
+                    "model": "m", "messages": messages, "tool_choice": tool_choice
+                })))
+                .map(|choice| choice.expect("a tool choice was given")),
+            );
+            assert!(message.contains("lists no tools"), "{message}");
+        }
+
+        let with_tools = request_tool_choice(&request(serde_json::json!({
+            "model": "m",
+            "messages": messages,
+            "tools": [{ "type": "function", "function": { "name": "a" } }],
+            "tool_choice": "required"
+        })))
+        .expect("required with tools is supported");
+        assert!(
+            matches!(with_tools, Some(ToolChoice::Required)),
+            "{with_tools:?}"
+        );
+
+        let auto = request_tool_choice(&request(serde_json::json!({
+            "model": "m", "messages": messages, "tool_choice": "auto"
+        })))
+        .expect("auto needs no tools");
+        assert!(matches!(auto, Some(ToolChoice::Auto)), "{auto:?}");
     }
 
     #[test]
