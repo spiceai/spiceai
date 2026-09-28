@@ -25,10 +25,11 @@ limitations under the License.
 //! return to the reported phase discards the wait. So a signal that crosses a
 //! boundary faster than that duration reports nothing at all.
 //!
-//! The wait is a per-observation argument, not a property of the tracker: a
-//! caller that can tell a firm reading from a marginal one passes
-//! [`Duration::ZERO`] for the firm reading and reports it at once. How to make
-//! that judgement is the caller's business, not this module's.
+//! The hold is fixed when the log is built. What varies per observation is the
+//! [`Damping`] the caller asks for: a caller that can tell a firm reading from a
+//! marginal one asks for [`Damping::Immediate`] on the firm one and has it
+//! reported at once. How to make that judgement is the caller's business, not
+//! this module's.
 //!
 //! The phase type is anything `Copy + PartialEq`, and nothing here assumes two
 //! phases.
@@ -37,6 +38,18 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+/// How much to damp one observed change.
+///
+/// Named rather than expressed as a duration of zero, so a caller cannot ask for
+/// an immediate report by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Damping {
+    /// Report the change the moment it is seen.
+    Immediate,
+    /// Report the change once it has held for the log's hold duration.
+    AfterHold,
+}
+
 /// Reports a phase change once the new phase has held long enough.
 #[derive(Debug)]
 pub(crate) struct PhaseChangeLog<S> {
@@ -44,28 +57,36 @@ pub(crate) struct PhaseChangeLog<S> {
     reported: S,
     /// A different phase, and when it was first seen continuously.
     candidate: Option<(S, Instant)>,
+    /// How long a phase must hold under [`Damping::AfterHold`].
+    hold: Duration,
 }
 
 impl<S: Copy + PartialEq> PhaseChangeLog<S> {
-    /// Start from `initial`, which is treated as already reported.
-    pub(crate) fn new(initial: S) -> Self {
+    /// Start from `initial`, which is treated as already reported, and damp with
+    /// `hold`.
+    pub(crate) fn new(initial: S, hold: Duration) -> Self {
         Self {
             reported: initial,
             candidate: None,
+            hold,
         }
     }
 
-    /// Feed the phase observed at `now` and return it once it has held
-    /// continuously for `hold`.
+    /// Feed the phase observed at `now` and return it once `damping` is
+    /// satisfied.
     ///
-    /// [`Duration::ZERO`] reports on first sighting. Any return to the reported
-    /// phase discards the candidate, so a phase that does not survive `hold`
-    /// reports nothing.
-    pub(crate) fn observe(&mut self, observed: S, now: Instant, hold: Duration) -> Option<S> {
+    /// Any return to the reported phase discards the candidate, so a phase that
+    /// does not survive the hold reports nothing.
+    pub(crate) fn observe(&mut self, observed: S, now: Instant, damping: Damping) -> Option<S> {
         if observed == self.reported {
             self.candidate = None;
             return None;
         }
+
+        let hold = match damping {
+            Damping::Immediate => Duration::ZERO,
+            Damping::AfterHold => self.hold,
+        };
 
         // An ongoing candidate keeps its original timestamp, or it would never
         // reach `hold`.
@@ -77,8 +98,8 @@ impl<S: Copy + PartialEq> PhaseChangeLog<S> {
             }
         };
 
-        // Checked after the candidate is recorded, so a zero hold reports on the
-        // first sighting rather than on the one after it.
+        // Checked after the candidate is recorded, so `Damping::Immediate`
+        // reports on the first sighting rather than on the one after it.
         if now.saturating_duration_since(since) < hold {
             return None;
         }
@@ -116,20 +137,20 @@ mod tests {
         Storm,
     }
 
-    /// A zero hold reports the moment the phase is first seen.
+    /// [`Damping::Immediate`] reports the moment the phase is first seen.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_zero_hold_reports_on_first_sighting() {
+    async fn immediate_damping_reports_on_first_sighting() {
         let hold = Duration::from_secs(10);
-        let mut phases = PhaseChangeLog::new(Phase::Calm);
+        let mut phases = PhaseChangeLog::new(Phase::Calm, hold);
         let start = Instant::now();
 
         assert_eq!(
-            phases.observe(Phase::Rough, start, Duration::ZERO),
+            phases.observe(Phase::Rough, start, Damping::Immediate),
             Some(Phase::Rough)
         );
         assert_eq!(phases.reported(), Phase::Rough);
         assert_eq!(
-            phases.observe(Phase::Rough, start + hold, Duration::ZERO),
+            phases.observe(Phase::Rough, start + hold, Damping::Immediate),
             None,
             "the same phase must not be reported twice"
         );
@@ -140,20 +161,26 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_phase_shorter_than_the_hold_reports_nothing() {
         let hold = Duration::from_secs(10);
-        let mut phases = PhaseChangeLog::new(Phase::Calm);
+        let mut phases = PhaseChangeLog::new(Phase::Calm, hold);
         let start = Instant::now();
 
-        assert_eq!(phases.observe(Phase::Rough, start, hold), None);
         assert_eq!(
-            phases.observe(Phase::Rough, start + hold / 2, hold),
+            phases.observe(Phase::Rough, start, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(Phase::Rough, start + hold / 2, Damping::AfterHold),
             None,
             "half the hold is not enough to report the phase"
         );
         // Back to the reported phase before the hold elapsed: the candidate is
         // discarded.
-        assert_eq!(phases.observe(Phase::Calm, start + hold, hold), None);
         assert_eq!(
-            phases.observe(Phase::Rough, start + hold * 2, hold),
+            phases.observe(Phase::Calm, start + hold, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(Phase::Rough, start + hold * 2, Damping::AfterHold),
             None,
             "the hold restarts after the phase returned to the reported one"
         );
@@ -166,30 +193,39 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_phase_held_for_the_hold_is_reported_once() {
         let hold = Duration::from_secs(10);
-        let mut phases = PhaseChangeLog::new(Phase::Calm);
+        let mut phases = PhaseChangeLog::new(Phase::Calm, hold);
         let start = Instant::now();
 
-        assert_eq!(phases.observe(Phase::Rough, start, hold), None);
-        assert_eq!(phases.observe(Phase::Rough, start + hold / 2, hold), None);
         assert_eq!(
-            phases.observe(Phase::Rough, start + hold, hold),
+            phases.observe(Phase::Rough, start, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(Phase::Rough, start + hold / 2, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(Phase::Rough, start + hold, Damping::AfterHold),
             Some(Phase::Rough),
             "a phase held for the hold must be reported"
         );
         assert_eq!(
-            phases.observe(Phase::Rough, start + hold * 3, hold),
+            phases.observe(Phase::Rough, start + hold * 3, Damping::AfterHold),
             None,
             "the same phase must not be reported twice"
         );
 
-        assert_eq!(phases.observe(Phase::Calm, start + hold * 4, hold), None);
         assert_eq!(
-            phases.observe(Phase::Calm, start + hold * 5, hold),
+            phases.observe(Phase::Calm, start + hold * 4, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(Phase::Calm, start + hold * 5, Damping::AfterHold),
             Some(Phase::Calm),
             "the return must be reported too"
         );
         assert_eq!(
-            phases.observe(Phase::Calm, start + hold * 9, hold),
+            phases.observe(Phase::Calm, start + hold * 9, Damping::AfterHold),
             None,
             "the return must not be reported twice"
         );
@@ -199,7 +235,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_phase_oscillating_faster_than_the_hold_reports_nothing() {
         let hold = Duration::from_secs(10);
-        let mut phases = PhaseChangeLog::new(Phase::Calm);
+        let mut phases = PhaseChangeLog::new(Phase::Calm, hold);
         let start = Instant::now();
         let step = hold / 4;
 
@@ -210,7 +246,7 @@ mod tests {
                 Phase::Calm
             };
             assert_eq!(
-                phases.observe(observed, start + step * tick, hold),
+                phases.observe(observed, start + step * tick, Damping::AfterHold),
                 None,
                 "oscillation faster than the hold must report nothing (tick {tick})"
             );
@@ -219,22 +255,32 @@ mod tests {
 
     /// Nothing here is binary: with three phases, switching to a third phase
     /// mid-hold restarts the hold, and each phase is reported on its own.
+    ///
+    /// This is the only test that reaches the `_` arm of the candidate match
+    /// while a *different* phase is already the candidate. With two phases that
+    /// arm is unreachable, because the stored candidate can only ever be the one
+    /// phase that is not reported — so this is the guard against anyone reducing
+    /// `Option<(S, Instant)>` to `Option<Instant>`, which would pass every
+    /// two-phase test and silently break supersession.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn more_than_two_phases_are_tracked_one_at_a_time() {
         let hold = Duration::from_secs(10);
-        let mut phases = PhaseChangeLog::new(Weather::Clear);
+        let mut phases = PhaseChangeLog::new(Weather::Clear, hold);
         let start = Instant::now();
 
         // Cloudy waits, then Storm replaces it as the candidate and starts its
         // own hold — Cloudy's elapsed time must not count towards Storm.
-        assert_eq!(phases.observe(Weather::Cloudy, start, hold), None);
         assert_eq!(
-            phases.observe(Weather::Storm, start + hold, hold),
+            phases.observe(Weather::Cloudy, start, Damping::AfterHold),
+            None
+        );
+        assert_eq!(
+            phases.observe(Weather::Storm, start + hold, Damping::AfterHold),
             None,
             "a different phase must start its own hold"
         );
         assert_eq!(
-            phases.observe(Weather::Storm, start + hold * 2, hold),
+            phases.observe(Weather::Storm, start + hold * 2, Damping::AfterHold),
             Some(Weather::Storm),
             "the phase that actually held must be the one reported"
         );
@@ -243,15 +289,15 @@ mod tests {
         // A third phase is reported on its own terms, with no reference to the
         // phase the tracker started from.
         assert_eq!(
-            phases.observe(Weather::Cloudy, start + hold * 3, hold),
+            phases.observe(Weather::Cloudy, start + hold * 3, Damping::AfterHold),
             None
         );
         assert_eq!(
-            phases.observe(Weather::Cloudy, start + hold * 4, hold),
+            phases.observe(Weather::Cloudy, start + hold * 4, Damping::AfterHold),
             Some(Weather::Cloudy)
         );
         assert_eq!(
-            phases.observe(Weather::Clear, start + hold * 5, Duration::ZERO),
+            phases.observe(Weather::Clear, start + hold * 5, Damping::Immediate),
             Some(Weather::Clear),
             "returning to the initial phase is an ordinary change"
         );

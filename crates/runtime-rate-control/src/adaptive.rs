@@ -56,7 +56,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-use crate::phase_change_log::PhaseChangeLog;
+use crate::phase_change_log::{Damping, PhaseChangeLog};
 
 /// Documentation for the rate-control parameters, linked from the throttling log
 /// line so an operator can act on it.
@@ -235,7 +235,7 @@ impl AdaptiveController {
                     accepts: 0.0,
                     last_update: None,
                 },
-                phases: PhaseChangeLog::new(ThrottleState::Healthy),
+                phases: PhaseChangeLog::new(ThrottleState::Healthy, control.window),
             }),
         }
     }
@@ -279,11 +279,11 @@ impl AdaptiveController {
         let observed = ThrottleState::of(self.coefficient_of(requests, accepts));
         // A reading one outcome from the boundary has to hold for a window; a
         // firmer one is reported the moment it is seen.
-        let hold = match self.confidence_of(observed, requests, accepts) {
-            Confidence::Unambiguous => Duration::ZERO,
-            Confidence::NearBoundary => self.half_life,
+        let damping = match self.confidence_of(observed, requests, accepts) {
+            Confidence::Unambiguous => Damping::Immediate,
+            Confidence::NearBoundary => Damping::AfterHold,
         };
-        state.phases.observe(observed, now, hold)
+        state.phases.observe(observed, now, damping)
     }
 
     /// Whether one more recorded outcome could flip `observed` back.
@@ -694,15 +694,19 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_quiet_origin_reports_recovery_only_when_traffic_returns() {
         let window = Duration::from_secs(10);
-        let mut phases = PhaseChangeLog::new(ThrottleState::Healthy);
+        let mut phases = PhaseChangeLog::new(ThrottleState::Healthy, window);
         let start = Instant::now();
 
         assert_eq!(
-            phases.observe(ThrottleState::Throttling, start, window),
+            phases.observe(ThrottleState::Throttling, start, Damping::AfterHold),
             None
         );
         assert_eq!(
-            phases.observe(ThrottleState::Throttling, start + window, window),
+            phases.observe(
+                ThrottleState::Throttling,
+                start + window,
+                Damping::AfterHold
+            ),
             Some(ThrottleState::Throttling)
         );
 
@@ -710,12 +714,20 @@ mod tests {
         // reported, however long the origin has been healthy.
         let quiet_for = Duration::from_secs(3600);
         assert_eq!(
-            phases.observe(ThrottleState::Healthy, start + quiet_for, window),
+            phases.observe(
+                ThrottleState::Healthy,
+                start + quiet_for,
+                Damping::AfterHold
+            ),
             None,
             "the first request back only starts the hold"
         );
         assert_eq!(
-            phases.observe(ThrottleState::Healthy, start + quiet_for + window, window),
+            phases.observe(
+                ThrottleState::Healthy,
+                start + quiet_for + window,
+                Damping::AfterHold
+            ),
             Some(ThrottleState::Healthy),
             "a marginal recovery is reported one window after traffic returns"
         );
