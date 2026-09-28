@@ -37,6 +37,34 @@ class CodeQlWorkflowTest(unittest.TestCase):
         self.assertIn("pull_request|pull_request_target)", script)
         self.assertNotIn("refs/pull/", script)
 
+    def test_analyze_runs_on_spiceai_macos(self):
+        import yaml
+
+        doc = yaml.safe_load(WORKFLOW.read_text())
+        analyze = doc["jobs"]["analyze"]
+        self.assertEqual(analyze["runs-on"], "spiceai-macos")
+        # Query evaluation stays on a fresh hosted VM. It does not check out
+        # the scanned tree.
+        self.assertEqual(doc["jobs"]["sarif"]["runs-on"], "ubuntu-24.04")
+        self.assertEqual(
+            analyze["env"]["HAS_SPICEIO_SECRET"],
+            "${{ secrets.UNAS_SMB_PASS != '' }}",
+        )
+        spiceio = next(step for step in analyze["steps"] if step["name"] == "Set up spiceio")
+        self.assertIn("runner.os == 'macOS'", spiceio["if"])
+        self.assertIn("HAS_SPICEIO_SECRET", spiceio["if"])
+        self.assertIn("spiceio/.github/actions/setup@", spiceio["uses"])
+        self.assertEqual(spiceio["with"]["bucket"], "sccache")
+        self.assertEqual(spiceio["with"]["immutable-objects"], "true")
+        sccache = next(step for step in analyze["steps"] if step["name"] == "Set up sccache")
+        self.assertEqual(
+            sccache["with"]["spiceio_endpoint"],
+            "${{ steps.setup-spiceio.outputs.endpoint }}",
+        )
+        self.assertIn("HAS_TEST_MINIO_SECRET", sccache["with"]["minio_endpoint"])
+        kill = next(step for step in analyze["steps"] if step["name"] == "Kill spiceio")
+        self.assertIn("always()", kill["if"])
+
     def test_produce_sarif_uses_the_cli_code_scanning_suite(self):
         import yaml
 

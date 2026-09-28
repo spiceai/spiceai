@@ -189,9 +189,10 @@ pub(crate) fn approx_captured_file_bytes(path: &str) -> usize {
 pub(crate) enum RowLocation {
     /// Row lives in the inline memtable; tombstoned by an inlined-data rewrite.
     Inlined,
-    /// Row lives in a Vortex file but its file-local position is unknown — a
-    /// cold-rebuilt keyset entry, or any entry under `deletion_mode: key`.
-    /// Tombstoned by a key-based deletion vector.
+    /// Row tombstoned by a key-based deletion: a Vortex file row whose
+    /// file-local position is unknown (a cold-rebuilt keyset entry, or any entry
+    /// under `deletion_mode: key`), or a CDC mem-tier row
+    /// ([`RowLocation::MEM_TIER`]).
     FileUnlocated,
     /// Row lives at a known `(file path, file-local position)`, captured by the
     /// `row_idx()` read-back under `deletion_mode: position`. Tombstoned by a
@@ -199,6 +200,15 @@ pub(crate) enum RowLocation {
     /// `file_path` `Arc` is shared across all rows in the same file, so the
     /// per-entry cost is one pointer + the `u64` position.
     FilePositioned { file_path: Arc<str>, position: u64 },
+}
+
+impl RowLocation {
+    /// The location of a CDC mem-tier row. Not `Inlined`: that location's inline
+    /// tombstone only hides metastore-inlined rows. A key deletion hides the row
+    /// both in the mem tier (scans filter it against the file deletion snapshot)
+    /// and in the file a checkpoint or spill moves it to, and the mem-tier append
+    /// folds both key lists into its own tombstones.
+    pub(crate) const MEM_TIER: Self = Self::FileUnlocated;
 }
 
 /// Outcome of [`CachedPkKeyset::try_insert_with_digest`].
