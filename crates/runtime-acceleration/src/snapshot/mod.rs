@@ -4472,6 +4472,8 @@ mod tests {
             snapshot_engine: Some(AccelerationEngine::Cayenne.to_string()),
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         }
     }
 
@@ -4771,6 +4773,8 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = SnapshotMetadata {
             format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
