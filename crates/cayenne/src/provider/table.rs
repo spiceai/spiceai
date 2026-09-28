@@ -7170,6 +7170,29 @@ impl CayenneTableProvider {
             .join(snapshot_id)
     }
 
+    /// The listing URL of a snapshot directory.
+    ///
+    /// `ListingTableUrl::parse` stats a local path, twice, to learn whether it names a directory,
+    /// and a scan builds this URL on every query. A snapshot directory is always a directory, so
+    /// an absolute local one is converted directly; anything else — an object-store URL, a
+    /// relative path, a path `parse` would read as a glob — still goes through `parse`.
+    fn snapshot_listing_url(
+        table_path: &str,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<ListingTableUrl> {
+        let dir = Self::snapshot_dir_path(table_path, table_id, snapshot_id);
+        if !table_path.starts_with("s3://")
+            && dir.is_absolute()
+            && !dir.to_string_lossy().contains(['*', '?', '['])
+            && let Ok(url) = url::Url::from_directory_path(&dir)
+            && let Ok(url) = url::Url::parse(url.as_str())
+        {
+            return ListingTableUrl::try_new(url, None);
+        }
+        ListingTableUrl::parse(Self::snapshot_dir_url(table_path, table_id, snapshot_id))
+    }
+
     /// Convert a directory path to a `DataFusion`-compatible URL string with trailing slash.
     ///
     /// `DataFusion` requires directory URLs to end with a trailing slash.
@@ -33915,12 +33938,11 @@ impl CayenneTableProvider {
         // view-typed read schema so the scan output matches the advertised
         // `TableProvider::schema()` and downstream joins plan on view arrays.
         let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
-        let snapshot_dir_url = Self::snapshot_dir_url(
+        let table_url = Self::snapshot_listing_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
-        );
-        let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
+        )?;
         let mut options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
@@ -34096,6 +34118,20 @@ impl CayenneTableProvider {
         let mut file_source = options
             .format
             .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+
+        // A primary-key equality reads only the key blocks that can hold the key
+        // (`VortexSource::with_key_column`). Their bounds are cached by file path,
+        // which is sound because a data file's uuid7 path is never reused.
+        if let [pk_index] = self.pk_column_indices.as_slice() {
+            let key_column: Arc<str> =
+                Arc::from(self.table_schema().field(*pk_index).name().as_str());
+            let keyed: Option<Arc<dyn FileSource>> = file_source
+                .downcast_ref::<VortexSource>()
+                .map(|vs| Arc::new(vs.clone().with_key_column(key_column)) as Arc<dyn FileSource>);
+            if let Some(keyed) = keyed {
+                file_source = keyed;
+            }
+        }
 
         // Small groups gain no decode parallelism worth having from being
         // byte-range-split into `target_partitions` scan units, but pay a Vortex
@@ -38120,6 +38156,36 @@ mod tests {
 
     fn url(s: &str) -> String {
         s.to_string()
+    }
+
+    /// A scan converts an absolute local snapshot directory to its listing URL
+    /// without `ListingTableUrl::parse`; the result must be exactly what `parse`
+    /// returns, for the paths converted directly and for those that still parse.
+    #[test]
+    fn snapshot_listing_url_is_what_parse_returns() {
+        // `parse` stats the path, so cover a snapshot directory that exists too.
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(temp.path().join("table-id").join("snapshot-id"))
+            .expect("snapshot dir");
+        let existing = temp.path().to_string_lossy().to_string();
+        for table_path in [
+            existing.as_str(),
+            "/does/not/exist/spice data",
+            "relative/spice/data",
+            "s3://bucket/prefix",
+            "/data/[glob]",
+        ] {
+            let direct =
+                CayenneTableProvider::snapshot_listing_url(table_path, "table-id", "snapshot-id")
+                    .expect("listing URL");
+            let parsed = ListingTableUrl::parse(CayenneTableProvider::snapshot_dir_url(
+                table_path,
+                "table-id",
+                "snapshot-id",
+            ))
+            .expect("parsed listing URL");
+            assert_eq!(direct, parsed, "table path {table_path}");
+        }
     }
 
     /// The per-file row cap must keep a full file's right-sized PK bloom
