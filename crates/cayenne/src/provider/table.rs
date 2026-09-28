@@ -10943,9 +10943,22 @@ impl CayenneTableProvider {
     /// an ordinary write inherits it from whatever session is executing
     /// (`runtime.query.target_partitions`, or a cluster's executor-slot count),
     /// and a configured `cayenne_write_concurrency` must survive that.
+    ///
+    /// A configured value is still capped at the CPU budget's ceiling. The
+    /// writer session is sized from the same budget, so the Vortex sink builds
+    /// no more shards than that (`VortexFormat::build_shard_spec`); capping here
+    /// keeps every count derived from this one — range split points, the shard
+    /// config, encode permits — equal to the shards actually written. Split
+    /// points computed for more shards would be cut down to their first few,
+    /// leaving the last shard nearly all of the rows.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
-        self.context.write_concurrency().unwrap_or(default).max(1)
+        let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
+        self.context
+            .write_concurrency()
+            .unwrap_or(default)
+            .min(ceiling)
+            .max(1)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -49099,15 +49112,28 @@ mod tests {
     /// Without that, a globally sorted stream is split across shard files and
     /// every file's zone maps span the whole range, silently forfeiting the
     /// pruning the sort exists for.
+    /// A configured write concurrency above 1 that the CPU budget does not cap,
+    /// so a test of how the configured value interacts with the partition hint
+    /// does not depend on the host's core count.
+    fn configured_write_concurrency_within_budget() -> usize {
+        let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
+        assert!(
+            ceiling >= 2,
+            "these tests need a CPU budget of at least 2 cores"
+        );
+        ceiling.min(8)
+    }
+
     #[tokio::test]
     async fn test_sorted_rewrite_stays_serial_under_write_concurrency_override() {
+        let configured = configured_write_concurrency_within_budget();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_cayenne_table_with_config(
             "sorted_rewrite_concurrency_override",
             Arc::clone(&schema),
             VortexConfig {
-                write_concurrency: Some(8),
+                write_concurrency: Some(configured),
                 sort_columns: vec!["id".to_string()],
                 ..VortexConfig::default()
             },
@@ -49136,7 +49162,7 @@ mod tests {
         // not hold, so a sorted rewrite that only passed `1` would fan out.
         assert_eq!(
             provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
-            8,
+            configured,
             "the partition hint alone does not bound a configured concurrency"
         );
     }
@@ -49147,18 +49173,19 @@ mod tests {
     /// `runtime.query.target_partitions`, or a cluster's executor-slot count — so
     /// treating it as a hard ceiling would silently disable a configured
     /// `cayenne_write_concurrency` on the CDC, DML, staged and overwrite paths.
-    /// `write_to_snapshot` builds its own `SessionConfig::default()` session for
-    /// the sink, so the sink would still have encoded at the configured width;
-    /// only the accelerator's request would have collapsed.
+    /// `write_to_snapshot` builds its own CPU-budget-sized session for the sink,
+    /// so the sink would still have encoded at the configured width; only the
+    /// accelerator's request would have collapsed.
     #[tokio::test]
     async fn test_low_partition_hint_does_not_serialize_a_sized_write() {
+        let configured = configured_write_concurrency_within_budget();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_cayenne_table_with_config(
             "low_partition_hint",
             Arc::clone(&schema),
             VortexConfig {
-                write_concurrency: Some(8),
+                write_concurrency: Some(configured),
                 ..VortexConfig::default()
             },
             vec![],
@@ -49169,7 +49196,7 @@ mod tests {
         let tsb = provider.context.target_file_size_bytes();
         assert_eq!(
             provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
-            8,
+            configured,
             "a configured write concurrency must survive a low partition hint"
         );
         assert_eq!(
@@ -49178,7 +49205,51 @@ mod tests {
                 .write_shard()
                 .expect("a sized write keeps its shard config")
                 .write_concurrency,
-            8
+            configured
+        );
+    }
+
+    /// A configured write concurrency above the CPU budget is capped at it, the
+    /// same count the writer session lets the Vortex sink build. Range split
+    /// points are computed for this count; computed for the uncapped one, the
+    /// sink would keep only the first few and route nearly every row to its
+    /// last shard.
+    #[tokio::test]
+    async fn test_write_concurrency_above_cpu_budget_is_capped_at_it() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "provider::table::tests::test_write_concurrency_above_cpu_budget_is_capped_at_it",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "write_concurrency_above_budget",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(16),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        assert_eq!(
+            provider.snapshot_shard_count(16, tsb, None, EncodeFanOut::Sized),
+            cores
+        );
+        let session_partitions = provider
+            .create_session_context()
+            .state()
+            .config()
+            .target_partitions();
+        assert_eq!(
+            session_partitions, cores,
+            "the writer session bounds the shards the sink builds"
         );
     }
 
