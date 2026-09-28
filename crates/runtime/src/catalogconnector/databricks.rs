@@ -49,6 +49,7 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use token_provider::StaticTokenProvider;
 use url::Url;
 
@@ -123,7 +124,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
     ParameterSpec::runtime("rate_control_acquire_timeout")
-        .description("Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Use '0' for no limit. If both are unset, the request waits with no limit."),
+        .description("Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Defaults to `client_timeout`. Use '0' for no limit."),
 
     // Databricks authentication
     ParameterSpec::component("auth_mode")
@@ -213,7 +214,7 @@ async fn shared_databricks_catalog_rate_controller(
     let connector_component = ConnectorComponent::from(catalog);
     // The Databricks clients do not report per-request outcomes, so only the
     // static limits apply.
-    let rate_control = http_rate_control::resolve_static_config_for_component(
+    let mut rate_control = http_rate_control::resolve_static_config_for_component(
         params,
         Some(&catalog.app.runtime.params),
         &connector_component,
@@ -224,6 +225,7 @@ async fn shared_databricks_catalog_rate_controller(
         connector_component: ConnectorComponent::from(catalog),
         source: source.into(),
     })?;
+    rate_control.apply_default_acquire_timeout(effective_client_timeout(params));
 
     runtime
         .http_rate_control_registry()
@@ -559,6 +561,25 @@ async fn create_token_provider_for_catalog(
                 })
         }
     }
+}
+
+/// The per-request HTTP timeout a Databricks component actually applies: the
+/// parsed `client_timeout`, or the SQL Warehouse default when the parameter is
+/// unset or unparseable. Rate control derives its acquire bound from this, the
+/// same way the HTTPS connector derives it from its own `client_timeout`.
+///
+/// Silent by design: [`build_sql_warehouse_config`] logs the warning for a bad
+/// value once, where the client config is built. The two must resolve the same
+/// value — `test_effective_client_timeout_matches_sql_warehouse_config` holds
+/// them together.
+#[must_use]
+pub fn effective_client_timeout(params: &Parameters) -> Duration {
+    params
+        .get("client_timeout")
+        .expose()
+        .ok()
+        .and_then(|value| duration_parse::parse_duration(value).ok())
+        .unwrap_or_else(|| SqlWarehouseConfig::default().request_timeout)
 }
 
 pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
@@ -898,6 +919,38 @@ mod tests {
                 "parameter `{name}` is consumed by build_sql_warehouse_config but not declared in PARAMETERS; Parameters::try_new would strip it"
             );
         }
+    }
+
+    /// `effective_client_timeout` feeds the rate-control acquire bound while
+    /// [`build_sql_warehouse_config`] feeds the HTTP client. Both read
+    /// `client_timeout` with the same parser and the same fallback, so they must
+    /// never disagree — including for an empty or unparseable value.
+    #[test]
+    fn test_effective_client_timeout_matches_sql_warehouse_config() {
+        for entries in [
+            vec![],
+            vec![("client_timeout", "2m")],
+            vec![("client_timeout", "")],
+            vec![("client_timeout", "not-a-duration")],
+        ] {
+            let params = make_parameters(&entries);
+            assert_eq!(
+                effective_client_timeout(&params),
+                build_sql_warehouse_config(&params).request_timeout,
+                "the acquire bound and the HTTP client must resolve the same client_timeout for {entries:?}"
+            );
+        }
+    }
+
+    /// An unset `client_timeout` resolves to the connector default, so a
+    /// Databricks component gets the same bound as an HTTPS or GraphQL dataset
+    /// that shares its origin.
+    #[test]
+    fn test_unset_client_timeout_is_the_connector_default() {
+        assert_eq!(
+            effective_client_timeout(&make_parameters(&[])),
+            SqlWarehouseConfig::default().request_timeout
+        );
     }
 
     /// Regression test: this catalog resolves its rate control with
