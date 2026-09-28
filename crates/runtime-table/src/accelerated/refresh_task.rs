@@ -218,11 +218,11 @@ pub(crate) fn collect_all_indexes(
 /// Whether a successful refresh changed the accelerator's contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
-    /// The refresh wrote to, or reloaded, the accelerator.
-    Changed,
-    /// The refresh found nothing new and left the accelerator as it was: the
-    /// source reported unchanged data, or no newer snapshot was available.
-    Unchanged,
+    /// The refresh may have written to or reloaded the accelerator.
+    Refreshed,
+    /// The accelerator already matched the source, so nothing was written:
+    /// the source reported unchanged data, or no newer snapshot was available.
+    UpToDate,
 }
 
 pub struct RefreshTaskBuilder {
@@ -751,7 +751,7 @@ impl RefreshTask {
                             status::ComponentStatus::Ready,
                         )
                         .await;
-                        return Ok(RefreshOutcome::Unchanged);
+                        return Ok(RefreshOutcome::UpToDate);
                     }
                     Ok(_) => {
                         // Data may have changed or provider does not support skipping; continue with refresh.
@@ -799,7 +799,7 @@ impl RefreshTask {
                 return self
                     .refresh_stale_cached_rows(refresh)
                     .await
-                    .map(|()| RefreshOutcome::Changed);
+                    .map(|()| RefreshOutcome::Refreshed);
             }
             RefreshMode::Snapshot => {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
@@ -814,8 +814,9 @@ impl RefreshTask {
             Err(e) => {
                 // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
                 // This is expected and should not be logged as an error.
+                // A canceled write may be partial, so report it as `Refreshed`.
                 if self.runtime_status.is_shutdown() {
-                    return Ok(RefreshOutcome::Changed);
+                    return Ok(RefreshOutcome::Refreshed);
                 }
                 self.log_refresh_error(
                     inner_err_from_retry_ref(&e),
@@ -859,8 +860,9 @@ impl RefreshTask {
         {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
+            // A canceled write may be partial, so report it as `Refreshed`.
             if self.runtime_status.is_shutdown() {
-                return Ok(RefreshOutcome::Changed);
+                return Ok(RefreshOutcome::Refreshed);
             }
             tracing::warn!(
                 "Failed to load data for {} {}: {}",
@@ -879,7 +881,7 @@ impl RefreshTask {
         )
         .await;
 
-        Ok(RefreshOutcome::Changed)
+        Ok(RefreshOutcome::Refreshed)
     }
 
     fn is_metric_enabled(&self, metric_name: &str) -> bool {
@@ -1397,7 +1399,7 @@ impl RefreshTask {
                 }
                 self.set_refresh_status(None, status::ComponentStatus::Ready)
                     .await;
-                return Ok(RefreshOutcome::Unchanged);
+                return Ok(RefreshOutcome::UpToDate);
             }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
@@ -1594,7 +1596,7 @@ impl RefreshTask {
 
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
-        Ok(RefreshOutcome::Changed)
+        Ok(RefreshOutcome::Refreshed)
     }
 
     async fn trace_load_completed(

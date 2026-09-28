@@ -1127,8 +1127,7 @@ impl Refresher {
                         let refresh_succeeded = res.is_ok();
                         // A retention failure can happen after a successful write, so cached
                         // query results must be invalidated even though the refresh reports an error.
-                        // A refresh that found nothing new (unchanged source, no newer snapshot)
-                        // leaves the accelerator as it was, so its cached results stay valid.
+                        // An `UpToDate` refresh wrote nothing, so cached results stay valid.
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
                         if refresh_succeeded {
@@ -1300,7 +1299,7 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
 fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) -> bool {
     matches!(
         result,
-        Ok(RefreshOutcome::Changed) | Err(super::Error::FailedToApplyRetentionSql { .. })
+        Ok(RefreshOutcome::Refreshed) | Err(super::Error::FailedToApplyRetentionSql { .. })
     )
 }
 
@@ -1498,10 +1497,10 @@ mod tests {
     #[test]
     fn test_refresh_result_changed_accelerator() {
         assert!(refresh_result_changed_accelerator(&Ok(
-            RefreshOutcome::Changed
+            RefreshOutcome::Refreshed
         )));
         assert!(!refresh_result_changed_accelerator(&Ok(
-            RefreshOutcome::Unchanged
+            RefreshOutcome::UpToDate
         )));
 
         assert!(refresh_result_changed_accelerator(&Err(
