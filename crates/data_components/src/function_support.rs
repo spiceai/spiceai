@@ -23,22 +23,6 @@ pub use datafusion_table_providers::util::supported_functions::{
 use datafusion::{common::Result, logical_expr::LogicalPlan};
 use datafusion_federation::FederatedPlanNode;
 
-/// Whether `plan` may be handed to a remote engine under `function_support`.
-///
-/// The decision every `SQLExecutor` in this crate makes in `can_execute_plan`,
-/// in one place so they cannot disagree about it. Absent a policy every plan
-/// federates, which is what an executor that overrides nothing does.
-///
-/// Fails safe: a support check that itself errors is read as "contains an
-/// unsupported function", so a statement is never sent to a remote engine on
-/// the strength of a check that did not complete.
-#[must_use]
-pub fn plan_is_federatable(plan: &LogicalPlan, function_support: Option<&FunctionSupport>) -> bool {
-    function_support.is_none_or(|function_support| {
-        !contains_unsupported_functions(plan, function_support).unwrap_or(true)
-    })
-}
-
 /// If `plan` is a `FederatedPlanNode` whose inner plan contains functions that
 /// are unsupported according to `function_support`, unwrap it back to the inner
 /// plan so it is executed locally rather than being sent to the remote.

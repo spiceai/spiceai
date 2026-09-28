@@ -29,7 +29,7 @@ use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSou
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::Stream;
 
-use crate::function_support::plan_is_federatable;
+use crate::function_support::contains_unsupported_functions;
 use crate::spark_connect::map_error_to_datafusion_err;
 use datafusion::logical_expr::LogicalPlan;
 
@@ -82,8 +82,12 @@ impl SQLExecutor for SparkConnectTableProvider {
     /// `DataFusion` runs it locally instead of unparsing it into the statement
     /// sent to Spark -- which answers `[UNRESOLVED_ROUTINE]` for every
     /// Spice-only UDF (#13664).
+    ///
+    /// Fails safe, as `SqlTable` does: a support check that itself errors is
+    /// read as "unsupported", so a plan is never sent on the strength of a
+    /// check that did not complete.
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        plan_is_federatable(plan, Some(self.spark_connect.function_support()))
+        !contains_unsupported_functions(plan, self.spark_connect.function_support()).unwrap_or(true)
     }
 
     fn execute(

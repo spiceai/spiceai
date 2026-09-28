@@ -58,7 +58,6 @@ use util::{
     format_datafusion_error,
 };
 
-use crate::function_support::FunctionSupport;
 #[cfg(test)]
 use crate::resilient_http::configure_client_builder;
 use crate::resilient_http::{
@@ -70,7 +69,7 @@ use crate::schema_discovery::{
     discover_schema,
 };
 use crate::{DESCRIPTION_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
-use runtime_udfs_api::deny_spice_specific_functions;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -391,12 +390,6 @@ pub struct DatabricksSqlWarehouse {
     pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
     metrics: Arc<DatabricksMetrics>,
     api: Arc<SqlWarehouseApi>,
-    /// Which functions may be pushed into the SQL sent to the warehouse.
-    ///
-    /// Defaults to the Spice deny-list rather than to "federate everything",
-    /// so a caller that forgets to set it is safe: the omission costs a
-    /// pushdown, not a query the warehouse answers `UNRESOLVED_ROUTINE` to.
-    function_support: Arc<FunctionSupport>,
 }
 
 impl DatabricksSqlWarehouse {
@@ -521,24 +514,7 @@ impl DatabricksSqlWarehouse {
             metrics: Arc::clone(&metrics),
             permissions,
         });
-        Ok(Self {
-            pool,
-            metrics,
-            api,
-            function_support: deny_spice_specific_functions(),
-        })
-    }
-
-    /// Replaces the deny-list applied to functions unparsed into the SQL sent
-    /// to the warehouse.
-    ///
-    /// The default already denies every Spice function, which is what
-    /// Databricks needs -- it evaluates none of them (issues #10703 and
-    /// #13664). This exists for a caller that has to widen or narrow that set.
-    #[must_use]
-    pub fn with_function_support(mut self, function_support: Arc<FunctionSupport>) -> Self {
-        self.function_support = function_support;
-        self
+        Ok(Self { pool, metrics, api })
     }
 
     /// Returns the shared metrics for this SQL Warehouse instance.
@@ -2128,7 +2104,11 @@ impl crate::Read for DatabricksSqlWarehouse {
                 .await
                 .context(SqlTableInitializationFailedSnafu)?
                 .with_dialect(dialect)
-                .with_function_support(Some(self.function_support.as_ref().clone())),
+                // Databricks evaluates none of the Spice functions, so a plan or
+                // filter naming one runs locally instead of being unparsed into
+                // a statement the warehouse answers `UNRESOLVED_ROUTINE` to
+                // (#10703, #13664).
+                .with_function_support(Some(deny_spice_functions_for_table_providers())),
         );
 
         Ok(Arc::new(

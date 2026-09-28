@@ -227,17 +227,11 @@ impl SparkConnect {
         })
     }
 
-    /// Replaces the deny-list applied to functions unparsed into the SQL sent
-    /// to Spark.
-    ///
-    /// The default already denies every Spice function, which is what Spark
-    /// needs -- it evaluates none of them and answers `[UNRESOLVED_ROUTINE]`
-    /// for the `json_get_str` set, the embedding and distance UDFs, and every
-    /// user-registered one (issues #10703 and #13664). This exists for a
-    /// caller that has to widen or narrow that set, such as a dialect that
-    /// rewrites one of those names into a real Spark function.
+    /// Replaces the default Spice deny-list, so a test can pin the exact
+    /// policy it exercises.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_function_support(mut self, function_support: Arc<FunctionSupport>) -> Self {
+    fn with_function_support(mut self, function_support: Arc<FunctionSupport>) -> Self {
         self.function_support = function_support;
         self
     }
@@ -752,7 +746,7 @@ mod tests {
             .await
             .expect("connect to the Spark Connect server")
             .with_function_support(permit_everything());
-        let unguarded_sql = federated_sql_for_spice_only_udf(&unguarded).await;
+        let unguarded_sql = federated_sql(&unguarded, SPICE_ONLY_QUERY).await;
         assert!(
             unguarded_sql
                 .as_deref()
@@ -768,7 +762,7 @@ mod tests {
             .await
             .expect("connect to the Spark Connect server")
             .with_function_support(deny_only(SPICE_ONLY_UDF));
-        let guarded_sql = federated_sql_for_spice_only_udf(&guarded).await;
+        let guarded_sql = federated_sql(&guarded, SPICE_ONLY_QUERY).await;
         assert!(
             guarded_sql
                 .as_deref()
@@ -837,8 +831,9 @@ mod tests {
         );
     }
 
-    /// The first column of every row `sql` returns, rendered as strings.
-    async fn rows(spark: &SparkConnect, sql: &str) -> Vec<String> {
+    /// A federating session over `spark`'s `docs` table, with the stand-in
+    /// UDFs registered.
+    async fn docs_ctx(spark: &SparkConnect) -> datafusion::prelude::SessionContext {
         use datafusion::execution::session_state::SessionStateBuilder;
         use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 
@@ -856,8 +851,13 @@ mod tests {
         ctx.register_udf(stub_udf(SPICE_SET_UDF));
         ctx.register_table(TableReference::bare("docs"), provider)
             .expect("register the docs table");
+        ctx
+    }
 
-        let batches = ctx
+    /// The first column of every row `sql` returns, rendered as strings.
+    async fn rows(spark: &SparkConnect, sql: &str) -> Vec<String> {
+        let batches = docs_ctx(spark)
+            .await
             .sql(sql)
             .await
             .expect("plan the query")
@@ -880,6 +880,7 @@ mod tests {
     }
 
     const SPICE_ONLY_UDF: &str = "spice_only_udf";
+    const SPICE_ONLY_QUERY: &str = "SELECT id, spice_only_udf(body) AS c FROM docs";
 
     /// A function that really is in the Spice set the default policy denies,
     /// so the default can be tested without naming the whole set.
@@ -922,35 +923,13 @@ mod tests {
         ))
     }
 
-    async fn federated_sql_for_spice_only_udf(spark: &SparkConnect) -> Option<String> {
-        federated_sql(spark, "SELECT id, spice_only_udf(body) AS c FROM docs").await
-    }
-
     /// The statement the federated plan for `sql` would send to Spark, or
     /// `None` when nothing federated.
     async fn federated_sql(spark: &SparkConnect, sql: &str) -> Option<String> {
-        use datafusion::execution::session_state::SessionStateBuilder;
         use datafusion::physical_plan::displayable;
-        use datafusion::prelude::SessionContext;
-        use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 
-        let provider = spark
-            .table_provider(TableReference::bare("docs"))
+        let physical = docs_ctx(spark)
             .await
-            .expect("build the docs table provider");
-
-        let state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
-            .build();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_udf(stub_udf(SPICE_ONLY_UDF));
-        ctx.register_udf(stub_udf(SPICE_SET_UDF));
-        ctx.register_table(TableReference::bare("docs"), provider)
-            .expect("register the docs table");
-
-        let physical = ctx
             .sql(sql)
             .await
             .expect("plan the query")
