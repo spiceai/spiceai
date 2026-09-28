@@ -70,6 +70,8 @@ inputs:
         - 'scripts/test_check_module_reachability.py'
         - 'scripts/check_fork_patches.py'
         - 'scripts/test_check_fork_patches.py'
+        - 'scripts/check_bench_mysql_load_nulls.py'
+        - 'scripts/test_check_bench_mysql_load_nulls.py'
         - 'docs/dev/fork_patches.md'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'

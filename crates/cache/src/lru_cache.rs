@@ -376,13 +376,25 @@ impl<
         // invalidate gate, so a concurrent insert into an already-walked shard
         // cannot survive this return.
         let backend = Arc::clone(&self.backend);
-        let removed = tokio::task::spawn_blocking(move || {
+        let removed = match tokio::task::spawn_blocking(move || {
             backend.invalidate_matching(|value| {
                 crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
             })
         })
         .await
-        .context(InvalidationDidNotFinishSnafu { table_name })?;
+        {
+            Ok(removed) => removed,
+            // Tokio cancels a blocking task only when its runtime is shutting down,
+            // and this in-memory cache is dropped with it, so nothing stale can be
+            // served. A panicked scan is still an error.
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(
+                    "Cache invalidation for dataset {table_name} was cancelled (likely shutdown)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e).context(InvalidationDidNotFinishSnafu { table_name }),
+        };
 
         tracing::debug!("Invalidated {removed} cache entries by scanning the shards in place");
         Ok(())
@@ -636,6 +648,41 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should not contain key after invalidation");
+    }
+
+    /// A refresh that finishes while the runtime is shutting down still invalidates
+    /// the cache, and Tokio cancels a `spawn_blocking` task on a runtime that is
+    /// already shut down. The cache is dropped with the runtime, so there is nothing
+    /// stale left to serve — this must not surface as an invalidation failure.
+    #[test]
+    fn test_invalidation_cancelled_by_runtime_shutdown_is_not_an_error() {
+        let shut_down = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("build runtime");
+        let shut_down_handle = shut_down.handle().clone();
+        shut_down.shutdown_background();
+
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            TEST_MAX_SIZE,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build runtime");
+        let result = driver.block_on(async {
+            let _entered = shut_down_handle.enter();
+            cache
+                .invalidate_for_table(TableReference::bare("test_table"))
+                .await
+        });
+
+        if let Err(e) = result {
+            panic!("invalidation cancelled by runtime shutdown must not be an error: {e}");
+        }
     }
 
     /// Regression test for #11266: cache invalidation must resolve both the
