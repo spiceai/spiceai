@@ -2487,10 +2487,9 @@ pub struct CayenneTableProvider {
     /// Coalescing state of write-driven compaction — one of
     /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
     /// [`COALESCED_TASK_RUNNING_DIRTY`] — so a high-ingest table does not spawn
-    /// one background compaction task per append. A write that asks for a pass
-    /// while one runs marks the state dirty, so the task re-evaluates once that
-    /// pass ends: the append that aborted it is otherwise never compacted until
-    /// the next write or background tick.
+    /// one background compaction task per append, and a request raised while a
+    /// pass runs is re-evaluated once it ends
+    /// (see [`coalesced_task_state_after_signal`]).
     post_write_compaction_state: Arc<AtomicU8>,
     /// Coalescing state of the orphaned-deletion-vector cleanup sweep — one of
     /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
@@ -3611,6 +3610,78 @@ const fn coalesced_task_state_after_signal(state: u8) -> Option<u8> {
         COALESCED_TASK_IDLE => Some(COALESCED_TASK_RUNNING),
         COALESCED_TASK_RUNNING => Some(COALESCED_TASK_RUNNING_DIRTY),
         _ => None,
+    }
+}
+
+/// Signal a coalesced task: `true` when this caller moved its state from idle to
+/// running and so owns the task it must now spawn; otherwise the signal was
+/// recorded on the task already running.
+fn coalesced_task_try_claim(state: &AtomicU8) -> bool {
+    state.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        coalesced_task_state_after_signal,
+    ) == Ok(COALESCED_TASK_IDLE)
+}
+
+/// One claimed episode of a coalesced task, from the claim to the task's exit.
+///
+/// A task that ends abnormally — a panic during unwind, or the task being dropped
+/// on abort — never reaches [`Self::try_finish`], so dropping an unfinished
+/// episode republishes idle; a stuck state would otherwise permanently suppress
+/// future signals AND hang `drain_in_flight_maintenance`. A clean finish disarms
+/// that reset, so it cannot stomp a state a LATER task already owns.
+///
+/// The abnormal exit deliberately drops a signal that arrived before it rather
+/// than re-arming a task from `Drop`: the abort case IS runtime shutdown, where
+/// spawning panics inside an unwind. Losing one edge is bounded — the next signal
+/// or open replays it — whereas leaving the state dirty with no task wedges it.
+struct CoalescedTaskEpisode {
+    state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl CoalescedTaskEpisode {
+    fn new(state: &Arc<AtomicU8>) -> Self {
+        Self {
+            state: Arc::clone(state),
+            armed: true,
+        }
+    }
+
+    /// End the episode if no signal arrived since the pass began, or consume
+    /// the signal and return `false` so the caller takes another pass.
+    ///
+    /// The episode ends only by atomically claiming a CLEAN running state. A
+    /// signal raised anywhere up to this point has already flipped the state to
+    /// dirty, so the exchange fails — the edge cannot be lost in the gap between
+    /// the last pass and the task exiting. A signal that lands between the
+    /// failed exchange and the store finds the state already dirty and adds
+    /// nothing: the pass it wants starts after it, which is what it asked for.
+    fn try_finish(&mut self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                COALESCED_TASK_RUNNING,
+                COALESCED_TASK_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.armed = false;
+            return true;
+        }
+        self.state.store(COALESCED_TASK_RUNNING, Ordering::Release);
+        false
+    }
+}
+
+impl Drop for CoalescedTaskEpisode {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.store(COALESCED_TASK_IDLE, Ordering::Release);
+        }
     }
 }
 
@@ -19068,21 +19139,11 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
-        if !self.post_write_compaction_due() {
-            return;
-        }
-
-        // Only the idle -> running winner owns the task; a request raised while
-        // it runs is recorded on it (see `coalesced_task_state_after_signal`).
-        // That request is typically the append that aborts the running pass, so
-        // dropping it would leave the aborted seed unconsolidated until the next
-        // write or background tick.
-        let previous = self.post_write_compaction_state.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            coalesced_task_state_after_signal,
-        );
-        if previous != Ok(COALESCED_TASK_IDLE) {
+        // A request raised while a pass runs is recorded on it rather than
+        // dropped: it is usually the append that aborts that pass.
+        if !self.post_write_compaction_due()
+            || !coalesced_task_try_claim(&self.post_write_compaction_state)
+        {
             return;
         }
 
@@ -19091,27 +19152,7 @@ impl CayenneTableProvider {
         // full snapshot rewrite) on the dedicated compaction runtime, isolated
         // from the query (compute) and CDC (refresh) runtimes.
         super::compaction::spawn_compaction(async move {
-            // A task that ends abnormally — a panic during unwind, or the task
-            // being dropped on abort — never reaches the exchange below, so
-            // republish idle here or a stuck state would permanently suppress
-            // future compaction scheduling and hang `drain_in_flight_maintenance`.
-            // Disarmed on the clean exit path so this cannot stomp a state a
-            // LATER task already owns.
-            struct ResetOnAbnormalExit {
-                state: Arc<AtomicU8>,
-                armed: bool,
-            }
-            impl Drop for ResetOnAbnormalExit {
-                fn drop(&mut self) {
-                    if self.armed {
-                        self.state.store(COALESCED_TASK_IDLE, Ordering::Release);
-                    }
-                }
-            }
-            let mut reset = ResetOnAbnormalExit {
-                state: Arc::clone(&table.post_write_compaction_state),
-                armed: true,
-            };
+            let mut episode = CoalescedTaskEpisode::new(&table.post_write_compaction_state);
 
             tokio::task::yield_now().await;
             let mut due = true;
@@ -19134,28 +19175,11 @@ impl CayenneTableProvider {
                         }
                     }
                 }
-                // End only by atomically claiming a CLEAN running state. A
-                // request raised up to this point has already flipped the state
-                // to dirty, so the exchange fails and the task re-evaluates.
-                if table
-                    .post_write_compaction_state
-                    .compare_exchange(
-                        COALESCED_TASK_RUNNING,
-                        COALESCED_TASK_IDLE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    reset.armed = false;
+                if episode.try_finish() {
                     break;
                 }
-                // Dirty: consume the request, then re-check the trigger — a pass
-                // that committed has reset the file credit, so a request it
-                // already served runs nothing.
-                table
-                    .post_write_compaction_state
-                    .store(COALESCED_TASK_RUNNING, Ordering::Release);
+                // A pass that committed has reset the file credit, so a request
+                // it already served runs nothing.
                 due = table.post_write_compaction_due();
             }
         });
@@ -19179,14 +19203,9 @@ impl CayenneTableProvider {
     /// publisher's `listing_fence` write guard anyway) and misreports when cleanup
     /// became due.
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
-        let previous = self.orphan_dv_sweep_state.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            coalesced_task_state_after_signal,
-        );
         // Only the idle -> running winner owns the worker; every other signal has
         // been recorded on the worker that is already running.
-        if previous != Ok(COALESCED_TASK_IDLE) {
+        if !coalesced_task_try_claim(&self.orphan_dv_sweep_state) {
             maintenance_metrics::track_maintenance(
                 self.table_metadata.table_name.as_str(),
                 MaintenanceOp::OrphanDvSweep,
@@ -19197,35 +19216,7 @@ impl CayenneTableProvider {
 
         let table = self.clone_for_write();
         super::compaction::spawn_compaction(async move {
-            // A worker that ends abnormally — a panic during unwind, or the task
-            // being dropped on abort — never reaches the exchange below, so
-            // republish idle here or a stuck state would permanently suppress
-            // future sweeps on a long-lived provider AND hang
-            // `drain_in_flight_maintenance`. Disarmed on the clean exit path so
-            // this cannot stomp a state a LATER worker already owns.
-            //
-            // This deliberately drops a signal that arrived before the abnormal
-            // exit rather than re-arming a worker from `Drop`: the abort case IS
-            // runtime shutdown, where spawning panics inside an unwind. Losing one
-            // edge is bounded — the startup pass replays it on the next open, which
-            // is the same repair a crash between a publication and its signal
-            // needs — whereas leaving the state dirty with no worker wedges the
-            // sweep permanently.
-            struct ResetOnAbnormalExit {
-                state: Arc<AtomicU8>,
-                armed: bool,
-            }
-            impl Drop for ResetOnAbnormalExit {
-                fn drop(&mut self) {
-                    if self.armed {
-                        self.state.store(COALESCED_TASK_IDLE, Ordering::Release);
-                    }
-                }
-            }
-            let mut reset = ResetOnAbnormalExit {
-                state: Arc::clone(&table.orphan_dv_sweep_state),
-                armed: true,
-            };
+            let mut episode = CoalescedTaskEpisode::new(&table.orphan_dv_sweep_state);
 
             tokio::task::yield_now().await;
             loop {
@@ -19235,31 +19226,9 @@ impl CayenneTableProvider {
                         ORPHAN_DV_SWEEP_MAX_BATCH,
                     )
                     .await;
-                // End the episode only by atomically claiming a CLEAN running
-                // state. A signal raised anywhere up to this point has already
-                // flipped the state to dirty, so the exchange fails and the worker
-                // sweeps again — the edge cannot be lost in the gap between the
-                // last pass and the worker exiting.
-                if table
-                    .orphan_dv_sweep_state
-                    .compare_exchange(
-                        COALESCED_TASK_RUNNING,
-                        COALESCED_TASK_IDLE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    reset.armed = false;
+                if episode.try_finish() {
                     break;
                 }
-                // Dirty: consume the signal and sweep again. A signal that lands
-                // between the failed exchange and this store finds the state
-                // already dirty and adds nothing — the pass it wants starts after
-                // it, which is exactly what it asked for.
-                table
-                    .orphan_dv_sweep_state
-                    .store(COALESCED_TASK_RUNNING, Ordering::Release);
             }
         });
     }
