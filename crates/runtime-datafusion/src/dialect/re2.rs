@@ -199,20 +199,20 @@ pub(super) fn engine_neutral_replacement(
     if replacement.contains('$') {
         return Err(EngineDependentSyntax::RewriteTemplate);
     }
-    let mut chars = replacement.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            continue;
-        }
-        let group = chars
+    // Every piece after a backslash must open with one digit naming a group
+    // and not continue with another numeric character. `\\` and a trailing
+    // `\` leave an empty piece, so they are refused here too.
+    let references_are_neutral = replacement.split('\\').skip(1).all(|tail| {
+        let mut chars = tail.chars();
+        let names_a_group = chars
             .next()
-            .filter(char::is_ascii_digit)
             .and_then(|digit| digit.to_digit(10))
-            .ok_or(EngineDependentSyntax::RewriteTemplate)?;
-        let names_a_group = usize::try_from(group).is_ok_and(|group| group <= capture_groups);
-        if !names_a_group || chars.peek().is_some_and(|next| next.is_numeric()) {
-            return Err(EngineDependentSyntax::RewriteTemplate);
-        }
+            .and_then(|group| usize::try_from(group).ok())
+            .is_some_and(|group| group <= capture_groups);
+        names_a_group && !chars.next().is_some_and(char::is_numeric)
+    });
+    if !references_are_neutral {
+        return Err(EngineDependentSyntax::RewriteTemplate);
     }
     Ok(())
 }

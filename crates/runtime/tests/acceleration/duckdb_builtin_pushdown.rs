@@ -1210,13 +1210,10 @@ fn write_regexp_group_reference_source(path: &Path) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-/// A `regexp_replace` whose replacement names a capture group as `\N` — a
-/// single backslash and a single digit — is pushed down to `DuckDB`, because
-/// the kernel rewrites that spelling into its own `${N}` and RE2 reads it
-/// natively, and the two agree on every row (#13966). Every other backslash
-/// form stays local: `\10` is group 10 to the kernel and group 1 then `0` to
-/// RE2, `\\1` is group 1 to the kernel and a literal backslash to RE2, and
-/// a group the pattern lacks is empty to the kernel and an error to RE2.
+/// A `regexp_replace` whose replacement names a capture group as `\N` is
+/// pushed down to `DuckDB` and agrees with local evaluation on every row, and
+/// every other backslash form stays local (#13966). The rule is
+/// `re2::engine_neutral_replacement`.
 ///
 /// The first shape is ClickBench q29's, whose `DuckDB` benchmark plans
 /// snapshot the aggregate federated; refusing it evaluated the whole
@@ -1320,7 +1317,8 @@ async fn duckdb_regexp_replace_group_references_push_down_where_the_engines_agre
             }
 
             // The values, so the agreement is not two engines agreeing on a
-            // wrong answer.
+            // wrong answer: the host of each URL row, and an empty group where
+            // the optional one did not take part.
             assert_batches_eq!(
                 [
                     "+----+-------------+",
@@ -1329,12 +1327,19 @@ async fn duckdb_regexp_replace_group_references_push_down_where_the_engines_agre
                     "| 1  | google.com  |",
                     "| 2  | yandex.ru   |",
                     "| 3  | example.org |",
-                    "| 6  | <>          |",
                     "+----+-------------+",
                 ],
                 &run_query(
                     &rt,
-                    r"SELECT id, CASE WHEN id = 6 THEN regexp_replace(s, '(a)?b', '<\1>') ELSE regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') END AS k FROM accelerated WHERE id IN (1, 2, 3, 6) ORDER BY id"
+                    r"SELECT id, regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k FROM accelerated WHERE id <= 3 ORDER BY id"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                ["+----+", "| k  |", "+----+", "| <> |", "+----+",],
+                &run_query(
+                    &rt,
+                    r"SELECT regexp_replace(s, '(a)?b', '<\1>') AS k FROM accelerated WHERE id = 6"
                 )
                 .await?
             );

@@ -242,6 +242,13 @@ fn screen_regexp_pattern(pattern: &str) -> Result<regex_syntax::ast::Ast, Patter
     re2::engine_neutral_ast(pattern).map_err(PatternRefusal::Syntax)
 }
 
+/// The kernel's translation of a parsed pattern, or `None` where it rejects it.
+fn translate(pattern: &str, ast: &regex_syntax::ast::Ast) -> Option<regex_syntax::hir::Hir> {
+    regex_syntax::hir::translate::Translator::new()
+        .translate(pattern, ast)
+        .ok()
+}
+
 /// Whether `DuckDB` counts the matches of the literal `pattern` exactly as the
 /// kernel does. Two properties are required (issue #13870):
 ///
@@ -259,10 +266,7 @@ fn screen_regexp_pattern(pattern: &str) -> Result<regex_syntax::ast::Ast, Patter
 /// match do not depend on how an empty match is iterated over.
 fn screen_regexp_count_pattern(pattern: &str) -> Result<regex_syntax::ast::Ast, PatternRefusal> {
     let ast = screen_regexp_pattern(pattern)?;
-    let minimum_len = regex_syntax::hir::translate::Translator::new()
-        .translate(pattern, &ast)
-        .ok()
-        .and_then(|hir| hir.properties().minimum_len());
+    let minimum_len = translate(pattern, &ast).and_then(|hir| hir.properties().minimum_len());
     match minimum_len {
         Some(min) if min > 0 => Ok(ast),
         _ => Err(PatternRefusal::MayMatchEmpty),
@@ -830,14 +834,13 @@ impl DuckDBRegexpFunction {
     /// Whether the two engines build the same string out of the call's
     /// replacement argument — `regexp_replace` only, and only for a string
     /// literal, since a value that cannot be read here cannot be judged here.
-    /// `pattern` and `ast` are the call's already-screened pattern, whose
-    /// capture groups are the ones a replacement may name.
-    /// The rule and its measurement are [`re2::engine_neutral_replacement`].
+    /// `capture_groups` counts the groups of the call's pattern, the ones a
+    /// replacement may name. The rule and its measurement are
+    /// [`re2::engine_neutral_replacement`].
     fn screen_replacement(
         &self,
         ast_args: &[FunctionArg],
-        pattern: &str,
-        ast: &regex_syntax::ast::Ast,
+        capture_groups: usize,
     ) -> Result<(), DataFusionError> {
         let name = self.federated_function_name();
         let Some(replacement) = ast_args.get(2).and_then(string_literal) else {
@@ -845,11 +848,6 @@ impl DuckDBRegexpFunction {
                 "Only string literal replacements are supported for regular expression function {name} with DuckDB"
             )));
         };
-        // A pattern the translator rejects has no groups to name, so only a
-        // replacement with no backslash at all can pass.
-        let capture_groups = regex_syntax::hir::translate::Translator::new()
-            .translate(pattern, ast)
-            .map_or(0, |hir| hir.properties().explicit_captures_len());
         re2::engine_neutral_replacement(replacement, capture_groups).map_err(|syntax| {
             let refusal = PatternRefusal::Syntax(syntax);
             DataFusionError::Plan(format!(
@@ -895,7 +893,11 @@ impl DuckDBRegexpFunction {
         })?;
 
         if matches!(self, DuckDBRegexpFunction::Replace) {
-            self.screen_replacement(ast_args, pattern, &ast)?;
+            // A pattern the translator rejects has no groups to name, so only
+            // a replacement with no backslash at all can pass.
+            let capture_groups =
+                translate(pattern, &ast).map_or(0, |hir| hir.properties().explicit_captures_len());
+            self.screen_replacement(ast_args, capture_groups)?;
         }
         Ok(())
     }
@@ -1658,14 +1660,10 @@ mod tests {
         }
     }
 
-    /// The kernel's rewrite template is `$1` and RE2's is `\1`, so a
-    /// replacement holding a `$` spells a different string in the two
-    /// engines: `regexp_replace('ab', '(a)(b)', '$2$1')` is `ba` locally and
-    /// the literal `$2$1` federated (measured, issue #14148). The kernel also
-    /// reads the POSIX `\N`, and a single backslash and a single digit naming
-    /// one of the pattern's groups is where the two meet; every other
-    /// backslash form stays local. A replacement whose value cannot be read
-    /// at unparse time is refused too.
+    /// A replacement renders when it is plain text or names one of the
+    /// pattern's groups as `\N`; the rule and why every other `$` and `\`
+    /// form stays local are on [`re2::engine_neutral_replacement`]. A
+    /// replacement whose value cannot be read at unparse time is refused too.
     #[test]
     fn regexp_replace_renders_plain_text_and_one_digit_group_references() {
         let dialect = new_duckdb_dialect();
