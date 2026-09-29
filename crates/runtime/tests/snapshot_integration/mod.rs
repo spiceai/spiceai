@@ -308,7 +308,10 @@ fn build_snapshots_config(
     }
 
     if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
-        param_map.insert("allow_http".to_string(), endpoint.starts_with("http://").to_string());
+        param_map.insert(
+            "allow_http".to_string(),
+            endpoint.starts_with("http://").to_string(),
+        );
         param_map.insert("s3_endpoint".to_string(), endpoint);
     }
 
@@ -2354,11 +2357,9 @@ impl SharedMetastoreFixture {
             .context("Writing sample CSV for the writer's datasets")?;
         let from = format!("file://{}", source_path.display());
 
-        let mut app = AppBuilder::new(format!("{test_name}_writer"))
-            .with_snapshots(build_snapshots_config(
-                &context,
-                BootstrapOnFailureBehavior::Warn,
-            ));
+        let mut app = AppBuilder::new(format!("{test_name}_writer")).with_snapshots(
+            build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn),
+        );
         for name in &names {
             let mut dataset = shared_metastore_dataset(
                 &from,
@@ -2380,10 +2381,15 @@ impl SharedMetastoreFixture {
         let runtime = Arc::new(Runtime::builder().with_app(app.build()).build().await);
         load_runtime(Arc::clone(&runtime)).await?;
         let expected_rows = count_table_rows(&runtime, &names[0]).await?;
-        let wait = context.wait_for_current_snapshots(&names, Duration::from_mins(2)).await;
+        let wait = context
+            .wait_for_current_snapshots(&names, Duration::from_mins(2))
+            .await;
         runtime.shutdown().await;
         wait?;
-        assert!(expected_rows > 0, "the writer loaded no rows from the sample CSV");
+        assert!(
+            expected_rows > 0,
+            "the writer loaded no rows from the sample CSV"
+        );
 
         Ok(Self {
             context,
@@ -2529,7 +2535,10 @@ fn shared_metastore_dataset(
             ),
             (
                 "cayenne_metadata_dir".to_string(),
-                root.join("data").join("metadata").to_string_lossy().to_string(),
+                root.join("data")
+                    .join("metadata")
+                    .to_string_lossy()
+                    .to_string(),
             ),
         ]))),
         refresh_on_startup: RefreshOnStartup::Auto,
