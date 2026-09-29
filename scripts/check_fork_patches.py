@@ -24,13 +24,19 @@
 #   scripts/check_fork_patches.py          # validate (exit 1 on drift)
 #   scripts/check_fork_patches.py --list   # print every fork and its status
 #
-# Pure stdlib; no third-party deps.
+# Pure stdlib; no third-party deps. The duckdb-rs Thrift-equality check also
+# shells out to `cargo metadata` only when the git checkout is not already on
+# disk, so a cold cache still resolves the tarball cargo would build.
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -180,6 +186,128 @@ def drift(pinned: dict[str, set[str]], recorded: dict[str, list[str]]) -> list[s
     return errors
 
 
+
+# Marker the macOS 27 / libc++ Thrift backport adds to the bundled header.
+# Exact signature so a coincidental `operator==` elsewhere in the archive does
+# not count, and so a re-cut that drops only this method fails the guard.
+DUCKDB_THRIFT_EQUALITY_MARKER = "bool operator==(const TEnumIterator& end)"
+DUCKDB_THRIFT_HEADER_SUFFIX = "third_party/thrift/thrift/Thrift.h"
+DUCKDB_RS_REPO = "duckdb-rs"
+
+
+def duckdb_rs_rev(pinned: dict[str, set[str]]) -> str | None:
+    """The single duckdb-rs revision Cargo.lock pins, or None if unpinned/ambiguous."""
+    revs = pinned.get(DUCKDB_RS_REPO)
+    if revs is None or len(revs) != 1:
+        return None
+    return next(iter(revs))
+
+
+def duckdb_tarball_from_checkouts(rev: str) -> Path | None:
+    """Locate libduckdb-sys/duckdb.tar.gz in the local cargo git checkouts."""
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    checkouts = cargo_home / "git" / "checkouts"
+    if not checkouts.is_dir():
+        return None
+    for repo_dir in checkouts.glob("duckdb-rs-*"):
+        if not repo_dir.is_dir():
+            continue
+        for short in repo_dir.iterdir():
+            if not short.is_dir() or not rev.startswith(short.name):
+                continue
+            candidate = short / "crates" / "libduckdb-sys" / "duckdb.tar.gz"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def duckdb_tarball_from_cargo_metadata(rev: str) -> Path | None:
+    """Ask cargo where libduckdb-sys lives for the pinned revision (fetches if needed)."""
+    for offline in (True, False):
+        cmd = ["cargo", "metadata", "--format-version", "1", "--locked"]
+        if offline:
+            cmd.append("--offline")
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode != 0 or not completed.stdout.strip():
+            continue
+        try:
+            metadata = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            continue
+        for package in metadata.get("packages", []):
+            if package.get("name") != "libduckdb-sys":
+                continue
+            source = package.get("source") or ""
+            if DUCKDB_RS_REPO not in source or rev not in source:
+                continue
+            manifest = Path(package["manifest_path"])
+            candidate = manifest.parent / "duckdb.tar.gz"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def resolve_duckdb_tarball(rev: str) -> Path | None:
+    """Prefer an existing checkout; fall back to cargo metadata to populate one."""
+    return duckdb_tarball_from_checkouts(rev) or duckdb_tarball_from_cargo_metadata(rev)
+
+
+def thrift_header_from_tarball(tarball: Path) -> str | None:
+    """Return the bundled Thrift.h text from duckdb.tar.gz, or None if absent."""
+    with tarfile.open(tarball, "r:gz") as archive:
+        for member in archive.getmembers():
+            if member.isfile() and member.name.endswith(DUCKDB_THRIFT_HEADER_SUFFIX):
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    return None
+                return extracted.read().decode("utf-8", errors="replace")
+    return None
+
+
+def duckdb_thrift_iterator_equality(pinned: dict[str, set[str]]) -> list[str]:
+    """Repo-side guard: the pinned duckdb-rs tarball still carries Thrift operator==.
+
+    The failure mode only surfaces as a compile error on the macOS 27 SDK, so a
+    behaviour test in this workspace cannot catch a re-cut that drops the
+    backport. Reading the marker out of the tarball cargo actually builds is what
+    fails here instead. The fork's own C++ regression test does not protect us.
+    """
+    rev = duckdb_rs_rev(pinned)
+    if rev is None:
+        return []
+    tarball = resolve_duckdb_tarball(rev)
+    if tarball is None:
+        return [
+            f"{DUCKDB_RS_REPO}: could not locate crates/libduckdb-sys/duckdb.tar.gz for "
+            f"pinned revision {rev[:12]}. Run `cargo metadata --locked` (or any build that "
+            f"fetches git deps) so the checkout exists, then re-run this guard"
+        ]
+    header = thrift_header_from_tarball(tarball)
+    if header is None:
+        return [
+            f"{DUCKDB_RS_REPO}: {tarball} has no {DUCKDB_THRIFT_HEADER_SUFFIX}; the bundled "
+            f"Parquet/Thrift sources are missing"
+        ]
+    if DUCKDB_THRIFT_EQUALITY_MARKER not in header:
+        return [
+            f"{DUCKDB_RS_REPO}: pinned revision {rev[:12]} lost the Thrift "
+            f"`TEnumIterator::operator==` backport (macOS 27 / libc++). Expected "
+            f"`{DUCKDB_THRIFT_EQUALITY_MARKER}` in the bundled Thrift.h. Re-carry fork PR #47 "
+            f"(or the upstream duckdb Thrift equality fix) before moving this pin"
+        ]
+    return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print every fork and its recorded revision")
@@ -214,7 +342,11 @@ def main() -> int:
         )
         return 1
 
-    errors = drift(pinned, recorded) + gap_accounting(ledger_text)
+    errors = (
+        drift(pinned, recorded)
+        + gap_accounting(ledger_text)
+        + duckdb_thrift_iterator_equality(pinned)
+    )
     if errors:
         print(
             f"\n{len(errors)} problem(s) with docs/dev/fork_patches.md:\n",
@@ -230,7 +362,10 @@ def main() -> int:
         return 1
 
     if not args.list:
-        print(f"fork-patch ledger: {len(pinned)} pinned forks, all recorded")
+        extra = ""
+        if duckdb_rs_rev(pinned) is not None:
+            extra = "; duckdb-rs Thrift iterator equality present"
+        print(f"fork-patch ledger: {len(pinned)} pinned forks, all recorded{extra}")
     return 0
 
 

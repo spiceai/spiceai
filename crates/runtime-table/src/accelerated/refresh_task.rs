@@ -41,7 +41,7 @@ use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
@@ -60,6 +60,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
@@ -287,7 +288,7 @@ impl RefreshTaskBuilder {
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
-                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
             )),
         }
     }
@@ -432,6 +433,8 @@ impl RefreshTaskBuilder {
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
 
+        let session_state = Arc::clone(&crate::accelerated::caching::SHARED_SESSION_STATE);
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
@@ -464,6 +467,7 @@ impl RefreshTaskBuilder {
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
+            session_state,
         }
     }
 }
@@ -543,6 +547,8 @@ pub struct RefreshTask {
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    /// Built once instead of a fresh `SessionContext` per stale entry.
+    session_state: Arc<SessionState>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -1230,6 +1236,7 @@ impl RefreshTask {
         let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
+            Arc::clone(&self.session_state),
             self.dataset_name.to_string().as_str(),
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
@@ -1287,6 +1294,7 @@ impl RefreshTask {
 
         let start_time = SystemTime::now();
         let current_local_id = state.current_loaded_id();
+        let known_metadata_e_tag = state.metadata_e_tag();
 
         // Take the accelerator write mutex up front so the entire refresh
         // (download + provider rebuild + swap) is serialized with other code
@@ -1330,12 +1338,19 @@ impl RefreshTask {
             });
         let download_result = state
             .manager
-            .download_if_newer(current_local_id, Some(validator.as_ref()))
+            .download_if_newer(
+                current_local_id,
+                known_metadata_e_tag.as_deref(),
+                Some(validator.as_ref()),
+            )
             .await;
 
-        let info = match download_result {
-            Ok(Some(info)) => info,
-            Ok(None) if current_local_id.is_none() => {
+        let (info, metadata_e_tag) = match download_result {
+            Ok(SnapshotPoll {
+                download: Some(info),
+                metadata_e_tag,
+            }) => (info, metadata_e_tag),
+            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
                 // No snapshot has ever been loaded and none is available at the configured location.
                 tracing::warn!(
                     dataset = %self.dataset_name,
@@ -1358,7 +1373,11 @@ impl RefreshTask {
                     },
                 ));
             }
-            Ok(None) => {
+            Ok(SnapshotPoll {
+                download: None,
+                metadata_e_tag,
+            }) => {
+                state.record_metadata_e_tag(metadata_e_tag);
                 tracing::debug!(
                     dataset = %self.dataset_name,
                     current_snapshot_id = ?current_local_id,
@@ -1551,7 +1570,7 @@ impl RefreshTask {
                 },
             ));
         }
-        state.set_current_loaded_id(info.snapshot_id);
+        state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
         if let Some(updated_at) = info.last_updated_at {
             self.last_updated_at
                 .store(updated_at, std::sync::atomic::Ordering::Release);
@@ -3027,9 +3046,13 @@ fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
 
 /// One Prometheus registry + meter provider for this crate's tests.
 ///
-/// `REFRESH_ERRORS` is a `LazyLock` on the global meter. Installing a second
-/// provider after the first instrument is built binds the counter to the
-/// other registry, so tests that scrape would read zero. Share this installer.
+/// Every `runtime_metrics` meter (`REFRESH_ERRORS`, `dataset_load_state`, …) is
+/// a `LazyLock` over `global::meter`, which binds to whichever provider is
+/// installed when it is first built and never rebinds. Under `cargo test` all
+/// tests share one process, so a test that records a metric before any test
+/// has installed this registry binds the instrument to the no-op default
+/// provider, and every test that scrapes reads nothing. [`install_test_meter_provider`]
+/// installs it before `main`, so no test can record first.
 #[cfg(test)]
 pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
     static REGISTRY: std::sync::OnceLock<prometheus::Registry> = std::sync::OnceLock::new();
@@ -3050,6 +3073,15 @@ pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
         opentelemetry::global::set_meter_provider(provider);
         registry
     })
+}
+
+// SAFETY: runs before `main`. It only allocates, initializes the registry's
+// `OnceLock`, and stores the provider in the `opentelemetry` global; it spawns
+// no thread and depends on no other life-before-main initialization.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_meter_provider() {
+    test_prometheus_registry();
 }
 
 /// The error that ended a refresh retry loop, if the refresh itself failed.
@@ -3873,6 +3905,40 @@ mod tests {
         assert!(
             generation_count.abs() < f64::EPSILON,
             "a non-generation connector failure must not be labeled object_generation_changed (got {generation_count})"
+        );
+    }
+
+    /// The periodic caching refresh fetches under the same process-wide `SessionState` as the
+    /// query path; a copy built per task would rebuild the default registry for every dataset.
+    #[tokio::test]
+    async fn refresh_task_reuses_the_shared_session_state() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("shared_session_state"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        assert!(
+            Arc::ptr_eq(
+                &task.session_state,
+                &crate::accelerated::caching::SHARED_SESSION_STATE
+            ),
+            "RefreshTaskBuilder::build must hand out the shared state, not build its own"
         );
     }
 

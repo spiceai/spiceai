@@ -110,24 +110,24 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Connection/timeout errors from reqwest
 /// - JSON decode errors (often due to truncated responses from timeouts)
 ///
-/// Note: `Error::RateLimited` is NOT retriable here because rate limiting is handled
-/// proactively by the `RateLimiter` trait via `check_rate_limit()`, which sleeps until
-/// the rate limit reset time. Any `RateLimited` error reaching this point indicates
-/// an unexpected issue that shouldn't be retried with additional backoff delays.
+/// `Error::RateLimited` is retriable: GitHub's secondary/CPU cap is reported on
+/// the response (`retry-after` + HTTP 403), after `check_rate_limit()` already
+/// ran. The next attempt waits on those headers instead of failing the scan.
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
+        Error::RateLimited { .. } => true,
         Error::InvalidReqwestStatus { status, .. } => {
             status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
         Error::JsonDecodeError { status, .. } => {
-            // JSON decode errors with server error status codes are often due to
-            // truncated responses from timeouts or server issues.
-            // A non-JSON 403 is also retriable: it indicates a transient upstream
-            // proxy/abuse-detection block (e.g. GitHub's "Request forbidden by
-            // administrative rules"), not a genuine credentials/permissions error
-            // (which would return valid JSON).
-            status.is_server_error() || *status == StatusCode::FORBIDDEN
+            // Truncated bodies show up as HTTP 200 with EOF mid-string; 5xx/403
+            // HTML is the same class of transient upstream failure. A 4xx JSON
+            // error (except 403) is a real client failure and is not retried.
+            status.is_success()
+                || status.is_server_error()
+                || *status == StatusCode::FORBIDDEN
+                || *status == StatusCode::REQUEST_TIMEOUT
         }
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
@@ -317,6 +317,30 @@ mod tests {
                 "JsonDecodeError with client status {status} should NOT be retriable"
             );
         }
+    }
+
+    #[test]
+    fn rate_limited_is_retriable() {
+        let error = Error::RateLimited {
+            message: "GitHub API rate limit exceeded".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a 403 secondary rate limit must retry the same page after retry-after"
+        );
+    }
+
+    #[test]
+    fn truncated_ok_json_is_retriable() {
+        let error = Error::JsonDecodeError {
+            status: StatusCode::OK,
+            detail: "EOF while parsing a string at line 1 column 219264".to_string(),
+            response_preview: "{\"data\":{\"repository\":".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a truncated HTTP 200 body must retry the same page, not restart the scan"
+        );
     }
 
     #[test]

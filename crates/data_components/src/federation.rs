@@ -139,23 +139,38 @@ mod tests {
 
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
+    use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
+    use datafusion::catalog::Session;
     use datafusion::common::Column;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::DefaultTableSource;
     use datafusion::datasource::TableProvider;
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::context::SessionContext;
     use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::logical_expr::TableType;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
         TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
         expr::ScalarFunction,
     };
+    use datafusion::logical_expr::{DmlStatement, WriteOp};
+    use datafusion::logical_expr::{exists, not_exists};
+    use datafusion::optimizer::analyzer::AnalyzerRule;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
         MySqlDialect, PostgreSqlDialect, SqliteDialect,
     };
+    use datafusion_federation::FederationAnalyzerRule;
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -2357,5 +2372,411 @@ mod tests {
                  {default_sql}"
             );
         }
+    }
+
+    /// A federated batch that does not fit its declared schema must fail, not come
+    /// back with a NULL where the value was.
+    ///
+    /// `SchemaCastScanExec` coerces every batch a remote returns to the schema the
+    /// plan declared, through `datafusion_federation`'s `try_cast_to`. Arrow's
+    /// default cast is the *safe* one: a value the target type cannot hold becomes
+    /// NULL instead of an error. So a federated column read one width too narrow —
+    /// a remote `BIGINT` the plan typed `INT`, which is what a schema inferred from
+    /// one driver and used against another gives — returns NULLs where the remote
+    /// returned numbers, on a query that reports success. The fork casts with
+    /// `safe: false` instead (federation PR #67), which makes it a failed query.
+    ///
+    /// The overflow arm is the point: the whole value of the patch is that the case
+    /// stops being silent. The in-range arm is the control, because a cast that
+    /// refused everything would satisfy the first assertion by itself.
+    #[test]
+    fn a_federated_value_too_wide_for_its_declared_type_is_an_error_not_a_null() {
+        use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch};
+        use datafusion_federation::schema_cast::record_convert::try_cast_to;
+
+        let remote = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let declared = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+
+        let overflowing = Int64Array::from(vec![i64::from(i32::MAX) + 1]);
+
+        // The counterfactual, run here rather than asserted in prose: Arrow's
+        // default cast is the one `try_cast_to` used before the patch, and it
+        // answers this very value with a NULL and no error. Without this arm the
+        // assertion below would also hold on a build where nothing could overflow.
+        let safe = datafusion::arrow::compute::cast(&overflowing, &DataType::Int32)
+            .expect("arrow's safe cast reports no error at all");
+        assert_eq!(
+            safe.null_count(),
+            1,
+            "the safe cast is the behaviour the patch replaces: it turns the overflow into a NULL"
+        );
+
+        let batch = RecordBatch::try_new(Arc::clone(&remote), vec![Arc::new(overflowing) as _])
+            .expect("an Int64 batch matching its own schema");
+        assert!(
+            try_cast_to(batch, Arc::clone(&declared)).is_err(),
+            "one past i32::MAX has to fail the cast; the safe cast above hands it back as NULL, \
+             so the query answers with a NULL where the remote sent a number and reports no error"
+        );
+
+        let in_range = RecordBatch::try_new(
+            Arc::clone(&remote),
+            vec![Arc::new(Int64Array::from(vec![7_i64]))],
+        )
+        .expect("an Int64 batch matching its own schema");
+        let cast = try_cast_to(in_range, declared).expect("7 is representable as an i32");
+        assert_eq!(
+            cast.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("the column was cast to Int32")
+                .value(0),
+            7,
+            "a value the target type holds still has to come through it"
+        );
+    }
+
+    /// A `TableSource` the federation analyzer recognises as federated, so a plan
+    /// built on it is one the analyzer will try to wrap.
+    fn federated_table_source() -> Arc<dyn TableSource> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        Arc::new(DefaultTableSource::new(Arc::new(
+            create_spice_federated_table_provider(
+                test_sql_table(),
+                schema,
+                TableReference::bare("t"),
+                None,
+            ),
+        )))
+    }
+
+    /// Nothing under a DML plan may be federated.
+    ///
+    /// The analyzer federates the largest sub-tree that draws on one provider,
+    /// and the input of a `DELETE` over a federated table is such a sub-tree. It
+    /// must be left alone: the unparser has no `dml_to_sql`, so a federated node
+    /// under a `Dml` cannot be rendered at all, and `DataFusion`'s physical
+    /// planner dispatches `delete_from`/`update` by matching `LogicalPlan::Dml`,
+    /// which it cannot do once the rows it owns have been replaced by an
+    /// extension node. The fork returns a DML plan untouched (federation PR #73).
+    ///
+    /// The assertion is on the *input*, not on the root, because the root is a
+    /// `Dml` either way — losing the patch federates what is under it rather than
+    /// replacing it. And the input has to be a shape the analyzer really does
+    /// federate, or the assertion holds for the wrong reason; the control
+    /// establishes that, and a `Limit` is used rather than a filter because a
+    /// filter is pushed into the scan before federation runs, collapsing the plan
+    /// to a bare `TableScan` that the adaptor serves itself and the analyzer
+    /// leaves alone.
+    ///
+    /// The fork gives a third reason for the patch — that a wrapped `Dml` is
+    /// invisible to a write-permission validator that walks for it. That is the
+    /// fork's rationale rather than something reproduced here:
+    /// `validate_sql_query_operations` runs on the plan `create_logical_plan`
+    /// returns, and analyzer rules have not run at that point.
+    #[test]
+    fn nothing_under_a_dml_plan_is_federated_by_the_analyzer() {
+        let source = federated_table_source();
+        let rows_to_delete = || {
+            LogicalPlanBuilder::scan("t", Arc::clone(&source), None)
+                .expect("scan the federated table")
+                .limit(0, Some(3))
+                .expect("limit the scan")
+                .build()
+                .expect("build the input plan")
+        };
+
+        let control = FederationAnalyzerRule::new()
+            .analyze(rows_to_delete(), &ConfigOptions::default())
+            .expect("the analyzer accepts a federated plan");
+        assert!(
+            contains_a_federated_node(&control),
+            "the control: this shape is one the analyzer does federate, which is what gives \
+             the assertion below teeth. Shape was:\n{}",
+            control.display_indent()
+        );
+
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            TableReference::bare("t"),
+            Arc::clone(&source),
+            WriteOp::Delete,
+            Arc::new(rows_to_delete()),
+        ));
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(dml, &ConfigOptions::default())
+            .expect("the analyzer accepts a DML plan");
+
+        let LogicalPlan::Dml(statement) = &analyzed else {
+            panic!(
+                "a Dml plan has to stay a Dml plan, got:\n{}",
+                analyzed.display_indent()
+            );
+        };
+        assert!(
+            !contains_a_federated_node(statement.input.as_ref()),
+            "a federated node under a Dml is a DELETE that can be neither rendered nor \
+             dispatched. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// Whether any node of `plan` is an extension node, which is what federation
+    /// wraps a sub-tree in.
+    fn contains_a_federated_node(plan: &LogicalPlan) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if matches!(node, LogicalPlan::Extension(_)) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        found
+    }
+
+    /// A `Limit` over a scan of the federated table: the subquery both `EXISTS`
+    /// guards below put inside their predicate.
+    ///
+    /// A `Limit` rather than a bare scan or a filter, for the reason the DML guard
+    /// above gives: a bare scan is served by the `FederatedTableProviderAdaptor`
+    /// itself and never wrapped, and a filter is pushed into the scan before
+    /// federation runs, collapsing to the same thing.
+    fn federated_subquery() -> Arc<LogicalPlan> {
+        Arc::new(
+            LogicalPlanBuilder::scan("t", federated_table_source(), None)
+                .expect("scan the federated table")
+                .limit(0, Some(1))
+                .expect("limit the scan")
+                .build()
+                .expect("build the subquery"),
+        )
+    }
+
+    /// A scan of a table that is *not* federated, filtered by `predicate`.
+    ///
+    /// The outer table is deliberately local. That way the statement cannot
+    /// federate as one unit, so the only thing that can carry a federated node is
+    /// the subquery itself, and the assertions cannot be satisfied by the outer
+    /// plan being wrapped instead.
+    fn statement_filtered_by(predicate: Expr) -> LogicalPlan {
+        // A real provider, not a `LogicalTableSource`: the analyzer resolves every
+        // scan through `source_as_provider`, which refuses anything else outright
+        // ("TableSource was not DefaultTableSource").
+        let local: Arc<dyn TableSource> =
+            Arc::new(DefaultTableSource::new(Arc::new(EmptyTable::new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            ))));
+        LogicalPlanBuilder::scan("local", local, None)
+            .expect("scan the local table")
+            .filter(predicate)
+            .expect("filter on the subquery predicate")
+            .build()
+            .expect("build the statement")
+    }
+
+    /// An `EXISTS` subquery over a federated table has to be federated.
+    ///
+    /// `Expr::Exists` fell through the analyzer's expression walk, so the tables
+    /// inside an `EXISTS` subquery were invisible to the provider verdict and the
+    /// subquery was never federated. It then runs locally — one scan per table
+    /// reference, every join and aggregate evaluated here — while the statement
+    /// around it federates. Fork PR #74 handles the expression in both halves of
+    /// the walk: counting the subquery's tables toward the verdict, and federating
+    /// the subquery's own plan.
+    #[test]
+    fn an_exists_subquery_over_a_federated_table_is_federated() {
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(
+                statement_filtered_by(exists(federated_subquery())),
+                &ConfigOptions::default(),
+            )
+            .expect("the analyzer accepts a statement with an EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped — otherwise the assertion below could be met by the wrong node. \
+             Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert_eq!(
+            federated_exists_negation(&analyzed),
+            Some(false),
+            "the subquery's only table is federated, so the subquery has to be pushed to \
+             that provider rather than run here a scan at a time. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// The same, for `NOT EXISTS`, which has to come back still negated.
+    ///
+    /// The patch does not wrap the existing expression — it rebuilds it, carrying
+    /// `negated` across by hand. Reconstructing it with the flag reset federates
+    /// exactly as well and returns the complement of the rows asked for, which the
+    /// guard above cannot see: it builds only the non-negated shape, and a
+    /// federated node is present either way. So this asserts the flag, not just
+    /// the wrapping.
+    #[test]
+    fn a_not_exists_subquery_is_federated_and_stays_negated() {
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(
+                statement_filtered_by(not_exists(federated_subquery())),
+                &ConfigOptions::default(),
+            )
+            .expect("the analyzer accepts a statement with a NOT EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert_eq!(
+            federated_exists_negation(&analyzed),
+            Some(true),
+            "a federated NOT EXISTS that comes back as EXISTS returns the complement of the \
+             rows the statement asked for, and reports success doing it. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// A provider that reports which of its methods was reached, and nothing else.
+    ///
+    /// An error rather than a plan because the call arriving is the whole
+    /// observation — building a real `ExecutionPlan` would add machinery the
+    /// assertion does not read.
+    #[derive(Debug)]
+    struct RecordingDmlProvider {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingDmlProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "scan reached the inner provider".to_string(),
+            ))
+        }
+
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "delete_from reached the inner provider".to_string(),
+            ))
+        }
+
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "update reached the inner provider".to_string(),
+            ))
+        }
+    }
+
+    /// The adaptor has to forward `delete_from` and `update` to the provider it
+    /// wraps.
+    ///
+    /// The fork PR that returns DML plans unwrapped carries these two delegations
+    /// as well, and they are independent of it: a re-cut could keep the analyzer's
+    /// early return and drop either method. `TableProvider` defaults both to
+    /// reporting the operation unsupported, so losing one compiles — and the
+    /// `DELETE` or `UPDATE` it stops is exactly the one the early return exists to
+    /// keep working, which is why the guard above cannot stand in for this. The
+    /// fork's own `delete_from_delegates_to_inner_provider` and
+    /// `update_delegates_to_inner_provider` leave with the branch that gets
+    /// re-cut.
+    #[tokio::test]
+    async fn the_adaptor_forwards_dml_to_the_provider_it_wraps() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let executor: Arc<dyn SQLExecutor> =
+            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_schema(
+            Arc::new(SQLFederationProvider::new(executor)),
+            RemoteTableRef::from(TableReference::bare("t")),
+            Arc::clone(&schema),
+        ));
+        let adaptor = FederatedTableProviderAdaptor::new_with_provider(
+            source,
+            Arc::new(RecordingDmlProvider { schema }),
+        );
+        let state = SessionContext::new().state();
+
+        let deleted = adaptor
+            .delete_from(&state, vec![])
+            .await
+            .expect_err("the recording provider reports the call rather than planning it");
+        assert!(
+            deleted
+                .to_string()
+                .contains("delete_from reached the inner provider"),
+            "the adaptor did not forward `delete_from`, so a DELETE against a federated \
+             table is refused as unsupported: {deleted}"
+        );
+
+        let updated = adaptor
+            .update(&state, vec![], vec![])
+            .await
+            .expect_err("the recording provider reports the call rather than planning it");
+        assert!(
+            updated
+                .to_string()
+                .contains("update reached the inner provider"),
+            "the adaptor did not forward `update`, so an UPDATE against a federated table \
+             is refused as unsupported: {updated}"
+        );
+    }
+
+    /// The `negated` flag of the first `EXISTS` subquery in `plan` that came back
+    /// federated, or `None` when no `EXISTS` subquery was federated at all.
+    ///
+    /// One accessor for both halves of the contract: that the subquery reached the
+    /// provider, and that it still asks the question it was written to ask.
+    fn federated_exists_negation(plan: &LogicalPlan) -> Option<bool> {
+        let mut negated = None;
+        plan.apply(|node| {
+            for expr in node.expressions() {
+                expr.apply(|e| {
+                    if let Expr::Exists(exists) = e
+                        && contains_a_federated_node(exists.subquery.subquery.as_ref())
+                    {
+                        negated = Some(exists.negated);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walking an expression cannot fail");
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        negated
     }
 }

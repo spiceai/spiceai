@@ -90,8 +90,7 @@ impl GraphQLContext for ProjectsTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 

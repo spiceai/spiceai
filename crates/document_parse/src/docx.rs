@@ -72,3 +72,105 @@ impl Document for DocxDocument {
         DocumentType::Docx
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use docx_rs::{Paragraph, Run, Table, TableCell, TableRow};
+    use std::io::Cursor;
+
+    /// A `.docx` built in memory rather than committed as a fixture, so the bytes
+    /// under test are produced by the same fork the extraction is read back
+    /// through — a fixture would also be asserting that whatever wrote it once
+    /// still agrees with the reader.
+    fn docx_bytes(build: impl FnOnce(Docx) -> Docx) -> Bytes {
+        let mut buffer = Cursor::new(Vec::new());
+        build(Docx::new())
+            .build()
+            .pack(&mut buffer)
+            .expect("packs the in-memory .docx");
+        Bytes::from(buffer.into_inner())
+    }
+
+    async fn extracted_text(raw: &Bytes) -> String {
+        DocxParser::default()
+            .parse(raw)
+            .await
+            .expect("the in-memory .docx parses")
+            .as_flat_utf8()
+            .expect("flat utf8 text")
+    }
+
+    /// Where the newlines land when a `.docx` becomes text, which is what decides
+    /// where the chunker splits it and therefore what gets embedded.
+    ///
+    /// Both halves are a Spice patch to the `spiceai/docx-rs` fork: upstream has no
+    /// `Render` at all, and the placement was got wrong once *inside* the fork
+    /// before it was fixed there — paragraph children were separated instead of
+    /// document children, which is exactly the shape a re-cut can restore. The
+    /// consequence is not a failure: extraction succeeds, and the text it returns
+    /// merges two paragraphs into one sentence or splits one sentence in two.
+    /// Nothing downstream can tell that from a document that was written that way.
+    #[tokio::test]
+    async fn a_docx_separates_paragraphs_and_not_the_runs_inside_one() {
+        let raw = docx_bytes(|docx| {
+            docx.add_paragraph(
+                Paragraph::new()
+                    .add_run(Run::new().add_text("first"))
+                    .add_run(Run::new().add_text("-continued")),
+            )
+            .add_paragraph(Paragraph::new().add_run(Run::new().add_text("second")))
+        });
+
+        let text = extracted_text(&raw).await;
+
+        assert!(
+            text.contains("first-continued"),
+            "two runs of one paragraph must not be separated — a break inserted mid-sentence \
+             moves the chunk boundary: {text:?}"
+        );
+        assert!(
+            text.contains("first-continued\nsecond"),
+            "two paragraphs must be separated by exactly one newline, or the extracted text runs \
+             them together into one sentence: {text:?}"
+        );
+    }
+
+    /// A table's own newline placement, which the same patch carries: cells are
+    /// delimited within a row and rows are delimited from each other, so a
+    /// table reads as rows rather than as one run of concatenated cell values.
+    #[tokio::test]
+    async fn a_docx_table_separates_its_rows_and_cells() {
+        let cell = |text: &str| {
+            TableCell::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(text)))
+        };
+        let raw = docx_bytes(|docx| {
+            docx.add_table(Table::new(vec![
+                TableRow::new(vec![cell("a1"), cell("b1")]),
+                TableRow::new(vec![cell("a2"), cell("b2")]),
+            ]))
+        });
+
+        let text = extracted_text(&raw).await;
+
+        for row in ["a1", "b1", "a2", "b2"] {
+            assert!(
+                text.contains(row),
+                "the extracted text lost the cell {row:?}: {text:?}"
+            );
+        }
+        assert!(
+            text.contains("a1") && text.contains("b1") && !text.contains("a1b1"),
+            "two cells of one row must be delimited, not concatenated: {text:?}"
+        );
+        let a1_line = text
+            .lines()
+            .find(|line| line.contains("a1"))
+            .expect("a line holding the first row");
+        assert!(
+            !a1_line.contains("a2"),
+            "two rows must be on separate lines, or the table reads as one run of values: \
+             {text:?}"
+        );
+    }
+}

@@ -184,6 +184,27 @@ pub(crate) async fn run_query(
     Ok(results)
 }
 
+/// The SQL each federated scan in an `EXPLAIN` sends to the remote engine, one
+/// per line, and empty when nothing federated.
+///
+/// `base_sql=` is the only part of a plan that says what the remote engine is
+/// asked to evaluate -- the logical plan above it names the `DataFusion`
+/// function whether or not it was pushed down -- so a test claiming a call did
+/// or did not reach the source reads this rather than the whole plan.
+///
+/// Returns an error rather than an empty string when the plan will not format:
+/// "nothing federated" and "the assertion could not be made" must not look the
+/// same to a caller asserting emptiness.
+pub(crate) fn pushed_down_sql(plan: &[RecordBatch]) -> Result<String, anyhow::Error> {
+    let rendered = to_pretty_display(plan)?.to_string();
+    Ok(rendered
+        .split("base_sql=")
+        .skip(1)
+        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
