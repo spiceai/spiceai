@@ -3716,6 +3716,7 @@ dependencies = [
  "hash-index",
  "im",
  "insta",
+ "key-index",
  "libc",
  "loom",
  "object_store 0.13.2",

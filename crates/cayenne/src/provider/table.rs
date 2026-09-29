@@ -1235,13 +1235,12 @@ struct RawScanInput {
     /// Current snapshot id captured under the read fence and pinned against GC
     /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
-    /// The secondary index published when this view was captured. A full
-    /// refresh publishes its index inside the same fenced flip that makes its
-    /// snapshot visible, so this is never an index for a newer snapshot than
-    /// [`Self::current_snapshot_id`]. Every lookup this view plans, including one
-    /// probed by a join long after planning, uses this index, so an index a
-    /// refresh publishes mid-query is never mistaken for a stale one.
-    lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
+    /// The secondary index view pinned when this view was captured, under the
+    /// same fence as [`Self::warm_files`]. It answers for the files it covers
+    /// and every other file is read in full, so every lookup this view plans,
+    /// including one probed by a join long after planning, is judged against
+    /// the files this view reads.
+    lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
     /// Warm files captured under the same fence as the inline and deletion views.
     /// A checkpoint may add files to the same directory after capture; those files
     /// must not be unioned with this view's pre-checkpoint inline rows.
@@ -2017,6 +2016,9 @@ pub struct CayenneTableProvider {
     /// `indexes`. `None` when it declares none. Owned by the provider and its
     /// clones, so dropping the table drops the index and its reservation.
     lookup_index: Option<Arc<super::lookup_index::LookupIndexState>>,
+    /// Each protected snapshot's files, listed once for the secondary index's
+    /// live set (see `lookup_index_protected_files`).
+    lookup_index_protected_listings: Arc<ParkingMutex<HashMap<String, Arc<[String]>>>>,
     /// Secondary indexes over a memory-mode table's rows, kept with each
     /// memory-tier segment. `None` in file mode and without `indexes`.
     mem_tier_index: Option<Arc<super::mem_tier_index::MemTierIndexer>>,
@@ -2712,25 +2714,36 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    index_word_bits: Option<u32>,
 }
 
 /// Resolves every configured lookup-index column before table creation/open.
 /// Returning the resolved specs lets `create` fail before it mutates the
-/// catalog, while `open` repeats the check against the persisted schema.
+/// catalog, while `open` repeats the check against the persisted schema. A
+/// file-mode table's index also needs a column type it can encode.
 fn validated_lookup_index_keys(
     table_name: &str,
     schema: &arrow_schema::Schema,
     indexes: &[Vec<String>],
+    memory_mode: bool,
 ) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
+    let invalid = |message| Error::InvalidConfiguration {
+        table: table_name.to_string(),
+        message,
+    };
     let keys = super::lookup_index::KeySpec::from_indexes(indexes);
     for key in &keys {
         for column in key.columns() {
-            super::lookup_index::KeyColumn::resolve(schema, column).map_err(|message| {
-                Error::InvalidConfiguration {
-                    table: table_name.to_string(),
-                    message,
-                }
-            })?;
+            let column =
+                super::lookup_index::KeyColumn::resolve(schema, column).map_err(invalid)?;
+            if !memory_mode {
+                super::lookup_index::supported_key_type(&column.data_type).map_err(|cause| {
+                    invalid(format!(
+                        "lookup index column '{}' has type {}, which cannot be indexed ({cause}); index a column of a scalar type such as an integer, decimal, string, or timestamp",
+                        column.name, column.data_type
+                    ))
+                })?;
+            }
         }
     }
     Ok(keys)
@@ -2833,6 +2846,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    index_word_bits: Option<u32>,
 }
 
 impl CayenneTableProviderBuilder {
@@ -2851,6 +2865,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
+            index_word_bits: None,
         }
     }
 
@@ -2945,6 +2960,17 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Hash every secondary index key to a word of only `bits` bits, so that
+    /// many keys share a word and every lookup returns other keys' rows as
+    /// candidates. For tests that queries still return exact results: never
+    /// use it to serve queries.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_index_word_bits(mut self, bits: u32) -> Self {
+        self.index_word_bits = Some(bits);
+        self
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors
@@ -2962,6 +2988,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            index_word_bits: self.index_word_bits,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -2977,7 +3004,12 @@ impl CayenneTableProviderBuilder {
     /// created in the catalog.
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
-        validated_lookup_index_keys(&table_name, &options.schema, &self.secondary_indexes)?;
+        validated_lookup_index_keys(
+            &table_name,
+            &options.schema,
+            &self.secondary_indexes,
+            options.vortex_config.memory_mode,
+        )?;
         let _table_id = self.catalog.create_table(options).await?;
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -2989,6 +3021,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            index_word_bits: self.index_word_bits,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -5871,11 +5904,6 @@ impl CayenneTableProvider {
         // (via `update_current_snapshot_id` + `invalidate_inlined_cache`) advance the
         // freshness gate; no torn-capture discard is possible.
         self.update_current_snapshot_id(new_snapshot_id);
-        // The refresh's write-time index becomes visible with its snapshot, never
-        // before: a probe can then treat any index for another snapshot as stale.
-        if let Some(lookup_index) = &self.lookup_index {
-            lookup_index.promote_staged(new_snapshot_id);
-        }
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
@@ -8734,6 +8762,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
+            index_word_bits,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -8917,8 +8946,12 @@ impl CayenneTableProvider {
         ));
         // Secondary indexes over the table's Vortex files, or — for a memory-mode
         // table, which writes no files — over its rows where they live.
-        let index_keys =
-            validated_lookup_index_keys(table_name, &table_metadata.schema, &secondary_indexes)?;
+        let index_keys = validated_lookup_index_keys(
+            table_name,
+            &table_metadata.schema,
+            &secondary_indexes,
+            table_metadata.vortex_config.memory_mode,
+        )?;
         // Shared with the lookup index, which invalidates cached scan views when
         // its published index changes.
         let scan_input_version = Arc::new(AtomicU64::new(0));
@@ -8937,10 +8970,16 @@ impl CayenneTableProvider {
                 super::lookup_index::LookupIndexState::new(
                     table_name,
                     index_keys,
+                    &table_metadata.schema,
                     Arc::clone(&context.runtime_env().memory_pool),
                     Arc::clone(&table_memory),
                     Arc::clone(&scan_input_version),
-                ),
+                    index_word_bits,
+                )
+                .map_err(|message| Error::InvalidConfiguration {
+                    table: table_name.to_string(),
+                    message,
+                })?,
                 None,
             )
         };
@@ -9037,6 +9076,7 @@ impl CayenneTableProvider {
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             lookup_index,
+            lookup_index_protected_listings: Arc::default(),
             mem_tier_index,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -9604,7 +9644,6 @@ impl CayenneTableProvider {
             estimated_bytes,
             policy,
             None,
-            None,
         )
         .await
     }
@@ -9618,10 +9657,11 @@ impl CayenneTableProvider {
     /// (see [`Self::overwrite_range_plan`]). A streaming write has no such view,
     /// passes `None`, and hashes as before.
     ///
-    /// `write_observer`, when set, is told each batch's file and file-local row
-    /// position as it is written: the full-refresh overwrite builds the
-    /// point-lookup index from it, so the index publishes with the snapshot
-    /// instead of being rebuilt from the finished files afterwards.
+    /// On an indexed table every write also builds the secondary index's runs
+    /// for the files it writes, from each batch's file and file-local row
+    /// position as the sink writes it, and publishes them when the write
+    /// returns: so the files are indexed by the time the caller makes them
+    /// visible, whatever kind of write produced them.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn write_to_snapshot_range_partitioned(
         &self,
@@ -9632,7 +9672,6 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         policy: super::delta_encoding::WritePolicy,
         range: Option<RangePartitioning<'_>>,
-        write_observer: Option<Arc<dyn VortexWriteObserver>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
@@ -9769,8 +9808,17 @@ impl CayenneTableProvider {
                 None => Arc::clone(self.context.file_format()),
             },
         };
-        let write_format = match write_observer {
-            Some(observer) => Arc::new(write_format.with_write_observer(observer)),
+        let index_observer = self.lookup_index.as_ref().map(|state| {
+            // A rewrite replaces files: it indexes every row before it is
+            // swapped in, even when its indexing falls behind.
+            let replaces = matches!(write_class, super::delta_encoding::WriteClass::Maintenance);
+            (Arc::clone(state), state.write_observer(replaces))
+        });
+        let write_format = match &index_observer {
+            Some((_, observer)) => Arc::new(
+                write_format
+                    .with_write_observer(Arc::clone(observer) as Arc<dyn VortexWriteObserver>),
+            ),
             None => write_format,
         };
 
@@ -9969,6 +10017,17 @@ impl CayenneTableProvider {
             && self.get_current_snapshot_id() == snapshot_id
         {
             self.record_current_snapshot_files_added(writer_ops);
+        }
+
+        // The write's files are complete; its caller makes them visible next.
+        if let Some((state, observer)) = index_observer {
+            // A rewrite replaces files: it is covered before its caller swaps it in.
+            state
+                .finish_write(
+                    &observer,
+                    matches!(write_class, super::delta_encoding::WriteClass::Maintenance),
+                )
+                .await;
         }
 
         Ok((total_rows, writer_ops, stats_accumulator))
@@ -11073,6 +11132,7 @@ impl CayenneTableProvider {
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             lookup_index: self.lookup_index.as_ref().map(Arc::clone),
+            lookup_index_protected_listings: Arc::clone(&self.lookup_index_protected_listings),
             mem_tier_index: self.mem_tier_index.as_ref().map(Arc::clone),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -24232,7 +24292,6 @@ impl CayenneTableProvider {
                     run_sort_bytes: None,
                     bounds_estimated: false,
                 }),
-                None,
             )
             .await;
 
@@ -26755,12 +26814,100 @@ impl CayenneTableProvider {
         }
     }
 
+    /// The files of every protected snapshot in `protected`, for the secondary
+    /// index's live set, and a digest of their ids that versions it. A
+    /// protected snapshot's files do not change once it is published, so each
+    /// is listed once and remembered until it leaves the map.
+    async fn lookup_index_protected_files(
+        &self,
+        protected: &HashMap<String, i64>,
+    ) -> datafusion_common::Result<(u64, Vec<String>)> {
+        let mut ids: Vec<&String> = protected.keys().collect();
+        ids.sort_unstable();
+        let digest =
+            hash_index::hash_key_bytes(&ids.iter().map(|id| id.as_bytes()).collect::<Vec<_>>());
+        let missing: Vec<String> = {
+            let listings = self.lookup_index_protected_listings.lock();
+            ids.iter()
+                .filter(|id| !listings.contains_key(id.as_str()))
+                .map(|id| (*id).clone())
+                .collect()
+        };
+        for id in missing {
+            let files: Arc<[String]> = self
+                .capture_warm_files(&id)
+                .await?
+                .files
+                .iter()
+                .map(|file| file.object_meta.location.to_string())
+                .collect();
+            self.lookup_index_protected_listings
+                .lock()
+                .insert(id, files);
+        }
+        let mut listings = self.lookup_index_protected_listings.lock();
+        listings.retain(|id, _| protected.contains_key(id));
+        let files = ids
+            .iter()
+            .filter_map(|id| listings.get(id.as_str()))
+            .flat_map(|files| files.iter().cloned())
+            .collect();
+        Ok((digest, files))
+    }
+
+    /// Retires, in the background, the secondary index runs of files a
+    /// snapshot change just replaced, so a table nobody scans still returns
+    /// their memory. Runs as a task: callers hold the listing fence.
+    fn spawn_lookup_index_reconcile(&self) {
+        if self.lookup_index.is_none() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let provider = self.shared_handle();
+        handle.spawn(async move {
+            let Some(state) = &provider.lookup_index else {
+                return;
+            };
+            let _fence = provider.listing_fence.read().await;
+            let snapshot_id = provider.get_current_snapshot_id();
+            let protected_map = provider.protected_snapshots.load_full();
+            let listed = match provider.capture_warm_files(&snapshot_id).await {
+                Ok(files) => provider
+                    .lookup_index_protected_files(&protected_map)
+                    .await
+                    .map(|protected| (files, protected)),
+                Err(error) => Err(error),
+            };
+            match listed {
+                Ok((files, (protected, protected_files))) => state.reconcile(
+                    &snapshot_id,
+                    super::lookup_index::FileSetVersion {
+                        dir_generation: files.dir_generation,
+                        listing_epoch: files.listing_epoch,
+                        protected,
+                    },
+                    files
+                        .files
+                        .iter()
+                        .map(|file| file.object_meta.location.as_ref())
+                        .chain(protected_files.iter().map(String::as_str)),
+                ),
+                Err(error) => {
+                    tracing::debug!(table = %provider.table_metadata.table_name, %error, "Secondary index runs were not reconciled after a snapshot change; the next scan does it");
+                }
+            }
+        });
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
+        self.spawn_lookup_index_reconcile();
         // [sound output_ordering] Any snapshot-id change invalidates the
         // sorted-snapshot attestation. The sorted compaction rewrite re-sets it
         // AFTER calling this; every other id change (overwrite, restore, catalog
@@ -28905,11 +29052,33 @@ impl CayenneTableProvider {
         // Capture the complete warm file set under the fence. Pinning a snapshot
         // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
-        let lookup_index = self
-            .lookup_index
-            .as_ref()
-            .and_then(|state| state.published());
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
+        // The secondary index answers for the files its runs cover, judged file
+        // by file against this listing; retire what this listing no longer holds
+        // before pinning it.
+        // Protected snapshots' files are part of that set: an upsert's rows
+        // live there until compaction folds them in.
+        let lookup_index = match &self.lookup_index {
+            Some(state) => {
+                let (protected, protected_files) =
+                    self.lookup_index_protected_files(&protected_map).await?;
+                state.reconcile(
+                    &current_snapshot_id,
+                    super::lookup_index::FileSetVersion {
+                        dir_generation: warm_files.dir_generation,
+                        listing_epoch: warm_files.listing_epoch,
+                        protected,
+                    },
+                    warm_files
+                        .files
+                        .iter()
+                        .map(|file| file.object_meta.location.as_ref())
+                        .chain(protected_files.iter().map(String::as_str)),
+                );
+                state.published()
+            }
+            None => None,
+        };
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         // The cold half of the file set, resolved under the SAME held fence as the
@@ -33622,7 +33791,10 @@ impl CayenneTableProvider {
     async fn scan_protected_snapshots(
         &self,
         scan: ProtectedSnapshotScan<'_>,
-    ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+    ) -> datafusion_common::Result<(
+        Vec<Arc<dyn ExecutionPlan>>,
+        Vec<super::lookup_index::LookupIndexExplain>,
+    )> {
         // Warn only on genuine amplification (compaction losing ground), not the
         // normal steady-state equilibrium. Under sustained CDC the protected-
         // snapshot count naturally sits at/above the compaction TRIGGER — fresh
@@ -33637,7 +33809,7 @@ impl CayenneTableProvider {
 
         // `protected_snapshots` is captured by the caller together with the deletion snapshot
         if scan.protected_snapshots.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         tracing::trace!(
@@ -33663,8 +33835,10 @@ impl CayenneTableProvider {
         }
 
         let mut plans = Vec::with_capacity(scan.protected_snapshots.len());
+        let mut explains = Vec::new();
 
         for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
+            let mut explain = super::lookup_index::LookupIndexExplain::not_applicable(None);
             let plan = self
                 .create_snapshot_scan_plan_with_config(
                     scan.state,
@@ -33686,9 +33860,9 @@ impl CayenneTableProvider {
                     // that multiplies file opens ~50× for no parallelism gain
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
                     None,
-                    None,
-                    None,
-                    None,
+                    scan.lookup_selection.clone(),
+                    scan.pinned_lookup_index.clone(),
+                    scan.lookup_selection.is_some().then_some(&mut explain),
                 )
                 .await?;
 
@@ -33701,9 +33875,12 @@ impl CayenneTableProvider {
             )?;
 
             plans.push(filtered_plan);
+            if scan.lookup_selection.is_some() {
+                explains.push(explain);
+            }
         }
 
-        Ok(plans)
+        Ok((plans, explains))
     }
 
     /// Unions [`ExecutionPlan`]s, dropping any [`EmptyExec`], instead of needlessly widening the
@@ -33897,15 +34074,16 @@ impl CayenneTableProvider {
         // main query branch keeps default splitting behavior).
         small_group_repartition_opt_out_bytes: u64,
         captured_files: Option<&CapturedSnapshotFiles>,
-        // Candidate row addresses for this scan's equality key, still to be
-        // validated against the file list resolved below. Only the main `scan()`
-        // path ever supplies one.
+        // Candidate row addresses for this scan's equality key, applied file by
+        // file to the file list resolved below. Only the main `scan()` path ever
+        // supplies one.
         lookup_selection: Option<super::lookup_index::LookupSelection>,
-        // The secondary index the scan's view pinned with its snapshot. A join's
-        // runtime lookup probes this one, never whatever is published by then.
-        pinned_lookup_index: Option<Arc<super::lookup_index::SnapshotLookupIndex>>,
+        // The secondary index view the scan's view pinned with its files. A
+        // join's runtime lookup probes this one, never whatever is published by
+        // then.
+        pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
         // Scan-local lookup-index evidence. The file listing below finalizes a
-        // provisional selection as selected, empty, or snapshot_mismatch.
+        // provisional selection as selected, empty, or unbuilt.
         lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let allow_runtime_lookup = lookup_index_explain.is_some();
@@ -33998,23 +34176,16 @@ impl CayenneTableProvider {
         // it, so the selection is composed with the provider this scan would
         // otherwise attach: deleted candidates are removed from the selection,
         // never resurrected.
-        // The file set the scan's files were listed at: the captured one when the
-        // caller captured its files with the snapshot.
-        let scan_file_set = captured_files.map_or_else(
-            || self.file_set_version(),
-            |files| super::lookup_index::FileSetVersion {
-                dir_generation: files.dir_generation,
-                listing_epoch: files.listing_epoch,
-            },
-        );
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
         if let Some(selection) = lookup_selection {
-            let (restricted_files, provider, explain) = selection.restrict(
-                snapshot_id,
+            let (restricted_files, provider, explain, uncovered) = selection.restrict(
                 partitioned_file_lists,
                 Self::position_deletion_plans(&self.pk_deletion_strategy),
-                scan_file_set,
             );
+            // Files no run covers were read in full; have them indexed.
+            if uncovered {
+                self.shared_handle().request_runtime_lookup_index_build();
+            }
             partitioned_file_lists = restricted_files;
             lookup_plan_provider = provider;
             if let Some(slot) = lookup_index_explain {
@@ -34155,8 +34326,6 @@ impl CayenneTableProvider {
                 Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
                     Arc::clone(index),
                     pinned_lookup_index.clone(),
-                    snapshot_id.to_string(),
-                    scan_file_set,
                     partitioned_file_lists
                         .iter()
                         .flat_map(FileGroup::iter)
@@ -35203,17 +35372,17 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Diffs the published secondary index against a fresh build made by reading
-    /// the snapshot's finished files.
+    /// Diffs the published secondary index runs against a read-back of the
+    /// current snapshot's files they cover.
     ///
-    /// The write-time index takes its positions from the writer, which is only
-    /// correct while the writer appends batches in arrival order. This is how
-    /// that invariant gets checked rather than assumed.
+    /// A write's runs take their positions from the writer, which is only
+    /// correct while the writer appends batches in the order it reports them.
+    /// This is how that invariant gets checked rather than assumed.
     ///
     /// # Errors
     ///
-    /// Returns an error when the table is not indexed, no index is published, or
-    /// the snapshot's files cannot be listed.
+    /// Returns an error when the table is not indexed or the snapshot's files
+    /// cannot be listed or read.
     pub async fn verify_lookup_index_against_read_back(
         &self,
     ) -> std::result::Result<super::lookup_index::LookupIndexVerification, String> {
@@ -35221,24 +35390,24 @@ impl CayenneTableProvider {
             .lookup_index
             .as_ref()
             .ok_or_else(|| "table is not indexed".to_string())?;
-        let published = state
-            .published()
-            .ok_or_else(|| "no published index to verify".to_string())?;
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
-        let (store, files) = self
-            .lookup_index_snapshot_files(&session, published.snapshot_id(), &read_schema)
-            .await
-            .ok_or_else(|| "could not list the indexed snapshot's files".to_string())?;
-        super::lookup_index::verify_against_read_back(
-            state,
-            published,
-            &store,
-            files,
-            &self.table_schema(),
-        )
-        .await
+        // The file list and the view, taken together under the fence as a scan
+        // captures them.
+        let (snapshot_id, store, files, view) = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            let (store, files) = self
+                .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
+                .await
+                .ok_or_else(|| "could not list the current snapshot's files".to_string())?;
+            let view = state
+                .published()
+                .ok_or_else(|| "no published index to verify".to_string())?;
+            (snapshot_id, store, files, view)
+        };
+        super::lookup_index::verify_against_read_back(state, view, snapshot_id, &store, files).await
     }
 
     /// Probe and build accounting for this table's secondary indexes, or `None`
@@ -35370,9 +35539,6 @@ impl CayenneTableProvider {
             super::lookup_index::ProbeOutcome::Unbuilt => {
                 super::lookup_index::LookupIndexExplainOutcome::Unbuilt
             }
-            super::lookup_index::ProbeOutcome::SnapshotMismatch => {
-                super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
-            }
         };
         Ok(Some((
             Some(segments),
@@ -35385,174 +35551,126 @@ impl CayenneTableProvider {
         )))
     }
 
-    /// The table's file-set version, sampled before a listing it describes.
-    fn file_set_version(&self) -> super::lookup_index::FileSetVersion {
-        super::lookup_index::FileSetVersion {
-            dir_generation: self.current_dir_generation.load(Ordering::Relaxed),
-            listing_epoch: self.listing_cache_epoch.load(Ordering::Acquire),
-        }
+    /// This provider as an `Arc` a background task can hold: the one it is
+    /// registered as, or a clone sharing all of its state when it was never
+    /// `Arc`-wrapped.
+    fn shared_handle(&self) -> Arc<Self> {
+        self.weak_self
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(self.clone_for_write()))
     }
 
-    /// Starts a write-time secondary index build for `snapshot_id`, or `None`
-    /// when the table is not indexed.
-    pub(crate) fn begin_lookup_index_build(
-        &self,
-        snapshot_id: &str,
-    ) -> Option<Arc<dyn VortexWriteObserver>> {
-        let state = self.lookup_index.as_ref()?;
-        // Keys are encoded against the STORED schema, so the same value encodes
-        // identically whether it arrives from a write stream or from a scan that
-        // decoded it as a view type.
-        let builder = state.begin_incremental_build(snapshot_id, &self.table_schema())?;
-        Some(builder as Arc<dyn VortexWriteObserver>)
-    }
-
-    /// Drops a write-time index build whose snapshot is being abandoned.
-    pub(crate) fn discard_lookup_index_build(&self) {
-        if let Some(state) = &self.lookup_index {
-            state.discard_pending();
-        }
-    }
-
-    /// Finishes the write-time index for `snapshot_id` BEFORE its snapshot becomes
-    /// visible, so the flip that makes it visible can publish the index with it
-    /// and no query is served by a full scan while an index is rebuilt.
+    /// Starts a background build of the files no secondary index run covers,
+    /// requested by a lookup that had to read some in full.
     ///
-    /// Best-effort by construction: a refused or failed build leaves the refreshed
-    /// table to a background build, and the snapshot publishes regardless. Data
-    /// availability must never depend on this index.
-    pub(crate) async fn stage_lookup_index_for_snapshot(&self, snapshot_id: &str) {
-        let Some(state) = &self.lookup_index else {
-            return;
-        };
-        let file_set = self.file_set_version();
-        let read_schema = self.read_schema();
-        let ctx = self.create_session_context();
-        let session = ctx.state();
-        match self
-            .lookup_index_snapshot_files(&session, snapshot_id, &read_schema)
-            .await
-        {
-            Some((_store, files)) => {
-                state.stage_pending(snapshot_id, files, file_set).await;
-            }
-            None => {
-                state.discard_pending();
-            }
-        }
-    }
-
-    /// Starts a read-back build requested by an exact runtime join filter.
-    ///
-    /// The first dynamic lookup after a restart or file-set change scans normally
-    /// while this detached task lists and builds the visible snapshot. The claim
-    /// keeps concurrent file openers and queries from starting duplicate builds.
+    /// The lookup that asked scans those files normally while this detached
+    /// task lists and reads them back. The claim keeps concurrent file openers
+    /// and queries from starting duplicate builds.
     fn request_runtime_lookup_index_build(self: &Arc<Self>) {
         let Some(index_state) = &self.lookup_index else {
             return;
         };
-        let visible_snapshot = self.get_current_snapshot_id();
-        let Some(claim) = index_state.claim_build(&visible_snapshot) else {
+        let Some(claim) = index_state.claim_build() else {
             return;
         };
         let provider = Arc::clone(self);
         tokio::spawn(async move {
-            let read_schema = provider.read_schema();
-            let ctx = provider.create_session_context();
-            provider
-                .start_lookup_index_build(claim, visible_snapshot, &ctx.state(), &read_schema)
-                .await;
+            provider.start_lookup_index_build(claim).await;
         });
     }
 
-    /// Lists `snapshot_id`'s files and starts the background build `claim`
-    /// holds, or frees the claim when the files cannot be listed.
-    async fn start_lookup_index_build(
-        &self,
-        claim: super::lookup_index::BuildClaim,
-        snapshot_id: String,
-        state: &dyn Session,
-        read_schema: &SchemaRef,
-    ) {
-        // Sampled before listing, so a file added while listing makes the
-        // index's file set older than the table's, never newer.
-        let file_set = self.file_set_version();
-        match self
-            .lookup_index_snapshot_files(state, &snapshot_id, read_schema)
+    /// Lists the current snapshot's files and starts the background build
+    /// `claim` holds over the ones no run covers, or frees the claim when the
+    /// files cannot be listed.
+    async fn start_lookup_index_build(self: &Arc<Self>, claim: super::lookup_index::BuildClaim) {
+        let Some(index_state) = &self.lookup_index else {
+            return;
+        };
+        let read_schema = self.read_schema();
+        let ctx = self.create_session_context();
+        let session = ctx.state();
+        let snapshot_id = self.get_current_snapshot_id();
+        let Some((store, files)) = self
+            .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
             .await
-        {
-            Some((store, files)) => super::lookup_index::spawn_build(
-                claim,
-                snapshot_id,
-                store,
-                files,
-                self.table_schema(),
-                file_set,
-            ),
-            None => claim.unpublished(),
-        }
+        else {
+            claim.unpublished();
+            return;
+        };
+        let view = index_state.published();
+        let uncovered: Vec<super::lookup_index::IndexedFile> = files
+            .into_iter()
+            .filter(|file| !view.as_ref().is_some_and(|view| view.covers(&file.path)))
+            .collect();
+        super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
+    }
+
+    /// Lists the table's current warm files under the listing fence, for an
+    /// index build to publish its runs against the files a reader sees then.
+    fn lookup_index_list_live(&self) -> super::lookup_index::ListLive {
+        let provider = self.shared_handle();
+        Box::new(move || {
+            Box::pin(async move {
+                let _fence = provider.listing_fence.read().await;
+                let snapshot_id = provider.get_current_snapshot_id();
+                let files = provider.capture_warm_files(&snapshot_id).await.ok()?;
+                Some(
+                    files
+                        .files
+                        .iter()
+                        .map(|file| file.object_meta.location.to_string())
+                        .collect(),
+                )
+            })
+        })
     }
 
     /// Resolves the secondary index for this scan.
     ///
-    /// Only a query whose filters pin every column of an indexed key to an
-    /// equality literal touches the index at all: it probes the published index
-    /// and, when there is none for the visible snapshot, may start the one
-    /// background build that replaces it — as the build schedule allows, so a
-    /// build that cannot fit or keeps failing is not retried on every lookup.
-    /// Returned candidate row addresses are still unvalidated against the file
-    /// list the plan resolves. The outer `None` means the table declares no
-    /// file-mode index; an indexed table always returns an explain decision.
-    async fn resolve_lookup_index_selection(
+    /// Only a query whose filters pin every column of an indexed key to
+    /// equality literals or `IN` lists touches the index at all: it probes
+    /// the view the scan pinned and, when that view covers none of the table's
+    /// files, may start the one background build that indexes them — as the
+    /// build schedule allows, so a build that cannot fit or keeps failing is
+    /// not retried on every lookup. The returned selection is applied file by
+    /// file to the file list the plan resolves. The outer `None` means the
+    /// table declares no file-mode index; an indexed table always returns an
+    /// explain decision.
+    fn resolve_lookup_index_selection(
         &self,
-        state: &dyn Session,
         filters: &[Expr],
-        read_schema: &SchemaRef,
-        pinned_index: Option<&Arc<super::lookup_index::SnapshotLookupIndex>>,
-        visible_snapshot: &str,
+        pinned_index: Option<&Arc<super::lookup_index::LookupIndexView>>,
     ) -> Option<(
         Option<super::lookup_index::LookupSelection>,
         super::lookup_index::LookupIndexExplain,
     )> {
         let index_state = self.lookup_index.as_ref()?;
-        let scalar_for = |column: &str| {
+        let values_for = |column: &str| {
             filters
                 .iter()
-                .find_map(|filter| bare_column_scalar_for(filter, column))
+                .find_map(|filter| bare_column_values_for(filter, column))
         };
-        let Some(shape) = index_state.matched_shape(&scalar_for) else {
+        let Some(shape) = index_state.matched_shape(&values_for) else {
             return Some((
                 None,
                 super::lookup_index::LookupIndexExplain::not_applicable(None),
             ));
         };
-
-        // Probe first: a stale index is dropped here, so a build claimed below
-        // replaces nothing rather than an index that is already gone. The probe
-        // uses the index and snapshot the scan's view captured together.
-        let (selection, explain, should_build) =
-            match index_state.probe(pinned_index, visible_snapshot, &scalar_for) {
-                super::lookup_index::LookupProbe::Selection(selection) => (
-                    Some(selection),
-                    super::lookup_index::LookupIndexExplain::not_applicable(Some(
-                        shape.to_string(),
-                    )),
-                    false,
-                ),
-                super::lookup_index::LookupProbe::Fallback(explain) => {
-                    let should_build = matches!(
-                        explain.outcome,
-                        super::lookup_index::LookupIndexExplainOutcome::Unbuilt
-                            | super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
-                    );
-                    (None, explain, should_build)
+        let (selection, explain) = match index_state.probe(pinned_index, &values_for) {
+            super::lookup_index::LookupProbe::Selection(selection) => (
+                Some(selection),
+                super::lookup_index::LookupIndexExplain::not_applicable(Some(
+                    index_state.shape_label(shape).to_string(),
+                )),
+            ),
+            super::lookup_index::LookupProbe::Fallback(explain) => {
+                if explain.outcome == super::lookup_index::LookupIndexExplainOutcome::Unbuilt {
+                    self.shared_handle().request_runtime_lookup_index_build();
                 }
-            };
-        if should_build && let Some(claim) = index_state.claim_build(visible_snapshot) {
-            // The claim frees its slot if this scan is dropped while listing.
-            self.start_lookup_index_build(claim, visible_snapshot.to_string(), state, read_schema)
-                .await;
-        }
+                (None, explain)
+            }
+        };
         Some((selection, explain))
     }
 
@@ -35830,6 +35948,38 @@ fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
         &|e| matches!(e, Expr::Column(col) if col.name == name),
         &evaluated_literal,
     )
+}
+
+/// The values a filter pins the BARE column `name` to, for the point-lookup
+/// index: one for an equality, several for a non-negated `IN` list of
+/// literals or a disjunction whose every branch pins the column (the planner
+/// rewrites an `IN` of up to three values into `=`s joined by `OR`), found
+/// through conjunctions. A NULL value matches nothing, so it is kept for the
+/// index to drop. The column side must be bare for the reason
+/// [`bare_column_scalar_for`] gives.
+fn bare_column_values_for(expr: &Expr, name: &str) -> Option<Vec<ScalarValue>> {
+    match expr {
+        Expr::BinaryExpr(bin) if bin.op == Operator::Or => {
+            let mut values = bare_column_values_for(&bin.left, name)?;
+            values.extend(bare_column_values_for(&bin.right, name)?);
+            Some(values)
+        }
+        // A branch that is never true selects no row: the planner folds
+        // `column = NULL` to a NULL literal, so `column IN (NULL, 5)` arrives
+        // as `NULL OR column = 5`.
+        Expr::Literal(ScalarValue::Boolean(None | Some(false)) | ScalarValue::Null, _) => {
+            Some(Vec::new())
+        }
+        Expr::InList(in_list)
+            if !in_list.negated
+                && matches!(in_list.expr.as_ref(), Expr::Column(col) if col.name == name) =>
+        {
+            in_list.list.iter().map(evaluated_literal).collect()
+        }
+        Expr::BinaryExpr(bin) if bin.op == Operator::And => bare_column_values_for(&bin.left, name)
+            .or_else(|| bare_column_values_for(&bin.right, name)),
+        _ => bare_column_scalar_for(expr, name).map(|value| vec![value]),
+    }
 }
 
 /// The constant `expr` evaluates to: a literal, or casts applied to one. `None`
@@ -36301,15 +36451,8 @@ impl TableProvider for CayenneTableProvider {
         // Secondary index: candidate row addresses for an exact equality key
         // over indexed columns. `None` keeps the ordinary scan, which is what a
         // table without `indexes` and every other predicate shape resolve to.
-        let lookup_resolution = self
-            .resolve_lookup_index_selection(
-                state,
-                scan_filters,
-                &read_schema,
-                pinned_lookup_index.as_ref(),
-                &current_snapshot_id,
-            )
-            .await;
+        let lookup_resolution =
+            self.resolve_lookup_index_selection(scan_filters, pinned_lookup_index.as_ref());
 
         // A PK point lookup (e.g. `WHERE pk_col = K`), small IN / tight BETWEEN,
         // or an index-restricted file set is selective: each file that survives
@@ -36372,6 +36515,12 @@ impl TableProvider for CayenneTableProvider {
         // (file scan, protected snapshots, inline + RAM tiers) so they agree with
         // each other and with the captured data even across a concurrent
         // schema-evolution, and joins plan on view arrays. See `viewify_read_schema`.
+        // Protected snapshots are narrowed by the same selection, against their
+        // own files.
+        let protected_lookup_selection = lookup_selection
+            .as_ref()
+            .map(super::lookup_index::LookupSelection::unrecorded);
+        let protected_pinned_lookup_index = pinned_lookup_index.clone();
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -36404,7 +36553,7 @@ impl TableProvider for CayenneTableProvider {
         // captured warm file set excludes later additions to that same directory.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
-        let protected_snapshot_plans = self
+        let (protected_snapshot_plans, protected_explains) = self
             .scan_protected_snapshots(ProtectedSnapshotScan {
                 state,
                 projection: effective_projection.as_ref(),
@@ -36414,8 +36563,19 @@ impl TableProvider for CayenneTableProvider {
                 protected_snapshots: protected_map,
                 deletion_snapshot: &deletion_snapshot,
                 read_schema: Arc::clone(&read_schema),
+                lookup_selection: protected_lookup_selection,
+                pinned_lookup_index: protected_pinned_lookup_index,
             })
             .await?;
+        // One decision for the whole scan: a key found only in a protected
+        // snapshot is still a selection.
+        if let Some(main) = lookup_index_explain.take() {
+            lookup_index_explain = Some(
+                protected_explains
+                    .into_iter()
+                    .fold(main, super::lookup_index::LookupIndexExplain::merge),
+            );
+        }
 
         // Build the COLD object-store tier branch (storage-cascade bottom tier) from
         // the CAPTURED manifest. Cold files hold OLD, fully-superseded data, so they

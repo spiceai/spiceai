@@ -110,6 +110,26 @@ async fn open(
         target_vortex_file_size_mb: 1,
         ..VortexConfig::default()
     };
+    open_with(fixture, runtime_env, name, indexes, vortex_config).await
+}
+
+async fn open_with(
+    fixture: &common::TestFixture,
+    runtime_env: Arc<RuntimeEnv>,
+    name: &str,
+    indexes: &[&[&str]],
+    vortex_config: VortexConfig,
+) -> Arc<CayenneTableProvider> {
+    open_configured(fixture, runtime_env, name, indexes, vortex_config).await
+}
+
+async fn open_configured(
+    fixture: &common::TestFixture,
+    runtime_env: Arc<RuntimeEnv>,
+    name: &str,
+    indexes: &[&[&str]],
+    vortex_config: VortexConfig,
+) -> Arc<CayenneTableProvider> {
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
     let options = CreateTableOptions {
         table_name: name.to_string(),
@@ -596,62 +616,142 @@ async fn dropping_an_indexed_table_releases_its_memory() {
     );
 }
 
-/// Rows appended after the build make the index stale for the snapshot it was
-/// built on: a dynamic lookup drops it, scans safely, requests a replacement,
-/// and uses that replacement for later lookups of the appended rows.
-///
-/// An append keeps the snapshot id, so runtime probes must also compare the file
-/// set captured by the scan with the one covered by the index.
+/// Every write indexes the files it writes, so appends and compactions never
+/// leave the index stale: the first lookups after each, literal and join
+/// alike, are answered from the index with no rebuild, and the index still
+/// agrees row for row with a read-back of the files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_append_drops_the_stale_index_and_dynamic_lookups_rebuild_it() {
+async fn appends_and_compactions_keep_the_index_current() {
     const ROWS: usize = 20_000;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
     let env = Arc::new(RuntimeEnv::default());
     let name = "appended";
-    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    // Small files compact after four, so the test can drive a compaction.
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 4,
+        compaction_background_interval_ms: 0,
+        ..VortexConfig::default()
+    };
+    let table = open_with(&fixture, Arc::clone(&env), name, &[&KEY], config).await;
     table.init_scan_view_cache();
     overwrite(&table, rows(0, ROWS)).await;
-    let before = lookups_until(
-        &table,
-        name,
-        i64::try_from(ROWS).expect("fits"),
-        Duration::from_secs(30),
-        |c| c.selected > 0,
-    )
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    // Above the inline cap, so each append writes a file, and small.
+    let appended_rows: i64 = 3_000;
+    lookups_until(&table, name, rows_i64, Duration::from_secs(30), |c| {
+        c.selected > 0
+    })
     .await;
 
-    let appended = i64::try_from(ROWS).expect("fits");
-    insert(&table, name, rows(appended, ROWS)).await;
-    let ids = [appended, appended + 1, appended * 2 - 1];
-    assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
-    let after_first = counters(&table);
-    assert!(
-        after_first.snapshot_mismatch > before.snapshot_mismatch,
-        "the stale runtime index must be refused: {before:?} -> {after_first:?}"
-    );
+    let check = |label: &str, before: &LookupIndexCounters, after: &LookupIndexCounters| {
+        assert_eq!(
+            (
+                after.selected - before.selected,
+                after.unbuilt - before.unbuilt,
+                after.builds_started - before.builds_started,
+            ),
+            (2, 0, 0),
+            "the literal and join lookups right after {label} were not both answered from the index: {before:?} -> {after:?}"
+        );
+    };
+    for round in 1..=6 {
+        let appended = rows_i64 * round;
+        insert(
+            &table,
+            name,
+            rows(appended, usize::try_from(appended_rows).expect("fits")),
+        )
+        .await;
+        let before = counters(&table);
+        lookup(&table, name, appended + 7).await;
+        let ids = [appended, appended + 1, appended + appended_rows - 1];
+        assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
+        check(&format!("append {round}"), &before, &counters(&table));
+    }
 
-    let deadline = Instant::now() + Duration::from_mins(1);
-    while counters(&table).builds_published <= before.builds_published {
+    // A compaction replaces the appended files; one may already be running
+    // after the last append.
+    let snapshot = |table: &Arc<CayenneTableProvider>| {
+        let table = Arc::clone(table);
+        async move {
+            table
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify")
+                .snapshot_id
+        }
+    };
+    let appended_snapshot = snapshot(&table).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !table
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("compaction")
+        && snapshot(&table).await == appended_snapshot
+    {
         assert!(
             Instant::now() < deadline,
-            "the replacement index did not publish: {:?}",
-            counters(&table)
+            "the appended small files were never compacted"
         );
-        assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        counters(&table).builds_started > before.builds_started,
-        "a paced dynamic lookup must claim the replacement build"
-    );
-
-    let selected_before = counters(&table).selected;
+    let before = counters(&table);
+    lookup(&table, name, 7).await;
+    let ids = [3, rows_i64 + 5, rows_i64 * 6 + appended_rows - 1];
     assert_eq!(dynamic_lookup(&table, name, &ids).await, ids);
+    check("a compaction", &before, &counters(&table));
+
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(verification.agrees(), "{verification:?}");
     assert_eq!(
-        counters(&table).selected,
-        selected_before + 1,
-        "the later dynamic lookup should use the replacement index"
+        verification.uncovered_files, 0,
+        "every file is indexed by the write that produced it: {verification:?}"
     );
+    println!("verification after appends and a compaction: {verification:?}");
+
+    // The index identifies a file by its name alone, across the moves and
+    // hardlinks between snapshot directories: two data files may share a
+    // name only when they are the same rows.
+    let mut by_name: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    vortex_files(&fixture.data_path, &mut by_name);
+    assert!(
+        by_name.len() >= 2,
+        "the table wrote data files: {by_name:?}"
+    );
+    for (name, paths) in &by_name {
+        let first = std::fs::read(&paths[0]).expect("read data file");
+        for other in &paths[1..] {
+            assert!(
+                std::fs::read(other).expect("read data file") == first,
+                "two different data files are both named {name}: {paths:?}"
+            );
+        }
+    }
+}
+
+/// Every Vortex data file under `dir`, grouped by file name.
+fn vortex_files(
+    dir: &std::path::Path,
+    by_name: &mut std::collections::HashMap<String, Vec<std::path::PathBuf>>,
+) {
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            vortex_files(&path, by_name);
+        } else if path.extension().is_some_and(|ext| ext == "vortex") {
+            let name = path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .to_string();
+            by_name.entry(name).or_default().push(path);
+        }
+    }
 }

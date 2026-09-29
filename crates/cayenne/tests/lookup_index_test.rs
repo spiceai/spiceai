@@ -34,7 +34,7 @@ use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
+use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
@@ -53,6 +53,12 @@ const PLAIN_EVIDENCE: &str = "svc_plain_evidence";
 const INDEXED_COUNT: &str = "svc_indexed_count";
 /// The write-time build test owns its own table.
 const INDEXED_WRITE_TIME: &str = "svc_indexed_write_time";
+/// The `IN`-list test uses its own pair of tables.
+const INDEXED_IN: &str = "svc_indexed_in";
+const PLAIN_IN: &str = "svc_plain_in";
+/// The collision test's indexed table and its control.
+const INDEXED_COLLIDING: &str = "svc_indexed_colliding";
+const PLAIN_COLLIDING: &str = "svc_plain_colliding";
 
 /// The indexed tables' `indexes`, one column set per entry.
 const INDEX_KEYS: [&[&str]; 3] = [
@@ -177,6 +183,16 @@ async fn build_table(
         target_vortex_file_size_mb: 1,
         ..VortexConfig::default()
     };
+    build_table_with(fixture, table_name, index_keys, runtime_env, vortex_config).await
+}
+
+async fn build_table_with(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    index_keys: &[&[&str]],
+    runtime_env: Arc<RuntimeEnv>,
+    vortex_config: VortexConfig,
+) -> Arc<CayenneTableProvider> {
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), table_name);
     let options = CreateTableOptions {
         table_name: table_name.to_string(),
@@ -365,10 +381,6 @@ async fn lookup_index_matches_the_ordinary_scan() {
 
     wait_for_index(&indexed, INDEXED).await;
     let before = counters_of(&indexed);
-    assert_eq!(
-        before.snapshot_mismatch, 0,
-        "the index must bind to the snapshot it was built from"
-    );
 
     // --- 20 keys of each shape, compared row-for-row without LIMIT so the
     //     comparison does not depend on which of several matches is returned.
@@ -428,10 +440,6 @@ async fn lookup_index_matches_the_ordinary_scan() {
     assert!(
         after_sample.access_plans_attached - before.access_plans_attached >= selected,
         "row selections were not attached to the Vortex scan: {after_sample:?}"
-    );
-    assert_eq!(
-        after_sample.snapshot_mismatch, 0,
-        "unexpected snapshot mismatch: {after_sample:?}"
     );
     // One candidate file per probe on a unique key is the point of the index;
     // allow slack for the non-unique pool shape but not a whole-table fan-out.
@@ -507,9 +515,11 @@ async fn lookup_index_matches_the_ordinary_scan() {
         rendered(&query(&plain, PLAIN, &null_key_sql.replace("{table}", PLAIN)).await)
     );
 
-    // --- Rows written after the index was built move the snapshot. The index
-    //     must refuse itself rather than answer from stale row addresses.
-    let mismatch_before = counters_of(&indexed).snapshot_mismatch;
+    // --- Rows written after the index was built stay reachable, and the very
+    //     next lookup is still answered by the index. (A write this small is
+    //     inlined into the metastore rather than written as a file; the
+    //     lifecycle suite covers appends that write files.)
+    let appended_before = counters_of(&indexed);
     let new_batch = service_rows(2_000_000, 256);
     insert(&indexed, INDEXED, new_batch.clone()).await;
     insert(&plain, PLAIN, new_batch).await;
@@ -531,12 +541,15 @@ async fn lookup_index_matches_the_ordinary_scan() {
         counters_of(&indexed)
     );
     assert_eq!(new_indexed, new_plain);
-    assert!(
-        counters_of(&indexed).snapshot_mismatch > mismatch_before
-            || counters_of(&indexed).unbuilt > before.unbuilt
-            || counters_of(&indexed).access_plans_attached > after_sample.access_plans_attached,
-        "the moved snapshot was neither refused nor re-indexed: {:?}",
-        counters_of(&indexed)
+    let appended_after = counters_of(&indexed);
+    assert_eq!(
+        (
+            (appended_after.selected + appended_after.empty)
+                - (appended_before.selected + appended_before.empty),
+            appended_after.unbuilt - appended_before.unbuilt,
+        ),
+        (1, 0),
+        "the lookup right after an append did not use the index: {appended_before:?} -> {appended_after:?}"
     );
 
     // Every row of the moved snapshot must still be reachable on both arms.
@@ -1040,10 +1053,6 @@ async fn write_time_index_matches_a_read_back_build() {
         after.unbuilt, before.unbuilt,
         "the first query after the overwrite saw an unbuilt index: {after:?}"
     );
-    assert_eq!(
-        after.snapshot_mismatch, 0,
-        "unexpected snapshot mismatch: {after:?}"
-    );
 
     // A SECOND overwrite must swap in a fresh index just as seamlessly, with the
     // new rows addressable straight away.
@@ -1073,5 +1082,362 @@ async fn write_time_index_matches_a_read_back_build() {
         after.selected,
         before.selected + 1,
         "the first query after the second overwrite did not use the index"
+    );
+}
+
+/// A write that replaces files swaps them in already covered, however large:
+/// a full refresh (an overwrite) of more rows than an append would finish in
+/// the background is finished before its commit, so the very first lookup
+/// after it uses the index and no read-back build runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_overwrite_is_covered_when_it_becomes_visible() {
+    const LARGE: usize = 1_200_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    // The rewrite layout pinned to one sort column, so the lookup this test
+    // runs cannot switch the table's compactions onto curve clustering.
+    let vortex_config = VortexConfig {
+        sort_columns: vec!["AutoId".to_string()],
+        ..VortexConfig::default()
+    };
+    let table = build_table_with(
+        &fixture,
+        INDEXED_WRITE_TIME,
+        &INDEX_KEYS,
+        Arc::clone(&runtime_env),
+        vortex_config,
+    )
+    .await;
+    overwrite(&table, service_rows(0, LARGE)).await;
+
+    let id = 1_000_003_i64;
+    let sql = format!(
+        "SELECT \"AutoId\" FROM {INDEXED_WRITE_TIME} WHERE \"TenantId\" = 'AC{:032x}' \
+         AND \"ServiceId\" = 'MG{id:032x}'",
+        id % ACCOUNTS
+    );
+    let before = counters_of(&table);
+    assert_eq!(
+        rendered(&query(&table, INDEXED_WRITE_TIME, &sql).await),
+        vec![id.to_string()]
+    );
+    let after = counters_of(&table);
+    assert_eq!(
+        after.selected,
+        before.selected + 1,
+        "the first lookup after a large overwrite did not use the index: {after:?}"
+    );
+    assert_eq!(after.builds_started, 0, "a read-back build ran: {after:?}");
+
+    let report = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verification ran");
+    assert!(
+        report.agrees(),
+        "the index disagrees with a read-back build: {:?}",
+        report.mismatches
+    );
+    assert!(
+        report.keys_compared > 0,
+        "verification compared nothing: {report:?}"
+    );
+}
+
+/// On a primary-key upsert table, an upsert's rows land in a protected
+/// snapshot until compaction folds them in. The index covers those files too:
+/// a lookup of an upserted key returns exactly its new row, and reads the one
+/// protected snapshot that holds it rather than every protected snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upserted_rows_are_found_through_the_index() {
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, on_conflict::OnConflict,
+    };
+    const TABLE: &str = "svc_upsert";
+    const BATCHES: i64 = 4;
+    // Large enough to be written to files rather than inlined.
+    const PER_BATCH: usize = 10_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    // Protected snapshots stay unfolded for the length of the test, and the
+    // rewrite layout is pinned, so the only thing under test is the index.
+    let vortex_config = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        deletion_mode: DeletionMode::Key,
+        sort_columns: vec!["AutoId".to_string()],
+        compaction_trigger_protected_snapshots: 1_000,
+        compaction_background_interval_ms: 0,
+        ..VortexConfig::default()
+    };
+    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), TABLE);
+    let catalog = Arc::clone(&fixture.catalog);
+    let catalog: Arc<dyn MetadataCatalog> = catalog;
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_context(context)
+            .with_secondary_indexes(
+                INDEX_KEYS
+                    .iter()
+                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
+                    .collect(),
+            )
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: service_schema(),
+                primary_key: vec!["AutoId".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "AutoId".to_string(),
+                ]))),
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            })
+            .await
+            .expect("create table"),
+    );
+    insert(&table, TABLE, service_rows(0, ROWS)).await;
+    // Each batch rewrites 10,000 existing keys with a new payload.
+    for batch in 0..BATCHES {
+        let rows = service_rows(batch * 10_000, PER_BATCH);
+        let ids = rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("AutoId");
+        let payload: StringArray = ids
+            .iter()
+            .map(|id| id.map(|id| format!("updated-{id}")))
+            .collect();
+        let mut columns = rows.columns().to_vec();
+        columns[5] = Arc::new(payload);
+        let updated = RecordBatch::try_new(rows.schema(), columns).expect("updated batch");
+        insert(&table, TABLE, updated).await;
+    }
+
+    // More writes, each followed by a scan that reconciles the index against
+    // a new file set, as a serving table sees: an index that only knew the
+    // current snapshot's files would retire the upserts' runs after a few.
+    for write in 0..6_i64 {
+        insert(
+            &table,
+            TABLE,
+            service_rows(100_000 + write * 10_000, PER_BATCH),
+        )
+        .await;
+        let _ = query(&table, TABLE, &format!("SELECT count(*) FROM {TABLE}")).await;
+    }
+
+    let id = 11_i64;
+    let lookup = format!(
+        "SELECT \"Payload\" FROM {TABLE} WHERE \"TenantId\" = 'AC{:032x}' \
+         AND \"ServiceId\" = 'MG{id:032x}'",
+        id % ACCOUNTS
+    );
+    assert_eq!(
+        rendered(&query(&table, TABLE, &lookup).await),
+        vec!["updated-11".to_string()],
+        "the lookup must return exactly the upserted row"
+    );
+    let plan = arrow::util::pretty::pretty_format_batches(
+        &query(&table, TABLE, &format!("EXPLAIN ANALYZE {lookup}")).await,
+    )
+    .expect("format plan")
+    .to_string();
+    let scanned: usize = plan
+        .split("files_scanned=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .expect("the plan reports files_scanned");
+    let snapshots: usize = plan
+        .split("snapshots_scanned=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .expect("the plan reports snapshots_scanned");
+    assert!(
+        plan.contains("lookup_index_outcome=selected"),
+        "a lookup answered from a protected snapshot must report the selection\n{plan}"
+    );
+    assert!(
+        scanned <= 2,
+        "the lookup read {scanned} files across {snapshots} snapshots instead of the candidates only\n{plan}"
+    );
+}
+
+/// An `IN` list on an indexed key is answered from the index, as one batched
+/// probe of every listed key: single-column lists, lists on every column of a
+/// composite key (their cartesian product), `NULL` members, and duplicates all
+/// return exactly what the ordinary scan returns. A negated list never touches
+/// the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_lists_are_answered_from_the_index() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(&fixture, INDEXED_IN, &INDEX_KEYS, Arc::clone(&runtime_env)).await;
+    let plain = build_table(&fixture, PLAIN_IN, &[], Arc::clone(&runtime_env)).await;
+    let batch = service_rows(0, ROWS);
+    overwrite(&indexed, batch.clone()).await;
+    overwrite(&plain, batch).await;
+
+    let account = |id: i64| format!("'AC{:032x}'", id % ACCOUNTS);
+    let application = |id: i64| format!("'MG{id:032x}'");
+    let answered = [
+        "SELECT * FROM {t} WHERE \"AutoId\" IN (3, 17, 17, 39999, 123456789) ORDER BY \"AutoId\""
+            .to_string(),
+        "SELECT * FROM {t} WHERE \"AutoId\" IN (NULL, 5) ORDER BY \"AutoId\"".to_string(),
+        format!(
+            "SELECT * FROM {{t}} WHERE \"TenantId\" IN ({}, {}) AND \"ServiceId\" IN ({}, {}, {}) ORDER BY \"AutoId\"",
+            account(7),
+            account(8),
+            application(7),
+            application(8),
+            application(507),
+        ),
+        format!(
+            "SELECT * FROM {{t}} WHERE \"TenantId\" = {} AND \"ServiceId\" IN ({}, {}) AND \"Active\" = 1 ORDER BY \"AutoId\"",
+            account(11),
+            application(11),
+            application(12),
+        ),
+        format!(
+            "SELECT * FROM {{t}} WHERE \"TenantId\" IN ('{DUP_ACCOUNT}', '{MISSING_ACCOUNT}') AND \"ServiceId\" IN ('{DUP_APPLICATION}', '{MISSING_APPLICATION}') ORDER BY \"AutoId\""
+        ),
+    ];
+    for query_sql in &answered {
+        let before = counters_of(&indexed);
+        let found =
+            rendered(&query(&indexed, INDEXED_IN, &query_sql.replace("{t}", INDEXED_IN)).await);
+        let expected =
+            rendered(&query(&plain, PLAIN_IN, &query_sql.replace("{t}", PLAIN_IN)).await);
+        assert_eq!(found, expected, "{query_sql}");
+        let after = counters_of(&indexed);
+        assert_eq!(
+            (after.selected + after.empty) - (before.selected + before.empty),
+            1,
+            "{query_sql} was not answered from the index: {before:?} -> {after:?}"
+        );
+        assert_eq!(after.unbuilt, before.unbuilt, "{query_sql}: {after:?}");
+    }
+
+    let negated = "SELECT COUNT(*) FROM {t} WHERE \"AutoId\" NOT IN (3, 17)";
+    let before = counters_of(&indexed);
+    assert_eq!(
+        rendered(&query(&indexed, INDEXED_IN, &negated.replace("{t}", INDEXED_IN)).await),
+        rendered(&query(&plain, PLAIN_IN, &negated.replace("{t}", PLAIN_IN)).await),
+    );
+    let after = counters_of(&indexed);
+    assert_eq!(
+        (after.selected, after.empty, after.unbuilt),
+        (before.selected, before.empty, before.unbuilt),
+        "a negated list must not be probed: {after:?}"
+    );
+}
+
+/// An index answers candidate rows, and a key's word may be shared with
+/// other keys (a 64-bit hash of a string key): every query must still return
+/// exactly its own rows. With 4-bit words, about 40,000 keys share 16 words,
+/// so every lookup's candidates are mostly other keys' rows, and the results
+/// must still match a table with no index row for row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_sharing_a_word_return_exactly_their_own_rows() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let vortex_config = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), INDEXED_COLLIDING);
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let indexed = Arc::new(
+        CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
+            .with_context(context)
+            .with_index_word_bits(4)
+            .with_secondary_indexes(
+                INDEX_KEYS
+                    .iter()
+                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
+                    .collect(),
+            )
+            .create(CreateTableOptions {
+                table_name: INDEXED_COLLIDING.to_string(),
+                schema: service_schema(),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            })
+            .await
+            .expect("create table"),
+    );
+    let plain = build_table(&fixture, PLAIN_COLLIDING, &[], Arc::clone(&runtime_env)).await;
+    let batch = service_rows(0, ROWS);
+    insert(&indexed, INDEXED_COLLIDING, batch.clone()).await;
+    insert(&plain, PLAIN_COLLIDING, batch).await;
+    wait_for_index(&indexed, INDEXED_COLLIDING).await;
+
+    let before = counters_of(&indexed);
+    let mut result_rows = 0_u64;
+    let mut lookups = 0_u64;
+    for i in 0..15i64 {
+        let id = i * 97;
+        let account = format!("AC{:032x}", id % ACCOUNTS);
+        let application = format!("MG{id:032x}");
+        for sql in [
+            format!(
+                "SELECT * FROM {{table}} WHERE \"TenantId\" = '{account}' \
+                 AND \"ServiceId\" = '{application}' ORDER BY \"AutoId\""
+            ),
+            format!("SELECT * FROM {{table}} WHERE \"AutoId\" = {id} ORDER BY \"AutoId\""),
+            // A key no row holds: every candidate belongs to another key.
+            format!(
+                "SELECT * FROM {{table}} WHERE \"TenantId\" = '{account}' \
+                 AND \"ServiceId\" = 'MGabsent{id}' ORDER BY \"AutoId\""
+            ),
+        ] {
+            let indexed_rows = rendered(
+                &query(
+                    &indexed,
+                    INDEXED_COLLIDING,
+                    &sql.replace("{table}", INDEXED_COLLIDING),
+                )
+                .await,
+            );
+            let plain_rows = rendered(
+                &query(
+                    &plain,
+                    PLAIN_COLLIDING,
+                    &sql.replace("{table}", PLAIN_COLLIDING),
+                )
+                .await,
+            );
+            assert_eq!(indexed_rows, plain_rows, "{sql}");
+            result_rows += u64::try_from(plain_rows.len()).expect("fits u64");
+            lookups += 1;
+        }
+    }
+    let after = counters_of(&indexed);
+    let selected = after.selected - before.selected;
+    let candidates = after.candidate_rows - before.candidate_rows;
+    println!(
+        "{lookups} lookups: {selected} answered from the index, {candidates} candidate rows, {result_rows} result rows"
+    );
+    assert!(
+        selected >= lookups,
+        "every lookup must use the index: {selected} of {lookups}"
+    );
+    assert!(
+        candidates > 100 * result_rows,
+        "4-bit words must make most candidates other keys' rows: {candidates} candidates for {result_rows} rows"
     );
 }

@@ -195,10 +195,14 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
     let table = build_table(&fixture, Arc::clone(&runtime_env)).await;
     overwrite(&table, service_rows(ROWS)).await;
 
-    // The write-time build ran and was refused; nothing may be published.
+    // The write's runs were built and refused; no file may be covered.
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
     assert!(
-        table.verify_lookup_index_against_read_back().await.is_err(),
-        "an index the pool cannot fit must not be published"
+        verification.files == 0 && verification.uncovered_files > 0,
+        "an index the pool cannot fit must not cover any file: {verification:?}"
     );
     let counters = table
         .lookup_index_counters()

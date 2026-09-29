@@ -427,7 +427,6 @@ async fn position_deletes_compose_with_the_index() {
         served
             && answered == u64::try_from(keys.len()).expect("fits")
             && after.selected > before.selected
-            && after.snapshot_mismatch == before.snapshot_mismatch
             && after.unbuilt == before.unbuilt,
         "lookups on a table with position deletes were not served from the index: {before:?} -> {after:?}"
     );
