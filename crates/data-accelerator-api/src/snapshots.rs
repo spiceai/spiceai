@@ -59,9 +59,10 @@ fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration, refresh_mode: Ref
 /// snapshots are enabled for bootstrapping, and the acceleration mode does not rebuild
 /// from the source on this load. Reads configuration only.
 ///
-/// [`should_download_snapshot`] combines this with a check for existing local data at
+/// [`download_snapshot_if_needed`] combines this with a check for existing local data at
 /// `layout.primary_path()`. An engine whose local-data marker is shared between datasets
-/// (Cayenne's metastore directory) combines it with its own per-dataset check instead.
+/// (Cayenne's metastore directory) combines it with its own per-dataset check and then
+/// calls [`download_snapshot`].
 pub fn snapshot_bootstrap_allowed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
@@ -85,12 +86,7 @@ pub fn snapshot_bootstrap_allowed(
 /// Decides whether a snapshot should be downloaded to bootstrap `layout`, with no side
 /// effects: it only reads configuration and checks whether `layout.primary_path()`
 /// already exists.
-///
-/// Split out of [`download_snapshot_if_needed`] so a caller whose own startup would
-/// otherwise create `primary_path` before the check runs (e.g. Cayenne opening its
-/// metastore) can make this decision first, against the true pre-startup state, and
-/// only then perform whatever side-effecting setup it needs before downloading.
-pub fn should_download_snapshot(
+fn should_download_snapshot(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     layout: &AccelerationLayout,
@@ -119,9 +115,8 @@ pub fn should_download_snapshot(
 /// Downloads the latest snapshot for `layout` unconditionally.
 ///
 /// Callers should first confirm a download is appropriate with
-/// [`should_download_snapshot`]; this function performs no checks of its own before
-/// downloading — it exists so the decision and the (potentially side-effecting) act of
-/// downloading can happen at different points in a caller's startup sequence.
+/// [`snapshot_bootstrap_allowed`] and their own check for existing local data; this
+/// function performs no checks of its own before downloading.
 pub async fn download_snapshot(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
@@ -173,7 +168,8 @@ pub async fn download_snapshot(
 /// Checks whether a snapshot should be downloaded to bootstrap `layout` and, if so,
 /// downloads it.
 ///
-/// Thin composition of [`should_download_snapshot`] and [`download_snapshot`], kept for
+/// Thin composition of [`snapshot_bootstrap_allowed`], a check that `layout.primary_path()`
+/// does not exist yet, and [`download_snapshot`], kept for
 /// callers (`DuckDB`, `SQLite`, Turso) that make the decision and perform the download at
 /// the same point in their startup, with no side-effecting setup of their own in
 /// between.
