@@ -1649,7 +1649,8 @@ mod tests {
             Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
         for (scope_kind, plan, _) in derived_scope_shapes(&volatile, "random()") {
             for (dialect_name, dialect) in federation_dialects() {
-                let Some(sql) = unparse_or_flattening_refusal(dialect_name, dialect.as_ref(), &plan)
+                let Some(sql) =
+                    unparse_or_flattening_refusal(dialect_name, dialect.as_ref(), &plan)
                 else {
                     continue;
                 };
