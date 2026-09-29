@@ -253,10 +253,8 @@ impl Runtime {
         // Keyed by resolved name, so a `localpod` path of `source`, `public.source`, or
         // `spice.public.source` finds the same parent. The value carries the dataset's own name
         // for the log line its task writes.
-        let mut dataset_futures: HashMap<
-            ResolvedTableReference,
-            (TableReference, Pin<Box<dyn Future<Output = ()> + Send>>),
-        > = HashMap::new();
+        let mut dataset_futures: HashMap<ResolvedTableReference, (TableReference, DatasetLoad)> =
+            HashMap::new();
         // Keyed by parent so several `localpod` datasets reading from one dataset all chain
         // behind the same load, rather than the first one consuming it.
         let mut localpod_by_parent: HashMap<
@@ -2615,6 +2613,9 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
 }
+
+/// A dataset's pending load, as startup queues it before spawning.
+type DatasetLoad = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Whether a `localpod` load chain runs over registrations a spicepod apply is replacing, whose
 /// cached results must be invalidated once each dataset reloads, or at startup, where nothing was
