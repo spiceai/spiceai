@@ -794,8 +794,7 @@ mod test {
             ParameterSpec::component("host"),
             ParameterSpec::runtime("pool_size").default("10"),
         ];
-        let mut resolved = Vec::new();
-        for diagnostics in [Diagnostics::Report, Diagnostics::Suppress] {
+        async fn resolve(diagnostics: Diagnostics) -> Vec<(String, String)> {
             let params = Parameters::try_new_with_diagnostics(
                 "accelerator test",
                 vec![
@@ -815,17 +814,18 @@ mod test {
                 .map(|(k, v)| (k, v.expose_secret().to_string()))
                 .collect();
             pairs.sort();
-            resolved.push(pairs);
+            pairs
         }
 
+        let reported = resolve(Diagnostics::Report).await;
         assert_eq!(
-            resolved[0],
+            reported,
             vec![
                 ("host".to_string(), "db.internal".to_string()),
                 ("pool_size".to_string(), "10".to_string()),
             ]
         );
-        assert_eq!(resolved[0], resolved[1]);
+        assert_eq!(resolve(Diagnostics::Suppress).await, reported);
     }
 
     #[tokio::test]
