@@ -5,17 +5,37 @@ requests to an origin when errors or slow responses exceed
 `rate_control_failure_threshold` (default `10%`). It scales configured limits
 without exceeding them. At least one of `requests_per_second_limit`,
 `requests_per_minute_limit`, or `max_concurrent_requests` must be set.
+Replace the example URLs and GraphQL query with those of the upstream API.
+
+## HTTPS: combine slow-response detection with other limits
+
+A complete `spicepod.yaml`:
 
 ```yaml
+version: v2
+kind: Spicepod
+name: adaptive-http-api
+
 datasets:
   - from: https://api.example.com/v1/items
     name: items
     params:
-      requests_per_second_limit: 10
-      rate_control_mode: adaptive
       client_timeout: 30
+      max_concurrent_requests: 4
+      requests_per_second_limit: 10
+      requests_per_minute_limit: 300
+      rate_control_mode: adaptive
+      rate_control_failure_threshold: '10%'
+      rate_control_window: 10s
       rate_control_slow_response_threshold: 2s
+      rate_control_acquire_timeout: 15s
+      rate_control_jitter_min: 5ms
+      rate_control_jitter_max: 10ms
 ```
+
+All three limits apply together, and adaptive control can lower requests further.
+The `15s` admission timeout bounds waiting for permission to send; it is separate
+from the `30`-second request timeout and excluded from the `2s` latency measurement.
 
 A successful response taking **strictly longer** than `2s` still returns the same
 rows. It counts as `slow` for adaptive control, with the same effect on admission
@@ -27,6 +47,36 @@ Static mode ignores it, including invalid values. There is no runtime-wide defau
 The threshold must be less than the effective HTTPS `client_timeout` (in whole
 seconds), or the GraphQL connector's fixed `30s` request timeout. Validation messages
 render durations in seconds, including fractional values.
+
+## GraphQL: combine slow-response detection with other limits
+
+A complete `spicepod.yaml` for a GraphQL API returning rows at `/data/items`:
+
+```yaml
+version: v2
+kind: Spicepod
+name: adaptive-graphql-api
+
+datasets:
+  - from: graphql:https://api.example.com/graphql
+    name: items
+    params:
+      graphql_query: '{ items { id name } }'
+      json_pointer: /data/items
+      max_concurrent_requests: 4
+      requests_per_second_limit: 10
+      requests_per_minute_limit: 300
+      rate_control_mode: adaptive
+      rate_control_failure_threshold: '10%'
+      rate_control_window: 10s
+      rate_control_slow_response_threshold: 2s
+      rate_control_acquire_timeout: 15s
+      rate_control_jitter_min: 5ms
+      rate_control_jitter_max: 10ms
+```
+
+Do not add `client_timeout`: GraphQL's request timeout is fixed at `30s`.
+The admission timeout and slow-response threshold have the same meanings as HTTPS.
 
 ## Timing and outcomes
 
@@ -49,6 +99,48 @@ timeout. Each dataset's latency classification feeds that shared controller.
 For example, use `1s` for `/items` and `20s` for `/search`, with the same origin limits.
 If their request timeouts differ, explicitly set the same
 `rate_control_acquire_timeout` so its connector-derived defaults do not conflict.
+
+## Runtime defaults with dataset-specific thresholds
+
+A complete `spicepod.yaml` with common rate-control defaults and two endpoints on
+one origin:
+
+```yaml
+version: v2
+kind: Spicepod
+name: adaptive-shared-origin
+
+runtime:
+  params:
+    http_max_concurrent_requests: 4
+    http_requests_per_second_limit: 10
+    http_requests_per_minute_limit: 300
+    http_rate_control_mode: adaptive
+    http_rate_control_failure_threshold: '10%'
+    http_rate_control_window: 10s
+    http_rate_control_acquire_timeout: 15s
+    http_rate_control_jitter_min: 5ms
+    http_rate_control_jitter_max: 10ms
+
+datasets:
+  - from: https://api.example.com/v1/items
+    name: items
+    params:
+      client_timeout: 10
+      rate_control_slow_response_threshold: 1s
+
+  - from: https://api.example.com/v1/search
+    name: search
+    params:
+      client_timeout: 60
+      rate_control_slow_response_threshold: 20s
+```
+
+These datasets share the origin's limits, not separate copies of its quota. The
+explicit `15s` admission timeout keeps their shared settings consistent despite
+having different request timeouts. Runtime defaults apply separately to other
+origins. There is no `http_rate_control_slow_response_threshold` runtime parameter:
+set the threshold on each dataset.
 
 ## Choose a threshold from observed latency
 
