@@ -40,13 +40,15 @@ def check(name: str, got, want) -> None:
         print(f"  FAIL: {name}\n    got:  {got!r}\n    want: {want!r}")
 
 
-def run_with_cargo(argv: list[str], cargo_body: str | None) -> subprocess.CompletedProcess:
+def run_with_cargo(
+    argv: list[str], cargo_body: str | None, mode: int = 0o755
+) -> subprocess.CompletedProcess:
     """Run Python with PATH holding only a stand-in `cargo` (or no cargo at all)."""
     with tempfile.TemporaryDirectory() as bin_dir:
         if cargo_body is not None:
             cargo = Path(bin_dir) / "cargo"
             cargo.write_text(f"#!/bin/sh\n{cargo_body}\n", encoding="utf-8")
-            cargo.chmod(0o755)
+            cargo.chmod(mode)
         return subprocess.run(
             [sys.executable, *argv],
             cwd=REPO,
@@ -56,7 +58,7 @@ def run_with_cargo(argv: list[str], cargo_body: str | None) -> subprocess.Comple
         )
 
 
-def run_helper(cargo_body: str | None) -> subprocess.CompletedProcess:
+def run_helper(cargo_body: str | None, mode: int = 0o755) -> subprocess.CompletedProcess:
     """Call `cargo_metadata()` the way a guard does, printing its `ok` field."""
     return run_with_cargo(
         [
@@ -65,6 +67,7 @@ def run_helper(cargo_body: str | None) -> subprocess.CompletedProcess:
             "from rust_guard_common import cargo_metadata; print(cargo_metadata()['ok'])",
         ],
         cargo_body,
+        mode,
     )
 
 
@@ -86,6 +89,10 @@ result = run_helper(None)
 check("no cargo on PATH exits 2", result.returncode, 2)
 check("  ...and points at the toolchain", "Rust toolchain installed" in result.stderr, True)
 
+result = run_helper("echo '{}'", mode=0o644)
+check("a cargo that cannot be executed exits 2", result.returncode, 2)
+check("  ...and says it could not be run", "could not be run" in result.stderr, True)
+
 result = run_helper('echo "{\\"ok\\": \\"$*\\"}"')
 check(
     "cargo is asked for the workspace only, never resolving dependencies",
@@ -97,12 +104,13 @@ check(
 # cargo it cannot read as a tooling error.
 for guard in CARGO_METADATA_GUARDS:
     print(guard)
-    for label, body in (
-        ("output that is not JSON", "echo 'warning: not json'"),
-        ("a failing cargo", "exit 101"),
-        ("no cargo on PATH", None),
+    for label, body, mode in (
+        ("output that is not JSON", "echo 'warning: not json'", 0o755),
+        ("a failing cargo", "exit 101", 0o755),
+        ("no cargo on PATH", None, 0o755),
+        ("a cargo that cannot be executed", "echo '{}'", 0o644),
     ):
-        result = run_with_cargo([str(REPO / "scripts" / guard)], body)
+        result = run_with_cargo([str(REPO / "scripts" / guard)], body, mode)
         check(f"{label} exits 2, not 1", result.returncode, 2)
         check("  ...without a traceback", "Traceback" in result.stderr, False)
 

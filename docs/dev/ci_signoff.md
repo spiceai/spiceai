@@ -199,8 +199,9 @@ also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
 what must be gated from what the `lint-rust` recipe reads (including the
-`scripts/` modules its guards import), from the tracked config-file names, and from every tracked `.rs` file — rather than from a list
-someone has to remember — and fails when the three drift. Change them together.
+`scripts/` modules its guards import), from the tracked config-file names, and
+from every tracked `.rs` file — rather than from a list someone has to remember
+— and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going
 ungated, which the config-file derivation cannot see: top-level `vendor/` holds

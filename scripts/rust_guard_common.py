@@ -42,6 +42,11 @@ def cargo_metadata() -> dict:
             file=sys.stderr,
         )
         raise SystemExit(2)
+    except OSError as e:
+        # A `cargo` that is on PATH but cannot be executed (not executable, a
+        # sandbox or noexec mount refusing it).
+        print(f"error: `cargo` could not be run: {e}", file=sys.stderr)
+        raise SystemExit(2)
     except subprocess.CalledProcessError as e:
         print(f"error: `cargo metadata` failed (exit {e.returncode}).", file=sys.stderr)
         if e.stderr:
