@@ -523,6 +523,31 @@ impl SpiceTestQueryWorker {
                             current_query_count += 1;
                         }
                         let end = SystemTime::now();
+                        if self.id == 0 {
+                            if let Some(durations) = query_durations.get(&query.name) {
+                                let us: Vec<String> = durations
+                                    .iter()
+                                    .map(|d| d.as_micros().to_string())
+                                    .collect();
+                                println!("RAW_SAMPLES_US\t{}\t{}", query.name, us.join(","));
+                            }
+                            if let Some(client) = self.executor.as_spice_client() {
+                                let parameters = query.get_parameters_batch().transpose()?;
+                                match crate::flight::query_to_batches(
+                                    client,
+                                    &format!("EXPLAIN ANALYZE {}", query.sql),
+                                    parameters,
+                                )
+                                .await
+                                {
+                                    Ok(batches) => match arrow::util::pretty::pretty_format_batches(&batches) {
+                                        Ok(t) => println!("EXPLAIN_ANALYZE_BEGIN {}\n{t}\nEXPLAIN_ANALYZE_END {}", query.name, query.name),
+                                        Err(e) => println!("EXPLAIN_ANALYZE_ERROR {}: {e}", query.name),
+                                    },
+                                    Err(e) => println!("EXPLAIN_ANALYZE_ERROR {}: {e}", query.name),
+                                }
+                            }
+                        }
                         query_iteration_durations
                             .insert(Arc::clone(&query.name), (query_start, end));
                         query_statuses.insert(Arc::clone(&query.name), query_status);

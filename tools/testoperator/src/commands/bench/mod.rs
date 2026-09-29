@@ -183,7 +183,12 @@ async fn run_inner(
         &app,
         NotStarted::new()
             .with_parallel_count(1)
-            .with_end_condition(EndCondition::QuerySetCompleted(5))
+            .with_end_condition(EndCondition::QuerySetCompleted(
+                std::env::var("SPICE_BENCH_ITERATIONS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5),
+            ))
             .with_validate(args.validate)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_query_executor(executor),
