@@ -107,6 +107,7 @@ use datafusion::physical_plan::aggregates::AggregateExec;
 )]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::scalar::ScalarValue;
@@ -152,7 +153,10 @@ impl PhysicalOptimizerRule for PartitionOnlyScanRewrite {
 
             let input = Arc::clone(aggregate.input());
             match rewrite_partition_only_scan(&input)? {
-                Some(new_input) => Ok(Transformed::yes(node.with_new_children(vec![new_input])?)),
+                Some(new_input) => Ok(Transformed::yes(node.replace_children(
+                    vec![new_input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?)),
                 None => Ok(Transformed::no(node)),
             }
         })
@@ -194,7 +198,10 @@ fn rewrite_partition_only_scan(
     }
 
     match rewrite_partition_only_scan(children[0])? {
-        Some(new_child) => Ok(Some(Arc::clone(plan).with_new_children(vec![new_child])?)),
+        Some(new_child) => Ok(Some(Arc::clone(plan).replace_children(
+            vec![new_child],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?)),
         None => Ok(None),
     }
 }

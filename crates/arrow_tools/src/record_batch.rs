@@ -2785,15 +2785,6 @@ mod nullability_alignment_tests {
         Arc::new(Schema::new(vec![Field::new(name, data_type, true)]))
     }
 
-    /// The address of the key column's value buffer, so a rebuild can be told from a relabel.
-    fn keys_buffer_ptr(column: &ArrayRef) -> *const u8 {
-        let map = column
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .expect("map column");
-        map.keys().to_data().buffers()[1].as_ptr()
-    }
-
     fn map_pairs(batch: &RecordBatch) -> Vec<(String, Option<String>)> {
         let map = batch
             .column(0)

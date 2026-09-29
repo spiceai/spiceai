@@ -579,6 +579,12 @@ impl TableProvider for EnsureSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+
+    fn stats_of(plan: &dyn ExecutionPlan, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        StatisticsContext::new().compute(plan, &StatisticsArgs::new().with_partition(partition))
+    }
+
     use arrow::array::{ArrayRef, Int64Array};
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -727,9 +733,7 @@ mod tests {
         let source = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
         let schema_cast = SchemaCastScanExec::new(source, expected_output_schema());
 
-        let stats = schema_cast
-            .partition_statistics(None)
-            .expect("partition_statistics should succeed");
+        let stats = stats_of(&schema_cast, None).expect("partition_statistics should succeed");
         assert_eq!(
             stats.column_statistics.len(),
             2,
@@ -763,8 +767,7 @@ mod tests {
         .expect("record batch");
         let source =
             MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).expect("source");
-        let input_total = source
-            .partition_statistics(None)
+        let input_total = stats_of(source.as_ref(), None)
             .expect("input statistics")
             .total_byte_size;
         assert!(
@@ -773,8 +776,7 @@ mod tests {
         );
 
         let schema_cast = SchemaCastScanExec::new(source, output_schema);
-        let total = schema_cast
-            .partition_statistics(None)
+        let total = stats_of(&schema_cast, None)
             .expect("partition_statistics should succeed")
             .total_byte_size;
         assert_ne!(
@@ -816,9 +818,7 @@ mod tests {
 
         // Before the fix this returned the `ExprBoundaries` col_index
         // out-of-bounds internal error instead of `Ok`.
-        filter
-            .partition_statistics(None)
-            .expect("filter statistics analysis must not go out of bounds");
+        stats_of(&filter, None).expect("filter statistics analysis must not go out of bounds");
     }
 
     #[test]
@@ -1518,8 +1518,7 @@ mod tests {
             Field::new("value", DataType::Int64, true),
             Field::new("id", DataType::Int64, true),
         ]));
-        let stats = SchemaCastScanExec::new(source, target_schema)
-            .partition_statistics(None)
+        let stats = stats_of(&SchemaCastScanExec::new(source, target_schema), None)
             .expect("partition_statistics should succeed");
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
@@ -1544,8 +1543,7 @@ mod tests {
         let source = source_with_null_counts(&input_schema, &[1], 2);
 
         let target_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
-        let stats = SchemaCastScanExec::new(source, target_schema)
-            .partition_statistics(None)
+        let stats = stats_of(&SchemaCastScanExec::new(source, target_schema), None)
             .expect("partition_statistics should succeed");
 
         assert_eq!(

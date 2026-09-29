@@ -2386,18 +2386,14 @@ mod tests {
         use datafusion_common::stats::Precision;
 
         let exec = CayenneAccelerationExec::new(one_partition_plan());
-        let stats = exec
-            .partition_statistics(Some(0))
-            .expect("partition statistics should be available");
+        let stats = stats_of(&exec, Some(0)).expect("partition statistics should be available");
         assert_eq!(
             stats.num_rows,
             Precision::Exact(3),
             "clean scan must keep the inner plan's exact row count"
         );
         // Aggregate over all partitions must likewise stay exact.
-        let agg = exec
-            .partition_statistics(None)
-            .expect("aggregate statistics should be available");
+        let agg = stats_of(&exec, None).expect("aggregate statistics should be available");
         assert_eq!(agg.num_rows, Precision::Exact(3));
     }
 
