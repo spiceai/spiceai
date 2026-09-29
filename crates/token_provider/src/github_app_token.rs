@@ -37,27 +37,32 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 #[derive(Debug, Snafu)]
 pub enum GitHubAppError {
-    #[snafu(display("Invalid private key. Verify the GitHub private key parameter."))]
+    #[snafu(display("Invalid private key. Verify the GitHub private key parameter. Cause: {source}"))]
     InvalidPrivateKey { source: jsonwebtoken::errors::Error },
 
-    #[snafu(display("Failed to get system time. Verify your system time."))]
+    #[snafu(display("Failed to get system time. Verify your system time. Cause: {source}"))]
     UnableToGetSystemTime { source: std::time::SystemTimeError },
 
-    #[snafu(display("Invalid system time. Verify your system time."))]
+    #[snafu(display("Invalid system time. Verify your system time. Cause: {source}"))]
     InvalidSystemTime { source: std::num::TryFromIntError },
 
     #[snafu(display(
-        "Failed to generate JWT. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to generate JWT. Verify the GitHub Connector configuration and try again. Cause: {source}. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGenerateJWT { source: jsonwebtoken::errors::Error },
 
     #[snafu(display(
-        "Failed to get GitHub installation access token. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to get GitHub installation access token. Verify the GitHub Connector configuration and try again. Cause: {source}. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessToken { source: reqwest::Error },
 
     #[snafu(display(
-        "Failed to get GitHub installation access token body. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to get GitHub installation access token. GitHub responded with status {status}: {message}. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+    ))]
+    GitHubInstallationAccessTokenRejected { status: reqwest::StatusCode, message: String },
+
+    #[snafu(display(
+        "Failed to get GitHub installation access token body. Verify the GitHub Connector configuration and try again. Cause: {source}. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
 
@@ -226,6 +231,25 @@ impl GitHubToken {
     }
 }
 
+/// Extracts the `message` field from a GitHub API error body, falling back to the raw body.
+fn github_error_message(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        message: String,
+    }
+    serde_json::from_str::<ErrorBody>(body).map_or_else(
+        |_| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "no response body".to_string()
+            } else {
+                trimmed.chars().take(500).collect()
+            }
+        },
+        |b| b.message,
+    )
+}
+
 #[derive(Serialize)]
 struct Claims {
     iat: usize,
@@ -277,8 +301,17 @@ async fn generate_token(
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
         .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return GitHubInstallationAccessTokenRejectedSnafu {
+            status,
+            message: github_error_message(&body),
+        }
+        .fail();
+    }
 
     #[expect(clippy::items_after_statements)]
     #[derive(Deserialize, Debug)]
@@ -297,4 +330,34 @@ async fn generate_token(
             .map_err(|_| GitHubAppError::UnableToParseTokenExpiration {})?
             .with_timezone(&Utc),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_error_message_extracts_json_message() {
+        assert_eq!(
+            github_error_message(r#"{"message":"Bad credentials","documentation_url":"x"}"#),
+            "Bad credentials"
+        );
+    }
+
+    #[test]
+    fn github_error_message_falls_back_to_body() {
+        assert_eq!(github_error_message("  upstream down "), "upstream down");
+        assert_eq!(github_error_message(""), "no response body");
+    }
+
+    #[test]
+    fn rejected_error_names_status_and_message() {
+        let err = GitHubAppError::GitHubInstallationAccessTokenRejected {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            message: "Bad credentials".to_string(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("401 Unauthorized"), "{text}");
+        assert!(text.contains("Bad credentials"), "{text}");
+    }
 }
