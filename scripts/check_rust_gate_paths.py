@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -154,12 +155,6 @@ def tracked_files() -> tuple[list[str], list[str]]:
     return [p for p in listing.split("\0") if p], []
 
 
-# `import name` / `from name import …`, at any indentation so an import inside a
-# `try:` block still counts. Only the first module of `import a, b` is read; the
-# guards import their `scripts/` siblings one per line.
-IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+(\w+)[ \t]+import\b|import[ \t]+(\w+))", re.MULTILINE)
-
-
 def read_script(path: str) -> str | None:
     """A repo file's text, or None when there is no such file."""
     try:
@@ -168,29 +163,47 @@ def read_script(path: str) -> str | None:
         return None
 
 
+def imported_modules(source: str) -> set[str]:
+    """Top-level names of every absolute import in a Python source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # The guard itself fails when `lint-rust` runs it, which reports this.
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+    return names
+
+
 def sibling_imports(guards: list[str], read=read_script) -> set[str]:
     """The `scripts/` modules the guards import, followed transitively.
 
     A guard's behavior lives in every module it imports, so a helper shared by
     several guards is as much a gate input as the guards are — yet nothing in the
-    `lint-rust` recipe names it. Any imported name with no `scripts/<name>.py`
+    `lint-rust` recipe names it. An imported name with no `scripts/<name>.py`
     behind it (the standard library) is skipped.
     """
     found: set[str] = set()
-    pending = [g for g in guards if g.startswith("scripts/")]
+    pending = [text for text in map(read, guards) if text is not None]
     while pending:
-        text = read(pending.pop())
-        if text is None:
-            continue
-        for match in IMPORT_RE.finditer(text):
-            module = f"scripts/{match.group(1) or match.group(2)}.py"
-            if module not in found and read(module) is not None:
+        for name in imported_modules(pending.pop()):
+            module = f"scripts/{name}.py"
+            if module in found:
+                continue
+            text = read(module)
+            if text is not None:
                 found.add(module)
-                pending.append(module)
+                pending.append(text)
     return found
 
 
-def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
+def derived_gate_paths(
+    tracked: list[str], imports=sibling_imports
+) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
@@ -220,7 +233,7 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     # different variable, or a bare `python` — is left unmatched.
     guards = re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
     paths.update(guards)
-    paths.update(sibling_imports(guards))
+    paths.update(imports(guards))
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 

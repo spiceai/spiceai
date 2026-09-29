@@ -71,27 +71,10 @@ def run_helper(cargo_body: str | None, mode: int = 0o755) -> subprocess.Complete
     )
 
 
-print("cargo_metadata")
+print("cargo_metadata() answering")
 
 result = run_helper('echo \'{"ok": "parsed"}\'')
 check("valid JSON is returned parsed", (result.returncode, result.stdout.strip()), (0, "parsed"))
-
-result = run_helper("echo 'warning: not json'")
-check("output that is not JSON exits 2", result.returncode, 2)
-check("  ...and names the cause", "emitted invalid JSON" in result.stderr, True)
-check("  ...without a traceback", "Traceback" in result.stderr, False)
-
-result = run_helper("echo 'error: failed to parse manifest' >&2; exit 101")
-check("a failing cargo exits 2", result.returncode, 2)
-check("  ...and shows cargo's own diagnostics", "failed to parse manifest" in result.stderr, True)
-
-result = run_helper(None)
-check("no cargo on PATH exits 2", result.returncode, 2)
-check("  ...and points at the toolchain", "Rust toolchain installed" in result.stderr, True)
-
-result = run_helper("echo '{}'", mode=0o644)
-check("a cargo that cannot be executed exits 2", result.returncode, 2)
-check("  ...and says it could not be run", "could not be run" in result.stderr, True)
 
 result = run_helper('echo "{\\"ok\\": \\"$*\\"}"')
 check(
@@ -100,20 +83,29 @@ check(
     ["metadata", "--format-version", "1", "--no-deps", "--locked"],
 )
 
+# Every way cargo can fail to answer: (label, stand-in body or None for no
+# cargo at all, its file mode, what the error must say).
+FAILURE_MODES = (
+    ("output that is not JSON", "echo 'warning: not json'", 0o755, "emitted invalid JSON"),
+    ("a failing cargo", "echo 'error: bad manifest' >&2; exit 101", 0o755, "bad manifest"),
+    ("no cargo on PATH", None, 0o755, "Rust toolchain installed"),
+    ("a cargo that cannot be executed", "echo '{}'", 0o644, "could not be run"),
+)
+
 # Regression test for #13121: each guard, not just the helper, must report a
 # cargo it cannot read as a tooling error.
-for guard in CARGO_METADATA_GUARDS:
-    print(guard)
-    for label, body, mode in (
-        ("output that is not JSON", "echo 'warning: not json'", 0o755),
-        ("a failing cargo", "exit 101", 0o755),
-        ("no cargo on PATH", None, 0o755),
-        ("a cargo that cannot be executed", "echo '{}'", 0o644),
-    ):
-        result = run_with_cargo([str(REPO / "scripts" / guard)], body, mode)
+targets = [("cargo_metadata() failing", None)]
+targets += [(g, str(REPO / "scripts" / g)) for g in CARGO_METADATA_GUARDS]
+for target, script in targets:
+    print(target)
+    for label, body, mode, says in FAILURE_MODES:
+        if script is None:
+            result = run_helper(body, mode)
+        else:
+            result = run_with_cargo([script], body, mode)
         check(f"{label} exits 2, not 1", result.returncode, 2)
+        check("  ...and names the cause", says in result.stderr, True)
         check("  ...without a traceback", "Traceback" in result.stderr, False)
-
 
 if failures:
     print(f"\n{failures} of {checks} checks FAILED")

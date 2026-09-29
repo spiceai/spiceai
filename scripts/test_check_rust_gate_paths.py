@@ -229,16 +229,15 @@ print("derived_gate_paths")
 
 def derived_from(recipe: str) -> list[str]:
     """Guard paths `derived_gate_paths` reads out of a synthetic `lint-rust` recipe."""
-    original = check_rust_gate_paths.lint_recipe, check_rust_gate_paths.sibling_imports
+    original = check_rust_gate_paths.lint_recipe
     check_rust_gate_paths.lint_recipe = lambda: recipe
-    # The guards' imports are read from the real files, which would tie these
-    # recipe-spelling cases to whatever those files import today; they are
-    # pinned separately below.
-    check_rust_gate_paths.sibling_imports = lambda guards: set()
     try:
-        paths, _ = derived_gate_paths([])
+        # The guards' imports are read from the real files, which would tie these
+        # recipe-spelling cases to whatever those files import today; they are
+        # pinned separately below.
+        paths, _ = derived_gate_paths([], imports=lambda guards: set())
     finally:
-        check_rust_gate_paths.lint_recipe, check_rust_gate_paths.sibling_imports = original
+        check_rust_gate_paths.lint_recipe = original
     # `RUST_SOURCE_PATHS` is seeded unconditionally and derived from nothing, so
     # dropping it leaves exactly what the recipe contributed.
     return sorted(set(paths) - set(check_rust_gate_paths.RUST_SOURCE_PATHS))
@@ -305,6 +304,22 @@ check(
     "an indented import is read, and a stdlib module is not a gate path",
     sorted(sibling_imports(["scripts/check_b.py"], reader)),
     ["scripts/common.py", "scripts/deeper.py"],
+)
+check(
+    "every module of a multi-module import is read",
+    sibling_imports(
+        ["scripts/check_d.py"],
+        {"scripts/check_d.py": "import json, common\n", "scripts/common.py": ""}.get,
+    ),
+    {"scripts/common.py"},
+)
+check(
+    "an import that is only text in a docstring is not read",
+    sibling_imports(
+        ["scripts/check_e.py"],
+        {"scripts/check_e.py": '"""\nimport common\n"""\n', "scripts/common.py": ""}.get,
+    ),
+    set(),
 )
 check(
     "a guard that is not on disk contributes nothing",
