@@ -98,6 +98,7 @@ pub(crate) mod resource_starvation;
 /// acceleration's `indexes`), so a check can prove a query used row selection
 /// rather than silently falling back to an ordinary scan.
 pub mod lookup_index {
+    pub use crate::provider::IndexSidecars;
     pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
 }
 

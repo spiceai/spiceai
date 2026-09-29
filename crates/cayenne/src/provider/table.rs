@@ -32,7 +32,9 @@ limitations under the License.
 //! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
-use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+use super::constants::{
+    LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
+};
 use super::delete::{
     CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
     DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -2714,7 +2716,29 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    index_sidecars: IndexSidecars,
     index_word_bits: Option<u32>,
+}
+
+/// Whether a table's secondary index runs persist as sidecar files, so a
+/// reopened table reads back only the files none covers. Hidden, for testing;
+/// the default comes from `SPICE_CAYENNE_INDEX_SIDECARS=enabled`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndexSidecars {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl IndexSidecars {
+    fn from_env() -> Self {
+        if std::env::var(super::lookup_index::SIDECARS_ENV).is_ok_and(|value| value == "enabled") {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
 }
 
 /// Resolves every configured lookup-index column before table creation/open.
@@ -2846,6 +2870,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    index_sidecars: IndexSidecars,
     index_word_bits: Option<u32>,
 }
 
@@ -2865,6 +2890,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
+            index_sidecars: IndexSidecars::from_env(),
             index_word_bits: None,
         }
     }
@@ -2960,6 +2986,15 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Whether the secondary index runs persist as sidecar files. Hidden, for
+    /// testing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_index_sidecars(mut self, sidecars: IndexSidecars) -> Self {
+        self.index_sidecars = sidecars;
+        self
+    }
+
     /// Hash every secondary index key to a word of only `bits` bits, so that
     /// many keys share a word and every lookup returns other keys' rows as
     /// candidates. For tests that queries still return exact results: never
@@ -2988,6 +3023,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            index_sidecars: self.index_sidecars,
             index_word_bits: self.index_word_bits,
         };
 
@@ -3021,6 +3057,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            index_sidecars: self.index_sidecars,
             index_word_bits: self.index_word_bits,
         };
 
@@ -8762,6 +8799,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
+            index_sidecars,
             index_word_bits,
         } = options;
 
@@ -9263,7 +9301,54 @@ impl CayenneTableProvider {
         // deduplicates concurrent scans on it). The first scan therefore pays one
         // build; every subsequent scan of the same state hits `latest_complete`.
 
+        if index_sidecars == IndexSidecars::Enabled {
+            provider.open_lookup_index_sidecars().await;
+        }
+
         Ok(provider)
+    }
+
+    /// Loads the secondary index runs persisted beside the table, and persists
+    /// every later change to them. Best-effort: the files no loaded run covers
+    /// are indexed as usual.
+    async fn open_lookup_index_sidecars(&self) {
+        let Some(state) = &self.lookup_index else {
+            return;
+        };
+        let Ok(url) = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            LOOKUP_INDEX_DIR_NAME,
+        )) else {
+            return;
+        };
+        let Ok(store) = self.context.runtime_env().object_store(&url) else {
+            return;
+        };
+        let live = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            match self.capture_warm_files(&snapshot_id).await {
+                Ok(files) => files
+                    .files
+                    .iter()
+                    .map(|file| file.object_meta.location.to_string())
+                    .collect(),
+                Err(error) => {
+                    tracing::debug!(table = %self.table_metadata.table_name, %error, "Secondary index sidecars were not loaded: the table's files could not be listed");
+                    return;
+                }
+            }
+        };
+        state
+            .open_sidecars(
+                store,
+                Arc::clone(&self.catalog),
+                self.table_metadata.table_id.clone(),
+                url.prefix(),
+                live,
+            )
+            .await;
     }
 
     /// Create a new table in Cayenne.

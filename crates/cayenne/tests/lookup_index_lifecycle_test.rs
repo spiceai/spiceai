@@ -34,8 +34,8 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
+use cayenne::lookup_index::{IndexSidecars, LookupIndexCounters};
+use cayenne::metadata::{CreateTableOptions, IndexRunRecord, VortexConfig};
 use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
@@ -120,7 +120,15 @@ async fn open_with(
     indexes: &[&[&str]],
     vortex_config: VortexConfig,
 ) -> Arc<CayenneTableProvider> {
-    open_configured(fixture, runtime_env, name, indexes, vortex_config).await
+    open_configured(
+        fixture,
+        runtime_env,
+        name,
+        indexes,
+        vortex_config,
+        IndexSidecars::Disabled,
+    )
+    .await
 }
 
 async fn open_configured(
@@ -129,6 +137,7 @@ async fn open_configured(
     name: &str,
     indexes: &[&[&str]],
     vortex_config: VortexConfig,
+    sidecars: IndexSidecars,
 ) -> Arc<CayenneTableProvider> {
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
     let options = CreateTableOptions {
@@ -145,6 +154,7 @@ async fn open_configured(
     Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
+            .with_index_sidecars(sidecars)
             .with_secondary_indexes(
                 indexes
                     .iter()
@@ -754,4 +764,269 @@ fn vortex_files(
             by_name.entry(name).or_default().push(path);
         }
     }
+}
+
+/// Sidecar files persisted under `dir`.
+fn sidecar_count(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|entry| entry.expect("dir entry").path())
+        .map(|path| {
+            if path.is_dir() {
+                sidecar_count(&path)
+            } else {
+                usize::from(path.extension().is_some_and(|ext| ext == "run"))
+            }
+        })
+        .sum()
+}
+
+/// The runs the metastore records as persisted for table `name`.
+async fn registered_runs(fixture: &common::TestFixture, name: &str) -> Vec<IndexRunRecord> {
+    let table_id = fixture
+        .catalog
+        .get_table(name)
+        .await
+        .expect("table metadata")
+        .table_id;
+    fixture
+        .catalog
+        .list_index_runs(&table_id)
+        .await
+        .expect("list persisted runs")
+}
+
+/// Waits until at least `runs` runs are registered and every sidecar file on
+/// disk is a registered one.
+async fn wait_for_persisted_runs(fixture: &common::TestFixture, name: &str, runs: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let registered = registered_runs(fixture, name).await.len();
+        let files = sidecar_count(&fixture.data_path);
+        if registered >= runs && files == registered {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runs were not persisted: {registered} registered, {files} sidecar files"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Every sidecar file under `dir`.
+fn sidecar_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            sidecar_files(&path, found);
+        } else if path.extension().is_some_and(|ext| ext == "run") {
+            found.push(path);
+        }
+    }
+}
+
+/// The metastore, not a directory listing, decides which sidecars a reopened
+/// table loads. A sidecar file with no registered run (a write that stopped
+/// before registering it) is deleted; a registered run whose file cannot be
+/// read, or is missing, is unregistered and its files are indexed again. The
+/// loaded index still agrees with a read-back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "registered";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexSidecars::Enabled,
+    )
+    .await;
+    overwrite(&table, rows(0, ROWS)).await;
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    insert(&table, name, rows(rows_i64, 3_000)).await;
+    insert(&table, name, rows(rows_i64 * 2, 3_000)).await;
+    wait_for_persisted_runs(&fixture, name, 3).await;
+    drop(table);
+
+    let registered = registered_runs(&fixture, name).await;
+    let mut files = Vec::new();
+    sidecar_files(&fixture.data_path, &mut files);
+    let file_of = |record: &IndexRunRecord| {
+        files
+            .iter()
+            .find(|path| {
+                path.file_name().is_some_and(|n| *n == *record.run_name)
+                    && path
+                        .parent()
+                        .and_then(|dir| dir.file_name())
+                        .is_some_and(|n| *n == *record.index_key)
+            })
+            .cloned()
+            .expect("every registered run has its file")
+    };
+    // A registered run whose file is corrupt.
+    let corrupt = registered[0].clone();
+    let corrupt_file = file_of(&corrupt);
+    std::fs::write(&corrupt_file, b"not a run").expect("corrupt a sidecar");
+    // A sidecar file no run is registered for.
+    let orphan_file = corrupt_file.with_file_name("00000000deadbeef.run");
+    std::fs::copy(file_of(&registered[1]), &orphan_file).expect("write an orphan sidecar");
+    // A registered run with no file.
+    let phantom = IndexRunRecord {
+        run_name: "00000000feedface.run".to_string(),
+        ..registered[1].clone()
+    };
+    fixture
+        .catalog
+        .register_index_run(&phantom)
+        .await
+        .expect("register a run with no file");
+
+    let reopened = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexSidecars::Enabled,
+    )
+    .await;
+    let after: Vec<String> = registered_runs(&fixture, name)
+        .await
+        .into_iter()
+        .map(|record| record.run_name)
+        .collect();
+    assert!(
+        !orphan_file.exists(),
+        "a sidecar file with no registered run must be deleted at open"
+    );
+    assert!(
+        !after.contains(&corrupt.run_name) && !corrupt_file.exists(),
+        "a registered run that cannot be read must be unregistered and deleted: {after:?}"
+    );
+    assert!(
+        !after.contains(&phantom.run_name),
+        "a registered run with no file must be unregistered: {after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        registered.len() - 1,
+        "the readable runs stay registered: {after:?}"
+    );
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after reopening with a corrupt, an orphan and a phantom sidecar: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    assert!(
+        verification.uncovered_files > 0,
+        "the corrupt run's files are no longer covered by a loaded run: {verification:?}"
+    );
+    let ids = [3, rows_i64 + 5, rows_i64 * 2 + 7];
+    assert_eq!(dynamic_lookup(&reopened, name, &ids).await, ids);
+}
+
+/// With sidecars, a reopened table loads its index runs instead of reading
+/// its files back: on reopen every file is covered before any build runs, and
+/// the loaded runs agree row for row with a read-back. Without them the same
+/// reopen starts uncovered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopened_table_loads_its_runs_from_sidecars() {
+    const ROWS: usize = 20_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "sidecars";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexSidecars::Enabled,
+    )
+    .await;
+    overwrite(&table, rows(0, ROWS)).await;
+    let rows_i64 = i64::try_from(ROWS).expect("fits");
+    insert(&table, name, rows(rows_i64, 3_000)).await;
+    insert(&table, name, rows(rows_i64 * 2, 3_000)).await;
+    // One run per write, each persisted in the background.
+    wait_for_persisted_runs(&fixture, name, 3).await;
+    drop(table);
+
+    let reopened = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexSidecars::Enabled,
+    )
+    .await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after reopening with sidecars: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(
+        (
+            verification.uncovered_files,
+            counters(&reopened).builds_started
+        ),
+        (0, 0),
+        "a reopened table must be covered by its sidecars, not by a build: {verification:?}"
+    );
+    let before = counters(&reopened);
+    lookup(&reopened, name, rows_i64 * 2 + 7).await;
+    let after = counters(&reopened);
+    assert_eq!(
+        (
+            after.selected - before.selected,
+            after.unbuilt - before.unbuilt
+        ),
+        (1, 0),
+        "the first lookup after reopening did not use the loaded index: {after:?}"
+    );
+    drop(reopened);
+
+    let without = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        config(),
+        IndexSidecars::Disabled,
+    )
+    .await;
+    let verification = without
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(
+        verification.files == 0 && verification.uncovered_files > 0,
+        "without sidecars a reopened table starts uncovered: {verification:?}"
+    );
 }

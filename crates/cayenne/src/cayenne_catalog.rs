@@ -18,9 +18,9 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
-    InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics, TableStorageStats,
+    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, IndexRunRecord, InlinedData,
+    InlinedDataStats, InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile,
+    SnapshotFileStatistics, TableMetadata, TableStatistics, TableStorageStats,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
@@ -4185,6 +4185,67 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_pk_index WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_index_run \
+                      (table_id, index_key, run_name, row_count, size_bytes) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
+                params: vec![
+                    MetastoreValue::Text(run.table_id.clone()),
+                    MetastoreValue::Text(run.index_key.clone()),
+                    MetastoreValue::Text(run.run_name.clone()),
+                    MetastoreValue::Integer(i64::try_from(run.row_count).unwrap_or(i64::MAX)),
+                    MetastoreValue::Integer(i64::try_from(run.size_bytes).unwrap_or(i64::MAX)),
+                ],
+            })
+            .await
+    }
+
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
+        let owner = table_id.to_string();
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT index_key, run_name, row_count, size_bytes
+                    FROM cayenne_index_run
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                move |row| {
+                    Ok(IndexRunRecord {
+                        table_id: owner.clone(),
+                        index_key: row.get_string(0)?,
+                        run_name: row.get_string(1)?,
+                        row_count: u64::try_from(row.get_i64(2)?).unwrap_or(0),
+                        size_bytes: u64::try_from(row.get_i64(3)?).unwrap_or(0),
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_index_run \
+                      WHERE table_id = ?1 AND index_key = ?2 AND run_name = ?3",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(index_key.to_string()),
+                    MetastoreValue::Text(run_name.to_string()),
+                ],
             })
             .await
     }
