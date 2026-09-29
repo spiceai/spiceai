@@ -3783,12 +3783,6 @@ impl DataAccelerator for CayenneAccelerator {
             let refresh_mode = resolved_refresh_mode(source, acceleration);
 
             let bootstrap_allowed = snapshot_bootstrap_allowed(acceleration, source, refresh_mode);
-            // Whether local data exists is decided per dataset, from the metastore opened
-            // below: `metadata_dir` is shared by every Cayenne dataset in this runtime, and
-            // datasets initialize concurrently, so its existence says only that *some*
-            // dataset opened the metastore. The directory is read here, before that open
-            // creates it, only as the fallback for a metastore that cannot be opened.
-            let metadata_dir_existed = metadata_dir.exists();
 
             // Build a CayenneSnapshotEngine so the snapshot tar uses the
             // per-dataset metastore-slice format (no raw cayenne.db file)
@@ -3799,41 +3793,34 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str)
                 .to_string();
-            // The catalog is opened unconditionally: normal operation needs it
-            // regardless of the snapshot decision.
+            // Normal operation needs the metastore whatever the snapshot decision, so a
+            // metastore that cannot be opened fails the dataset here. Restoring through
+            // the default snapshot engine instead would unpack a raw archive into
+            // `metadata_dir`, which every other Cayenne dataset in this runtime shares.
             let catalog = self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-                .await;
+                .await
+                .boxed()?;
+            // Whether local data exists is decided per dataset, from the metastore:
+            // `metadata_dir` is shared by every Cayenne dataset in this runtime, and
+            // datasets initialize concurrently, so its existence says only that *some*
+            // dataset opened the metastore.
             let should_bootstrap = bootstrap_allowed
-                && match &catalog {
-                    Ok(catalog) => {
-                        !Self::dataset_in_metastore(catalog.as_ref(), &source.name().to_string())
-                            .await?
-                    }
-                    Err(_) => !metadata_dir_existed,
-                };
+                && !Self::dataset_in_metastore(catalog.as_ref(), &source.name().to_string())
+                    .await?;
             if bootstrap_allowed && !should_bootstrap {
                 tracing::info!(
-                    "Dataset {} already has local data in the Cayenne metastore at {}, skipping snapshot bootstrap",
+                    "Dataset '{}' already has local Cayenne data in '{}', so it starts from that data instead of bootstrapping from a snapshot",
                     source.name(),
                     metadata_dir.display()
                 );
             }
-            let snapshot_engine = match catalog {
-                Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
-                    catalog,
-                    source.name().to_string(),
-                    path_buf.clone(),
-                ))
-                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
-                         falling back to default engine: {err}"
-                    );
-                    None
-                }
-            };
+            let snapshot_engine = Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
+                catalog,
+                source.name().to_string(),
+                path_buf.clone(),
+            ))
+                as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>;
 
             if !should_bootstrap {
                 return Ok(BootstrapStatus::none());
@@ -3844,7 +3831,7 @@ impl DataAccelerator for CayenneAccelerator {
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
-                snapshot_engine,
+                Some(snapshot_engine),
             )
             .await)
         } else {
@@ -5330,10 +5317,6 @@ mod tests {
             .expect("the engine must still build from its own configuration");
     }
 
-    /// The write profile is the engine's answer about its *own* acceleration, so an
-    /// acceleration naming another engine must get `None` rather than a Cayenne
-    /// classification. The runtime filters by engine before asking, so only this test
-    /// stands between a second consumer and a silently wrong budget.
     /// Two Cayenne datasets in one runtime share one metastore directory: datasets with
     /// different `cayenne_file_path`s are required to share `cayenne_metadata_dir`, and
     /// without it both resolve to the default one. Datasets initialize concurrently, so
@@ -5422,6 +5405,10 @@ mod tests {
         );
     }
 
+    /// The write profile is the engine's answer about its *own* acceleration, so an
+    /// acceleration naming another engine must get `None` rather than a Cayenne
+    /// classification. The runtime filters by engine before asking, so only this test
+    /// stands between a second consumer and a silently wrong budget.
     #[test]
     fn the_write_profile_is_answered_only_for_a_cayenne_acceleration() {
         let accelerator = CayenneAccelerator::new();
