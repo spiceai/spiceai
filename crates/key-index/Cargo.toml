@@ -30,3 +30,11 @@ workspace = true
 # Opts this crate into `cargo verus focus`.
 [package.metadata.verus]
 verify = true
+
+[[bench]]
+harness = false
+name = "in_list"
+
+[[bench]]
+harness = false
+name = "run_finish"
