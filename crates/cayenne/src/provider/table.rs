@@ -37608,7 +37608,13 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                     // this, on a delete-heavy table the bake wins every tick, the
                     // size-tier leveler never runs, and protected snapshots (full-copy
                     // data files) accumulate on disk (the footprint regression).
-                    Ok(true) => baked = true,
+                    Ok(true) => {
+                        baked = true;
+                        // What this bake could not prune tells the adaptive
+                        // controller whether the trigger is within its reach.
+                        self.context
+                            .record_bake_residual(self.pk_deletion_snapshot().delete_len());
+                    }
                     Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
                     Err(e) => return Err(e.to_string()),
                 }
@@ -68506,7 +68512,10 @@ mod tests {
                         .cloned()
                 };
                 assert!(
-                    matches!(location_of(flushed_digest), Some(RowLocation::FileUnlocated)),
+                    matches!(
+                        location_of(flushed_digest),
+                        Some(RowLocation::FileUnlocated)
+                    ),
                     "id=7 was committed inline before the flush moved it into a file: an \
                      `Inlined` entry would supersede only the inline copy and leave the file \
                      copy live"

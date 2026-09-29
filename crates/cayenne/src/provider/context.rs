@@ -854,6 +854,12 @@ impl CayenneContext {
         self.ingest_stats.record_publish_latency(d);
     }
 
+    /// Record the live deletion-index size a committed seq-prefix bake left
+    /// behind, for the adaptive controller's futile-bake backoff.
+    pub(crate) fn record_bake_residual(&self, deletion_index_len: usize) {
+        self.ingest_stats.record_bake_residual(deletion_index_len);
+    }
+
     /// Current memory pressure (`used / budget`), or `None` when unsampled. A
     /// single relaxed atomic load — for hot paths (e.g. the checkpoint tick's
     /// critical-pressure check) that need only this one signal, not the full

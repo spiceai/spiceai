@@ -1046,6 +1046,9 @@ pub(crate) struct IngestStats {
     /// Current small-file count in the snapshot (read amplification), set by the
     /// compaction/scan path. Defaults to 0 (healthy) until first observed.
     read_amp: AtomicUsize,
+    /// Live deletion-index size (tombstone count) the most recent committed
+    /// seq-prefix bake left behind; `usize::MAX` until the first bake.
+    bake_residual: AtomicUsize,
     /// Memory usage as a fraction of the cgroup-aware budget, stored ×1000.
     /// `u64::MAX` is the sentinel for "unknown" (no budget/sample yet).
     mem_pressure_milli: AtomicU64,
@@ -1075,6 +1078,7 @@ impl IngestStats {
             total_bytes: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             read_amp: AtomicUsize::new(0),
+            bake_residual: AtomicUsize::new(usize::MAX),
             mem_pressure_milli: AtomicU64::new(u64::MAX),
             newest_source_commit_ts_ms: AtomicI64::new(i64::MIN),
             last_visible_ts_ms: AtomicI64::new(i64::MIN),
@@ -1123,6 +1127,14 @@ impl IngestStats {
     /// compaction/scan path.
     pub fn set_read_amp(&self, small_files: usize) {
         self.read_amp.store(small_files, Ordering::Relaxed);
+    }
+
+    /// Record the live deletion-index size a committed seq-prefix bake left
+    /// behind. A bake prunes only tombstones at or below its prefix cutoff, so
+    /// this residual is the part of the index it could not remove.
+    pub fn record_bake_residual(&self, deletion_index_len: usize) {
+        self.bake_residual
+            .store(deletion_index_len.min(usize::MAX - 1), Ordering::Relaxed);
     }
 
     /// Update the current memory usage as a fraction of the cgroup-aware budget
@@ -1279,6 +1291,10 @@ impl IngestStats {
             arrival_gap_ms,
             apply_vs_arrival,
             read_amp: self.read_amp.load(Ordering::Relaxed),
+            bake_residual: match self.bake_residual.load(Ordering::Relaxed) {
+                usize::MAX => None,
+                residual => Some(residual),
+            },
             mem_pressure,
             delete_fraction,
             arrival_cv,
@@ -1323,6 +1339,9 @@ pub(crate) struct IngestSnapshot {
     /// Small-file count (read amplification): the ingest→query coupling signal —
     /// high means ingest is producing files that slow scans.
     pub read_amp: usize,
+    /// Live deletion-index size the most recent committed seq-prefix bake left
+    /// behind, or `None` before the first bake (see `bake_is_futile`).
+    pub bake_residual: Option<usize>,
     /// Memory usage as a fraction of the cgroup-aware budget (`used / budget`);
     /// `None` when no budget/sample is available. `> 1.0` means over budget.
     pub mem_pressure: Option<f64>,
@@ -2704,6 +2723,26 @@ pub(crate) fn decide_with_goals(
         });
     }
 
+    // (3c) Futile-bake backoff: the last bake could not bring the deletion index
+    // under the trigger (see `bake_is_futile`), so every tick re-bakes the whole
+    // protected prefix to retire only the tombstones that arrived since. Raise the
+    // trigger above the residual. Only reached with read-amp not high (the
+    // unhealthy block above returns first), so it never fights the read-amp arm
+    // that lowers the trigger for query health.
+    if bake_is_futile(s, cur.bake_deletion_index_trigger)
+        && let Some(v) = clamp_move_usize(
+            cur.bake_deletion_index_trigger,
+            futile_bake_trigger(s, cur.bake_deletion_index_trigger),
+            b.bake_deletion_index_trigger,
+        )
+    {
+        return Some(Adjustment {
+            actuator: Actuator::BakeDeletionIndexTrigger,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "futile bake: the last bake left the deletion index above the trigger → raise it over the residual → stop re-baking the prefix every tick",
+        });
+    }
+
     // (4) Healthy on every axis (ingest caught up, queries not read-amp-bound,
     // memory comfortable) → relax the actuators that cost queries/CPU back toward
     // their efficient defaults, one per tick in priority order: shed a write shard
@@ -3183,6 +3222,26 @@ fn decide_goal(
         });
     }
 
+    // (3c) Futile-bake backoff: the last bake could not bring the deletion index
+    // under the trigger (see `bake_is_futile`), so every tick re-bakes the whole
+    // protected prefix to retire only the tombstones that arrived since. Raise the
+    // trigger above the residual. Withheld while a query goal is violated so it
+    // never fights the query tier's LOWER move above (queries win).
+    if !query_violated
+        && bake_is_futile(s, cur.bake_deletion_index_trigger)
+        && let Some(v) = clamp_move_usize(
+            cur.bake_deletion_index_trigger,
+            futile_bake_trigger(s, cur.bake_deletion_index_trigger),
+            b.bake_deletion_index_trigger,
+        )
+    {
+        return Some(Adjustment {
+            actuator: Actuator::BakeDeletionIndexTrigger,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "futile bake: the last bake left the deletion index above the trigger → raise it over the residual → stop re-baking the prefix every tick",
+        });
+    }
+
     // (4) Healthy-relax: every active goal comfortably met, memory ok, AND the
     // legacy healthy predicate — apply well under the offered-load interval and
     // read-amp low. A goal being comfortably met is necessary but not sufficient
@@ -3571,6 +3630,38 @@ fn clamp_move_usize(cur: usize, target: usize, (lo, hi): (usize, usize)) -> Opti
     (v != cur).then_some(v)
 }
 
+/// How far above the residual a futile bake moves the seq-prefix bake trigger:
+/// the next bake then fires once the index has grown by about three residuals,
+/// so each prefix rewrite retires most of the index instead of a sliver.
+/// Measured on CH-benCH SF-100 (`MySQL`, 3 000 txn/s): with no bake at all the
+/// tables' indexes grew linearly (`order_line` 3.4 M tombstones after 300 s) while
+/// query throughput rose 23 %, so a larger index costs the merge-on-read probe
+/// far less than the bake's prefix rewrites cost the whole process.
+const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
+
+/// Whether the seq-prefix bake is futile at `trigger`: the most recent bake could
+/// not bring the live deletion index under `trigger`.
+///
+/// A bake prunes only tombstones at or below its prefix cutoff — the newest
+/// protected snapshots and the in-memory tier stay out of reach — and it rewrites
+/// the whole protected prefix to do so. When that residual is at or above the
+/// trigger, the next compaction tick bakes again, re-encoding the full prefix to
+/// retire only the tombstones that arrived since: CH-benCH at SF-100 held
+/// `order_line` at ~430 K tombstones against a 50 K trigger while rewriting
+/// ~0.5 GB every ~12 s, and `stock` ~1.2 GB. A bake that got the index under
+/// the trigger is doing its job, however large its residual, so the trigger only
+/// moves once per genuine shortfall and cannot ratchet toward its ceiling.
+fn bake_is_futile(s: &IngestSnapshot, trigger: usize) -> bool {
+    s.bake_residual.is_some_and(|residual| residual >= trigger)
+}
+
+/// The trigger a futile bake moves to: `BAKE_TRIGGER_RESIDUAL_HEADROOM` × the
+/// residual, and at least one ordinary grow step.
+fn futile_bake_trigger(s: &IngestSnapshot, trigger: usize) -> usize {
+    let residual = s.bake_residual.unwrap_or(0);
+    grow_usize(trigger).max(residual.saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM))
+}
+
 fn clamp_move_i64(cur: i64, target: i64, (lo, hi): (i64, i64)) -> Option<i64> {
     let v = target.clamp(lo, hi);
     (v != cur).then_some(v)
@@ -3681,6 +3772,7 @@ mod tests {
             arrival_gap_ms: 100.0,
             apply_vs_arrival: 0.2,
             read_amp: 1,
+            bake_residual: None,
             mem_pressure: None,
             delete_fraction: 0.0,
             arrival_cv: 0.0,
@@ -4745,6 +4837,155 @@ mod tests {
 
     fn lag_goal(target_secs: f64) -> Goals {
         Goals::from_targets(Some(target_secs), None, None, None, Duration::from_mins(1))
+    }
+
+    // ---- futile-bake backoff ----------------------------------------------
+
+    /// The deletion index CH-benCH SF-100 held on `order_line` after each bake
+    /// against the 50 K default trigger.
+    const FUTILE_BAKE_RESIDUAL: usize = 430_000;
+
+    fn query_latency_goal_ms(target_ms: f64) -> Goals {
+        Goals::from_targets(None, None, Some(target_ms), None, Duration::from_mins(1))
+    }
+
+    fn raised_bake_trigger(adj: Option<Adjustment>) -> Option<u64> {
+        adj.filter(|a| a.actuator == Actuator::BakeDeletionIndexTrigger)
+            .map(|a| a.new_value)
+    }
+
+    #[test]
+    fn bake_residual_is_unknown_until_a_bake_records_it() {
+        let stats = IngestStats::new();
+        assert_eq!(stats.snapshot().bake_residual, None);
+        stats.record_bake_residual(FUTILE_BAKE_RESIDUAL);
+        assert_eq!(stats.snapshot().bake_residual, Some(FUTILE_BAKE_RESIDUAL));
+        stats.record_bake_residual(0);
+        assert_eq!(stats.snapshot().bake_residual, Some(0));
+    }
+
+    #[test]
+    fn futile_bake_raises_the_trigger_over_the_residual() {
+        let s = IngestSnapshot {
+            bake_residual: Some(FUTILE_BAKE_RESIDUAL),
+            ..snap()
+        };
+        let expected = u64::try_from(FUTILE_BAKE_RESIDUAL * BAKE_TRIGGER_RESIDUAL_HEADROOM)
+            .expect("fits in u64");
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&s, &actuators(), &bounds())),
+            Some(expected),
+            "a bake that left the index at 430 K against a 50 K trigger must raise the \
+             trigger to the residual times the headroom"
+        );
+        // Goal mode, every goal met: the same move.
+        let met = IngestSnapshot {
+            query_latency_p99_ms: Some(10.0),
+            ..s
+        };
+        assert_eq!(
+            raised_bake_trigger(goal_decide(
+                &met,
+                &actuators(),
+                &bounds(),
+                &query_latency_goal_ms(10_000.0)
+            )),
+            Some(expected),
+            "goal mode must raise a futile trigger when no query goal is violated"
+        );
+    }
+
+    #[test]
+    fn futile_bake_trigger_is_clamped_to_the_ceiling() {
+        let ceiling = bounds().bake_deletion_index_trigger.1;
+        let s = IngestSnapshot {
+            bake_residual: Some(ceiling),
+            ..snap()
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&s, &actuators(), &bounds())),
+            Some(u64::try_from(ceiling).expect("fits in u64")),
+        );
+        // Already at the ceiling: nothing left to move.
+        let at_ceiling = ActuatorValues {
+            bake_deletion_index_trigger: ceiling,
+            ..actuators()
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&s, &at_ceiling, &bounds())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bake_that_got_the_index_under_the_trigger_leaves_it_alone() {
+        // Well under the trigger.
+        let s = IngestSnapshot {
+            bake_residual: Some(10_000),
+            ..snap()
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&s, &actuators(), &bounds())),
+            None
+        );
+        // After a raise the index grows to the new trigger and the next bake
+        // leaves more behind the larger the index was (CH-benCH SF-100: a bake at
+        // ~1 M left 575 K). It still got under the trigger, so raising again would
+        // only walk the trigger toward its ceiling.
+        let after_raise = IngestSnapshot {
+            bake_residual: Some(575_000),
+            ..snap()
+        };
+        let raised = ActuatorValues {
+            bake_deletion_index_trigger: 995_856,
+            ..actuators()
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&after_raise, &raised, &bounds())),
+            None
+        );
+        // And a table that has not baked yet carries no signal at all.
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&snap(), &actuators(), &bounds())),
+            None
+        );
+    }
+
+    #[test]
+    fn futile_bake_backoff_never_raises_against_high_read_amp() {
+        let s = IngestSnapshot {
+            bake_residual: Some(FUTILE_BAKE_RESIDUAL),
+            read_amp: READ_AMP_HIGH + 1,
+            ..snap()
+        };
+        let cur = actuators();
+        if let Some(v) = raised_bake_trigger(decide_fresh(&s, &cur, &bounds())) {
+            assert!(
+                v < u64::try_from(cur.bake_deletion_index_trigger).expect("fits in u64"),
+                "with read-amp high the trigger may only be lowered, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn futile_bake_backoff_yields_to_a_violated_query_goal() {
+        let s = IngestSnapshot {
+            bake_residual: Some(FUTILE_BAKE_RESIDUAL),
+            query_latency_p99_ms: Some(60_000.0),
+            ..snap()
+        };
+        let cur = actuators();
+        if let Some(v) = raised_bake_trigger(goal_decide(
+            &s,
+            &cur,
+            &bounds(),
+            &query_latency_goal_ms(100.0),
+        )) {
+            assert!(
+                v < u64::try_from(cur.bake_deletion_index_trigger).expect("fits in u64"),
+                "a violated query goal may only lower the bake trigger, got {v}"
+            );
+        }
     }
 
     #[test]
