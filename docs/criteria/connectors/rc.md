@@ -13,8 +13,8 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Clickhouse                       | ➖          |              |
 | Cosmos DB (NoSQL)                | ✅          | @lukekim     |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖          |              |
-| Databricks (mode: sql_warehouse) | ➖          |              |
+| Databricks (mode: spark_connect) | ✅          | @lukekim     |
+| Databricks (mode: sql_warehouse) | ✅          | @lukekim     |
 | Debezium                         | ➖          |              |
 | Delta Lake                       | ✅          | @Sevenannn   |
 | Dremio                           | ✅          | @Sevenannn   |
@@ -22,24 +22,24 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | DuckLake                         | ➖          |              |
 | DynamoDB                         | ✅          | @krinart     |
 | File                             | ✅          | @Sevenannn   |
-| FlightSQL                        | ➖          |              |
+| FlightSQL                        | ✅          | @lukekim     |
 | FTP/SFTP                         | ➖          |              |
 | GCS                              | ➖          |              |
 | Git                              | ✅          | @lukekim     |
 | GitHub                           | ✅          | @peasee      |
-| Glue                             | ➖          |              |
+| Glue                             | ✅          | @lukekim     |
 | GraphQL                          | ✅          | @peasee      |
-| HTTP/HTTPS                       | ➖          |              |
+| HTTP/HTTPS                       | ✅          | @lukekim     |
 | Iceberg                          | ✅          | @phillipleblanc |
 | IMAP                             | ➖          |              |
 | Kafka                            | ➖          |              |
-| Localpod                         | ➖          |              |
-| MongoDB                          | ➖          |              |
+| Localpod                         | ✅          | @lukekim     |
+| MongoDB                          | ✅          | @lukekim     |
 | MS SQL                           | ➖          |              |
 | MySQL                            | ✅          | @peasee      |
 | NFS                              | ➖          |              |
 | ODBC                             | ➖          |              |
-| Oracle                           | ➖          |              |
+| Oracle                           | ✅          | @lukekim     |
 | PostgreSQL                       | ✅          | @Sevenannn   |
 | S3                               | ✅          | @Sevenannn   |
 | ScyllaDB                         | ➖          |              |
