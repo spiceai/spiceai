@@ -851,6 +851,7 @@ impl RuntimeBuilder {
             dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
+            dataset_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
         };
 
