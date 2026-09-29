@@ -68524,6 +68524,76 @@ mod tests {
         }
     }
 
+    /// The per-shard index is a Bloom once the keyset outgrows its budget (the
+    /// form every large CH-benCH table runs in at SF-1000, where each discard of
+    /// it was reported as `kind=bloom, reason=invalidated`). A Bloom carries no
+    /// row locations, so an inline flush during its checkout has nothing to
+    /// relabel and must not cost the index: the restore keeps it and replays the
+    /// keys committed while it was out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inline_flush_during_a_sharded_checkout_keeps_a_bloom_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
+            &ctx,
+            "pk_sharded_checkout_inline_flush_bloom",
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Bloom(_))
+            ),
+            "precondition: the over-budget per-shard index is a Bloom"
+        );
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard Bloom is checked out");
+
+        // A key committed inline while the index is out, then the checkpoint's
+        // inline flush, then the restore.
+        let committed = pk_digest_set_for_ids(&converter, &[1_000_000]);
+        let committed_key: Vec<u8> = {
+            let (_, key) = committed
+                .iter_with_digest()
+                .next()
+                .expect("one committed key");
+            let bytes: &[u8] = key.as_ref();
+            bytes.to_vec()
+        };
+        provider.record_pk_keys_with_location(&committed, &RowLocation::Inlined, 1_000_001);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Bloom(blooms)) => {
+                let shard = crate::provider::pk_index::shard_of_pk(&committed_key, blooms.len());
+                assert!(
+                    blooms[shard].maybe_contains(&committed_key),
+                    "the restore must replay the key committed during the checkout"
+                );
+            }
+            other => panic!(
+                "the per-shard Bloom must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next apply), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
     /// A checked-out index that is never restored must not blind the checkout
     /// mechanism for the rest of the process — regression test for #13267.
     ///
