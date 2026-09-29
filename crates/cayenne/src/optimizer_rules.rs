@@ -497,24 +497,19 @@ fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<MaintainedAggregateSource<'_>> {
     if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
-        // Soundness guard — mirrors `CayenneStatsAggregateRewriter::optimize`,
-        // which declines when `scan.has_pushed_filter()`. A maintained aggregate
-        // view answers the *unfiltered* relation, but the physical `FilterPushdown`
-        // pass can push a query's `WHERE` ONTO the scan and REMOVE the `FilterExec`
-        // above it (the inner Vortex source accepts the predicate; see
-        // `CayenneAccelerationExec::handle_child_pushdown_result`). Reaching the bare
-        // scan with a pushed filter therefore means the scan returns a row *subset*
-        // the whole-relation view cannot answer — serving it would silently drop the
-        // predicate and return wrong results. Decline so the real scan+aggregate runs.
-        // (A *surviving* `FilterExec` is still captured by the `FilterExec` branch
-        // below and matched against a filtered view, so filtered views are unaffected.)
-        //
-        // DEEP walk: on a merge-on-read table with pending tombstones the scan is
-        // wrapped in a deletion-filter exec and the predicate is pushed onto the file
-        // source BELOW it, which the shallow `has_pushed_filter` (identity-preserving
-        // whitelist) would miss — leaving the bug open on exactly the delete-heavy CDC
-        // tables this view targets.
-        if cayenne_scan.has_pushed_filter_deep() {
+        // Soundness guard. A maintained view answers the whole table, but reaching
+        // the bare scan says nothing about whether the query still reads the whole
+        // table: physical `FilterPushdown` can move a `WHERE` into the scan (onto a
+        // Vortex source, or into a `FilterExec` on a branch that cannot evaluate it)
+        // and remove the `FilterExec` above, and a subquery `LIMIT` becomes a fetch
+        // inside the scan. Serving the view for such a scan returns whole-table
+        // totals for a subset. Decline unless the scan's subtree provably passes
+        // every live row through, so the real scan and aggregate run. (A `FilterExec`
+        // that survives above the scan is captured by the branch below and matched
+        // against a filtered view.) The view also describes the stored values, so a
+        // projection pushed into the scan that computes a column under a table
+        // column's name declines it too.
+        if !cayenne_scan.scans_whole_relation() || !cayenne_scan.outputs_table_columns() {
             return None;
         }
         return cayenne_scan
@@ -701,14 +696,24 @@ fn filter_additions_for_join(
 
     let mut pair_columns: HashMap<(usize, usize), BTreeSet<String>> = HashMap::new();
     for (left_key, right_key) in hash_join.on() {
-        let Some(left_column) = physical_column_name(left_key) else {
+        let Some(left_key) = left_key.downcast_ref::<Column>() else {
             continue;
         };
-        let Some(right_column) = physical_column_name(right_key) else {
+        let Some(right_key) = right_key.downcast_ref::<Column>() else {
             continue;
         };
 
-        if left_column != right_column {
+        // A dynamic filter on one scan constrains the other only if each join key
+        // carries that scan column's values. A key with the right name can hold
+        // anything else (`t.c + 1 AS c`, or a `UNION` of two tables), so resolve
+        // each key to the scan column it actually reads.
+        let (Some((left_identity, scan_column)), Some((right_identity, right_scan_column))) = (
+            scan_column_lineage(hash_join.left(), left_key.index()),
+            scan_column_lineage(hash_join.right(), right_key.index()),
+        ) else {
+            continue;
+        };
+        if left_identity != right_identity || scan_column != right_scan_column {
             continue;
         }
 
@@ -716,20 +721,22 @@ fn filter_additions_for_join(
             &left_scans,
             &right_scans,
             &right_scans_by_identity,
-            left_column,
-            right_column,
+            &scan_column,
+            &scan_column,
         );
         let [(left_index, right_index)] = matching_pairs.as_slice() else {
             continue;
         };
-        if left_scans[*left_index].schema_fields != right_scans[*right_index].schema_fields {
+        if left_scans[*left_index].identity != left_identity
+            || left_scans[*left_index].schema_fields != right_scans[*right_index].schema_fields
+        {
             continue;
         }
 
         pair_columns
             .entry((*left_index, *right_index))
             .or_default()
-            .insert(left_column.to_string());
+            .insert(scan_column);
     }
 
     let mut left_additions = Vec::new();
@@ -792,6 +799,15 @@ fn try_rewrite_oversized_join(
 
     // Sorted-merge inputs rely on the default null-comparison semantics.
     if hash_join.null_equality() != NullEquality::NullEqualsNothing {
+        return Ok(None);
+    }
+
+    // `x NOT IN (subquery)` plans as a null-aware anti join: a NULL among the
+    // subquery's values leaves no row selected, and a NULL `x` is never selected.
+    // `SortMergeJoinExec` has no null-aware mode, so the rewrite would answer as
+    // the plain anti join `NOT EXISTS` plans and keep both kinds of row. This is
+    // the same rule DataFusion's planner applies when it picks a join.
+    if hash_join.null_aware {
         return Ok(None);
     }
 
@@ -1164,7 +1180,7 @@ fn rewrite_partitioned_hash_join_to_collect_left(
             .map(|indices| indices.to_vec()),
         PartitionMode::CollectLeft,
         hash_join.null_equality(),
-        false,
+        hash_join.null_aware,
     )?;
     Ok(Some(Arc::new(join)))
 }
@@ -1707,6 +1723,112 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
     }
 }
 
+/// The Cayenne scan and the column of it that produce output column `index` of
+/// `plan`, found by following the column down through operators that pass it
+/// through with its values unchanged: a projection of a bare column, a filter, a
+/// group-by key, either input of a hash join, a schema cast that keeps the
+/// column's type, and the order-, partitioning- and batching-only operators. Any
+/// other operator ends the walk with `None`: a computed column (above the scan or
+/// pushed into it), a `UNION` (its values come from several inputs), or an
+/// operator not listed here. Filters and joins below the column only remove rows,
+/// which does not change where the surviving values come from.
+///
+/// A limit ends the walk too. The walk proves which values a column holds, and a
+/// filter shared into the scan below a limit changes which rows the limit keeps:
+/// `ORDER BY c DESC LIMIT 1` over a scan filtered to `c = 1` returns 1, not the
+/// largest `c`.
+#[expect(deprecated)]
+fn scan_column_lineage(
+    plan: &Arc<dyn ExecutionPlan>,
+    index: usize,
+) -> Option<(Arc<ScanIdentity>, String)> {
+    if plan.fetch().is_some() {
+        return None;
+    }
+    if let Some(cayenne) = plan.downcast_ref::<CayenneAccelerationExec>() {
+        if !cayenne.outputs_table_columns() {
+            return None;
+        }
+        let identity = cayenne.scan_identity()?;
+        let name = cayenne.schema().fields().get(index)?.name().clone();
+        return Some((identity, name));
+    }
+    if let Some(cast) = plan.downcast_ref::<SchemaCastScanExec>() {
+        let input_index = cast.input_column(index)?;
+        let children = plan.children();
+        let [input] = children.as_slice() else {
+            return None;
+        };
+        return scan_column_lineage(input, input_index);
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let column = projection
+            .expr()
+            .get(index)?
+            .expr
+            .downcast_ref::<Column>()?;
+        return scan_column_lineage(projection.input(), column.index());
+    }
+    if let Some(filter) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
+        let input_index = match filter.projection() {
+            Some(projection) => *projection.get(index)?,
+            None => index,
+        };
+        return scan_column_lineage(filter.input(), input_index);
+    }
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        // A group limit keeps the first groups it sees, which is a limit too.
+        if aggregate.limit_options().is_some() {
+            return None;
+        }
+        let (group_key, _) = aggregate.group_expr().expr().get(index)?;
+        let column = group_key.downcast_ref::<Column>()?;
+        return scan_column_lineage(aggregate.input(), column.index());
+    }
+    if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() {
+        let joined_index = match &hash_join.projection {
+            Some(projection) => *projection.get(index)?,
+            None => index,
+        };
+        let left_width = hash_join.left().schema().fields().len();
+        return match hash_join.join_type() {
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
+                if joined_index < left_width {
+                    scan_column_lineage(hash_join.left(), joined_index)
+                } else {
+                    scan_column_lineage(hash_join.right(), joined_index - left_width)
+                }
+            }
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+                scan_column_lineage(hash_join.left(), joined_index)
+            }
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
+                scan_column_lineage(hash_join.right(), joined_index)
+            }
+        };
+    }
+
+    let passes_columns_through = plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<datafusion_physical_plan::sorts::sort::SortExec>()
+        || plan
+            .is::<datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>(
+            )
+        || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
+        || plan.is::<BytesProcessedExec>()
+        || plan.is::<Int64PkDeletionFilterExec>()
+        || plan.is::<KeyBasedDeletionFilterExec>();
+    if !passes_columns_through {
+        return None;
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return None;
+    };
+    scan_column_lineage(child, index)
+}
+
 fn physical_column_name(expr: &Arc<dyn PhysicalExpr>) -> Option<&str> {
     expr.downcast_ref::<Column>().map(Column::name)
 }
@@ -2153,7 +2275,7 @@ mod tests {
     /// O(groups) maintained state, not an O(rows) re-scan. Pairs with the
     /// module's value-correctness tests (`maintains_min_max_with_retraction`), so
     /// together they prove the served path is both selected AND correct. MIN/MAX
-    /// inherits the P0-1 `has_pushed_filter_deep` guard from the shared,
+    /// inherits the whole-relation guard (`scans_whole_relation`) from the shared,
     /// function-agnostic `maintained_aggregate_source`.
     #[test]
     fn maintained_aggregate_rewriter_serves_min_max_group_by() -> DFResult<()> {
@@ -5165,6 +5287,84 @@ mod tests {
             assert!(
                 child.is::<SortMergeJoinExec>(),
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
+            );
+        }
+    }
+
+    /// Output column `index` of a schema cast is the input column of the same name,
+    /// which need not sit at the same position; a column the cast retypes carries
+    /// other values.
+    #[test]
+    fn lineage_follows_a_schema_cast_by_name_and_stops_at_a_retyped_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let reordered = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let cast: Arc<dyn ExecutionPlan> = Arc::new(
+            runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec::new(
+                cayenne_file_exec(&schema, "t/file.vortex", None),
+                reordered,
+            ),
+        );
+        let (_, name) =
+            super::scan_column_lineage(&cast, 0).expect("`b` carries over the cast unchanged");
+        assert_eq!(name, "b");
+
+        let retyped = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let cast: Arc<dyn ExecutionPlan> = Arc::new(
+            runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec::new(
+                cayenne_file_exec(&schema, "t/file.vortex", None),
+                retyped,
+            ),
+        );
+        assert!(
+            super::scan_column_lineage(&cast, 0).is_none(),
+            "a retyped column is a cast of the stored values"
+        );
+        assert_eq!(
+            super::scan_column_lineage(&cast, 1).map(|(_, name)| name),
+            Some("b".to_string())
+        );
+    }
+
+    /// A filter shared below a limit changes which rows the limit keeps, so the
+    /// walk ends at every kind of limit.
+    #[test]
+    fn lineage_stops_at_a_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)]));
+        let scan = || cayenne_file_exec(&schema, "t/file.vortex", None);
+        assert!(super::scan_column_lineage(&scan(), 0).is_some());
+
+        let top_k: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(
+                datafusion::physical_expr::LexOrdering::new(vec![
+                    datafusion::physical_expr::PhysicalSortExpr::new_default(
+                        col("c", &schema).expect("column c exists"),
+                    ),
+                ])
+                .expect("non-empty ordering"),
+                scan(),
+            )
+            .with_fetch(Some(1)),
+        );
+        let global: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::limit::GlobalLimitExec::new(scan(), 1, None),
+        );
+        let local: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::limit::LocalLimitExec::new(scan(), 1),
+        );
+        for limited in [top_k, global, local] {
+            assert!(
+                super::scan_column_lineage(&limited, 0).is_none(),
+                "the walk must end at {}",
+                limited.name()
             );
         }
     }

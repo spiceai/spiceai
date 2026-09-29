@@ -60,6 +60,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
@@ -1293,6 +1294,7 @@ impl RefreshTask {
 
         let start_time = SystemTime::now();
         let current_local_id = state.current_loaded_id();
+        let known_metadata_e_tag = state.metadata_e_tag();
 
         // Take the accelerator write mutex up front so the entire refresh
         // (download + provider rebuild + swap) is serialized with other code
@@ -1336,12 +1338,19 @@ impl RefreshTask {
             });
         let download_result = state
             .manager
-            .download_if_newer(current_local_id, Some(validator.as_ref()))
+            .download_if_newer(
+                current_local_id,
+                known_metadata_e_tag.as_deref(),
+                Some(validator.as_ref()),
+            )
             .await;
 
-        let info = match download_result {
-            Ok(Some(info)) => info,
-            Ok(None) if current_local_id.is_none() => {
+        let (info, metadata_e_tag) = match download_result {
+            Ok(SnapshotPoll {
+                download: Some(info),
+                metadata_e_tag,
+            }) => (info, metadata_e_tag),
+            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
                 // No snapshot has ever been loaded and none is available at the configured location.
                 tracing::warn!(
                     dataset = %self.dataset_name,
@@ -1364,7 +1373,11 @@ impl RefreshTask {
                     },
                 ));
             }
-            Ok(None) => {
+            Ok(SnapshotPoll {
+                download: None,
+                metadata_e_tag,
+            }) => {
+                state.record_metadata_e_tag(metadata_e_tag);
                 tracing::debug!(
                     dataset = %self.dataset_name,
                     current_snapshot_id = ?current_local_id,
@@ -1557,7 +1570,7 @@ impl RefreshTask {
                 },
             ));
         }
-        state.set_current_loaded_id(info.snapshot_id);
+        state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
         if let Some(updated_at) = info.last_updated_at {
             self.last_updated_at
                 .store(updated_at, std::sync::atomic::Ordering::Release);
@@ -3033,9 +3046,13 @@ fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
 
 /// One Prometheus registry + meter provider for this crate's tests.
 ///
-/// `REFRESH_ERRORS` is a `LazyLock` on the global meter. Installing a second
-/// provider after the first instrument is built binds the counter to the
-/// other registry, so tests that scrape would read zero. Share this installer.
+/// Every `runtime_metrics` meter (`REFRESH_ERRORS`, `dataset_load_state`, …) is
+/// a `LazyLock` over `global::meter`, which binds to whichever provider is
+/// installed when it is first built and never rebinds. Under `cargo test` all
+/// tests share one process, so a test that records a metric before any test
+/// has installed this registry binds the instrument to the no-op default
+/// provider, and every test that scrapes reads nothing. [`install_test_meter_provider`]
+/// installs it before `main`, so no test can record first.
 #[cfg(test)]
 pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
     static REGISTRY: std::sync::OnceLock<prometheus::Registry> = std::sync::OnceLock::new();
@@ -3056,6 +3073,15 @@ pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
         opentelemetry::global::set_meter_provider(provider);
         registry
     })
+}
+
+// SAFETY: runs before `main`. It only allocates, initializes the registry's
+// `OnceLock`, and stores the provider in the `opentelemetry` global; it spawns
+// no thread and depends on no other life-before-main initialization.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_meter_provider() {
+    test_prometheus_registry();
 }
 
 /// The error that ended a refresh retry loop, if the refresh itself failed.
