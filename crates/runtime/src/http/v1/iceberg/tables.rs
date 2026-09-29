@@ -46,7 +46,7 @@ const MAX_SCHEMA_RECURSION_DEPTH: usize = 10;
 /// This endpoint returns a 200 OK response if the table exists, otherwise it returns a 404 Not Found response.
 #[cfg_attr(feature = "openapi", utoipa::path(
     head,
-    path = "/v1/iceberg/namespaces/{namespace}/tables/{table}",
+    path = "/v1/namespaces/{namespace}/tables/{table}",
     operation_id = "head_table",
     tag = "Iceberg",
     responses(
@@ -124,7 +124,7 @@ struct TableMetadata {
 /// This endpoint returns the table if it exists, otherwise it returns a 404 Not Found response.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/iceberg/namespaces/{namespace}/tables/{table}",
+    path = "/v1/namespaces/{namespace}/tables/{table}",
     operation_id = "get_table",
     tag = "Iceberg",
     params(
