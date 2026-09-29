@@ -113,7 +113,7 @@ use super::binlog::{
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
-use super::rows::{build_change_batch, truncate_change};
+use super::rows::{ChangeBatchSchemas, build_change_batch, truncate_change};
 use super::{
     CursorType, Error, GtidSet, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
     check_resume_compatibility, encode_checkpoint_schema_json, stream_error,
@@ -596,6 +596,9 @@ fn snapshot_boundary_envelope(
 struct MemberHandle {
     dataset_name: String,
     schema: SchemaRef,
+    /// `schema`'s derived change-batch schemas, shared by every
+    /// [`MysqlChangeRows`] this member hands downstream.
+    change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
     /// Immutable decode layout behind an `Arc` swapped on a compatible ALTER
     /// (see [`adopt_current_layout`]). The pump clones the current `Arc` into a
@@ -892,6 +895,7 @@ async fn attach_member(
         Arc::new(MemberHandle {
             dataset_name: dataset_name.clone(),
             schema: Arc::clone(&schema),
+            change_schemas: Arc::new(ChangeBatchSchemas::new(&schema)),
             primary_keys: primary_keys.clone(),
             layout: Mutex::new(Arc::new(MemberLayout {
                 layout: layout.clone(),
@@ -1995,6 +1999,7 @@ async fn deliver_commit(
         // as a `StreamError` on this one dataset's stream.
         let rows = MysqlChangeRows::new(
             Arc::clone(&member.schema),
+            Arc::clone(&member.change_schemas),
             member.primary_keys.clone(),
             Arc::clone(layout),
             Arc::clone(tme),
@@ -2590,6 +2595,7 @@ mod tests {
         let member = Arc::new(MemberHandle {
             dataset_name: "orders".to_string(),
             schema: test_schema(),
+            change_schemas: Arc::new(ChangeBatchSchemas::new(&test_schema())),
             primary_keys: vec!["id".to_string()],
             layout: Mutex::new(Arc::new(MemberLayout {
                 // Covers every column of `test_schema`, so anything the member

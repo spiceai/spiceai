@@ -23,7 +23,7 @@ limitations under the License.
 //! only buffers the **owned** wire payload (`RowsEventData<'static>`) plus
 //! `Arc` snapshots of the table-map columns and the member's decode layout, and
 //! hands them to this [`MysqlChangeRows`]. [`ChangeRows::build`] then runs the
-//! decode + [`build_change_batch`] later, on the per-dataset consumer thread.
+//! decode + [`build_change_batch`](super::rows::build_change_batch) later, on the per-dataset consumer thread.
 //!
 //! Two consequences, both intended:
 //!   - shared-pump CPU stays ~flat as members grow, and
@@ -38,7 +38,7 @@ use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
 use super::binlog::{TableMapRowDecoder, buffer_rows_event, buffer_rows_event_fast};
 use super::metrics::MetricsCollector;
-use super::rows::{TransactionBuffer, build_change_batch};
+use super::rows::{ChangeBatchSchemas, TransactionBuffer, build_change_batch_with};
 use super::setup::TableLayout;
 use crate::cdc::{ChangeBatch, ChangeBatchError, ChangeRows};
 
@@ -60,6 +60,8 @@ pub(super) struct MemberLayout {
 /// transaction. Carries owned wire payloads; the decode runs in [`Self::build`].
 pub(crate) struct MysqlChangeRows {
     schema: SchemaRef,
+    /// The member's derived change-batch schemas (see [`ChangeBatchSchemas`]).
+    change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
     /// Decode-time layout snapshot (see [`MemberLayout`]).
     layout: Arc<MemberLayout>,
@@ -82,6 +84,7 @@ pub(crate) struct MysqlChangeRows {
 impl MysqlChangeRows {
     pub(super) fn new(
         schema: SchemaRef,
+        change_schemas: Arc<ChangeBatchSchemas>,
         primary_keys: Vec<String>,
         layout: Arc<MemberLayout>,
         tme: Arc<TableMapEvent<'static>>,
@@ -108,6 +111,7 @@ impl MysqlChangeRows {
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
         Self {
             schema,
+            change_schemas,
             primary_keys,
             layout,
             tme,
@@ -181,7 +185,8 @@ impl ChangeRows for MysqlChangeRows {
                 message: e.to_string(),
             })?;
         }
-        build_change_batch(
+        build_change_batch_with(
+            &self.change_schemas,
             &self.schema,
             &self.primary_keys,
             &self.layout.column_map,
