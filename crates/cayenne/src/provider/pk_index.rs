@@ -1289,6 +1289,13 @@ pub(crate) struct PendingPkKeys {
     /// describes a table state that has since been superseded (a DELETE, a
     /// compaction, a recovery) and must not be cached when it comes back.
     invalidated: bool,
+    /// A checkpoint moved the inline rows into files while the index was checked
+    /// out (see [`Self::relocate_inlined_after_flush`]). Holds how many batches the
+    /// log held at the most recent such flush: the index's own `Inlined` entries
+    /// and those batches were all committed before it, so they are relabeled
+    /// `FileUnlocated` at the restore; batches recorded after it keep the location
+    /// they were committed with.
+    inline_flushed_at: Option<usize>,
 }
 
 impl PendingPkKeys {
@@ -1320,6 +1327,7 @@ impl PendingPkKeys {
         }
         self.batches.clear();
         self.approx_bytes = 0;
+        self.inline_flushed_at = None;
         self.outstanding = self.outstanding.saturating_add(1);
     }
 
@@ -1334,6 +1342,29 @@ impl PendingPkKeys {
         self.invalidated = true;
         self.batches.clear();
         self.approx_bytes = 0;
+        self.inline_flushed_at = None;
+    }
+
+    /// Report that a checkpoint moved every inline row into files while an index
+    /// was checked out. The index stays valid — the flush changed where those rows
+    /// live, not which keys are live — so instead of discarding it (which costs the
+    /// next apply a rebuild from a full-table key scan), the restore relabels the
+    /// `Inlined` entries the index and the batches held so far carry, exactly as
+    /// the flush relabels an index sitting in its cache cell. A no-op when nothing
+    /// is checked out.
+    ///
+    /// Only sound for an index whose `Inlined` entries all name rows this flush
+    /// moved: an entry for a row written to the inline memtable after the flush
+    /// would be relabeled too, and that row is still inline. The per-shard index
+    /// qualifies. It is checked out, built and restored by one apply holding
+    /// `write_lock`, which every inline write also takes, so no row reaches the
+    /// inline memtable while it is out; validation only reads it, and keys join
+    /// it in `append_to_shard`, after the restore.
+    pub(crate) fn relocate_inlined_after_flush(&mut self) {
+        if self.outstanding == 0 {
+            return;
+        }
+        self.inline_flushed_at = Some(self.batches.len());
     }
 
     /// Hold one committed key batch. A no-op when no index is checked out, or once
@@ -1361,6 +1392,7 @@ impl PendingPkKeys {
             self.overflowed = true;
             self.batches.clear();
             self.approx_bytes = 0;
+            self.inline_flushed_at = None;
             return;
         }
         self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
@@ -1383,6 +1415,7 @@ impl PendingPkKeys {
             discard_index: self.overflowed || self.invalidated,
             overflowed: self.overflowed,
             invalidated: self.invalidated,
+            inline_flushed_at: self.inline_flushed_at.take(),
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1409,9 +1442,13 @@ impl PendingPkKeys {
             HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher);
         // Later batches win: a key committed twice during the checkout lives where
         // its most recent commit put it.
-        for batch in &self.batches {
+        for (position, batch) in self.batches.iter().enumerate() {
+            let location = relocated_after_inline_flush(
+                &batch.location,
+                self.inline_flushed_at.is_some_and(|at| position < at),
+            );
             for (digest, _) in batch.keys.iter_with_digest() {
-                locations.insert(digest, batch.location.clone());
+                locations.insert(digest, location.clone());
             }
         }
         Some(PendingPkExistence {
@@ -1551,9 +1588,33 @@ pub(crate) struct RestoredPkKeys {
     overflowed: bool,
     /// The cache was invalidated while the index was out.
     invalidated: bool,
+    /// See [`PendingPkKeys::relocate_inlined_after_flush`]: `Some(n)` when a
+    /// checkpoint moved the inline rows into files during the checkout, `n` being
+    /// how many of `batches` were committed before it.
+    inline_flushed_at: Option<usize>,
+}
+
+/// The location a key committed before an inline flush lives at after it: the
+/// flush moved every inline row into a file, so an `Inlined` entry that predates it
+/// now names a file row whose position is unknown. Everything else is unchanged.
+fn relocated_after_inline_flush(location: &RowLocation, predates_flush: bool) -> &RowLocation {
+    static FILE_UNLOCATED: RowLocation = RowLocation::FileUnlocated;
+    if predates_flush && matches!(location, RowLocation::Inlined) {
+        &FILE_UNLOCATED
+    } else {
+        location
+    }
 }
 
 impl RestoredPkKeys {
+    /// Whether a checkpoint moved the inline rows into files while the index was
+    /// out, so the restore must relabel the index's `Inlined` entries
+    /// (`FileUnlocated`) before caching it. [`Self::batches`] already relabels the
+    /// batches committed before that flush.
+    pub(crate) const fn relocates_inlined(&self) -> bool {
+        self.inline_flushed_at.is_some()
+    }
+
     /// Whether the index that was checked out must be dropped rather than cached:
     /// keys committed during the checkout went unheld (the log hit its cap), or the
     /// cache was invalidated while the index was out. Caching it either way would
@@ -1580,11 +1641,21 @@ impl RestoredPkKeys {
     }
 
     /// Replay every held batch, oldest first, so a key committed twice ends on its
-    /// most recent location and sequence.
+    /// most recent location and sequence. A batch committed before an inline flush
+    /// that happened during the checkout comes back relabeled the way the flush
+    /// relabels the cached index (see [`Self::relocates_inlined`]).
     pub(crate) fn batches(&self) -> impl Iterator<Item = (&PkDigestSet, &RowLocation, i64)> {
+        let flushed_at = self.inline_flushed_at;
         self.batches
             .iter()
-            .map(|batch| (&batch.keys, &batch.location, batch.sequence))
+            .enumerate()
+            .map(move |(position, batch)| {
+                let location = relocated_after_inline_flush(
+                    &batch.location,
+                    flushed_at.is_some_and(|at| position < at),
+                );
+                (&batch.keys, location, batch.sequence)
+            })
     }
 }
 
@@ -1792,6 +1863,20 @@ impl ShardedPkIndex {
         match self {
             Self::Exact(s) => s.len(),
             Self::Bloom(s) => s.len(),
+        }
+    }
+
+    /// Relabel every `Inlined` entry `FileUnlocated`: a checkpoint moved the inline
+    /// rows into files. A bloom carries no locations, so it is unchanged.
+    pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) {
+        if let Self::Exact(keysets) = self {
+            for keyset in keysets.iter_mut() {
+                for location in keyset.locations_mut() {
+                    if matches!(location, RowLocation::Inlined) {
+                        *location = RowLocation::FileUnlocated;
+                    }
+                }
+            }
         }
     }
 
@@ -3101,6 +3186,114 @@ mod tests {
             pending.lock().outstanding,
             0,
             "closing every window must return the count to zero exactly"
+        );
+    }
+
+    /// An inline flush during a checkout relabels instead of discarding: the index
+    /// is still valid, the batches committed before the flush come back
+    /// `FileUnlocated` (their rows now live in a file), and a batch committed after
+    /// it keeps the location it was committed with — both in the restore and in the
+    /// existence view the in-flight validation reads.
+    #[test]
+    fn an_inline_flush_during_a_checkout_relabels_the_keys_it_moved() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        let checkout = PkCheckoutGuard::open(&pending, || {});
+
+        let digest_set = |id: u64| {
+            let mut keys = PkDigestSet::with_capacity(1);
+            let k = owned_key(&key(id));
+            let digest = pk_digest(&k);
+            keys.insert_with_digest(digest, k);
+            (keys, digest)
+        };
+        let (before, before_digest) = digest_set(1);
+        let (after, after_digest) = digest_set(2);
+        let (file, file_digest) = digest_set(3);
+
+        pending
+            .lock()
+            .record(&before, &RowLocation::Inlined, 1, usize::MAX);
+        pending.lock().relocate_inlined_after_flush();
+        pending
+            .lock()
+            .record(&after, &RowLocation::Inlined, 2, usize::MAX);
+        pending
+            .lock()
+            .record(&file, &RowLocation::FileUnlocated, 3, usize::MAX);
+
+        let existence = pending
+            .lock()
+            .existence()
+            .expect("three keys were committed during the checkout");
+        assert!(matches!(
+            existence.location_by_digest(before_digest),
+            Some(RowLocation::FileUnlocated)
+        ));
+        assert!(matches!(
+            existence.location_by_digest(after_digest),
+            Some(RowLocation::Inlined)
+        ));
+        assert!(matches!(
+            existence.location_by_digest(file_digest),
+            Some(RowLocation::FileUnlocated)
+        ));
+
+        let restored = checkout.close();
+        assert!(
+            !restored.index_must_be_discarded(),
+            "a flush changes where rows live, not which keys are live, so the index \
+             must be restored rather than rebuilt from a full-table scan"
+        );
+        assert!(restored.relocates_inlined());
+        let locations: Vec<RowLocation> = restored
+            .batches()
+            .map(|(_, location, _)| location.clone())
+            .collect();
+        assert!(matches!(
+            locations.as_slice(),
+            [
+                RowLocation::FileUnlocated,
+                RowLocation::Inlined,
+                RowLocation::FileUnlocated
+            ]
+        ));
+    }
+
+    /// With nothing checked out a flush has no index to relabel, and it must not
+    /// leak into the next checkout; an invalidation after a flush still discards.
+    #[test]
+    fn an_inline_flush_outside_a_checkout_is_a_no_op_and_invalidation_still_wins() {
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        pending.lock().relocate_inlined_after_flush();
+        let restored = PkCheckoutGuard::open(&pending, || {}).close();
+        assert!(!restored.relocates_inlined());
+        assert!(!restored.index_must_be_discarded());
+
+        let checkout = PkCheckoutGuard::open(&pending, || {});
+        pending.lock().relocate_inlined_after_flush();
+        pending.lock().invalidate();
+        let restored = checkout.close();
+        assert!(
+            restored.index_must_be_discarded(),
+            "a superseded table state must still drop the index"
+        );
+        assert!(!restored.relocates_inlined());
+    }
+
+    #[test]
+    fn relocating_a_sharded_index_relabels_only_inlined_entries() {
+        let mut inlined = CachedPkKeyset::with_capacity(2);
+        inlined.insert(owned_key(&key(1)), RowLocation::Inlined);
+        inlined.insert(owned_key(&key(2)), RowLocation::FileUnlocated);
+        let mut index = ShardedPkIndex::from_exact(inlined, 1);
+        index.relocate_inlined_to_file_unlocated();
+        let ShardedPkIndex::Exact(keysets) = &index else {
+            panic!("an exact index stays exact");
+        };
+        assert!(
+            keysets[0]
+                .locations()
+                .all(|location| matches!(location, RowLocation::FileUnlocated))
         );
     }
 

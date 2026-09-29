@@ -12038,18 +12038,22 @@ impl CayenneTableProvider {
         // in lockstep so a post-checkpoint upsert tombstones a flushed key by file,
         // not as a phantom inline conflict. At N=1 the sharded cache is empty.
         let mut sharded = self.sharded_pk_keyset_cache.lock();
-        if let Some(ShardedPkIndex::Exact(keysets)) = sharded.as_mut() {
-            for keyset in keysets.iter_mut() {
-                for location in keyset.locations_mut() {
-                    if matches!(location, RowLocation::Inlined) {
-                        *location = RowLocation::FileUnlocated;
-                    }
-                }
-            }
-        } else if sharded.is_none() {
-            // Checked out for validation (or cold, where this is a no-op) — see the
-            // single-index arm above.
-            self.sharded_pk_keyset_pending.lock().invalidate();
+        if let Some(index) = sharded.as_mut() {
+            index.relocate_inlined_to_file_unlocated();
+        } else {
+            // Checked out for validation (or cold, where this is a no-op). The
+            // per-shard index is checked out, built and restored by one apply holding
+            // `write_lock`, so no inline row can be written while it is out and every
+            // `Inlined` entry it holds names a row this flush moved: have the restore
+            // relabel it (see `relocate_inlined_after_flush`) instead of discarding
+            // it. A discard costs the next apply a rebuild from a full-table key scan
+            // under `write_lock`, and the in-memory CDC checkpoint runs this flush
+            // off-lock while an apply validates (every bake after a seal), so on a
+            // large table those rebuilds were most of the apply time (SF-1000
+            // CH-benCH: order_line 1 253 s of 1 599 s).
+            self.sharded_pk_keyset_pending
+                .lock()
+                .relocate_inlined_after_flush();
         }
     }
 
@@ -12315,6 +12319,13 @@ impl CayenneTableProvider {
             return;
         }
         let mut index = index;
+        if restored.relocates_inlined() {
+            // A checkpoint moved the inline rows into files while the index was out;
+            // relabel exactly as `flip_inlined_keyset_entries_to_file_unlocated` does
+            // for an index in the cell. `batches()` relabels the held batches that
+            // predate the flush.
+            index.relocate_inlined_to_file_unlocated();
+        }
         let mut drop_index = false;
         // The per-shard index carries existence and location only — per-key OCC
         // stamps live on the table-wide keyset — so the recorded sequence has no
@@ -68435,6 +68446,84 @@ mod tests {
             ),
         }
     }
+
+    /// A checkpoint that moves the inline rows into files while an apply has the
+    /// per-shard index checked out must not cost that index: the flush changes
+    /// where rows live, not which keys are live. The restore relabels the `Inlined`
+    /// entries committed before the flush and caches the index. Discarding it made
+    /// the next apply rebuild the index from a full-table key scan under
+    /// `write_lock`, which was most of `order_line`'s apply time in the SF-1000
+    /// CH-benCH run.
+    #[tokio::test]
+    async fn an_inline_flush_during_a_sharded_checkout_relabels_instead_of_discarding() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_inline_flush",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+
+        // One inline commit lands before the flush, one after it.
+        let flushed = pk_digest_set_for_ids(&converter, &[7]);
+        let flushed_digest = flushed
+            .iter_with_digest()
+            .next()
+            .expect("one flushed key")
+            .0;
+        provider.record_pk_keys_with_location(&flushed, &RowLocation::Inlined, 11);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        let still_inline = pk_digest_set_for_ids(&converter, &[8]);
+        let still_inline_digest = still_inline
+            .iter_with_digest()
+            .next()
+            .expect("one still-inline key")
+            .0;
+        provider.record_pk_keys_with_location(&still_inline, &RowLocation::Inlined, 12);
+
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                let location_of = |digest: u128| {
+                    keysets
+                        .iter()
+                        .find_map(|keyset| keyset.location_by_digest(digest))
+                        .cloned()
+                };
+                assert!(
+                    matches!(location_of(flushed_digest), Some(RowLocation::FileUnlocated)),
+                    "id=7 was committed inline before the flush moved it into a file: an \
+                     `Inlined` entry would supersede only the inline copy and leave the file \
+                     copy live"
+                );
+                assert!(
+                    matches!(location_of(still_inline_digest), Some(RowLocation::Inlined)),
+                    "id=8 was committed inline after the flush and is still inline"
+                );
+            }
+            other => panic!(
+                "the per-shard index must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next apply), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
     /// A checked-out index that is never restored must not blind the checkout
     /// mechanism for the rest of the process — regression test for #13267.
     ///
