@@ -709,6 +709,10 @@ pub struct Runtime {
     /// fetched from the scheduler; for all other modes it is set before
     /// the runtime starts.
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+
+    /// The engines found to have created the snapshots of datasets that read snapshots
+    /// (`file_format: snapshot`), which building those datasets needs.
+    snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
 }
 
 impl Debug for Runtime {
@@ -843,6 +847,13 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The engines of the snapshot sources this runtime has resolved.
+    pub(crate) fn snapshot_sources(
+        &self,
+    ) -> &Arc<component::dataset::snapshot_source::SnapshotSourceRegistry> {
+        &self.snapshot_sources
     }
 
     #[must_use]

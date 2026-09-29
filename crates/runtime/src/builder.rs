@@ -852,6 +852,7 @@ impl RuntimeBuilder {
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             telemetry_config: self.telemetry_config,
+            snapshot_sources: Arc::default(),
         };
 
         // Executors: register cluster status before any concurrent

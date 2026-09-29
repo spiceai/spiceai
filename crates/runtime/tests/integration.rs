@@ -185,6 +185,9 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
+// Cayenne does not build on Windows.
+#[cfg(all(feature = "snapshots", feature = "duckdb", not(windows)))]
+mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "snowflake")]

@@ -718,6 +718,22 @@ impl Runtime {
         bootstrap_status: BootstrapStatus,
         load_semaphore: Arc<Semaphore>,
     ) {
+        // A dataset that reads snapshots has no acceleration to load them into until
+        // the engine that created them is known, which only their metadata says.
+        let (ds, bootstrap_status) = if ds.is_pending_snapshot_source() {
+            let shutdown_token = self.status.shutdown_token();
+            let resolved = tokio::select! {
+                resolved = self.resolve_snapshot_source(&ds, &load_semaphore) => resolved,
+                () = shutdown_token.cancelled() => None,
+            };
+            let Some(resolved) = resolved else {
+                return;
+            };
+            resolved
+        } else {
+            (ds, bootstrap_status)
+        };
+
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
@@ -1555,6 +1571,14 @@ impl Runtime {
         &self,
         ds: Arc<Dataset>,
     ) -> Result<Arc<dyn DataConnector>> {
+        // A dataset that reads acceleration snapshots is served only from its
+        // acceleration; its source supplies nothing but the snapshot's schema.
+        if ds.is_snapshot_source() {
+            return Ok(Arc::new(
+                dataconnector::snapshot_source::SnapshotSourceConnector::new(ds),
+            ));
+        }
+
         let source = ds.source();
 
         // Resolve the connector before building parameters. The builder resolves it too — it
@@ -1941,6 +1965,36 @@ impl Runtime {
                     continue;
                 }
 
+                // The dataset now reads snapshots whose engine is not known yet — it moved
+                // to `file_format: snapshot`, or to another snapshot location — so there is
+                // no acceleration to swap in. Unload it, and load it again once its load
+                // has read the snapshots' metadata.
+                if ds.is_pending_snapshot_source() {
+                    self.df.clear_cached_plans().await;
+                    self.invalidate_cached_results_for(&ds.name).await;
+                    let current_acceleration = existing_datasets
+                        .iter()
+                        .find(|current| current.name == ds.name)
+                        .and_then(|current| current.acceleration.clone());
+                    Arc::clone(&self)
+                        .remove_dataset(ds.name.clone(), current_acceleration.as_ref())
+                        .await;
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                    let runtime = Arc::clone(&self);
+                    let ds_clone = Arc::clone(ds);
+                    let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+                    added_futures.insert(
+                        resolve_table_reference(ds.name.clone()),
+                        Box::pin(async move {
+                            runtime
+                                .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                                .await;
+                        }),
+                    );
+                    continue;
+                }
+
                 Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
                 continue;
             }
@@ -2037,6 +2091,9 @@ impl Runtime {
 
                 self.status
                     .update_dataset(&ds_name, status::ComponentStatus::Disabled);
+                // A dataset reading snapshots may still be resolving, and must not load
+                // after it is removed; one added again reads its snapshots' metadata afresh.
+                self.snapshot_sources().forget(&ds_name);
                 Arc::clone(&self)
                     .remove_dataset(ds_name, ds_acceleration.as_ref())
                     .await;
@@ -2085,7 +2142,7 @@ impl Runtime {
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
     /// Returns a `HashMap` mapping each dataset name to its initialization result, which contains
     /// the `BootstrapStatus` on success or an error on failure.
-    async fn initialize_datasets_accelerators(
+    pub(super) async fn initialize_datasets_accelerators(
         &self,
         datasets: &[Arc<Dataset>],
     ) -> HashMap<TableReference, Result<BootstrapStatus>> {
