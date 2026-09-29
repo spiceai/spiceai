@@ -641,12 +641,13 @@ enum ChoiceDisposition {
     /// The model finished a tool call: run the Spice tools it named and stream the
     /// follow-up answer in place of this choice.
     RunTools,
-    /// Nothing in the choice is for the caller (a tool-call argument chunk).
+    /// Nothing in the choice is for the caller: no finish and no content.
     Drop,
 }
 
 /// Decides each choice exactly once, so a choice is never forwarded twice and a
-/// `tool_calls` finish that Spice acts on is never forwarded at all.
+/// `tool_calls` finish that Spice acts on is never forwarded at all. Every other
+/// finish is forwarded whether or not the provider sent `content` beside it.
 ///
 /// Some providers (`DeepSeek`, for one) put `"content": ""` on every chunk, the
 /// tool-call chunks and the final `tool_calls` finish included. Deciding on
@@ -657,9 +658,9 @@ enum ChoiceDisposition {
 fn choice_disposition(choice: &ChatChoiceStream) -> ChoiceDisposition {
     match choice.finish_reason {
         Some(FinishReason::ToolCalls) => ChoiceDisposition::RunTools,
-        Some(FinishReason::Stop | FinishReason::Length) => ChoiceDisposition::Forward,
-        _ if choice.delta.content.is_some() => ChoiceDisposition::Forward,
-        _ => ChoiceDisposition::Drop,
+        Some(_) => ChoiceDisposition::Forward,
+        None if choice.delta.content.is_some() => ChoiceDisposition::Forward,
+        None => ChoiceDisposition::Drop,
     }
 }
 
@@ -754,21 +755,11 @@ fn make_a_stream(
                         }
 
                         // A tool call has finished (i.e. we have all chunks), process it.
-                        let tool_call_states_clone = Arc::clone(&tool_call_states);
-
-                        let tool_calls_to_process = {
-                            match tool_call_states_clone.lock() {
-                                Ok(states_lock) => states_lock
-                                    .values()
-                                    .cloned()
-                                    .collect(),
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to lock tool_call_states: {}",
-                                        e
-                                    );
-                                    return;
-                                }
+                        let tool_calls_to_process = match tool_call_states.lock() {
+                            Ok(states_lock) => states_lock.values().cloned().collect(),
+                            Err(e) => {
+                                tracing::error!("Failed to lock tool_call_states: {}", e);
+                                return;
                             }
                         };
 
@@ -796,11 +787,18 @@ fn make_a_stream(
 
                         // Text the model wrote alongside the tool call belongs before the answer
                         // the tool results produce, not after it.
-                        if let Some(text) = chat_choice.delta.content.as_ref().filter(|t| !t.is_empty()) {
-                            let mut text_only = chat_choice.clone();
+                        if chat_choice
+                            .delta
+                            .content
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                        {
+                            let mut text_only = chat_choice;
                             text_only.delta.tool_calls = None;
                             text_only.finish_reason = None;
-                            chat_output.push_str(text);
+                            if let Some(text) = &text_only.delta.content {
+                                chat_output.push_str(text);
+                            }
                             let mut resp = response.clone();
                             resp.choices = vec![text_only];
                             if let Err(e) = sender_clone.send(Ok(resp)).await {
@@ -939,11 +937,13 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_or_length_finish_is_forwarded_once_whatever_its_content() {
+    fn any_other_finish_is_forwarded_once_whatever_its_content() {
         for choice in [
             r#"{"index":0,"delta":{"content":""},"finish_reason":"stop"}"#,
             r#"{"index":0,"delta":{},"finish_reason":"stop"}"#,
             r#"{"index":0,"delta":{"content":"done"},"finish_reason":"length"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"content_filter"}"#,
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"content_filter"}"#,
         ] {
             assert_eq!(
                 choice_disposition(&stream_choice(choice)),
@@ -966,18 +966,6 @@ mod tests {
                 r#"{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}"#
             )),
             ChoiceDisposition::Drop
-        );
-        assert_eq!(
-            choice_disposition(&stream_choice(
-                r#"{"index":0,"delta":{},"finish_reason":"content_filter"}"#
-            )),
-            ChoiceDisposition::Drop
-        );
-        assert_eq!(
-            choice_disposition(&stream_choice(
-                r#"{"index":0,"delta":{"content":""},"finish_reason":"content_filter"}"#
-            )),
-            ChoiceDisposition::Forward
         );
     }
 
