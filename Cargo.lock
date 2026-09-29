@@ -126,8 +126,11 @@ dependencies = [
  "runtime-checkpoint-postgres",
  "runtime-datafusion",
  "runtime-parameters",
+ "runtime-secrets",
  "runtime-table-partition",
+ "secrecy",
  "snafu",
+ "tokio",
 ]
 
 [[package]]
