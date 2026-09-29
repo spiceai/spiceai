@@ -187,16 +187,32 @@ pub(crate) async fn head_namespace(Path(namespace): Path<NamespacePath>) -> Resp
     }
 }
 
-/// Check if a namespace exists.
+/// The Iceberg REST `GetNamespaceResponse`.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct GetNamespaceResponse {
+    namespace: Namespace,
+    /// Always `null`: Spice does not store namespace properties, and the spec
+    /// asks a server without them to return `null` rather than `{}`.
+    properties: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Load an Iceberg namespace
 ///
-/// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
+/// Returns the namespace if it exists. Spice does not store namespace properties, so `properties` is `null`.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/namespaces/{namespace}",
     operation_id = "get_namespace",
     tag = "Iceberg",
     responses(
-        (status = 200, description = "Namespace exists"),
+        (status = 200, description = "Namespace exists", content((
+            GetNamespaceResponse = "application/json",
+            example = json!({
+                "namespace": ["spice", "public"],
+                "properties": null
+            })
+        ))),
         (status = 404, description = "Namespace does not exist"),
         (status = 400, description = "Invalid namespace format")
     )
@@ -209,8 +225,9 @@ pub(crate) async fn get_namespace(Path(namespace): Path<NamespacePath>) -> Respo
     match get_child_namespaces_impl(&df, &namespace) {
         Ok(_) => (
             status::StatusCode::OK,
-            Json(NamespacesResponse {
-                namespaces: vec![namespace],
+            Json(GetNamespaceResponse {
+                namespace,
+                properties: None,
             }),
         )
             .into_response(),
@@ -387,7 +404,23 @@ pub(crate) async fn list_tables(Path(namespace): Path<NamespacePath>) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::CONFIG_RESPONSE;
+    use super::{CONFIG_RESPONSE, GetNamespaceResponse, Namespace};
+
+    /// `loadNamespaceMetadata` answers with the spec's `GetNamespaceResponse`,
+    /// which `PyIceberg` validates: `namespace` is required, and `properties`
+    /// is `null` for a server that does not store namespace properties.
+    #[test]
+    fn load_namespace_returns_get_namespace_response() {
+        let body = serde_json::to_value(GetNamespaceResponse {
+            namespace: Namespace::from_parts(vec!["spice".to_string(), "public".to_string()]),
+            properties: None,
+        })
+        .expect("serializes");
+        assert_eq!(
+            body,
+            serde_json::json!({ "namespace": ["spice", "public"], "properties": null })
+        );
+    }
 
     /// Iceberg REST clients refuse any operation whose endpoint the config does
     /// not list verbatim in the spec's form (`GET /v1/{prefix}/namespaces`), so
