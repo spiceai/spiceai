@@ -285,20 +285,20 @@ pub fn build_change_batch(
 ) -> Result<ChangeBatch> {
     build_change_batch_with(
         &ChangeBatchSchemas::new(dataset_schema),
-        dataset_schema,
         primary_keys,
         column_map,
         changes,
     )
 }
 
-/// The two schemas every change batch of one dataset is built with: the
-/// dataset's fields all made nullable (see [`build_change_batch`]), and the
-/// `op` / `primary_keys` / `data` wrapper around them. A dataset's schema is
+/// A dataset's schema with the two schemas every one of its change batches is
+/// built with: its fields all made nullable (see [`build_change_batch`]), and
+/// the `op` / `primary_keys` / `data` wrapper around them. A dataset's schema is
 /// fixed for the life of its replication member, so these are derived once per
 /// member rather than once per batch — the streaming path builds a batch for
 /// every committed source transaction that touches the table.
 pub(super) struct ChangeBatchSchemas {
+    dataset: SchemaRef,
     nullable: SchemaRef,
     wrapper: SchemaRef,
 }
@@ -307,7 +307,16 @@ impl ChangeBatchSchemas {
     pub(super) fn new(dataset_schema: &SchemaRef) -> Self {
         let nullable = nullable_clone(dataset_schema);
         let wrapper = Arc::new(changes_schema(&nullable));
-        Self { nullable, wrapper }
+        Self {
+            dataset: Arc::clone(dataset_schema),
+            nullable,
+            wrapper,
+        }
+    }
+
+    /// The dataset's own (declared-nullability) schema.
+    pub(super) fn dataset(&self) -> &SchemaRef {
+        &self.dataset
     }
 }
 
@@ -315,12 +324,12 @@ impl ChangeBatchSchemas {
 /// caller (see [`ChangeBatchSchemas`]).
 pub(super) fn build_change_batch_with(
     schemas: &ChangeBatchSchemas,
-    dataset_schema: &SchemaRef,
     primary_keys: &[String],
     column_map: &[usize],
     changes: &[DecodedChange],
 ) -> Result<ChangeBatch> {
     let num_rows = changes.len();
+    let dataset_schema = &schemas.dataset;
     let nullable_schema = &schemas.nullable;
 
     let mut op_builder = StringBuilder::with_capacity(num_rows, num_rows * 2);
@@ -1330,7 +1339,7 @@ mod tests {
             row: vec![Value::Int(1), Value::Bytes(b"one".to_vec())],
         }];
         let pks = ["id".to_string()];
-        let shared = build_change_batch_with(&schemas, &schema, &pks, &[0, 1], &changes)
+        let shared = build_change_batch_with(&schemas, &pks, &[0, 1], &changes)
             .expect("shared-schema batch builds");
         let per_call =
             build_change_batch(&schema, &pks, &[0, 1], &changes).expect("per-call batch builds");

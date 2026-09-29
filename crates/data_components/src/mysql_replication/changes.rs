@@ -33,7 +33,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
+use arrow::datatypes::{DataType, IntervalUnit};
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
 use super::binlog::{TableMapRowDecoder, buffer_rows_event, buffer_rows_event_fast};
@@ -59,8 +59,8 @@ pub(super) struct MemberLayout {
 /// Deferred [`ChangeRows`] for one member's rows within one committed source
 /// transaction. Carries owned wire payloads; the decode runs in [`Self::build`].
 pub(crate) struct MysqlChangeRows {
-    schema: SchemaRef,
-    /// The member's derived change-batch schemas (see [`ChangeBatchSchemas`]).
+    /// The member's dataset schema and its derived change-batch schemas (see
+    /// [`ChangeBatchSchemas`]).
     change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
     /// Decode-time layout snapshot (see [`MemberLayout`]).
@@ -83,7 +83,6 @@ pub(crate) struct MysqlChangeRows {
 
 impl MysqlChangeRows {
     pub(super) fn new(
-        schema: SchemaRef,
         change_schemas: Arc<ChangeBatchSchemas>,
         primary_keys: Vec<String>,
         layout: Arc<MemberLayout>,
@@ -95,7 +94,8 @@ impl MysqlChangeRows {
         // Both metadata figures are computed WITHOUT decoding, from the buffered
         // wire size (`rows_data()` is a byte-slice accessor, no row parse).
         let wire_bytes: usize = events.iter().map(|e| e.rows_data().len()).sum();
-        let per_row_fixed: usize = schema
+        let per_row_fixed: usize = change_schemas
+            .dataset()
             .fields()
             .iter()
             .map(|f| arrow_fixed_width(f.data_type()))
@@ -110,7 +110,6 @@ impl MysqlChangeRows {
         // allocation), matching `PgChangeRows`.
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
         Self {
-            schema,
             change_schemas,
             primary_keys,
             layout,
@@ -187,7 +186,6 @@ impl ChangeRows for MysqlChangeRows {
         }
         build_change_batch_with(
             &self.change_schemas,
-            &self.schema,
             &self.primary_keys,
             &self.layout.column_map,
             &buffer.changes,

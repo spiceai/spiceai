@@ -1998,7 +1998,6 @@ async fn deliver_commit(
         // the decode + build runs on the consumer, and a decode failure surfaces
         // as a `StreamError` on this one dataset's stream.
         let rows = MysqlChangeRows::new(
-            Arc::clone(&member.schema),
             Arc::clone(&member.change_schemas),
             member.primary_keys.clone(),
             Arc::clone(layout),
