@@ -912,6 +912,8 @@ impl DataFusionBuilder {
         // DataFusion's default (prefer hash joins) stands; the Cayenne
         // `CayenneAntiJoinSortMergeRewriter` still selectively converts oversized
         // hash joins to sort-merge under the memory gate.
+        config.options_mut().optimizer.repartition_file_min_size = 10 * 1024 * 1024;
+
         if let Some(prefer_hash_join) = self.prefer_hash_join {
             config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
             tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
