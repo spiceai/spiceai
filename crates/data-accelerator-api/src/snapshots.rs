@@ -55,6 +55,33 @@ fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration, refresh_mode: Ref
     !matches!(refresh_mode, RefreshMode::Full | RefreshMode::Caching)
 }
 
+/// Whether this dataset's configuration lets it bootstrap from a snapshot at all:
+/// snapshots are enabled for bootstrapping, and the acceleration mode does not rebuild
+/// from the source on this load. Reads configuration only.
+///
+/// [`should_download_snapshot`] combines this with a check for existing local data at
+/// `layout.primary_path()`. An engine whose local-data marker is shared between datasets
+/// (Cayenne's metastore directory) combines it with its own per-dataset check instead.
+pub fn snapshot_bootstrap_allowed(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    refresh_mode: RefreshMode,
+) -> bool {
+    if !acceleration.snapshot_behavior.bootstrap_enabled() {
+        return false;
+    }
+
+    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
+        tracing::info!(
+            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
+            source.name()
+        );
+        return false;
+    }
+
+    true
+}
+
 /// Decides whether a snapshot should be downloaded to bootstrap `layout`, with no side
 /// effects: it only reads configuration and checks whether `layout.primary_path()`
 /// already exists.
@@ -69,15 +96,7 @@ pub fn should_download_snapshot(
     layout: &AccelerationLayout,
     refresh_mode: RefreshMode,
 ) -> bool {
-    if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return false;
-    }
-
-    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
-        tracing::info!(
-            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
-            source.name()
-        );
+    if !snapshot_bootstrap_allowed(acceleration, source, refresh_mode) {
         return false;
     }
 

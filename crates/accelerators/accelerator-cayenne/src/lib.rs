@@ -52,7 +52,7 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::{download_snapshot, should_download_snapshot};
+use data_accelerator_api::snapshots::{download_snapshot, snapshot_bootstrap_allowed};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -2468,6 +2468,20 @@ impl CayenneAccelerator {
         .map(Arc::clone)
     }
 
+    /// Whether `dataset` already has a table in the metastore, i.e. local data a snapshot
+    /// bootstrap must not overwrite. A snapshot restore registers the table only once its
+    /// files are in place (`import_dataset_slice`), so a partial restore reads as absent.
+    async fn dataset_in_metastore(
+        catalog: &dyn cayenne::MetadataCatalog,
+        dataset: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        match catalog.get_table(dataset).await {
+            Ok(_) => Ok(true),
+            Err(cayenne::CatalogError::TableNotFound { .. }) => Ok(false),
+            Err(err) => Err(Box::new(err)),
+        }
+    }
+
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
@@ -3768,14 +3782,13 @@ impl DataAccelerator for CayenneAccelerator {
             );
             let refresh_mode = resolved_refresh_mode(source, acceleration);
 
-            // Decide whether to bootstrap from a snapshot before `get_or_create_catalog`
-            // below opens the local metastore: that call creates `metadata_dir` as a
-            // side effect (it's a fresh SQLite connection), and this decision's "does an
-            // acceleration already exist here" check reads that same directory's
-            // existence. Deciding first means the check sees the true pre-startup state
-            // instead of a directory the catalog open just created.
-            let should_bootstrap =
-                should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode);
+            let bootstrap_allowed = snapshot_bootstrap_allowed(acceleration, source, refresh_mode);
+            // Whether local data exists is decided per dataset, from the metastore opened
+            // below: `metadata_dir` is shared by every Cayenne dataset in this runtime, and
+            // datasets initialize concurrently, so its existence says only that *some*
+            // dataset opened the metastore. The directory is read here, before that open
+            // creates it, only as the fallback for a metastore that cannot be opened.
+            let metadata_dir_existed = metadata_dir.exists();
 
             // Build a CayenneSnapshotEngine so the snapshot tar uses the
             // per-dataset metastore-slice format (no raw cayenne.db file)
@@ -3787,11 +3800,26 @@ impl DataAccelerator for CayenneAccelerator {
                 .map_or("sqlite", String::as_str)
                 .to_string();
             // The catalog is opened unconditionally: normal operation needs it
-            // regardless of the snapshot decision above.
-            let snapshot_engine = match self
+            // regardless of the snapshot decision.
+            let catalog = self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-                .await
-            {
+                .await;
+            let should_bootstrap = bootstrap_allowed
+                && match &catalog {
+                    Ok(catalog) => {
+                        !Self::dataset_in_metastore(catalog.as_ref(), &source.name().to_string())
+                            .await?
+                    }
+                    Err(_) => !metadata_dir_existed,
+                };
+            if bootstrap_allowed && !should_bootstrap {
+                tracing::info!(
+                    "Dataset {} already has local data in the Cayenne metastore at {}, skipping snapshot bootstrap",
+                    source.name(),
+                    metadata_dir.display()
+                );
+            }
+            let snapshot_engine = match catalog {
                 Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
                     catalog,
                     source.name().to_string(),
@@ -5306,6 +5334,94 @@ mod tests {
     /// acceleration naming another engine must get `None` rather than a Cayenne
     /// classification. The runtime filters by engine before asking, so only this test
     /// stands between a second consumer and a silently wrong budget.
+    /// Two Cayenne datasets in one runtime share one metastore directory: datasets with
+    /// different `cayenne_file_path`s are required to share `cayenne_metadata_dir`, and
+    /// without it both resolve to the default one. Datasets initialize concurrently, so
+    /// once the first has opened the metastore the directory exists for every other
+    /// dataset, whether or not it has any local data. The bootstrap decision therefore
+    /// asks the metastore about the dataset itself.
+    ///
+    /// Covers both ways the directory used to hide a missing dataset: a second dataset
+    /// initializing after the first opened the metastore, and a restart where only some
+    /// datasets have local data. No object store or replication is involved.
+    #[tokio::test]
+    async fn bootstrap_is_decided_per_dataset_not_by_the_shared_metastore_dir() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().to_string_lossy().to_string();
+        let metadata_dir = |name: &str| {
+            CayenneAccelerator::resolve_metadata_dir(Some(&Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params: HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        format!("{root}/data/{name}/"),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        format!("{root}/data/metadata/"),
+                    ),
+                ]),
+                ..Default::default()
+            }))
+        };
+        let shared = metadata_dir("dataset_a");
+        assert_eq!(
+            shared,
+            metadata_dir("dataset_b"),
+            "both datasets resolve to the one shared metastore directory"
+        );
+
+        // dataset_a's `init` opens the shared metastore.
+        let accelerator = CayenneAccelerator::new();
+        let catalog = accelerator
+            .get_or_create_catalog(&shared, "sqlite")
+            .await
+            .expect("open the shared metastore");
+        assert!(
+            PathBuf::from(&shared).exists(),
+            "opening the metastore creates the shared directory"
+        );
+
+        // dataset_b has no table of its own yet, so it still bootstraps.
+        assert!(
+            !CayenneAccelerator::dataset_in_metastore(catalog.as_ref(), "dataset_b")
+                .await
+                .expect("look up dataset_b"),
+            "dataset_b has no local data and must bootstrap from its snapshot, although the \
+             metastore directory dataset_a opened exists"
+        );
+
+        // Once dataset_b has a table (restored or created), a restart keeps it.
+        catalog
+            .create_table(cayenne::metadata::CreateTableOptions {
+                table_name: "dataset_b".to_string(),
+                schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                ])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: format!("{root}/data/dataset_b/"),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create dataset_b's table");
+        assert!(
+            CayenneAccelerator::dataset_in_metastore(catalog.as_ref(), "dataset_b")
+                .await
+                .expect("look up dataset_b"),
+            "dataset_b has local data now, so a restart must not bootstrap over it"
+        );
+        // ...while dataset_a, which still has no table, keeps bootstrapping.
+        assert!(
+            !CayenneAccelerator::dataset_in_metastore(catalog.as_ref(), "dataset_a")
+                .await
+                .expect("look up dataset_a"),
+            "dataset_a has no local data of its own"
+        );
+    }
+
     #[test]
     fn the_write_profile_is_answered_only_for_a_cayenne_acceleration() {
         let accelerator = CayenneAccelerator::new();
