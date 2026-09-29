@@ -1109,7 +1109,10 @@ fn left_first_join_filter(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
         fields,
         listed_schema.metadata().clone(),
     ));
-    let column_indices = order.iter().map(|&listed| indices[listed].clone()).collect();
+    let column_indices = order
+        .iter()
+        .map(|&listed| indices[listed].clone())
+        .collect();
     let expression = Arc::clone(filter.expression())
         .transform(|expr| {
             let Some(column) = expr.downcast_ref::<Column>() else {
@@ -1124,7 +1127,7 @@ fn left_first_join_filter(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
                 )));
             };
             Ok(Transformed::yes(
-                Arc::new(Column::new(column.name(), position)) as Arc<dyn PhysicalExpr>
+                Arc::new(Column::new(column.name(), position)) as Arc<dyn PhysicalExpr>,
             ))
         })
         .data()?;
