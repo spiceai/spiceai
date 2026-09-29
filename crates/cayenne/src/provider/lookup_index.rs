@@ -24,6 +24,9 @@ limitations under the License.
 //! append, a full-refresh overwrite, a compaction's rewrite, a memory-tier
 //! checkpoint. So a file is indexed from the moment a scan can read it, and
 //! nothing an append, a compaction or a refresh does leaves the index stale.
+//! The one exception is an append of more than 2^20 rows,
+//! which finishes its run in the background: its files are read in full until
+//! the run publishes.
 //! A file no run covers — written before a restart, or by a write whose run
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
