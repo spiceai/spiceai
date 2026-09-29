@@ -3741,6 +3741,7 @@ dependencies = [
  "tokio-stream",
  "tpchgen",
  "tracing",
+ "tracing-subscriber",
  "turso",
  "turso-shared",
  "url",

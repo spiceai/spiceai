@@ -138,6 +138,7 @@ test-framework = { path = "../test-framework" }
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 # The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
 # primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
@@ -158,6 +159,10 @@ loom = { workspace = true }
 [[bench]]
 harness = false
 name = "in_list_query_e2e"
+
+[[bench]]
+harness = false
+name = "lookup_index_freshness"
 
 [[bench]]
 harness = false
