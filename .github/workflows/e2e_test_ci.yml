@@ -2111,17 +2111,19 @@ jobs:
     # `simulate_append_data.sh` rewrites `.spice/service_data.parquet` every 3s; a
     # refresh tick that races the rename observes a half-published file and the
     # runtime logs a WARN before retrying on the next tick. DuckDB surfaces the
-    # truncated read as one of two errors depending on which part of the file it
-    # reaches first: "TProtocolException: Invalid data" (corrupt Thrift footer) or
-    # "don't know what type: <token>", where the token is whatever bytes happen to
-    # sit where the schema element's type has not been written yet — empty, or an
-    # arbitrary byte such as 0x0e (see run 30534651210). Both log checks in this job
-    # tolerate both variants of that specific transient.
+    # truncated read as one of three errors depending on which part of the file it
+    # reaches first: "TProtocolException: Invalid data" (corrupt Thrift footer), or
+    # "don't know what type: <token>" / "invalid TType", where the deserializer
+    # reads whatever bytes happen to sit where the schema element's type has not
+    # been written yet — empty, an arbitrary byte such as 0x0e (see run
+    # 30534651210), or a byte that is no TType at all (see run 36496497190). Both
+    # log checks in this job tolerate all three variants of that specific transient.
     env:
       PARQUET_RENAME_RACE_ALLOW: |
         WARN +runtime_table::accelerated::refresh_task: Failed to load data for dataset
         ^Invalid Error: TProtocolException: Invalid data$
         ^Invalid Error: don't know what type:
+        ^Invalid Error: invalid TType$
 
     strategy:
       fail-fast: false
