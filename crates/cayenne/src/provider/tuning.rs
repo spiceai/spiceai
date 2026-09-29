@@ -1235,8 +1235,8 @@ impl IngestStats {
     /// then applies to RAM for the rest of its life, so without an expiry the
     /// bootstrap's large-write latency stands as the table's latency forever and
     /// reads as I/O-bound against every later arrival gap: on CH-benCH SF-100 a
-    /// bootstrap-seeded 720–820 ms held `order_line` "I/O-bound" for a whole run,
-    /// and the write-pressure rule walked its bake trigger to the ceiling one
+    /// bootstrap-seeded 720–820 ms keeps `order_line` "I/O-bound" for the whole
+    /// run, and the write-pressure rule walks its bake trigger to the ceiling one
     /// crawl step per tick. A latency nobody has refreshed says nothing about the
     /// write path, so the controller reads it as unavailable. Pure in `now_ms`.
     pub fn expire_stale_latencies(&self, snap: &mut IngestSnapshot, now_ms: i64) {
@@ -2802,9 +2802,8 @@ pub(crate) fn decide_with_goals(
     // under the trigger, or bakes are running back-to-back (see `bake_is_futile`),
     // so every tick re-bakes the whole protected prefix to retire only the
     // tombstones that arrived since. Raise the trigger over the residual. Only
-    // reached with read-amp not high (the
-    // unhealthy block above returns first), so it never fights the read-amp arm
-    // that lowers the trigger for query health.
+    // reached with read-amp not high (the unhealthy block above returns first), so
+    // it never fights the read-amp arm that lowers the trigger for query health.
     if bake_is_futile(s, cur)
         && let Some(v) = clamp_move_usize(
             cur.bake_deletion_index_trigger,
@@ -3302,8 +3301,8 @@ fn decide_goal(
     // under the trigger, or bakes are running back-to-back (see `bake_is_futile`),
     // so every tick re-bakes the whole protected prefix to retire only the
     // tombstones that arrived since. Raise the trigger over the residual. Withheld
-    // while a query goal is violated so it
-    // never fights the query tier's LOWER move above (queries win).
+    // while a query goal is violated, so it never fights the query tier's LOWER
+    // move above (queries win).
     if !query_violated
         && bake_is_futile(s, cur)
         && let Some(v) = clamp_move_usize(
@@ -3725,10 +3724,11 @@ const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
 /// the whole protected prefix to do so. When its residual sits at, or within one
 /// tick's worth of new tombstones below, the trigger, the next compaction tick
 /// bakes again, re-encoding the full prefix to retire only the tombstones that
-/// arrived since: CH-benCH at SF-100 held `order_line` at ~430 K tombstones
-/// against a 50 K trigger while rewriting ~0.5 GB every ~12 s, and `stock` ~1.2 GB;
-/// a single raise that landed `stock` at 360 K, just over its ~300 K residual,
-/// still left it baking every tick.
+/// arrived since. On CH-benCH at SF-100 that residual is ~430 K tombstones on
+/// `order_line` against the 50 K default, with ~0.5 GB rewritten every ~12 s
+/// (`stock`: ~1.2 GB). A raise that lands just above the residual (`stock` at
+/// 360 K over a ~300 K residual) lets the index regrow past the trigger within a
+/// tick, so bakes running back-to-back count as futile too.
 fn bake_is_futile(s: &IngestSnapshot, cur: &ActuatorValues) -> bool {
     let Some(residual) = s.bake_residual else {
         return false;
@@ -4929,8 +4929,8 @@ mod tests {
 
     // ---- futile-bake backoff ----------------------------------------------
 
-    /// The deletion index CH-benCH SF-100 held on `order_line` after each bake
-    /// against the 50 K default trigger.
+    /// The deletion index a bake leaves on CH-benCH SF-100 `order_line` against
+    /// the 50 K default trigger.
     const FUTILE_BAKE_RESIDUAL: usize = 430_000;
 
     fn query_latency_goal_ms(target_ms: f64) -> Goals {
@@ -5022,10 +5022,10 @@ mod tests {
             raised_bake_trigger(decide_fresh(&s, &actuators(), &bounds())),
             None
         );
-        // After a raise the index grows to the new trigger and the next bake
-        // leaves more behind the larger the index was (CH-benCH SF-100: a bake at
-        // ~1 M left 575 K). It still got under the trigger, so raising again would
-        // only walk the trigger toward its ceiling.
+        // After a raise the index grows to the new trigger, and the next bake
+        // leaves more behind the larger the index is (CH-benCH SF-100: a bake at
+        // ~1 M leaves ~575 K). That is still under the trigger, so raising again
+        // would only walk the trigger toward its ceiling.
         let after_raise = IngestSnapshot {
             bake_residual: Some(575_000),
             ..snap()
