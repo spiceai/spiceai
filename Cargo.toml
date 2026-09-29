@@ -268,7 +268,7 @@ datafusion-common-runtime = "55.1.0"
 datafusion-datasource = "55.1.0"
 datafusion-execution = "55.1.0"
 datafusion-expr = "55.1.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "40fefe6426addce7864b80261bdf771ddb19d8ab", features = ["sql"] } # branch: spiceai-55-patches
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7e52a9740fc3447fe9ea8e4edd51dea696b45758", features = ["sql"] } # branch: spiceai-55-patches
 datafusion-functions = "55.1.0"
 datafusion-functions-aggregate = "55.1.0"
 datafusion-functions-aggregate-common = "55.1.0"
@@ -293,7 +293,7 @@ datafusion-substrait = "55.1.0"
 # Upstream restructured this fork into per-provider crates
 # (datafusion-table-providers-{sqlite,postgres,mysql,duckdb,...} under crates/)
 # with `core/` (this facade) re-exporting them at the same paths Spice already uses.
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "9845ca1d539a8c071a4d04197e9081dff62a3990" } # branch: spiceai-55-patches
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "b483e9f210d8467cf3114124633f575958b65398" } # branch: spiceai-55-patches
 delta_kernel = { version = "0.27.1", features = [
     "default-engine-base",
     "arrow-59",
@@ -632,7 +632,7 @@ delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-r
 # Cargo.toml does exactly that (`datafusion-federation = "0.5"`), which
 # resolved to a real crates.io 0.5.7 release alongside our patched 0.4.2 until
 # this entry was added. Must stay on the same rev as the entry above.
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "40fefe6426addce7864b80261bdf771ddb19d8ab" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7e52a9740fc3447fe9ea8e4edd51dea696b45758" }
 
 # duckdb 1.4.4 on arrow 59. branch: spiceai-1.4.4-patches
 # datafusion-table-providers pins this same rev as a direct git dep, so both
@@ -656,7 +656,7 @@ iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git",
 # [patch.crates-io] block higher up in this file. Keeping those here would be
 # a duplicate-key error.
 
-# arrow-rs 59.2.0 with spice patches. branch: spiceai-59-patches
+# arrow-rs 59.3.0 with spice patches. branch: spiceai-59-patches
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "16974504b7f1776971f4fb20bbe355b09d090a0d" }
 arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "16974504b7f1776971f4fb20bbe355b09d090a0d" }
 arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "16974504b7f1776971f4fb20bbe355b09d090a0d" }

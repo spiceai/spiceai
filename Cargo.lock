@@ -6879,7 +6879,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.5.7"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=40fefe6426addce7864b80261bdf771ddb19d8ab#40fefe6426addce7864b80261bdf771ddb19d8ab"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=7e52a9740fc3447fe9ea8e4edd51dea696b45758#7e52a9740fc3447fe9ea8e4edd51dea696b45758"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -7381,7 +7381,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "datafusion",
@@ -7398,7 +7398,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-adbc"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7422,7 +7422,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-common"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7457,7 +7457,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-duckdb"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -7486,7 +7486,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-mongodb"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -7510,7 +7510,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-mysql"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "async-stream",
@@ -7535,7 +7535,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-postgres"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7572,7 +7572,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers-sqlite"
 version = "0.13.1"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=9845ca1d539a8c071a4d04197e9081dff62a3990#9845ca1d539a8c071a4d04197e9081dff62a3990"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b483e9f210d8467cf3114124633f575958b65398#b483e9f210d8467cf3114124633f575958b65398"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -19404,7 +19404,7 @@ dependencies = [
 [[package]]
 name = "sea-query"
 version = "1.0.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=985eec78d1a4417b5933e57aac1f39e4470f9473#985eec78d1a4417b5933e57aac1f39e4470f9473"
+source = "git+https://github.com/spiceai/sea-query.git?rev=f6725070c491f3358688805f517a7c1688f32b95#f6725070c491f3358688805f517a7c1688f32b95"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -19417,7 +19417,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "1.0.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=985eec78d1a4417b5933e57aac1f39e4470f9473#985eec78d1a4417b5933e57aac1f39e4470f9473"
+source = "git+https://github.com/spiceai/sea-query.git?rev=f6725070c491f3358688805f517a7c1688f32b95#f6725070c491f3358688805f517a7c1688f32b95"
 dependencies = [
  "darling 0.20.11",
  "heck 0.4.1",

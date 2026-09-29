@@ -99,6 +99,7 @@ serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
+# branch: spiceai-59-patches
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "9d452dc9015cf11d096dd49a6d7dda94e8b28ede", features = [
     "tls",
 ], optional = true } # branch: spiceai-59-patches

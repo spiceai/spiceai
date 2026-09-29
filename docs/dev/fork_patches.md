@@ -105,8 +105,8 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `fe5f49581968880c664a1466f234fec2301ca7bf` | `spiceai-maint-24-patches` (TEMPORARY: spiceai/arrow-adbc spiceai-maint-24-patches → spiceai-maint-24 fork PR) |
-| [arrow-rs](#arrow-rs) | `16974504b7f1776971f4fb20bbe355b09d090a0d` | `spiceai-59-patches` (TEMPORARY: spiceai/arrow-rs spiceai-59-patches → spiceai-59 fork PR)|
+| [arrow-adbc](#arrow-adbc) | `fe5f49581968880c664a1466f234fec2301ca7bf` | `spiceai-maint-24-patches` (TEMPORARY: spiceai/arrow-adbc#5) |
+| [arrow-rs](#arrow-rs) | `16974504b7f1776971f4fb20bbe355b09d090a0d` | `spiceai-59-patches` (TEMPORARY: spiceai/arrow-rs#28)|
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -114,23 +114,23 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `5979a0fe3376e2b79dcbda28fc459ab72dae57a3` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion spiceai-55-patches → spiceai-55 fork PR)|
-| [datafusion-ballista](#datafusion-ballista) | `72781d6d5267fd52756f57e3cc670272f3de4872` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-ballista spiceai-55-patches → spiceai-55 fork PR) |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `40fefe6426addce7864b80261bdf771ddb19d8ab` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-federation spiceai-55-patches → spiceai-55 fork PR) |
+| [datafusion](#datafusion) | `5979a0fe3376e2b79dcbda28fc459ab72dae57a3` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion#236)|
+| [datafusion-ballista](#datafusion-ballista) | `72781d6d5267fd52756f57e3cc670272f3de4872` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-ballista#66) |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `7e52a9740fc3447fe9ea8e4edd51dea696b45758` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-federation#86) |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `9845ca1d539a8c071a4d04197e9081dff62a3990` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-table-providers spiceai-55-patches → spiceai-55 fork PR)|
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b483e9f210d8467cf3114124633f575958b65398` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-table-providers#78)|
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27`|
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `875974763e847eb4dc4e071f875f5bbecdd63b47` | `spiceai-1.4.4-patches` (TEMPORARY: spiceai/duckdb-rs spiceai-1.4.4-patches → spiceai-1.4.4 fork PR) |
+| [duckdb-rs](#duckdb-rs) | `875974763e847eb4dc4e071f875f5bbecdd63b47` | `spiceai-1.4.4-patches` (TEMPORARY: spiceai/duckdb-rs#48) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `b4e000b62c1477bf5a6479c8196040677134509c` | `spiceai-0.10.0-df-55-patches` (TEMPORARY: spiceai/iceberg-rust spiceai-0.10.0-df-55-patches → spiceai-0.10.0-df-55 fork PR)|
+| [iceberg-rust](#iceberg-rust) | `b4e000b62c1477bf5a6479c8196040677134509c` | `spiceai-0.10.0-df-55-patches` (TEMPORARY: spiceai/iceberg-rust#47)|
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
-| [sea-query](#sea-query) | `985eec78d1a4417b5933e57aac1f39e4470f9473` | `spiceai-1.0.1-patches` (TEMPORARY: spiceai/sea-query spiceai-1.0.1-patches → spiceai-1.0.1 fork PR)|
-| [snowflake-rs](#snowflake-rs) | `354f35c414c89c7dca5c2ce5e000bd7a2948ad39` | `spiceai-59-patches` (TEMPORARY: spiceai/snowflake-rs spiceai-59-patches → spiceai-59 fork PR)|
-| [spark-connect-rs](#spark-connect-rs) | `9d452dc9015cf11d096dd49a6d7dda94e8b28ede` | `spiceai-59-patches` (TEMPORARY: spiceai/spark-connect-rs spiceai-59-patches → spiceai-59 fork PR) |
+| [sea-query](#sea-query) | `f6725070c491f3358688805f517a7c1688f32b95` | `spiceai-1.0.1-patches` (TEMPORARY: spiceai/sea-query#3)|
+| [snowflake-rs](#snowflake-rs) | `354f35c414c89c7dca5c2ce5e000bd7a2948ad39` | `spiceai-59-patches` (TEMPORARY: spiceai/snowflake-rs#12)|
+| [spark-connect-rs](#spark-connect-rs) | `9d452dc9015cf11d096dd49a6d7dda94e8b28ede` | `spiceai-59-patches` (TEMPORARY: spiceai/spark-connect-rs#14) |
 | [text-embeddings-inference](#mistralrs-and-text-embeddings-inference) | `ac4e457936bc11c9b4fee453f2be33133d3146d8` | `spiceai` |
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
