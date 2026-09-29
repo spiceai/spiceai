@@ -209,13 +209,20 @@ fn json_get_int_rejects_every_non_integer() {
     for value in [
         "1.5",  // a float is not an integer
         "-1.5", // and neither is a negative one
-        "-1e3", // nor an exponent form, whatever it evaluates to
         "true", "false", "null", "{}", "[]",
         r#""abc""#, // a string that does not parse as an integer
         r#""1.5""#, // including one that parses only as a float
     ] {
         assert_eq!(get_int(&doc(value), A), None, "json_get_int over {value}");
     }
+}
+
+/// An integral JSON float reads as an integer (upstream #147); a fractional one does not.
+#[test]
+fn json_get_int_reads_an_integral_float() {
+    assert_eq!(get_int(&doc("-1e3"), A), Some(-1000));
+    assert_eq!(get_int(&doc("2.0"), A), Some(2));
+    assert_eq!(get_int(&doc("2.5"), A), None);
 }
 
 #[test]
@@ -266,12 +273,23 @@ fn a_missing_value_is_null_not_an_error() {
         None,
         "index on a non-array"
     );
-    assert_eq!(get_int("[-1]", &[Path::Index(-1)]), None, "negative index");
+    assert_eq!(
+        get_int("[-1]", &[Path::Index(-2)]),
+        None,
+        "negative index past the start"
+    );
     assert_eq!(
         get_float(&doc("-1.5"), &[Path::Key("b")]),
         None,
         "wrong key"
     );
+}
+
+/// A negative index counts from the end of the array, as in Postgres (upstream #128).
+#[test]
+fn a_negative_index_counts_from_the_end() {
+    assert_eq!(get_int("[10, 20, 30]", &[Path::Index(-1)]), Some(30));
+    assert_eq!(get_int("[10, 20, 30]", &[Path::Index(-3)]), Some(10));
 }
 
 #[test]

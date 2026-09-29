@@ -273,13 +273,15 @@ datafusion-functions = "55.1.0"
 datafusion-functions-aggregate = "55.1.0"
 datafusion-functions-aggregate-common = "55.1.0"
 datafusion-functions-nested = "55.1.0"
-# Fork dropped for the DF55 bump: upstream's v0.55.3 tag contains all three
+# Fork dropped for the DF55 bump: upstream's v0.55.x tags contain all three
 # Spice-relevant fixes from the spiceai-54 fork (ca9d4c6 #125, 774c570 #124,
 # 2d7a86f #121; confirmed ancestors via `git merge-base --is-ancestor`), so
 # there's nothing left to carry and the fork's own "54"-only version
 # requirement on datafusion was the source of a duplicate-major-version
 # resolution (datafusion@54.1.0 alongside our patched 55.1.0).
-datafusion-functions-json = "0.55.3"
+# One release behind upstream's latest (v0.55.6). A negative array index counts from the end
+# since 0.55.1 (upstream #128), as in Postgres.
+datafusion-functions-json = "0.55.5"
 datafusion-physical-expr = "55.1.0"
 datafusion-physical-expr-adapter = "55.1.0"
 datafusion-physical-expr-common = "55.1.0"

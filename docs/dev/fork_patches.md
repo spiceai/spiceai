@@ -117,7 +117,6 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `5979a0fe3376e2b79dcbda28fc459ab72dae57a3` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion#236)|
 | [datafusion-ballista](#datafusion-ballista) | `72781d6d5267fd52756f57e3cc670272f3de4872` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-ballista#66) |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `7e52a9740fc3447fe9ea8e4edd51dea696b45758` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-federation#86) |
-| [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b483e9f210d8467cf3114124633f575958b65398` | `spiceai-55-patches` (TEMPORARY: spiceai/datafusion-table-providers#78)|
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27`|
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
@@ -364,28 +363,6 @@ crates are replaced together through `[patch.crates-io]`: the patch changes an
 |---|---|---|---|
 | `AdbcStatementCancel` issued without the statement lock, and statement release moved from the clonable handle to the shared inner (fork PR #4) | `cancel` is serialized behind the `execute` it exists to interrupt, so it returns only once the query has finished on its own and cancels nothing. A Flight client that goes away then leaves the remote query running — billing, on BigQuery — and holds its pooled connection for the rest of that query's life, which exhausts a small pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection` |
 | Arrow floor raised to 58 (fork PR #4) | The requirement spans 53 to 58, so a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — may resolve the ADBC crates onto it while the rest of the workspace runs on 58. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the floor is missing |
-
-## datafusion-functions-json
-
-Upstream
-[datafusion-contrib/datafusion-functions-json](https://github.com/datafusion-contrib/datafusion-functions-json),
-branch `spiceai-54`.
-
-**No Spice patches.** The branch is upstream `main` unmodified. It is pinned rather
-than taken from crates.io because three correctness fixes landed upstream after
-`v0.54.2` and have not been published; the pin exists only to carry them, and should
-be dropped for a plain version requirement as soon as a release contains them.
-
-Every one of the three returns a wrong answer rather than an error, so the loss mode
-if the pin is dropped early is silent. All three guards live in one file, and the
-`json_get_int`/`json_get_float` rows cover the sign and type matrix rather than only
-the case named:
-
-| Patch | What breaks if it is lost | Loss | Guard |
-|---|---|---|---|
-| `json_get_int` / `json_get_float` read negative numbers (upstream PR #125) | Every negative JSON number reads as NULL — `json_get_int('{"a": -1}', 'a')` is NULL, not `-1`. No error, no warning | silent (wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::json_get_int_reads_negative_numbers`, `::json_get_float_reads_negative_numbers` |
-| Integers outside jiter's `i64` fast path (upstream PR #124) | `json_get` panics on an in-range integer jiter hands back as a big integer, taking the query down; `json_get_int` reads the same value as NULL | silent (panic, and wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::json_get_reads_an_integer_outside_the_fast_path_without_panicking`, `::json_get_int_spans_the_whole_i64_range` |
-| Nested `json_as_text` is not flattened (upstream PR #121) | `json_as_text(json_as_text(x, 'a'), 'b')` folds into one two-element path, which reads the wrong value whenever the inner result is itself a JSON document | silent (wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::a_json_string_holding_json_is_read_one_level_at_a_time` |
 
 ## duckdb-rs
 
