@@ -565,7 +565,10 @@ pub enum SnapshotUploadError {
         source: std::io::Error,
     },
     #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
-    PrepareUpload { source: engine::SnapshotEngineError },
+    PrepareUpload {
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     AdapterDisabled { dataset: String },
     #[snafu(display("Failed to create snapshot archive at {}: {source}", path.display()))]
@@ -1491,7 +1494,9 @@ impl SnapshotManager {
             .snapshot_engine
             .prepare_directory_snapshot(dirs, &self.dataset_name)
             .await
-            .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            .map_err(|source| SnapshotUploadError::PrepareUpload {
+                source: Box::new(source),
+            })?;
         let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
         let extras: Vec<(String, Vec<u8>)> = plan
             .extra_entries
