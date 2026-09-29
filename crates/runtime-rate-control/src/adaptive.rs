@@ -184,9 +184,6 @@ pub struct AdaptiveController {
     half_life: Duration,
     /// The origin this controller governs, named in the log lines.
     origin: String,
-    /// Coefficient at which the origin's limiting quota charges its full capacity.
-    floor_coefficient: Option<f64>,
-
     /// The decaying window and the log state it drives, under one lock so the
     /// coefficient and the transition decision cannot disagree.
     state: Mutex<ControllerState>,
@@ -242,7 +239,7 @@ struct ControllerState {
     /// real throttling. How near the boundary a reading sits depends on how much
     /// traffic the window holds, which [`Confidence`] measures directly.
     phases: PhaseChangeLog<ThrottleState>,
-    floor_since: Option<Instant>,
+    throttled_since: Option<Instant>,
 }
 
 impl AdaptiveController {
@@ -255,7 +252,6 @@ impl AdaptiveController {
             failure_threshold: control.failure_threshold,
             half_life: control.window,
             origin: origin.into(),
-            floor_coefficient: None,
             state: Mutex::new(ControllerState {
                 window: DecayWindow {
                     requests: 0.0,
@@ -264,14 +260,9 @@ impl AdaptiveController {
                     last_update: None,
                 },
                 phases: PhaseChangeLog::new(ThrottleState::Healthy, control.window),
-                floor_since: None,
+                throttled_since: None,
             }),
         }
-    }
-
-    pub(crate) fn with_floor_coefficient(mut self, coefficient: Option<f64>) -> Self {
-        self.floor_coefficient = coefficient;
-        self
     }
 
     #[must_use]
@@ -279,27 +270,24 @@ impl AdaptiveController {
         self.half_life
     }
 
-    /// Whether the origin has continuously charged full capacity for a window.
+    /// Whether adaptive admission has continuously stayed reduced for `duration`.
     #[must_use]
-    pub fn at_floor_for_window(&self) -> bool {
+    pub fn throttled_for(&self, duration: Duration) -> bool {
         let now = Instant::now();
         let mut state = self.state.lock();
         state.window.decay_to(now, self.half_life);
-        self.update_floor(&mut state, now);
+        self.update_throttled_since(&mut state, now);
         state
-            .floor_since
-            .is_some_and(|since| now.duration_since(since) >= self.half_life)
+            .throttled_since
+            .is_some_and(|since| now.duration_since(since) >= duration)
     }
 
-    fn update_floor(&self, state: &mut ControllerState, now: Instant) {
+    fn update_throttled_since(&self, state: &mut ControllerState, now: Instant) {
         let coefficient = self.coefficient_of(state.window.requests, state.window.accepts);
-        if self
-            .floor_coefficient
-            .is_some_and(|floor| coefficient < 1.0 && coefficient <= floor)
-        {
-            state.floor_since.get_or_insert(now);
+        if ThrottleState::of(coefficient) == ThrottleState::Throttling {
+            state.throttled_since.get_or_insert(now);
         } else {
-            state.floor_since = None;
+            state.throttled_since = None;
         }
     }
 
@@ -341,15 +329,15 @@ impl AdaptiveController {
         let mut state = self.state.lock();
         state.window.decay_to(now, self.half_life);
         // Decay only raises the coefficient between outcomes. Check before and
-        // after the update so an idle recovery cannot count as time at the floor.
-        self.update_floor(&mut state, now);
+        // after the update so an idle recovery cannot count as time throttled.
+        self.update_throttled_since(&mut state, now);
         state.window.requests += 1.0;
         match outcome {
             RequestOutcome::Success => state.window.accepts += 1.0,
             RequestOutcome::Slow => state.window.slow += 1.0,
             RequestOutcome::Failure => {}
         }
-        self.update_floor(&mut state, now);
+        self.update_throttled_since(&mut state, now);
 
         let (requests, accepts) = (state.window.requests, state.window.accepts);
         let observed = ThrottleState::of(self.coefficient_of(requests, accepts));
@@ -402,7 +390,7 @@ impl AdaptiveController {
         let (requests, accepts) = {
             let mut state = self.state.lock();
             state.window.decay_to(now, self.half_life);
-            self.update_floor(&mut state, now);
+            self.update_throttled_since(&mut state, now);
             (state.window.requests, state.window.accepts)
         };
 
@@ -515,30 +503,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn floor_requires_an_uninterrupted_full_window() {
-        let controller = enabled(0.1).with_floor_coefficient(Some(0.5));
+    async fn diagnostic_requires_uninterrupted_throttling() {
+        let controller = enabled(0.1);
+        let duration = DEFAULT_ADAPTIVE_WINDOW * 2;
         for _ in 0..10 {
             controller.record(RequestOutcome::Slow);
         }
-        assert!(!controller.at_floor_for_window());
-        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW).await;
-        assert!(controller.at_floor_for_window());
-        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW * 10).await;
+        assert!(!controller.throttled_for(duration));
+        tokio::time::advance(
+            duration
+                .checked_sub(Duration::from_nanos(1))
+                .expect("diagnostic duration exceeds one nanosecond"),
+        )
+        .await;
+        assert!(!controller.throttled_for(duration));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(controller.throttled_for(duration));
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW * 64).await;
         assert!(
-            !controller.at_floor_for_window(),
-            "idle decay recovers above the floor"
+            !controller.throttled_for(duration),
+            "idle decay recovers full admission"
         );
         for _ in 0..10 {
             controller.record(RequestOutcome::Slow);
         }
         assert!(
-            !controller.at_floor_for_window(),
-            "a new floor episode restarts the window"
+            !controller.throttled_for(duration),
+            "a new throttling episode restarts the observation period"
         );
+        tokio::time::advance(duration).await;
+        assert!(controller.throttled_for(duration));
         for _ in 0..100 {
             controller.record(RequestOutcome::Success);
         }
-        assert!(!controller.at_floor_for_window());
+        assert!(!controller.throttled_for(duration));
     }
 
     #[test]

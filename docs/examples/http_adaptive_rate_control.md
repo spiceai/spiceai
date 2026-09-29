@@ -186,15 +186,18 @@ When slow responses contribute to throttling, the warning names both causes:
 WARN Upstream 'https://api.example.com' is failing, or responding slower than its `rate_control_slow_response_threshold`, on more than the 10% `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control
 ```
 
-If the origin remains at its floor for a full `rate_control_window` and a dataset
-still returns slow responses, the following warning is emitted once for that dataset:
+If a dataset keeps returning slow responses and the origin's admission remains
+reduced for two consecutive `rate_control_window` intervals, the following warning
+is emitted once for that dataset. With the default `10s` window, this requires at
+least `20s` and is evaluated when a slow response completes. A non-slow outcome for
+that dataset or recovery to full admission restarts the observation period.
 
 ```text
-WARN Responses from 'https://api.example.com' for dataset 'items' still take longer than its 1s `rate_control_slow_response_threshold` at the minimum request rate, so the threshold may be below this API's normal response time. Check `http_client_request_duration_ms` and raise `rate_control_slow_response_threshold` for dataset 'items'.
+WARN Responses from 'https://api.example.com' for dataset 'items' still take longer than its 1s `rate_control_slow_response_threshold` while adaptive rate control is reducing requests, so the threshold may be below this API's normal response time. Check `http_client_request_duration_ms` and raise `rate_control_slow_response_threshold` for dataset 'items'.
 ```
 
 Increase the threshold when the histogram shows that it is below normal response
-time. The floor retains recovery probes; once the origin responds quickly again,
+time. Recovery probes continue while throttled; once the origin responds quickly again,
 the admission ratio recovers toward `1`.
 
 Support is limited to dynamic HTTPS API and GraphQL datasets on a single node.

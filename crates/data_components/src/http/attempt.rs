@@ -24,6 +24,8 @@ use runtime_rate_control::{RateController, RequestOutcome};
 use tokio::time::Instant;
 use url::Url;
 
+const SLOW_RESPONSE_WARNING_WINDOWS: u32 = 2;
+
 /// Canonical origin key shared by admission and HTTP attempt metrics.
 #[must_use]
 pub fn origin_key(url: &Url) -> String {
@@ -52,14 +54,19 @@ struct SlowWarning {
 }
 
 impl SlowWarning {
-    fn observe(&mut self, outcome: RequestOutcome, window: Duration, at_floor: bool) -> bool {
+    fn observe(
+        &mut self,
+        outcome: RequestOutcome,
+        duration: Duration,
+        sustained_throttling: bool,
+    ) -> bool {
         let now = Instant::now();
         if outcome != RequestOutcome::Slow {
             self.slow_since = None;
             return false;
         }
         let since = *self.slow_since.get_or_insert(now);
-        if !self.warned && at_floor && now.duration_since(since) >= window {
+        if !self.warned && sustained_throttling && now.duration_since(since) >= duration {
             self.warned = true;
             return true;
         }
@@ -106,10 +113,11 @@ impl HttpAttemptObserver {
             controller.record_outcome(outcome);
             if let Some(window) = controller.adaptive_window()
                 && let Some(threshold) = self.slow_threshold
-                && self
-                    .warning
-                    .lock()
-                    .observe(outcome, window, controller.at_floor_for_window())
+                && self.warning.lock().observe(
+                    outcome,
+                    window.saturating_mul(SLOW_RESPONSE_WARNING_WINDOWS),
+                    controller.throttled_for(window.saturating_mul(SLOW_RESPONSE_WARNING_WINDOWS)),
+                )
             {
                 tracing::warn!(
                     "{}",
@@ -165,7 +173,7 @@ fn classify(
 
 fn slow_threshold_warning(origin: &str, dataset: &str, threshold: Duration) -> String {
     format!(
-        "Responses from '{origin}' for dataset '{dataset}' still take longer than its {}s `rate_control_slow_response_threshold` at the minimum request rate, so the threshold may be below this API's normal response time. Check `http_client_request_duration_ms` and raise `rate_control_slow_response_threshold` for dataset '{dataset}'.",
+        "Responses from '{origin}' for dataset '{dataset}' still take longer than its {}s `rate_control_slow_response_threshold` while adaptive rate control is reducing requests, so the threshold may be below this API's normal response time. Check `http_client_request_duration_ms` and raise `rate_control_slow_response_threshold` for dataset '{dataset}'.",
         threshold.as_secs_f64()
     )
 }
@@ -227,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn warnings_are_once_per_dataset_after_continued_slow_responses_at_floor() {
+    async fn warnings_are_once_per_dataset_after_two_slow_throttled_windows() {
         let url = Url::parse("https://api.example.com/items").expect("test URL");
         let slow =
             HttpAttemptObserver::new(&url, "items".to_string(), Some(Duration::from_millis(100)));
@@ -249,6 +257,9 @@ mod tests {
             slow.record(Some(&controller), elapsed, Some(StatusCode::OK), true);
         }
         assert!(!slow.warning.lock().warned);
+        tokio::time::advance(window).await;
+        slow.record(Some(&controller), elapsed, Some(StatusCode::OK), true);
+        assert!(!slow.warning.lock().warned, "one window is insufficient");
         tokio::time::advance(window).await;
         slow.record(Some(&controller), elapsed, Some(StatusCode::OK), true);
         assert!(slow.warning.lock().warned);
@@ -285,11 +296,85 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn warning_requires_continuous_slow_responses_and_sustained_throttling() {
+        let duration = Duration::from_secs(20);
+        for interrupted_by in [RequestOutcome::Success, RequestOutcome::Failure] {
+            let mut warning = SlowWarning::default();
+            assert!(!warning.observe(RequestOutcome::Slow, duration, true));
+            tokio::time::advance(duration / 2).await;
+            assert!(!warning.observe(interrupted_by, duration, true));
+            tokio::time::advance(duration).await;
+            assert!(!warning.observe(RequestOutcome::Slow, duration, true));
+            tokio::time::advance(
+                duration
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("diagnostic duration exceeds one nanosecond"),
+            )
+            .await;
+            assert!(!warning.observe(RequestOutcome::Slow, duration, true));
+            tokio::time::advance(Duration::from_nanos(1)).await;
+            assert!(warning.observe(RequestOutcome::Slow, duration, true));
+        }
+        let mut warning = SlowWarning::default();
+        assert!(!warning.observe(RequestOutcome::Slow, duration, false));
+        tokio::time::advance(duration * 2).await;
+        assert!(
+            !warning.observe(RequestOutcome::Slow, duration, false),
+            "slow responses alone do not imply sustained throttling"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failures_fast_responses_and_disabled_thresholds_do_not_warn() {
+        let url = Url::parse("https://api.example.com/items").expect("test URL");
+        let window = Duration::from_secs(10);
+        let threshold = Some(Duration::from_secs(2));
+        for (threshold, status, elapsed) in [
+            (None, StatusCode::OK, Duration::from_secs(3)),
+            (threshold, StatusCode::OK, Duration::from_secs(1)),
+            (
+                threshold,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Duration::from_secs(3),
+            ),
+        ] {
+            let observer = HttpAttemptObserver::new(&url, "items".to_string(), threshold);
+            let controller = RateController::builder()
+                .with_max_concurrent_requests(4)
+                .with_adaptive(
+                    runtime_rate_control::AdaptiveRateControl::new(0.1, window)
+                        .expect("adaptive config"),
+                    "https://api.example.com:443",
+                )
+                .build();
+            for _ in 0..20 {
+                observer.record(Some(&controller), elapsed, Some(status), true);
+                tokio::time::advance(Duration::from_secs(3)).await;
+            }
+            assert!(!observer.warning.lock().warned);
+        }
+        let observer = HttpAttemptObserver::new(&url, "static".to_string(), threshold);
+        let controller = RateController::builder()
+            .with_max_concurrent_requests(4)
+            .build();
+        for _ in 0..20 {
+            observer.record(
+                Some(&controller),
+                Duration::from_secs(3),
+                Some(StatusCode::OK),
+                true,
+            );
+            tokio::time::advance(Duration::from_secs(3)).await;
+        }
+        assert!(!observer.warning.lock().warned);
+    }
+
     #[test]
     fn warning_names_the_dataset_and_fix() {
         assert_eq!(
             slow_threshold_warning("https://api.example.com", "items", Duration::from_secs(1)),
-            "Responses from 'https://api.example.com' for dataset 'items' still take longer than its 1s `rate_control_slow_response_threshold` at the minimum request rate, so the threshold may be below this API's normal response time. Check `http_client_request_duration_ms` and raise `rate_control_slow_response_threshold` for dataset 'items'."
+            "Responses from 'https://api.example.com' for dataset 'items' still take longer than its 1s `rate_control_slow_response_threshold` while adaptive rate control is reducing requests, so the threshold may be below this API's normal response time. Check `http_client_request_duration_ms` and raise `rate_control_slow_response_threshold` for dataset 'items'."
         );
     }
 }
