@@ -102,6 +102,31 @@ impl SplitBlockBloomFilter {
         }
     }
 
+    /// The filter's bits as 32-bit words, eight per block, for persistence.
+    /// Taken with relaxed loads, like [`Clone`].
+    #[must_use]
+    pub fn to_words(&self) -> Vec<u32> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.0.iter().map(|word| word.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// The inverse of [`Self::to_words`]; `None` unless `words` is a whole,
+    /// non-zero number of blocks.
+    #[must_use]
+    pub fn from_words(words: &[u32]) -> Option<Self> {
+        if words.is_empty() || !words.len().is_multiple_of(8) {
+            return None;
+        }
+        Some(Self {
+            blocks: words
+                .chunks_exact(8)
+                .map(|chunk| Block(array::from_fn(|i| AtomicU32::new(chunk[i]))))
+                .collect(),
+        })
+    }
+
     /// Number of items this filter was sized for at the design FPR.
     #[must_use]
     pub fn capacity(&self) -> usize {
@@ -156,6 +181,22 @@ impl SplitBlockBloomFilter {
         }
     }
 
+    /// [`Self::insert`], returning whether it set any bit not already set.
+    /// `false` means the filter already held every bit of `hash`, so the
+    /// insert left its false-positive rate unchanged: a key inserted again,
+    /// or (rarely) a new key that collides with bits already set.
+    #[inline]
+    #[must_use = "use `insert` when whether a bit was new does not matter"]
+    pub fn insert_new(&self, hash: u64) -> bool {
+        let block = &self.blocks[self.block_index(hash)];
+        let masks = Self::masks(hash);
+        let mut new = false;
+        for (word, mask) in block.0.iter().zip(masks) {
+            new |= word.fetch_or(mask, Ordering::Relaxed) & mask != mask;
+        }
+        new
+    }
+
     /// Checks whether a hash might be in the filter.
     ///
     /// Returns `false` if the item is definitely not present; `true` if it
@@ -195,6 +236,17 @@ impl Clone for SplitBlockBloomFilter {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn insert_new_reports_only_new_bits() {
+        let filter = SplitBlockBloomFilter::new(100);
+        assert!(filter.insert_new(0x1234_5678_9abc_def0));
+        assert!(
+            !filter.insert_new(0x1234_5678_9abc_def0),
+            "the same hash sets no new bit"
+        );
+        assert!(filter.might_contain(0x1234_5678_9abc_def0));
+    }
     use super::*;
     use crate::hash_key;
 
