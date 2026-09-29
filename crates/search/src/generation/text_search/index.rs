@@ -44,8 +44,8 @@ use crate::generation::text_search::query::FullTextSearchQuery;
 use crate::generation::text_search::util::{with_json_subset_column, without_columns};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
-    InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
-    TextSearchIndexingSnafu,
+    IndexDirectoryCreationSnafu, InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu,
+    PersistedIndexMissingColumnsSnafu, TextSearchIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
@@ -653,6 +653,13 @@ impl FullTextDatabaseIndex {
         )?;
 
         let index = if let Some(path) = &directory {
+            // `create_in_dir` opens `path` with `MmapDirectory::open`, which requires the
+            // directory to already exist — it never creates one. That's fine for the default,
+            // runtime-managed path (`make_spice_data_sub_directory` creates it), but an
+            // explicit `index_directory` pointing at a not-yet-existing path would otherwise
+            // fail cold bootstrap with a tantivy `DoesNotExist` error instead of just creating it.
+            std::fs::create_dir_all(path)
+                .context(IndexDirectoryCreationSnafu { path: path.clone() })?;
             match tantivy::Index::create_in_dir(path, tantivy_schema.clone()) {
                 Ok(idx) => idx,
                 Err(TantivyError::IndexAlreadyExists) => {

@@ -132,6 +132,12 @@ pub enum Error {
     #[snafu(display("Cannot restore a full-text snapshot because index directory '{}' has no parent", path.display()))]
     SnapshotDirectoryParent { path: std::path::PathBuf },
 
+    #[snafu(display("Failed to create the full-text index directory '{}': {source}", path.display()))]
+    IndexDirectoryCreation {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
     FailedToRetrieveDataFromIndex { source: TantivyError },
 

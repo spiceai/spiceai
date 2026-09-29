@@ -25,7 +25,7 @@ use super::{
 use crate::metric::Metrics;
 use crate::param::Params;
 #[cfg(feature = "schemars")]
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
@@ -870,11 +870,39 @@ pub struct ApiKeyAuth {
 ///
 /// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
 /// constant-time comparison via the `subtle` crate to prevent timing attacks.
+///
+/// YAML/JSON configuration accepts a string. Optional `:ro` (default) or `:rw`
+/// suffix selects capability (for example `sk_live:rw`).
 #[derive(Clone)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+}
+
+/// Aligns the generated Spicepod JSON Schema with [`Deserialize`] / [`Serialize`],
+/// which accept and emit API keys as strings (not externally-tagged enum objects).
+#[cfg(feature = "schemars")]
+impl JsonSchema for ApiKey {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ApiKey".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::ApiKey").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "description": "API key for authentication. Keys can be read-only or read-write.
+The key value is redacted in Debug output to prevent credential leakage.
+
+Pass the key as a string. Optional `:ro` (default) or `:rw` suffix selects capability.
+
+All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+constant-time comparison via the `subtle` crate to prevent timing attacks.",
+        })
+    }
 }
 
 /// Constant-time comparison for `ApiKey` to `ApiKey`.
@@ -1546,6 +1574,23 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 mod tests {
     use super::*;
     use yaml;
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn test_api_key_json_schema_is_string() {
+        use schemars::schema_for;
+        let schema = schema_for!(ApiKey);
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        assert_eq!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "ApiKey JSON Schema must match string Deserialize/Serialize: {value}"
+        );
+        assert!(
+            value.get("oneOf").is_none(),
+            "ApiKey must not use externally-tagged object oneOf: {value}"
+        );
+    }
 
     #[test]
     fn test_deserialize_api_keys() {

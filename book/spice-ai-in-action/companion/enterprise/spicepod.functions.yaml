@@ -1,0 +1,20 @@
+version: v1
+kind: Spicepod
+name: northstar-functions
+runtime:
+  functions:
+    enabled: true
+functions:
+- name: net_cents
+  from: sql
+  description: Subtract an already reconciled refund amount from gross cents.
+  volatility: immutable
+  as_tool: false
+  signature:
+    args:
+    - name: gross
+      type: int64
+    - name: refund
+      type: int64
+    returns: int64
+  body: gross - refund

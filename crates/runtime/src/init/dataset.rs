@@ -1120,7 +1120,7 @@ impl Runtime {
             {
                 manager.set_indexes(indexes).await;
                 if let Err(error) = manager
-                    .restore_indexes_from_snapshot(&info.index_snapshots, &table_provider)
+                    .restore_indexes_from_snapshot(info, &table_provider)
                     .await
                 {
                     // A restored dataset with `refresh_mode: full` and no `refresh_check_interval`
