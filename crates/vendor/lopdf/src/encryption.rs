@@ -896,7 +896,7 @@ mod tests {
             // Reencode cipher from a hex string to a Vec<u8>
             let cipher = cipher.as_bytes();
             let mut cipher_bytes = Vec::with_capacity(cipher.len() / 2);
-            for hex_pair in cipher.chunks_exact(2) {
+            for hex_pair in cipher.as_chunks::<2>().0 {
                 cipher_bytes
                     .push(u8::from_str_radix(std::str::from_utf8(hex_pair).unwrap(), 16).unwrap());
             }

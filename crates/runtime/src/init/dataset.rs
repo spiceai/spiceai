@@ -478,7 +478,6 @@ impl Runtime {
         crate::dataconnector::sink::accelerated_checkpoint_schema(&dataset).await
     }
 
-    #[expect(clippy::result_large_err)]
     fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
             .clone()
@@ -633,7 +632,7 @@ impl Runtime {
                 .register_deferred_dataset(Arc::clone(&ds), init, deferred_schema)
                 .await
                 .map_err(|source| crate::Error::UnableToAttachDataConnector {
-                    source,
+                    source: Box::new(source),
                     data_connector: ds.source().to_string(),
                     connector_component: crate::dataconnector::ConnectorComponent::from(
                         ds.as_ref(),
@@ -2426,7 +2425,6 @@ fn configured_retention_setting(acceleration: &Acceleration) -> Option<String> {
 /// arrives afterwards reports a loss it was supposed to prevent.
 ///
 /// The decision itself is [`validate_dataset`], which touches nothing.
-#[expect(clippy::result_large_err)]
 fn preflight_dataset(
     ds: &Arc<Dataset>,
     status: &status::RuntimeStatus,
@@ -2477,7 +2475,6 @@ fn refuse_permanently(
     .build()
 }
 
-#[expect(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
         return Err(FullTextSearchRequiresAccelerationSnafu {

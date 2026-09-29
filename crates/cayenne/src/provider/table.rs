@@ -885,7 +885,12 @@ fn deserialize_delete_keys_from_ipc(
                     rest.len()
                 )));
             }
-            Ok(rest.chunks_exact(8).map(bytes_key).collect())
+            Ok(rest
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| bytes_key(chunk))
+                .collect())
         }
         // cycle-5 TASK 2a: LZ4-compressed Arrow IPC (composite keys).
         tombstone_format::COMPRESSED_IPC => deserialize_delete_keys_from_arrow_ipc(rest),
@@ -21652,6 +21657,7 @@ impl CayenneTableProvider {
     #[inline]
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "release no-op stub mirrors the async debug-build signature so \
                   call sites `.await` it unconditionally"
     )]
@@ -51663,7 +51669,7 @@ mod tests {
             payload_flat.extend_from_slice(&buf);
         }
         let payload =
-            arrow::array::BinaryArray::from_iter_values(payload_flat.chunks_exact(PAYLOAD_LEN));
+            arrow::array::BinaryArray::from_iter_values(payload_flat.as_chunks::<PAYLOAD_LEN>().0);
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![

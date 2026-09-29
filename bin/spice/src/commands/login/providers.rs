@@ -18,7 +18,7 @@ limitations under the License.
 
 // Async functions match the interface used by the main login command dispatcher,
 // even though most don't actually need to await anything.
-#![allow(clippy::unused_async)]
+#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
