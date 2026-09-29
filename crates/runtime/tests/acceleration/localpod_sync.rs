@@ -53,7 +53,7 @@ use tokio::fs;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{runtime_ready_check, runtime_ready_check_with_timeout, test_request_context},
 };
 
 const CSV_HEADER: &str = "id,name\n";
@@ -781,6 +781,56 @@ async fn test_localpod_passthrough_child_follows_parent_removed_and_added_back()
                 "the query path should answer from the re-added parent's rows, not from a plan \
                  or result cached over the removed parent's table"
             );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Every `localpod` dataset reading from one parent must load at startup, and so must a
+/// `localpod` dataset listed ahead of the `localpod` dataset it reads from.
+///
+/// Regression test for <https://github.com/spiceai/spiceai/issues/13087>: startup chained each
+/// `localpod` dataset behind its parent by taking the parent's load out of the queue, so the
+/// second sibling found no parent and failed with "Parent dataset 'time_series' doesn't exist",
+/// and a grandchild listed before its parent failed the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_localpod_siblings_and_out_of_order_grandchild_load_at_startup()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = TempDir::new().expect("create temp dir");
+            let csv_path = temp_dir.path().join("data.csv");
+            fs::write(&csv_path, format!("{CSV_HEADER}{}", rows(0, 5)))
+                .await
+                .expect("write initial csv");
+
+            let app = AppBuilder::new("test_localpod_siblings_load_at_startup")
+                .with_dataset(file_parent(&csv_path, None))
+                .with_dataset(localpod_dataset("localpod:local_b", "local_local_b"))
+                .with_dataset(localpod_dataset("localpod:time_series", "local_a"))
+                .with_dataset(localpod_dataset("localpod:time_series", "local_b"))
+                .build();
+
+            configure_test_datafusion();
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&runtime).load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&runtime, Duration::from_secs(30)).await;
+
+            for table in ["time_series", "local_a", "local_b", "local_local_b"] {
+                assert_eq!(
+                    wait_for_registered_count(&runtime, table, 5, Duration::from_secs(30)).await,
+                    Some(5),
+                    "dataset '{table}' should load the five startup rows"
+                );
+            }
 
             Ok(())
         })
