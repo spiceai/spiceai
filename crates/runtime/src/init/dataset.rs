@@ -305,18 +305,10 @@ impl Runtime {
         // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
         // dataset reading from another `localpod` dataset loads after that one, so every chain
         // hangs off the load of a non-`localpod` dataset.
-        let roots: Vec<ResolvedTableReference> = localpod_by_parent
-            .keys()
-            .filter(|parent| dataset_futures.contains_key(*parent))
-            .cloned()
+        let roots: Vec<_> = localpod_by_parent
+            .extract_if(|parent, _| dataset_futures.contains_key(parent))
             .collect();
-        for parent in roots {
-            let Some(children) = localpod_by_parent.remove(&parent) else {
-                continue;
-            };
-            let Some((parent_name, parent_future)) = dataset_futures.remove(&parent) else {
-                continue;
-            };
+        for (parent, children) in roots {
             let chains: Vec<_> = children
                 .into_iter()
                 .map(|(ds, bootstrap_status)| {
@@ -324,19 +316,17 @@ impl Runtime {
                         ds,
                         bootstrap_status,
                         &mut localpod_by_parent,
+                        ReplacesRegistration::No,
                     )
                 })
                 .collect();
-            dataset_futures.insert(
-                parent,
-                (
-                    parent_name,
-                    Box::pin(async move {
-                        parent_future.await;
-                        join_all(chains).await;
-                    }),
-                ),
-            );
+            if let Some((_, parent_future)) = dataset_futures.get_mut(&parent) {
+                let parent_load = std::mem::replace(parent_future, Box::pin(async {}));
+                *parent_future = Box::pin(async move {
+                    parent_load.await;
+                    join_all(chains).await;
+                });
+            }
         }
 
         // Whatever is still queued has no chain to a dataset that is loading: its parent is
@@ -2021,6 +2011,7 @@ impl Runtime {
                         ds,
                         bootstrap_status,
                         &mut localpod_by_parent,
+                        ReplacesRegistration::Yes,
                     )
                 })
                 .collect();
@@ -2085,13 +2076,19 @@ impl Runtime {
             ResolvedTableReference,
             Vec<(Arc<Dataset>, BootstrapStatus)>,
         >,
+        replaces_registration: ReplacesRegistration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let children: Vec<_> = localpod_by_parent
             .remove(&resolve_table_reference(ds.name.clone()))
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
-                Arc::clone(&self).localpod_load_chain(child, child_status, localpod_by_parent)
+                Arc::clone(&self).localpod_load_chain(
+                    child,
+                    child_status,
+                    localpod_by_parent,
+                    replaces_registration,
+                )
             })
             .collect();
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
@@ -2103,8 +2100,11 @@ impl Runtime {
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
             // from the previous registration after the mark above must not be stored as fresh.
-            // For a dataset new to this apply the mark is a no-op.
-            self.invalidate_cached_results_for(&name).await;
+            // For a dataset new to this apply the mark is a no-op; at startup there is no previous
+            // registration, so it is skipped.
+            if replaces_registration == ReplacesRegistration::Yes {
+                self.invalidate_cached_results_for(&name).await;
+            }
             join_all(children).await;
         })
     }
@@ -2614,6 +2614,15 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
+/// Whether a `localpod` load chain runs over registrations a spicepod apply is replacing, whose
+/// cached results must be invalidated once each dataset reloads, or at startup, where nothing was
+/// registered before.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacesRegistration {
+    Yes,
+    No,
 }
 
 /// The dataset a `localpod` dataset reads through, resolved as the query engine resolves it (so
