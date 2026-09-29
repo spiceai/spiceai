@@ -6382,6 +6382,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
+ "runtime-metrics",
  "runtime-rate-control",
  "runtime-request-context",
  "rusqlite",

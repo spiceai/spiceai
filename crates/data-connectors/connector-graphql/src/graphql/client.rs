@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime_rate_control::{RateController, RequestOutcome};
+use data_components::http::attempt::HttpAttemptObserver;
+use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
@@ -798,6 +799,7 @@ pub struct GraphQLClient {
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
+    attempt_observer: HttpAttemptObserver,
     semaphore: Option<Arc<Semaphore>>,
     nested_pager: Option<NestedConnectionPager>,
 }
@@ -929,12 +931,14 @@ pub(crate) struct GraphQLQueryResult {
 }
 
 impl GraphQLClient {
-    /// Feed a request outcome to the origin's adaptive rate controller, if one is
-    /// configured. A no-op in static rate-control mode.
-    fn record_adaptive_outcome(&self, outcome: RequestOutcome) {
-        if let Some(rate_controller) = &self.rate_controller {
-            rate_controller.record_outcome(outcome);
-        }
+    #[must_use]
+    pub fn with_slow_response_threshold(
+        mut self,
+        dataset: String,
+        threshold: Option<std::time::Duration>,
+    ) -> Self {
+        self.attempt_observer = HttpAttemptObserver::new(&self.endpoint, dataset, threshold);
+        self
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1001,6 +1005,7 @@ impl GraphQLClient {
 
         Ok(Self {
             client,
+            attempt_observer: HttpAttemptObserver::new(&endpoint, String::new(), None),
             endpoint,
             json_pointer,
             unnest_parameters,
@@ -1187,7 +1192,7 @@ impl GraphQLClient {
         // of reusing the (possibly broken) pooled connection. Preserve user-agent and
         // timeouts to match the original client — GitHub requires a User-Agent header.
         let http_client = if close_connection {
-            reqwest::Client::builder()
+            data_components::resilient_http::configure_client_builder(reqwest::Client::builder())
                 .user_agent(util::spiceai_user_agent())
                 .pool_max_idle_per_host(0)
                 .build()
@@ -1216,22 +1221,14 @@ impl GraphQLClient {
         let semaphore_wait = semaphore_started.elapsed();
 
         let http_started = Instant::now();
-        // A transport/timeout/connection error is a failure signal for adaptive
-        // rate control: the origin is unreachable or too slow, so admit fewer
-        // requests until it recovers.
-        let response = request
-            .send()
-            .await
-            .inspect_err(|_| self.record_adaptive_outcome(RequestOutcome::Failure))
-            .context(ReqwestInternalSnafu)?;
-
-        if let Some(permit) = permit {
-            drop(permit);
-        }
-
-        if let Some(rate_controller_permit) = rate_controller_permit {
-            drop(rate_controller_permit);
-        }
+        let attempt = self.attempt_observer.start(self.rate_controller.as_deref());
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(source) => {
+                attempt.finish(None, false);
+                return Err(Error::ReqwestInternal { source });
+            }
+        };
 
         let response_headers = response.headers().clone();
 
@@ -1242,19 +1239,13 @@ impl GraphQLClient {
 
         let status = response.status();
 
-        // Feed the response outcome to adaptive rate control, matching the HTTP
-        // provider's classification: a retryable status (408/429/5xx) is a failure
-        // signal; a 2xx is a success; any other status (a non-retryable 4xx such as
-        // 401/403/404) is discarded — the origin answered promptly, but the failure
-        // is a client/auth/config condition that throttling cannot remediate.
-        if data_components::resilient_http::status_is_retryable(status) {
-            self.record_adaptive_outcome(RequestOutcome::Failure);
-        } else if status.is_success() {
-            self.record_adaptive_outcome(RequestOutcome::Success);
-        }
-
-        // Get the response body as text first, so we can log it if JSON parsing fails
-        let response_text = response.text().await.context(ReqwestInternalSnafu)?;
+        // Keep admission permits through body consumption and record exactly once,
+        // before JSON decoding or another retry attempt.
+        let response_text = response.text().await;
+        attempt.finish(Some(status), response_text.is_ok());
+        drop(permit);
+        drop(rate_controller_permit);
+        let response_text = response_text.context(ReqwestInternalSnafu)?;
         let http_elapsed = http_started.elapsed();
 
         let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
@@ -2169,6 +2160,121 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn slow_response_observation_includes_bodies_and_excludes_admission() {
+        use crate::graphql::{
+            builder::GraphQLClientBuilder,
+            client::{GraphQLQuery, UnnestBehavior},
+        };
+        use runtime_rate_control::{
+            AdaptiveRateControl, JitterConfig, RateController, RequestOutcome,
+        };
+        use std::{sync::Arc, time::Duration};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        for (delay, jitter, timeout, expected) in [
+            (100, 0, 1000, RequestOutcome::Slow),
+            (0, 200, 1000, RequestOutcome::Success),
+            (200, 0, 50, RequestOutcome::Failure),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind GraphQL origin");
+            let endpoint = url::Url::parse(&format!(
+                "http://{}/graphql",
+                listener.local_addr().expect("origin address")
+            ))
+            .expect("URL");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept GraphQL request");
+                let mut buffer = [0; 4096];
+                let mut request = Vec::new();
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("read GraphQL request");
+                    assert_ne!(read, 0, "request must finish before the connection closes");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&request[..end]).expect("HTTP headers");
+                        let content_length = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| {
+                                value.trim().parse::<usize>().expect("content length")
+                            })
+                            .expect("GraphQL POST has a content length");
+                        if request.len() >= end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let body = r#"{"data":{"items":[{"id":1},{"id":2}]}}"#;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("write headers");
+                // The body delay is the latency under test.
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            });
+            let controller = RateController::builder()
+                .with_max_concurrent_requests(2)
+                .with_jitter(JitterConfig::new(
+                    Duration::from_millis(jitter),
+                    Duration::from_millis(jitter),
+                ))
+                .with_adaptive(
+                    AdaptiveRateControl::new(0.1, Duration::from_secs(10))
+                        .expect("adaptive config"),
+                    "http://graphql-origin",
+                )
+                .build();
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_millis(timeout))
+                .build()
+                .expect("HTTP client");
+            let client = GraphQLClientBuilder::new(endpoint, UnnestBehavior::Depth(0))
+                .with_json_pointer(Some("/data/items"))
+                .with_rate_controller(Some(Arc::clone(&controller)))
+                .build(http)
+                .expect("GraphQL client")
+                .with_slow_response_threshold("items".to_string(), Some(Duration::from_millis(50)));
+            let query = GraphQLQuery::try_from(Arc::from("{ items { id } }")).expect("query");
+            let result = client
+                .fetch_checked(&query, None, None, None, None, false, None)
+                .await;
+            if expected == RequestOutcome::Failure {
+                assert!(
+                    matches!(result, Err(crate::graphql::Error::ReqwestInternal { source }) if source.is_timeout())
+                );
+            } else {
+                assert_eq!(
+                    result.expect("successful body"),
+                    serde_json::json!({"data":{"items":[{"id":1},{"id":2}]}})
+                );
+            }
+            for outcome in RequestOutcome::ALL {
+                assert_eq!(
+                    controller.metrics().adaptive_outcomes_total(outcome),
+                    u64::from(outcome == expected),
+                    "one completed attempt"
+                );
+            }
+            assert_eq!(controller.metrics().inflight_permits(), 0);
+            server.await.expect("origin exits");
+        }
+    }
+
     use std::sync::Arc;
 
     use reqwest::StatusCode;

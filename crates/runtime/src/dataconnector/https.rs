@@ -260,6 +260,7 @@ struct HttpProviderParams {
     allowed_paths: Vec<String>,
     request_filters: RequestFilterParams,
     rate_control: HttpRateControlConfig,
+    slow_response_threshold: Option<Duration>,
     max_request_partitions: Option<usize>,
     cache_max_size_bytes: usize,
     cache_fallback_ttl: Option<Duration>,
@@ -392,6 +393,13 @@ impl Https {
             "https",
         )?;
         rate_control.apply_default_acquire_timeout(self.configured_client_timeout());
+        let slow_response_threshold = http_rate_control::resolve_slow_response_threshold(
+            &self.params,
+            &rate_control,
+            http_rate_control::HttpRequestTimeout::Https(self.configured_client_timeout()),
+            &ConnectorComponent::from(dataset),
+            "https",
+        )?;
 
         // Both of these bound memory, so an unparseable value is refused rather
         // than quietly replaced by a default: silently falling back would leave
@@ -581,6 +589,7 @@ impl Https {
                 request_header_allowlist,
             },
             rate_control,
+            slow_response_threshold,
             max_request_partitions,
             cache_max_size_bytes,
             cache_fallback_ttl,
@@ -1213,6 +1222,7 @@ impl Https {
             allowed_paths,
             request_filters,
             rate_control,
+            slow_response_threshold,
             max_request_partitions,
             cache_max_size_bytes,
             cache_fallback_ttl,
@@ -1375,7 +1385,8 @@ impl Https {
             .set_rate_controller(rate_controller.shared().controller.as_ref());
         provider = provider
             .with_rate_limiter(Some(rate_limiter))
-            .with_rate_controller(rate_controller.shared().controller.as_ref().map(Arc::clone));
+            .with_rate_controller(rate_controller.shared().controller.as_ref().map(Arc::clone))
+            .with_slow_response_threshold(dataset.name.to_string(), slow_response_threshold);
 
         let provider = Arc::new(provider);
         if let Some(metric_source) = &self.rate_control_metric_source {
@@ -2395,6 +2406,41 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .expect_err("append mode should continue to provider validation");
 
         assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn slow_response_threshold_validates_the_effective_https_timeout() {
+        let dataset = DatasetSpec::new("https://api.example.com/items", "items".into());
+        for (value, expected) in [("0", None), ("500ms", Some(Duration::from_millis(500)))] {
+            let connector = test_connector_with(&[
+                ("rate_control_mode", "adaptive"),
+                ("requests_per_second_limit", "10"),
+                ("rate_control_slow_response_threshold", value),
+            ])
+            .await;
+            let resolved = connector
+                .resolve_http_provider_params(&dataset)
+                .expect("valid threshold");
+            assert_eq!(resolved.slow_response_threshold, expected);
+        }
+        for (value, message) in [
+            ("invalid", "The 'rate_control_slow_response_threshold' parameter must be a duration such as '2s' or '500ms'. See: https://spiceai.org/docs/components/data-connectors/http".to_string()),
+            ("1s", "The 'rate_control_slow_response_threshold' parameter (1s) must be less than `client_timeout` (1s). A response slower than `client_timeout` fails rather than succeeding, so it is never counted as slow. Lower 'rate_control_slow_response_threshold', or raise `client_timeout`. See: https://spiceai.org/docs/components/data-connectors/http".to_string()),
+            ("1500ms", "The 'rate_control_slow_response_threshold' parameter (1.5s) must be less than `client_timeout` (1s). A response slower than `client_timeout` fails rather than succeeding, so it is never counted as slow. Lower 'rate_control_slow_response_threshold', or raise `client_timeout`. See: https://spiceai.org/docs/components/data-connectors/http".to_string()),
+        ] {
+            let connector = test_connector_with(&[("rate_control_mode", "adaptive"), ("requests_per_second_limit", "10"), ("rate_control_slow_response_threshold", value)]).await;
+            let Err(DataConnectorError::InvalidConfigurationNoSource { message: actual, .. }) = connector.resolve_http_provider_params(&dataset) else { panic!("threshold must be rejected"); };
+            assert_eq!(actual, message);
+        }
+        let connector =
+            test_connector_with(&[("rate_control_slow_response_threshold", "invalid")]).await;
+        assert_eq!(
+            connector
+                .resolve_http_provider_params(&dataset)
+                .expect("static ignores threshold")
+                .slow_response_threshold,
+            None
+        );
     }
 
     #[tokio::test]

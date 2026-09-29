@@ -411,6 +411,31 @@ impl RateControllerBuilder {
             1
         };
 
+        // The quota with the longest full-bucket period determines the minimum
+        // origin request rate. With only concurrency configured, the floor is
+        // one concurrent request. Equal periods reach that floor as soon as the
+        // smaller bucket is fully charged.
+        let floor_coefficient = self
+            .quotas
+            .iter()
+            .max_by(|left, right| {
+                let period = |quota: &QuotaDefinition| {
+                    quota
+                        .quota
+                        .replenish_interval()
+                        .saturating_mul(quota.quota.burst_size().get())
+                };
+                period(left)
+                    .cmp(&period(right))
+                    .then_with(|| right.quota.burst_size().cmp(&left.quota.burst_size()))
+            })
+            .map(|quota| 1.0 / f64::from(quota.quota.burst_size().get()))
+            .or_else(|| {
+                self.max_concurrent_requests
+                    .and_then(|capacity| u32::try_from(capacity).ok())
+                    .map(|capacity| 1.0 / f64::from(capacity))
+            });
+
         // Each limiter carries its own capacity so the adaptive weight is clamped
         // per limiter: a weighted acquire never asks a limiter for more than it can
         // hold, and one small limit never bounds how deeply a larger one throttles.
@@ -474,10 +499,10 @@ impl RateControllerBuilder {
         // takes it from the target. `with_adaptive` always sets an origin, so
         // the fallback is unreachable.
         let adaptive = self.adaptive.map(|control| {
-            Arc::new(AdaptiveController::new(
-                control,
-                target.as_origin().unwrap_or_default(),
-            ))
+            Arc::new(
+                AdaptiveController::new(control, target.as_origin().unwrap_or_default())
+                    .with_floor_coefficient(floor_coefficient),
+            )
         });
 
         RateController::new(
@@ -502,6 +527,7 @@ pub struct RateControllerMetrics {
     wait_duration_ms_total: AtomicU64,
     inflight_permits: AtomicU64,
     adaptive_throttled_total: AtomicU64,
+    adaptive_outcomes_total: [AtomicU64; 3],
 }
 
 impl RateControllerMetrics {
@@ -533,6 +559,12 @@ impl RateControllerMetrics {
     #[must_use]
     pub fn adaptive_throttled_total(&self) -> u64 {
         self.adaptive_throttled_total.load(Ordering::Relaxed)
+    }
+
+    /// Recorded outcomes by kind. Only applicable when adaptive control is enabled.
+    #[must_use]
+    pub fn adaptive_outcomes_total(&self, outcome: RequestOutcome) -> u64 {
+        self.adaptive_outcomes_total[outcome.index()].load(Ordering::Relaxed)
     }
 
     fn record_adaptive_throttle(&self) {
@@ -827,8 +859,23 @@ impl RateController {
     /// no-op when adaptive control is disabled).
     pub fn record_outcome(&self, outcome: RequestOutcome) {
         if let Some(adaptive) = &self.adaptive {
+            self.metrics.adaptive_outcomes_total[outcome.index()].fetch_add(1, Ordering::Relaxed);
             adaptive.record(outcome);
         }
+    }
+
+    /// Whether the origin's limiting quota has been at its floor for a full window.
+    #[must_use]
+    pub fn at_floor_for_window(&self) -> bool {
+        self.adaptive
+            .as_ref()
+            .is_some_and(|adaptive| adaptive.at_floor_for_window())
+    }
+
+    /// The adaptive decay window, or `None` in static mode.
+    #[must_use]
+    pub fn adaptive_window(&self) -> Option<Duration> {
+        self.adaptive.as_ref().map(|adaptive| adaptive.window())
     }
 
     /// The adaptive admission coefficient in `[0, 1]`, or `None` when adaptive
@@ -1192,6 +1239,41 @@ mod tests {
             (effective_ratio - coefficient).abs() < 0.01,
             "effective rate ratio {effective_ratio} should track coefficient {coefficient}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn origin_floor_uses_the_longest_bucket_period_not_the_largest_capacity() {
+        let window = Duration::from_secs(10);
+        let controller = RateController::builder()
+            .with_quotas(vec![
+                Quota::per_second(NonZeroU32::new(100).expect("nonzero")),
+                Quota::per_minute(NonZeroU32::new(2).expect("nonzero")),
+            ])
+            .with_max_concurrent_requests(1000)
+            .with_adaptive(
+                AdaptiveRateControl::new(0.1, window).expect("adaptive config"),
+                "https://api.example.com",
+            )
+            .build();
+        for _ in 0..10 {
+            controller.record_outcome(RequestOutcome::Slow);
+        }
+        assert!(!controller.at_floor_for_window());
+        tokio::time::advance(window).await;
+        assert!(
+            controller.at_floor_for_window(),
+            "one request/minute is the origin floor despite larger second and concurrency caps"
+        );
+        for outcome in RequestOutcome::ALL {
+            assert_eq!(
+                controller.metrics().adaptive_outcomes_total(outcome),
+                if outcome == RequestOutcome::Slow {
+                    10
+                } else {
+                    0
+                }
+            );
+        }
     }
 
     /// However deep the throttle, a request never charges more than a limiter's

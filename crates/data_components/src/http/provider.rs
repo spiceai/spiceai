@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::attempt::{HttpAttempt, HttpAttemptObserver};
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;
 use arrow::{
@@ -46,7 +47,7 @@ use reqwest::{
     Client,
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
-use runtime_rate_control::{Permit, RateController, RequestOutcome};
+use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -109,11 +110,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A retryable HTTP status retains its response so the final allowed attempt
 /// can supply its body and metadata after the retry budget is exhausted.
 enum RequestAttemptError {
-    Response {
-        response: reqwest::Response,
-        attempt_started: Instant,
-        permit: Option<Permit>,
-    },
+    Response(HttpFetchResult),
     Failure(Error),
 }
 
@@ -656,6 +653,7 @@ pub struct HttpTableProvider {
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
+    attempt_observer: Arc<HttpAttemptObserver>,
     /// When set, JSON response rows are decomposed into the declared
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
@@ -683,6 +681,7 @@ impl HttpTableProvider {
     ) -> Self {
         Self {
             table_ref: None,
+            attempt_observer: Arc::new(HttpAttemptObserver::new(&base_url, String::new(), None)),
             base_url,
             client,
             file_format,
@@ -739,6 +738,17 @@ impl HttpTableProvider {
     #[must_use]
     pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
         self.rate_controller = rate_controller;
+        self
+    }
+
+    #[must_use]
+    pub fn with_slow_response_threshold(
+        mut self,
+        dataset: String,
+        threshold: Option<Duration>,
+    ) -> Self {
+        self.attempt_observer =
+            Arc::new(HttpAttemptObserver::new(&self.base_url, dataset, threshold));
         self
     }
 
@@ -1198,11 +1208,19 @@ impl HttpTableProvider {
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
+        let attempt = self.attempt_observer.start(self.rate_controller.as_deref());
         match self.client.get(test_url.clone()).send().await {
-            Ok(response) => {
+            Ok(mut response) => {
                 self.update_rate_limiter_from_headers(response.headers())
                     .await;
                 let status = response.status();
+                let body_result = async {
+                    while response.chunk().await?.is_some() {}
+                    Ok::<_, reqwest::Error>(())
+                }
+                .await;
+                attempt.finish(Some(status), body_result.is_ok());
+                body_result.map_err(|source| Error::HttpRequest { source })?;
                 if self.health_probe.is_some() {
                     tracing::debug!(
                         "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
@@ -1227,7 +1245,7 @@ impl HttpTableProvider {
                 Ok(())
             }
             Err(e) => {
-                // Check the error type to provide more specific messages and just return the error
+                attempt.finish(None, false);
                 Err(Error::HttpRequest { source: e })
             }
         }
@@ -1522,15 +1540,6 @@ impl HttpTableProvider {
         }
     }
 
-    /// Feed a request's outcome to the origin's rate limiter so an adaptive
-    /// controller can raise or lower the effective rate. A no-op for limiters
-    /// without adaptive control.
-    fn record_request_outcome(&self, outcome: RequestOutcome) {
-        if let Some(rate_controller) = &self.rate_controller {
-            rate_controller.record_outcome(outcome);
-        }
-    }
-
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -1561,24 +1570,7 @@ impl HttpTableProvider {
 
         match result {
             Ok(fetch_result) => Ok(fetch_result),
-            Err(RequestAttemptError::Response {
-                response,
-                attempt_started,
-                permit: _rate_control_permit,
-            }) => {
-                let status_code = response.status().as_u16();
-                Self::extract_response(
-                    response,
-                    status_code,
-                    path_label,
-                    attempt_started,
-                    self.auth.as_ref().map(|auth| auth.header_name()),
-                )
-                .await
-                .map_err(|e| match e {
-                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                })
-            }
+            Err(RequestAttemptError::Response(response)) => Ok(response),
             Err(RequestAttemptError::Failure(err)) => Err(err),
         }
     }
@@ -1602,7 +1594,7 @@ impl HttpTableProvider {
         request_headers: Option<&HeaderMap>,
         path_label: &str,
     ) -> std::result::Result<HttpFetchResult, RetryError<RequestAttemptError>> {
-        let rate_control_permit = self
+        let _rate_control_permit = self
             .acquire_rate_control_permit()
             .await
             .map_err(|err| RetryError::transient(RequestAttemptError::Failure(err)))?;
@@ -1642,52 +1634,31 @@ impl HttpTableProvider {
             request_builder = auth.apply(request_builder);
         }
 
-        let response = request_builder.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {e}");
-            // A timeout or connection error is a failure signal for adaptive
-            // rate control: the origin is unreachable or too slow, so admit
-            // fewer requests until it recovers.
-            self.record_request_outcome(RequestOutcome::Failure);
-            RetryError::transient(RequestAttemptError::Failure(Error::HttpRequest {
-                source: e,
-            }))
-        })?;
+        let attempt = self.attempt_observer.start(self.rate_controller.as_deref());
+        let response = match request_builder.send().await {
+            Ok(response) => response,
+            Err(source) => {
+                attempt.finish(None, false);
+                return Err(RetryError::transient(RequestAttemptError::Failure(
+                    Error::HttpRequest { source },
+                )));
+            }
+        };
 
         let status = response.status();
         let status_code = status.as_u16();
         let response_headers = response.headers().clone();
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
-        // Classify the response for adaptive rate control:
-        // - retryable (408/429/5xx): a failure signal — the origin is struggling,
-        //   so admit fewer requests until it recovers.
-        // - 2xx: a success — the origin served the request under load.
-        // - anything else (a non-retryable 4xx such as 401/403/404): discarded, not
-        //   recorded. The origin answered promptly, but the failure is a
-        //   client/auth/config condition that throttling cannot remediate, so it
-        //   must move the coefficient in neither direction.
-        if crate::resilient_http::status_is_retryable(status) {
-            self.record_request_outcome(RequestOutcome::Failure);
-        } else if status.is_success() {
-            self.record_request_outcome(RequestOutcome::Success);
-        }
-
-        if Self::is_retryable_status(status_code) {
-            tracing::debug!("HTTP retryable status ({status_code}), will retry");
-            return Err(RetryError::transient(RequestAttemptError::Response {
-                response,
-                attempt_started,
-                permit: rate_control_permit,
-            }));
-        }
-
-        // 2xx, 3xx, 4xx: valid response; 4xx may be a business response.
-        Self::extract_response(
+        // Consume every attempt before retrying, including retryable statuses.
+        // The final response retains its body and metadata when retries are exhausted.
+        let result = Self::extract_response(
             response,
             status_code,
             path_label,
             attempt_started,
             self.auth.as_ref().map(|auth| auth.header_name()),
+            attempt,
         )
         .await
         .map_err(|error| match error {
@@ -1696,7 +1667,11 @@ impl HttpTableProvider {
                 err: RequestAttemptError::Failure(err),
                 retry_after,
             },
-        })
+        })?;
+        if Self::is_retryable_status(status_code) {
+            return Err(RetryError::transient(RequestAttemptError::Response(result)));
+        }
+        Ok(result)
     }
 
     /// Extract content and metadata from an HTTP response.
@@ -1706,6 +1681,7 @@ impl HttpTableProvider {
         path_label: &str,
         attempt_started: Instant,
         auth_header_name: Option<&HeaderName>,
+        attempt: HttpAttempt<'_>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -1821,10 +1797,11 @@ impl HttpTableProvider {
         // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
-        let content = response
-            .text()
-            .await
-            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
+        let status = response.status();
+        let content = response.text().await;
+        attempt.finish(Some(status), content.is_ok());
+        let content =
+            content.map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -5315,6 +5292,177 @@ mod tests {
             .randomization_factor(0.0)
             .build();
         (provider, metrics)
+    }
+
+    async fn slow_body_origin(
+        statuses: Vec<u16>,
+        delay: Duration,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+        let url = Url::parse(&format!(
+            "http://{}/items",
+            listener.local_addr().expect("origin address")
+        ))
+        .expect("origin URL");
+        let server = tokio::spawn(async move {
+            let mut ordinal = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let status = statuses[ordinal.min(statuses.len() - 1)];
+                ordinal += 1;
+                tokio::spawn(async move {
+                    let mut buffer = [0; 4096];
+                    let _ = stream.read(&mut buffer).await;
+                    let body = r#"[{"id":1},{"id":2}]"#;
+                    let headers = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    // Delay the body, not headers: latency includes the entire download.
+                    tokio::time::sleep(delay).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        (url, server)
+    }
+
+    fn adaptive_test_controller(jitter: Duration) -> Arc<RateController> {
+        RateControllerBuilder::new()
+            .with_max_concurrent_requests(10)
+            .with_jitter(runtime_rate_control::JitterConfig::new(jitter, jitter))
+            .with_adaptive(
+                runtime_rate_control::AdaptiveRateControl::new(0.1, Duration::from_secs(10))
+                    .expect("adaptive config"),
+                "http://test-origin",
+            )
+            .build()
+    }
+
+    #[tokio::test]
+    async fn slow_body_success_returns_identical_rows_without_retry_on_a_shared_origin() {
+        use runtime_rate_control::RequestOutcome;
+        let (url, server) = slow_body_origin(vec![200], Duration::from_millis(100)).await;
+        let controller = adaptive_test_controller(Duration::ZERO);
+        for (dataset, threshold) in [("items", 20), ("search", 500)] {
+            let provider =
+                HttpTableProvider::new(url.clone(), Client::new(), "json".to_string(), false)
+                    .with_rate_controller(Some(Arc::clone(&controller)))
+                    .with_slow_response_threshold(
+                        dataset.to_string(),
+                        Some(Duration::from_millis(threshold)),
+                    );
+            let response = provider
+                .perform_request_with_retry(url.clone(), None, None, "/items")
+                .await
+                .expect("slow success is data");
+            assert_eq!(response.content, r#"[{"id":1},{"id":2}]"#);
+        }
+        let metrics = controller.metrics();
+        assert_eq!(metrics.permits_acquired_total(), 2, "no latency retries");
+        assert_eq!(metrics.adaptive_outcomes_total(RequestOutcome::Slow), 1);
+        assert_eq!(metrics.adaptive_outcomes_total(RequestOutcome::Success), 1);
+        assert_eq!(metrics.adaptive_outcomes_total(RequestOutcome::Failure), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_response_measurement_excludes_admission_waits() {
+        use runtime_rate_control::RequestOutcome;
+        let (url, server) = slow_body_origin(vec![200], Duration::ZERO).await;
+        let controller = adaptive_test_controller(Duration::from_millis(200));
+        let provider =
+            HttpTableProvider::new(url.clone(), Client::new(), "json".to_string(), false)
+                .with_rate_controller(Some(Arc::clone(&controller)))
+                .with_slow_response_threshold(
+                    "items".to_string(),
+                    Some(Duration::from_millis(100)),
+                );
+        provider
+            .perform_request_with_retry(url, None, None, "/items")
+            .await
+            .expect("fast origin");
+        assert!(controller.metrics().wait_duration_ms_total() >= 200);
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Success),
+            1
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Slow),
+            0
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_response_records_each_retry_and_body_timeout_once() {
+        use runtime_rate_control::RequestOutcome;
+        let (url, server) = slow_body_origin(vec![503, 200], Duration::from_millis(100)).await;
+        let controller = adaptive_test_controller(Duration::ZERO);
+        let (provider, _) = retry_test_provider(url.clone(), 1, Duration::from_secs(2));
+        let provider = provider
+            .with_rate_controller(Some(Arc::clone(&controller)))
+            .with_slow_response_threshold("items".to_string(), Some(Duration::from_millis(20)));
+        let result = provider
+            .perform_request_with_retry(url, None, None, "/items")
+            .await
+            .expect("retry succeeds");
+        assert_eq!(result.content, r#"[{"id":1},{"id":2}]"#);
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Failure),
+            1
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Slow),
+            1
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Success),
+            0
+        );
+        server.abort();
+
+        let (url, server) = slow_body_origin(vec![200], Duration::from_millis(200)).await;
+        let controller = adaptive_test_controller(Duration::ZERO);
+        let (provider, _) = retry_test_provider(url.clone(), 1, Duration::from_millis(50));
+        let provider = provider
+            .with_rate_controller(Some(Arc::clone(&controller)))
+            .with_slow_response_threshold("items".to_string(), Some(Duration::from_millis(20)));
+        assert!(
+            provider
+                .perform_request_with_retry(url, None, None, "/items")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Failure),
+            2
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Slow),
+            0
+        );
+        assert_eq!(
+            controller
+                .metrics()
+                .adaptive_outcomes_total(RequestOutcome::Success),
+            0
+        );
+        server.abort();
     }
 
     #[tokio::test]

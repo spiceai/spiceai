@@ -258,6 +258,13 @@ impl GraphQL {
         // The GraphQL client is `default_spice_client`, so its request timeout
         // is the `client_timeout` equivalent the acquire bound defaults to.
         rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
+        let slow_response_threshold = http_rate_control::resolve_slow_response_threshold(
+            &self.params,
+            &rate_control,
+            http_rate_control::HttpRequestTimeout::GraphQl(DEFAULT_SPICE_CLIENT_TIMEOUT),
+            &ConnectorComponent::from(dataset),
+            "graphql",
+        )?;
         let rate_limiter = self
             .rate_control_registry
             .shared_rate_limiter_for_config(&endpoint, &rate_control)
@@ -289,6 +296,9 @@ impl GraphQL {
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
         .build(client)
+        .map(|client| {
+            client.with_slow_response_threshold(dataset.name.to_string(), slow_response_threshold)
+        })
         .boxed();
 
         match client_result {
@@ -422,6 +432,48 @@ mod tests {
             .expect("test dataset should build")
     }
 
+    #[tokio::test]
+    async fn graphql_slow_response_threshold_validates_the_client_timeout() {
+        let dataset = test_dataset("https://graphql-slow-threshold.example.com/graphql").await;
+        for value in ["30s", "45000ms", "invalid"] {
+            let graphql = GraphQL {
+                app_name: Arc::from("test_app"),
+                params: test_params(&[
+                    ("rate_control_mode", "adaptive"),
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_slow_response_threshold", value),
+                ])
+                .await,
+                runtime_rate_control_params: None,
+                rate_control_registry: Arc::new(
+                    http_rate_control::HttpRateControlRegistry::default(),
+                ),
+                metrics: Arc::new(HttpRateControlMetrics::default()),
+                emit_rate_control_metrics: true,
+                rate_control_metric_source: None,
+            };
+            let Err(DataConnectorError::InvalidConfigurationNoSource { message, .. }) =
+                graphql.get_client(&dataset).await
+            else {
+                panic!("invalid threshold must fail before requests");
+            };
+            if value == "invalid" {
+                assert_eq!(
+                    message,
+                    "The 'rate_control_slow_response_threshold' parameter must be a duration such as '2s' or '500ms'. See: https://spiceai.org/docs/components/data-connectors/http"
+                );
+            } else {
+                let seconds = if value == "30s" { 30 } else { 45 };
+                assert_eq!(
+                    message,
+                    format!(
+                        "The 'rate_control_slow_response_threshold' parameter ({seconds}s) must be less than the GraphQL connector's 30s request timeout. A slower response fails rather than succeeding, so it is never counted as slow. Lower 'rate_control_slow_response_threshold'. See: https://spiceai.org/docs/components/data-connectors/graphql"
+                    )
+                );
+            }
+        }
+    }
+
     #[test]
     fn graphql_parameters_include_http_rate_control_specs() {
         let parameters = GraphQLFactory::new().parameters();
@@ -431,6 +483,7 @@ mod tests {
             "requests_per_minute_limit",
             "rate_control_jitter_min",
             "rate_control_jitter_max",
+            "rate_control_slow_response_threshold",
         ] {
             assert!(
                 parameters

@@ -43,7 +43,7 @@ use runtime_parameters::{ParameterSpec, Parameters};
 pub use runtime_rate_control::AdaptiveRateControl;
 use runtime_rate_control::{
     AdaptiveRateControlError, DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW,
-    JitterConfig, RateController, RateControllerMetrics,
+    JitterConfig, RateController, RateControllerMetrics, RequestOutcome,
 };
 use tokio::sync::RwLock;
 use url::Url;
@@ -569,6 +569,9 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     )
     .description("Fraction of the configured HTTP rate limits currently admitted for this upstream origin (1 = admit all); absent in static rate-control mode")
     .auto_register(),
+    MetricSpec::new("rate_control_adaptive_outcomes_total", MetricType::ObservableCounterU64)
+        .description("Completed HTTP attempts recorded by adaptive control, by success, slow or failure; absent in static mode")
+        .auto_register(),
     MetricSpec::new(
         "rate_control_adaptive_throttled_total",
         MetricType::ObservableCounterU64,
@@ -722,6 +725,24 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             "rate_control_adaptive_throttled_total" => {
                 observe_optional_metric!(metrics.adaptive_throttled_total())
             }
+            "rate_control_adaptive_outcomes_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    if should_observe_metrics(metric_source.as_ref())
+                        && metrics.adaptive_admission_ratio().is_some()
+                    {
+                        for outcome in RequestOutcome::ALL {
+                            let mut attributes = attributes.clone();
+                            attributes.push(KeyValue::new("outcome", outcome.label()));
+                            observer.observe(
+                                metrics.rate_controller_metric(|metrics| {
+                                    metrics.adaptive_outcomes_total(outcome)
+                                }),
+                                &attributes,
+                            );
+                        }
+                    }
+                })))
+            }
             _ => None,
         }
     }
@@ -732,7 +753,7 @@ fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -
 }
 
 #[must_use]
-pub fn parameter_specs() -> [ParameterSpec; 9] {
+pub fn parameter_specs() -> [ParameterSpec; 10] {
     [
         ParameterSpec::runtime("max_concurrent_requests")
             .description("Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled."),
@@ -750,9 +771,67 @@ pub fn parameter_specs() -> [ParameterSpec; 9] {
             .description("How the configured HTTP rate limits apply. 'static' (default) applies them as they are. 'adaptive' lowers the effective request rate while the upstream origin fails or times out, then raises it again as the origin recovers, always within the configured static limits. Overrides runtime.params.http_rate_control_mode when set."),
         ParameterSpec::runtime("rate_control_failure_threshold")
             .description("The upstream error rate above which adaptive rate control begins throttling, as a percentage like '25%' or a fraction like '0.25'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate. Overrides runtime.params.http_rate_control_failure_threshold when set. Applies only when rate_control_mode is 'adaptive'. Defaults to 10%."),
+        ParameterSpec::runtime("rate_control_slow_response_threshold")
+            .description("Successful responses taking longer than this duration count as slow for adaptive rate control, but still return normally without retrying. Includes the complete body download, excludes rate-control waits. Unset or '0' disables it; static mode ignores it. Must be less than the request timeout. Per dataset, with no runtime default; datasets sharing an origin may use different values."),
         ParameterSpec::runtime("rate_control_window")
             .description("The reaction and recovery window for adaptive rate control, as a duration such as '10s' — the half-life over which request outcomes decay. A shorter window reacts to and recovers from failures faster; a longer one is smoother and slower. Overrides runtime.params.http_rate_control_window when set. Applies only when rate_control_mode is 'adaptive'. Defaults to 10s."),
     ]
+}
+
+/// The request timeout used by the connector's HTTP client.
+#[derive(Clone, Copy)]
+pub enum HttpRequestTimeout {
+    Https(Duration),
+    GraphQl(Duration),
+}
+
+/// Resolve the dataset-local latency threshold, independently of shared-origin config.
+/// Only connectors declaring `rate_control_slow_response_threshold` may call this.
+///
+/// # Errors
+/// Rejects invalid durations and thresholds at or above the effective request timeout.
+pub fn resolve_slow_response_threshold(
+    params: &Parameters,
+    config: &HttpRateControlConfig,
+    timeout: HttpRequestTimeout,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<Option<Duration>> {
+    if !config.adaptive_enabled() {
+        return Ok(None);
+    }
+    let Some(value) = params
+        .get("rate_control_slow_response_threshold")
+        .expose()
+        .ok()
+    else {
+        return Ok(None);
+    };
+    let error = |message: String| DataConnectorError::InvalidConfigurationNoSource {
+        dataconnector: dataconnector.to_string(),
+        connector_component: connector_component.clone(),
+        message,
+    };
+    let threshold = fundu::parse_duration(value.trim()).ok().filter(|duration| *duration != Duration::MAX).ok_or_else(|| error("The 'rate_control_slow_response_threshold' parameter must be a duration such as '2s' or '500ms'. See: https://spiceai.org/docs/components/data-connectors/http".to_string()))?;
+    if threshold.is_zero() {
+        return Ok(None);
+    }
+    let (HttpRequestTimeout::Https(request_timeout) | HttpRequestTimeout::GraphQl(request_timeout)) =
+        timeout;
+    if threshold >= request_timeout {
+        let seconds = threshold.as_secs_f64();
+        return Err(error(match timeout {
+            HttpRequestTimeout::Https(_) => format!(
+                "The 'rate_control_slow_response_threshold' parameter ({seconds}s) must be less than `client_timeout` ({}s). A response slower than `client_timeout` fails rather than succeeding, so it is never counted as slow. Lower 'rate_control_slow_response_threshold', or raise `client_timeout`. See: https://spiceai.org/docs/components/data-connectors/http",
+                request_timeout.as_secs_f64()
+            ),
+            HttpRequestTimeout::GraphQl(_) => format!(
+                "The 'rate_control_slow_response_threshold' parameter ({seconds}s) must be less than the GraphQL connector's {}s request timeout. A slower response fails rather than succeeding, so it is never counted as slow. Lower 'rate_control_slow_response_threshold'. See: https://spiceai.org/docs/components/data-connectors/graphql",
+                request_timeout.as_secs_f64()
+            ),
+        }));
+    }
+    Ok(Some(threshold))
 }
 
 /// Resolve a component's rate-control configuration from its own parameters,
@@ -1777,12 +1856,7 @@ fn runtime_or_dataset_param_name<S: BuildHasher>(
 
 #[must_use]
 pub fn rate_control_key(base_url: &Url) -> String {
-    let scheme = base_url.scheme();
-    let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
-    match base_url.port_or_known_default() {
-        Some(port) => format!("{scheme}://{host}:{port}"),
-        None => format!("{scheme}://{host}"),
-    }
+    data_components::http::attempt::origin_key(base_url)
 }
 
 fn rate_control_state_object_key(spicepod_name: &str, origin_key: &str) -> String {

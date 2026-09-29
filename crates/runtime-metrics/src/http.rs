@@ -23,6 +23,27 @@ use opentelemetry::{
 
 use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
+pub static CLIENT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("http_client_request_duration_ms")
+        .with_description("HTTP request attempt duration from sending through complete body consumption, excluding rate-control waits")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Record one completed HTTP attempt, omitting status when no headers arrived.
+pub fn record_client_request(duration: std::time::Duration, origin: &str, status: Option<u16>) {
+    let mut attributes = vec![opentelemetry::KeyValue::new("origin", origin.to_owned())];
+    if let Some(status) = status {
+        attributes.push(opentelemetry::KeyValue::new(
+            "http.response.status_code",
+            i64::from(status),
+        ));
+    }
+    CLIENT_REQUEST_DURATION_MS.record(duration.as_secs_f64() * 1000.0, &attributes);
+}
+
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http"));
 
 /// Deprecated, to be removed in the future

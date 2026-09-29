@@ -206,9 +206,12 @@ The HTTP connector provides metadata columns:
 - HTTP rate-control parameters apply to dynamic JSON HTTP API datasets and HTTP-family connectors such as GraphQL. Structured HTTP file datasets that route through the listing connector (`csv`, `parquet`, `arrow`, `avro`, `jsonl`, `ndjson`, and similar formats) currently reject these parameters; omit the runtime defaults for those sources or use a dynamic JSON HTTP API dataset
 - HTTP 429 responses and rate-limit cooldown headers are honored automatically and shared by HTTP datasets with the same origin. Supported cooldown hints include `Retry-After`, `retry-after-ms`, `x-retry-after-ms`, and exhausted-quota reset headers such as `RateLimit-Remaining: 0` with `RateLimit-Reset` or common `X-RateLimit-Reset` variants
 
+For adaptive throttling on errors and slow successful responses, see
+[Adaptive HTTP rate control](http_adaptive_rate_control.md).
+
 ## Rate-Control Metrics
 
-HTTP rate-control metrics are auto-registered and available through `/metrics`, `runtime.metrics`, and OTLP exporters with the dataset `name` attribute. HTTP connector datasets use `dataset_http_{metric_name}` and GraphQL connector datasets use `dataset_graphql_{metric_name}`. Because rate-control state is shared by upstream origin, each origin is emitted once using the first successfully initialized dataset that claims metrics for that origin to avoid double-counting shared counters. They can be disabled individually in the owning dataset `metrics` section with `enabled: false`.
+HTTP rate-control metrics are auto-registered and available through `/metrics`, `runtime.metrics`, and OTLP exporters with the upstream `origin` attribute (`scheme://host:port`). HTTP connector datasets use `dataset_http_{metric_name}` and GraphQL connector datasets use `dataset_graphql_{metric_name}`. Because rate-control state is shared by upstream origin, each origin is emitted once using the first successfully initialized dataset that claims metrics for that origin to avoid double-counting shared counters. They can be disabled individually in the owning dataset `metrics` section with `enabled: false`.
 
 | Metric                                    | Type    | Description                                                                |
 | ----------------------------------------- | ------- | -------------------------------------------------------------------------- |

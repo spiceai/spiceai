@@ -142,7 +142,30 @@ impl AdaptiveRateControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestOutcome {
     Success,
+    /// A successful response whose complete body took longer than its dataset's threshold.
+    Slow,
     Failure,
+}
+
+impl RequestOutcome {
+    pub const ALL: [Self; 3] = [Self::Success, Self::Slow, Self::Failure];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Slow => "slow",
+            Self::Failure => "failure",
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::Slow => 1,
+            Self::Failure => 2,
+        }
+    }
 }
 
 /// A live adaptive controller for one origin.
@@ -161,6 +184,8 @@ pub struct AdaptiveController {
     half_life: Duration,
     /// The origin this controller governs, named in the log lines.
     origin: String,
+    /// Coefficient at which the origin's limiting quota charges its full capacity.
+    floor_coefficient: Option<f64>,
 
     /// The decaying window and the log state it drives, under one lock so the
     /// coefficient and the transition decision cannot disagree.
@@ -217,6 +242,7 @@ struct ControllerState {
     /// real throttling. How near the boundary a reading sits depends on how much
     /// traffic the window holds, which [`Confidence`] measures directly.
     phases: PhaseChangeLog<ThrottleState>,
+    floor_since: Option<Instant>,
 }
 
 impl AdaptiveController {
@@ -229,25 +255,69 @@ impl AdaptiveController {
             failure_threshold: control.failure_threshold,
             half_life: control.window,
             origin: origin.into(),
+            floor_coefficient: None,
             state: Mutex::new(ControllerState {
                 window: DecayWindow {
                     requests: 0.0,
                     accepts: 0.0,
+                    slow: 0.0,
                     last_update: None,
                 },
                 phases: PhaseChangeLog::new(ThrottleState::Healthy, control.window),
+                floor_since: None,
             }),
+        }
+    }
+
+    pub(crate) fn with_floor_coefficient(mut self, coefficient: Option<f64>) -> Self {
+        self.floor_coefficient = coefficient;
+        self
+    }
+
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        self.half_life
+    }
+
+    /// Whether the origin has continuously charged full capacity for a window.
+    #[must_use]
+    pub fn at_floor_for_window(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        state.window.decay_to(now, self.half_life);
+        self.update_floor(&mut state, now);
+        state
+            .floor_since
+            .is_some_and(|since| now.duration_since(since) >= self.half_life)
+    }
+
+    fn update_floor(&self, state: &mut ControllerState, now: Instant) {
+        let coefficient = self.coefficient_of(state.window.requests, state.window.accepts);
+        if self
+            .floor_coefficient
+            .is_some_and(|floor| coefficient < 1.0 && coefficient <= floor)
+        {
+            state.floor_since.get_or_insert(now);
+        } else {
+            state.floor_since = None;
         }
     }
 
     /// Record the outcome of one request.
     pub fn record(&self, outcome: RequestOutcome) {
         match self.record_and_evaluate(outcome) {
-            Some(ThrottleState::Throttling) => tracing::warn!(
-                "Upstream '{}' is failing more than the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
-                self.origin,
-                format_percentage(self.failure_threshold),
-            ),
+            Some(ThrottleState::Throttling) => {
+                let condition = if self.state.lock().window.slow > 0.0 {
+                    "is failing, or responding slower than its `rate_control_slow_response_threshold`, on more than"
+                } else {
+                    "is failing more than"
+                };
+                tracing::warn!(
+                    "Upstream '{}' {condition} the {} `rate_control_failure_threshold`, so adaptive rate control is reducing requests to it below the configured limits until it recovers. See: {RATE_CONTROL_DOCS_URL}",
+                    self.origin,
+                    format_percentage(self.failure_threshold),
+                );
+            }
             Some(ThrottleState::Healthy) => tracing::info!(
                 "Upstream '{}' has recovered, so adaptive rate control is sending it the full configured limits again.",
                 self.origin,
@@ -270,10 +340,16 @@ impl AdaptiveController {
         let now = Instant::now();
         let mut state = self.state.lock();
         state.window.decay_to(now, self.half_life);
+        // Decay only raises the coefficient between outcomes. Check before and
+        // after the update so an idle recovery cannot count as time at the floor.
+        self.update_floor(&mut state, now);
         state.window.requests += 1.0;
-        if outcome == RequestOutcome::Success {
-            state.window.accepts += 1.0;
+        match outcome {
+            RequestOutcome::Success => state.window.accepts += 1.0,
+            RequestOutcome::Slow => state.window.slow += 1.0,
+            RequestOutcome::Failure => {}
         }
+        self.update_floor(&mut state, now);
 
         let (requests, accepts) = (state.window.requests, state.window.accepts);
         let observed = ThrottleState::of(self.coefficient_of(requests, accepts));
@@ -326,6 +402,7 @@ impl AdaptiveController {
         let (requests, accepts) = {
             let mut state = self.state.lock();
             state.window.decay_to(now, self.half_life);
+            self.update_floor(&mut state, now);
             (state.window.requests, state.window.accepts)
         };
 
@@ -376,6 +453,7 @@ fn format_percentage(fraction: f64) -> String {
 struct DecayWindow {
     requests: f64,
     accepts: f64,
+    slow: f64,
     last_update: Option<Instant>,
 }
 
@@ -397,6 +475,7 @@ impl DecayWindow {
         let factor = 0.5_f64.powf(half_lives);
         self.requests *= factor;
         self.accepts *= factor;
+        self.slow *= factor;
     }
 }
 
@@ -411,6 +490,55 @@ mod tests {
 
     fn enabled(failure_threshold: f64) -> AdaptiveController {
         AdaptiveController::new(control(failure_threshold), "https://origin.example.com")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_outcomes_have_the_same_control_effect_as_failures() {
+        let slow = enabled(0.1);
+        let failed = enabled(0.1);
+        for i in 0..8000 {
+            slow.record(if i % 2 == 0 {
+                RequestOutcome::Slow
+            } else {
+                RequestOutcome::Success
+            });
+            failed.record(if i % 2 == 0 {
+                RequestOutcome::Failure
+            } else {
+                RequestOutcome::Success
+            });
+        }
+        assert!(
+            (slow.admission_coefficient() - failed.admission_coefficient()).abs() < f64::EPSILON
+        );
+        assert!((slow.admission_coefficient() - (0.5 / 0.9)).abs() < 0.001);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn floor_requires_an_uninterrupted_full_window() {
+        let controller = enabled(0.1).with_floor_coefficient(Some(0.5));
+        for _ in 0..10 {
+            controller.record(RequestOutcome::Slow);
+        }
+        assert!(!controller.at_floor_for_window());
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW).await;
+        assert!(controller.at_floor_for_window());
+        tokio::time::advance(DEFAULT_ADAPTIVE_WINDOW * 10).await;
+        assert!(
+            !controller.at_floor_for_window(),
+            "idle decay recovers above the floor"
+        );
+        for _ in 0..10 {
+            controller.record(RequestOutcome::Slow);
+        }
+        assert!(
+            !controller.at_floor_for_window(),
+            "a new floor episode restarts the window"
+        );
+        for _ in 0..100 {
+            controller.record(RequestOutcome::Success);
+        }
+        assert!(!controller.at_floor_for_window());
     }
 
     #[test]
