@@ -1,0 +1,399 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::cmp::Ordering;
+use std::sync::Arc;
+
+use arrow_array::{
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int32Array,
+    Int64Array, LargeStringArray, StringArray, StringViewArray, UInt16Array,
+};
+use arrow_schema::DataType;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+
+use crate::{Error, KeyEncoder, KeyField};
+
+// ---- key encoding --------------------------------------------------------
+
+fn composite_columns(rng: &mut StdRng, rows: usize) -> Vec<ArrayRef> {
+    let ints: Int64Array = (0..rows)
+        .map(|_| {
+            rng.random_bool(0.9)
+                .then(|| rng.random_range(-3_i64..=3) * (i64::MAX / 3))
+        })
+        .collect();
+    let strings: StringArray = (0..rows)
+        .map(|_| {
+            rng.random_bool(0.9).then(|| {
+                let len = rng.random_range(0..4);
+                (0..len)
+                    .map(|_| ['\0', '\u{1}', 'a', 'b', 'é'][rng.random_range(0..5)])
+                    .collect::<String>()
+            })
+        })
+        .collect();
+    let floats: Float64Array = (0..rows)
+        .map(|_| [-f64::INFINITY, -1.5, -0.0, 0.0, 2.25, f64::MAX][rng.random_range(0..6)])
+        .map(Some)
+        .collect();
+    let bools: BooleanArray = (0..rows).map(|_| Some(rng.random_bool(0.5))).collect();
+    vec![
+        Arc::new(ints),
+        Arc::new(strings),
+        Arc::new(floats),
+        Arc::new(bools),
+    ]
+}
+
+fn composite_encoder() -> KeyEncoder {
+    KeyEncoder::new(vec![
+        KeyField::new(DataType::Int64, true),
+        KeyField::new(DataType::Utf8, true),
+        KeyField::new(DataType::Float64, false),
+        KeyField::new(DataType::Boolean, false),
+    ])
+    .expect("supported key types")
+}
+
+/// Compare two rows of [`composite_columns`] as SQL orders the tuple, NULLs
+/// first — the order the encoding must reproduce.
+fn compare_rows(columns: &[ArrayRef], a: usize, b: usize) -> Ordering {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    let ints = columns[0].as_primitive::<arrow_array::types::Int64Type>();
+    let strings = columns[1].as_string::<i32>();
+    let floats = columns[2].as_primitive::<arrow_array::types::Float64Type>();
+    let bools = columns[3].as_boolean();
+    let int = |i: usize| ints.is_valid(i).then(|| ints.value(i));
+    let string = |i: usize| strings.is_valid(i).then(|| strings.value(i).as_bytes());
+    int(a)
+        .cmp(&int(b))
+        .then_with(|| string(a).cmp(&string(b)))
+        .then_with(|| floats.value(a).total_cmp(&floats.value(b)))
+        .then_with(|| bools.value(a).cmp(&bools.value(b)))
+}
+
+#[test]
+fn encoding_preserves_tuple_order_and_is_prefix_free() {
+    let mut rng = StdRng::seed_from_u64(13);
+    let columns = composite_columns(&mut rng, 3_000);
+    let encoder = composite_encoder();
+    let bound = encoder.bind(&columns).expect("columns match the key");
+    let (bytes, offsets) = bound.encode_all();
+    let key = |i: usize| &bytes[offsets[i]..offsets[i + 1]];
+    for _ in 0..50_000 {
+        let (a, b) = (rng.random_range(0..3_000), rng.random_range(0..3_000));
+        assert_eq!(
+            key(a).cmp(key(b)),
+            compare_rows(&columns, a, b),
+            "rows {a} and {b}"
+        );
+        if key(a) != key(b) {
+            assert!(
+                !key(a).starts_with(key(b)) && !key(b).starts_with(key(a)),
+                "rows {a} and {b} encode to a prefix of one another"
+            );
+        }
+    }
+}
+
+#[test]
+fn string_array_types_encode_identically() {
+    let values = [Some("a\0b"), None, Some(""), Some("\u{1}"), Some("zz")];
+    let string_columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(values.to_vec())),
+        Arc::new(LargeStringArray::from(values.to_vec())),
+        Arc::new(StringViewArray::from(values.to_vec())),
+    ];
+    let mut encodings = Vec::new();
+    for column in string_columns {
+        let encoder = KeyEncoder::new(vec![KeyField::new(column.data_type().clone(), true)])
+            .expect("supported key type");
+        let columns = [column];
+        let bound = encoder.bind(&columns).expect("column matches the key");
+        encodings.push(bound.encode_all());
+    }
+    assert_eq!(encodings[0], encodings[1]);
+    assert_eq!(encodings[0], encodings[2]);
+    // NULL, then "", then "\u{1}", then "a\0b", then "zz".
+    let (bytes, offsets) = &encodings[0];
+    let key = |i: usize| &bytes[offsets[i]..offsets[i + 1]];
+    let order = [1, 2, 3, 0, 4];
+    for pair in order.windows(2) {
+        assert!(key(pair[0]) < key(pair[1]), "{pair:?}");
+    }
+}
+
+#[test]
+fn fixed_width_and_sliced_columns_encode_by_value() {
+    let ints = Int32Array::from(vec![i32::MIN, -1, 0, 1, i32::MAX]);
+    let small = Int8Array::from(vec![-128_i8, -1, 0, 1, 127]);
+    let unsigned = UInt16Array::from(vec![0_u16, 1, 2, 3, u16::MAX]);
+    let fixed = FixedSizeBinaryArray::try_from_iter(
+        [[0_u8, 0], [0, 1], [1, 0], [1, 1], [255, 255]].into_iter(),
+    )
+    .expect("fixed size binary");
+    let binary = BinaryArray::from(vec![&b""[..], b"\0", b"\0\0", b"\x01", b"\xff"]);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(ints),
+        Arc::new(small),
+        Arc::new(unsigned),
+        Arc::new(fixed),
+        Arc::new(binary),
+    ];
+    let encoder = KeyEncoder::new(
+        columns
+            .iter()
+            .map(|c| KeyField::new(c.data_type().clone(), false))
+            .collect(),
+    )
+    .expect("supported key types");
+    let bound = encoder.bind(&columns).expect("columns match the key");
+    let (bytes, offsets) = bound.encode_all();
+    for row in 1..5 {
+        assert!(
+            bytes[offsets[row - 1]..offsets[row]] < bytes[offsets[row]..offsets[row + 1]],
+            "row {row} does not sort after row {}",
+            row - 1
+        );
+    }
+
+    // A sliced array encodes its own rows, not the parent's from offset 0.
+    let sliced: Vec<ArrayRef> = columns.iter().map(|c| c.slice(2, 3)).collect();
+    let bound_slice = encoder.bind(&sliced).expect("sliced columns match the key");
+    let (slice_bytes, _) = bound_slice.encode_all();
+    assert_eq!(slice_bytes, bytes[offsets[2]..offsets[5]]);
+}
+
+#[test]
+fn bind_rejects_mismatched_columns() {
+    let encoder = KeyEncoder::new(vec![KeyField::new(DataType::Int64, false)]).expect("int64 key");
+    let wrong_type: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1]))];
+    assert!(matches!(
+        encoder.bind(&wrong_type),
+        Err(Error::ColumnMismatch { .. })
+    ));
+    let with_null: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None]))];
+    assert!(matches!(
+        encoder.bind(&with_null),
+        Err(Error::ColumnMismatch { .. })
+    ));
+    assert!(matches!(
+        encoder.bind(&[]),
+        Err(Error::ColumnMismatch { .. })
+    ));
+    assert!(matches!(
+        KeyEncoder::new(vec![KeyField::new(
+            DataType::List(Arc::new(arrow_schema::Field::new(
+                "x",
+                DataType::Int8,
+                true
+            ))),
+            false
+        )]),
+        Err(Error::UnsupportedType { .. })
+    ));
+}
+
+/// The streaming encoder produces exactly the verified escape
+/// (`escape_proof::escape_into`), so the prefix-freedom proved for the
+/// specification holds for the bytes stored in the trees.
+#[test]
+fn streaming_encoder_matches_the_verified_escape() {
+    let mut rng = StdRng::seed_from_u64(0x5afe);
+    let values: Vec<Vec<u8>> = (0..5_000)
+        .map(|_| {
+            let len = rng.random_range(0..12);
+            (0..len)
+                .map(|_| match rng.random_range(0..4) {
+                    0 => 0u8,
+                    1 => 1u8,
+                    _ => rng.random_range(0..=255_u8),
+                })
+                .collect()
+        })
+        .collect();
+    let nulls: Vec<bool> = (0..values.len()).map(|_| rng.random_bool(0.1)).collect();
+    // Non-nullable binary column: the key is the escape alone.
+    let binary: ArrayRef = Arc::new(BinaryArray::from_iter_values(values.iter()));
+    let encoder =
+        KeyEncoder::new(vec![KeyField::new(DataType::Binary, false)]).expect("binary key");
+    let bound = encoder.bind(std::slice::from_ref(&binary)).expect("bind");
+    for (row, value) in values.iter().enumerate() {
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        bound.encode_row(row, &mut got);
+        crate::escape_proof::escape_into(value, &mut want);
+        assert_eq!(got, want, "row {row}: {value:?}");
+    }
+    // Nullable string column: `00` for NULL, `01` then the escape.
+    let strings: Vec<Option<String>> = values
+        .iter()
+        .zip(&nulls)
+        .map(|(v, &null)| (!null).then(|| v.iter().map(|&b| char::from(b % 128)).collect()))
+        .collect();
+    let utf8: ArrayRef = Arc::new(StringArray::from(strings.clone()));
+    let encoder = KeyEncoder::new(vec![KeyField::new(DataType::Utf8, true)]).expect("utf8 key");
+    let bound = encoder.bind(std::slice::from_ref(&utf8)).expect("bind");
+    for (row, value) in strings.iter().enumerate() {
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        bound.encode_row(row, &mut got);
+        match value {
+            None => want.push(0),
+            Some(s) => {
+                want.push(1);
+                crate::escape_proof::escape_into(s.as_bytes(), &mut want);
+            }
+        }
+        assert_eq!(got, want, "row {row}: {value:?}");
+    }
+}
+
+/// `Decimal256` and intervals encode in value order (field by field for
+/// intervals, as Arrow compares them), equal values identically, nullable
+/// columns included.
+#[test]
+fn wide_decimals_and_intervals_encode_in_order() {
+    use arrow_array::{Decimal256Array, IntervalDayTimeArray, IntervalMonthDayNanoArray};
+    use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, i256};
+    let mut rng = StdRng::seed_from_u64(77);
+    let n = 2_000;
+    let small = |rng: &mut StdRng| rng.random_range(-3_i32..3);
+    let decimals: Vec<Option<i256>> = (0..n)
+        .map(|i| {
+            (i % 11 != 0).then(|| {
+                i256::from_parts(
+                    rng.random::<u128>() >> rng.random_range(0..128),
+                    i128::from(small(&mut rng)),
+                )
+            })
+        })
+        .collect();
+    let day_time: Vec<IntervalDayTime> = (0..n)
+        .map(|_| IntervalDayTime::new(small(&mut rng), small(&mut rng)))
+        .collect();
+    let month_day_nano: Vec<IntervalMonthDayNano> = (0..n)
+        .map(|_| {
+            IntervalMonthDayNano::new(small(&mut rng), small(&mut rng), i64::from(small(&mut rng)))
+        })
+        .collect();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(
+            Decimal256Array::from(decimals.clone())
+                .with_precision_and_scale(76, 4)
+                .expect("decimal"),
+        ),
+        Arc::new(IntervalDayTimeArray::from(day_time.clone())),
+        Arc::new(IntervalMonthDayNanoArray::from(month_day_nano.clone())),
+    ];
+    let fields: Vec<KeyField> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| KeyField::new(c.data_type().clone(), i == 0))
+        .collect();
+    let encoder = KeyEncoder::new(fields).expect("supported types");
+    let bound = encoder.bind(&columns).expect("bind");
+    let keys: Vec<Vec<u8>> = (0..n)
+        .map(|row| {
+            let mut key = Vec::new();
+            bound.encode_row(row, &mut key);
+            key
+        })
+        .collect();
+    let value = |row: usize| {
+        (
+            decimals[row],
+            (day_time[row].days, day_time[row].milliseconds),
+            (
+                month_day_nano[row].months,
+                month_day_nano[row].days,
+                month_day_nano[row].nanoseconds,
+            ),
+        )
+    };
+    for _ in 0..20_000 {
+        let (a, b) = (rng.random_range(0..n), rng.random_range(0..n));
+        // NULL sorts first, as `Option`'s `None` does.
+        assert_eq!(
+            keys[a].cmp(&keys[b]),
+            value(a).cmp(&value(b)),
+            "rows {a} and {b}"
+        );
+    }
+    for (a, key) in keys.iter().enumerate() {
+        for other in &keys[a + 1..] {
+            assert!(!other.starts_with(key) || other == key, "prefix-free");
+        }
+    }
+}
+
+/// A key of fixed-width fields that fit 8 bytes is its own word, so distinct
+/// keys have distinct words, in key order, whether or not a field is nullable;
+/// any other key is hashed.
+#[test]
+fn key_words_are_exact_for_keys_that_fit_eight_bytes() {
+    use arrow_array::{Int32Array, Int64Array, StringArray};
+    let words = |encoder: &KeyEncoder, columns: &[ArrayRef]| -> Vec<u64> {
+        let bound = encoder.bind(columns).expect("bind");
+        (0..bound.num_rows())
+            .map(|row| {
+                let mut key = Vec::new();
+                bound.encode_row(row, &mut key);
+                encoder.key_word(&key)
+            })
+            .collect()
+    };
+    let values: Vec<i64> = vec![i64::MIN, -5, -1, 0, 1, 7, i64::MAX];
+    for nullable in [false, true] {
+        let encoder = KeyEncoder::new(vec![KeyField::new(DataType::Int64, nullable)]).expect("i64");
+        assert!(encoder.exact_words());
+        let got = words(&encoder, &[Arc::new(Int64Array::from(values.clone()))]);
+        assert!(
+            got.windows(2).all(|pair| pair[0] < pair[1]),
+            "exact words keep key order: {got:?}"
+        );
+    }
+    let pair = KeyEncoder::new(vec![
+        KeyField::new(DataType::Int32, false),
+        KeyField::new(DataType::Int32, true),
+    ])
+    .expect("(i32, i32)");
+    assert!(pair.exact_words(), "two 4-byte fields fit a word");
+    let got = words(
+        &pair,
+        &[
+            Arc::new(Int32Array::from(vec![0, 0, 1, 1])),
+            Arc::new(Int32Array::from(vec![0, 1, 0, 1])),
+        ],
+    );
+    assert!(got.windows(2).all(|pair| pair[0] < pair[1]), "{got:?}");
+    for fields in [
+        vec![KeyField::new(DataType::Utf8, false)],
+        vec![
+            KeyField::new(DataType::Int64, false),
+            KeyField::new(DataType::Int32, false),
+        ],
+    ] {
+        assert!(!KeyEncoder::new(fields).expect("key").exact_words());
+    }
+    let strings = KeyEncoder::new(vec![KeyField::new(DataType::Utf8, false)]).expect("utf8");
+    let got = words(
+        &strings,
+        &[Arc::new(StringArray::from(vec!["a", "b", "a"]))],
+    );
+    assert_eq!(got[0], got[2], "equal keys share a word");
+    assert_ne!(got[0], got[1]);
+}

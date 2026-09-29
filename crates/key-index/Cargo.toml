@@ -1,0 +1,32 @@
+[package]
+name = "key-index"
+description = "Primary-key and secondary indexes over compound Arrow keys: a ROWEX adaptive radix tree, frozen and tiered runs"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+hash-index = { path = "../hash-index" }
+parking_lot.workspace = true
+snafu.workspace = true
+# The Verus specification of the key encoding (`escape_proof`); erased by a
+# normal build. Pinned to the Verus release CI runs.
+vstd = "=0.0.0-2026-08-30-0159"
+
+[dev-dependencies]
+proptest = "1"
+rand.workspace = true
+
+[lints]
+workspace = true
+
+# Opts this crate into `cargo verus focus`.
+[package.metadata.verus]
+verify = true
