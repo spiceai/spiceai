@@ -1359,7 +1359,10 @@ impl PendingPkKeys {
     /// qualifies. It is checked out, built and restored by one apply holding
     /// `write_lock`, which every inline write also takes, so no row reaches the
     /// inline memtable while it is out; validation only reads it, and keys join
-    /// it in `append_to_shard`, after the restore.
+    /// it in `append_to_shard`, after the restore. An index rebuilt during the
+    /// checkout holds the moved keys too: the rebuild reads the inline rows under
+    /// the same listing fence as the snapshot list the flush registers its file
+    /// in, so each moved row is in one or the other.
     pub(crate) fn relocate_inlined_after_flush(&mut self) {
         if self.outstanding == 0 {
             return;

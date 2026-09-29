@@ -1933,6 +1933,11 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by `load_existing_pk_index` after its fenced capture
+    /// and before its scans, so a test can run a checkpoint in the window a keyset
+    /// rebuild reads the table after that capture. Consumed on first fire.
+    #[cfg(test)]
+    test_post_keyset_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -8985,6 +8990,8 @@ impl CayenneTableProvider {
             test_post_scan_view_selection_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -11057,6 +11064,8 @@ impl CayenneTableProvider {
             ),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
+            #[cfg(test)]
+            test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -12961,6 +12970,7 @@ impl CayenneTableProvider {
         let (
             mem_snapshots,
             staged_keys,
+            inlined_batches,
             protected_snapshots,
             current_snapshot_id,
             cold_files,
@@ -12979,6 +12989,12 @@ impl CayenneTableProvider {
             // registration, so reading both here leaves a key in this capture or in
             // the `current_snapshot_id` scan below — never in neither.
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
+            // The inline rows join the same fenced instant: a checkpoint registers the
+            // file it flushed them into as a protected snapshot and clears them under
+            // the WRITE fence, so read after the scans below, the rows of a checkpoint
+            // landing in between would be in neither this snapshot list nor the
+            // inline corpus — and their keys missing from the rebuilt index.
+            let inlined_batches = self.read_inlined_batches_if_present().await?;
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
@@ -13025,12 +13041,15 @@ impl CayenneTableProvider {
             (
                 mem_snapshots,
                 staged_keys,
+                inlined_batches,
                 protected_snapshots,
                 current_snapshot_id,
                 cold_files,
                 scan_guard,
             )
         };
+        #[cfg(test)]
+        self.run_test_post_keyset_capture_hook().await;
 
         let ctx = self.create_session_context();
         // Only read PK columns - no need to load all columns for keyset building
@@ -13184,15 +13203,13 @@ impl CayenneTableProvider {
             );
         }
 
-        if self.cached_inlined_row_count() > 0 {
-            let inlined_batches = self.read_inlined_batches().await?;
-            self.process_visible_inlined_batches_into_keyset(
-                &inlined_batches,
-                pk_indices,
-                converter,
-                &mut keyset,
-            )?;
-        }
+        // The inline rows (read under the fence at the top).
+        self.process_visible_inlined_batches_into_keyset(
+            &inlined_batches,
+            pk_indices,
+            converter,
+            &mut keyset,
+        )?;
 
         // Finally fold in the un-checkpointed mem-tier keys (snapshotted at the top).
         Self::fold_mem_tier_keys_into_keyset(&mem_snapshots, pk_indices, converter, &mut keyset)?;
@@ -13395,11 +13412,14 @@ impl CayenneTableProvider {
     /// Fold the post-checkpoint delta — every protected snapshot and inline entry
     /// (all created after the checkpoint, since compaction clears both) — into a
     /// bloom loaded from the sidecar, making it a superset of all current keys.
+    /// `protected_snapshots` and `inlined_batches` must be captured under one
+    /// listing fence (see `load_existing_pk_index`).
     async fn extend_bloom_with_protected_and_inline(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
         protected_snapshots: &HashMap<String, i64>,
+        inlined_batches: &[RecordBatch],
         bloom: &mut PkBloom,
     ) -> Result<()> {
         let ctx = self.create_session_context();
@@ -13427,12 +13447,9 @@ impl CayenneTableProvider {
             }
         }
 
-        if self.cached_inlined_row_count() > 0 {
-            let inlined_batches = self.read_inlined_batches().await?;
-            for batch in &inlined_batches {
-                // Inlined batches carry the full table schema, so use pk_indices directly.
-                Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
-            }
+        for batch in inlined_batches {
+            // Inlined batches carry the full table schema, so use pk_indices directly.
+            Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
         }
         Ok(())
     }
@@ -13567,7 +13584,14 @@ impl CayenneTableProvider {
         // The mem-tier snapshot is taken inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
         // or already durable in the protected/current scan.
-        let (mem_snapshots, staged_keys, protected_snapshots, current_snapshot_id, _scan_guard) = {
+        let (
+            mem_snapshots,
+            staged_keys,
+            inlined_batches,
+            protected_snapshots,
+            current_snapshot_id,
+            _scan_guard,
+        ) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -13575,9 +13599,11 @@ impl CayenneTableProvider {
                 .iter()
                 .map(ArcSwap::load_full)
                 .collect();
-            // Same fenced instant as the full rebuild captures them in, and for the
-            // same reason — see `load_existing_pk_index`.
+            // The staged keys and the inline rows join the same fenced instant as the
+            // full rebuild captures them in, and for the same reasons — see
+            // `load_existing_pk_index`.
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
+            let inlined_batches = self.read_inlined_batches_if_present().await?;
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
             // Pin the snapshot dirs this path reads (the protected snapshots folded
@@ -13596,6 +13622,7 @@ impl CayenneTableProvider {
             (
                 mem_snapshots,
                 staged_keys,
+                inlined_batches,
                 protected_snapshots,
                 current_snapshot_id,
                 scan_guard,
@@ -13632,6 +13659,7 @@ impl CayenneTableProvider {
             pk_indices,
             converter,
             &protected_snapshots,
+            &inlined_batches,
             &mut bloom,
         )
         .await?;
@@ -26766,6 +26794,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-keyset-capture hook, if one is
+    /// installed. See [`Self::test_post_keyset_capture_hook`].
+    #[cfg(test)]
+    async fn run_test_post_keyset_capture_hook(&self) {
+        let hook = self.test_post_keyset_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
@@ -27967,6 +28005,15 @@ impl CayenneTableProvider {
         // Cache miss: populate both `batches` and `view` together.
         self.populate_inlined_cache(current_gen).await?;
         Ok((*self.inlined_cache.load().batches).clone())
+    }
+
+    /// [`Self::read_inlined_batches`], skipped when the table holds no inline rows.
+    async fn read_inlined_batches_if_present(&self) -> Result<Vec<RecordBatch>> {
+        if self.cached_inlined_row_count() > 0 {
+            self.read_inlined_batches().await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Return the per-entry inline view, building and caching it on first access
@@ -68601,6 +68648,121 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// A checkpoint can land while an apply rebuilds the per-shard index: after the
+    /// rebuild's fenced capture of the snapshot list, before it has read the rest
+    /// of the table. The checkpoint registers the file it flushes the inline rows
+    /// into as a protected snapshot that capture does not list, then clears them,
+    /// so the rebuild must have read the inline rows inside the same fence. The
+    /// index survives the flush (see `relocate_inlined_after_flush`), so a key it
+    /// misses stays missing for every later apply, and the next upsert of that key
+    /// leaves two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_during_a_sharded_keyset_rebuild_keeps_the_flushed_inline_keys() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_rebuild_inline_flush",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // RAM-tier rows for the checkpoint to flush, and key 7 in the inline corpus.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1), (101, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        assert!(
+            !provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: key 7 must be in the inline corpus"
+        );
+
+        // A cold cache, so the next checkout rebuilds the index from the table, and
+        // a checkpoint that runs right after the rebuild's fenced capture.
+        provider.clear_cached_pk_keyset();
+        let checkpointed = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let checkpointed = Arc::clone(&checkpointed);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint during the keyset rebuild");
+                    checkpointed.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard index is rebuilt and checked out");
+        assert!(
+            checkpointed.load(Ordering::SeqCst),
+            "precondition: the checkpoint ran inside the rebuild"
+        );
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+        provider.store_sharded_pk_index(checked_out);
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => assert!(
+                keysets
+                    .iter()
+                    .any(|keyset| keyset.location_by_digest(key_7).is_some()),
+                "the rebuilt index must hold key 7, whose row the checkpoint moved into a \
+                 file the rebuild's snapshot list does not name"
+            ),
+            other => panic!(
+                "the rebuilt per-shard index must survive the checkpoint's inline flush, \
+                 present={}",
+                other.is_some()
+            ),
+        }
+
+        // What a missing key costs: the next upsert of key 7 must replace its row,
+        // not add a second one.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_sharded_rebuild_inline_flush")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value"
+        );
     }
 
     /// A checked-out index that is never restored must not blind the checkout
