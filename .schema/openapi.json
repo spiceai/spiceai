@@ -643,11 +643,11 @@
           "429": {
             "description": "Rate limited"
           },
-          "503": {
-            "description": "Upstream provider unavailable"
-          },
           "500": {
             "description": "Evaluation failed"
+          },
+          "503": {
+            "description": "Upstream provider unavailable"
           }
         }
       }
@@ -971,13 +971,13 @@
           "mcp"
         ],
         "summary": "Open an MCP server-to-client SSE stream",
-        "description": "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+        "description": "Legacy-era only (`2025-11-25` and earlier). Open a long-lived server-to-client SSE stream for an MCP session created via `POST /v1/mcp`. `2026-07-28` clients do not use GET; they POST `subscriptions/listen` instead. The `Mcp-Session-Id` header must identify an existing legacy session.",
         "operationId": "mcp_stream",
         "parameters": [
           {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -989,7 +989,7 @@
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin."
           },
           "404": {
             "description": "Unknown or expired `Mcp-Session-Id`."
@@ -1001,13 +1001,37 @@
           "mcp"
         ],
         "summary": "Send a Model Context Protocol message",
-        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
+        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. Spice is dual-era: `2026-07-28` clients call `server/discover` and tools without a session; legacy clients may still `initialize` and use `Mcp-Session-Id`. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header.",
         "operationId": "mcp_message",
         "parameters": [
           {
+            "name": "MCP-Protocol-Version",
+            "in": "header",
+            "description": "Required for `2026-07-28` requests. Must match `_meta['io.modelcontextprotocol/protocolVersion']` in the JSON-RPC body. Spice serves `2026-07-28` and remains dual-era for legacy `initialize` clients.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Method",
+            "in": "header",
+            "description": "Required for `2026-07-28` requests. Must match the JSON-RPC `method` (e.g. `server/discover`, `tools/list`, `tools/call`). Header/body mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Name",
+            "in": "header",
+            "description": "Required for `2026-07-28` `tools/call` (and `resources/read` / `prompts/get`) requests. Must match `params.name` or `params.uri`.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Param-*",
+            "in": "header",
+            "description": "For `2026-07-28` `tools/call` requests, one header per tool argument annotated with `x-mcp-header`. The header name is `Mcp-Param-` plus the annotation value (for example `Mcp-Param-Region`). The value must match the corresponding argument in the JSON-RPC body; mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            "required": false
+          },
+          {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -1019,16 +1043,16 @@
             "description": "Message accepted (for JSON-RPC notifications / responses that do not require a reply)."
           },
           "400": {
-            "description": "Malformed JSON-RPC payload."
+            "description": "Malformed JSON-RPC payload, unsupported protocol version (`-32022` lists supported versions), or Streamable HTTP header/body mismatch (`-32020`)."
           },
           "401": {
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Configure `runtime.mcp.allowed_hosts` or `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin. A concrete Origin list 403s a mismatched `Origin`."
           },
           "404": {
-            "description": "Unknown or expired `Mcp-Session-Id`."
+            "description": "Unknown method, or unknown/expired `Mcp-Session-Id` on a legacy-era request."
           },
           "413": {
             "description": "Payload too large. Maximum allowed size is 32 MiB."
@@ -1040,13 +1064,13 @@
           "mcp"
         ],
         "summary": "Terminate an MCP Streamable HTTP session",
-        "description": "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+        "description": "Legacy-era only (`2025-11-25` and earlier). Terminate the MCP session identified by the `Mcp-Session-Id` header. `2026-07-28` requests are sessionless and do not use DELETE. Subsequent legacy requests bearing the same session id will receive `404 Not Found`.",
         "operationId": "mcp_terminate_session",
         "parameters": [
           {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -1058,7 +1082,7 @@
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin."
           },
           "404": {
             "description": "Unknown or already-terminated `Mcp-Session-Id`."
