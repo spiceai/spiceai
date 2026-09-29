@@ -29,6 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SCRIPT="$PROJECT_ROOT/install/install.sh"
 INSTALL_SPICED_SCRIPT="$PROJECT_ROOT/install/install-spiced.sh"
+INSTALL_NIGHTLY_SCRIPT="$PROJECT_ROOT/install/install-nightly.sh"
 
 # Test configuration
 LIVE_TESTS=false
@@ -781,6 +782,85 @@ test_spiced_variant_cuda_documented() {
 }
 
 # =============================================================================
+# Sudo Decision Tests
+# =============================================================================
+
+# Runs install.sh end to end, piped into bash as the README one-liner does, with no
+# network and no TTY: `curl` serves a local archive holding a stub `spice`, and `sudo`
+# records its arguments to $home.sudo and refuses, as sudo does without a terminal.
+# Extra arguments are VAR=value pairs passed to the installer's environment.
+run_install_offline() {
+    local home="$1"
+    shift
+    local stubs="$home.stubs"
+    mkdir -p "$stubs/pkg"
+    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/spice"
+    chmod +x "$stubs/pkg/spice"
+    tar czf "$stubs/spice.tar.gz" -C "$stubs/pkg" spice
+    cat > "$stubs/curl" <<STUB
+#!/bin/sh
+while [ \$# -gt 0 ]; do
+    if [ "\$1" = "-o" ]; then cp "$stubs/spice.tar.gz" "\$2"; exit 0; fi
+    shift
+done
+exit 1
+STUB
+    cat > "$stubs/sudo" <<STUB
+#!/bin/sh
+echo "\$*" >> "$home.sudo"
+echo "sudo: a terminal is required to read the password" >&2
+exit 1
+STUB
+    chmod +x "$stubs/curl" "$stubs/sudo"
+    : > "$home.sudo"
+    env -i HOME="$home" PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin" SHELL=/bin/bash "$@" \
+        /bin/bash -c "cat '$INSTALL_SCRIPT' | /bin/bash -s -- 0.0.0" > "$home.log" 2>&1 < /dev/null
+}
+
+# regression test for #14445: a first install, with no ~/.spice yet, must not ask for sudo
+test_install_sh_fresh_home_needs_no_sudo() {
+    local home="$TEST_TMP_DIR/fresh-home"
+    mkdir -p "$home"
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    [[ ! -s "$home.sudo" ]] || { echo "sudo was called: $(cat "$home.sudo")"; return 1; }
+    [[ -x "$home/.spice/bin/spice" && -O "$home/.spice/bin/spice" ]]
+}
+
+test_install_sh_unwritable_dir_uses_sudo() {
+    local home="$TEST_TMP_DIR/locked-home"
+    mkdir -p "$home/locked"
+    chmod 555 "$home/locked"
+    run_install_offline "$home" SPICE_CLI_INSTALL_DIR="$home/locked/new/bin" || true
+    chmod 755 "$home/locked"
+    grep -q "^mkdir -p $home/locked/new/bin" "$home.sudo"
+}
+
+test_install_sh_explicit_use_sudo_is_honored() {
+    local home="$TEST_TMP_DIR/explicit-sudo-home"
+    mkdir -p "$home"
+    run_install_offline "$home" USE_SUDO=true || true
+    grep -q "^cp .* $home/.spice/bin$" "$home.sudo"
+}
+
+# Evaluates install-nightly.sh's getSystemInfo for one SPICED_INSTALL_DIR
+nightly_use_sudo_for() {
+    bash -c "USE_SUDO=false; SPICED_INSTALL_DIR='$1'
+        $(sed -n '/^getSystemInfo() {/,/^}/p' "$INSTALL_NIGHTLY_SCRIPT")
+        getSystemInfo; echo \"\$USE_SUDO\""
+}
+
+test_install_nightly_sh_missing_parent_needs_no_sudo() {
+    local home="$TEST_TMP_DIR/nightly-home"
+    mkdir -p "$home/locked"
+    chmod 555 "$home/locked"
+    local writable locked
+    writable=$(nightly_use_sudo_for "$home/new/bin")
+    locked=$(nightly_use_sudo_for "$home/locked/new/bin")
+    chmod 755 "$home/locked"
+    [[ "$writable" == "false" && "$locked" == "true" ]]
+}
+
+# =============================================================================
 # Error Handling Tests
 # =============================================================================
 
@@ -981,6 +1061,18 @@ run_all_tests() {
     run_test "CUDA variant documented" test_spiced_variant_cuda_documented
     echo ""
     
+    # Sudo decision (a root user never runs sudo, so these only run unprivileged)
+    echo "--- Sudo Decision ---"
+    if [[ $EUID -ne 0 ]]; then
+        run_test "install.sh: first install into a fresh HOME needs no sudo" test_install_sh_fresh_home_needs_no_sudo
+        run_test "install.sh: unwritable install dir uses sudo" test_install_sh_unwritable_dir_uses_sudo
+        run_test "install.sh: explicit USE_SUDO=true is honored" test_install_sh_explicit_use_sudo_is_honored
+        run_test "install-nightly.sh: missing parent dir needs no sudo" test_install_nightly_sh_missing_parent_needs_no_sudo
+    else
+        skip_test "Sudo decision tests" "running as root"
+    fi
+    echo ""
+
     # Error Handling
     echo "--- Error Handling ---"
     run_test "install.sh has error handling" test_script_has_error_handling
