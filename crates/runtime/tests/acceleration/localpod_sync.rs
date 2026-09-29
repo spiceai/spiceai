@@ -792,7 +792,7 @@ async fn test_localpod_passthrough_child_follows_parent_removed_and_added_back()
 ///
 /// Regression test for <https://github.com/spiceai/spiceai/issues/13087>: startup chained each
 /// `localpod` dataset behind its parent by taking the parent's load out of the queue, so the
-/// second sibling found no parent and failed with "Parent dataset 'time_series' doesn't exist",
+/// second sibling found no parent and failed with `Parent dataset 'time_series' doesn't exist`,
 /// and a grandchild listed before its parent failed the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_siblings_and_out_of_order_grandchild_load_at_startup()
