@@ -154,12 +154,49 @@ def tracked_files() -> tuple[list[str], list[str]]:
     return [p for p in listing.split("\0") if p], []
 
 
+# `import name` / `from name import …`, at any indentation so an import inside a
+# `try:` block still counts. Only the first module of `import a, b` is read; the
+# guards import their `scripts/` siblings one per line.
+IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+(\w+)[ \t]+import\b|import[ \t]+(\w+))", re.MULTILINE)
+
+
+def read_script(path: str) -> str | None:
+    """A repo file's text, or None when there is no such file."""
+    try:
+        return (REPO / path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def sibling_imports(guards: list[str], read=read_script) -> set[str]:
+    """The `scripts/` modules the guards import, followed transitively.
+
+    A guard's behavior lives in every module it imports, so a helper shared by
+    several guards is as much a gate input as the guards are — yet nothing in the
+    `lint-rust` recipe names it. Any imported name with no `scripts/<name>.py`
+    behind it (the standard library) is skipped.
+    """
+    found: set[str] = set()
+    pending = [g for g in guards if g.startswith("scripts/")]
+    while pending:
+        text = read(pending.pop())
+        if text is None:
+            continue
+        for match in IMPORT_RE.finditer(text):
+            module = f"scripts/{match.group(1) or match.group(2)}.py"
+            if module not in found and read(module) is not None:
+                found.add(module)
+                pending.append(module)
+    return found
+
+
 def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
-    at, and every `$(PYTHON) scripts/…` guard it runs) plus the tracked files whose
-    basename marks them as lint/test config.
+    at, every `$(PYTHON) scripts/…` guard it runs, and the `scripts/` modules those
+    guards import) plus the tracked files whose basename marks them as lint/test
+    config.
     """
     paths: set[str] = set(RUST_SOURCE_PATHS)
     notes: list[str] = []
@@ -181,9 +218,9 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     # exact failure this script exists to catch. So the accepted spellings are
     # deliberately broad, and only a spelling that would drop a guard — a
     # different variable, or a bare `python` — is left unmatched.
-    paths.update(
-        re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
-    )
+    guards = re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
+    paths.update(guards)
+    paths.update(sibling_imports(guards))
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 

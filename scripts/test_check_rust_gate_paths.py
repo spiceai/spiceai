@@ -29,6 +29,7 @@ from check_rust_gate_paths import (  # noqa: E402
     read_patterns,
     rust_source_errors,
     rust_source_trees,
+    sibling_imports,
     tracked_files,
 )
 
@@ -228,12 +229,16 @@ print("derived_gate_paths")
 
 def derived_from(recipe: str) -> list[str]:
     """Guard paths `derived_gate_paths` reads out of a synthetic `lint-rust` recipe."""
-    original = check_rust_gate_paths.lint_recipe
+    original = check_rust_gate_paths.lint_recipe, check_rust_gate_paths.sibling_imports
     check_rust_gate_paths.lint_recipe = lambda: recipe
+    # The guards' imports are read from the real files, which would tie these
+    # recipe-spelling cases to whatever those files import today; they are
+    # pinned separately below.
+    check_rust_gate_paths.sibling_imports = lambda guards: set()
     try:
         paths, _ = derived_gate_paths([])
     finally:
-        check_rust_gate_paths.lint_recipe = original
+        check_rust_gate_paths.lint_recipe, check_rust_gate_paths.sibling_imports = original
     # `RUST_SOURCE_PATHS` is seeded unconditionally and derived from nothing, so
     # dropping it leaves exactly what the recipe contributed.
     return sorted(set(paths) - set(check_rust_gate_paths.RUST_SOURCE_PATHS))
@@ -279,6 +284,45 @@ check(
     "the clippy config directory derives its clippy.toml",
     derived_from('\tCLIPPY_CONF_DIR=".ci" cargo clippy'),
     [".ci/clippy.toml"],
+)
+
+print("sibling_imports")
+
+SCRIPTS = {
+    "scripts/check_a.py": "import json\nfrom common import cargo_metadata\n",
+    "scripts/check_b.py": "try:\n    import tomllib\nexcept ModuleNotFoundError:\n    pass\nimport common\n",
+    "scripts/common.py": "import sys\nfrom deeper import helper  # noqa: E402\n",
+    "scripts/deeper.py": "import common\n",
+}
+reader = SCRIPTS.get
+
+check(
+    "a guard's `from x import` pulls in its sibling, transitively",
+    sorted(sibling_imports(["scripts/check_a.py"], reader)),
+    ["scripts/common.py", "scripts/deeper.py"],
+)
+check(
+    "an indented import is read, and a stdlib module is not a gate path",
+    sorted(sibling_imports(["scripts/check_b.py"], reader)),
+    ["scripts/common.py", "scripts/deeper.py"],
+)
+check(
+    "a guard that is not on disk contributes nothing",
+    sibling_imports(["scripts/check_missing.py"], reader),
+    set(),
+)
+check(
+    "a commented-out import is not read",
+    sibling_imports(["scripts/check_c.py"], {"scripts/check_c.py": "# import nowhere\n"}.get),
+    set(),
+)
+# The shipped helper is imported by both cargo-metadata guards and named by no
+# recipe line, so this is the only derivation that gates it.
+check(
+    "the shipped guards derive scripts/rust_guard_common.py",
+    "scripts/rust_guard_common.py"
+    in sibling_imports(["scripts/check_crate_layers.py", "scripts/check_module_reachability.py"]),
+    True,
 )
 
 print("live tree")
