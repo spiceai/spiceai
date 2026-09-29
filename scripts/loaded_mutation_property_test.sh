@@ -53,7 +53,7 @@ NHOGS="${NHOGS:-$(( ncpu < 16 ? ncpu : 16 ))}"
 
 run_tests() {
   # sccache can point at an unwritable dir in some sandboxes and break the C
-  # build; bypass the wrappers for these runs (see CLAUDE.md).
+  # build; bypass the wrappers for these runs (see AGENTS.md).
   env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
     SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}" \
     RUST_BACKTRACE=1 CAYENNE_PROPTEST_OPS_SCALE="$OPS_SCALE" \

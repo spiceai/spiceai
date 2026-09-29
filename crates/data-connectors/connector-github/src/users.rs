@@ -54,9 +54,7 @@ impl GraphQLContext for UsersTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (user) + 3 count-only connections: followers, following, repositories
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(4)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 

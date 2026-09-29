@@ -1,0 +1,27 @@
+[package]
+description = "Sharded in-memory cache with LRU and TinyLFU eviction for Spice results caches"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "sharded-cache"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+# Specification and proof vocabulary for `src/layout.rs`. A normal `cargo build`
+# erases the specifications, so this carries no runtime cost; `cargo verus focus`
+# re-checks the proofs. Pinned to the Verus release whose verifier is run in CI —
+# the two are versioned together. Must match the `vstd` pin in
+# `crates/hash-index/Cargo.toml` and `crates/cache/Cargo.toml`, and
+# `VERUS_VSTD_VERSION` in `.github/workflows/verus_verify.yml`.
+vstd = "=0.0.0-2026-08-30-0159"
+
+[lints]
+workspace = true
+
+# Opts this crate into `cargo verus focus`. Without it the verifier compiles the
+# crate and checks nothing, reporting "no crates that opted into verification".
+[package.metadata.verus]
+verify = true

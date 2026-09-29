@@ -532,6 +532,77 @@ fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
 
 #[cfg(test)]
 mod tests {
+    /// The decode `block_to_arrow` performs for a `ClickHouse` `Date32` column, over
+    /// the range that makes `Date32` a distinct type: `ClickHouse` `Date` is 16
+    /// unsigned bits of days from the epoch, so it stops at 1970-01-01 on one side
+    /// and 2149-06-06 on the other, and `Date32` is the only way to carry a date
+    /// outside that.
+    ///
+    /// `Date32` support is a Spice patch to the `spiceai/clickhouse-rs` fork, in
+    /// three parts: `DateConverter for i32`, the `Value`/`ValueRef::Date32`
+    /// variants, and the `FromSql for NaiveDate` arm asserted here — which is the
+    /// one `block_to_arrow` calls, through `row.get::<NaiveDate, _>()` on the
+    /// `SqlType::Date` arm.
+    ///
+    /// Fed a `ValueRef` directly rather than a decoded column because a `Date32`
+    /// column cannot be built client-side: `Block::add_column` over `NaiveDate`
+    /// resolves through `SqlType::from(Value::Date32) == SqlType::Date` to a 16-bit
+    /// `DateColumnData<u16>`, and the only thing that produces the 32-bit one is
+    /// `column::factory`'s `"Date32"` wire-type arm, reached from `Block::load`,
+    /// which is `pub(crate)`. That half of the patch is guarded end-to-end instead,
+    /// by the `Date32` column in `test/scripts/setup-data-clickhouse.sql` — losing
+    /// it leaves the wire type unrecognised and fails the whole `SELECT`.
+    #[test]
+    fn a_date32_value_decodes_the_dates_a_date_column_cannot_hold() {
+        use chrono::NaiveDate;
+        use clickhouse_rs::types::{FromSql, SqlType, Value, ValueRef};
+
+        // Day counts from the Unix epoch. -25_567 is 1900-01-01, before the epoch
+        // `Date` counts from at all; 84_006 is 2200-01-01, past the 2149-06-06 that
+        // is `Date`'s last representable day (65_535).
+        for (days, expected) in [
+            (-25_567_i32, (1900, 1, 1)),
+            (84_006_i32, (2200, 1, 1)),
+            (0_i32, (1970, 1, 1)),
+        ] {
+            let expected = NaiveDate::from_ymd_opt(expected.0, expected.1, expected.2)
+                .expect("the guard's expected date is a real date");
+
+            let decoded =
+                <NaiveDate as FromSql>::from_sql(ValueRef::Date32(days)).unwrap_or_else(|e| {
+                    panic!(
+                        "a ClickHouse Date32 column holding {expected} failed to decode, so every \
+                         query against a dataset with a Date32 column fails: {e}"
+                    )
+                });
+            assert_eq!(
+                decoded, expected,
+                "a ClickHouse Date32 of {days} days decoded as {decoded}, not {expected}: the \
+                 dataset reports a date that is not the one stored"
+            );
+
+            // The same conversion reached through `Value`, which is what a column
+            // built from these values pushes through.
+            assert_eq!(
+                NaiveDate::from(Value::Date32(days)),
+                expected,
+                "Value::Date32 of {days} days converted to the wrong date"
+            );
+        }
+
+        // `block_to_arrow` selects the `NaiveDate` decode above by matching
+        // `SqlType::Date`, and a `Date32` column reports exactly that. A re-cut
+        // that gave `Date32` a `SqlType` of its own would leave the column
+        // matching no arm at all — an unsupported-type error on a column that
+        // decodes fine today — so the mapping is part of what has to hold.
+        assert_eq!(
+            SqlType::from(Value::Date32(0)),
+            SqlType::Date,
+            "a Date32 column no longer reports SqlType::Date, so block_to_arrow's Date arm does \
+             not claim it and the column is rejected as an unsupported type"
+        );
+    }
+
     #[test]
     fn test_block_to_arrow() {
         use super::block_to_arrow;

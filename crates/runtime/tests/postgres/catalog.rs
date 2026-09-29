@@ -48,7 +48,10 @@ use spicepod::{component::catalog::Catalog, param::Params};
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+    utils::{
+        pushed_down_sql, register_test_connectors, run_query, runtime_ready_check,
+        test_request_context,
+    },
 };
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
@@ -56,9 +59,9 @@ use data_components::catalog_filter::TableSelector;
 use data_components::postgres::provider::PostgresCatalogProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::UnsupportedTypeAction;
-use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
+use runtime::catalogconnector::postgres::build_table_factory;
 
 const CATALOG_NAME: &str = "pg_e2e";
 
@@ -904,7 +907,9 @@ async fn refreshable_catalog(
     let provider = Arc::new(PostgresCatalogProvider::new(
         CATALOG_NAME.to_string(),
         Arc::clone(&pool),
-        Arc::new(PostgresTableFactory::new(pool)) as Arc<dyn Read>,
+        // The connector's own seam, not a bare `PostgresTableFactory`: a test
+        // holding the latter asserts against a provider no user is given.
+        build_table_factory(pool),
         TableSelector::select_all(),
     ));
 
@@ -1346,7 +1351,7 @@ async fn test_refresh_registers_nothing_when_include_matches_no_table() -> Resul
             let provider = PostgresCatalogProvider::new(
                 CATALOG_NAME.to_string(),
                 Arc::clone(&pool),
-                Arc::new(PostgresTableFactory::new(pool)) as Arc<dyn Read>,
+                build_table_factory(pool),
                 TableSelector::new(Some(globset_of(&["public.absent"])), None)
                     .with_include_patterns(&["public.absent".to_string()]),
             );
@@ -1439,4 +1444,95 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// A `TEXT` column of JSON documents, which the Spice-only UDF below reads.
+/// `TEXT` rather than `JSONB` so the column arrives as `Utf8` whatever
+/// `unsupported_type_action` says, keeping the test about pushdown.
+async fn seed_json_documents(port: usize) -> Result<(), anyhow::Error> {
+    source_exec(
+        port,
+        "CREATE TABLE documents (id INT PRIMARY KEY, body TEXT NOT NULL); \
+         INSERT INTO documents (id, body) VALUES \
+             (1, '{\"color\": \"red\"}'), (2, '{\"color\": \"blue\"}');",
+    )
+    .await
+}
+
+/// A Spice-only UDF over a catalog-registered table is evaluated locally
+/// instead of being unparsed into the SQL sent to `PostgreSQL`.
+///
+/// The catalog connector built its tables through a bare
+/// `PostgresTableFactory`, which federates with no function deny-list, so
+/// `json_get_str` reached the server verbatim and the query failed with
+/// `function json_get_str(text, unknown) does not exist`. Registering the same
+/// source per-dataset never had the problem; only a `catalogs:` entry did.
+/// Regression test for #13664.
+#[tokio::test]
+async fn test_catalog_evaluates_a_spice_only_udf_locally() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_json_documents(port).await?;
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            let rows = run_query(
+                &rt,
+                &format!(
+                    "SELECT id, json_get_str(body, 'color') AS color \
+                     FROM {CATALOG_NAME}.public.documents ORDER BY id"
+                ),
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------+",
+                    "| id | color |",
+                    "+----+-------+",
+                    "| 1  | red   |",
+                    "| 2  | blue  |",
+                    "+----+-------+",
+                ],
+                &rows
+            );
+
+            // The denied call must stay local: the server is asked only for the
+            // columns. Reading the pushed-down SQL, not just the rows, is what
+            // separates "evaluated locally" from "the server happened to cope".
+            let pushed = pushed_down_sql(
+                &run_query(
+                    &rt,
+                    &format!(
+                        "EXPLAIN SELECT json_get_str(body, 'color') AS color \
+                         FROM {CATALOG_NAME}.public.documents"
+                    ),
+                )
+                .await?,
+            )?;
+            assert!(
+                !pushed.contains("json_get_str"),
+                "json_get_str must not reach PostgreSQL; pushed SQL was: {pushed}"
+            );
+
+            // ...and a query with no denied function must still federate, so the
+            // deny-list unfederates the plans that need it and nothing else.
+            let pushed = pushed_down_sql(
+                &run_query(
+                    &rt,
+                    &format!("EXPLAIN SELECT upper(body) FROM {CATALOG_NAME}.public.documents"),
+                )
+                .await?,
+            )?;
+            assert!(
+                pushed.contains("upper"),
+                "upper() must still federate to PostgreSQL; pushed SQL was: {pushed}"
+            );
+
+            Ok(())
+        })
+        .await
 }

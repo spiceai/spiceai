@@ -359,6 +359,48 @@ impl RuntimeStatus {
         self.get_component_status(&format!("dataset:{dataset}"))
     }
 
+    /// Returns the current status of a single model, if registered.
+    #[must_use]
+    pub fn get_model_status(&self, model_name: &str) -> Option<ComponentStatus> {
+        self.get_component_status(&format!("model:{model_name}"))
+    }
+
+    /// Returns the current status of a single embedding model, if registered.
+    #[must_use]
+    pub fn get_embedding_status(&self, model_name: &str) -> Option<ComponentStatus> {
+        self.get_component_status(&format!("embedding:{model_name}"))
+    }
+
+    /// Explains why the configured model `model_name` is missing from the store that serves it,
+    /// or `None` when its status gives no better explanation than "not found". See
+    /// [`unavailable_model_message`].
+    #[must_use]
+    pub fn unavailable_model_reason(&self, model_name: &str) -> Option<String> {
+        unavailable_model_message(model_name, self.get_model_status(model_name))
+    }
+
+    /// The embedding-model counterpart of [`RuntimeStatus::unavailable_model_reason`].
+    #[must_use]
+    pub fn unavailable_embedding_reason(&self, model_name: &str) -> Option<String> {
+        unavailable_model_message(model_name, self.get_embedding_status(model_name))
+    }
+
+    /// Returns `true` if the dataset has reported `Ready` at least once since it was
+    /// registered. A refresh task reports `Refreshing` from the moment a load starts,
+    /// including the first one, so this is what tells a refresh of loaded data apart
+    /// from a first load that is still filling the dataset.
+    #[must_use]
+    pub fn has_dataset_ever_been_ready(&self, dataset: &TableReference) -> bool {
+        self.has_component_ever_been_ready(&format!("dataset:{dataset}"))
+    }
+
+    fn has_component_ever_been_ready(&self, component_name: &str) -> bool {
+        self.ever_ready_components
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(component_name)
+    }
+
     /// Returns the status of all registered views.
     #[must_use]
     pub fn get_view_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
@@ -590,6 +632,34 @@ impl RuntimeStatus {
                 () = self.shutdown_token.cancelled() => return WaitOutcome::ShuttingDown,
             }
         }
+    }
+}
+
+/// Explains why a configured model is absent from the store serving a request.
+///
+/// A model that failed to load, or has not finished loading, is never inserted into its serving
+/// store, so a lookup miss alone reads as "no such model" and sends the user to check a name that
+/// is correct. Returns `None` when `status` gives no better explanation, and the caller keeps its
+/// own "not found" message.
+#[must_use]
+pub fn unavailable_model_message(
+    model_id: &str,
+    status: Option<ComponentStatus>,
+) -> Option<String> {
+    match status? {
+        ComponentStatus::Error(Some(cause)) => Some(format!(
+            "Model '{model_id}' failed to load, so it cannot serve requests. Cause: {cause}"
+        )),
+        ComponentStatus::Error(None) => Some(format!(
+            "Model '{model_id}' failed to load, so it cannot serve requests. Check the Spice runtime logs for the cause."
+        )),
+        // `Refreshing` here is a reload: the model leaves its store before it is loaded again.
+        ComponentStatus::Initializing
+        | ComponentStatus::NotLoaded
+        | ComponentStatus::Refreshing => Some(format!(
+            "Model '{model_id}' is still loading. Retry once it is ready."
+        )),
+        ComponentStatus::Ready | ComponentStatus::Disabled | ComponentStatus::ShuttingDown => None,
     }
 }
 
@@ -997,5 +1067,87 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Ready);
         receiver.changed().await.expect("should receive change");
         assert_eq!(*receiver.borrow(), ComponentStatus::Ready);
+    }
+
+    #[test]
+    fn a_refreshing_dataset_that_was_never_ready_has_not_been_ready() {
+        let status = RuntimeStatus::new();
+        let first_load = TableReference::bare("first_load");
+        let refreshed = TableReference::bare("refreshed");
+
+        status.update_dataset(&first_load, ComponentStatus::Initializing);
+        status.update_dataset(&first_load, ComponentStatus::Refreshing);
+        status.update_dataset(&refreshed, ComponentStatus::Ready);
+        status.update_dataset(&refreshed, ComponentStatus::Refreshing);
+
+        assert!(
+            !status.has_dataset_ever_been_ready(&first_load),
+            "a dataset whose first load is in flight has never been ready"
+        );
+        assert!(
+            status.has_dataset_ever_been_ready(&refreshed),
+            "a dataset refreshing data it already loaded has been ready"
+        );
+        assert!(
+            !status.has_dataset_ever_been_ready(&TableReference::bare("unregistered")),
+            "an unregistered dataset has never been ready"
+        );
+    }
+
+    #[test]
+    fn unavailable_model_message_explains_each_absent_state() {
+        assert_eq!(
+            unavailable_model_message(
+                "m",
+                Some(ComponentStatus::error_with_message("Insufficient Balance"))
+            )
+            .as_deref(),
+            Some(
+                "Model 'm' failed to load, so it cannot serve requests. Cause: Insufficient Balance"
+            )
+        );
+        assert_eq!(
+            unavailable_model_message("m", Some(ComponentStatus::error())).as_deref(),
+            Some(
+                "Model 'm' failed to load, so it cannot serve requests. Check the Spice runtime logs for the cause."
+            )
+        );
+        for loading in [
+            ComponentStatus::Initializing,
+            ComponentStatus::NotLoaded,
+            ComponentStatus::Refreshing,
+        ] {
+            assert_eq!(
+                unavailable_model_message("m", Some(loading.clone())).as_deref(),
+                Some("Model 'm' is still loading. Retry once it is ready."),
+                "{loading:?}"
+            );
+        }
+        // No status, or one that does not explain the absence (a removed model is `Disabled`),
+        // leaves the caller's own "not found" message in place.
+        for unexplained in [
+            None,
+            Some(ComponentStatus::Ready),
+            Some(ComponentStatus::Disabled),
+            Some(ComponentStatus::ShuttingDown),
+        ] {
+            assert_eq!(
+                unavailable_model_message("m", unexplained.clone()),
+                None,
+                "{unexplained:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_reasons_read_the_matching_status_kind() {
+        let status = RuntimeStatus::new();
+        status.update_model("m", ComponentStatus::error_with_message("boom"));
+        status.update_embedding("e", ComponentStatus::Initializing);
+
+        assert!(status.unavailable_model_reason("m").is_some());
+        assert_eq!(status.unavailable_embedding_reason("m"), None);
+        assert!(status.unavailable_embedding_reason("e").is_some());
+        assert_eq!(status.unavailable_model_reason("e"), None);
     }
 }

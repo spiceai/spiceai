@@ -88,7 +88,11 @@ fn bench_in_list_pruning(c: &mut Criterion) {
     let mut group = c.benchmark_group("in_list_pruning");
     for list_len in LIST_LENS {
         let df_expr = in_list_expr(&schema, list_len);
-        let vortex_expr = convertor.convert(df_expr.as_ref()).expect("convert");
+        // A scan filter converts as a predicate, which is the form that keeps the
+        // bare `list_contains` and its falsifier.
+        let vortex_expr = convertor
+            .convert_predicate(df_expr.as_ref())
+            .expect("convert");
         let falsified = vortex_expr
             .falsify(&scope, &session)
             .expect("falsify")
@@ -113,7 +117,11 @@ fn bench_in_list_pruning(c: &mut Criterion) {
         );
 
         group.bench_with_input(BenchmarkId::new("convert", list_len), &list_len, |b, _| {
-            b.iter(|| convertor.convert(df_expr.as_ref()).expect("convert"));
+            b.iter(|| {
+                convertor
+                    .convert_predicate(df_expr.as_ref())
+                    .expect("convert")
+            });
         });
         group.bench_with_input(BenchmarkId::new("falsify", list_len), &list_len, |b, _| {
             b.iter(|| vortex_expr.falsify(&scope, &session).expect("falsify"));

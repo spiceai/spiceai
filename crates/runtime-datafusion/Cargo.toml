@@ -27,6 +27,7 @@ futures.workspace = true
 itertools.workspace = true
 opentelemetry.workspace = true
 parking_lot.workspace = true
+regex-syntax.workspace = true
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-query-engine = { path = "../runtime-query-engine" }

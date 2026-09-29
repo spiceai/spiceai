@@ -1,0 +1,14 @@
+{
+  "enterprise": {
+    "commit": "7fae16569c601ffd310375ce3cd8e5abd077548e",
+    "path": "/Users/lukim/dev/ent"
+  },
+  "operator": {
+    "commit": "4de706cabe416e20afe9ef343fc7fb2d375cd00f",
+    "path": "/Users/lukim/dev/spice-k8s-operator"
+  },
+  "cloud_docs": {
+    "commit": "fd4a879ebc932996295fe9c5fda4178c94b7bb60",
+    "path": "/Users/lukim/dev/docs"
+  }
+}

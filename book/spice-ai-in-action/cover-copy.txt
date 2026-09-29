@@ -1,0 +1,10 @@
+Top Text: Because your AI was confidently querying its imagination.
+Title: Spice.ai in Action
+Subtitle: SQL, Search, and AI—from Local Development to Enterprise
+Author: @denitdao
+Subtitle Placement: Below the title
+Color: #0a79b5
+Animal Image: Goat
+Custom Image: Leave blank
+
+Text for the O’RLY cover-generator form. The generated goat image is not used in the manuscript.

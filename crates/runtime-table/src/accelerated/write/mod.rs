@@ -43,6 +43,7 @@ limitations under the License.
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
 pub mod dual_write;
+pub(crate) mod lock;
 pub(crate) mod write_back;
 
 use std::sync::Arc;
@@ -79,6 +80,20 @@ pub(crate) enum WriteMode {
 }
 
 impl WriteMode {
+    /// Whether a write in this mode reaches the local accelerator, and so has
+    /// to run under `lock::AcceleratorWriteLockExec` to serialize against
+    /// acceleration snapshot creation (#13548).
+    ///
+    /// This one predicate answers both halves of that: a guarded write also
+    /// gets its freshness marker stamped by the wrapper when it finishes, so
+    /// only an *unguarded* write stamps where its plan is built.
+    /// `WriteThrough` is the unguarded one — it writes to the federated source
+    /// alone, and the accelerator learns of the change through refresh or CDC,
+    /// both of which take that lock themselves.
+    pub(crate) fn reaches_accelerator(&self) -> bool {
+        !matches!(self, Self::WriteThrough)
+    }
+
     /// Returns `true` if this is the dual-write mode (Iceberg catalog cache path).
     #[must_use]
     pub fn is_dual_write(&self) -> bool {

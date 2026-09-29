@@ -105,6 +105,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::status::get,
         v1::spicepods::get,
         v1::embeddings::post,
+        v1::evaluate::post,
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
@@ -125,7 +126,19 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::packages::generate,
     ),
 
-    components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
+    components(schemas(
+        DatasetQueryParams,
+        DatasetFilter,
+        Format,
+        evaluate_api::EvaluateRequest,
+        evaluate_api::EvaluateResponse,
+        evaluate_api::Question,
+        evaluate_api::Answer,
+        evaluate_api::EntryType,
+        evaluate_api::NonNullEntry,
+        evaluate_api::NullableEntry,
+        evaluate_api::NoulCriteria,
+    ))
 )]
 pub(crate) struct ApiDoc;
 
@@ -475,10 +488,15 @@ pub(crate) fn routes(
                 post(v1::responses::post).layer(ModelContextLayer),
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
+            .route(
+                "/v1/evaluate",
+                post(v1::evaluate::post).layer(ModelContextLayer),
+            )
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
+            .layer(Extension(rt.evaluate_models()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
@@ -563,6 +581,9 @@ pub(crate) fn routes(
 
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(rt)))
+        // Handlers that report a model's load state take the status on its own, so they can be
+        // exercised without building a `Runtime`.
+        .layer(Extension(rt.status()))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(v1::status::MetricsTlsEnabled(metrics_tls)))
         .layer(Extension(config));

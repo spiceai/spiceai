@@ -31,6 +31,7 @@ aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
+aws-sdk-sqs.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.12.5", features = ["typed-header", "query"] }
@@ -96,6 +97,7 @@ opendal.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
+evaluate-api = { path = "../evaluate-api" }
 mediatype = "0.21.0"
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
@@ -371,6 +373,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "evaluate-api/openapi",
     "runtime-acceleration/openapi",
     "runtime-table/openapi",
     "runtime-api-types/openapi",

@@ -30,6 +30,30 @@ name: mysql-cayenne[file]-adaptive
 # order_line carries predicate-aware maintained aggregates for CH-benCH q1 and q6.
 # Past the retained-entry cap the registry detaches and those queries fall back to a
 # base-table scan (expected at SF1000).
+#
+# CLUSTERED LAYOUT: the three high-volume CDC tables CH-benCH filters on pin
+# `cayenne_cluster_by`, so their warm files are laid out along a Hilbert curve over that
+# key instead of the default layout, which ranks columns by how OFTEN a query filters them
+# rather than by how much they prune — at CH-benCH that favours `ol_delivery_d`, the
+# most-filtered order_line column, although the seed writes it as one constant plus NULL,
+# so it separates almost nothing. Each key pairs the leading primary-key column (`*_w_id`,
+# keeping the per-warehouse locality the CDC upsert probes and every join read through)
+# with the one column a query filters selectively — order_line q8 `ol_i_id < 1000` and q19
+# `ol_w_id IN (1,2,3)`, oorder q13 `o_carrier_id > 8`, customer q3 `c_state LIKE 'A%'`.
+# stock, new_order, district and warehouse stay unpinned (no CH-benCH query filters them),
+# so every run still carries a high-volume table on the default layout to compare against.
+# Keys match the postgres adaptive pod, so the two sources stay comparable.
+# What it costs and buys, measured on the 3-node lab (mysql, SF-100, 3 reps per side,
+# arms interleaved, one binary, pods differing only by these keys): worst-table freshness
+# halves — 25.1s unpinned vs 12.5s pinned, every pinned arm below every unpinned one, exact
+# permutation p=0.05 — while QPH (p=0.55), tpmC, spiced CPU and RSS all stay put. The layout
+# does change: an explicit key replaces the inference-derived sort order (the two cannot be
+# combined) and routes whole-snapshot writes through ONE ordered writer instead of the
+# range-routed parallel write, so order_line's durable scan reads 4 files in 4 groups where
+# the unpinned arm reads 31 in 20. Fewer footer opens against less scan fan-out cancel out on
+# a 20-core host, which is why query latency does not move. WHY freshness improves is NOT
+# established: every write-path metric scraped (files on disk, write MiB/s, metastore and
+# mem-tier checkpoints, files reclaimed, encode waits) is flat between the arms.
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
 # (server_id derived from the connection identity - the engine default). The
@@ -107,7 +131,14 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration:
+      <<: *cayenne_accel
+      params:
+        <<: *cayenne_params
+        # q3's `c_state LIKE 'A%'` (one state prefix in 26) is the only customer
+        # predicate a zone map can prune — q22 filters on `substr(c_phone, 1, 1)`
+        # and a scalar subquery. c_w_id leads the primary key.
+        cayenne_cluster_by: c_w_id,c_state
 
   - from: mysql:new_order
     name: new_order
@@ -121,7 +152,14 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration:
+      <<: *cayenne_accel
+      params:
+        <<: *cayenne_params
+        # q13 filters `o_carrier_id > 8` (the Delivery txn sets it, NULL until then).
+        # o_w_id leads the primary key and is the join key q3/q5/q10/q12/q18/q21 read
+        # oorder through.
+        cayenne_cluster_by: o_w_id,o_carrier_id
 
   - from: mysql:order_line
     name: order_line
@@ -130,6 +168,14 @@ datasets:
       mysql_replication_initial_snapshot: auto
     acceleration:
       <<: *cayenne_accel
+      params:
+        <<: *cayenne_params
+        # The two selective CH-benCH predicates over the heaviest table: q8
+        # `ol_i_id < 1000` (999 of the 100,000 item ids the seed draws from, ~1% of
+        # rows) and q19's `ol_w_id IN (...)` lists (3 warehouses of the scale factor;
+        # degenerate at SF1, where the whole table is one warehouse). ol_w_id also
+        # leads the primary key.
+        cayenne_cluster_by: ol_w_id,ol_i_id
       # Predicate-aware maintained aggregates for CH-benCH q1 and q6 over
       # order_line. Same views as the postgres adaptive pod: q1 grouped by
       # ol_number over delivered lines; q6 a global SUM over a delivery-date
