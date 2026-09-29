@@ -30,10 +30,15 @@ use crate::{
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
+    use crate::acceleration::get_params;
     use datafusion_table_providers::sql::db_connection_pool::{
         DbConnectionPool, duckdbpool::DuckDbConnectionPool,
     };
     use duckdb::AccessMode;
+    use runtime::{component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_checkpointer};
+    use runtime_acceleration::sidecar::OpenOption;
+    use runtime_acceleration::snapshot::SnapshotBehavior;
+    use spicepod::acceleration::Mode;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
