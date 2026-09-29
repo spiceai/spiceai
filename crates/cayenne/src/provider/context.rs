@@ -845,13 +845,15 @@ impl CayenneContext {
     /// phase) into the tuner's rolling EWMA. Called from the write path with the
     /// duration it already measured for telemetry.
     pub(crate) fn record_io_latency(&self, d: std::time::Duration) {
-        self.ingest_stats.record_io_latency(d);
+        self.ingest_stats
+            .record_io_latency_at(d, chrono::Utc::now().timestamp_millis());
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
     /// single-writer commit) into the tuner's rolling EWMA.
     pub(crate) fn record_publish_latency(&self, d: std::time::Duration) {
-        self.ingest_stats.record_publish_latency(d);
+        self.ingest_stats
+            .record_publish_latency_at(d, chrono::Utc::now().timestamp_millis());
     }
 
     /// Record the live deletion-index size a committed seq-prefix bake left
@@ -920,6 +922,7 @@ impl CayenneContext {
         snap.metastore_storage = self.config.metastore_storage_class;
         snap.data_write_mbps = self.config.data_storage_write_mbps;
         snap.metastore_write_mbps = self.config.metastore_storage_write_mbps;
+        self.ingest_stats.expire_stale_latencies(&mut snap, now_ms);
         snap
     }
 

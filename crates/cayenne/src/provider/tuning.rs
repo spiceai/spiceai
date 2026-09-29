@@ -271,6 +271,15 @@ const MEM_TIER_BUDGET_FRACTION: u64 = 16;
 /// (`cayenne_goal_convergence_window`).
 pub(crate) const DEFAULT_GOAL_CONVERGENCE_WINDOW: Duration = Duration::from_mins(1);
 
+/// How long a per-batch write / publish latency sample stays a live controller
+/// signal: one goal-convergence window (see
+/// [`IngestStats::expire_stale_latencies`]).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a minutes-scale convergence window's millis fit i64 with vast headroom"
+)]
+const LATENCY_SIGNAL_TTL_MS: i64 = DEFAULT_GOAL_CONVERGENCE_WINDOW.as_millis() as i64;
+
 /// Number of correction steps the goal controller plans across the convergence
 /// window. Sets BOTH the per-tick step cap (`range / N` — "no big jumps") AND the
 /// goal-mode dwell (`window / N` — "converge within the window"): with the default
@@ -1049,6 +1058,11 @@ pub(crate) struct IngestStats {
     /// Live deletion-index size (tombstone count) the most recent committed
     /// seq-prefix bake left behind; `usize::MAX` until the first bake.
     bake_residual: AtomicUsize,
+    /// Wall-clock time (ms since the Unix epoch) of the newest per-batch write /
+    /// publish latency sample; `i64::MIN` until the first. See
+    /// [`IngestStats::expire_stale_latencies`].
+    io_latency_at_ms: AtomicI64,
+    publish_latency_at_ms: AtomicI64,
     /// Memory usage as a fraction of the cgroup-aware budget, stored ×1000.
     /// `u64::MAX` is the sentinel for "unknown" (no budget/sample yet).
     mem_pressure_milli: AtomicU64,
@@ -1079,6 +1093,8 @@ impl IngestStats {
             total_batches: AtomicU64::new(0),
             read_amp: AtomicUsize::new(0),
             bake_residual: AtomicUsize::new(usize::MAX),
+            io_latency_at_ms: AtomicI64::new(i64::MIN),
+            publish_latency_at_ms: AtomicI64::new(i64::MIN),
             mem_pressure_milli: AtomicU64::new(u64::MAX),
             newest_source_commit_ts_ms: AtomicI64::new(i64::MIN),
             last_visible_ts_ms: AtomicI64::new(i64::MIN),
@@ -1187,6 +1203,45 @@ impl IngestStats {
         let ms = duration_ms(d);
         inner.publish_latency_ms.update(ms);
         inner.publish_latency_fast_ms.update(ms);
+    }
+
+    /// [`Self::record_io_latency`], stamped with the sample's wall-clock time.
+    pub fn record_io_latency_at(&self, d: Duration, now_ms: i64) {
+        self.record_io_latency(d);
+        self.io_latency_at_ms.fetch_max(now_ms, Ordering::Relaxed);
+    }
+
+    /// [`Self::record_publish_latency`], stamped with the sample's wall-clock time.
+    pub fn record_publish_latency_at(&self, d: Duration, now_ms: i64) {
+        self.record_publish_latency(d);
+        self.publish_latency_at_ms.fetch_max(now_ms, Ordering::Relaxed);
+    }
+
+    /// Drop the write and publish latencies from `snap` when no batch has
+    /// refreshed them within [`LATENCY_SIGNAL_TTL_MS`] of `now_ms`.
+    ///
+    /// Those latencies are sampled only on the durable write path. A memory-mode
+    /// CDC table takes that path while its initial snapshot loads and on a spill,
+    /// then applies to RAM for the rest of its life, so without an expiry the
+    /// bootstrap's large-write latency stands as the table's latency forever and
+    /// reads as I/O-bound against every later arrival gap: on CH-benCH SF-100 a
+    /// bootstrap-seeded 720–820 ms held `order_line` "I/O-bound" for a whole run,
+    /// and the write-pressure rule walked its bake trigger to the ceiling one
+    /// crawl step per tick. A latency nobody has refreshed says nothing about the
+    /// write path, so the controller reads it as unavailable. Pure in `now_ms`.
+    pub fn expire_stale_latencies(&self, snap: &mut IngestSnapshot, now_ms: i64) {
+        let stale = |at: &AtomicI64| {
+            let at = at.load(Ordering::Relaxed);
+            at == i64::MIN || now_ms.saturating_sub(at) > LATENCY_SIGNAL_TTL_MS
+        };
+        if stale(&self.io_latency_at_ms) {
+            snap.io_latency_ms = None;
+            snap.io_latency_fast_ms = None;
+        }
+        if stale(&self.publish_latency_at_ms) {
+            snap.publish_latency_ms = None;
+            snap.publish_latency_fast_ms = None;
+        }
     }
 
     /// Replication lag in seconds relative to `now_ms` (age of the newest applied
@@ -4986,6 +5041,67 @@ mod tests {
                 "a violated query goal may only lower the bake trigger, got {v}"
             );
         }
+    }
+
+    #[test]
+    fn a_write_latency_nobody_refreshes_stops_steering_the_controller() {
+        let stats = IngestStats::new();
+        let loaded_at_ms = 1_000_000;
+        // The bootstrap's durable writes are slow; the table then applies to RAM.
+        stats.record_io_latency_at(Duration::from_millis(800), loaded_at_ms);
+        stats.record_publish_latency_at(Duration::from_millis(400), loaded_at_ms);
+
+        let mut fresh = stats.snapshot();
+        stats.expire_stale_latencies(&mut fresh, loaded_at_ms + LATENCY_SIGNAL_TTL_MS);
+        assert!(fresh.io_latency_ms.is_some() && fresh.publish_latency_ms.is_some());
+
+        let mut stale = stats.snapshot();
+        stats.expire_stale_latencies(&mut stale, loaded_at_ms + LATENCY_SIGNAL_TTL_MS + 1);
+        assert_eq!(
+            (
+                stale.io_latency_ms,
+                stale.io_latency_fast_ms,
+                stale.publish_latency_ms,
+                stale.publish_latency_fast_ms
+            ),
+            (None, None, None, None),
+            "a latency no batch refreshed within a window must not keep the table I/O-bound"
+        );
+
+        // A new durable write refreshes the signal.
+        let later_ms = loaded_at_ms + 10 * LATENCY_SIGNAL_TTL_MS;
+        stats.record_io_latency_at(Duration::from_millis(50), later_ms);
+        let mut refreshed = stats.snapshot();
+        stats.expire_stale_latencies(&mut refreshed, later_ms + 1);
+        assert!(refreshed.io_latency_ms.is_some());
+        assert_eq!(refreshed.publish_latency_ms, None);
+    }
+
+    #[test]
+    fn an_expired_write_latency_no_longer_raises_the_bake_trigger() {
+        // The write-pressure raise, fed a bootstrap-era latency above half a steady
+        // 2 s arrival gap, raises the trigger every tick …
+        let io_bound = IngestSnapshot {
+            io_latency_ms: Some(1_500.0),
+            arrival_gap_ms: 2_000.0,
+            apply_ms: 20.0,
+            apply_vs_arrival: 0.01,
+            ..snap()
+        };
+        let goals = query_latency_goal_ms(10_000.0);
+        assert!(
+            raised_bake_trigger(goal_decide(&io_bound, &actuators(), &bounds(), &goals)).is_some(),
+            "precondition: the stale latency reads as write pressure"
+        );
+        // … and stops once the latency has expired.
+        let expired = IngestSnapshot {
+            io_latency_ms: None,
+            ..io_bound
+        };
+        assert_eq!(
+            raised_bake_trigger(goal_decide(&expired, &actuators(), &bounds(), &goals)),
+            None
+        );
     }
 
     #[test]
