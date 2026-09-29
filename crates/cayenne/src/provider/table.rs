@@ -12058,8 +12058,8 @@ impl CayenneTableProvider {
             // it. A discard costs the next apply a rebuild from a full-table key scan
             // under `write_lock`, and the in-memory CDC checkpoint runs this flush
             // off-lock while an apply validates (every bake after a seal), so on a
-            // large table those rebuilds were most of the apply time (SF-1000
-            // CH-benCH: order_line 1 253 s of 1 599 s).
+            // large table a discard on every such overlap makes those rebuilds most
+            // of the apply time.
             self.sharded_pk_keyset_pending
                 .lock()
                 .relocate_inlined_after_flush();
@@ -68503,10 +68503,9 @@ mod tests {
     /// A checkpoint that moves the inline rows into files while an apply has the
     /// per-shard index checked out must not cost that index: the flush changes
     /// where rows live, not which keys are live. The restore relabels the `Inlined`
-    /// entries committed before the flush and caches the index. Discarding it made
-    /// the next apply rebuild the index from a full-table key scan under
-    /// `write_lock`, which was most of `order_line`'s apply time in the SF-1000
-    /// CH-benCH run.
+    /// entries committed before the flush and caches the index; discarding it would
+    /// make the next apply rebuild the index from a full-table key scan under
+    /// `write_lock`.
     #[tokio::test]
     async fn an_inline_flush_during_a_sharded_checkout_relabels_instead_of_discarding() {
         let ctx = SessionContext::new();
@@ -68581,8 +68580,8 @@ mod tests {
     }
 
     /// The per-shard index is a Bloom once the keyset outgrows its budget (the
-    /// form every large CH-benCH table runs in at SF-1000, where each discard of
-    /// it was reported as `kind=bloom, reason=invalidated`). A Bloom carries no
+    /// form every large CH-benCH table runs in at SF-1000; a discard of it reports
+    /// `kind=bloom, reason=invalidated`). A Bloom carries no
     /// row locations, so an inline flush during its checkout has nothing to
     /// relabel and must not cost the index: the restore keeps it and replays the
     /// keys committed while it was out.
