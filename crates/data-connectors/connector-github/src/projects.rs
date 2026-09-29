@@ -19,7 +19,7 @@ use data_connector_api::ConnectorComponent;
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext};
+use connector_graphql::graphql::{ErrorChecker, GraphQLContext, RefusalKind};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ impl GraphQLContext for ProjectsTableArgs {
                 // returns "Something went wrong while executing your query" instead of a proper
                 // permission error. GitHub sends the same message when its backend times out, so
                 // the cause is not certain from the message. The error is reported as an inferred
-                // refusal (`explicit_deny: false`) and is retried: a few retries on a real
+                // refusal (`RefusalKind::Inferred`) and is retried: a few retries on a real
                 // permission failure cost less than a permanent failure on a transient timeout.
                 if let Some(errors) = response.get("errors") {
                     tracing::debug!(
@@ -80,7 +80,7 @@ impl GraphQLContext for ProjectsTableArgs {
                                 );
                                 return Err(connector_graphql::graphql::Error::InvalidCredentialsOrPermissions {
                                 message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error. This is either a transient GitHub backend failure or a GitHub App that lacks project read permissions. If the error persists, verify the app has the required project access."),
-                                explicit_deny: false,
+                                kind: RefusalKind::Inferred,
                             });
                             }
                         }

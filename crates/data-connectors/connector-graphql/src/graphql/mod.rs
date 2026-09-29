@@ -59,16 +59,10 @@ pub enum Error {
 
     /// The API refused the request for a credential or permission reason.
     ///
-    /// `explicit_deny` records how the refusal was reported. It is `true` when
-    /// the API named the refusal (HTTP 401/403, a `FORBIDDEN` GraphQL error
-    /// type) and `false` when the connector inferred it from an ambiguous
-    /// message that a transient backend failure also produces. Only an explicit
-    /// deny is permanent; see `is_retriable_error`.
+    /// `kind` records how the refusal was reported. Only an explicit deny is
+    /// permanent; see `is_retriable_error`.
     #[snafu(display("{message}"))]
-    InvalidCredentialsOrPermissions {
-        message: String,
-        explicit_deny: bool,
-    },
+    InvalidCredentialsOrPermissions { message: String, kind: RefusalKind },
 
     #[snafu(display("{message}"))]
     ResourceNotFound { message: String },
@@ -110,6 +104,16 @@ pub enum Error {
     },
 }
 
+/// How a credential/permission refusal was reported by the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The API named the refusal (HTTP 401/403, a `FORBIDDEN` GraphQL error type).
+    Explicit,
+    /// The connector inferred the refusal from an ambiguous message that a
+    /// transient backend failure also produces.
+    Inferred,
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Determines if a GraphQL error is retriable (transient).
@@ -125,13 +129,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// ran. The next attempt waits on those headers instead of failing the scan.
 ///
 /// `Error::InvalidCredentialsOrPermissions` is retriable unless the API named
-/// the refusal (`explicit_deny`). An inferred refusal comes from a message that
-/// a backend timeout also produces, so it must not make the refresh permanent.
+/// the refusal (`RefusalKind::Explicit`). An inferred refusal comes from a
+/// message that a backend timeout also produces, so it must not make the
+/// refresh permanent.
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
         Error::RateLimited { .. } => true,
-        Error::InvalidCredentialsOrPermissions { explicit_deny, .. } => !explicit_deny,
+        Error::InvalidCredentialsOrPermissions { kind, .. } => *kind == RefusalKind::Inferred,
         Error::InvalidReqwestStatus { status, .. } => {
             status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
@@ -189,7 +194,7 @@ pub fn should_shrink_page_size(error: &Error) -> bool {
         || matches!(
             error,
             Error::InvalidCredentialsOrPermissions {
-                explicit_deny: false,
+                kind: RefusalKind::Inferred,
                 ..
             }
         )
@@ -400,7 +405,7 @@ mod tests {
     fn test_inferred_credentials_error_is_retriable_and_shrinks() {
         let inferred = Error::InvalidCredentialsOrPermissions {
             message: "GitHub returned an internal error".to_string(),
-            explicit_deny: false,
+            kind: RefusalKind::Inferred,
         };
         assert!(
             is_retriable_error(&inferred),
@@ -413,7 +418,7 @@ mod tests {
 
         let named = Error::InvalidCredentialsOrPermissions {
             message: "HTTP 403".to_string(),
-            explicit_deny: true,
+            kind: RefusalKind::Explicit,
         };
         assert!(
             !is_retriable_error(&named),
@@ -447,7 +452,7 @@ mod tests {
         let non_retriable_errors = vec![
             Error::InvalidCredentialsOrPermissions {
                 message: "Invalid credentials".to_string(),
-                explicit_deny: true,
+                kind: RefusalKind::Explicit,
             },
             Error::ResourceNotFound {
                 message: "Resource not found".to_string(),
@@ -638,7 +643,7 @@ mod tests {
         let non_status_errors = vec![
             Error::InvalidCredentialsOrPermissions {
                 message: "bad creds".to_string(),
-                explicit_deny: true,
+                kind: RefusalKind::Explicit,
             },
             Error::InternalError {
                 message: "internal".to_string(),

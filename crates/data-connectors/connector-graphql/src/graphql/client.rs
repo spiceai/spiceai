@@ -20,8 +20,8 @@ use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
 
 use super::{
-    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_gateway_error, is_retriable_error, should_shrink_page_size,
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RefusalKind,
+    ReqwestInternalSnafu, Result, is_gateway_error, is_retriable_error, should_shrink_page_size,
 };
 use arrow::{
     array::RecordBatch,
@@ -1976,13 +1976,13 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials are correct."
                 ),
-                explicit_deny: true,
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials have the necessary permissions."
                 ),
-                explicit_deny: true,
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => {
                 Err(Error::InvalidReqwestStatus {
@@ -2037,7 +2037,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     );
                     return Err(Error::InvalidCredentialsOrPermissions {
                         message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
-                        explicit_deny: false,
+                        kind: RefusalKind::Inferred,
                     });
                 }
             }
@@ -2094,7 +2094,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     message: format!(
                         "The API returned a 'FORBIDDEN' error. Verify the credentials have the necessary permissions. {message}"
                     ),
-                    explicit_deny: true,
+                    kind: RefusalKind::Explicit,
                 });
             }
             if error_type.to_lowercase() == "not_found" {
