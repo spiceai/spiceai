@@ -24,14 +24,13 @@ limitations under the License.
 //! `column_indices` order. `SortMergeJoinExec` builds it with every left
 //! column first, so once `CayenneAntiJoinSortMergeRewriter` carries that
 //! filter onto a sort-merge join the batch no longer matches the filter's
-//! schema.
+//! schema: a query fails when the misplaced columns differ in type, and
+//! returns wrong rows when they do not.
 //!
 //! Every query runs in a session with the rewriter and in one without it, and
 //! the rows must match. The memory gate is set low enough that the join counts
 //! as oversized, and one partition gives both join inputs the same partition
 //! count, which the rewrite requires.
-
-#![allow(clippy::expect_used)]
 
 mod common;
 
@@ -59,6 +58,15 @@ const ORDER_LINES: i32 = 6_000;
 const Q17: &str = "SELECT sum(ol_amount) / 2.0 AS avg_yearly \
     FROM order_line, \
       (SELECT i_id, avg(ol_quantity) AS a FROM item, order_line \
+       WHERE i_data LIKE '%b' AND ol_i_id = i_id GROUP BY i_id) t \
+    WHERE ol_i_id = t.i_id AND ol_quantity < t.a";
+
+/// q17 with `max` in place of `avg`, so both sides of the filter are `Int32`.
+/// Misplaced columns of one type raise no error: the filter compares
+/// `a < ol_quantity` instead of `ol_quantity < a`, and the answer is wrong.
+const Q17_SAME_TYPE: &str = "SELECT count(*) AS lines, sum(ol_amount) AS amount \
+    FROM order_line, \
+      (SELECT i_id, max(ol_quantity) AS a FROM item, order_line \
        WHERE i_data LIKE '%b' AND ol_i_id = i_id GROUP BY i_id) t \
     WHERE ol_i_id = t.i_id AND ol_quantity < t.a";
 
@@ -195,7 +203,7 @@ async fn a_swapped_join_filter_survives_the_sort_merge_rewrite_impl(
         )?;
     }
 
-    for sql in [Q17_LEFT_JOIN, Q17] {
+    for sql in [Q17_SAME_TYPE, Q17_LEFT_JOIN, Q17] {
         // The rewrite must be in play for the comparison to mean anything.
         let plan = plan_of(&with_rewriter, sql).await?;
         assert!(
@@ -209,10 +217,11 @@ async fn a_swapped_join_filter_survives_the_sort_merge_rewrite_impl(
             1,
             "precondition: {sql} returns one row: {reference_rows:?}"
         );
-        let got = match sorted_rows(&with_rewriter, sql).await {
-            Ok(rows) => rows,
-            Err(err) => panic!("{sql} failed under the sort-merge rewrite: {err}\n{plan}"),
-        };
+        let got = sorted_rows(&with_rewriter, sql)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("{sql} failed under the sort-merge rewrite: {err}\n{plan}")
+            });
         assert_eq!(
             got, reference_rows,
             "the sort-merge rewrite changed the answer to {sql}:\n{plan}"

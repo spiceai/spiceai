@@ -126,7 +126,7 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -1065,35 +1065,27 @@ fn finish_sort_merge_rewrite(
 /// no longer matches the filter schema: CH-benCHmark q17's
 /// `CAST(ol_quantity@0 AS Float64) < a@1`, with `ol_quantity` on the right,
 /// failed with "expected Int32 but found Float64 at column index 0" (#14235).
+/// When the two misplaced columns share a type there is no error, and the filter
+/// silently compares the wrong columns. `DataFusion` fixed the reader upstream in
+/// `apache/datafusion#25489`; this is needed until the pinned fork carries it.
 fn left_columns_first(filter: &JoinFilter) -> Result<JoinFilter, DataFusionError> {
     let column_indices = filter.column_indices();
-    let order: Vec<usize> = (0..column_indices.len())
-        .filter(|&i| column_indices[i].side == JoinSide::Left)
-        .chain((0..column_indices.len()).filter(|&i| column_indices[i].side != JoinSide::Left))
-        .collect();
-    if order.iter().enumerate().all(|(new, &old)| new == old) {
+    if column_indices.is_sorted_by_key(|column| column.side != JoinSide::Left) {
         return Ok(filter.clone());
     }
+    // A stable sort, so each side keeps its relative order.
+    let mut order: Vec<usize> = (0..column_indices.len()).collect();
+    order.sort_by_key(|&i| column_indices[i].side != JoinSide::Left);
 
     // `position[old]` is where the intermediate column at `old` moves to.
     let mut position = vec![0; order.len()];
     for (new, &old) in order.iter().enumerate() {
         position[old] = new;
     }
-    let schema = filter.schema();
-    let reordered_schema = Arc::new(Schema::new_with_metadata(
-        order
-            .iter()
-            .map(|&old| Arc::clone(&schema.fields()[old]))
-            .collect::<Vec<_>>(),
-        schema.metadata().clone(),
-    ));
+    let reordered_schema = Arc::new(filter.schema().project(&order)?);
     let reordered_indices = order
         .iter()
-        .map(|&old| ColumnIndex {
-            index: column_indices[old].index,
-            side: column_indices[old].side,
-        })
+        .map(|&old| column_indices[old].clone())
         .collect();
     let expression = Arc::clone(filter.expression())
         .transform(|expr| {
