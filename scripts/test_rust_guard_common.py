@@ -60,15 +60,11 @@ def run_with_cargo(
 
 def run_helper(cargo_body: str | None, mode: int = 0o755) -> subprocess.CompletedProcess:
     """Call `cargo_metadata()` the way a guard does, printing its `ok` field."""
-    return run_with_cargo(
-        [
-            "-c",
-            "import sys; sys.path.insert(0, 'scripts'); "
-            "from rust_guard_common import cargo_metadata; print(cargo_metadata()['ok'])",
-        ],
-        cargo_body,
-        mode,
+    call = (
+        "import sys; sys.path.insert(0, 'scripts'); "
+        "from rust_guard_common import cargo_metadata; print(cargo_metadata()['ok'])"
     )
+    return run_with_cargo(["-c", call], cargo_body, mode)
 
 
 print("cargo_metadata() answering")
