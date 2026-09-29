@@ -219,6 +219,17 @@ const MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL: u64 = 32;
 /// error.
 const MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES: u64 = 3;
 
+/// How a rebuild of the maintained-aggregate views from the visible table state
+/// ended, when it did not error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintainedAggregateRebuild {
+    /// The views were rebuilt from a scan that no write changed while it ran.
+    Rebuilt,
+    /// A write became visible while the scan ran, so the scanned rows match no
+    /// single epoch; the registry was left stale for a later attempt.
+    Superseded,
+}
+
 /// Floor for the derived retained-index budget, applied only where the pool can
 /// afford it. Below this an index is too small to serve any useful table, so a
 /// modest pool is lifted to the floor rather than left with a share no index can
@@ -1938,6 +1949,11 @@ pub struct CayenneTableProvider {
     /// rebuild reads the table after that capture. Consumed on first fire.
     #[cfg(test)]
     test_post_keyset_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by `rebuild_maintained_aggregates_from_visible_state`
+    /// after its scan has been read, so a test can land a write inside that scan's
+    /// window. Consumed on first fire.
+    #[cfg(test)]
+    test_post_maintained_aggregate_scan_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -8992,6 +9008,8 @@ impl CayenneTableProvider {
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -11066,6 +11084,10 @@ impl CayenneTableProvider {
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
+            #[cfg(test)]
+            test_post_maintained_aggregate_scan_hook: Arc::clone(
+                &self.test_post_maintained_aggregate_scan_hook,
+            ),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -25729,23 +25751,46 @@ impl CayenneTableProvider {
 
     async fn rebuild_maintained_aggregates_from_visible_state(
         &self,
-    ) -> datafusion_common::Result<()> {
+    ) -> datafusion_common::Result<MaintainedAggregateRebuild> {
         if self.maintained_aggregates.is_empty() {
-            return Ok(());
+            return Ok(MaintainedAggregateRebuild::Rebuilt);
         }
 
         let ctx = self.create_session_context();
         let session_state = Arc::new(ctx.state());
-        // NOTE: the scan is deliberately unprojected. The views resolve their
-        // group-by, aggregate-input, and PK columns as indices into the TABLE
-        // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
-        // the columns out from under them. Projecting requires re-resolving every
-        // view against the projected schema; until that lands, correctness wins
-        // over the wasted materialization.
-        let plan =
-            <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None).await?;
+        // Take the epoch and the scan's snapshot together under `write_lock`, which
+        // every write that changes the visible rows holds while it does so, so the
+        // snapshot is the state at exactly this epoch. Planning captures the
+        // snapshot; the read below runs after the lock is released.
+        let (plan, epoch) = {
+            let _write_guard = self.write_lock.lock().await;
+            let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
+            // NOTE: the scan is deliberately unprojected. The views resolve their
+            // group-by, aggregate-input, and PK columns as indices into the TABLE
+            // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
+            // the columns out from under them. Projecting requires re-resolving every
+            // view against the projected schema; until that lands, correctness wins
+            // over the wasted materialization.
+            let plan = <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None)
+                .await?;
+            (plan, epoch)
+        };
         let batches = collect(plan, session_state.task_ctx()).await?;
-        let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
+        #[cfg(test)]
+        self.run_test_post_maintained_aggregate_scan_hook().await;
+        // A write that became visible while the scan ran is not in these rows, and
+        // its delta reached a stale registry, which dropped it. Marked fresh, the
+        // views would be served without that write's rows, so leave the registry
+        // stale and let a later attempt rebuild it.
+        if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
+            self.mark_maintained_aggregates_stale();
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                epoch,
+                "Maintained aggregate rebuild superseded by a write during its scan; the registry stays stale until a later attempt"
+            );
+            return Ok(MaintainedAggregateRebuild::Superseded);
+        }
         // Capture stats before `batches` is moved into the blocking task.
         let batch_count = batches.len();
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
@@ -25767,7 +25812,7 @@ impl CayenneTableProvider {
             rows = row_count,
             "Initialized maintained aggregate state from visible table snapshot"
         );
-        Ok(())
+        Ok(MaintainedAggregateRebuild::Rebuilt)
     }
 
     /// Rebuild a stale maintained-aggregate registry, rate-limited.
@@ -25822,13 +25867,15 @@ impl CayenneTableProvider {
             .rebuild_maintained_aggregates_from_visible_state()
             .await
         {
-            Ok(()) if !self.maintained_aggregates.is_stale() => {
+            // Logged at debug where it happened; the next interval retries.
+            Ok(MaintainedAggregateRebuild::Superseded) => {}
+            Ok(MaintainedAggregateRebuild::Rebuilt) if !self.maintained_aggregates.is_stale() => {
                 tracing::info!(
                     table = %self.table_metadata.table_name,
                     "Maintained aggregate state rebuilt after staleness; queries are served from maintained state again"
                 );
             }
-            Ok(()) => {
+            Ok(MaintainedAggregateRebuild::Rebuilt) => {
                 tracing::warn!(
                     table = %self.table_metadata.table_name,
                     retained_bytes = retained,
@@ -26799,6 +26846,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_post_keyset_capture_hook(&self) {
         let hook = self.test_post_keyset_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-maintained-aggregate-scan hook, if one
+    /// is installed. See [`Self::test_post_maintained_aggregate_scan_hook`].
+    #[cfg(test)]
+    async fn run_test_post_maintained_aggregate_scan_hook(&self) {
+        let hook = self.test_post_maintained_aggregate_scan_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -56338,6 +56395,106 @@ mod tests {
             collect_id_count_sum(&served),
             vec![(1, 1, 10), (2, 1, 20)],
             "staged feed must populate count(*)=1 and sum(value)=value per key"
+        );
+    }
+
+    /// A stale maintained-aggregate registry is rebuilt from a full scan while CDC
+    /// writes continue. A write that becomes visible during that scan is in neither
+    /// the scanned rows nor the registry, which dropped its delta while stale, so
+    /// the rebuild must not mark the views fresh: served from them, the aggregate
+    /// would leave that write's rows out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintained_aggregate_rebuild_does_not_serve_a_write_its_scan_missed() {
+        use std::sync::atomic::Ordering;
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "ma_rebuild_scan_race",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first CDC write prepares");
+        write.finish().await.expect("first CDC write publishes");
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        assert_eq!(
+            collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
+            vec![(1, 1, 10), (2, 1, 20)],
+            "precondition: the registry serves the first write"
+        );
+
+        // Stale, as after a durable delete, then a rebuild whose scan a write lands in.
+        provider.mark_maintained_aggregates_stale();
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let schema = Arc::clone(&schema);
+            *provider.test_post_maintained_aggregate_scan_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let task_ctx = SessionContext::new().task_ctx();
+                    let write = provider_in_hook
+                        .write_cdc_append_stream(
+                            single_batch_stream(id_value_batch(schema, &[3], &[30])),
+                            &task_ctx,
+                        )
+                        .await
+                        .expect("CDC write during the rebuild scan prepares");
+                    write
+                        .finish()
+                        .await
+                        .expect("CDC write during the rebuild scan publishes");
+                    // Let the applier take in (and, while stale, drop) that write's delta.
+                    let published = provider_in_hook
+                        .maintained_aggregate_epoch
+                        .load(Ordering::Acquire);
+                    for _ in 0..250 {
+                        if provider_in_hook.maintained_aggregates.epoch_for_test() >= published {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    panic!("the applier never took in the delta of the write made during the scan");
+                })
+            }));
+        }
+        let _ = provider
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+            .expect("rebuild runs");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "ma_rebuild_scan_race").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "precondition: the table holds the write made during the rebuild scan"
+        );
+        let epoch = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+        if let Some(served) = provider
+            .maintained_aggregates
+            .batch_for_aggregate(&aggregate_exec, epoch)
+            .expect("maintained serve must not error")
+        {
+            assert_eq!(
+                collect_id_count_sum(&served),
+                vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+                "a served maintained aggregate must include every visible row"
+            );
+        }
+
+        // With no write during its scan, the next rebuild restores serving, complete.
+        let _ = provider
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+            .expect("rebuild runs");
+        assert_eq!(
+            collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+            "a rebuild with no write during its scan serves every row"
         );
     }
 
