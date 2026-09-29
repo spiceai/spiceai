@@ -3183,9 +3183,8 @@ pub mod cayenne {
     /// Counts secondary index probes by outcome, so an indexed run can be told
     /// apart from one that silently fell back to the ordinary scan. Outcomes (the
     /// `outcome` dimension): `selected` (row selection attached), `empty`
-    /// (complete index miss, no candidate rows), `unbuilt` (no index for the
-    /// table's data yet), `snapshot_mismatch` (the index no longer matches the
-    /// table's data). `dimensions` carries `table`, `shape` (the indexed columns,
+    /// (the covered files hold no candidate for the key), `unbuilt` (no index
+    /// run covers the files read). `dimensions` carries `table`, `shape` (the indexed columns,
     /// as the `indexes` entry names them) and `outcome`.
     pub fn track_lookup_index_probe(dimensions: &[KeyValue]) {
         LOOKUP_INDEX_PROBE
