@@ -1644,10 +1644,7 @@ mod tests {
             .compute_index(vec![new_rows])
             .await
             .expect("populate fresh index");
-        fresh
-            .on_write_complete()
-            .await
-            .expect("commit fresh index");
+        fresh.on_write_complete().await.expect("commit fresh index");
         drop(fresh);
 
         live.restore_from(staging.path())
