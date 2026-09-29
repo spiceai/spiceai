@@ -859,7 +859,8 @@ impl CayenneContext {
     /// Record the live deletion-index size a committed seq-prefix bake left
     /// behind, for the adaptive controller's futile-bake backoff.
     pub(crate) fn record_bake_residual(&self, deletion_index_len: usize) {
-        self.ingest_stats.record_bake_residual(deletion_index_len);
+        self.ingest_stats
+            .record_bake(deletion_index_len, chrono::Utc::now().timestamp_millis());
     }
 
     /// Current memory pressure (`used / budget`), or `None` when unsampled. A

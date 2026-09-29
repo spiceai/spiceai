@@ -1058,6 +1058,10 @@ pub(crate) struct IngestStats {
     /// Live deletion-index size (tombstone count) the most recent committed
     /// seq-prefix bake left behind; `usize::MAX` until the first bake.
     bake_residual: AtomicUsize,
+    /// Wall-clock times (ms since the Unix epoch) of the two most recent committed
+    /// bakes; `i64::MIN` until they happen.
+    bake_at_ms: AtomicI64,
+    prev_bake_at_ms: AtomicI64,
     /// Wall-clock time (ms since the Unix epoch) of the newest per-batch write /
     /// publish latency sample; `i64::MIN` until the first. See
     /// [`IngestStats::expire_stale_latencies`].
@@ -1093,6 +1097,8 @@ impl IngestStats {
             total_batches: AtomicU64::new(0),
             read_amp: AtomicUsize::new(0),
             bake_residual: AtomicUsize::new(usize::MAX),
+            bake_at_ms: AtomicI64::new(i64::MIN),
+            prev_bake_at_ms: AtomicI64::new(i64::MIN),
             io_latency_at_ms: AtomicI64::new(i64::MIN),
             publish_latency_at_ms: AtomicI64::new(i64::MIN),
             mem_pressure_milli: AtomicU64::new(u64::MAX),
@@ -1145,12 +1151,15 @@ impl IngestStats {
         self.read_amp.store(small_files, Ordering::Relaxed);
     }
 
-    /// Record the live deletion-index size a committed seq-prefix bake left
-    /// behind. A bake prunes only tombstones at or below its prefix cutoff, so
-    /// this residual is the part of the index it could not remove.
-    pub fn record_bake_residual(&self, deletion_index_len: usize) {
+    /// Record a committed seq-prefix bake: the live deletion-index size it left
+    /// behind (a bake prunes only tombstones at or below its prefix cutoff, so
+    /// this residual is the part of the index it could not remove) and when it
+    /// committed.
+    pub fn record_bake(&self, deletion_index_len: usize, now_ms: i64) {
         self.bake_residual
             .store(deletion_index_len.min(usize::MAX - 1), Ordering::Relaxed);
+        let previous = self.bake_at_ms.swap(now_ms, Ordering::Relaxed);
+        self.prev_bake_at_ms.store(previous, Ordering::Relaxed);
     }
 
     /// Update the current memory usage as a fraction of the cgroup-aware budget
@@ -1214,7 +1223,8 @@ impl IngestStats {
     /// [`Self::record_publish_latency`], stamped with the sample's wall-clock time.
     pub fn record_publish_latency_at(&self, d: Duration, now_ms: i64) {
         self.record_publish_latency(d);
-        self.publish_latency_at_ms.fetch_max(now_ms, Ordering::Relaxed);
+        self.publish_latency_at_ms
+            .fetch_max(now_ms, Ordering::Relaxed);
     }
 
     /// Drop the write and publish latencies from `snap` when no batch has
@@ -1350,6 +1360,13 @@ impl IngestStats {
                 usize::MAX => None,
                 residual => Some(residual),
             },
+            bake_gap_ms: match (
+                self.bake_at_ms.load(Ordering::Relaxed),
+                self.prev_bake_at_ms.load(Ordering::Relaxed),
+            ) {
+                (i64::MIN, _) | (_, i64::MIN) => None,
+                (at, previous) => Some(at.saturating_sub(previous)),
+            },
             mem_pressure,
             delete_fraction,
             arrival_cv,
@@ -1397,6 +1414,9 @@ pub(crate) struct IngestSnapshot {
     /// Live deletion-index size the most recent committed seq-prefix bake left
     /// behind, or `None` before the first bake (see `bake_is_futile`).
     pub bake_residual: Option<usize>,
+    /// Milliseconds between the two most recent committed bakes, or `None`
+    /// before the second (see `bake_is_futile`).
+    pub bake_gap_ms: Option<i64>,
     /// Memory usage as a fraction of the cgroup-aware budget (`used / budget`);
     /// `None` when no budget/sample is available. `> 1.0` means over budget.
     pub mem_pressure: Option<f64>,
@@ -2779,22 +2799,23 @@ pub(crate) fn decide_with_goals(
     }
 
     // (3c) Futile-bake backoff: the last bake could not bring the deletion index
-    // under the trigger (see `bake_is_futile`), so every tick re-bakes the whole
-    // protected prefix to retire only the tombstones that arrived since. Raise the
-    // trigger above the residual. Only reached with read-amp not high (the
+    // under the trigger, or bakes are running back-to-back (see `bake_is_futile`),
+    // so every tick re-bakes the whole protected prefix to retire only the
+    // tombstones that arrived since. Raise the trigger over the residual. Only
+    // reached with read-amp not high (the
     // unhealthy block above returns first), so it never fights the read-amp arm
     // that lowers the trigger for query health.
-    if bake_is_futile(s, cur.bake_deletion_index_trigger)
+    if bake_is_futile(s, cur)
         && let Some(v) = clamp_move_usize(
             cur.bake_deletion_index_trigger,
-            futile_bake_trigger(s, cur.bake_deletion_index_trigger),
+            cur.bake_deletion_index_trigger.max(futile_bake_trigger(s)),
             b.bake_deletion_index_trigger,
         )
     {
         return Some(Adjustment {
             actuator: Actuator::BakeDeletionIndexTrigger,
             new_value: u64::try_from(v).unwrap_or(0),
-            reason: "futile bake: the last bake left the deletion index above the trigger → raise it over the residual → stop re-baking the prefix every tick",
+            reason: "futile bake: the last bake left the deletion index at or near the trigger → raise it over the residual → stop re-baking the prefix every tick",
         });
     }
 
@@ -3278,22 +3299,23 @@ fn decide_goal(
     }
 
     // (3c) Futile-bake backoff: the last bake could not bring the deletion index
-    // under the trigger (see `bake_is_futile`), so every tick re-bakes the whole
-    // protected prefix to retire only the tombstones that arrived since. Raise the
-    // trigger above the residual. Withheld while a query goal is violated so it
+    // under the trigger, or bakes are running back-to-back (see `bake_is_futile`),
+    // so every tick re-bakes the whole protected prefix to retire only the
+    // tombstones that arrived since. Raise the trigger over the residual. Withheld
+    // while a query goal is violated so it
     // never fights the query tier's LOWER move above (queries win).
     if !query_violated
-        && bake_is_futile(s, cur.bake_deletion_index_trigger)
+        && bake_is_futile(s, cur)
         && let Some(v) = clamp_move_usize(
             cur.bake_deletion_index_trigger,
-            futile_bake_trigger(s, cur.bake_deletion_index_trigger),
+            cur.bake_deletion_index_trigger.max(futile_bake_trigger(s)),
             b.bake_deletion_index_trigger,
         )
     {
         return Some(Adjustment {
             actuator: Actuator::BakeDeletionIndexTrigger,
             new_value: u64::try_from(v).unwrap_or(0),
-            reason: "futile bake: the last bake left the deletion index above the trigger → raise it over the residual → stop re-baking the prefix every tick",
+            reason: "futile bake: the last bake left the deletion index at or near the trigger → raise it over the residual → stop re-baking the prefix every tick",
         });
     }
 
@@ -3694,27 +3716,37 @@ fn clamp_move_usize(cur: usize, target: usize, (lo, hi): (usize, usize)) -> Opti
 /// far less than the bake's prefix rewrites cost the whole process.
 const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
 
-/// Whether the seq-prefix bake is futile at `trigger`: the most recent bake could
-/// not bring the live deletion index under `trigger`.
+/// Whether the seq-prefix bake is futile at the current trigger: the most recent
+/// bake could not bring the live deletion index under the trigger, or the last two
+/// bakes ran back-to-back (at most two compaction intervals apart).
 ///
 /// A bake prunes only tombstones at or below its prefix cutoff — the newest
 /// protected snapshots and the in-memory tier stay out of reach — and it rewrites
-/// the whole protected prefix to do so. When that residual is at or above the
-/// trigger, the next compaction tick bakes again, re-encoding the full prefix to
-/// retire only the tombstones that arrived since: CH-benCH at SF-100 held
-/// `order_line` at ~430 K tombstones against a 50 K trigger while rewriting
-/// ~0.5 GB every ~12 s, and `stock` ~1.2 GB. A bake that got the index under
-/// the trigger is doing its job, however large its residual, so the trigger only
-/// moves once per genuine shortfall and cannot ratchet toward its ceiling.
-fn bake_is_futile(s: &IngestSnapshot, trigger: usize) -> bool {
-    s.bake_residual.is_some_and(|residual| residual >= trigger)
+/// the whole protected prefix to do so. When its residual sits at, or within one
+/// tick's worth of new tombstones below, the trigger, the next compaction tick
+/// bakes again, re-encoding the full prefix to retire only the tombstones that
+/// arrived since: CH-benCH at SF-100 held `order_line` at ~430 K tombstones
+/// against a 50 K trigger while rewriting ~0.5 GB every ~12 s, and `stock` ~1.2 GB;
+/// a single raise that landed `stock` at 360 K, just over its ~300 K residual,
+/// still left it baking every tick.
+fn bake_is_futile(s: &IngestSnapshot, cur: &ActuatorValues) -> bool {
+    let Some(residual) = s.bake_residual else {
+        return false;
+    };
+    let back_to_back_ms =
+        i64::try_from(cur.compaction_background_interval_ms.saturating_mul(2)).unwrap_or(i64::MAX);
+    residual >= cur.bake_deletion_index_trigger
+        || s.bake_gap_ms.is_some_and(|gap| gap <= back_to_back_ms)
 }
 
 /// The trigger a futile bake moves to: `BAKE_TRIGGER_RESIDUAL_HEADROOM` × the
-/// residual, and at least one ordinary grow step.
-fn futile_bake_trigger(s: &IngestSnapshot, trigger: usize) -> usize {
-    let residual = s.bake_residual.unwrap_or(0);
-    grow_usize(trigger).max(residual.saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM))
+/// residual it left. Idempotent for one bake outcome — the signal stays set until
+/// the next bake, and a trigger already there is not moved again — so a raise
+/// spaces the bakes out and cannot ratchet toward the ceiling.
+fn futile_bake_trigger(s: &IngestSnapshot) -> usize {
+    s.bake_residual
+        .unwrap_or(0)
+        .saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM)
 }
 
 fn clamp_move_i64(cur: i64, target: i64, (lo, hi): (i64, i64)) -> Option<i64> {
@@ -3828,6 +3860,7 @@ mod tests {
             apply_vs_arrival: 0.2,
             read_amp: 1,
             bake_residual: None,
+            bake_gap_ms: None,
             mem_pressure: None,
             delete_fraction: 0.0,
             arrival_cv: 0.0,
@@ -4913,10 +4946,16 @@ mod tests {
     fn bake_residual_is_unknown_until_a_bake_records_it() {
         let stats = IngestStats::new();
         assert_eq!(stats.snapshot().bake_residual, None);
-        stats.record_bake_residual(FUTILE_BAKE_RESIDUAL);
+        stats.record_bake(FUTILE_BAKE_RESIDUAL, 1_000);
         assert_eq!(stats.snapshot().bake_residual, Some(FUTILE_BAKE_RESIDUAL));
-        stats.record_bake_residual(0);
+        assert_eq!(
+            stats.snapshot().bake_gap_ms,
+            None,
+            "one bake has no gap yet"
+        );
+        stats.record_bake(0, 13_500);
         assert_eq!(stats.snapshot().bake_residual, Some(0));
+        assert_eq!(stats.snapshot().bake_gap_ms, Some(12_500));
     }
 
     #[test]
@@ -5041,6 +5080,60 @@ mod tests {
                 "a violated query goal may only lower the bake trigger, got {v}"
             );
         }
+    }
+
+    #[test]
+    fn back_to_back_bakes_raise_the_trigger_even_when_the_residual_is_under_it() {
+        // The first raise landed just over the residual, so the index regrows past
+        // the trigger within a tick and the table bakes every tick again.
+        let s = IngestSnapshot {
+            bake_residual: Some(300_000),
+            bake_gap_ms: Some(10_000),
+            ..snap()
+        };
+        let cur = ActuatorValues {
+            bake_deletion_index_trigger: 359_716,
+            compaction_background_interval_ms: 10_000,
+            ..actuators()
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&s, &cur, &bounds())),
+            Some(1_200_000)
+        );
+    }
+
+    #[test]
+    fn a_futile_bake_moves_the_trigger_once_until_the_next_bake() {
+        // Same outcome, trigger already raised to it: the signal is still set
+        // (no bake since), but there is nothing left to move — the raise is not
+        // repeated on every tick until the next bake reports.
+        let s = IngestSnapshot {
+            bake_residual: Some(300_000),
+            bake_gap_ms: Some(10_000),
+            ..snap()
+        };
+        let raised = ActuatorValues {
+            bake_deletion_index_trigger: 1_200_000,
+            compaction_background_interval_ms: 10_000,
+            ..actuators()
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&s, &raised, &bounds())),
+            None
+        );
+        // And once the bakes space out, the same residual is no longer futile.
+        let spaced = IngestSnapshot {
+            bake_gap_ms: Some(70_000),
+            ..s
+        };
+        let low = ActuatorValues {
+            bake_deletion_index_trigger: 1_000_000,
+            ..raised
+        };
+        assert_eq!(
+            raised_bake_trigger(decide_fresh(&spaced, &low, &bounds())),
+            None
+        );
     }
 
     #[test]

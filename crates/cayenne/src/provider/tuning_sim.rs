@@ -1651,6 +1651,7 @@ fn sim_property_sweep_no_panic_in_bounds_coherent() {
             bake_residual: rng
                 .chance(0.5)
                 .then(|| rng.range_u64(0, 10_000_000) as usize),
+            bake_gap_ms: rng.chance(0.5).then(|| rng.range_u64(0, 600_000) as i64),
             mem_pressure: opt(&mut rng, 0.0, 1.3),
             delete_fraction: rng.range_f64(0.0, 1.0),
             arrival_cv: rng.range_f64(0.0, 3.0),
