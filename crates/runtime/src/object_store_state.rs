@@ -19,8 +19,8 @@ use std::sync::{Arc, LazyLock};
 
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use object_store::ObjectStore;
-use runtime_object_store::build_azure_object_store;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use runtime_object_store::{build_azure_object_store, build_gcs_object_store};
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::ExposeSecret;
@@ -80,6 +80,14 @@ pub(crate) enum Error {
         "Failed to parse {usage} file location {location}: URL is not a local file path"
     ))]
     InvalidFileLocation {
+        usage: &'static str,
+        location: String,
+    },
+
+    #[snafu(display(
+        "Failed to parse {usage} location {location}: a Google Cloud Storage location needs a bucket, as in gs://bucket/path"
+    ))]
+    InvalidGcsLocation {
         usage: &'static str,
         location: String,
     },
@@ -165,6 +173,17 @@ pub(crate) async fn build_object_store(
         let params = params.map(Params::as_string_map);
         let azure_params = build_secret_resolved_parameters(secrets, params.as_ref()).await;
         build_azure_object_store(&url, &azure_params, io_runtime).context(ObjectStoreInitSnafu {
+            usage,
+            location: url.to_string(),
+        })?
+    } else if matches!(url.scheme(), "gs" | "gcs") {
+        let bucket = url.host_str().ok_or_else(|| Error::InvalidGcsLocation {
+            usage,
+            location: url.to_string(),
+        })?;
+        let params = params.map(Params::as_string_map);
+        let gcs_params = build_secret_resolved_parameters(secrets, params.as_ref()).await;
+        build_gcs_object_store(bucket, &gcs_params, io_runtime).context(ObjectStoreInitSnafu {
             usage,
             location: url.to_string(),
         })?
@@ -451,6 +470,43 @@ mod tests {
         assert!(result.is_ok(), "abfs state store should build: {result:?}");
         let (_, prefix) = result.expect("abfs state store should build");
         assert_eq!(prefix, "");
+    }
+
+    /// A `gs://` location honors `params` (and keeps its path as the prefix) instead
+    /// of building a store from the environment alone.
+    #[tokio::test]
+    async fn build_object_store_accepts_gcs_location_with_params() {
+        let mut params = HashMap::new();
+        params.insert("skip_signature".to_string(), "true".to_string());
+        let params = Params::from_string_map(params);
+
+        let result = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/runtime/rate-control/",
+            Some(&params),
+            "test state",
+        )
+        .await;
+
+        let (_, prefix) = result.expect("gcs state store should build");
+        assert_eq!(prefix, "runtime/rate-control");
+
+        let invalid = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/",
+            Some(&Params::from_string_map(HashMap::from([(
+                "skip_signature".to_string(),
+                "not-a-bool".to_string(),
+            )]))),
+            "test state",
+        )
+        .await;
+        assert!(
+            invalid.is_err(),
+            "an invalid GCS parameter is reported, not ignored"
+        );
     }
 
     #[tokio::test]
