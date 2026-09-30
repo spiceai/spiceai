@@ -18,8 +18,10 @@ limitations under the License.
 //!
 //! An evaluation model takes unstructured `state` plus a map of typed
 //! `questions` and returns structured `answers` (noul / choice / score) with
-//! calibrated probabilities. Implemented by provider crates; called by the
-//! runtime's `POST /v1/evaluate` endpoint — which never names a provider.
+//! probabilities. Implemented by provider crates and by `evaluate-chat`, which
+//! answers through any chat model; called by the runtime's `POST /v1/evaluate`
+//! endpoint — which never names a provider. [`check_answers`] holds every
+//! implementation's answers to the same invariants.
 //!
 //! Deliberately separate from chat completions: System One models such as
 //! `TypeSafe` Jev do not generate strings and must not be faked as `OpenAI` chat.
@@ -33,6 +35,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use snafu::Snafu;
+
+mod check;
+
+pub use check::{check_answers, is_probability, probability_sum_tolerance};
 
 /// Name → evaluation model map. Holds System One providers (e.g. `TypeSafe` Jev).
 pub type EvaluateModelStore = std::collections::HashMap<String, Arc<dyn Evaluate>>;

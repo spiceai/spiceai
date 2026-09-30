@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `POST /v1/evaluate` — System One evaluation (`TypeSafe` Jev and similar).
+//! `POST /v1/evaluate` — System One evaluation, by a System One model (`TypeSafe` Jev
+//! and similar) or by any chat model.
 //!
 //! Not a chat-completions endpoint. Request carries `model`, `state`, and a
 //! map of typed `questions`; response returns typed `answers` with confidence.
@@ -37,14 +38,15 @@ use tokio::sync::RwLock;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing_futures::Instrument;
 
-use crate::model::EvaluateModelStore;
+use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 
 /// Evaluate
 ///
 /// Evaluate unstructured `state` against a map of typed System One questions
-/// (noul / choice / score). Returns structured answers with calibrated
-/// probabilities and confidence. Chat completions are not supported for these
-/// models — use this endpoint instead of `/v1/chat/completions`.
+/// (noul / choice / score). Returns structured answers with probabilities and
+/// confidence. `model` names either a System One model (`TypeSafe` Jev), whose
+/// probabilities are calibrated, or any chat model, whose probabilities are the
+/// model's own estimates. System One models do not support chat completions.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/evaluate",
@@ -53,7 +55,7 @@ use crate::model::EvaluateModelStore;
     request_body = EvaluateRequest,
     responses(
         (status = 200, description = "Evaluation succeeded", body = EvaluateResponse),
-        (status = 404, description = "Model not found"),
+        (status = 404, description = "No System One or chat model with this name"),
         (status = 400, description = "Invalid request"),
         (status = 422, description = "Malformed JSON request body (Axum Json extractor)"),
         (status = 401, description = "Upstream authentication failed"),
@@ -65,6 +67,7 @@ use crate::model::EvaluateModelStore;
 ))]
 pub(crate) async fn post(
     Extension(models): Extension<Arc<RwLock<EvaluateModelStore>>>,
+    Extension(chat_models): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     Json(req): Json<EvaluateRequest>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -94,20 +97,33 @@ pub(crate) async fn post(
     }
 
     let model_id = req.model.clone();
-    let Some(model) = models.read().await.get(&model_id).cloned() else {
+    // Evaluations are inference: they belong in the same request, failure, duration and
+    // token series as the chat and responses paths rather than a family of their own.
+    // A chat model's evaluation already lands there, since every call it makes to the
+    // model — corrective retries included — is recorded by the chat model itself, so
+    // recording the evaluation too would count its requests and tokens twice. Both stores
+    // are read under one hold, so the evaluator and whether its calls are recorded come
+    // from the same moment even while the model is reloaded.
+    let (model, recorded_per_call) = {
+        let chat_models = chat_models.read().await;
+        let models = models.read().await;
+        (
+            models.get(&model_id).cloned(),
+            chat_models.contains_key(&model_id),
+        )
+    };
+    let Some(model) = model else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": format!(
-                    "Evaluation model '{model_id}' not found. Configure a System One model (e.g. `from: typesafe:jev`) in your Spicepod."
+                    "Model '{model_id}' not found. Evaluate with a chat model or a System One model (e.g. `from: typesafe:jev`) configured in your Spicepod. See: https://spiceai.org/docs/components/models"
                 )
             })),
         )
             .into_response();
     };
 
-    // Evaluations are inference: they belong in the same request, failure, duration and
-    // token series as the chat and responses paths rather than a family of their own.
     let labels = [KeyValue::new(
         Key::new("model"),
         Value::String(model_id.clone().into()),
@@ -115,11 +131,13 @@ pub(crate) async fn post(
     let start = Instant::now();
 
     let result = model.evaluate(req).await;
-    handle_metrics(start.elapsed(), result.is_err(), &labels);
+    if !recorded_per_call {
+        handle_metrics(start.elapsed(), result.is_err(), &labels);
+    }
 
     match result {
         Ok(response) => {
-            if let Some(usage) = response.usage.as_ref() {
+            if let Some(usage) = response.usage.as_ref().filter(|_| !recorded_per_call) {
                 handle_token_metrics(
                     u32::try_from(usage.input_tokens).unwrap_or(u32::MAX),
                     u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
@@ -211,6 +229,10 @@ mod tests {
         }
     }
 
+    fn no_chat_models() -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+        Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()))
+    }
+
     fn request_with_question(model: &str) -> EvaluateRequest {
         let mut questions = BTreeMap::new();
         questions.insert(
@@ -230,7 +252,12 @@ mod tests {
     #[tokio::test]
     async fn evaluate_returns_404_for_unknown_model() {
         let models = Arc::new(RwLock::new(EvaluateModelStore::new()));
-        let response = post(Extension(models), Json(request_with_question("missing"))).await;
+        let response = post(
+            Extension(models),
+            Extension(no_chat_models()),
+            Json(request_with_question("missing")),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -239,7 +266,12 @@ mod tests {
         let mut store = EvaluateModelStore::new();
         store.insert("jev".into(), Arc::new(DummyEvaluate { name: "jev".into() }));
         let models = Arc::new(RwLock::new(store));
-        let response = post(Extension(models), Json(request_with_question("jev"))).await;
+        let response = post(
+            Extension(models),
+            Extension(no_chat_models()),
+            Json(request_with_question("jev")),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response
             .into_body()
@@ -259,6 +291,7 @@ mod tests {
         let models = Arc::new(RwLock::new(store));
         let response = post(
             Extension(models),
+            Extension(no_chat_models()),
             Json(EvaluateRequest {
                 model: "jev".into(),
                 state: EvaluateState::from("x"),
@@ -275,6 +308,7 @@ mod tests {
         let models = Arc::new(RwLock::new(EvaluateModelStore::new()));
         let response = post(
             Extension(models),
+            Extension(no_chat_models()),
             Json(EvaluateRequest {
                 model: "jev".to_string(),
                 state: EvaluateState::String("s".to_string()),
@@ -318,7 +352,12 @@ mod tests {
         let mut store = EvaluateModelStore::new();
         store.insert("jev".into(), Arc::new(UnavailableEvaluate));
         let models = Arc::new(RwLock::new(store));
-        let response = post(Extension(models), Json(request_with_question("jev"))).await;
+        let response = post(
+            Extension(models),
+            Extension(no_chat_models()),
+            Json(request_with_question("jev")),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response
             .into_body()
@@ -328,5 +367,69 @@ mod tests {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json["error"], "upstream 503");
+    }
+
+    /// A chat model that replies with a fixed `answers` object.
+    struct AnsweringChat;
+
+    #[async_trait]
+    impl llms::chat::Chat for AnsweringChat {
+        fn as_sql(&self) -> Option<&dyn llms::chat::SqlGeneration> {
+            None
+        }
+
+        async fn chat_request(
+            &self,
+            _req: async_openai::types::chat::CreateChatCompletionRequest,
+        ) -> Result<
+            async_openai::types::chat::CreateChatCompletionResponse,
+            async_openai::error::OpenAIError,
+        > {
+            Ok(serde_json::from_value(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "judge",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "{\"answers\": {\"is_urgent\": 0.75}}"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 9, "total_tokens": 59}
+            }))
+            .expect("chat completion"))
+        }
+    }
+
+    /// A chat model answers `/v1/evaluate` through the evaluator registered for it.
+    #[tokio::test]
+    async fn evaluate_answers_with_a_chat_model() {
+        let chat: Arc<dyn llms::chat::Chat> = Arc::new(AnsweringChat);
+        let mut evaluators = EvaluateModelStore::new();
+        evaluators.insert(
+            "judge".into(),
+            crate::model::chat_evaluator("judge", Arc::clone(&chat)),
+        );
+        let mut chats = LLMChatCompletionsModelStore::new();
+        chats.insert("judge".into(), chat);
+
+        let response = post(
+            Extension(Arc::new(RwLock::new(evaluators))),
+            Extension(Arc::new(RwLock::new(chats))),
+            Json(request_with_question("judge")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["model"], "judge");
+        assert_eq!(json["answers"]["is_urgent"]["noul"], 0.75);
+        assert_eq!(json["usage"]["input_tokens"], 50);
     }
 }

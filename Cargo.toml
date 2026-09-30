@@ -37,6 +37,7 @@ members = [
     "crates/embed-api",
     "crates/rerank-api",
     "crates/evaluate-api",
+    "crates/evaluate-chat",
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/otel-arrow",

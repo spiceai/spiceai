@@ -154,8 +154,19 @@ impl Runtime {
 
                     let completion_llms = self.completion_llms();
                     let mut llm_map = completion_llms.write().await;
-                    llm_map.insert(m.name.clone(), completions_model);
+                    llm_map.insert(m.name.clone(), completions_model.chat);
                     drop(llm_map);
+
+                    // Every chat model also answers `/v1/evaluate`, through the model
+                    // without runtime tools: an evaluation's `state` is untrusted input and
+                    // must not be able to steer a tool call.
+                    let evaluate_models = self.llm_runtime_stores.evaluate_models();
+                    let mut evaluate_map = evaluate_models.write().await;
+                    evaluate_map.insert(
+                        m.name.clone(),
+                        crate::model::chat_evaluator(&m.name, completions_model.without_tools),
+                    );
+                    drop(evaluate_map);
 
                     if let Some(responses_model) = responses_model {
                         let responses_llms = self.responses_llms();
@@ -220,6 +231,13 @@ impl Runtime {
     }
 
     async fn remove_model(&self, m: &SpicepodModel) {
+        // Removed before the chat model: `/v1/chat/completions` reports a name found only
+        // among evaluation models as evaluation-only, which an unloading chat model is not.
+        let evaluate_models = self.llm_runtime_stores.evaluate_models();
+        let mut evaluate_map = evaluate_models.write().await;
+        evaluate_map.remove(&m.name);
+        drop(evaluate_map);
+
         let completion_llms = self.completion_llms();
         let mut llm_map = completion_llms.write().await;
         llm_map.remove(&m.name);
@@ -229,11 +247,6 @@ impl Runtime {
         let mut responses_map = responses_llms.write().await;
         responses_map.remove(&m.name);
         drop(responses_map);
-
-        let evaluate_models = self.llm_runtime_stores.evaluate_models();
-        let mut evaluate_map = evaluate_models.write().await;
-        evaluate_map.remove(&m.name);
-        drop(evaluate_map);
 
         let responses_api_support = self.llm_runtime_stores.responses_api_support();
         let mut responses_support_map = responses_api_support.write().await;

@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! System One evaluation model loader (`TypeSafe` Jev).
+//! Evaluation models: System One providers (`TypeSafe` Jev) loaded from their own
+//! Spicepod source, and an evaluator over every chat model.
 
 #![expect(clippy::implicit_hasher)]
 
-use llms::chat::Error as LlmError;
+use evaluate_chat::ChatEvaluator;
+use llms::chat::{Chat, Error as LlmError};
 use llms::evaluate::Evaluate;
 use llms::typesafe::TypeSafe;
 use runtime_rate_control::RateController;
@@ -99,6 +101,15 @@ async fn typesafe(
     }
 
     Ok((Arc::new(client) as Arc<dyn Evaluate>, rate_controller))
+}
+
+/// The evaluator `/v1/evaluate` uses for the chat model the Spicepod names `name`.
+///
+/// Pass the model without runtime tools ([`super::LoadedChatModel::without_tools`]): an
+/// evaluation's `state` is untrusted input and must not be able to steer a tool call.
+#[must_use]
+pub fn chat_evaluator(name: &str, chat: Arc<dyn Chat>) -> Arc<dyn Evaluate> {
+    Arc::new(ChatEvaluator::new(name, chat))
 }
 
 /// Whether this Spicepod model is an evaluation-only (non-chat) source.

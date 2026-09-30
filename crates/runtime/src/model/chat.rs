@@ -69,6 +69,17 @@ use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
+/// A loaded chat model, both as `/v1/chat/completions` serves it and without the Spice
+/// runtime tools.
+pub struct LoadedChatModel {
+    /// The model with the runtime tools its Spicepod `tools` param enables.
+    pub chat: Arc<dyn Chat>,
+    /// The same model — same provider client, system prompt and parameter defaults — with
+    /// no runtime tools, for callers that send it content they do not trust, such as an
+    /// evaluation's `state`, which must not be able to steer a tool call.
+    pub without_tools: Arc<dyn Chat>,
+}
+
 // Default recursion limit for tool usage to prevent infinite loops.
 // This limit can be adjusted using the `tool_recursion_limit` model parameter.
 const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
@@ -85,7 +96,7 @@ pub async fn try_to_chat_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
-) -> Result<Arc<dyn Chat>, LlmError> {
+) -> Result<LoadedChatModel, LlmError> {
     let secrets = rt.secrets();
     let model = construct_model(component, params, &secrets, rt.token_provider_registry()).await?;
 
@@ -124,15 +135,18 @@ pub async fn try_to_chat_model(
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
             Arc::new(ToolUsingChat::new(
-                model,
+                Arc::clone(&model),
                 Arc::clone(&rt),
                 tools,
                 spice_recursion_limit,
             ))
         }
-        Some(_) | None => model,
+        Some(_) | None => Arc::clone(&model),
     };
-    Ok(tool_model)
+    Ok(LoadedChatModel {
+        chat: tool_model,
+        without_tools: model,
+    })
 }
 
 /// Deserializes the source's typed params from the (already secret-resolved)
