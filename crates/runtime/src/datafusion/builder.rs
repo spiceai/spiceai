@@ -87,7 +87,7 @@ use datafusion_optimizer_rules::{
         cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown, PartitionOnlyScanRewrite,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
         flightsql::broadcast_join::{ExecutorAddressProvider, FlightSQLBroadcastJoinPushdown},
     },
@@ -1054,7 +1054,11 @@ impl DataFusionBuilder {
 
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            // Answer a `GROUP BY`/`DISTINCT` over only partition columns from the
+            // directory listing instead of scanning every file. Registered before
+            // `BytesProcessedPhysicalOptimizer` so it rewrites the bare scan.
+            .with_physical_optimizer_rule(Arc::new(PartitionOnlyScanRewrite::new()));
 
         if self.cte_materialization.is_auto() {
             tracing::info!("Applied runtime.query.cte_materialization=auto");
@@ -1141,14 +1145,16 @@ impl DataFusionBuilder {
             }
         }
 
+        // Rules a primary-key point lookup cannot trigger are skipped while one is planned.
+        super::point_lookup::wrap_skippable_rules(&mut state);
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc` and
-        // `date_trunc` (scalar) and `avg` (aggregate): `register_all` would register
+        // Register Spark-compatible functions, but skip Spark's `trunc`,
+        // `date_trunc` and `date_part` (scalar) and `avg` (aggregate): `register_all` would register
         // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
         // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
         // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
@@ -1164,7 +1170,15 @@ impl DataFusionBuilder {
             // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
             // federated filter comparing a timestamp against one loses the type
             // its comparison needs and is pushed down as a pair BigQuery refuses.
-            if matches!(udf.name(), "trunc" | "date_trunc") {
+            //
+            // Spark `date_part` counts `dow` from Sunday = 1, where the built-in
+            // counts from Sunday = 0 as the SQL reference documents — and so does
+            // `EXTRACT(DOW FROM …)`, which the planner binds straight to the
+            // built-in, never through the registry. Registered over the built-in,
+            // the two spellings of one weekday answered a day apart
+            // (spiceai/spiceai#13920). Spark's also takes only a timestamp or a
+            // date, so `date_part('hour', <time>)` stopped planning.
+            if matches!(udf.name(), "trunc" | "date_trunc" | "date_part") {
                 continue;
             }
             let name = udf.name().to_string();
@@ -1226,8 +1240,8 @@ impl DataFusionBuilder {
 
         // Add cache invalidation optimizer rule if caching is enabled
         if let Some(caching) = &self.caching {
-            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
-                Arc::downgrade(caching),
+            ctx.add_optimizer_rule(super::point_lookup::skippable_optimizer_rule(Arc::new(
+                CacheInvalidationOptimizerRule::new(Arc::downgrade(caching)),
             )));
         }
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
@@ -1296,35 +1310,39 @@ impl DataFusionBuilder {
             };
 
         if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
-            ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-                ctx.state().catalog_list(),
-                &ddl_enabled_catalogs,
-                Arc::clone(&ddl_extension_store),
-                Arc::clone(cayenne_ddl_handler),
-                SPICE_DEFAULT_SCHEMA,
-                SPICE_DEFAULT_CATALOG,
+            ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(Arc::new(
+                datafusion_ddl::DdlAnalyzerRule::new(
+                    ctx.state().catalog_list(),
+                    &ddl_enabled_catalogs,
+                    Arc::clone(&ddl_extension_store),
+                    Arc::clone(cayenne_ddl_handler),
+                    SPICE_DEFAULT_SCHEMA,
+                    SPICE_DEFAULT_CATALOG,
+                ),
             )));
         }
 
         // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
         // Federation runs as the first of these (see `AnalyzerRulesBuilder::include_federation`).
         for rule in AnalyzerRulesBuilder::default().build() {
-            ctx.add_analyzer_rule(rule);
+            ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(rule));
         }
         for rule in self.additional_analyzer_rules {
             ctx.add_analyzer_rule(rule);
         }
 
         // Iceberg DDL analyzer rule.
-        ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-            ctx.state().catalog_list(),
-            &ddl_enabled_catalogs,
-            Arc::clone(&ddl_extension_store),
-            Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
-                &datafusion_ref,
-            ))),
-            SPICE_DEFAULT_SCHEMA,
-            SPICE_DEFAULT_CATALOG,
+        ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(Arc::new(
+            datafusion_ddl::DdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+                Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
+                    &datafusion_ref,
+                ))),
+                SPICE_DEFAULT_SCHEMA,
+                SPICE_DEFAULT_CATALOG,
+            ),
         )));
 
         DataFusion {
@@ -2678,14 +2696,90 @@ mod tests {
         );
 
         // Spark's *other* functions must still be there — the skip is meant to
-        // be two names, not a disabled registration.
+        // be three names, not a disabled registration.
         assert!(
             df.ctx
                 .state()
                 .scalar_functions()
                 .contains_key("array_append"),
-            "only `trunc` and `date_trunc` are skipped; the rest of the Spark \
-             functions must still register"
+            "only `trunc`, `date_trunc` and `date_part` are skipped; the rest of \
+             the Spark functions must still register"
+        );
+    }
+
+    /// The built session keeps the **built-in** `date_part`, not Spark's.
+    ///
+    /// Spark's `date_part` counts `dow` from Sunday = 1. The built-in counts
+    /// from Sunday = 0, as the SQL reference documents, and so does
+    /// `EXTRACT(DOW FROM …)`, which the planner binds straight to the built-in
+    /// and never through the registry. Registered over the built-in, the two
+    /// spellings of one weekday answered a day apart; and Spark's signature
+    /// takes only a timestamp or a date, so `date_part` over a time stopped
+    /// planning (regression test for #13920).
+    ///
+    /// Through `DataFusionBuilder::build` for the same reason as the
+    /// `date_trunc` guard above: the thing that can regress is the registration
+    /// loop's skip.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_date_part() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        // 2026-01-04 is a Sunday: the one weekday the two conventions name
+        // differently at a glance, 0 documented and 1 under Spark's.
+        let weekday = df
+            .ctx
+            .sql(
+                "SELECT date_part('dow', DATE '2026-01-04') AS via_date_part, \
+                 EXTRACT(DOW FROM DATE '2026-01-04') AS via_extract",
+            )
+            .await
+            .expect("plan the weekday extraction")
+            .collect()
+            .await
+            .expect("run the weekday extraction");
+        datafusion::assert_batches_eq!(
+            [
+                "+---------------+-------------+",
+                "| via_date_part | via_extract |",
+                "+---------------+-------------+",
+                "| 0             | 0           |",
+                "+---------------+-------------+",
+            ],
+            &weekday
+        );
+
+        // Spark's overload takes only a timestamp or a date, so a time and an
+        // interval are the arguments that stop planning if the built-in is
+        // shadowed; and Spark's declares `Int32` for every field where the
+        // built-in returns `Float64` for `epoch`, which the shadowed session
+        // reports as an internal schema-assertion failure.
+        let other_shapes = df
+            .ctx
+            .sql(
+                "SELECT date_part('hour', TIME '12:34:56') AS over_a_time, \
+                 date_part('hour', INTERVAL '5 hours') AS over_an_interval, \
+                 date_part('epoch', TIMESTAMP '1970-01-01T00:01:00') AS epoch_seconds",
+            )
+            .await
+            .expect("plan date_part over a time, an interval and for epoch")
+            .collect()
+            .await
+            .expect("run date_part over a time, an interval and for epoch");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------------+------------------+---------------+",
+                "| over_a_time | over_an_interval | epoch_seconds |",
+                "+-------------+------------------+---------------+",
+                "| 12          | 5                | 60.0          |",
+                "+-------------+------------------+---------------+",
+            ],
+            &other_shapes
         );
     }
 
@@ -2782,7 +2876,7 @@ mod tests {
             "target_partitions wired through DataFusionBuilder should be visible on the session config"
         );
 
-        // Sanity check the inverse — None leaves DataFusion's default in place.
+        // Sanity check the inverse — None sizes the fan-out from the CPU budget.
         let df_default = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
@@ -2790,7 +2884,7 @@ mod tests {
         )
         .target_partitions(None)
         .build();
-        assert_ne!(
+        assert_eq!(
             df_default
                 .ctx
                 .state()
@@ -2798,8 +2892,8 @@ mod tests {
                 .options()
                 .execution
                 .target_partitions,
-            4,
-            "Without an override target_partitions should fall back to DataFusion's default"
+            cpu_budget::cpu_budget().target_partitions(),
+            "Without an override target_partitions should fall back to the CPU budget"
         );
     }
 

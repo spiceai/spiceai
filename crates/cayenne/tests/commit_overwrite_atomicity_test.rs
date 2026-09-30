@@ -604,7 +604,7 @@ async fn commit_overwrite_clears_inlined_state_unlike_commit_compaction() {
     let new_overwrite_snap = uuid::Uuid::now_v7().to_string();
 
     catalog
-        .commit_compaction(&compact_id, &new_compact_snap)
+        .commit_compaction(&compact_id, &compact_snap, &new_compact_snap)
         .await
         .expect("commit_compaction");
     catalog

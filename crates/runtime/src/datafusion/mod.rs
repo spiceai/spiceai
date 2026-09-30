@@ -155,6 +155,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
+pub(crate) mod point_lookup;
 pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
@@ -5988,6 +5989,7 @@ async fn build_snapshot_refresh_state(
         swappable_provider,
         provider_factory,
         current_snapshot_id,
+        metadata_e_tag: Arc::default(),
     })
 }
 

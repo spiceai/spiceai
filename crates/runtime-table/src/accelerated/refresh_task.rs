@@ -60,6 +60,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
@@ -213,6 +214,16 @@ pub(crate) fn collect_all_indexes(
         .chain(indexes_from_federated(federated))
         .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
         .collect()
+}
+
+/// Whether a successful refresh changed the accelerator's contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The refresh may have written to or reloaded the accelerator.
+    Refreshed,
+    /// The accelerator already matched the source, so nothing was written:
+    /// the source reported unchanged data, or no newer snapshot was available.
+    UpToDate,
 }
 
 pub struct RefreshTaskBuilder {
@@ -601,11 +612,15 @@ impl RefreshTask {
 
     /// Runs one refresh to completion.
     ///
+    /// Reports whether the refresh changed the accelerator, so callers can skip
+    /// work (such as results-cache invalidation) after a refresh that found
+    /// nothing new.
+    ///
     /// # Errors
     ///
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
-    pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
+    pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
@@ -632,7 +647,7 @@ impl RefreshTask {
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
             match self.run_once(&refresh).await {
-                Ok(()) => Ok(()),
+                Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
                     if !self.runtime_status.is_shutdown()
                         && let Some(error) = attempt_refresh_error(&retry_err)
@@ -666,7 +681,10 @@ impl RefreshTask {
         result
     }
 
-    async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
+    async fn run_once(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         self.set_refresh_status(
             refresh.display_sql().as_deref(),
             status::ComponentStatus::Refreshing,
@@ -734,7 +752,7 @@ impl RefreshTask {
                             status::ComponentStatus::Ready,
                         )
                         .await;
-                        return Ok(());
+                        return Ok(RefreshOutcome::UpToDate);
                     }
                     Ok(_) => {
                         // Data may have changed or provider does not support skipping; continue with refresh.
@@ -779,7 +797,10 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
-                return self.refresh_stale_cached_rows(refresh).await;
+                return self
+                    .refresh_stale_cached_rows(refresh)
+                    .await
+                    .map(|()| RefreshOutcome::Refreshed);
             }
             RefreshMode::Snapshot => {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
@@ -794,8 +815,9 @@ impl RefreshTask {
             Err(e) => {
                 // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
                 // This is expected and should not be logged as an error.
+                // Report `Refreshed` so a canceled refresh never keeps cached results.
                 if self.runtime_status.is_shutdown() {
-                    return Ok(());
+                    return Ok(RefreshOutcome::Refreshed);
                 }
                 self.log_refresh_error(
                     inner_err_from_retry_ref(&e),
@@ -839,8 +861,9 @@ impl RefreshTask {
         {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
+            // Report `Refreshed` so a canceled refresh never keeps cached results.
             if self.runtime_status.is_shutdown() {
-                return Ok(());
+                return Ok(RefreshOutcome::Refreshed);
             }
             tracing::warn!(
                 "Failed to load data for {} {}: {}",
@@ -859,7 +882,7 @@ impl RefreshTask {
         )
         .await;
 
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 
     fn is_metric_enabled(&self, metric_name: &str) -> bool {
@@ -1262,7 +1285,7 @@ impl RefreshTask {
     async fn refresh_from_snapshot(
         &self,
         refresh: &Refresh,
-    ) -> Result<(), RetryError<super::Error>> {
+    ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
 
         let Some(state) = self.snapshot_refresh_state.clone() else {
@@ -1293,6 +1316,7 @@ impl RefreshTask {
 
         let start_time = SystemTime::now();
         let current_local_id = state.current_loaded_id();
+        let known_metadata_e_tag = state.metadata_e_tag();
 
         // Take the accelerator write mutex up front so the entire refresh
         // (download + provider rebuild + swap) is serialized with other code
@@ -1336,12 +1360,19 @@ impl RefreshTask {
             });
         let download_result = state
             .manager
-            .download_if_newer(current_local_id, Some(validator.as_ref()))
+            .download_if_newer(
+                current_local_id,
+                known_metadata_e_tag.as_deref(),
+                Some(validator.as_ref()),
+            )
             .await;
 
-        let info = match download_result {
-            Ok(Some(info)) => info,
-            Ok(None) if current_local_id.is_none() => {
+        let (info, metadata_e_tag) = match download_result {
+            Ok(SnapshotPoll {
+                download: Some(info),
+                metadata_e_tag,
+            }) => (info, metadata_e_tag),
+            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
                 // No snapshot has ever been loaded and none is available at the configured location.
                 tracing::warn!(
                     dataset = %self.dataset_name,
@@ -1364,7 +1395,11 @@ impl RefreshTask {
                     },
                 ));
             }
-            Ok(None) => {
+            Ok(SnapshotPoll {
+                download: None,
+                metadata_e_tag,
+            }) => {
+                state.record_metadata_e_tag(metadata_e_tag);
                 tracing::debug!(
                     dataset = %self.dataset_name,
                     current_snapshot_id = ?current_local_id,
@@ -1377,7 +1412,7 @@ impl RefreshTask {
                 }
                 self.set_refresh_status(None, status::ComponentStatus::Ready)
                     .await;
-                return Ok(());
+                return Ok(RefreshOutcome::UpToDate);
             }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
@@ -1557,7 +1592,7 @@ impl RefreshTask {
                 },
             ));
         }
-        state.set_current_loaded_id(info.snapshot_id);
+        state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
         if let Some(updated_at) = info.last_updated_at {
             self.last_updated_at
                 .store(updated_at, std::sync::atomic::Ordering::Release);
@@ -1574,7 +1609,7 @@ impl RefreshTask {
 
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 
     async fn trace_load_completed(
@@ -2793,7 +2828,7 @@ pub async fn probe_acceleration_contents(
     // the source-federation wiring a refresh needs applies. `accelerator_df`
     // still normalizes the provider chain, and a `FederatedTableProviderAdaptor`
     // left un-federated scans its inner provider directly.
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let batches = async {
         accelerator_df(accelerator, &ctx)
             .and_then(|df| df.limit(0, Some(1)))?
@@ -3033,9 +3068,13 @@ fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
 
 /// One Prometheus registry + meter provider for this crate's tests.
 ///
-/// `REFRESH_ERRORS` is a `LazyLock` on the global meter. Installing a second
-/// provider after the first instrument is built binds the counter to the
-/// other registry, so tests that scrape would read zero. Share this installer.
+/// Every `runtime_metrics` meter (`REFRESH_ERRORS`, `dataset_load_state`, …) is
+/// a `LazyLock` over `global::meter`, which binds to whichever provider is
+/// installed when it is first built and never rebinds. Under `cargo test` all
+/// tests share one process, so a test that records a metric before any test
+/// has installed this registry binds the instrument to the no-op default
+/// provider, and every test that scrapes reads nothing. [`install_test_meter_provider`]
+/// installs it before `main`, so no test can record first.
 #[cfg(test)]
 pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
     static REGISTRY: std::sync::OnceLock<prometheus::Registry> = std::sync::OnceLock::new();
@@ -3058,13 +3097,22 @@ pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
     })
 }
 
+// SAFETY: runs before `main`. It only allocates, initializes the registry's
+// `OnceLock`, and stores the provider in the `opentelemetry` global; it spawns
+// no thread and depends on no other life-before-main initialization.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_meter_provider() {
+    test_prometheus_registry();
+}
+
 /// The error that ended a refresh retry loop, if the refresh itself failed.
 ///
 /// A recovered retry (`Ok`) and a shutdown abort are not refresh failures.
 /// Used for the user-facing error log. Metric increments use
 /// [`attempt_refresh_error`] and [`terminal_generation_change_refresh_error`].
 #[must_use]
-fn terminal_refresh_error(result: &super::Result<()>, shutdown: bool) -> Option<&super::Error> {
+fn terminal_refresh_error<T>(result: &super::Result<T>, shutdown: bool) -> Option<&super::Error> {
     if shutdown {
         return None;
     }
@@ -3086,8 +3134,8 @@ fn attempt_refresh_error(error: &RetryError<super::Error>) -> Option<&super::Err
 /// An exhausted generation-change after the retry loop. A recovered 412 is
 /// `Ok` and is not counted; a non-generation terminal was already counted
 /// per attempt.
-fn terminal_generation_change_refresh_error(
-    result: &super::Result<()>,
+fn terminal_generation_change_refresh_error<T>(
+    result: &super::Result<T>,
     shutdown: bool,
 ) -> Option<&super::Error> {
     let error = terminal_refresh_error(result, shutdown)?;
@@ -3914,6 +3962,35 @@ mod tests {
             ),
             "RefreshTaskBuilder::build must hand out the shared state, not build its own"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_uses_cpu_budget_partitions() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "accelerated::refresh_task::tests::refresh_session_uses_cpu_budget_partitions",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("cpu_budget_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert_eq!(refresh.state().config().target_partitions(), cores);
     }
 
     #[derive(Debug)]
