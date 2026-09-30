@@ -1759,11 +1759,11 @@ jobs:
         run: |
           # `spice refresh` only triggers the refresh; cached results are invalidated when it
           # completes, which is an S3 round trip of unbounded latency. Poll for the miss
-          # rather than sleeping a fixed interval. item_ttl is 300s, so within this bound a
-          # miss can only come from the refresh's invalidation.
+          # rather than sleeping a fixed interval. The item_ttl set in "Spice configure" (300s)
+          # is well above this bound, so a miss here can only come from the refresh's invalidation.
           deadline=$((SECONDS + 60))
           while :; do
-            response=$(curl -sS -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
             if echo "$response" | grep -q "results-cache-status: MISS"; then
               echo "$response"
               echo "Cache miss detected as expected"
