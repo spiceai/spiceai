@@ -2932,6 +2932,141 @@ mod tests {
         );
     }
 
+    /// Whether `plan` has an `AggregateExec` anywhere below a `HashJoinExec`, which
+    /// is where eager aggregation puts the pre-aggregation it pushes.
+    #[cfg(not(windows))]
+    fn aggregates_below_a_join(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        below_a_join: bool,
+    ) -> bool {
+        use datafusion::physical_plan::aggregates::AggregateExec;
+        use datafusion::physical_plan::joins::HashJoinExec;
+
+        if below_a_join && plan.is::<AggregateExec>() {
+            return true;
+        }
+        let below_a_join = below_a_join || plan.is::<HashJoinExec>();
+        plan.children()
+            .into_iter()
+            .any(|child| aggregates_below_a_join(child, below_a_join))
+    }
+
+    /// Plans `SUM(amount) GROUP BY name` over `fact JOIN dim` in a session built
+    /// with `eager_aggregation`, and returns whether the plan pre-aggregates below the
+    /// join, the rendered plan, and the query's rows.
+    #[cfg(not(windows))]
+    async fn plan_an_aggregate_over_a_join(eager_aggregation: bool) -> (bool, String, String) {
+        use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .eager_aggregation(Some(eager_aggregation))
+        .build();
+
+        // 10,000 fact rows over 100 join keys, and one dimension row per key.
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("fk", DataType::Int32, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let fact = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))),
+                Arc::new(Int64Array::from_iter_values(1..=10_000)),
+            ],
+        )
+        .expect("build the fact batch");
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("dk", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let dim = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|k| format!("n{k}")),
+                )),
+            ],
+        )
+        .expect("build the dimension batch");
+        for (name, schema, batch) in [("fact", fact_schema, fact), ("dim", dim_schema, dim)] {
+            let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the table");
+            df.ctx
+                .register_table(name, Arc::new(table) as Arc<dyn TableProvider>)
+                .expect("register the table");
+        }
+
+        let query = df
+            .ctx
+            .sql(
+                "SELECT d.name, SUM(f.amount) AS total FROM fact f JOIN dim d ON f.fk = d.dk \
+                 WHERE f.fk = 5 GROUP BY d.name",
+            )
+            .await
+            .expect("plan the query");
+        let plan = query
+            .clone()
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let rows = arrow::util::pretty::pretty_format_batches(
+            &query.collect().await.expect("run the query"),
+        )
+        .expect("format the rows")
+        .to_string();
+        (aggregates_below_a_join(&plan, false), rendered, rows)
+    }
+
+    /// The eager-aggregation rule — a physical optimizer rule the
+    /// `spiceai/datafusion` fork carries and spiced enables by default — actually
+    /// rewrites a plan built by this session, rather than only being switched on in
+    /// its configuration.
+    ///
+    /// The push side reaches the join through a `FilterExec`, and that is what makes
+    /// this a guard for the rule's `StatisticsContext` migration as well as for the
+    /// rule: the rule's cost gate reads row and distinct counts, `DataFusion` 55
+    /// derives a `FilterExec`'s only through `StatisticsContext`, and a rule still
+    /// reading the deprecated `partition_statistics` sees none there, declines every
+    /// push, and returns the same rows more slowly. The rows are asserted too, and
+    /// the disabled session is the control that shows the plan check can tell the
+    /// two apart.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn eager_aggregation_pushes_an_aggregate_below_a_join() {
+        let expected_rows = [
+            "+------+--------+",
+            "| name | total  |",
+            "+------+--------+",
+            "| n5   | 495500 |",
+            "+------+--------+",
+        ]
+        .join("\n");
+
+        let (pushed, plan, rows) = plan_an_aggregate_over_a_join(true).await;
+        assert!(
+            pushed,
+            "with eager aggregation enabled the aggregate over the join has to be \
+             pre-aggregated below it; the rule declined the push, so it no longer fires: \
+             {plan}"
+        );
+        assert_eq!(rows, expected_rows, "the rewritten plan returned wrong rows");
+
+        let (pushed, plan, rows) = plan_an_aggregate_over_a_join(false).await;
+        assert!(
+            !pushed,
+            "with eager aggregation disabled nothing may be pre-aggregated below the join, \
+             or the check above cannot tell the rule firing from the plan's own shape: {plan}"
+        );
+        assert_eq!(rows, expected_rows, "the unrewritten plan returned wrong rows");
+    }
+
     #[test]
     #[cfg(not(windows))]
     fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
