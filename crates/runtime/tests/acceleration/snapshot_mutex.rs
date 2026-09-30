@@ -135,7 +135,17 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let local_snapshot_file = temp_root.join("acceleration.db");
 
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    tokio::fs::write(&local_snapshot_file, b"snapshot-data").await?;
+    // A real database file: the DuckDB snapshot engine folds the write-ahead log into
+    // the file before copying it, and refuses to publish a file that is not a database.
+    let database_path = local_snapshot_file.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = duckdb::Connection::open(&database_path)?;
+        connection.execute_batch(
+            "CREATE TABLE snapshot_mutex_test (id INTEGER); INSERT INTO snapshot_mutex_test VALUES (1);",
+        )?;
+        Ok(())
+    })
+    .await??;
 
     let snapshots = Snapshots {
         enabled: true,

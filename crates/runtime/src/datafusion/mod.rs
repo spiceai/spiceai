@@ -3230,6 +3230,29 @@ impl DataFusion {
                 (accelerated_table_provider, None)
             };
 
+        // Whether an earlier acceleration left a checkpoint, and the definition fingerprint it
+        // persisted with the rows it left. Decides readiness below and, in every refresh mode
+        // (caching included), the provenance the first refresh inherits; see
+        // `starts_configured` below.
+        let (left_by_earlier_acceleration, earlier_acceleration_fingerprint) = if let Ok(checkpoint) =
+            dataset_checkpointer(
+                dataset,
+                self.accelerator_engine_registry(),
+                OpenOption::OpenExisting,
+                acceleration_settings.snapshot_behavior.clone(),
+            )
+            .await
+            && checkpoint.exists().await
+        {
+            // An unreadable fingerprint vouches for nothing, so it reads as none.
+            (
+                true,
+                checkpoint.get_source_fingerprint().await.ok().flatten(),
+            )
+        } else {
+            (false, None)
+        };
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -3239,15 +3262,7 @@ impl DataFusion {
             // Caching mode datasets are always ready immediately
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-        } else if let Ok(checkpoint) = dataset_checkpointer(
-            dataset,
-            self.accelerator_engine_registry(),
-            OpenOption::OpenExisting,
-            acceleration_settings.snapshot_behavior.clone(),
-        )
-        .await
-            && checkpoint.exists().await
-        {
+        } else if left_by_earlier_acceleration {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
@@ -3356,6 +3371,35 @@ impl DataFusion {
         {
             refresh.write_retention_sql_delete_expr = Some(retention_delete_expr);
         }
+
+        // Seed the provenance of the rows this acceleration starts with, before any refresh
+        // can inherit it. Only a `full` refresh establishes provenance from nothing, so
+        // starting every acceleration unconfigured would keep an `append` dataset from ever
+        // publishing a snapshot, and a view over it from ever bootstrapping.
+        let at_start = if bootstrap_status.is_bootstrapped() {
+            crate::accelerated::AccelerationAtStart::Bootstrapped
+        } else if left_by_earlier_acceleration {
+            crate::accelerated::AccelerationAtStart::Existing {
+                persisted_fingerprint: earlier_acceleration_fingerprint.as_deref(),
+            }
+        } else if acceleration_holds_rows(Arc::clone(&accelerated_table_provider)).await
+            == Some(false)
+        {
+            crate::accelerated::AccelerationAtStart::Empty
+        } else {
+            // Rows with no readable checkpoint — a first refresh that never checkpointed,
+            // or a checkpoint that could not be read — have nothing vouching for them.
+            crate::accelerated::AccelerationAtStart::Existing {
+                persisted_fingerprint: None,
+            }
+        };
+        let configured_fingerprint =
+            crate::dataaccelerator::AccelerationSource::definition_fingerprint(dataset)
+                .map(|definition| definition.fingerprint);
+        refresh.set_materialization_is_configured(crate::accelerated::starts_configured(
+            at_start,
+            configured_fingerprint.as_deref(),
+        ));
 
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -6251,6 +6295,11 @@ async fn build_snapshot_creation_config(
                         &live,
                     ),
                 ),
+                // Views have no `refresh_mode: snapshot`, so nothing follows this
+                // series by its source selection.
+                selection_fingerprint: None,
+                matched_on:
+                    runtime_acceleration::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization:
                     runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,
@@ -6275,6 +6324,29 @@ async fn build_snapshot_creation_config(
             snapshot_creation_trigger,
         )))
     }
+}
+
+/// Whether the acceleration behind `provider` holds any row, or `None` when that cannot be
+/// read. Reads at most one row.
+///
+/// Decides whether an acceleration with no readable checkpoint is empty, which is the only
+/// such state whose rows the configured definition can vouch for: a missing checkpoint
+/// alone does not show that, since a first refresh can write rows and stop before it
+/// checkpoints.
+///
+/// It reads through the accelerator, so an engine that applies retention while scanning
+/// (Cayenne) reports expired rows it still stores as absent. Those rows stay hidden from
+/// every deployment that loads the series, because retention is part of both the
+/// definition and the source selection a follower must match.
+async fn acceleration_holds_rows(provider: Arc<dyn TableProvider>) -> Option<bool> {
+    let batches = util::session_state::session_context()
+        .read_table(provider)
+        .and_then(|frame| frame.limit(0, Some(1)))
+        .ok()?
+        .collect()
+        .await
+        .ok()?;
+    Some(batches.iter().any(|batch| batch.num_rows() > 0))
 }
 
 /// Effective runtime `Refresh.sql` for each accelerated dataset in `view`'s closure.
@@ -6397,9 +6469,10 @@ async fn build_snapshot_refresh_state(
             }
         });
     // Fingerprinted like every other manager built from a source: `refresh_mode: snapshot`
-    // is the path that loads someone else's snapshots, so it is the last place that should
-    // accept an archive materialized from a different definition. Views also carry the
-    // producing-read stamp so a `consistent_read` consumer cannot restore `accept_skew`.
+    // is the path that loads someone else's snapshots, so it must not accept an archive
+    // that read a different source. It compares the series' source selection rather than
+    // its full definition (`DefinitionMatch::SourceSelection`): the publisher's refresh mode
+    // and write policies are its own, and its refresh mode always differs from this one's.
     let manager = manager.with_source(dataset);
     let manager = manager
         .with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy)

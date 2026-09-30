@@ -131,10 +131,107 @@ impl MaterializationIdentity {
     }
 }
 
+/// What an acceleration holds when a process registers it — the input to
+/// [`starts_configured`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelerationAtStart<'a> {
+    /// Holds no rows. Established by reading the acceleration, not inferred from a
+    /// missing checkpoint: a first refresh can write rows and stop before it checkpoints.
+    Empty,
+    /// Downloaded from a snapshot that bootstrap checked against this definition.
+    Bootstrapped,
+    /// Rows an earlier process left, with the definition fingerprint it persisted
+    /// alongside them in the local checkpoint — `None` when it persisted none or there is
+    /// no readable checkpoint.
+    Existing {
+        persisted_fingerprint: Option<&'a str>,
+    },
+}
+
+/// Whether the rows an acceleration starts a process with are known to be its configured
+/// definition's result — the provenance its first refresh inherits.
+///
+/// Every other state starts a generation unconfigured, and only a `full` refresh
+/// establishes provenance from nothing. Without this seed a dataset whose refreshes add
+/// to what is already there (`append`) would never publish a snapshot, and a view over
+/// one would never bootstrap.
+///
+/// Rows an earlier process left are vouched for only by the fingerprint it persisted with
+/// them: it persists the configured definition's fingerprint with rows that definition
+/// produced, and retracts it when an override or a runtime `refresh_sql` change lands
+/// rows the definition does not describe. A missing or different fingerprint therefore
+/// leaves them unconfigured until a `full` refresh replaces them.
+///
+/// That retraction is written by the checkpoint that follows the overriding refresh, not
+/// before its rows land, so a process that stops between the two leaves a stamp that
+/// still names the configured definition over the override's rows. The pre-recreation
+/// snapshot trusts the same persisted stamp; retracting it before the write is #14616.
+#[must_use]
+pub fn starts_configured(
+    at_start: AccelerationAtStart<'_>,
+    configured_fingerprint: Option<&str>,
+) -> bool {
+    match at_start {
+        AccelerationAtStart::Empty | AccelerationAtStart::Bootstrapped => true,
+        AccelerationAtStart::Existing {
+            persisted_fingerprint,
+        } => match configured_fingerprint {
+            // A source with no definition has nothing its rows could disagree with.
+            None => true,
+            Some(configured) => persisted_fingerprint == Some(configured),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MaterializationIdentity, MaterializationSample};
+    use super::{
+        AccelerationAtStart, MaterializationIdentity, MaterializationSample, starts_configured,
+    };
     use std::thread;
+
+    /// An `append` dataset only ever inherits provenance, so a fresh or verified start must
+    /// be configured or it never publishes; rows an earlier process could not vouch for must not.
+    #[test]
+    fn provenance_at_start_follows_what_the_acceleration_holds() {
+        let configured = Some("sha256:orders");
+
+        assert!(
+            starts_configured(AccelerationAtStart::Empty, configured),
+            "an empty acceleration holds no rows the definition did not produce"
+        );
+        assert!(
+            starts_configured(AccelerationAtStart::Bootstrapped, configured),
+            "bootstrap already checked the snapshot against this definition"
+        );
+        assert!(
+            starts_configured(
+                AccelerationAtStart::Existing {
+                    persisted_fingerprint: Some("sha256:orders"),
+                },
+                configured,
+            ),
+            "rows persisted with this definition's fingerprint are this definition's"
+        );
+        assert!(
+            !starts_configured(
+                AccelerationAtStart::Existing {
+                    persisted_fingerprint: None,
+                },
+                configured,
+            ),
+            "a retracted fingerprint means an override landed rows the definition does not describe"
+        );
+        assert!(
+            !starts_configured(
+                AccelerationAtStart::Existing {
+                    persisted_fingerprint: Some("sha256:orders-before-from-change"),
+                },
+                configured,
+            ),
+            "rows of a previous definition are not this one's"
+        );
+    }
 
     #[test]
     fn begin_refresh_retracts_configured_and_increments_epoch() {

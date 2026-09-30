@@ -84,7 +84,9 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
-pub use materialization::{MaterializationIdentity, MaterializationSample};
+pub use materialization::{
+    AccelerationAtStart, MaterializationIdentity, MaterializationSample, starts_configured,
+};
 pub use refresh_completion::{
     RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };

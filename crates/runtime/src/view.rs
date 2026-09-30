@@ -1166,6 +1166,11 @@ fn dataset_identity_fields(
         &mut fields,
         dataset.time_column.as_deref(),
         dataset.time_format.as_ref().map(|f| format!("{f:?}")),
+        dataset.time_partition_column.as_deref(),
+        dataset
+            .time_partition_format
+            .as_ref()
+            .map(|f| format!("{f:?}")),
         &dataset.columns,
         &dataset.embeddings,
     );
@@ -1242,6 +1247,53 @@ pub(crate) fn dataset_definition_identity_from_spec(
     dataset_definition_identity(&spec.from, &dataset_identity_fields_from_spec(spec))
 }
 
+/// A dataset's source selection: [`dataset_definition_identity_from_spec`] without the
+/// policies that decide how one deployment writes its copy — refresh mode, primary key,
+/// conflict handling and indexes.
+///
+/// What a `refresh_mode: snapshot` dataset checks against the series it follows. It never
+/// refreshes or writes those rows itself, so its own refresh mode (always `snapshot`) and
+/// its write policies say nothing about them and legitimately differ from the
+/// publisher's, whose full identity already covers them. What the two must share is what
+/// decides which source rows are kept and how they are shaped: `from:`, the connector
+/// `params`, `refresh_sql`, `refresh_data_window`, retention, and the time, column and
+/// embedding configuration.
+#[must_use]
+pub(crate) fn dataset_selection_identity_from_spec(
+    spec: &crate::component::dataset::DatasetSpec,
+) -> String {
+    let mut fields = BTreeMap::new();
+
+    for (key, value) in &spec.params {
+        fields.insert(format!("param.{key}"), value.clone());
+    }
+
+    push_dataset_shape_fields(
+        &mut fields,
+        spec.time_column.as_deref(),
+        spec.time_format.as_ref().map(|f| format!("{f:?}")),
+        spec.time_partition_column.as_deref(),
+        spec.time_partition_format
+            .as_ref()
+            .map(|f| format!("{f:?}")),
+        &spec.columns,
+        &spec.embeddings,
+    );
+
+    if let Some(acceleration) = &spec.acceleration {
+        push_acceleration_row_selection(
+            &mut fields,
+            acceleration.refresh_sql.as_deref(),
+            acceleration.refresh_data_window.as_deref(),
+            acceleration.retention_period.as_deref(),
+            acceleration.retention_sql.as_deref(),
+            acceleration.retention_check_enabled,
+        );
+    }
+
+    dataset_definition_identity(&spec.from, &fields)
+}
+
 /// The identity fields of a dataset as PARSED into its runtime configuration. See
 /// [`dataset_identity_fields`] for why both exist and what keeps them in step.
 fn dataset_identity_fields_from_spec(
@@ -1257,6 +1309,10 @@ fn dataset_identity_fields_from_spec(
         &mut fields,
         spec.time_column.as_deref(),
         spec.time_format.as_ref().map(|f| format!("{f:?}")),
+        spec.time_partition_column.as_deref(),
+        spec.time_partition_format
+            .as_ref()
+            .map(|f| format!("{f:?}")),
         &spec.columns,
         &spec.embeddings,
     );
@@ -1311,10 +1367,16 @@ fn canonical_columns(reference: &str) -> String {
 }
 
 /// Dataset-level configuration that changes which rows are stored or what they contain.
+///
+/// The partition column and its format are included with the time column: a refresh
+/// window filters on both, so reading an integer partition column as seconds rather than
+/// milliseconds selects different rows under an otherwise identical definition.
 fn push_dataset_shape_fields(
     fields: &mut BTreeMap<String, String>,
     time_column: Option<&str>,
     time_format: Option<String>,
+    time_partition_column: Option<&str>,
+    time_partition_format: Option<String>,
     columns: &[spicepod::semantic::Column],
     embeddings: &[ColumnEmbeddingConfig],
 ) {
@@ -1323,6 +1385,15 @@ fn push_dataset_shape_fields(
     }
     if let Some(time_format) = time_format {
         fields.insert("time_format".to_string(), time_format);
+    }
+    if let Some(time_partition_column) = time_partition_column {
+        fields.insert(
+            "time_partition_column".to_string(),
+            time_partition_column.to_string(),
+        );
+    }
+    if let Some(time_partition_format) = time_partition_format {
+        fields.insert("time_partition_format".to_string(), time_partition_format);
     }
     if !columns.is_empty() {
         fields.insert("columns".to_string(), identity_value(&columns));
@@ -1462,20 +1533,16 @@ fn push_acceleration_row_policies(
     retention_sql: Option<&str>,
     retention_check_enabled: bool,
 ) {
-    if let Some(refresh_sql) = refresh_sql {
-        fields.insert(
-            "acceleration.refresh_sql".to_string(),
-            refresh_sql.trim().to_string(),
-        );
-    }
+    push_acceleration_row_selection(
+        fields,
+        refresh_sql,
+        refresh_data_window,
+        retention_period,
+        retention_sql,
+        retention_check_enabled,
+    );
     if let Some(refresh_mode) = refresh_mode {
         fields.insert("acceleration.refresh_mode".to_string(), refresh_mode);
-    }
-    if let Some(window) = refresh_data_window {
-        fields.insert(
-            "acceleration.refresh_data_window".to_string(),
-            window.to_string(),
-        );
     }
     if let Some(primary_key) = primary_key {
         fields.insert("acceleration.primary_key".to_string(), primary_key);
@@ -1485,6 +1552,35 @@ fn push_acceleration_row_policies(
     }
     for (column, index) in indexes {
         fields.insert(format!("acceleration.index.{column}"), index);
+    }
+}
+
+/// The acceleration settings that decide which source rows are kept: the refresh SQL that
+/// filters and projects them, the window that bounds them in time, and the retention that
+/// expires them. A `retention_period` with no `refresh_data_window` is also the window a
+/// refresh reads, and an archive carries rows retention hides but has not yet removed.
+///
+/// The part of [`push_acceleration_row_policies`] a dataset shares with every deployment
+/// that follows its snapshots — see [`dataset_selection_identity_from_spec`].
+fn push_acceleration_row_selection(
+    fields: &mut BTreeMap<String, String>,
+    refresh_sql: Option<&str>,
+    refresh_data_window: Option<&str>,
+    retention_period: Option<&str>,
+    retention_sql: Option<&str>,
+    retention_check_enabled: bool,
+) {
+    if let Some(refresh_sql) = refresh_sql {
+        fields.insert(
+            "acceleration.refresh_sql".to_string(),
+            refresh_sql.trim().to_string(),
+        );
+    }
+    if let Some(window) = refresh_data_window {
+        fields.insert(
+            "acceleration.refresh_data_window".to_string(),
+            window.to_string(),
+        );
     }
     if let Some(period) = retention_period {
         fields.insert(

@@ -128,6 +128,14 @@ const NETWORK_RETRY_MAX: usize = 3;
 /// not a stale one.
 pub const SOURCE_FINGERPRINT_PROPERTY: &str = "spice.source-fingerprint";
 
+/// Metadata property recording the source selection of the most recent publish — which
+/// source rows it kept and how they are shaped, without the publisher's refresh mode or
+/// its write policies. A `refresh_mode: snapshot` dataset follows
+/// a series another deployment publishes and compares this instead of
+/// [`SOURCE_FINGERPRINT_PROPERTY`]; see
+/// [`crate::acceleration_source::DefinitionMatch::SourceSelection`].
+pub const SOURCE_SELECTION_FINGERPRINT_PROPERTY: &str = "spice.source-selection-fingerprint";
+
 /// Docs link carried on the producing-read-shape refusal so a reword cannot drop it.
 const SNAPSHOT_READ_CONSISTENCY_DOCS: &str =
     "https://spiceai.org/docs/components/data-accelerators/snapshots";
@@ -141,6 +149,77 @@ fn accept_skew_snapshot_bootstrap_reason() -> String {
 fn missing_read_consistency_bootstrap_reason() -> String {
     format!(
         "it records no `snapshot-read-consistency`, so it cannot be shown to have come from a single consistent read. Set `snapshots_consistency: accept_skew` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+    )
+}
+
+/// Whether an archive recording `stored_definition` and `stored_selection` may be
+/// restored under `definition`, and if not, why.
+///
+/// Shared by the series-level and the per-entry checks so the two cannot disagree. A
+/// [`crate::acceleration_source::DefinitionMatch::SourceSelection`] consumer compares the
+/// recorded source selection.
+///
+/// An archive recording neither stamp follows `accept_unstamped`, but only while its
+/// series records none either (`series_stamped` is false): such a series was published
+/// before definitions were recorded. Once a publisher has stamped the series, an
+/// unstamped entry in it — an older archive a `fallback` bootstrap walks back to, or one
+/// written by a source with no definition — cannot be told apart from an archive of a
+/// different source, and is refused. One that records a definition but no selection was
+/// published by a deployment that could not establish what it read — a snapshot taken
+/// before an acceleration was recreated recovers only the outgoing definition — so a
+/// consumer cannot verify it and refuses it.
+fn definition_stamp_permits(
+    definition: &crate::acceleration_source::SourceDefinition,
+    stored_definition: Option<&str>,
+    stored_selection: Option<&str>,
+    series_stamped: bool,
+) -> Result<(), String> {
+    let accepts_unstamped = definition.accept_unstamped && !series_stamped;
+    match definition.matched_on {
+        crate::acceleration_source::DefinitionMatch::FullDefinition => match stored_definition {
+            Some(stored) if stored == definition.fingerprint => Ok(()),
+            Some(stored) => Err(format!(
+                "the snapshot was materialized from a different definition (recorded `{stored}`, current `{}`)",
+                definition.fingerprint
+            )),
+            None if accepts_unstamped => Ok(()),
+            None => Err(format!(
+                "the snapshot records no `{SOURCE_FINGERPRINT_PROPERTY}`, so it cannot be shown to match the definition now in force (`{}`)",
+                definition.fingerprint
+            )),
+        },
+        crate::acceleration_source::DefinitionMatch::SourceSelection => {
+            let Some(expected) = definition.selection_fingerprint.as_deref() else {
+                return Err(format!(
+                    "this dataset records no source selection to compare with the snapshot's `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}`"
+                ));
+            };
+            match (stored_selection, stored_definition) {
+                (Some(stored), _) if stored == expected => Ok(()),
+                (Some(stored), _) => Err(format!(
+                    "the snapshot was materialized from a different source selection (recorded `{stored}`, current `{expected}`)"
+                )),
+                (None, None) if accepts_unstamped => Ok(()),
+                (None, None) if series_stamped => Err(format!(
+                    "the snapshot records no `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}` although its series does, so it cannot be shown to read the same source as this dataset (`{expected}`)"
+                )),
+                (None, None) => Err(format!(
+                    "the snapshot records no `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}`, so it cannot be shown to read the same source as this dataset (`{expected}`)"
+                )),
+                (None, Some(_)) => Err(format!(
+                    "the snapshot records a definition but no `{SOURCE_SELECTION_FINGERPRINT_PROPERTY}` (a snapshot taken before its acceleration was recreated), so it cannot be shown to read the same source as this dataset (`{expected}`)"
+                )),
+            }
+        }
+    }
+}
+
+/// The warning a `refresh_mode: snapshot` dataset logs when it refuses a snapshot of the
+/// series it follows. Unlike a source that publishes its own series, it cannot rebuild
+/// from its source, so the consequence is that it keeps what it already loaded.
+fn snapshot_refused_by_follower_warning(dataset_name: &str, reason: &str) -> String {
+    format!(
+        "Did not load a snapshot of '{dataset_name}', so it keeps its current contents, or stays unavailable if it has none, until its snapshot series holds a snapshot of the same source: {reason}. A `refresh_mode: snapshot` dataset must declare the same `from`, `params`, `refresh_sql`, `refresh_data_window`, retention, time column, `columns` and `embeddings` as the dataset that publishes its snapshots. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
     )
 }
 
@@ -273,6 +352,17 @@ struct SnapshotEntry {
         rename = "snapshot-source-fingerprint"
     )]
     snapshot_source_fingerprint: Option<String>,
+    /// Source selection this particular snapshot was materialized from — what a
+    /// `refresh_mode: snapshot` consumer compares. Recorded per entry for the same
+    /// reason as [`Self::snapshot_source_fingerprint`]. Absent for an entry written
+    /// before this was recorded, by a source with no selection (a view), or by a
+    /// publish that could only recover the outgoing definition (pre-recreation).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-source-selection-fingerprint"
+    )]
+    snapshot_source_selection_fingerprint: Option<String>,
     /// How the producing materialization was allowed to read its sources.
     ///
     /// Recorded per entry so a `consistent_read` bootstrap can refuse an archive
@@ -311,6 +401,16 @@ impl DatasetMetadata {
         self.schemas
             .iter()
             .find(|schema| schema.schema_id == self.current_schema_id)
+    }
+
+    /// Whether a publisher has recorded a definition on this series. An unstamped entry
+    /// is only accepted from a series that has never been stamped; see
+    /// [`definition_stamp_permits`].
+    fn records_definition_stamps(&self) -> bool {
+        self.properties.contains_key(SOURCE_FINGERPRINT_PROPERTY)
+            || self
+                .properties
+                .contains_key(SOURCE_SELECTION_FINGERPRINT_PROPERTY)
     }
 }
 
@@ -1261,15 +1361,34 @@ impl SnapshotManager {
     /// accepts an entry carrying the same value, and treats an entry carrying a
     /// different one — or none at all, unless `accept_unstamped` is set — as
     /// unverified. Datasets and views both refuse unstamped archives: absence
-    /// cannot be shown to match the definition now in force.
-    fn entry_fingerprint_matches(&self, entry: &SnapshotEntry) -> bool {
+    /// cannot be shown to match the definition now in force. A
+    /// `refresh_mode: snapshot` dataset compares the entry's source selection
+    /// instead; see [`definition_stamp_permits`].
+    fn entry_fingerprint_matches(
+        &self,
+        entry: &SnapshotEntry,
+        dataset_metadata: &DatasetMetadata,
+    ) -> bool {
+        self.entry_definition_permits(entry, dataset_metadata)
+            .is_ok()
+    }
+
+    /// [`Self::entry_fingerprint_matches`], with the reason an entry is refused.
+    /// `dataset_metadata` is the series the entry belongs to.
+    fn entry_definition_permits(
+        &self,
+        entry: &SnapshotEntry,
+        dataset_metadata: &DatasetMetadata,
+    ) -> Result<(), String> {
         let Some(definition) = self.source_definition.as_ref() else {
-            return true;
+            return Ok(());
         };
-        match entry.snapshot_source_fingerprint.as_deref() {
-            Some(stored) => stored == definition.fingerprint,
-            None => definition.accept_unstamped,
-        }
+        definition_stamp_permits(
+            definition,
+            entry.snapshot_source_fingerprint.as_deref(),
+            entry.snapshot_source_selection_fingerprint.as_deref(),
+            dataset_metadata.records_definition_stamps(),
+        )
     }
 
     /// Whether one snapshot entry's producing-read stamp is admissible for this manager.
@@ -1298,13 +1417,33 @@ impl SnapshotManager {
         match self.source_fingerprint_matches(dataset_metadata) {
             Ok(()) => true,
             Err(reason) => {
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    "Did not bootstrap '{}' from its snapshot, so it starts empty and its first refresh rebuilds it: {reason}",
-                    self.dataset_name
-                );
+                self.warn_snapshot_refused(&reason);
                 false
             }
+        }
+    }
+
+    /// The operator-facing warning for a snapshot this manager's definition refuses.
+    ///
+    /// The consequence depends on what the source can do without it: a source that
+    /// matches its full definition rebuilds from its own source, while a
+    /// `refresh_mode: snapshot` dataset cannot, and keeps whatever it already loaded.
+    fn warn_snapshot_refused(&self, reason: &str) {
+        let follows_published_series = self.source_definition.as_ref().is_some_and(|definition| {
+            definition.matched_on == crate::acceleration_source::DefinitionMatch::SourceSelection
+        });
+        if follows_published_series {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "{}",
+                snapshot_refused_by_follower_warning(&self.dataset_name, reason)
+            );
+        } else {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Did not bootstrap '{}' from its snapshot, so it starts empty and its first refresh rebuilds it: {reason}",
+                self.dataset_name
+            );
         }
     }
 
@@ -1312,18 +1451,18 @@ impl SnapshotManager {
         let Some(definition) = self.source_definition.as_ref() else {
             return Ok(());
         };
-        match dataset_metadata.properties.get(SOURCE_FINGERPRINT_PROPERTY) {
-            Some(stored) if *stored == definition.fingerprint => Ok(()),
-            Some(stored) => Err(format!(
-                "the snapshot was materialized from a different definition (recorded `{stored}`, current `{}`)",
-                definition.fingerprint
-            )),
-            None if definition.accept_unstamped => Ok(()),
-            None => Err(format!(
-                "the snapshot records no `{SOURCE_FINGERPRINT_PROPERTY}`, so it cannot be shown to match the definition now in force (`{}`)",
-                definition.fingerprint
-            )),
-        }
+        definition_stamp_permits(
+            definition,
+            dataset_metadata
+                .properties
+                .get(SOURCE_FINGERPRINT_PROPERTY)
+                .map(String::as_str),
+            dataset_metadata
+                .properties
+                .get(SOURCE_SELECTION_FINGERPRINT_PROPERTY)
+                .map(String::as_str),
+            dataset_metadata.records_definition_stamps(),
+        )
     }
 
     /// Returns the schema currently stored in snapshot metadata for this dataset, if any.
@@ -2159,12 +2298,8 @@ impl SnapshotManager {
             return Ok(None);
         };
 
-        if !self.entry_fingerprint_matches(&current_entry) {
-            tracing::warn!(
-                dataset = %self.dataset_name,
-                "Did not bootstrap '{}' from its snapshot, so it starts empty and its first refresh rebuilds it: the current snapshot was materialized from a different definition",
-                self.dataset_name
-            );
+        if let Err(reason) = self.entry_definition_permits(&current_entry, &dataset_metadata) {
+            self.warn_snapshot_refused(&reason);
             return Ok(None);
         }
 
@@ -2238,7 +2373,7 @@ impl SnapshotManager {
             // Judge each candidate on its OWN recorded definition. The series-level property
             // checked above describes the most recent publish, so on its own it would let
             // this walk fall back past a definition change into archives of the previous one.
-            if !self.entry_fingerprint_matches(&snapshot) {
+            if !self.entry_fingerprint_matches(&snapshot, &dataset_metadata) {
                 tracing::debug!(
                     "Skipping snapshot materialized from a different definition; attempting next available snapshot. dataset={} snapshot={}",
                     self.dataset_name,
@@ -3032,12 +3167,28 @@ impl SnapshotManager {
             dataset_entry.engine = Some(engine_str);
 
             // Stamp the definition this series materializes, so a later bootstrap can
-            // refuse an archive built from a different one.
+            // refuse an archive built from a different one. The source selection travels
+            // with it for the `refresh_mode: snapshot` datasets that follow this series.
+            // A publish without one removes the previous publish's selection rather than
+            // leaving it to vouch for rows it does not describe.
             if let Some(definition) = self.source_definition.as_ref() {
                 dataset_entry.properties.insert(
                     SOURCE_FINGERPRINT_PROPERTY.to_string(),
                     definition.fingerprint.clone(),
                 );
+                match definition.selection_fingerprint.as_ref() {
+                    Some(selection) => {
+                        dataset_entry.properties.insert(
+                            SOURCE_SELECTION_FINGERPRINT_PROPERTY.to_string(),
+                            selection.clone(),
+                        );
+                    }
+                    None => {
+                        dataset_entry
+                            .properties
+                            .remove(SOURCE_SELECTION_FINGERPRINT_PROPERTY);
+                    }
+                }
             }
 
             // Metadata written before recorded schemas were conformed keeps the invalid
@@ -3173,6 +3324,10 @@ impl SnapshotManager {
                     .source_definition
                     .as_ref()
                     .map(|definition| definition.fingerprint.clone()),
+                snapshot_source_selection_fingerprint: self
+                    .source_definition
+                    .as_ref()
+                    .and_then(|definition| definition.selection_fingerprint.clone()),
                 snapshot_read_consistency: self.snapshots_consistency,
             };
 
@@ -4051,6 +4206,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -4125,6 +4281,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: Some(SnapshotsConsistency::AcceptSkew),
         };
 
@@ -4198,6 +4355,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: Some(SnapshotsConsistency::ConsistentRead),
         };
 
@@ -4269,6 +4427,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: Some(SnapshotsConsistency::AcceptSkew),
         };
 
@@ -4337,6 +4496,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let schema = sample_schema();
@@ -4479,6 +4639,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         }
     }
@@ -4780,6 +4941,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = SnapshotMetadata {
@@ -4922,6 +5084,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -4937,6 +5100,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -5231,6 +5395,8 @@ mod tests {
         let manager = manager_for_gate_tests(&store, local_path).with_source_definition(
             crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:abc123".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             },
@@ -5260,6 +5426,99 @@ mod tests {
         );
     }
 
+    /// The series-level and current-entry source-selection stamps, in that order.
+    async fn recorded_source_selection(
+        manager: &SnapshotManager,
+    ) -> (Option<String>, Option<String>) {
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let dataset_entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded");
+        (
+            dataset_entry
+                .properties
+                .get(SOURCE_SELECTION_FINGERPRINT_PROPERTY)
+                .cloned(),
+            dataset_entry
+                .current_snapshot()
+                .expect("a current snapshot")
+                .snapshot_source_selection_fingerprint
+                .clone(),
+        )
+    }
+
+    /// The selection stamp is what `refresh_mode: snapshot` followers trust. A publish that
+    /// has none — a pre-recreation archive, which recovers only the outgoing definition —
+    /// must remove the previous publish's selection, or the series would vouch for rows it
+    /// does not describe.
+    #[tokio::test]
+    async fn upload_records_the_source_selection_and_a_publish_without_one_clears_it() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let publisher = manager_for_gate_tests(&store, local_path.clone()).with_source_definition(
+            crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:orders-definition".to_string(),
+                selection_fingerprint: Some("sha256:orders-selection".to_string()),
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            },
+        );
+        let mutex = Arc::new(Mutex::new(()));
+        publisher
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+        assert_eq!(
+            recorded_source_selection(&publisher).await,
+            (
+                Some("sha256:orders-selection".to_string()),
+                Some("sha256:orders-selection".to_string())
+            )
+        );
+
+        let pre_recreation = manager_for_gate_tests(&store, local_path).with_source_definition(
+            crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:outgoing-definition".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            },
+        );
+        pre_recreation
+            .create_snapshot(
+                &schema,
+                Arc::clone(&mutex).lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+        assert_eq!(
+            recorded_source_selection(&pre_recreation).await,
+            (None, None),
+            "a publish without a source selection must not inherit the previous one"
+        );
+    }
+
     #[tokio::test]
     async fn upload_records_the_producing_read_consistency_on_the_entry() {
         let store = Arc::new(InMemory::new());
@@ -5269,6 +5528,8 @@ mod tests {
         let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
             Some(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:view".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             }),
@@ -5317,6 +5578,8 @@ mod tests {
         let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
             Some(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:view".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             }),
@@ -5359,6 +5622,8 @@ mod tests {
         let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
             Some(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:dataset".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::SourceTable,
             }),
@@ -5427,6 +5692,8 @@ mod tests {
         let view_manager = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
             .with_source_definition(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:current".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             });
@@ -5454,6 +5721,8 @@ mod tests {
         let dataset_manager = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
             .with_source_definition(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:new-from".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::SourceTable,
             });
@@ -5475,6 +5744,144 @@ mod tests {
         );
     }
 
+    /// A `refresh_mode: snapshot` dataset follows a series another deployment publishes.
+    /// Their full definitions always differ — the follower's refresh mode is `snapshot`
+    /// and the publisher's is not — so it must match on the source selection alone, or
+    /// no follower could ever load its publisher's snapshots.
+    #[test]
+    fn snapshot_follower_matches_its_publisher_on_source_selection() {
+        let store = Arc::new(InMemory::new());
+        let follower = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:follower-definition".to_string(),
+                selection_fingerprint: Some("sha256:orders-selection".to_string()),
+                matched_on: crate::acceleration_source::DefinitionMatch::SourceSelection,
+                accept_unstamped: true,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+        // Same source selection, but a source that restores its own series: a change to
+        // its refresh mode or write policies is still a different definition to it.
+        let own_series = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:changed-definition".to_string(),
+                selection_fingerprint: Some("sha256:orders-selection".to_string()),
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+
+        let series = |definition: Option<&str>, selection: Option<&str>| {
+            let mut meta = DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                ..Default::default()
+            };
+            if let Some(v) = definition {
+                meta.properties
+                    .insert(SOURCE_FINGERPRINT_PROPERTY.to_string(), v.to_string());
+            }
+            if let Some(v) = selection {
+                meta.properties.insert(
+                    SOURCE_SELECTION_FINGERPRINT_PROPERTY.to_string(),
+                    v.to_string(),
+                );
+            }
+            meta
+        };
+        let entry = |definition: Option<&str>, selection: Option<&str>| {
+            let mut entry = dummy_snapshot_entry(None);
+            entry.snapshot_source_fingerprint = definition.map(ToString::to_string);
+            entry.snapshot_source_selection_fingerprint = selection.map(ToString::to_string);
+            entry
+        };
+
+        let published = (
+            Some("sha256:publisher-definition"),
+            Some("sha256:orders-selection"),
+        );
+        follower
+            .source_fingerprint_matches(&series(published.0, published.1))
+            .expect("the same source selection loads despite a different refresh mode");
+        let published_series = series(published.0, published.1);
+        follower
+            .entry_definition_permits(&entry(published.0, published.1), &published_series)
+            .expect("the same source selection loads despite a different refresh mode");
+        let full_mismatch = own_series
+            .source_fingerprint_matches(&series(published.0, published.1))
+            .expect_err("a source restoring its own series still compares the full definition");
+        assert!(
+            full_mismatch.contains("different definition"),
+            "{full_mismatch}"
+        );
+
+        let other_source = (
+            Some("sha256:publisher-definition"),
+            Some("sha256:eu-orders-selection"),
+        );
+        let refused = follower
+            .source_fingerprint_matches(&series(other_source.0, other_source.1))
+            .expect_err("a series that read a different source is refused");
+        assert!(refused.contains("different source selection"), "{refused}");
+        assert!(
+            !follower.entry_fingerprint_matches(
+                &entry(other_source.0, other_source.1),
+                &published_series
+            ),
+            "an entry that read a different source is refused"
+        );
+
+        // A pre-recreation archive recovers only the outgoing definition, so it carries
+        // no selection: the follower cannot tell what it read and must not load it.
+        let unverifiable = follower
+            .source_fingerprint_matches(&series(Some("sha256:outgoing-definition"), None))
+            .expect_err("a definition without a source selection cannot be verified");
+        assert!(
+            unverifiable.contains(SOURCE_SELECTION_FINGERPRINT_PROPERTY),
+            "{unverifiable}"
+        );
+        assert!(
+            !follower.entry_fingerprint_matches(
+                &entry(Some("sha256:outgoing-definition"), None),
+                &published_series
+            ),
+            "an entry with a definition but no source selection cannot be verified"
+        );
+
+        // A series published before definitions were recorded stays loadable: the follower
+        // cannot rebuild from its source, so refusing it would leave the dataset unavailable.
+        let legacy_series = series(None, None);
+        follower
+            .source_fingerprint_matches(&legacy_series)
+            .expect("a series published before definitions were recorded still loads");
+        assert!(follower.entry_fingerprint_matches(&entry(None, None), &legacy_series));
+
+        // Once a publisher has stamped the series, an unstamped entry in it — an older
+        // archive a `fallback` bootstrap walks back to after the current one fails its
+        // integrity check — cannot be told apart from an archive of a different source.
+        let unstamped_in_stamped_series = follower
+            .entry_definition_permits(&entry(None, None), &published_series)
+            .expect_err("an unstamped entry in a stamped series cannot be verified");
+        assert!(
+            unstamped_in_stamped_series.contains("although its series does"),
+            "{unstamped_in_stamped_series}"
+        );
+    }
+
+    #[test]
+    fn snapshot_follower_refusal_names_the_dataset_the_impact_and_the_fix() {
+        let message = snapshot_refused_by_follower_warning(
+            "orders",
+            "the snapshot was materialized from a different source selection",
+        );
+        assert!(message.contains("'orders'"), "{message}");
+        assert!(message.contains("keeps its current contents"), "{message}");
+        assert!(message.contains("different source selection"), "{message}");
+        assert!(message.contains("`from`"), "{message}");
+        assert!(
+            message.contains(SNAPSHOT_READ_CONSISTENCY_DOCS),
+            "{message}"
+        );
+    }
+
     fn dummy_snapshot_entry(consistency: Option<SnapshotsConsistency>) -> SnapshotEntry {
         SnapshotEntry {
             snapshot_id: 0,
@@ -5487,6 +5894,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: consistency,
         }
     }
@@ -5579,6 +5987,8 @@ mod tests {
             .with_source_identity(
                 Some(crate::acceleration_source::SourceDefinition {
                     fingerprint: "sha256:view".to_string(),
+                    selection_fingerprint: None,
+                    matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                     accept_unstamped: false,
                     materialization:
                         crate::acceleration_source::MaterializationSource::PlannedQuery,
@@ -5595,6 +6005,8 @@ mod tests {
             .with_source_identity(
                 Some(crate::acceleration_source::SourceDefinition {
                     fingerprint: "sha256:dataset".to_string(),
+                    selection_fingerprint: None,
+                    matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                     accept_unstamped: false,
                     materialization: crate::acceleration_source::MaterializationSource::SourceTable,
                 }),
@@ -5674,6 +6086,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: Some("sha256:old-from".to_string()),
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         });
         entry.current_snapshot_id = Some(0);
@@ -5704,6 +6117,8 @@ mod tests {
         let incoming =
             manager.with_source_definition(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:new-from".to_string(),
+                selection_fingerprint: None,
+                matched_on: crate::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::SourceTable,
             });
@@ -6065,6 +6480,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
@@ -6135,6 +6551,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
@@ -6205,6 +6622,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
@@ -6280,6 +6698,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
@@ -6361,6 +6780,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
@@ -6439,6 +6859,7 @@ mod tests {
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
@@ -6528,6 +6949,7 @@ mod tests {
             snapshot_row_count: Some(50),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -6543,6 +6965,7 @@ mod tests {
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -6622,6 +7045,7 @@ mod tests {
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -6714,6 +7138,7 @@ mod tests {
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -6729,6 +7154,7 @@ mod tests {
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -7156,6 +7582,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -7640,6 +8067,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: Some(1_704_153_600_000),
                     snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
                     snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -7729,6 +8157,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -7799,6 +8228,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -7813,6 +8243,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -7889,6 +8320,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -7958,6 +8390,7 @@ mod tests {
                 snapshot_row_count: None,
                 snapshot_last_updated_at_ms: None,
                 snapshot_source_fingerprint: None,
+                snapshot_source_selection_fingerprint: None,
                 snapshot_read_consistency: None,
             });
             store
@@ -8020,6 +8453,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -8124,6 +8558,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -8138,6 +8573,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -8229,6 +8665,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
 
@@ -8422,6 +8859,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
                     snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -8475,6 +8913,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
                     snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -8535,6 +8974,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
                     snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -8559,6 +8999,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
                     snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -8627,6 +9068,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_source_selection_fingerprint: None,
                     snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -8757,6 +9199,7 @@ mod tests {
                 snapshot_row_count: Some(100),
                 snapshot_last_updated_at_ms: Some(1_704_240_000_000),
                 snapshot_source_fingerprint: None,
+                snapshot_source_selection_fingerprint: None,
                 snapshot_read_consistency: None,
             });
             dataset.current_snapshot_id = Some(1);
@@ -8982,6 +9425,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_source_selection_fingerprint: None,
             snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {

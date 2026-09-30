@@ -1334,13 +1334,15 @@ impl Refresher {
                             }
                         }
 
-                        // Checkpoint whenever the accelerator changed — including a
-                        // FailedToApplyRetentionSql after a successful write — so a
-                        // stale definition fingerprint cannot survive on modified rows.
+                        // Checkpoint after every successful refresh and after a
+                        // FailedToApplyRetentionSql that followed a successful write, so a
+                        // stale definition fingerprint cannot survive on modified rows. An
+                        // `UpToDate` refresh checkpoints too: whether an unchanged
+                        // acceleration is published again is the creation policy's call.
                         // Archive publication stays conditional on a fully successful
                         // refresh: a retention failure must retract/persist identity
                         // without publishing those rows.
-                        if refresh_changed_accelerator && let Some(checkpointer) = &checkpointer {
+                        if refresh_result_requires_checkpoint(&res) && let Some(checkpointer) = &checkpointer {
                             let refresh_sql = {
                                 let refresh = refresh.read().await;
                                 refresh.sql.as_ref().map(RefreshSQL::to_sql)
@@ -1493,6 +1495,19 @@ fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) ->
     matches!(
         result,
         Ok(RefreshOutcome::Refreshed) | Err(super::Error::FailedToApplyRetentionSql { .. })
+    )
+}
+
+/// Whether a finished refresh is followed by a checkpoint (and, when it fully
+/// succeeded, a snapshot offer).
+///
+/// Wider than [`refresh_result_changed_accelerator`]: an `UpToDate` refresh wrote
+/// nothing, so cached results stay valid, but the snapshot creation policy still
+/// decides whether that acceleration is published again (`always` republishes it).
+fn refresh_result_requires_checkpoint(result: &super::Result<RefreshOutcome>) -> bool {
+    matches!(
+        result,
+        Ok(_) | Err(super::Error::FailedToApplyRetentionSql { .. })
     )
 }
 
@@ -1754,6 +1769,32 @@ mod tests {
         )));
 
         assert!(!refresh_result_changed_accelerator(&Err(
+            super::super::Error::FailedToRefreshDataset {
+                source: datafusion::error::DataFusionError::Execution(
+                    "source refresh failed before write".to_string(),
+                ),
+            }
+        )));
+    }
+
+    #[test]
+    fn up_to_date_refresh_still_checkpoints_but_a_failed_one_does_not() {
+        assert!(refresh_result_requires_checkpoint(&Ok(
+            RefreshOutcome::Refreshed
+        )));
+        assert!(
+            refresh_result_requires_checkpoint(&Ok(RefreshOutcome::UpToDate)),
+            "the creation policy, not the refresh outcome, decides whether an unchanged acceleration is republished"
+        );
+        assert!(refresh_result_requires_checkpoint(&Err(
+            super::super::Error::FailedToApplyRetentionSql {
+                dataset_name: "retained_table".to_string(),
+                source: datafusion::error::DataFusionError::Execution(
+                    "retention failed after write".to_string(),
+                ),
+            }
+        )));
+        assert!(!refresh_result_requires_checkpoint(&Err(
             super::super::Error::FailedToRefreshDataset {
                 source: datafusion::error::DataFusionError::Execution(
                     "source refresh failed before write".to_string(),

@@ -38,6 +38,24 @@ pub enum MaterializationSource {
     PlannedQuery,
 }
 
+/// Which part of a definition a snapshot must have been materialized from for a source
+/// to restore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionMatch {
+    /// The whole definition. The source restores archives of the series it publishes
+    /// itself, so everything that decides its rows — its refresh mode and its write
+    /// policies included — must match.
+    FullDefinition,
+    /// Only the source selection: which source rows are kept and how they are shaped.
+    ///
+    /// A `refresh_mode: snapshot` dataset follows a series that another deployment
+    /// publishes and never refreshes or writes those rows itself. Its own refresh mode
+    /// (always `snapshot`) and its write policies (primary key, conflict handling,
+    /// indexes) therefore say nothing about the rows it loads, and may differ from the
+    /// publisher's, whose full definition already covers them.
+    SourceSelection,
+}
+
 /// Identity of the definition a source's rows were materialized from, and how to treat a
 /// snapshot that records no definition at all.
 #[derive(Debug, Clone)]
@@ -45,6 +63,13 @@ pub struct SourceDefinition {
     /// Stable hash of the definition. A snapshot recording a *different* value is always
     /// refused: its rows answer a different question.
     pub fingerprint: String,
+    /// Stable hash of the source selection alone — the part of the definition a
+    /// [`DefinitionMatch::SourceSelection`] consumer compares. Stamped next to
+    /// [`Self::fingerprint`] on every publish that has one, so the deployments following
+    /// this series can check it. `None` for a source no other deployment follows (a view).
+    pub selection_fingerprint: Option<String>,
+    /// Which of the recorded stamps a bootstrap of this source compares.
+    pub matched_on: DefinitionMatch,
     /// Whether a snapshot recording NO definition may still be restored.
     ///
     /// `false` where an unstamped archive cannot be shown to match the definition now
@@ -55,7 +80,10 @@ pub struct SourceDefinition {
     /// upgrade cost of refusing is a rebuild, not wrong rows.
     ///
     /// `true` only for a source that can prove those unstamped rows still answer
-    /// its current definition. Accepting them still refuses every *mismatch*.
+    /// its current definition, or — for a [`DefinitionMatch::SourceSelection`]
+    /// consumer — one that cannot rebuild from its source at all, so refusing a
+    /// series published before definitions were recorded would leave it unavailable
+    /// rather than rebuilt. Accepting them still refuses every *mismatch*.
     pub accept_unstamped: bool,
     /// What produced these rows. A fingerprint alone cannot answer this: every
     /// definition-bearing source has one, but only a query's rows need a compiled plan

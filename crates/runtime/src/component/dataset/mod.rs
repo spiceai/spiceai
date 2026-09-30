@@ -279,11 +279,31 @@ impl AccelerationSource for Dataset {
         // `Refresh.sql` without updating it; publication is then declined until
         // a refresh runs with SQL that still matches this definition (see
         // `Refresh::live_refresh_sql_matches_configured`).
+        //
+        // A `refresh_mode: snapshot` dataset follows a series another deployment
+        // publishes, so it compares the source selection alone: its own refresh mode and
+        // write policies never touch those rows, and its refresh mode always differs from
+        // the publisher's. It also accepts a series published before definitions were
+        // recorded — it cannot rebuild from its source, so refusing one would leave it
+        // unavailable rather than rebuilt — while still refusing every mismatch.
         let identity = crate::view::dataset_definition_identity_from_spec(&self.spec);
+        let selection = crate::view::dataset_selection_identity_from_spec(&self.spec);
+        let follows_published_series = self
+            .spec
+            .acceleration
+            .as_ref()
+            .and_then(|acceleration| acceleration.refresh_mode)
+            .is_some_and(|mode| mode.is_snapshot_only());
         Some(
             runtime_acceleration::acceleration_source::SourceDefinition {
                 fingerprint: crate::view::definition_fingerprint(&identity),
-                accept_unstamped: false,
+                selection_fingerprint: Some(crate::view::definition_fingerprint(&selection)),
+                matched_on: if follows_published_series {
+                    runtime_acceleration::acceleration_source::DefinitionMatch::SourceSelection
+                } else {
+                    runtime_acceleration::acceleration_source::DefinitionMatch::FullDefinition
+                },
+                accept_unstamped: follows_published_series,
                 materialization:
                     runtime_acceleration::acceleration_source::MaterializationSource::SourceTable,
             },
@@ -396,6 +416,161 @@ mod tests {
             definition.materialization,
             runtime_acceleration::acceleration_source::MaterializationSource::SourceTable
         );
+    }
+
+    /// The writer/reader pair of the `snapshot_refresh` integration tests: same source,
+    /// but the reader follows by `refresh_mode: snapshot` and declares a primary key and
+    /// `on_conflict` for its own write gate. The reader must match the writer's source
+    /// selection even though every full-definition field it adds differs.
+    #[tokio::test]
+    async fn snapshot_follower_matches_its_publisher_on_source_selection() {
+        let writer = create_accelerated_dataset(spicepod::acceleration::Acceleration {
+            enabled: true,
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+            ..Default::default()
+        })
+        .await;
+        let reader = create_accelerated_dataset(spicepod::acceleration::Acceleration {
+            enabled: true,
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
+            primary_key: Some("id".to_string()),
+            on_conflict: HashMap::from([(
+                "id".to_string(),
+                spicepod::acceleration::OnConflictBehavior::Upsert,
+            )]),
+            ..Default::default()
+        })
+        .await;
+        let filtered_reader = create_accelerated_dataset(spicepod::acceleration::Acceleration {
+            enabled: true,
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
+            refresh_sql: Some("SELECT * FROM orders WHERE region = 'us'".to_string()),
+            ..Default::default()
+        })
+        .await;
+        // A retention period with no refresh window is also the window a refresh reads,
+        // so a follower expecting a different retention expects different rows.
+        let retained_reader = create_accelerated_dataset(spicepod::acceleration::Acceleration {
+            enabled: true,
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
+            retention_period: Some("7d".to_string()),
+            retention_check_enabled: true,
+            ..Default::default()
+        })
+        .await;
+
+        let definition = |dataset: &Dataset| {
+            runtime_acceleration::acceleration_source::AccelerationSource::definition_fingerprint(
+                dataset,
+            )
+            .expect("every dataset stamps its snapshot identity")
+        };
+        let writer = definition(&writer);
+        let reader = definition(&reader);
+        let filtered_reader = definition(&filtered_reader);
+        let retained_reader = definition(&retained_reader);
+
+        assert_eq!(
+            writer.matched_on,
+            runtime_acceleration::acceleration_source::DefinitionMatch::FullDefinition,
+            "a dataset that refreshes its own rows restores only its own full definition"
+        );
+        assert!(!writer.accept_unstamped);
+        assert_eq!(
+            reader.matched_on,
+            runtime_acceleration::acceleration_source::DefinitionMatch::SourceSelection,
+            "a `refresh_mode: snapshot` dataset follows another deployment's series"
+        );
+        assert!(
+            reader.accept_unstamped,
+            "a follower cannot rebuild from its source, so a series published before definitions were recorded is still loaded"
+        );
+
+        assert_ne!(
+            writer.fingerprint, reader.fingerprint,
+            "the full definitions differ in refresh mode, primary key and on_conflict"
+        );
+        assert!(writer.selection_fingerprint.is_some());
+        assert_eq!(
+            writer.selection_fingerprint, reader.selection_fingerprint,
+            "refresh mode and write policies are the publisher's own; the source read is the same"
+        );
+        assert_ne!(
+            writer.selection_fingerprint, filtered_reader.selection_fingerprint,
+            "a follower whose refresh_sql reads different rows must not match the publisher"
+        );
+        assert_ne!(
+            writer.selection_fingerprint, retained_reader.selection_fingerprint,
+            "a follower whose retention keeps different rows must not match the publisher"
+        );
+    }
+
+    /// A refresh window filters on the time partition column too, so reading it as
+    /// seconds rather than milliseconds selects different rows: a follower must not match.
+    #[tokio::test]
+    async fn time_partition_format_is_part_of_the_source_selection() {
+        let partitioned = |format: spicepod::component::dataset::TimeFormat| {
+            let mut dataset = orders_dataset(spicepod::acceleration::Acceleration {
+                enabled: true,
+                refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
+                refresh_data_window: Some("1d".to_string()),
+                ..Default::default()
+            });
+            dataset.time_column = Some("created_at".to_string());
+            dataset.time_partition_column = Some("created_day".to_string());
+            dataset.time_partition_format = Some(format);
+            dataset
+        };
+        let seconds = dataset_from_spicepod(partitioned(
+            spicepod::component::dataset::TimeFormat::UnixSeconds,
+        ))
+        .await;
+        let millis = dataset_from_spicepod(partitioned(
+            spicepod::component::dataset::TimeFormat::UnixMillis,
+        ))
+        .await;
+
+        let selection = |dataset: &Dataset| {
+            runtime_acceleration::acceleration_source::AccelerationSource::definition_fingerprint(
+                dataset,
+            )
+            .expect("every dataset stamps its snapshot identity")
+            .selection_fingerprint
+        };
+        assert_ne!(selection(&seconds), selection(&millis));
+    }
+
+    fn orders_dataset(
+        acceleration: spicepod::acceleration::Acceleration,
+    ) -> spicepod::component::dataset::Dataset {
+        let mut spicepod_dataset = spicepod::component::dataset::Dataset::new(
+            "file://orders.csv".to_string(),
+            "orders".to_string(),
+        );
+        spicepod_dataset.acceleration = Some(acceleration);
+        spicepod_dataset
+    }
+
+    async fn create_accelerated_dataset(
+        acceleration: spicepod::acceleration::Acceleration,
+    ) -> Dataset {
+        dataset_from_spicepod(orders_dataset(acceleration)).await
+    }
+
+    async fn dataset_from_spicepod(
+        spicepod_dataset: spicepod::component::dataset::Dataset,
+    ) -> Dataset {
+        let app = AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let rt = crate::Runtime::builder().build().await;
+
+        DatasetBuilder::try_from(spicepod_dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("valid dataset")
     }
 
     async fn create_dataset_with_params(params: HashMap<String, String>) -> Dataset {

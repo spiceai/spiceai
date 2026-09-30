@@ -369,6 +369,11 @@ impl AccelerationSource for View {
                         &live,
                     ),
                 ),
+                // No other deployment follows a view's series: views have no
+                // `refresh_mode: snapshot`.
+                selection_fingerprint: None,
+                matched_on:
+                    runtime_acceleration::acceleration_source::DefinitionMatch::FullDefinition,
                 accept_unstamped: false,
                 materialization:
                     runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,

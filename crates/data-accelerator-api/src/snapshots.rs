@@ -28,7 +28,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use runtime_acceleration::BootstrapStatus;
 use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
 use runtime_acceleration::acceleration_source::{
-    AccelerationSource, MaterializationSource, SourceDefinition,
+    AccelerationSource, DefinitionMatch, MaterializationSource, SourceDefinition,
 };
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::{
@@ -482,11 +482,18 @@ fn pre_recreation_stamp_fingerprint(
 /// the local materialization, the archive must not be published: stamping the
 /// incoming definition would make a later cold start accept the old rows as
 /// current.
+///
+/// Only the outgoing *definition* is persisted, not its source selection, so the
+/// archive carries no selection stamp and the `refresh_mode: snapshot` datasets
+/// following the series refuse it rather than guess what it read. They pick up
+/// the next snapshot the publisher takes after rebuilding.
 fn outgoing_definition_for_pre_recreation(
     persisted_outgoing_fingerprint: Option<String>,
 ) -> Option<SourceDefinition> {
     Some(SourceDefinition {
         fingerprint: persisted_outgoing_fingerprint?,
+        selection_fingerprint: None,
+        matched_on: DefinitionMatch::FullDefinition,
         accept_unstamped: false,
         materialization: MaterializationSource::SourceTable,
     })
@@ -620,6 +627,11 @@ mod tests {
             !stamped.accept_unstamped,
             "a pre-recreation archive must still refuse a later unstamped bootstrap"
         );
+        assert!(
+            stamped.selection_fingerprint.is_none(),
+            "only the outgoing definition was persisted, so the archive must not vouch for a source selection a `refresh_mode: snapshot` follower would trust"
+        );
+        assert_eq!(stamped.matched_on, DefinitionMatch::FullDefinition);
     }
 
     #[test]
