@@ -158,6 +158,22 @@ impl KeyResolver {
         })
     }
 
+    /// The resolver a change stream applies: each change of a key supersedes the
+    /// one before it (under `drop` the first is kept), so no repeat is an error.
+    pub(crate) fn for_change_stream(self) -> Self {
+        let policy = match self.policy {
+            ConflictPolicy::KeepFirst => ConflictPolicy::KeepFirst,
+            ConflictPolicy::Upsert
+            | ConflictPolicy::UpsertDropIdentical
+            | ConflictPolicy::UpsertKeepLast => ConflictPolicy::UpsertKeepLast,
+        };
+        Self {
+            policy,
+            rows: None,
+            ..self
+        }
+    }
+
     pub(crate) fn policy(&self) -> ConflictPolicy {
         self.policy
     }
@@ -237,8 +253,8 @@ impl KeyResolver {
     /// Returns an error if a primary key is null, or the policy rejects a repeat.
     pub(crate) fn collapse_write(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         let resolved = batches
-            .iter()
-            .map(|batch| self.resolve_batch(batch))
+            .into_iter()
+            .map(|batch| self.resolve_batch(&batch))
             .collect::<Result<Vec<_>>>()?;
         // The (batch, row) each key keeps across the write.
         let rows: usize = resolved.iter().map(|batch| batch.digests.len()).sum();
@@ -427,7 +443,11 @@ mod tests {
     fn collapse_write_follows_the_documented_table() {
         let write = || vec![batch(&[(1, "a"), (2, "b"), (1, "a")]), batch(&[(1, "c")])];
         assert_eq!(
-            rows(&resolver(ConflictPolicy::KeepFirst).collapse_write(write()).expect("drop")),
+            rows(
+                &resolver(ConflictPolicy::KeepFirst)
+                    .collapse_write(write())
+                    .expect("drop")
+            ),
             owned(&[(1, "a"), (2, "b")])
         );
         resolver(ConflictPolicy::Upsert)
@@ -465,7 +485,9 @@ mod tests {
             .collapse_write(vec![batch(&[(1, "a"), (1, "b")])])
             .expect_err("different values under one key within a batch");
         assert!(
-            error.to_string().contains("uniqueness constraint on column(s): 'id'"),
+            error
+                .to_string()
+                .contains("uniqueness constraint on column(s): 'id'"),
             "{error}"
         );
     }
@@ -498,7 +520,10 @@ mod tests {
             let error = resolver(policy)
                 .resolve_batch(&nulls)
                 .expect_err("null key");
-            assert!(error.to_string().contains("'id' has null values"), "{policy:?}: {error}");
+            assert!(
+                error.to_string().contains("'id' has null values"),
+                "{policy:?}: {error}"
+            );
         }
     }
 

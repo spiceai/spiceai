@@ -545,6 +545,14 @@ impl CayenneTableProvider {
             ));
         }
 
+        let collapsed = self.collapse_buffered_write(buffer.batches().to_vec())?;
+        let mut resolved =
+            InlineBatchBuffer::new(stream.schema(), inline_max_rows, inline_max_buffer_bytes);
+        for batch in collapsed {
+            resolved.push(batch);
+        }
+        buffer = resolved;
+
         // A zero-row overwrite takes the normal path: it writes no files anyway,
         // and the commit's clear alone is the correct end state (an empty table).
         // An inline entry with no rows would just be a row to read back and drop.
