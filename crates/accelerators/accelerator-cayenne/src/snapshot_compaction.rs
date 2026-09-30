@@ -1058,6 +1058,175 @@ mod tests {
         );
     }
 
+    /// Every directory the capture references — the current snapshot and each
+    /// protected snapshot — survives the live table's own maintenance passes
+    /// while the rewrite runs: current-snapshot compaction, the
+    /// protected-snapshot fold, the seq-prefix bake, a mem-tier checkpoint and
+    /// an overwrite all retire directories through the sweep, which excludes
+    /// the pinned set. The compacted copy then holds exactly the captured rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn captured_snapshots_survive_live_maintenance_passes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = Node::new(&tmp.path().join("writer")).await;
+        let live = create_live_table(&writer).await;
+        // Several small base files and several upsert publishes, so both the
+        // current-snapshot compaction and the protected-snapshot passes have
+        // work to do.
+        for chunk in (1..=2000).collect::<Vec<i64>>().chunks(250) {
+            let rows: Vec<(i64, i64)> = chunk.iter().map(|id| (*id, id * 10)).collect();
+            insert(&live, &rows).await;
+        }
+        for round in 1..=4_i64 {
+            let upserts: Vec<(i64, i64)> = (1..=100).map(|id| (id, id * 1000 + round)).collect();
+            insert(&live, &upserts).await;
+        }
+        delete_where(&live, col("id").gt(lit(1900_i64))).await;
+        let expected = rows(&live).await;
+
+        let meta = writer.catalog.get_table(DATASET).await.expect("live meta");
+        let protected_at_capture = writer
+            .catalog
+            .get_all_snapshot_sequences(&meta.table_id)
+            .await
+            .expect("protected");
+        assert!(
+            !protected_at_capture.is_empty(),
+            "upserts must have published protected snapshots"
+        );
+        let table_dir = writer.data_dir.join(&meta.table_id);
+        let captured_dirs: Vec<PathBuf> = std::iter::once(meta.current_snapshot_id.clone())
+            .chain(protected_at_capture.keys().cloned())
+            .map(|id| table_dir.join(id))
+            .collect();
+        assert!(captured_dirs.iter().all(|d| d.is_dir()));
+
+        let engine = CayenneSnapshotEngine::new(
+            Arc::clone(&writer.catalog),
+            DATASET,
+            writer.data_dir.clone(),
+        )
+        .with_compaction(true);
+        let live_dyn: Arc<dyn TableProvider> = Arc::clone(&live) as Arc<dyn TableProvider>;
+        let plan = engine
+            .prepare_directory_snapshot(&writer.dirs(), DATASET, Some(&live_dyn))
+            .await
+            .expect("prepare");
+        let deferred = plan.deferred.expect("compaction defers the build");
+
+        // Live maintenance while the plan is alive. Each pass reports whether
+        // it did work; the protected set must have shrunk for the test to mean
+        // anything.
+        let folded = live
+            .compact_protected_snapshots_subset(32)
+            .await
+            .expect("protected fold");
+        let baked = live
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("seq-prefix bake");
+        let compacted = live
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("current-snapshot compaction");
+        insert(&live, &[(5000, 5)]).await;
+        live.checkpoint_mem_tier()
+            .await
+            .expect("mem-tier checkpoint");
+        {
+            let ctx = SessionContext::new();
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![batch(&[(7, 7), (8, 8)])]], schema(), None)
+                    .expect("memory exec");
+            let overwrite = live
+                .insert_into(&ctx.state(), input, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(overwrite, ctx.task_ctx()).await.expect("overwrite");
+        }
+        let protected_now = writer
+            .catalog
+            .get_all_snapshot_sequences(&meta.table_id)
+            .await
+            .expect("protected");
+        assert!(
+            protected_now.len() < protected_at_capture.len(),
+            "maintenance must have retired protected snapshots (fold={folded} bake={baked} compact={compacted}: {} -> {})",
+            protected_at_capture.len(),
+            protected_now.len()
+        );
+        // Past the sweep's 5 s grace (time itself is under test), with
+        // pointer-advancing commits scheduling sweeps.
+        for i in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let ctx = SessionContext::new();
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![batch(&[(9000 + i, i)])]], schema(), None)
+                    .expect("memory exec");
+            let overwrite = live
+                .insert_into(&ctx.state(), input, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(overwrite, ctx.task_ctx()).await.expect("overwrite");
+        }
+        live.drain_in_flight_maintenance().await.expect("drain");
+        let missing: Vec<&PathBuf> = captured_dirs.iter().filter(|d| !d.is_dir()).collect();
+        assert!(
+            missing.is_empty(),
+            "captured snapshot directories must survive live maintenance: missing {missing:?}"
+        );
+
+        let materialized = deferred.await.expect("materialize");
+        let reader = Node::new(&tmp.path().join("reader")).await;
+        let tar = tmp.path().join("snapshot.tar");
+        let skip: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = materialized
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        archive_directories_to_file_with_plan(&materialized.dirs, &tar, &skip, &extras)
+            .await
+            .expect("archive");
+        for dir in &materialized.cleanup_dirs {
+            tokio::fs::remove_dir_all(dir)
+                .await
+                .expect("cleanup scratch");
+        }
+        extract_archive_file_with_options(
+            &tar,
+            &tmp.path().join("reader"),
+            ExtractOptions {
+                prefix_mappings: Some(vec![
+                    ("metadata/".to_string(), reader.metadata_dir.clone()),
+                    ("data/".to_string(), reader.data_dir.clone()),
+                ]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .expect("extract");
+        CayenneSnapshotEngine::new(
+            Arc::clone(&reader.catalog),
+            DATASET,
+            reader.data_dir.clone(),
+        )
+        .finalize_directory_snapshot(&reader.dirs(), DATASET)
+        .await
+        .expect("import slice");
+        let ctx = SessionContext::new();
+        let restored = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&reader.catalog), ctx.runtime_env())
+                .open(DATASET)
+                .await
+                .expect("open reader table"),
+        );
+        assert_eq!(
+            rows(&restored).await,
+            expected,
+            "the compacted copy holds the rows captured before maintenance ran"
+        );
+    }
+
     #[test]
     fn scratch_vortex_config_forces_files_and_disables_maintenance() {
         let live = VortexConfig {
