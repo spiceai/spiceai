@@ -162,6 +162,8 @@ mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
+mod pushdown_roundtrip;
 #[cfg(feature = "rate-control")]
 mod rate_control;
 mod ready_state;
