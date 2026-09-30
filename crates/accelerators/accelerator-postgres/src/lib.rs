@@ -18,8 +18,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{
     PostgresTableProviderFactory, write::PostgresTableWriter,
@@ -134,7 +133,7 @@ impl DataAccelerator for PostgresAccelerator {
             }
         );
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
 
         // Validate and normalize pool_min and connection_pool_size
         let connection_pool_min_idle = match cmd.options.get("connection_pool_min") {
