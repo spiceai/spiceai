@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2024-2026 The Spice.ai OSS Authors
-"""CodeQL runs on the merge queue and trunk, and analyzes a trusted suite."""
+"""CodeQL runs on the merge queue and trunk, and publishes SARIF for the uploader."""
 
 from __future__ import annotations
 
@@ -41,11 +41,12 @@ class CodeQlWorkflowTest(unittest.TestCase):
         import yaml
 
         doc = yaml.safe_load(WORKFLOW.read_text())
+        # Extraction and query evaluation share one job. The spiceai-macos
+        # runners are persistent and all run merge-queue extractions, so a
+        # second job on that pool would add no isolation.
+        self.assertEqual(set(doc["jobs"]), {"analyze"})
         analyze = doc["jobs"]["analyze"]
         self.assertEqual(analyze["runs-on"], "spiceai-macos")
-        # Query evaluation stays on a fresh hosted VM. It does not check out
-        # the scanned tree.
-        self.assertEqual(doc["jobs"]["sarif"]["runs-on"], "ubuntu-24.04")
         self.assertEqual(
             analyze["env"]["HAS_SPICEIO_SECRET"],
             "${{ secrets.UNAS_SMB_PASS != '' }}",
@@ -65,18 +66,48 @@ class CodeQlWorkflowTest(unittest.TestCase):
         kill = next(step for step in analyze["steps"] if step["name"] == "Kill spiceio")
         self.assertIn("always()", kill["if"])
 
-    def test_produce_sarif_uses_the_cli_code_scanning_suite(self):
+    def test_analyze_publishes_sarif_for_the_uploader(self):
         import yaml
 
         doc = yaml.safe_load(WORKFLOW.read_text())
-        steps = doc["jobs"]["sarif"]["steps"]
-        script = next(step["run"] for step in steps if step["name"] == "Analyze imported database")
-        self.assertIn(
-            'suite="codeql/${lang}-queries:codeql-suites/${lang}-code-scanning.qls"',
-            script,
+        analyze = doc["jobs"]["analyze"]
+        steps = analyze["steps"]
+
+        # No query override, so init resolves the default code-scanning suite.
+        init = next(
+            step for step in steps if step.get("uses", "").startswith("github/codeql-action/init@")
         )
-        self.assertNotIn("config-queries.qls", script)
-        self.assertNotIn("relocate_database_tree", script)
+        self.assertFalse({"queries", "packs", "config", "config-file"} & set(init["with"]))
+
+        run = next(
+            step
+            for step in steps
+            if step.get("uses", "").startswith("github/codeql-action/analyze@")
+        )
+        self.assertNotIn("skip-queries", run["with"])
+        self.assertEqual(run["with"]["upload"], "never")
+        self.assertIs(run["with"]["upload-database"], False)
+        # The action passes `--threads` and `--ram` from init's CODEQL_THREADS
+        # and CODEQL_RAM. A bare `codeql database analyze` defaults to one
+        # thread and a heap this database runs out of.
+        self.assertFalse(any("database analyze" in step.get("run", "") for step in steps))
+
+        sarif = next(step for step in steps if step["name"] == "Upload SARIF artifact")
+        self.assertEqual(sarif["with"]["path"], run["with"]["output"])
+        self.assertEqual(sarif["with"]["name"], "codeql-sarif-${{ matrix.language }}")
+        self.assertEqual(sarif["with"]["if-no-files-found"], "error")
+
+        upload = yaml.safe_load(UPLOAD.read_text())
+        download = next(
+            step
+            for step in upload["jobs"]["upload"]["steps"]
+            if step["name"] == "Download SARIF artifact"
+        )
+        self.assertEqual(download["with"]["pattern"], "codeql-sarif-*")
+
+        # The token stays read-only. codeql-upload.yml is what publishes.
+        self.assertNotIn("security-events", doc["permissions"])
+        self.assertNotIn("security-events", analyze["permissions"])
 
 
 if __name__ == "__main__":

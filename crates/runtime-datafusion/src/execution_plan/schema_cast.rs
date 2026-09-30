@@ -107,6 +107,17 @@ impl SchemaCastScanExec {
         }
     }
 
+    /// The input column that output column `index` carries over unchanged, or
+    /// `None` where it is cast, ambiguous or absent from the input. See
+    /// [`Self::output_to_input_columns`].
+    #[must_use]
+    pub fn input_column(&self, index: usize) -> Option<usize> {
+        Self::output_to_input_columns(&self.input.schema(), &self.output_schema)
+            .get(index)
+            .copied()
+            .flatten()
+    }
+
     /// For each output column, the input column it is derived from, or `None`
     /// where no input column carries over unchanged.
     ///

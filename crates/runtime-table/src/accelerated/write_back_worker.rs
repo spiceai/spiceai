@@ -93,7 +93,7 @@ use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use opentelemetry::KeyValue;
 use parking_lot::Mutex;
@@ -408,8 +408,10 @@ impl WriteBackWorker {
         // provider's SHARED RuntimeEnv (object-store registrations for S3, memory
         // pool, caches) — a fresh `SessionContext::new()` would lose them and fail
         // object-store-backed scans.
-        let ctx =
-            SessionContext::new_with_config_rt(SessionConfig::new(), self.provider.runtime_env());
+        let ctx = SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            self.provider.runtime_env(),
+        );
         // `Arc<CayenneTableProvider>` coerces to the `Arc<dyn TableProvider>`
         // `read_table` expects at the call argument below.
         let accelerator = Arc::clone(&self.provider);
