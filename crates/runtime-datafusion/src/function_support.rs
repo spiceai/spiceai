@@ -199,10 +199,15 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
 /// A cast from a fractional value into an integer stays local too: `BigQuery`
 /// documents that it rounds one where `DataFusion` truncates
 /// ([`crate::dialect::integer_cast_is_renderable`]).
+///
+/// So does a cast `BigQuery` renders at a lower precision than `DataFusion`
+/// evaluates it — text into a nanosecond timestamp, or a decimal scale past
+/// `BIGNUMERIC` ([`crate::dialect::bigquery_cast_is_renderable`]).
 #[must_use]
 pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     !matches!(expr, Expr::Like(like) if like.case_insensitive)
         && crate::dialect::integer_cast_is_renderable(expr, schema)
+        && crate::dialect::bigquery_cast_is_renderable(expr, schema)
 }
 
 /// `SQLite`-flavored deny-list as a value, for

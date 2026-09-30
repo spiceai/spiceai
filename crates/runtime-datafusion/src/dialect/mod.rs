@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock};
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
@@ -334,6 +334,66 @@ fn operand_type(operand: &Expr, scope: &DFSchema) -> Option<DataType> {
         .field_with_unqualified_name(column.name())
         .ok()
         .map(|field| field.data_type().clone())
+}
+
+/// The widest fractional scale `BigQuery`'s `BIGNUMERIC` holds. A decimal
+/// scale past it is rounded away silently rather than refused.
+const BIGNUMERIC_MAX_SCALE: i8 = 38;
+
+/// Whether `BigQuery` renders this cast at the precision `DataFusion`
+/// evaluates it at.
+///
+/// Two targets it does not (issue #13887):
+///
+/// - a **nanosecond timestamp** — `DataFusion`'s default `TIMESTAMP`, so the
+///   ordinary spelling of `CAST(<text> AS TIMESTAMP)` — from **text**.
+///   `BigQuery` holds at most six sub-second digits, and the dialect strips the
+///   rest before parsing (`REGEXP_REPLACE(…, r'(\.\d{6})\d+', r'\1')`), so text
+///   carrying seven to nine digits parses to an earlier instant than the same
+///   cast evaluated locally, which is visible at an equality, a grouping key
+///   or a range boundary. A cast into a microsecond or coarser unit truncates
+///   the same digits on both sides and federates; so does a cast from a
+///   timestamp or a date, which has no digits to lose.
+/// - a **decimal scale past `BIGNUMERIC`'s 38**. The dialect renders every
+///   wide decimal as `BIGNUMERIC`, whose scale overflow `BigQuery` rounds away
+///   silently where an integer overflow it refuses outright; only `Decimal256`
+///   can name such a scale.
+///
+/// As with [`integer_cast_is_renderable`], a text-to-timestamp operand whose
+/// type cannot be read is refused rather than assumed harmless: the check must
+/// not admit a cast it cannot vouch for, and refusing costs only the pushdown.
+#[must_use]
+pub(crate) fn bigquery_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    match field.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let empty = DFSchema::empty();
+            operand_type(operand, scope.unwrap_or(&empty))
+                .is_some_and(|data_type| !is_string_type(&data_type))
+        }
+        DataType::Decimal256(_, scale) => *scale <= BIGNUMERIC_MAX_SCALE,
+        _ => true,
+    }
+}
+
+/// Whether values of `data_type` are text, looking through a dictionary
+/// encoding of them.
+fn is_string_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
+        DataType::Dictionary(_, value) => is_string_type(value),
+        _ => false,
+    }
 }
 
 /// Names of the functions [`new_bigquery_dialect`] rewrites to native
