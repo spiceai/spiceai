@@ -38,11 +38,15 @@ use datafusion::sql::unparser::Unparser;
 use tracing::Level;
 
 use crate::error::find_datafusion_root;
-use crate::refresh_sql::RefreshSQLDistinctOn;
+use crate::refresh_sql::RefreshSQL;
+use datafusion::sql::planner::NullOrdering;
 
 /// Gets data from a table provider and returns it as a stream of `RecordBatch`es.
 ///
 /// # Errors
+///
+/// `refresh_sql` contributes its scan SQL, its partition filters and its
+/// `DISTINCT ON`; `filters` are the refresh's own (such as the append window).
 ///
 /// Returns a `DataFusionError` if the scan cannot be planned — an invalid
 /// refresh `sql`, a projection the source schema cannot satisfy, an
@@ -51,11 +55,13 @@ pub async fn get_data(
     ctx: &mut SessionContext,
     table_name: TableReference,
     table_provider: Arc<dyn TableProvider>,
-    sql: Option<String>,
-    filters: Vec<Expr>,
-    distinct_on: Option<&RefreshSQLDistinctOn>,
+    refresh_sql: Option<&RefreshSQL>,
+    mut filters: Vec<Expr>,
 ) -> Result<SendableRecordBatchStream, DataFusionError> {
-    let mut df = match sql {
+    if let Some(refresh_sql) = refresh_sql {
+        refresh_sql.extend_effective_partition_filters(&mut filters);
+    }
+    let mut df = match refresh_sql.map(RefreshSQL::to_scan_sql) {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
 
@@ -95,21 +101,16 @@ pub async fn get_data(
     // DISTINCT ON goes above the refresh filters, so it selects among the rows this
     // refresh reads (the append window, this node's partitions) rather than the
     // whole source.
-    if let Some(distinct_on) = distinct_on {
-        let on_expr = distinct_on.on.iter().map(|c| ident(&c.value)).collect();
-        let select_expr = df
-            .schema()
-            .columns()
-            .into_iter()
-            .map(Expr::Column)
-            .collect();
-        let sort_expr = distinct_on
-            .order_by
-            .iter()
-            .map(|o| ident(&o.column.value).sort(o.is_ascending(), o.sorts_nulls_first()))
-            .collect();
-        df = df
-            .distinct_on(on_expr, select_expr, Some(sort_expr))
+    if let Some(distinct_on) = refresh_sql.and_then(RefreshSQL::distinct_on) {
+        let null_ordering = NullOrdering::from(
+            ctx.state()
+                .config_options()
+                .sql_parser
+                .default_null_ordering
+                .as_str(),
+        );
+        df = distinct_on
+            .apply(df, null_ordering)
             .map_err(find_datafusion_root)?;
     }
 
@@ -175,12 +176,13 @@ mod tests {
     use crate::refresh_sql::parse_refresh_sql;
     use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::assert_batches_sorted_eq;
     use datafusion::catalog::MemTable;
     use datafusion::logical_expr::{col, lit};
     use futures::TryStreamExt;
 
-    async fn latest_rows(refresh_sql: &str, filters: Vec<Expr>) -> String {
+    /// `events`: key 1 has an older and a newer row, key 2 a real and a NULL time.
+    fn events() -> (SessionContext, Arc<dyn TableProvider>, Arc<Schema>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("occurred_at", DataType::Int64, true),
@@ -198,60 +200,65 @@ mod tests {
         let provider: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("valid table"),
         );
-        let mut ctx = SessionContext::new();
+        let ctx = SessionContext::new();
         ctx.register_table("events", Arc::clone(&provider))
             .expect("register table");
+        (ctx, provider, schema)
+    }
 
+    async fn scan(refresh_sql: &str, filters: Vec<Expr>) -> Vec<RecordBatch> {
+        let (mut ctx, provider, schema) = events();
         let table = TableReference::parse_str("events");
         let (parsed, _) =
             parse_refresh_sql(table.clone(), refresh_sql, schema).expect("valid refresh SQL");
-        let stream = get_data(
-            &mut ctx,
-            table,
-            provider,
-            Some(parsed.to_scan_sql()),
-            filters,
-            parsed.distinct_on(),
-        )
-        .await
-        .expect("refresh scan plans");
-        let mut batches: Vec<RecordBatch> = stream.try_collect().await.expect("scan runs");
-        batches.retain(|b| b.num_rows() > 0);
-        let sorted =
-            arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat");
-        let order = arrow::compute::sort_to_indices(sorted.column(0), None, None).expect("sort");
-        let sorted = arrow::compute::take_record_batch(&sorted, &order).expect("take");
-        pretty_format_batches(&[sorted])
-            .expect("format")
-            .to_string()
+        get_data(&mut ctx, table, provider, Some(&parsed), filters)
+            .await
+            .expect("refresh scan plans")
+            .try_collect()
+            .await
+            .expect("scan runs")
     }
 
     #[tokio::test]
     async fn distinct_on_keeps_the_latest_row_per_key() {
-        let out = latest_rows(
+        let batches = scan(
             "SELECT DISTINCT ON (id) * FROM events ORDER BY id, occurred_at DESC NULLS LAST",
             vec![],
         )
         .await;
-        assert!(out.contains("| 1  | 10          | new  |"), "{out}");
-        assert!(out.contains("| 2  | 5           | only |"), "{out}");
-        assert_eq!(
-            out.lines().filter(|l| l.starts_with("| ")).count(),
-            3,
-            "{out}"
+        assert_batches_sorted_eq!(
+            [
+                "+----+-------------+------+",
+                "| id | occurred_at | v    |",
+                "+----+-------------+------+",
+                "| 1  | 10          | new  |",
+                "| 2  | 5           | only |",
+                "+----+-------------+------+",
+            ],
+            &batches
         );
     }
 
     // `DESC` with no NULLS clause sorts NULLs first, so the NULL-time row is kept;
-    // this is what the registration-time info message warns about.
+    // this is what the load-time info message warns about.
     #[tokio::test]
     async fn distinct_on_desc_without_nulls_clause_keeps_the_null_row() {
-        let out = latest_rows(
+        let batches = scan(
             "SELECT DISTINCT ON (id) * FROM events ORDER BY id, occurred_at DESC",
             vec![],
         )
         .await;
-        assert!(out.contains("null-time"), "{out}");
+        assert_batches_sorted_eq!(
+            [
+                "+----+-------------+-----------+",
+                "| id | occurred_at | v         |",
+                "+----+-------------+-----------+",
+                "| 1  | 10          | new       |",
+                "| 2  |             | null-time |",
+                "+----+-------------+-----------+",
+            ],
+            &batches
+        );
     }
 
     // The refresh's own filters (the append window, partitions) must apply before
@@ -259,11 +266,44 @@ mod tests {
     // row is outside the filter.
     #[tokio::test]
     async fn distinct_on_runs_after_the_refresh_filters() {
-        let out = latest_rows(
+        let batches = scan(
             "SELECT DISTINCT ON (id) * FROM events ORDER BY id, occurred_at DESC NULLS LAST",
             vec![col("occurred_at").lt(lit(9_i64))],
         )
         .await;
-        assert!(out.contains("| 1  | 8           | old  |"), "{out}");
+        assert_batches_sorted_eq!(
+            [
+                "+----+-------------+------+",
+                "| id | occurred_at | v    |",
+                "+----+-------------+------+",
+                "| 1  | 8           | old  |",
+                "| 2  | 5           | only |",
+                "+----+-------------+------+",
+            ],
+            &batches
+        );
+    }
+
+    // The selection is one grouped aggregate; nothing sorts the kept rows afterwards.
+    #[tokio::test]
+    async fn distinct_on_plans_no_sort() {
+        let (ctx, _, schema) = events();
+        let (parsed, _) = parse_refresh_sql(
+            TableReference::parse_str("events"),
+            "SELECT DISTINCT ON (id) * FROM events ORDER BY id, occurred_at DESC NULLS LAST",
+            schema,
+        )
+        .expect("valid refresh SQL");
+        let df = parsed
+            .distinct_on()
+            .expect("DISTINCT ON is parsed")
+            .apply(
+                ctx.table("events").await.expect("table"),
+                NullOrdering::NullsMax,
+            )
+            .expect("plans");
+        let plan = df.logical_plan().display_indent().to_string();
+        assert!(plan.contains("Aggregate: groupBy=[[events.id]]"), "{plan}");
+        assert!(!plan.contains("Sort:"), "{plan}");
     }
 }

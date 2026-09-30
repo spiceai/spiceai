@@ -558,6 +558,9 @@ impl Error {
     /// is the conservative one.
     #[must_use]
     pub(crate) fn is_retriable(&self) -> bool {
+        if let Self::UnableToBuildAcceleratedTable { source, .. } = self {
+            return source.is_retriable();
+        }
         !matches!(
             self,
             // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
@@ -582,14 +585,6 @@ impl Error {
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
                 | Self::SnapshotCreationBatchesShouldBePositive
-                // A `refresh_sql` the refresh cannot honor (e.g. `DISTINCT ON`
-                // without a matching primary key), found when the table is built.
-                | Self::UnableToBuildAcceleratedTable {
-                    source: AcceleratedTableBuilderError::AcceleratedTableError {
-                        source: accelerated::Error::InvalidRefreshSql { .. }
-                    },
-                    ..
-                }
         )
     }
 }

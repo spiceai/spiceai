@@ -22,10 +22,14 @@ use arrow_schema::SchemaRef;
 use arrow_tools::metadata_keys::INFERRED_INDEXES_METADATA_KEY;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
+use datafusion::functions_aggregate::first_last::first_value_udaf;
+use datafusion::logical_expr::{ExprFunctionExt, SortExpr, ident};
 use datafusion::sql::parser::{DFParser, Statement};
+use datafusion::sql::planner::NullOrdering;
 use datafusion::sql::sqlparser::ast::{
-    Distinct, Expr, GroupByExpr, OrderByKind, SelectItem, SetExpr,
+    Distinct, Expr, GroupByExpr, OrderByKind, OrderByOptions, SelectItem, SetExpr,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
@@ -43,46 +47,36 @@ pub enum RefreshSQLColumns {
     Named(Vec<sqlparser::ast::Ident>),
 }
 
-/// One `ORDER BY` column of a `DISTINCT ON` refresh SQL, keeping the user's
-/// explicit direction and NULL ordering (`None` when omitted).
+/// One `ORDER BY` column of a `DISTINCT ON` refresh SQL, with the user's direction
+/// and NULL ordering as written (unset when omitted).
 #[derive(Clone, Debug)]
 pub struct RefreshSQLOrderBy {
     pub column: sqlparser::ast::Ident,
-    /// `Some(true)` for `ASC`, `Some(false)` for `DESC`.
-    pub asc: Option<bool>,
-    /// `Some(true)` for `NULLS FIRST`, `Some(false)` for `NULLS LAST`.
-    pub nulls_first: Option<bool>,
+    pub options: OrderByOptions,
 }
 
 impl RefreshSQLOrderBy {
     /// Whether the column sorts ascending (`ASC` is the default).
     #[must_use]
     pub fn is_ascending(&self) -> bool {
-        self.asc.unwrap_or(true)
+        self.options.asc.unwrap_or(true)
     }
 
-    /// Whether NULLs sort first. An omitted `NULLS` clause follows `DataFusion`'s
-    /// default, which treats NULL as the largest value: first when descending,
-    /// last when ascending.
-    #[must_use]
-    pub fn sorts_nulls_first(&self) -> bool {
-        self.nulls_first.unwrap_or(!self.is_ascending())
+    /// The sort for this column, resolving an omitted `NULLS` clause the way SQL
+    /// planning does, with the session's `default_null_ordering`.
+    fn sort_expr(&self, null_ordering: NullOrdering) -> SortExpr {
+        let asc = self.is_ascending();
+        let nulls_first = self
+            .options
+            .nulls_first
+            .unwrap_or_else(|| null_ordering.nulls_first(asc));
+        ident(&self.column.value).sort(asc, nulls_first)
     }
 }
 
 impl std::fmt::Display for RefreshSQLOrderBy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.column)?;
-        match self.asc {
-            Some(true) => write!(f, " ASC")?,
-            Some(false) => write!(f, " DESC")?,
-            None => {}
-        }
-        match self.nulls_first {
-            Some(true) => write!(f, " NULLS FIRST"),
-            Some(false) => write!(f, " NULLS LAST"),
-            None => Ok(()),
-        }
+        write!(f, "{}{}", self.column, self.options)
     }
 }
 
@@ -99,9 +93,46 @@ pub struct RefreshSQLDistinctOn {
 impl RefreshSQLDistinctOn {
     /// The `ORDER BY` columns after the `DISTINCT ON` columns: the ones that
     /// decide which row of each key is kept.
-    #[must_use]
-    pub fn selecting_columns(&self) -> &[RefreshSQLOrderBy] {
+    pub(crate) fn selecting_columns(&self) -> &[RefreshSQLOrderBy] {
         self.order_by.get(self.on.len()..).unwrap_or_default()
+    }
+
+    /// Keep the first row per `on` value of `df`, by the selecting columns.
+    ///
+    /// Planned directly as a grouped aggregate with an ordered `first_value` per
+    /// non-key column, the plan `DataFusion` rewrites `DISTINCT ON` into, but without
+    /// the sort on the key it adds above that aggregate to order the output. A refresh
+    /// writes rows in any order, and that sort would buffer every kept row a second time.
+    pub(crate) fn apply(
+        &self,
+        df: DataFrame,
+        null_ordering: NullOrdering,
+    ) -> datafusion::error::Result<DataFrame> {
+        let order_by: Vec<SortExpr> = self
+            .selecting_columns()
+            .iter()
+            .map(|o| o.sort_expr(null_ordering))
+            .collect();
+        let keys: Vec<&str> = self.on.iter().map(|c| c.value.as_str()).collect();
+        let columns: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let first_values = columns
+            .iter()
+            .filter(|name| !keys.contains(&name.as_str()))
+            .map(|name| {
+                first_value_udaf()
+                    .call(vec![ident(name)])
+                    .order_by(order_by.clone())
+                    .build()
+                    .map(|e| e.alias(name))
+            })
+            .collect::<datafusion::error::Result<Vec<_>>>()?;
+        df.aggregate(keys.iter().map(|k| ident(*k)).collect(), first_values)?
+            .select(columns.iter().map(ident))
     }
 }
 
@@ -181,7 +212,7 @@ impl RefreshSQL {
     /// rows the refresh reads. Planning `DISTINCT ON` in the SQL would leave those
     /// filters above it, where they cannot be pushed below the aggregate it becomes.
     #[must_use]
-    pub fn to_scan_sql(&self) -> String {
+    pub(crate) fn to_scan_sql(&self) -> String {
         self.render(false)
     }
 
@@ -288,48 +319,33 @@ impl RefreshSQL {
     ///
     /// # Errors
     ///
-    /// Returns an error if the refresh SQL uses `DISTINCT ON` and the dataset has no
-    /// primary key, or its `DISTINCT ON` columns differ from the primary key.
-    pub fn validate_distinct_on_primary_key<S: AsRef<str>>(
-        &self,
-        primary_key: Option<&[S]>,
-    ) -> Result<()> {
+    /// Returns an error if the refresh SQL uses `DISTINCT ON` and `primary_key` is
+    /// empty, or its `DISTINCT ON` columns differ from it.
+    pub fn validate_distinct_on_primary_key<S: AsRef<str>>(&self, primary_key: &[S]) -> Result<()> {
         let Some(distinct_on) = &self.distinct_on else {
             return Ok(());
         };
-        let on = distinct_on
+        let on: Vec<&str> = distinct_on
             .on
             .iter()
             .map(|i| i.value.as_str())
             .sorted()
-            .join(", ");
-        let Some(primary_key) = primary_key.filter(|pk| !pk.is_empty()) else {
-            return DistinctOnRequiresPrimaryKeySnafu { distinct_on: on }.fail();
-        };
-        let pk = primary_key.iter().map(AsRef::as_ref).sorted().join(", ");
+            .collect();
+        if primary_key.is_empty() {
+            return DistinctOnRequiresPrimaryKeySnafu {
+                distinct_on: on.join(", "),
+            }
+            .fail();
+        }
+        let pk: Vec<&str> = primary_key.iter().map(AsRef::as_ref).sorted().collect();
         ensure!(
             on == pk,
             DistinctOnPrimaryKeyMismatchSnafu {
-                distinct_on: on,
-                primary_key: pk,
+                distinct_on: on.join(", "),
+                primary_key: pk.join(", "),
             }
         );
         Ok(())
-    }
-
-    /// Reject `DISTINCT ON` where the refresh never reads the source through the
-    /// refresh scan, so it would be silently ignored. `unsupported_reason` is `None`
-    /// when this refresh does read the source, otherwise the cause clause of the error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the refresh SQL uses `DISTINCT ON` and `unsupported_reason`
-    /// is set.
-    pub fn ensure_distinct_on_supported(&self, unsupported_reason: Option<String>) -> Result<()> {
-        match (&self.distinct_on, unsupported_reason) {
-            (Some(_), Some(reason)) => DistinctOnNotSupportedSnafu { reason }.fail(),
-            _ => Ok(()),
-        }
     }
 
     /// Info messages for `DISTINCT ON` ordering columns sorted descending with no
@@ -343,7 +359,7 @@ impl RefreshSQL {
         distinct_on
             .selecting_columns()
             .iter()
-            .filter(|o| o.asc == Some(false) && o.nulls_first.is_none())
+            .filter(|o| o.options.asc == Some(false) && o.options.nulls_first.is_none())
             .map(|o| distinct_on_nulls_first_notice(dataset, &o.column.value))
             .collect()
     }
@@ -352,7 +368,7 @@ impl RefreshSQL {
 /// The info message for a `DISTINCT ON` ordering column sorted `DESC` without a
 /// `NULLS` clause.
 #[must_use]
-pub fn distinct_on_nulls_first_notice(dataset: &TableReference, column: &str) -> String {
+pub(crate) fn distinct_on_nulls_first_notice(dataset: &TableReference, column: &str) -> String {
     format!(
         "Dataset '{dataset}' 'acceleration.refresh_sql' keeps one row per key ordered by '{column}' DESC with no NULLS clause, so NULLs sort first and a row whose '{column}' is NULL is kept over rows with a value. Add NULLS LAST to keep the latest row with a value, or NULLS FIRST to keep this behavior without this message. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationrefresh_sql"
     )
@@ -427,7 +443,15 @@ pub enum Error {
     #[snafu(display(
         "The refresh SQL uses DISTINCT ON, which selects among the rows a refresh reads from the source, but {reason}. Remove DISTINCT ON and ORDER BY from 'acceleration.refresh_sql', or use 'acceleration.refresh_mode: full' or 'append'. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationrefresh_sql"
     ))]
-    DistinctOnNotSupported { reason: String },
+    DistinctOnNotSupported { reason: &'static str },
+}
+
+/// The error for a `DISTINCT ON` refresh SQL on a refresh that never reads the source
+/// through the refresh scan, where it would be silently ignored. `reason` is the cause
+/// clause of the message.
+#[must_use]
+pub fn distinct_on_not_supported(reason: &'static str) -> Error {
+    Error::DistinctOnNotSupported { reason }
 }
 
 macro_rules! ensure_no_expr {
@@ -729,8 +753,7 @@ fn parse_distinct_on(
             );
             Ok(RefreshSQLOrderBy {
                 column: column(&o.expr, "ORDER BY")?,
-                asc: o.options.asc,
-                nulls_first: o.options.nulls_first,
+                options: o.options,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1204,7 +1227,10 @@ mod tests {
         assert_eq!(distinct_on.on.len(), 1);
         assert_eq!(distinct_on.selecting_columns().len(), 1);
         assert!(!distinct_on.selecting_columns()[0].is_ascending());
-        assert!(!distinct_on.selecting_columns()[0].sorts_nulls_first());
+        assert_eq!(
+            distinct_on.selecting_columns()[0].options.nulls_first,
+            Some(false)
+        );
         Ok(())
     }
 
@@ -1213,7 +1239,7 @@ mod tests {
         let refresh_sql = parse_events(
             "SELECT DISTINCT ON (id, region) id, region, occurred_at, v FROM events ORDER BY region, id, occurred_at DESC",
         )?;
-        refresh_sql.validate_distinct_on_primary_key(Some(&["region", "id"][..]))?;
+        refresh_sql.validate_distinct_on_primary_key(&["region", "id"])?;
         Ok(())
     }
 
@@ -1286,22 +1312,21 @@ mod tests {
     fn test_distinct_on_must_match_primary_key() -> Result<()> {
         let refresh_sql =
             parse_events("SELECT DISTINCT ON (id) * FROM events ORDER BY id, occurred_at DESC")?;
-        let none: Option<&[&str]> = None;
         let missing = refresh_sql
-            .validate_distinct_on_primary_key(none)
+            .validate_distinct_on_primary_key::<&str>(&[])
             .expect_err("DISTINCT ON without a primary key is rejected");
         assert_eq!(
             missing.to_string(),
             "The refresh SQL keeps one row per (id) with DISTINCT ON, but the dataset has no 'acceleration.primary_key', so rows cannot be matched to the ones already loaded. Set 'acceleration.primary_key' to the DISTINCT ON columns. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationrefresh_sql"
         );
         let mismatch = refresh_sql
-            .validate_distinct_on_primary_key(Some(&["id", "region"][..]))
+            .validate_distinct_on_primary_key(&["id", "region"])
             .expect_err("DISTINCT ON columns that differ from the primary key are rejected");
         assert!(matches!(
             mismatch,
             Error::DistinctOnPrimaryKeyMismatch { .. }
         ));
-        refresh_sql.validate_distinct_on_primary_key(Some(&["id"][..]))?;
+        refresh_sql.validate_distinct_on_primary_key(&["id"])?;
         Ok(())
     }
 

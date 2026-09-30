@@ -25,7 +25,7 @@ limitations under the License.
 //! the exact rows the acceleration holds after each.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,6 +194,35 @@ impl Case<'_> {
     }
 }
 
+/// Write `files` (`name`, rows) as Parquet into a fresh `source/` directory.
+async fn write_source(
+    files: &[(&str, &[Row])],
+) -> Result<(tempfile::TempDir, PathBuf), anyhow::Error> {
+    let temp = tempfile::tempdir()?;
+    let source_dir = temp.path().join("source");
+    std::fs::create_dir_all(&source_dir)?;
+    for (name, rows) in files {
+        write_parquet(&source_dir.join(name), rows).await?;
+    }
+    Ok((temp, source_dir))
+}
+
+/// Load `case` over `files` and wait for it to be ready. The returned directory
+/// holds the source files and the acceleration, so keep it alive for the test.
+async fn load(
+    case: &Case<'_>,
+    files: &[(&str, &[Row])],
+) -> Result<(tempfile::TempDir, PathBuf, Arc<Runtime>), anyhow::Error> {
+    let (temp, source_dir) = write_source(files).await?;
+    let rt = start(
+        case.dataset(&source_dir, &temp.path().join("accelerator")),
+        "refresh_sql_distinct_on",
+    )
+    .await?;
+    runtime_ready_check(&rt).await;
+    Ok((temp, source_dir, rt))
+}
+
 async fn start(dataset: Dataset, app_name: &str) -> Result<Arc<Runtime>, anyhow::Error> {
     crate::configure_test_datafusion();
     let app = AppBuilder::new(app_name).with_dataset(dataset).build();
@@ -234,18 +263,8 @@ fn rows(expected: &[(i64, &str)]) -> Vec<(i64, String)> {
 /// Run both refreshes for one case and check the stored rows after each.
 async fn run_case(case: &Case<'_>) -> Result<(), anyhow::Error> {
     let label = case.label();
-    let temp = tempfile::tempdir()?;
-    let source_dir = temp.path().join("source");
-    std::fs::create_dir_all(&source_dir)?;
-    write_parquet(&source_dir.join("a.parquet"), FILE_A).await?;
-    write_parquet(&source_dir.join("b.parquet"), FILE_B).await?;
-
-    let rt = start(
-        case.dataset(&source_dir, &temp.path().join("accelerator")),
-        "refresh_sql_distinct_on",
-    )
-    .await?;
-    runtime_ready_check(&rt).await;
+    let (_temp, source_dir, rt) =
+        load(case, &[("a.parquet", FILE_A), ("b.parquet", FILE_B)]).await?;
 
     let first = rows(&[
         (1, "id1-eu-jan11"),
@@ -353,17 +372,8 @@ async fn distinct_on_with_filter_and_projection() -> Result<(), anyhow::Error> {
                     refresh_sql: "SELECT DISTINCT ON (id) id, occurred_at, v FROM events \
                          WHERE region = 'us' ORDER BY id, occurred_at DESC NULLS LAST",
                 };
-                let temp = tempfile::tempdir()?;
-                let source_dir = temp.path().join("source");
-                std::fs::create_dir_all(&source_dir)?;
-                write_parquet(&source_dir.join("a.parquet"), FILE_A).await?;
-                write_parquet(&source_dir.join("b.parquet"), FILE_B).await?;
-                let rt = start(
-                    case.dataset(&source_dir, &temp.path().join("accelerator")),
-                    "refresh_sql_distinct_on_filter",
-                )
-                .await?;
-                runtime_ready_check(&rt).await;
+                let (_temp, _, rt) =
+                    load(&case, &[("a.parquet", FILE_A), ("b.parquet", FILE_B)]).await?;
 
                 assert_eq!(
                     stored(&rt).await?,
@@ -413,26 +423,15 @@ async fn distinct_on_breaks_ties_with_order_by() -> Result<(), anyhow::Error> {
                         on_conflict: OnConflictBehavior::Upsert,
                         refresh_sql: &refresh_sql,
                     };
-                    let temp = tempfile::tempdir()?;
-                    let source_dir = temp.path().join("source");
-                    std::fs::create_dir_all(&source_dir)?;
                     // The tied rows are in different files, so read order cannot decide.
-                    write_parquet(
-                        &source_dir.join("a.parquet"),
-                        &[(7, "us", Some(6), 1, "tie-seq1")],
+                    let (_temp, _, rt) = load(
+                        &case,
+                        &[
+                            ("a.parquet", &[(7, "us", Some(6), 1, "tie-seq1")]),
+                            ("b.parquet", &[(7, "us", Some(6), 2, "tie-seq2")]),
+                        ],
                     )
                     .await?;
-                    write_parquet(
-                        &source_dir.join("b.parquet"),
-                        &[(7, "us", Some(6), 2, "tie-seq2")],
-                    )
-                    .await?;
-                    let rt = start(
-                        case.dataset(&source_dir, &temp.path().join("accelerator")),
-                        "refresh_sql_distinct_on_ties",
-                    )
-                    .await?;
-                    runtime_ready_check(&rt).await;
                     assert_eq!(
                         stored(&rt).await?,
                         rows(&[(7, expected)]),
@@ -453,10 +452,7 @@ async fn distinct_on_without_primary_key_is_refused() -> Result<(), anyhow::Erro
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
     test_request_context()
         .scope(async {
-            let temp = tempfile::tempdir()?;
-            let source_dir = temp.path().join("source");
-            std::fs::create_dir_all(&source_dir)?;
-            write_parquet(&source_dir.join("a.parquet"), FILE_A).await?;
+            let (temp, source_dir) = write_source(&[("a.parquet", FILE_A)]).await?;
             let mut dataset = Case {
                 engine: Engine::DuckDb,
                 refresh_mode: RefreshMode::Full,
@@ -468,20 +464,9 @@ async fn distinct_on_without_primary_key_is_refused() -> Result<(), anyhow::Erro
                 acceleration.primary_key = None;
                 acceleration.on_conflict = HashMap::new();
             }
-            crate::configure_test_datafusion();
-            let app = AppBuilder::new("refresh_sql_distinct_on_no_pk")
-                .with_dataset(dataset)
-                .build();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             // The dataset is refused, so loading finishes with it in an error state
-            // rather than retrying; a timeout here means it is being retried.
-            tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "loading kept retrying the refused dataset instead of failing it"
-                    )
-                })?;
+            // rather than retrying; `start` timing out means it is being retried.
+            let rt = start(dataset, "refresh_sql_distinct_on_no_pk").await?;
             assert!(
                 runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(10))
                     .await

@@ -235,49 +235,71 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// must read the source through the refresh scan (`full`, or `append` polled from a
 /// time column or primary key) and the `DISTINCT ON` columns must be the accelerator's
 /// primary key. Called wherever a refresh SQL is installed — table build, a runtime
-/// update, and a per-refresh override — so none of them can run a `DISTINCT ON` that
-/// is silently ignored or keeps several rows per key.
+/// update — and on every refresh, whose overrides can change the SQL or the mode, so
+/// none of them can run a `DISTINCT ON` that is silently ignored or keeps several rows
+/// per key.
 ///
 /// # Errors
 ///
-/// Returns the refresh SQL error describing the first check that fails.
+/// Returns [`Error::InvalidRefreshSql`] describing the first check that fails.
 pub(crate) fn validate_refresh_sql_distinct_on(
     refresh_sql: &refresh::RefreshSQL,
     accelerator: &Arc<dyn TableProvider>,
     mode: RefreshMode,
     streams_appends: bool,
-) -> std::result::Result<(), runtime_datafusion::refresh_sql::Error> {
+) -> Result<()> {
     if refresh_sql.distinct_on().is_none() {
         return Ok(());
     }
     let unsupported_reason = match mode {
         RefreshMode::Append if streams_appends => Some(
-            "this dataset's source streams appended rows instead of being read on each refresh"
-                .to_string(),
+            "this dataset's source streams appended rows instead of being read on each refresh",
         ),
         RefreshMode::Full | RefreshMode::Append => None,
         RefreshMode::Changes => Some(
-            "'acceleration.refresh_mode: changes' applies the source's change stream instead of reading the source"
-                .to_string(),
+            "'acceleration.refresh_mode: changes' applies the source's change stream instead of reading the source",
         ),
         RefreshMode::Caching => Some(
-            "'acceleration.refresh_mode: caching' stores the results of individual queries instead of reading the source"
-                .to_string(),
+            "'acceleration.refresh_mode: caching' stores the results of individual queries instead of reading the source",
         ),
         RefreshMode::Snapshot => Some(
-            "'acceleration.refresh_mode: snapshot' loads snapshots instead of reading the source"
-                .to_string(),
+            "'acceleration.refresh_mode: snapshot' loads snapshots instead of reading the source",
         ),
-        RefreshMode::Disabled => Some("refresh is disabled for this dataset".to_string()),
+        RefreshMode::Disabled => Some("refresh is disabled for this dataset"),
     };
-    refresh_sql.ensure_distinct_on_supported(unsupported_reason)?;
+    let result = match unsupported_reason {
+        Some(reason) => Err(runtime_datafusion::refresh_sql::distinct_on_not_supported(
+            reason,
+        )),
+        None => {
+            refresh_sql.validate_distinct_on_primary_key(&accelerator_primary_keys(accelerator))
+        }
+    };
+    result.map_err(|source| Error::InvalidRefreshSql {
+        source: Box::new(source),
+    })
+}
+
+/// Log the load-time notices for a refresh SQL being installed, such as a
+/// `DISTINCT ON` ordering column that keeps NULLs first.
+pub(crate) fn log_refresh_sql_notices(
+    dataset_name: &TableReference,
+    refresh_sql: &refresh::RefreshSQL,
+) {
+    for notice in refresh_sql.null_ordering_notices(dataset_name) {
+        tracing::info!("{notice}");
+    }
+}
+
+/// The accelerator's primary-key columns, from its declared constraints; empty when
+/// it has none.
+fn accelerator_primary_keys(accelerator: &Arc<dyn TableProvider>) -> Vec<String> {
     let schema = accelerator.schema();
-    let primary_key = accelerator
+    accelerator
         .constraints()
         .map_or_else(Vec::new, |constraints| {
             get_primary_keys_from_constraints(constraints, &schema)
-        });
-    refresh_sql.validate_distinct_on_primary_key(Some(primary_key.as_slice()))
+        })
 }
 
 #[derive(Debug, Snafu)]
@@ -334,6 +356,20 @@ pub enum AcceleratedTableBuilderError {
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
+
+impl AcceleratedTableBuilderError {
+    /// Whether building the table again can succeed. A refresh SQL the refresh cannot
+    /// honor is configuration: every retry would be refused the same way.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            Self::AcceleratedTableError {
+                source: Error::InvalidRefreshSql { .. }
+            }
+        )
+    }
+}
 
 // An accelerated table consists of a federated table and a local accelerator.
 //
@@ -887,13 +923,8 @@ impl Builder {
                 &self.accelerator,
                 self.refresh.mode,
                 self.append_stream.is_some(),
-            )
-            .map_err(|source| Error::InvalidRefreshSql {
-                source: Box::new(source),
-            })?;
-            for notice in refresh_sql.null_ordering_notices(&self.dataset_name) {
-                tracing::info!("{notice}");
-            }
+            )?;
+            log_refresh_sql_notices(&self.dataset_name, refresh_sql);
         }
 
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
@@ -929,13 +960,7 @@ impl Builder {
                     }
                 }
 
-                let schema = self.accelerator.schema();
-                let primary_keys = self
-                    .accelerator
-                    .constraints()
-                    .map_or_else(Vec::new, |constraints| {
-                        get_primary_keys_from_constraints(constraints, &schema)
-                    });
+                let primary_keys = accelerator_primary_keys(&self.accelerator);
                 let has_primary_key = !primary_keys.is_empty();
                 let has_time_column = self.refresh.time_column.is_some();
                 let has_append_stream = self.append_stream.is_some();
@@ -1613,10 +1638,8 @@ impl AcceleratedTable {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
-        validate_refresh_sql_distinct_on(&refresh_sql, &self.accelerator, refresh.mode, false)
-            .map_err(|source| Error::InvalidRefreshSql {
-                source: Box::new(source),
-            })?;
+        validate_refresh_sql_distinct_on(&refresh_sql, &self.accelerator, refresh.mode, false)?;
+        log_refresh_sql_notices(dataset_name, &refresh_sql);
         // Preserve existing partition filters when updating user SQL, including
         // an empty ("no partitions assigned — load no rows") assignment.
         let existing_partition_filters = refresh
@@ -3490,13 +3513,16 @@ mod tests {
         assert_eq!(accelerator_row_count(&accelerator).await, 0);
     }
 
-    fn distinct_on_accelerator(primary_key: bool) -> Arc<dyn TableProvider> {
-        let schema = Arc::new(Schema::new(vec![
+    fn distinct_on_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("occurred_at", DataType::Int64, true),
-        ]));
-        let table =
-            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("valid table");
+        ]))
+    }
+
+    fn distinct_on_accelerator(primary_key: bool) -> Arc<dyn TableProvider> {
+        let table = datafusion::catalog::MemTable::try_new(distinct_on_schema(), vec![vec![]])
+            .expect("valid table");
         if primary_key {
             Arc::new(
                 table.with_constraints(datafusion::common::Constraints::new_unverified(vec![
@@ -3509,14 +3535,10 @@ mod tests {
     }
 
     fn distinct_on_refresh_sql() -> refresh::RefreshSQL {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("occurred_at", DataType::Int64, true),
-        ]));
         runtime_datafusion::refresh_sql::parse_refresh_sql(
             TableReference::parse_str("events"),
             "SELECT DISTINCT ON (id) * FROM events ORDER BY id, occurred_at DESC NULLS LAST",
-            schema,
+            distinct_on_schema(),
         )
         .expect("valid refresh SQL")
         .0

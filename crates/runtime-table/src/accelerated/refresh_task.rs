@@ -1649,7 +1649,7 @@ impl RefreshTask {
 
     async fn get_data_update(
         &self,
-        mut filters: Vec<Expr>,
+        filters: Vec<Expr>,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
@@ -1675,6 +1675,7 @@ impl RefreshTask {
             refresh_sql::parse_refresh_sql(dataset_name.clone(), s, federated_provider.schema())
         }) {
             Some(Ok((mut parsed, _schema))) => {
+                super::log_refresh_sql_notices(&dataset_name, &parsed);
                 if let Some(base) = &refresh.sql {
                     parsed.set_partition_filters(base.partition_filters().map(<[_]>::to_vec));
                 }
@@ -1703,25 +1704,11 @@ impl RefreshTask {
             ));
         }
 
-        // Extract SQL string and partition filters from RefreshSQL
-        let sql_string = effective_sql
-            .as_ref()
-            .map(super::refresh::RefreshSQL::to_scan_sql);
-        let distinct_on = effective_sql
-            .as_ref()
-            .and_then(super::refresh::RefreshSQL::distinct_on)
-            .cloned();
-        if let Some(ref s) = effective_sql {
-            s.extend_effective_partition_filters(&mut filters);
-        }
-
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
             let dataset_name_for_runtime = dataset_name.clone();
             let filters_for_runtime = filters.clone();
             let update_type_for_runtime = update_type.clone();
             let provider_for_runtime = Arc::clone(&federated_provider);
-            let sql_for_runtime = sql_string.clone();
-            let distinct_on_for_runtime = distinct_on.clone();
             let request_context = RequestContext::current(AsyncMarker::new().await);
             let span = Span::current();
 
@@ -1752,9 +1739,8 @@ impl RefreshTask {
                         &mut ctx,
                         dataset_name_for_runtime,
                         provider_for_runtime,
-                        sql_for_runtime,
+                        effective_sql.as_ref(),
                         filters_for_runtime,
-                        distinct_on_for_runtime.as_ref(),
                     )
                     .await
                     .map_err(check_and_mark_retriable_error)?;
@@ -1789,9 +1775,8 @@ impl RefreshTask {
             &mut ctx,
             dataset_name,
             federated_provider,
-            sql_string,
+            effective_sql.as_ref(),
             filters,
-            distinct_on.as_ref(),
         )
         .await
         .map_err(check_and_mark_retriable_error);
