@@ -2581,8 +2581,9 @@ fn persisted_runs_loaded_message(
             files - covered
         )
     };
+    let plural = if runs == 1 { "" } else { "s" };
     format!(
-        "Dataset '{table_name}' (cayenne): loaded {runs} persisted secondary index runs ({mib:.1} MiB on disk), {coverage}"
+        "Dataset '{table_name}' (cayenne): loaded {runs} persisted secondary index run{plural} ({mib:.1} MiB on disk), {coverage}"
     )
 }
 
@@ -3567,6 +3568,10 @@ mod tests {
         assert_eq!(
             persisted_runs_loaded_message("orders", 3, 3 << 19, 18, 20),
             "Dataset 'orders' (cayenne): loaded 3 persisted secondary index runs (1.5 MiB on disk), covering 18 of its 20 files; the other 2 are indexed in the background"
+        );
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 1, 5 << 20, 4, 4),
+            "Dataset 'orders' (cayenne): loaded 1 persisted secondary index run (5.0 MiB on disk), covering all 4 of its files"
         );
     }
 
