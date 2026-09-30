@@ -50,7 +50,7 @@ use crate::{
     component::{
         AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
     },
-    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
+    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR,
         SCYLLADB_FEATURE,
@@ -214,8 +214,8 @@ impl Runtime {
         //
         // `LogErrors(true)` here, and `LogErrors(false)` in `load_views` below, because
         // the two validate the same views and only one of them may report: this pre-pass
-        // is the one that always runs. The snapshot validations between here and
-        // `load_views` return early on failure, so reporting from `load_views` instead
+        // is the one that always runs. The snapshot validation between here and
+        // `load_views` returns early on failure, so reporting from `load_views` instead
         // loses every view's load error, its status update, and its
         // discarded-acceleration warning on exactly the startups that already went wrong.
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
@@ -241,16 +241,6 @@ impl Runtime {
             {
                 tracing::warn!("{warning}");
             }
-        }
-
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        // All Cayenne datasets sharing the same metadata directory must have the same
-        // snapshot configuration (either all enabled or all disabled).
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
-            return;
         }
 
         let init_results = self
@@ -2038,14 +2028,6 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
-            return;
-        }
 
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
