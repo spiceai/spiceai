@@ -45,7 +45,7 @@ use crate::suite::load_tpch_suite;
 pub const SUITE_REF: &str = "spiceai/substrait-compliance@43d31411c69ef7594887c7d759037bcf8244eeed";
 
 /// spiceai/datafusion git rev from the workspace `[patch.crates-io]`.
-pub const DATAFUSION_FORK_REV: &str = "11624fb82dc5460d201d0379d269a4613e82f9c7";
+pub const DATAFUSION_FORK_REV: &str = "e9dc1dd4deede689576f6c91aace44caba781a88";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
@@ -224,4 +224,25 @@ async fn run() -> Result<ExitCode> {
     // Report-only: never fail the process on a low pass rate. A non-zero
     // exit is reserved for harness I/O / load errors (already returned).
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The revision the harness reports must be the one the workspace builds
+    /// against, or its results are credited to a `DataFusion` they were not run on.
+    #[test]
+    fn the_reported_datafusion_rev_is_the_workspace_pin() {
+        let manifest = include_str!("../../../Cargo.toml");
+        let pinned = manifest
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(
+                    "datafusion = { git = \"https://github.com/spiceai/datafusion.git\", rev = \"",
+                )?
+                .split('"')
+                .next()
+            })
+            .expect("the workspace patches `datafusion` to a spiceai/datafusion revision");
+        assert_eq!(super::DATAFUSION_FORK_REV, pinned);
+    }
 }
