@@ -17,8 +17,9 @@ limitations under the License.
 use std::sync::{Arc, LazyLock};
 
 use datafusion::common::DFSchema;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
+use datafusion::logical_expr::{Cast, Expr, TryCast};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
@@ -229,11 +230,79 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
-/// `DataFusion` does — today, a cast into text over a binary operand is the one
-/// shape it does not (see `duckdb::cast_is_renderable`).
+/// `DataFusion` does — today, two casts it does not: one into text over a
+/// binary operand (see `duckdb::cast_is_renderable`), and one from a fractional
+/// value into an integer, which `DuckDB` rounds where `DataFusion` truncates
+/// (see [`integer_cast_is_renderable`]).
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
-    duckdb::cast_is_renderable(expr, scope)
+    duckdb::cast_is_renderable(expr, scope) && integer_cast_is_renderable(expr, scope)
+}
+
+/// Whether `PostgreSQL` evaluates this non-function expression node the way
+/// `DataFusion` does — today, a cast from a fractional value into an integer is
+/// the one shape it does not (see [`integer_cast_is_renderable`]).
+#[must_use]
+pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    integer_cast_is_renderable(expr, scope)
+}
+
+/// Whether MySQL evaluates this non-function expression node the way
+/// `DataFusion` does — today, a cast from a fractional value into an integer is
+/// the one shape it does not (see [`integer_cast_is_renderable`]).
+#[must_use]
+pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    integer_cast_is_renderable(expr, scope)
+}
+
+/// Whether an engine that rounds a fractional value on its way into an integer
+/// evaluates this cast the way `DataFusion` does.
+///
+/// `DataFusion` truncates toward zero: `CAST(1.5 AS INT)` is `1` and
+/// `CAST(-1.5 AS INT)` is `-1`, and a `DECIMAL` is divided by its scale in
+/// integer arithmetic (`arrow-cast`'s `cast_decimal_to_integer`), so
+/// `CAST(2.49 AS INT)` is `2` too. `DuckDB`, `PostgreSQL` and MySQL round to
+/// the nearest integer instead — `2`, `-2` and `2` — and their `TRY_CAST`
+/// rounds the same way, so a cast pushed to any of them answers a different
+/// value than the same cast evaluated locally, and a filter over it selects
+/// different rows, with no error anywhere (issue #14482). Measured on `DuckDB`
+/// v1.4.4, `PostgreSQL` 18.6 and `MariaDB` 11.8: each answers `2`, `-2`, `3`
+/// for `CAST(1.5 AS INT)`, `CAST(-1.5 AS INT)`, `CAST(2.5 AS INT)`.
+///
+/// The cast therefore stays local when its target is an integer type and its
+/// operand is a floating-point or decimal value — or cannot be proven not to
+/// be. `scope` is the schema the operand resolves against and is `None` where
+/// the type cannot be read; a column whose type will not resolve is refused
+/// rather than assumed integral, because assuming wrong is a wrong answer and
+/// refusing costs only the pushdown. A literal carries its own type and needs
+/// no scope. A cast from an integer, a boolean or a string is not this
+/// check's to refuse: the engines agree on an integral operand, and a
+/// fractional *string* fails `DataFusion`'s own cast rather than answering a
+/// different row.
+#[must_use]
+pub(crate) fn integer_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    if !field.data_type().is_integer() {
+        return true;
+    }
+    let empty = DFSchema::empty();
+    match operand.get_type(scope.unwrap_or(&empty)) {
+        Ok(data_type) => !(data_type.is_floating() || data_type.is_decimal()),
+        // Deliberately not propagated: a node whose type will not resolve is
+        // treated as fractional, because unprovable and unsafe are the same
+        // answer for a check that must not admit a cast it cannot vouch for.
+        Err(_) => false,
+    }
 }
 
 /// Names of the functions [`new_bigquery_dialect`] rewrites to native
@@ -320,7 +389,8 @@ mod tests {
     use super::{
         bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
         duckdb_can_evaluate_expression, duckdb_can_translate, duckdb_native_function_names,
-        new_duckdb_dialect,
+        integer_cast_is_renderable, mysql_can_evaluate_expression, new_duckdb_dialect,
+        postgres_can_evaluate_expression,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::DFSchema;
@@ -546,22 +616,123 @@ mod tests {
     }
 
     /// With no scope a column's type cannot be proven, so a text cast of it is
-    /// refused rather than assumed to be over a string; a non-text cast is not
-    /// this check's to refuse, and a literal carries its own type.
+    /// refused rather than assumed to be over a string, and an integer cast of
+    /// it is refused rather than assumed to be over an integer; a cast whose
+    /// target neither check is about is not theirs to refuse, and a literal
+    /// carries its own type.
     #[test]
-    fn duckdb_declines_a_text_cast_whose_operand_type_cannot_be_read() {
+    fn duckdb_declines_a_cast_whose_operand_type_cannot_be_read() {
         assert!(!duckdb_can_evaluate_expression(
             &cast(col("a"), DataType::Utf8),
             None
         ));
-        assert!(duckdb_can_evaluate_expression(
+        assert!(!duckdb_can_evaluate_expression(
             &cast(col("a"), DataType::Int64),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(col("a"), DataType::Float64),
             None
         ));
         assert!(duckdb_can_evaluate_expression(
             &cast(lit(1_i64), DataType::Utf8),
             None
         ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(lit(1_i64), DataType::Int32),
+            None
+        ));
+    }
+
+    /// Regression test for #14482: `DuckDB`, `PostgreSQL` and MySQL round a
+    /// fractional value cast into an integer where `DataFusion` truncates, so
+    /// the cast has to stay local on each of them — `CAST` and `TRY_CAST`, from
+    /// every floating-point and decimal operand, into every integer width, and
+    /// whether the operand is a column, a literal or a value reached through
+    /// another node.
+    #[test]
+    fn a_fractional_to_integer_cast_stays_local_on_every_engine_that_rounds_it() {
+        let scope = scope_of(&[
+            ("f", DataType::Float64),
+            ("h", DataType::Float32),
+            ("d", DataType::Decimal128(10, 2)),
+            ("n", DataType::Int64),
+        ]);
+        let operands = [
+            col("f"),
+            col("h"),
+            col("d"),
+            lit(1.5_f64),
+            lit(1.5_f32),
+            lit(ScalarValue::Decimal128(Some(249), 4, 2)),
+            col("n") * lit(1.5_f64),
+            datafusion::functions::expr_fn::coalesce(vec![col("f"), col("n")]),
+        ];
+        let targets = [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let engines: [(&str, fn(&Expr, Option<&DFSchema>) -> bool); 3] = [
+            ("DuckDB", duckdb_can_evaluate_expression),
+            ("PostgreSQL", postgres_can_evaluate_expression),
+            ("MySQL", mysql_can_evaluate_expression),
+        ];
+        for (engine, can_evaluate) in engines {
+            for operand in &operands {
+                for target in &targets {
+                    for expr in [
+                        cast(operand.clone(), target.clone()),
+                        try_cast(operand.clone(), target.clone()),
+                    ] {
+                        assert!(
+                            !can_evaluate(&expr, Some(&scope)),
+                            "{engine} rounds {expr}, so it must stay local"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The complement: the refusal costs only the casts it is about. A cast
+    /// from an integer, a boolean or a string into an integer, and a cast from
+    /// a fractional value into anything but an integer, federate as before.
+    #[test]
+    fn every_other_cast_still_federates_on_the_engines_that_round() {
+        let scope = scope_of(&[
+            ("f", DataType::Float64),
+            ("d", DataType::Decimal128(10, 2)),
+            ("n", DataType::Int64),
+            ("b", DataType::Boolean),
+            ("s", DataType::Utf8),
+        ]);
+        for expr in [
+            cast(col("n"), DataType::Int32),
+            try_cast(col("n"), DataType::UInt8),
+            cast(col("b"), DataType::Int32),
+            cast(col("s"), DataType::Int64),
+            cast(lit(7_i32), DataType::Int64),
+            cast(col("f"), DataType::Float32),
+            cast(col("f"), DataType::Decimal128(10, 2)),
+            cast(col("d"), DataType::Float64),
+            cast(col("f"), DataType::Utf8),
+            col("f"),
+            col("f").gt(lit(1.5_f64)),
+        ] {
+            assert!(
+                integer_cast_is_renderable(&expr, Some(&scope)),
+                "{expr} answers the same on every engine and must federate"
+            );
+            assert!(duckdb_can_evaluate_expression(&expr, Some(&scope)));
+            assert!(postgres_can_evaluate_expression(&expr, Some(&scope)));
+            assert!(mysql_can_evaluate_expression(&expr, Some(&scope)));
+        }
     }
 
     /// A literal carries its own type, so an all-literal call still federates

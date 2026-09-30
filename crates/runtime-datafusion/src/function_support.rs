@@ -228,11 +228,16 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
 /// `TRIM` has no two-argument form at all, and its `TRIM(BOTH chars FROM str)`
 /// strips repetitions of `chars` as a *string*, where `btrim` strips any
 /// character in it — so a rewrite would trade a failed query for wrong rows.
+///
+/// A cast from a fractional value into an integer stays local too, because
+/// MySQL rounds it where `DataFusion` truncates
+/// ([`crate::dialect::mysql_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also([crate::dialect::BTRIM_NAME.to_string()])
         .build()
+        .with_expression_support(Arc::new(crate::dialect::mysql_can_evaluate_expression))
 }
 
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
@@ -260,6 +265,10 @@ pub const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
 /// `DataFusion` array functions `PostgreSQL` can't execute. Used with
 /// `PostgresTableProviderFactory::with_function_support` (accelerator) and the
 /// `PostgreSQL` connector's federation deny-list. See issue #10703.
+///
+/// A cast from a fractional value into an integer stays local too, because
+/// `PostgreSQL` rounds it where `DataFusion` truncates
+/// ([`crate::dialect::postgres_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
     let unsupported_arrays = datafusion_nested_function_names()
@@ -269,6 +278,7 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(unsupported_arrays)
         .build()
+        .with_expression_support(Arc::new(crate::dialect::postgres_can_evaluate_expression))
 }
 
 #[cfg(test)]
@@ -277,6 +287,8 @@ mod tests {
         deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
+        deny_spice_functions_for_mysql_table_providers,
+        deny_spice_functions_for_postgres_table_providers,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
@@ -536,5 +548,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A scan of `t(id, f, d)` with `f` a float and `d` a decimal, filtered by
+    /// `predicate` and projecting `projection` — the shapes #14482 measured.
+    fn plan_over_fractions(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("d", DataType::Decimal128(10, 2), true),
+        ]);
+        let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
+        if let Some(predicate) = predicate {
+            plan = plan.filter(predicate).expect("filter");
+        }
+        plan.project(vec![projection])
+            .expect("project")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #14482, through every policy whose engine rounds a
+    /// fractional value cast into an integer where `DataFusion` truncates: a
+    /// plan holding such a cast, in a projection or a filter, must stay local
+    /// on `DuckDB` (both accessors), `PostgreSQL` and MySQL. The same policies
+    /// decide the scan-level filter pushdown, so a filter over the cast is kept
+    /// out of the pushed-down scan too rather than pre-applied by the engine
+    /// with its own rounding.
+    #[test]
+    fn a_fractional_to_integer_cast_is_not_federated_to_an_engine_that_rounds() {
+        use datafusion::prelude::{cast, try_cast};
+        for (policy, support) in [
+            (
+                "DuckDB table providers",
+                deny_spice_functions_for_duckdb_table_providers(),
+            ),
+            (
+                "DuckLake catalog",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ] {
+            for plan in [
+                plan_over_fractions(None, cast(col("f"), DataType::Int32)),
+                plan_over_fractions(None, try_cast(col("f"), DataType::Int64)),
+                plan_over_fractions(None, cast(col("d"), DataType::Int16)),
+                plan_over_fractions(None, cast(col("id") * lit(1.5_f64), DataType::Int32)),
+                plan_over_fractions(
+                    Some(cast(col("id") * lit(1.5_f64), DataType::Int32).eq(lit(2))),
+                    col("id"),
+                ),
+                plan_over_fractions(
+                    Some(try_cast(col("d"), DataType::Int64).gt(lit(1))),
+                    col("id"),
+                ),
+            ] {
+                assert!(
+                    contains_unsupported_functions(&plan, &support)
+                        .expect("the support check must not error"),
+                    "the {policy} policy must keep this plan local:\n{plan}"
+                );
+            }
+
+            // The fractional columns themselves, a cast between integers, a
+            // cast into a fractional type and a comparison over a fraction
+            // still federate: the refusal costs only the casts it is about.
+            for plan in [
+                plan_over_fractions(None, col("f")),
+                plan_over_fractions(None, col("d")),
+                plan_over_fractions(None, cast(col("id"), DataType::Int32)),
+                plan_over_fractions(None, cast(col("id"), DataType::Float64)),
+                plan_over_fractions(None, cast(col("f"), DataType::Float32)),
+                plan_over_fractions(Some(col("f").gt(lit(1.5_f64))), col("id")),
+            ] {
+                assert!(
+                    !contains_unsupported_functions(&plan, &support)
+                        .expect("the support check must not error"),
+                    "the {policy} policy must still federate:\n{plan}"
+                );
+            }
+        }
+    }
+
+    /// The local half of #14482, pinned so the refusal above cannot outlive
+    /// the divergence it exists for: `DataFusion` truncates a fractional value
+    /// cast into an integer — toward zero for a float, and by integer division
+    /// for a decimal — where the engines above round it.
+    #[tokio::test]
+    async fn datafusion_truncates_a_fractional_value_cast_into_an_integer() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches = ctx
+            .sql(
+                "SELECT CAST(1.5 AS INT) AS a, CAST(-1.5 AS INT) AS b, CAST(2.5 AS BIGINT) AS c, \
+                 TRY_CAST(2.49 AS SMALLINT) AS d, CAST(CAST(2.49 AS DECIMAL(4, 2)) AS INT) AS e, \
+                 CAST(CAST(-2.5 AS DECIMAL(4, 1)) AS INT) AS f",
+            )
+            .await
+            .expect("the casts plan")
+            .collect()
+            .await
+            .expect("the casts run");
+        datafusion::assert_batches_eq!(
+            [
+                "+---+----+---+---+---+----+",
+                "| a | b  | c | d | e | f  |",
+                "+---+----+---+---+---+----+",
+                "| 1 | -1 | 2 | 2 | 2 | -2 |",
+                "+---+----+---+---+---+----+",
+            ],
+            &batches
+        );
     }
 }
