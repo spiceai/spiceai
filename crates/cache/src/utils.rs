@@ -394,7 +394,10 @@ pub fn to_cached_record_batch_stream(
                                 cache_max_size,
                                 "Encoded query result still exceeds cache max size, skipping"
                             );
-                        } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                        } else if let Err(e) = cache_provider
+                            .put_raw_key_with_weight(&raw_cache_key, cached_result, actual_size)
+                            .await
+                        {
                             tracing::error!("Failed to cache query results: {e}");
                         }
                     }

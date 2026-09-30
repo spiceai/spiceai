@@ -16,7 +16,7 @@ parking_lot.workspace = true
 # the two are versioned together. Must match the `vstd` pin in
 # `crates/hash-index/Cargo.toml` and `crates/cache/Cargo.toml`, and
 # `VERUS_VSTD_VERSION` in `.github/workflows/verus_verify.yml`.
-vstd = "=0.0.0-2026-08-30-0159"
+vstd = "=0.0.0-2026-09-20-0158"
 
 [lints]
 workspace = true

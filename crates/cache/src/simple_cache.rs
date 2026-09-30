@@ -145,6 +145,11 @@ impl<
         self.cache.insert(*key, value).await;
     }
 
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, _weight: usize) {
+        // Entries are bounded by count, so there is no weight to bill.
+        self.put_raw_key(key, value).await;
+    }
+
     async fn replace_if(
         &self,
         key: &u64,

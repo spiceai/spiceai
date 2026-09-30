@@ -12,6 +12,7 @@ version.workspace = true
 ansi_colors = { path = "../ansi_colors" }
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 chrono.workspace = true
+cpu-budget = { path = "../cpu-budget", optional = true }
 ctrlc = "3.5"
 futures.workspace = true
 http-body = { version = "1.0.1", optional = true }
@@ -34,7 +35,7 @@ parking_lot.workspace = true
 
 [features]
 default = ["datafusion"]
-datafusion = ["dep:datafusion", "dep:datafusion-proto"]
+datafusion = ["dep:cpu-budget", "dep:datafusion", "dep:datafusion-proto"]
 http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]
 
 [lints]

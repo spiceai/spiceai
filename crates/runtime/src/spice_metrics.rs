@@ -45,7 +45,11 @@ pub enum Error {
         "Failed to register the internal metrics table: {}",
         format_datafusion_error(source)
     ))]
-    UnableToRegisterToMetricsTable { source: DataFusionError },
+    UnableToRegisterToMetricsTable {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(DataFusionError, Box::new)))]
+        source: Box<DataFusionError>,
+    },
 }
 
 /// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.

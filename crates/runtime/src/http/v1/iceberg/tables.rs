@@ -22,7 +22,7 @@ use super::{
 };
 use crate::datafusion::is_spice_internal_schema;
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
+use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use axum::{
     Json,
     extract::Path,
@@ -31,7 +31,7 @@ use axum::{
 };
 use datafusion::common::TableReference;
 use iceberg::{
-    arrow::arrow_schema_to_schema,
+    arrow::{UTC_TIME_ZONE, arrow_schema_to_schema},
     spec::{PartitionSpec, Schema, SortOrder},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -107,7 +107,7 @@ struct TableMetadata {
 
     // The following fields are part of the Iceberg Table Metadata V2 spec - but we don't do anything with them yet
     last_updated_ms: i64,
-    last_column_id: u32,
+    last_column_id: i32,
     last_sequence_number: u64,
     current_schema_id: u32,
     #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
@@ -146,7 +146,6 @@ struct TableMetadata {
         )))
     )
 ))]
-#[expect(clippy::cast_possible_truncation)]
 pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
@@ -160,11 +159,7 @@ pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>)
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    let arrow_schema = table.schema();
-    let arrow_schema =
-        crate::datafusion::iceberg_ddl::coerce_arrow_schema_for_iceberg_v2(&arrow_schema);
-    let arrow_schema = assign_field_ids(&arrow_schema);
-    let iceberg_schema = match arrow_schema_to_schema(&arrow_schema) {
+    let iceberg_schema = match iceberg_schema_for(&table.schema()) {
         Ok(schema) => schema,
         Err(e) => {
             tracing::debug!(
@@ -186,12 +181,13 @@ pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>)
         vec![]
     };
 
+    let last_column_id = iceberg_schema.highest_field_id();
     let metadata = TableMetadata {
         format_version: TableFormatVersion::V2,
         table_uuid: Uuid::new_v4(),
         location: format!("spice.ai/{table_reference}"),
         schemas: vec![iceberg_schema],
-        last_column_id: arrow_schema.fields.len() as u32,
+        last_column_id,
         last_updated_ms,
         last_sequence_number: 0,
         current_schema_id: 0,
@@ -222,10 +218,40 @@ fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference>
     Some(TableReference::full(catalog, schema, table))
 }
 
+/// Convert a table's Arrow schema into the Iceberg v2 schema the catalog API serves:
+/// every field, nested ones included, is coerced to an Iceberg-compatible type and
+/// assigned a field ID.
+fn iceberg_schema_for(schema: &ArrowSchema) -> iceberg::Result<Schema> {
+    arrow_schema_to_schema(&assign_field_ids(schema))
+}
+
+/// The Iceberg v2 equivalent of a non-nested Arrow type that `arrow_schema_to_schema`
+/// cannot map directly, or `None` when the type needs no coercion. Each coercion
+/// represents every value of the original type.
+///
+/// This is a superset of the `CREATE TABLE` coercion in `iceberg_ddl`, which writes data
+/// into the schema it creates and so only coerces what its write path casts; this API
+/// only describes a schema.
+fn coerce_leaf_for_iceberg_v2(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        // An Arrow timestamp with any time zone holds UTC instants and uses the zone only
+        // for display, which is exactly Iceberg's `timestamptz`.
+        DataType::Timestamp(_, Some(tz)) if !matches!(tz.as_ref(), "UTC" | UTC_TIME_ZONE) => Some(
+            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
+        ),
+        DataType::Float16 => Some(DataType::Float32),
+        DataType::Dictionary(key, value) => coerce_leaf_for_iceberg_v2(value)
+            .map(|value| DataType::Dictionary(key.clone(), Box::new(value))),
+        other => crate::datafusion::iceberg_ddl::coerce_temporal_type_for_iceberg_v2(other),
+    }
+}
+
 struct DepthExceeded;
 
 /// Iceberg requires field IDs to be set for all fields, including nested fields in Struct, List, and Map types.
 /// The iceberg-rust crate expects them to be set in the `PARQUET:field_id` metadata key.
+///
+/// Every non-nested type, at any depth, is also coerced with [`coerce_leaf_for_iceberg_v2`].
 fn assign_field_ids(schema: &ArrowSchema) -> ArrowSchema {
     if let Ok(new_schema) = try_assign_field_ids(schema) {
         new_schema
@@ -288,7 +314,7 @@ fn assign_field_id_recursive(
             Arc::new(assign_field_id_recursive(struct_field, counter, depth + 1)?),
             *keys_sorted,
         ),
-        other => other.clone(),
+        other => coerce_leaf_for_iceberg_v2(other).unwrap_or_else(|| other.clone()),
     };
 
     // Preserve existing metadata and add/update the field ID
@@ -304,6 +330,7 @@ mod tests {
 
     use super::*;
     use iceberg::arrow::arrow_schema_to_schema;
+    use iceberg::spec::{PrimitiveType, Type};
 
     fn get_field_id(field: &Field) -> Option<i32> {
         field
@@ -643,11 +670,9 @@ mod tests {
         );
     }
 
-    /// Helper: coerce + assign field IDs + convert to Iceberg schema (the full HTTP path).
+    /// Helper: the schema conversion the HTTP handler serves.
     fn coerce_and_convert(schema: &ArrowSchema) -> iceberg::spec::Schema {
-        let coerced = crate::datafusion::iceberg_ddl::coerce_arrow_schema_for_iceberg_v2(schema);
-        let with_ids = assign_field_ids(&coerced);
-        arrow_schema_to_schema(&with_ids).expect("Should convert to iceberg schema")
+        iceberg_schema_for(schema).expect("Should convert to iceberg schema")
     }
 
     #[test]
@@ -753,5 +778,188 @@ mod tests {
             Field::new("data", DataType::Binary, true),
         ]);
         coerce_and_convert(&schema);
+    }
+
+    fn iceberg_type_of(schema: &iceberg::spec::Schema, name: &str) -> iceberg::spec::Type {
+        schema
+            .field_by_name(name)
+            .unwrap_or_else(|| panic!("Iceberg schema should have field {name}"))
+            .field_type
+            .as_ref()
+            .clone()
+    }
+
+    fn element(data_type: DataType) -> Arc<Field> {
+        Arc::new(Field::new("element", data_type, true))
+    }
+
+    #[test]
+    fn test_coerce_nested_temporal_types() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("dates", DataType::List(element(DataType::Date64)), true),
+            Field::new(
+                "times",
+                DataType::List(element(DataType::Time32(TimeUnit::Millisecond))),
+                true,
+            ),
+            Field::new(
+                "event",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "at",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    true,
+                )])),
+                true,
+            ),
+            // A nanosecond timestamp is a v3 type; the table is served as format v2.
+            Field::new(
+                "instants",
+                DataType::LargeList(element(DataType::Timestamp(TimeUnit::Nanosecond, None))),
+                true,
+            ),
+            Field::new(
+                "by_key",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new(
+                                "value",
+                                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                                true,
+                            ),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]);
+
+        let iceberg_schema = coerce_and_convert(&schema);
+
+        for (name, expected) in [
+            ("dates.element", PrimitiveType::Date),
+            ("times.element", PrimitiveType::Time),
+            ("event.at", PrimitiveType::Timestamp),
+            ("instants.element", PrimitiveType::Timestamp),
+            ("by_key.value", PrimitiveType::Timestamptz),
+        ] {
+            assert_eq!(
+                iceberg_type_of(&iceberg_schema, name),
+                Type::Primitive(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coerce_non_utc_timestamps_to_timestamptz() {
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "ny",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
+                true,
+            ),
+            Field::new(
+                "offset_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+02:00".into())),
+                true,
+            ),
+            Field::new(
+                "utc_offset",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                true,
+            ),
+            Field::new(
+                "nested",
+                DataType::List(element(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some("Asia/Tokyo".into()),
+                ))),
+                true,
+            ),
+        ]);
+
+        let iceberg_schema = coerce_and_convert(&schema);
+
+        for name in ["ny", "offset_ms", "utc_offset", "nested.element"] {
+            assert_eq!(
+                iceberg_type_of(&iceberg_schema, name),
+                Type::Primitive(PrimitiveType::Timestamptz),
+                "{name} should be served as timestamptz"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coerce_float16_and_dictionary_values() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("half", DataType::Float16, true),
+            Field::new("halves", DataType::List(element(DataType::Float16)), true),
+            Field::new(
+                "dict_ts",
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Timestamp(TimeUnit::Second, None)),
+                ),
+                true,
+            ),
+            Field::new(
+                "dict_str",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]);
+
+        let iceberg_schema = coerce_and_convert(&schema);
+
+        for (name, expected) in [
+            ("half", PrimitiveType::Float),
+            ("halves.element", PrimitiveType::Float),
+            ("dict_ts", PrimitiveType::Timestamp),
+            ("dict_str", PrimitiveType::String),
+        ] {
+            assert_eq!(
+                iceberg_type_of(&iceberg_schema, name),
+                Type::Primitive(expected),
+                "{name}"
+            );
+        }
+    }
+
+    /// Types with no Iceberg v2 equivalent that holds every value stay a conversion error.
+    #[test]
+    fn test_types_without_an_iceberg_equivalent_are_rejected() {
+        for data_type in [
+            DataType::UInt64,
+            DataType::Duration(TimeUnit::Second),
+            DataType::Decimal256(40, 0),
+        ] {
+            let schema = ArrowSchema::new(vec![Field::new("c", data_type.clone(), true)]);
+            assert!(
+                iceberg_schema_for(&schema).is_err(),
+                "{data_type} should not convert"
+            );
+        }
+    }
+
+    /// `last-column-id` is the highest assigned field ID, which counts nested fields.
+    #[test]
+    fn test_highest_field_id_counts_nested_fields() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("tags", DataType::List(element(DataType::Utf8)), true),
+            Field::new(
+                "s",
+                DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)])),
+                true,
+            ),
+        ]);
+
+        // id=0, tags=1, tags.element=2, s=3, s.x=4
+        assert_eq!(coerce_and_convert(&schema).highest_field_id(), 4);
     }
 }

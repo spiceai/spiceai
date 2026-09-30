@@ -636,7 +636,7 @@ impl CayenneDeletionSink {
                     })
                     .collect::<crate::provider::Result<Vec<_>>>()?;
 
-                let is_already_deleted = u32::try_from(row_position).ok().is_some_and(|pos| {
+                let is_already_deleted = u32::try_from(row_position).is_ok_and(|pos| {
                     already_deleted
                         .as_ref()
                         .is_some_and(|deletion_vector| deletion_vector.contains(pos))

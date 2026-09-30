@@ -67,6 +67,7 @@ use crate::schema_discovery::{
     discover_schema,
 };
 use crate::{DESCRIPTION_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -2097,7 +2098,12 @@ impl crate::Read for DatabricksSqlWarehouse {
             SqlTable::new("databricks", &self.pool, table_reference, None)
                 .await
                 .context(SqlTableInitializationFailedSnafu)?
-                .with_dialect(dialect),
+                .with_dialect(dialect)
+                // Databricks evaluates none of the Spice functions, so a plan or
+                // filter naming one runs locally instead of being unparsed into
+                // a statement the warehouse answers `UNRESOLVED_ROUTINE` to
+                // (#10703, #13664).
+                .with_function_support(Some(deny_spice_functions_for_table_providers())),
         );
 
         Ok(Arc::new(

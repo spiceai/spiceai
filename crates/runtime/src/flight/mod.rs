@@ -1059,7 +1059,11 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to register parquet file: {source}"))]
-    RegisterParquet { source: crate::datafusion::Error },
+    RegisterParquet {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(crate::datafusion::Error, Box::new)))]
+        source: Box<crate::datafusion::Error>,
+    },
 
     #[snafu(display("{source}"))]
     DataFusion {

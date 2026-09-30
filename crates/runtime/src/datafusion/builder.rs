@@ -1115,6 +1115,8 @@ impl DataFusionBuilder {
             }
         }
 
+        // Rules a primary-key point lookup cannot trigger are skipped while one is planned.
+        super::point_lookup::wrap_skippable_rules(&mut state);
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -1208,8 +1210,8 @@ impl DataFusionBuilder {
 
         // Add cache invalidation optimizer rule if caching is enabled
         if let Some(caching) = &self.caching {
-            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
-                Arc::downgrade(caching),
+            ctx.add_optimizer_rule(super::point_lookup::skippable_optimizer_rule(Arc::new(
+                CacheInvalidationOptimizerRule::new(Arc::downgrade(caching)),
             )));
         }
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
@@ -1278,35 +1280,39 @@ impl DataFusionBuilder {
             };
 
         if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
-            ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-                ctx.state().catalog_list(),
-                &ddl_enabled_catalogs,
-                Arc::clone(&ddl_extension_store),
-                Arc::clone(cayenne_ddl_handler),
-                SPICE_DEFAULT_SCHEMA,
-                SPICE_DEFAULT_CATALOG,
+            ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(Arc::new(
+                datafusion_ddl::DdlAnalyzerRule::new(
+                    ctx.state().catalog_list(),
+                    &ddl_enabled_catalogs,
+                    Arc::clone(&ddl_extension_store),
+                    Arc::clone(cayenne_ddl_handler),
+                    SPICE_DEFAULT_SCHEMA,
+                    SPICE_DEFAULT_CATALOG,
+                ),
             )));
         }
 
         // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
         // Federation runs as the first of these (see `AnalyzerRulesBuilder::include_federation`).
         for rule in AnalyzerRulesBuilder::default().build() {
-            ctx.add_analyzer_rule(rule);
+            ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(rule));
         }
         for rule in self.additional_analyzer_rules {
             ctx.add_analyzer_rule(rule);
         }
 
         // Iceberg DDL analyzer rule.
-        ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-            ctx.state().catalog_list(),
-            &ddl_enabled_catalogs,
-            Arc::clone(&ddl_extension_store),
-            Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
-                &datafusion_ref,
-            ))),
-            SPICE_DEFAULT_SCHEMA,
-            SPICE_DEFAULT_CATALOG,
+        ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(Arc::new(
+            datafusion_ddl::DdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+                Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
+                    &datafusion_ref,
+                ))),
+                SPICE_DEFAULT_SCHEMA,
+                SPICE_DEFAULT_CATALOG,
+            ),
         )));
 
         DataFusion {
@@ -2839,7 +2845,7 @@ mod tests {
             "target_partitions wired through DataFusionBuilder should be visible on the session config"
         );
 
-        // Sanity check the inverse — None leaves DataFusion's default in place.
+        // Sanity check the inverse — None sizes the fan-out from the CPU budget.
         let df_default = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
@@ -2847,7 +2853,7 @@ mod tests {
         )
         .target_partitions(None)
         .build();
-        assert_ne!(
+        assert_eq!(
             df_default
                 .ctx
                 .state()
@@ -2855,8 +2861,8 @@ mod tests {
                 .options()
                 .execution
                 .target_partitions,
-            4,
-            "Without an override target_partitions should fall back to DataFusion's default"
+            cpu_budget::cpu_budget().target_partitions(),
+            "Without an override target_partitions should fall back to the CPU budget"
         );
     }
 

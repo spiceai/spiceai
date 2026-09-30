@@ -189,7 +189,7 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
     );
 
     match first_result {
-        Ok(()) => return Err("expected panic error from first refresh".to_string()),
+        Ok(_) => return Err("expected panic error from first refresh".to_string()),
         Err(AcceleratedError::RefreshWorkerPanicked {
             dataset_name,
             message,

@@ -56,7 +56,8 @@ pub enum Error {
         "Failed to load the table '{table}'. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     LoadTable {
-        source: iceberg::Error,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
         table: String,
     },
 

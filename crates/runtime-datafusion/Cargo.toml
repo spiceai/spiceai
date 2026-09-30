@@ -15,6 +15,7 @@ arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+cpu-budget = { path = "../cpu-budget" }
 dashmap = "6.1.0"
 datafusion.workspace = true
 datafusion-catalog.workspace = true
@@ -59,6 +60,7 @@ datafusion-pruning.workspace = true
 insta.workspace = true
 object_store.workspace = true
 regex.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

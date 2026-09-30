@@ -140,7 +140,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
         let schemas = data.iter().map(|d| d.data.schema()).collect::<Vec<_>>();
         let () = verify_schema_compatibility(schemas.as_slice())?;
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let mut table_names: Vec<TableReference> = Vec::with_capacity(num_inputs);
 
         // Find all additional columns in the schema that are not part of the primary key or the expected

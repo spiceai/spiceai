@@ -28,7 +28,7 @@ use data_connector_api::parameters::ConnectorContext;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
-    physical_plan::SendableRecordBatchStream, prelude::SessionContext,
+    physical_plan::SendableRecordBatchStream,
 };
 use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
 use futures::StreamExt as FuturesStreamExt;
@@ -535,7 +535,7 @@ fn is_stale_resume_token_error(error: &mongodb::error::Error) -> bool {
 async fn snapshot_stream(
     table_provider: Arc<dyn TableProvider>,
 ) -> Result<SendableRecordBatchStream, data_components::cdc::StreamError> {
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let df = ctx
         .read_table(table_provider)
         .map_err(|error| data_components::cdc::StreamError::Arrow(error.to_string()))?;

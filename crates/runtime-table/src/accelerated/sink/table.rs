@@ -24,7 +24,7 @@ use arrow_tools::{
 use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::{
     catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
-    physical_plan::collect, prelude::SessionContext,
+    physical_plan::collect,
 };
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -245,7 +245,7 @@ impl TableSink {
             overwrite
         );
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(
             &self.dataset_name,

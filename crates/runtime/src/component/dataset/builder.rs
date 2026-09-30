@@ -189,7 +189,6 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 }
 
 impl DatasetBuilder {
-    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
@@ -222,7 +221,6 @@ impl DatasetBuilder {
         })
     }
 
-    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {

@@ -46,6 +46,7 @@ snafu.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
+util = { path = "../../util" }
 
 [features]
 default = []

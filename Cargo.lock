@@ -128,6 +128,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-table-partition",
  "snafu",
+ "util",
 ]
 
 [[package]]
@@ -156,6 +157,7 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -4913,6 +4915,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -6424,6 +6427,7 @@ dependencies = [
  "runtime-checkpoint-api",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-udfs-api",
  "rusqlite",
  "rustc-hash 2.1.2",
  "s3_vectors",
@@ -17846,6 +17850,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "cpu-budget",
  "criterion 0.7.0",
  "dashmap",
  "datafusion",
@@ -17878,6 +17883,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "spice-table",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -18096,6 +18102,7 @@ dependencies = [
  "datafusion",
  "globset",
  "snafu",
+ "util",
 ]
 
 [[package]]
@@ -18263,6 +18270,7 @@ dependencies = [
  "cache",
  "cayenne",
  "chrono",
+ "cpu-budget",
  "ctor",
  "data-accelerator-api",
  "data-connector-api",
@@ -18408,6 +18416,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -23213,6 +23222,7 @@ dependencies = [
  "arrow-schema",
  "backoff",
  "chrono",
+ "cpu-budget",
  "ctrlc",
  "datafusion",
  "datafusion-proto",
@@ -23376,15 +23386,15 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "verus_builtin"
-version = "0.0.0-2026-08-30-0159"
+version = "0.0.0-2026-09-16-0054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300d269a2e06dbe54cb53084464065912ad7accbb52ae8d6c8aa7a6c521974c5"
+checksum = "5e4a9e69d45ddbe303075756d3fc2fcc965eb9dc70c80651d0e4458a6af1ed83"
 
 [[package]]
 name = "verus_builtin_macros"
-version = "0.0.0-2026-08-30-0159"
+version = "0.0.0-2026-09-20-0158"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc040bfded82e79a708c1819c52b386ee23c0c823239334f39ced152bbdf3624"
+checksum = "213ca3e8a80925aec251d3f1952a213d6090156b58ad81dccc3a2f1fed77c99f"
 dependencies = [
  "convert_case 0.4.0",
  "proc-macro2",
@@ -23397,9 +23407,9 @@ dependencies = [
 
 [[package]]
 name = "verus_prettyplease"
-version = "0.0.0-2026-08-09-0044"
+version = "0.0.0-2026-09-06-0133"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51fc115de5fb3806bc362060bb683024660ed2bc13c1183d1f01d464e4537139"
+checksum = "71956c0dcf55f57fd5a5335fff16981f7e0912d2e887914518c5a64fe36c063c"
 dependencies = [
  "proc-macro2",
  "verus_syn",
@@ -23407,9 +23417,9 @@ dependencies = [
 
 [[package]]
 name = "verus_state_machines_macros"
-version = "0.0.0-2026-08-02-0125"
+version = "0.0.0-2026-09-06-0133"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93f77ff8d121edb1bf2651335769a80a2f611da8573c3b498434a66b3162805f"
+checksum = "5f78ea16629331605a440e9e0a259dd3492a78212186ba82253ad0988127407f"
 dependencies = [
  "indexmap 2.14.0",
  "proc-macro2",
@@ -23419,9 +23429,9 @@ dependencies = [
 
 [[package]]
 name = "verus_syn"
-version = "0.0.0-2026-08-02-0125"
+version = "0.0.0-2026-09-06-0133"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f17237ea6d267e457d53ce36f55b315fc9edd26eb88c765dd95e035c0b415869"
+checksum = "7d8b53574934e1f608dfccd809ce17f3733d6eb99c14ce8220326121929e1637"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -24142,9 +24152,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vstd"
-version = "0.0.0-2026-08-30-0159"
+version = "0.0.0-2026-09-20-0158"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7169790c92857fa9441c8ba7e0c469f4fc62104caf1dfc632c318577a1a08d7a"
+checksum = "bb7a36bbc0193492141eef73272853a5a8d73288bed1ea5344563b0382cdf7c9"
 dependencies = [
  "verus_builtin",
  "verus_builtin_macros",

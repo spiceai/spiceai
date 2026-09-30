@@ -1676,7 +1676,14 @@ impl Query {
                 } else {
                     // For regular plans, use the standard physical plan execution
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
-                    let mut physical_plan = match session.create_physical_plan(&plan).await {
+                    let point_lookup = super::point_lookup::is_point_lookup(&plan);
+                    let mut physical_plan = match super::point_lookup::create_physical_plan(
+                        &mut session,
+                        &plan,
+                        point_lookup,
+                    )
+                    .await
+                    {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -1702,8 +1709,15 @@ impl Query {
                             &query_id_str,
                             &timeout_state,
                         )?;
-                        let adaptive_session = Self::session_with_batch_size(&session, batch_size);
-                        physical_plan = match adaptive_session.create_physical_plan(&plan).await {
+                        let mut adaptive_session =
+                            Self::session_with_batch_size(&session, batch_size);
+                        physical_plan = match super::point_lookup::create_physical_plan(
+                            &mut adaptive_session,
+                            &plan,
+                            point_lookup,
+                        )
+                        .await
+                        {
                             Ok(stream) => stream,
                             Err(e) => {
                                 let e = find_datafusion_root(e);
