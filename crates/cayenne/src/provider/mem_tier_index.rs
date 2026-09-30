@@ -41,8 +41,8 @@ use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use datafusion_common::ScalarValue;
 
 use super::lookup_index::{
-    Counters, KeyColumn, KeySpec, LookupIndexCounters, ProbeOutcome, cast_to, key_converter,
-    key_tuples, record_probe_outcome,
+    Counters, KeyColumn, KeySpec, LookupIndexCounters, LookupIndexScanReason, ProbeOutcome,
+    cast_to, key_converter, key_tuples, record_probe_outcome,
 };
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
 use crate::row_converter::RowConverter;
@@ -206,7 +206,7 @@ impl MemTierIndexer {
     /// answers with the values a column is pinned to: one for an equality,
     /// several for an `IN` list. `None` when no key is pinned, the product
     /// exceeds the lookup bound, or a pinned literal cannot be cast to its
-    /// column's type — the lookup then scans.
+    /// column's type — the lookup then scans, for the reason returned.
     ///
     /// `values_for` must only answer for predicates that compare the bare
     /// column with a value: a cast on the column side can hold for stored
@@ -214,26 +214,33 @@ impl MemTierIndexer {
     pub(crate) fn probe_key(
         &self,
         values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
-    ) -> Option<ProbeKey<'_>> {
+    ) -> Result<ProbeKey<'_>, LookupIndexScanReason> {
+        // Why a pinned key could not be probed outranks "no key pinned".
+        let mut reason = LookupIndexScanReason::NoKeyPinned;
         for (position, key) in self.keys.iter().enumerate() {
             let names: Vec<String> = key
                 .columns
                 .iter()
                 .map(|column| column.name.clone())
                 .collect();
+            if !names.iter().all(|name| values_for(name).is_some()) {
+                continue;
+            }
             let Some(tuples) = key_tuples(&names, values_for) else {
+                reason = LookupIndexScanReason::TooManyKeys;
                 continue;
             };
             let Some(hashes) = Self::hash_tuples(key, &tuples) else {
+                reason = LookupIndexScanReason::ValueNotIndexable;
                 continue;
             };
-            return Some(ProbeKey {
+            return Ok(ProbeKey {
                 position,
                 label: &key.label,
                 hashes,
             });
         }
-        None
+        Err(reason)
     }
 
     /// The sorted, distinct hashes of `tuples` under `key`'s encoding, leaving
@@ -523,10 +530,11 @@ mod tests {
                 .is_empty()
         );
 
-        assert!(
+        assert_eq!(
             indexer
                 .probe_key(&|column| (column == "tenant").then(|| vec![ScalarValue::Int64(Some(1))]))
-                .is_none(),
+                .err(),
+            Some(LookupIndexScanReason::NoKeyPinned),
             "a key with an unpinned column is not probed"
         );
         // A literal of another type is cast to the column's before hashing.
@@ -638,7 +646,10 @@ mod tests {
             ),
             _ => None,
         };
-        assert!(indexer.probe_key(&many).is_none());
+        assert_eq!(
+            indexer.probe_key(&many).err(),
+            Some(LookupIndexScanReason::TooManyKeys)
+        );
     }
 
     #[test]

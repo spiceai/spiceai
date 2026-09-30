@@ -638,7 +638,8 @@ async fn lookup_index_plan_evidence() {
         .to_string();
     assert!(
         fallback_text.contains("lookup_index=none")
-            && fallback_text.contains("lookup_index_outcome=not_applicable"),
+            && fallback_text.contains("lookup_index_outcome=not_applicable")
+            && fallback_text.contains("lookup_index_reason=no_key_pinned"),
         "fallback plan did not explain why the index was skipped:\n{fallback_text}"
     );
 
@@ -1325,6 +1326,34 @@ async fn in_lists_are_answered_from_the_index() {
         );
         assert_eq!(after.unbuilt, before.unbuilt, "{query_sql}: {after:?}");
     }
+
+    // 60 accounts by 40 services is 2,400 tuples, past the 2,048 a lookup
+    // probes: the lookup scans, says why, and still matches.
+    let accounts: Vec<String> = (0..60).map(account).collect();
+    let applications: Vec<String> = (0..40).map(application).collect();
+    let too_many = format!(
+        "SELECT * FROM {{t}} WHERE \"TenantId\" IN ({}) AND \"ServiceId\" IN ({}) ORDER BY \"AutoId\"",
+        accounts.join(", "),
+        applications.join(", ")
+    );
+    assert_eq!(
+        rendered(&query(&indexed, INDEXED_IN, &too_many.replace("{t}", INDEXED_IN)).await),
+        rendered(&query(&plain, PLAIN_IN, &too_many.replace("{t}", PLAIN_IN)).await),
+    );
+    let bounded = query(
+        &indexed,
+        INDEXED_IN,
+        &format!("EXPLAIN {}", too_many.replace("{t}", INDEXED_IN)),
+    )
+    .await;
+    let bounded = arrow::util::pretty::pretty_format_batches(&bounded)
+        .expect("format plan")
+        .to_string();
+    assert!(
+        bounded.contains("lookup_index_outcome=not_applicable")
+            && bounded.contains("lookup_index_reason=too_many_keys"),
+        "a lookup past the key bound did not say why it scanned:\n{bounded}"
+    );
 
     let negated = "SELECT COUNT(*) FROM {t} WHERE \"AutoId\" NOT IN (3, 17)";
     let before = counters_of(&indexed);

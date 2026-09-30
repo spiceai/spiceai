@@ -35481,11 +35481,14 @@ impl CayenneTableProvider {
                 .iter()
                 .find_map(|filter| bare_column_values_for(filter, column, column_type(column)))
         };
-        let Some(probe) = indexer.probe_key(&values_for) else {
-            return Ok(Some((
-                None,
-                super::lookup_index::LookupIndexExplain::not_applicable(None),
-            )));
+        let probe = match indexer.probe_key(&values_for) {
+            Ok(probe) => probe,
+            Err(reason) => {
+                return Ok(Some((
+                    None,
+                    super::lookup_index::LookupIndexExplain::scanned(None, reason),
+                )));
+            }
         };
         let mut segments = Vec::new();
         let mut read_whole = false;
@@ -35668,7 +35671,10 @@ impl CayenneTableProvider {
         let Some(shape) = index_state.matched_shape(&values_for) else {
             return Some((
                 None,
-                super::lookup_index::LookupIndexExplain::not_applicable(None),
+                super::lookup_index::LookupIndexExplain::scanned(
+                    None,
+                    super::lookup_index::LookupIndexScanReason::NoKeyPinned,
+                ),
             ));
         };
         let (selection, explain) = match index_state.probe(pinned_index, &values_for) {

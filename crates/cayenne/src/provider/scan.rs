@@ -995,6 +995,9 @@ impl DisplayAs for CayenneAccelerationExec {
             if let Some(candidate_rows) = lookup.candidate_rows {
                 write!(f, ", candidate_rows={candidate_rows}")?;
             }
+            if let Some(reason) = lookup.reason {
+                write!(f, ", lookup_index_reason={}", reason.as_str())?;
+            }
         }
         Ok(())
     }
