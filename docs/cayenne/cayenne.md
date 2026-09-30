@@ -112,20 +112,6 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
   until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
 
-For a table with a primary key, memory-tier and inline writes resolve or
-validate keys across their buffered batches before publishing. Within one
-buffered write, `on_conflict: drop` keeps the
-first row for each key, including repeats across record batches. `upsert`
-rejects repeats within a record batch and keeps the last copy across batches.
-If `on_conflict` is absent, the runtime
-automatically configures `upsert` for a primary key. `upsert_dedup` removes
-identical rows but rejects conflicting values; and
-`upsert_dedup_by_row_id` keeps the last row for each key. Both deduplication
-modes keep the last copy across batches. A null key fails the
-refresh and leaves the prior table visible. The two deduplication modes buffer
-the incoming write in memory to resolve conflicts across batches on buffered
-memory-tier and inline paths, including when the acceleration uses `mode: file`.
-
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,
 partition reject), `VortexConfig.memory_mode`,
@@ -992,6 +978,23 @@ The mechanics that make this correct:
 - Inline-conflict tombstones are inserted durably as unpublished and carry their exact UUID into Stage B. Their in-memory activation and replacement-snapshot publication happen under one listing fence; durable `published = true` flips are deferred and replay-safe, so neither a crash nor a repeated finalize can activate a different tombstone for the same key.
 - `total_superseded` nets the live row count: an upsert replacing *N* rows adds `inserted − N` live rows, not `inserted`.
 
+
+### Keys repeated within one write
+
+A refresh or `INSERT` can carry the same primary key more than once (two source files holding one key, say). Cayenne applies the documented `on_conflict` semantics, in which each incoming record batch is one upsert statement (`ConflictPolicy`, `KeyResolver` in `provider/key_conflicts.rs`):
+
+| `on_conflict` | repeat within a batch | repeat across batches |
+|---|---|---|
+| `drop` | first copy kept | first copy kept |
+| `upsert` | the write fails | last copy wins |
+| `upsert_dedup` | identical rows collapse; differing ones fail the write | last copy wins |
+| `upsert_dedup_by_row_id` | last copy wins | last copy wins |
+
+"Last" is the order the rows arrive in. The `upsert` refinement (`UpsertDedup`) comes from the acceleration's options on every load and is not stored in the table metadata. How a write applies the table depends on whether it holds all its rows before committing:
+
+- **Buffered writes** — `mode: memory`, an inline-admitted write or overwrite, and each segment of a segmented append (`write_append_segmented`) — collapse their raw batches with `KeyResolver::collapse_write` *before* conflict validation runs, so validation, the tombstones it records and the live-row delta see one row per key.
+- **A streaming full refresh** (`begin_overwrite` on the Vortex path) cannot know a later copy is coming, and rows inside one snapshot are never ordered by sequence, so it writes a later copy into a higher **layer**: the main snapshot, then protected snapshots above it (`LayerSplitter`, `provider/overwrite_layers.rs`). A batch that repeats a key the current layer may hold — or that would take the layer past `MAX_LAYER_ROWS` (8M) — opens a new layer, and in every layer above the first, a key an earlier layer may hold is tombstoned at that layer's delete sequence. Each layer reserves `D < I < T` above the main snapshot's `S`, so its tombstones hide the key in every lower layer while its threshold `T` exempts its own rows. Both questions are answered by bloom filters charged to the query memory pool (48 bits per key for the current layer, 16 for the whole write): a false positive costs an extra layer or a harmless tombstone, never a row. The layers, their key deletion vectors (with the re-insert marker) and their `cayenne_snapshot_sequence` rows commit in the overwrite's own transaction (`OverwriteLayer`, `commit_overwrite_in_txn`) and are installed in its visibility flip (`publish_overwrite_snapshot_fenced`), so the published state is exactly what the overwrite followed by one upsert per layer leaves — the state every scan, reopen and compaction already handles. With more than one layer the row count is served inexact until compaction folds the layers. Under `drop`, a later copy must be dropped outright, which a bloom false positive would get wrong, so the refresh keeps an exact 16-byte digest per key instead (`FirstCopyFilter`).
+- **Change-stream writes** (`refresh_mode: changes`) apply the rows as ordered changes: a later change of a key supersedes an earlier one (under `drop` the first is kept), and a repeat never fails the write (`KeyResolver::for_change_stream`).
 
 ## Flow D — Delete (the filter fast path)
 
