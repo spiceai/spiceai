@@ -125,6 +125,10 @@ modes keep the last copy across batches. A null key fails the
 refresh and leaves the prior table visible. The two deduplication modes buffer
 the incoming write in memory to resolve conflicts across batches on buffered
 memory-tier and inline paths, including when the acceleration uses `mode: file`.
+When a file-backed append exceeds inline buffering, Cayenne streams its batches
+into ordered protected-snapshot layers. A repeated key starts a later layer;
+validation against the preceding layer records the upsert deletion. All layers
+commit in one metastore transaction and become visible under one listing fence.
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,
