@@ -86,38 +86,31 @@ pub struct ChatWrapper {
     pub defaults: Vec<(String, serde_json::Value)>,
 }
 
-/// Sets a certain field in a [`CreateChatCompletionRequest`] to a given value.
-/// Emit a warning if the value cannot be parsed, from a string to the respective field's type.
+/// Sets a field of a [`CreateChatCompletionRequest`] to the model's default for it when
+/// the request leaves it unset.
 macro_rules! set_default_w_warning {
     ($req:expr, $field:ident, $value:expr, $model:expr) => {
         $req.$field = $req
             .$field
-            .or_else(|| match serde_json::from_value($value.clone()) {
-                Ok(val) => Some(val),
-                Err(_) => {
-                    tracing::warn!(
-                        "Failed to parse `{}` model parameter override for model='{}'. Ensure {:?} is of the correct format.",
-                        stringify!($field),
-                        $model,
-                        $value
-                    );
-                    None
-                }
-            })
+            .or_else(|| parse_default(stringify!($field), $value, &$model))
     };
 }
 
-/// Emits the warning [`set_default_w_warning`] would when `value` is not a valid `T`,
-/// for a default that is checked but not applied.
-fn warn_if_unparseable<T: serde::de::DeserializeOwned>(
+/// `value` as the model's default for `field`, or `None`, with a warning, when it is not
+/// a valid value for that field.
+fn parse_default<T: serde::de::DeserializeOwned>(
     field: &str,
     value: &serde_json::Value,
     model: &str,
-) {
-    if serde_json::from_value::<T>(value.clone()).is_err() {
-        tracing::warn!(
-            "Failed to parse `{field}` model parameter override for model='{model}'. Ensure {value:?} is of the correct format."
-        );
+) -> Option<T> {
+    match T::deserialize(value) {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            tracing::warn!(
+                "Failed to parse `{field}` model parameter override for model='{model}'. Ensure {value:?} is of the correct format."
+            );
+            None
+        }
     }
 }
 
@@ -244,22 +237,25 @@ impl ChatWrapper {
         mut req: CreateChatCompletionRequest,
     ) -> CreateChatCompletionRequest {
         let offers_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
-        for (key, v) in &self.defaults {
-            let value = v.clone();
+        for (key, value) in &self.defaults {
             match key.as_str() {
+                // These defaults are only checked, so a malformed one is still reported at
+                // startup. Whether to stream is decided by the call, `chat_request` or
+                // `chat_stream`, and `chat_request` fails on a request marked as streaming.
                 // A tool choice or parallel-call setting means nothing to a request that
-                // offers no tools, and providers reject a request that sends one alone,
-                // so these defaults apply only when the request offers tools. The value
-                // is still checked, so a malformed default is reported at startup.
+                // offers no tools, and providers reject one sent alone.
+                "stream" => {
+                    parse_default::<bool>("stream", value, &self.public_name);
+                }
                 "tool_choice" if !offers_tools => {
-                    warn_if_unparseable::<ChatCompletionToolChoiceOption>(
+                    parse_default::<ChatCompletionToolChoiceOption>(
                         "tool_choice",
-                        &value,
+                        value,
                         &self.public_name,
                     );
                 }
                 "parallel_tool_calls" if !offers_tools => {
-                    warn_if_unparseable::<bool>("parallel_tool_calls", &value, &self.public_name);
+                    parse_default::<bool>("parallel_tool_calls", value, &self.public_name);
                 }
                 "frequency_penalty" => {
                     set_default_w_warning!(req, frequency_penalty, value, self.public_name);
@@ -286,7 +282,6 @@ impl ChatWrapper {
                 }
                 "seed" => set_default_w_warning!(req, seed, value, self.public_name),
                 "stop" => set_default_w_warning!(req, stop, value, self.public_name),
-                "stream" => set_default_w_warning!(req, stream, value, self.public_name),
                 "stream_options" => {
                     set_default_w_warning!(req, stream_options, value, self.public_name);
                 }
@@ -594,7 +589,7 @@ mod stream_options_null_suppression {
 }
 
 #[cfg(test)]
-mod tool_only_defaults {
+mod call_dependent_defaults {
     use std::sync::Arc;
 
     use async_openai::types::chat::{
@@ -621,6 +616,7 @@ mod tool_only_defaults {
             "judge",
             None,
             vec![
+                ("stream".to_string(), json!(true)),
                 ("tool_choice".to_string(), json!("auto")),
                 ("parallel_tool_calls".to_string(), json!(false)),
                 ("temperature".to_string(), json!(0.5)),
@@ -631,6 +627,15 @@ mod tool_only_defaults {
     fn request(tools: serde_json::Value) -> CreateChatCompletionRequest {
         serde_json::from_value(json!({"model": "judge", "messages": [], "tools": tools}))
             .expect("chat request")
+    }
+
+    /// A `stream` default would turn a non-streaming call into one `chat_request`
+    /// refuses ("When stream is true, use Chat::create_stream"); the call decides.
+    #[test]
+    fn a_stream_default_is_never_applied() {
+        let prepared = wrapper().with_model_defaults(request(serde_json::Value::Null));
+
+        assert_eq!(prepared.stream, None);
     }
 
     /// A request with no tools, such as an evaluation's, must not be sent a tool choice

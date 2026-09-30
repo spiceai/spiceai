@@ -41,13 +41,25 @@ const MAX_PROBABILITY_SUM_TOLERANCE: f64 = 0.1;
 /// defined.
 ///
 /// A response that drops, re-types, or answers outside its own options is a wrong
-/// result, not a success, so a provider surfaces a failure here as an unparseable
-/// response rather than publishing it.
+/// result, not a success, so it is reported as an unparseable response from `model`
+/// rather than published.
 ///
 /// # Errors
 ///
-/// Returns a description of the first answer that does not match its question.
+/// Returns [`crate::Error::UnparseableResponse`] describing the first answer that does
+/// not match its question.
 pub fn check_answers(
+    model: &str,
+    asked: &BTreeMap<String, Question>,
+    response: &EvaluateResponse,
+) -> crate::Result<()> {
+    first_mismatch(asked, response).map_err(|detail| crate::Error::UnparseableResponse {
+        model: model.to_string(),
+        response: detail,
+    })
+}
+
+fn first_mismatch(
     asked: &BTreeMap<String, Question>,
     response: &EvaluateResponse,
 ) -> Result<(), String> {

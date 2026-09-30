@@ -33,7 +33,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
-use evaluate_api::{EntryType, NonNullEntry, NoulCriteria, NullableEntry, Question};
+use evaluate_api::{EntryType, NoulCriteria, NullableEntry, Question};
 use serde_json::{Map, Value, json};
 
 use crate::AnswerMode;
@@ -66,102 +66,74 @@ pub(crate) fn reply_schema(questions: &BTreeMap<String, Question>, mode: AnswerM
 }
 
 fn answer_schema(question: &Question, mode: AnswerMode) -> Value {
-    match (question, mode) {
-        (
-            Question::Noul {
-                instructions,
-                criteria,
-            },
-            _,
-        ) => {
+    let (instructions, labels, probability_intro, discrete_header) = match question {
+        Question::Noul {
+            instructions,
+            criteria,
+        } => {
             let kind = match mode {
                 AnswerMode::Probabilities => "number",
                 AnswerMode::Discrete => "boolean",
             };
-            json!({
+            return json!({
                 "description": noul_description(instructions, criteria.as_ref(), mode),
                 "type": kind,
-            })
+            });
         }
-        (
-            Question::Choice {
-                instructions,
-                criteria,
-            },
-            AnswerMode::Probabilities,
-        ) => probability_map(
-            &format!(
-                "Each property maps an option to the probability that it is the best answer.\nQuestion: {}",
-                instruction_text(instructions)
-            ),
+        Question::Choice {
+            instructions,
+            criteria,
+        } => (
+            instructions,
             criteria
                 .iter()
-                .map(|(option, criterion)| (option.clone(), entry_text(criterion))),
+                .map(|(option, criterion)| (option.clone(), entry_text(criterion)))
+                .collect::<Vec<_>>(),
+            "Each property maps an option to the probability that it is the best answer.",
+            "Choice labels, answer with one label",
         ),
-        (
-            Question::Choice {
-                instructions,
-                criteria,
-            },
-            AnswerMode::Discrete,
-        ) => {
-            let options = criteria
-                .iter()
-                .map(|(option, criterion)| format!("{option} = {}", entry_text(criterion)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            json!({
-                "description": format!(
-                    "{}\nChoice labels, answer with one label:\n{options}",
-                    instruction_text(instructions)
-                ),
-                "enum": criteria.keys().collect::<Vec<_>>(),
-                "type": "string",
-            })
-        }
-        (
-            Question::Score {
-                instructions,
-                criteria,
-            },
-            AnswerMode::Probabilities,
-        ) => probability_map(
-            &format!(
-                "Each property maps a rubric level to the probability that the document matches it.\nQuestion: {}",
-                instruction_text(instructions)
-            ),
+        Question::Score {
+            instructions,
+            criteria,
+        } => (
+            instructions,
             criteria
                 .iter()
                 .enumerate()
-                .map(|(level, criterion)| (level.to_string(), level_text(criterion))),
+                .map(|(level, criterion)| {
+                    (level.to_string(), entry_text(&EntryType::from(criterion)))
+                })
+                .collect(),
+            "Each property maps a rubric level to the probability that the document matches it.",
+            "Score levels, answer with the integer",
         ),
-        (
-            Question::Score {
-                instructions,
-                criteria,
-            },
-            AnswerMode::Discrete,
-        ) => {
-            let levels = criteria
+    };
+    let asked = instruction_text(instructions);
+    match mode {
+        AnswerMode::Probabilities => {
+            probability_map(&format!("{probability_intro}\nQuestion: {asked}"), labels)
+        }
+        AnswerMode::Discrete => {
+            let listing = labels
                 .iter()
-                .enumerate()
-                .map(|(level, criterion)| format!("{level} = {}", level_text(criterion)))
+                .map(|(label, text)| format!("{label} = {text}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            json!({
-                "description": format!(
-                    "{}\nScore levels, answer with the integer:\n{levels}",
-                    instruction_text(instructions)
-                ),
-                "type": "integer",
-            })
+            let description = format!("{asked}\n{discrete_header}:\n{listing}");
+            // A choice is answered with its label, a score with its level's index.
+            if matches!(question, Question::Choice { .. }) {
+                let options: Vec<String> = labels.into_iter().map(|(label, _)| label).collect();
+                json!({"description": description, "enum": options, "type": "string"})
+            } else {
+                json!({"description": description, "type": "integer"})
+            }
         }
     }
 }
 
 /// An object holding one probability per option or rubric level, each described by
 /// its criterion.
-fn probability_map(description: &str, labels: impl Iterator<Item = (String, String)>) -> Value {
+fn probability_map(description: &str, labels: Vec<(String, String)>) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
     for (label, criterion) in labels {
@@ -217,14 +189,6 @@ fn entry_text(entry: &EntryType) -> String {
         EntryType::String(text) => text.clone(),
         EntryType::Array(items) => Value::Array(items.clone()).to_string(),
         EntryType::Object(fields) => Value::Object(fields.clone()).to_string(),
-    }
-}
-
-fn level_text(level: &NonNullEntry) -> String {
-    match level {
-        NonNullEntry::String(text) => text.clone(),
-        NonNullEntry::Array(items) => Value::Array(items.clone()).to_string(),
-        NonNullEntry::Object(fields) => Value::Object(fields.clone()).to_string(),
     }
 }
 

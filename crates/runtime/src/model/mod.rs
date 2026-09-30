@@ -34,7 +34,7 @@ mod wrapper;
 
 pub use chat::{LLMChatCompletionsModelStore, LoadedChatModel, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
-pub use evaluate::{EvaluateModelStore, chat_evaluator, is_evaluate_only, try_to_evaluate_model};
+pub use evaluate::{EvaluateModelStore, is_evaluate_only, try_to_evaluate_model};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };

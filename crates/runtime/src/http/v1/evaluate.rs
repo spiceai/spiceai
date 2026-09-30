@@ -22,7 +22,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::model::metrics::{handle_metrics, handle_token_metrics};
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -31,14 +30,12 @@ use axum::{
 #[cfg(feature = "openapi")]
 use evaluate_api::EvaluateResponse;
 use evaluate_api::{Error as EvaluateError, EvaluateRequest};
-use opentelemetry::{Key, KeyValue, Value};
-use std::time::Instant;
 use tokio::sync::RwLock;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing_futures::Instrument;
 
-use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
+use crate::model::EvaluateModelStore;
 
 /// Evaluate
 ///
@@ -67,7 +64,6 @@ use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 ))]
 pub(crate) async fn post(
     Extension(models): Extension<Arc<RwLock<EvaluateModelStore>>>,
-    Extension(chat_models): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     Json(req): Json<EvaluateRequest>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -97,53 +93,22 @@ pub(crate) async fn post(
     }
 
     let model_id = req.model.clone();
-    // Evaluations are inference: they belong in the same request, failure, duration and
-    // token series as the chat and responses paths rather than a family of their own.
-    // A chat model's evaluation already lands there, since every call it makes to the
-    // model — corrective retries included — is recorded by the chat model itself, so
-    // recording the evaluation too would count its requests and tokens twice. Both stores
-    // are read under one hold, so the evaluator and whether its calls are recorded come
-    // from the same moment even while the model is reloaded.
-    let (model, recorded_per_call) = {
-        let chat_models = chat_models.read().await;
-        let models = models.read().await;
-        (
-            models.get(&model_id).cloned(),
-            chat_models.contains_key(&model_id),
-        )
-    };
-    let Some(model) = model else {
+    let Some(model) = models.read().await.get(&model_id).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": format!(
-                    "Model '{model_id}' not found. Evaluate with a chat model or a System One model (e.g. `from: typesafe:jev`) configured in your Spicepod. See: https://spiceai.org/docs/components/models"
+                    "Model '{model_id}' not found. Evaluate with a model under `models` in your Spicepod: a chat model, or a System One model such as `from: typesafe:jev`. See: https://spiceai.org/docs/components/models"
                 )
             })),
         )
             .into_response();
     };
 
-    let labels = [KeyValue::new(
-        Key::new("model"),
-        Value::String(model_id.clone().into()),
-    )];
-    let start = Instant::now();
-
-    let result = model.evaluate(req).await;
-    if !recorded_per_call {
-        handle_metrics(start.elapsed(), result.is_err(), &labels);
-    }
-
-    match result {
+    // Request, duration and token metrics are recorded by the model itself, where the
+    // inference happens (`ChatWrapper`, or the System One model's wrapper).
+    match model.evaluate(req).await {
         Ok(response) => {
-            if let Some(usage) = response.usage.as_ref().filter(|_| !recorded_per_call) {
-                handle_token_metrics(
-                    u32::try_from(usage.input_tokens).unwrap_or(u32::MAX),
-                    u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
-                    &labels,
-                );
-            }
             // The exporter reads `captured_output` for the row's result and derives
             // `error_message` only from ERROR events, so both are emitted here.
             tracing::info!(
@@ -227,10 +192,10 @@ mod tests {
                 }),
             })
         }
-    }
 
-    fn no_chat_models() -> Arc<RwLock<LLMChatCompletionsModelStore>> {
-        Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()))
+        async fn health(&self) -> evaluate_api::Result<()> {
+            Ok(())
+        }
     }
 
     fn request_with_question(model: &str) -> EvaluateRequest {
@@ -252,12 +217,7 @@ mod tests {
     #[tokio::test]
     async fn evaluate_returns_404_for_unknown_model() {
         let models = Arc::new(RwLock::new(EvaluateModelStore::new()));
-        let response = post(
-            Extension(models),
-            Extension(no_chat_models()),
-            Json(request_with_question("missing")),
-        )
-        .await;
+        let response = post(Extension(models), Json(request_with_question("missing"))).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -266,12 +226,7 @@ mod tests {
         let mut store = EvaluateModelStore::new();
         store.insert("jev".into(), Arc::new(DummyEvaluate { name: "jev".into() }));
         let models = Arc::new(RwLock::new(store));
-        let response = post(
-            Extension(models),
-            Extension(no_chat_models()),
-            Json(request_with_question("jev")),
-        )
-        .await;
+        let response = post(Extension(models), Json(request_with_question("jev"))).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response
             .into_body()
@@ -291,7 +246,6 @@ mod tests {
         let models = Arc::new(RwLock::new(store));
         let response = post(
             Extension(models),
-            Extension(no_chat_models()),
             Json(EvaluateRequest {
                 model: "jev".into(),
                 state: EvaluateState::from("x"),
@@ -308,7 +262,6 @@ mod tests {
         let models = Arc::new(RwLock::new(EvaluateModelStore::new()));
         let response = post(
             Extension(models),
-            Extension(no_chat_models()),
             Json(EvaluateRequest {
                 model: "jev".to_string(),
                 state: EvaluateState::String("s".to_string()),
@@ -345,6 +298,10 @@ mod tests {
             }
             .fail()
         }
+
+        async fn health(&self) -> evaluate_api::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -352,12 +309,7 @@ mod tests {
         let mut store = EvaluateModelStore::new();
         store.insert("jev".into(), Arc::new(UnavailableEvaluate));
         let models = Arc::new(RwLock::new(store));
-        let response = post(
-            Extension(models),
-            Extension(no_chat_models()),
-            Json(request_with_question("jev")),
-        )
-        .await;
+        let response = post(Extension(models), Json(request_with_question("jev"))).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response
             .into_body()
@@ -401,21 +353,20 @@ mod tests {
         }
     }
 
-    /// A chat model answers `/v1/evaluate` through the evaluator registered for it.
+    /// A chat model answers `/v1/evaluate` through its evaluator.
     #[tokio::test]
     async fn evaluate_answers_with_a_chat_model() {
-        let chat: Arc<dyn llms::chat::Chat> = Arc::new(AnsweringChat);
         let mut evaluators = EvaluateModelStore::new();
         evaluators.insert(
             "judge".into(),
-            crate::model::chat_evaluator("judge", Arc::clone(&chat)),
+            Arc::new(evaluate_chat::ChatEvaluator::new(
+                "judge",
+                Arc::new(AnsweringChat),
+            )),
         );
-        let mut chats = LLMChatCompletionsModelStore::new();
-        chats.insert("judge".into(), chat);
 
         let response = post(
             Extension(Arc::new(RwLock::new(evaluators))),
-            Extension(Arc::new(RwLock::new(chats))),
             Json(request_with_question("judge")),
         )
         .await;

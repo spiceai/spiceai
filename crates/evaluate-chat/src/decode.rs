@@ -28,7 +28,7 @@ use std::fmt;
 use evaluate_api::{
     Answer, EntryType, NonNullEntry, Question, is_probability, probability_sum_tolerance,
 };
-use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 use crate::AnswerMode;
@@ -48,9 +48,6 @@ pub(crate) fn parse_reply(
     mode: AnswerMode,
 ) -> Result<BTreeMap<String, Answer>, String> {
     let json = json_object(reply)?;
-    // Parsing into a `Value` keeps only the last of repeated keys, so a reply giving two
-    // answers for one question would lose the conflict there. It is caught first.
-    serde_json::from_str::<NoRepeatedKeys>(json).map_err(|e| e.to_string())?;
     let Value::Object(mut reply) =
         serde_json::from_str(json).map_err(|e| format!("the reply is not a JSON object ({e})"))?
     else {
@@ -114,10 +111,10 @@ fn answer(question: &Question, value: &Value, mode: AnswerMode) -> Result<Answer
             Ok(choice_answer(&options, &probabilities))
         }
         Question::Score { criteria, .. } => {
-            let levels: Vec<String> = (0..criteria.len()).map(|level| level.to_string()).collect();
-            let levels: Vec<&str> = levels.iter().map(String::as_str).collect();
-            let probabilities = distribution(value, &levels, mode)?;
-            Ok(score_answer(criteria, &probabilities))
+            let labels: Vec<String> = (0..criteria.len()).map(|level| level.to_string()).collect();
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let probabilities = distribution(value, &labels, mode)?;
+            Ok(score_answer(criteria, &labels, &probabilities))
         }
     }
 }
@@ -243,55 +240,40 @@ fn choice_answer(options: &[&str], probabilities: &[f64]) -> Answer {
 
 /// The probability-weighted average level, with the full distribution and the rubric
 /// as its legend.
-fn score_answer(levels: &[NonNullEntry], probabilities: &[f64]) -> Answer {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "score rubrics have at most ten levels"
-    )]
-    let (score, top): (f64, f64) = (
-        probabilities
-            .iter()
-            .enumerate()
-            .map(|(level, p)| level as f64 * p)
-            .sum(),
-        levels.len().saturating_sub(1) as f64,
-    );
+fn score_answer(levels: &[NonNullEntry], labels: &[&str], probabilities: &[f64]) -> Answer {
+    let score: f64 = probabilities
+        .iter()
+        .enumerate()
+        .map(|(level, p)| as_f64(level) * p)
+        .sum();
     Answer::Score {
         // The exact average of a distribution lies inside the rubric; rounding in the sum
         // can land it a hair outside, on a level no reply chose.
-        score: score.clamp(0.0, top),
-        legend: levels
+        score: score.clamp(0.0, as_f64(levels.len().saturating_sub(1))),
+        legend: labels
             .iter()
-            .enumerate()
-            .map(|(level, criterion)| (level.to_string(), legend_entry(criterion)))
+            .zip(levels)
+            .map(|(label, criterion)| ((*label).to_string(), EntryType::from(criterion)))
             .collect(),
-        probabilities: probabilities
+        probabilities: labels
             .iter()
-            .enumerate()
-            .map(|(level, p)| (level.to_string(), *p))
+            .zip(probabilities)
+            .map(|(label, p)| ((*label).to_string(), *p))
             .collect(),
         confidence: score_confidence(probabilities),
     }
 }
 
-fn legend_entry(level: &NonNullEntry) -> EntryType {
-    match level {
-        NonNullEntry::String(text) => EntryType::String(text.clone()),
-        NonNullEntry::Array(items) => EntryType::Array(items.clone()),
-        NonNullEntry::Object(fields) => EntryType::Object(fields.clone()),
-    }
-}
-
 /// Where the peak probability sits between uniform (0) and certainty (1).
+///
+/// `probabilities` sum to 1, so no rescaling is needed; the clamp absorbs the rounding
+/// in a sum that is 1 only to within [`NORMALIZED_SUM_SLACK`].
 pub(crate) fn choice_confidence(probabilities: &[f64]) -> f64 {
     if probabilities.len() <= 1 {
         return 1.0;
     }
-    let probabilities = normalized(probabilities);
-    #[expect(clippy::cast_precision_loss, reason = "the number of options is small")]
-    let uniform = 1.0 / probabilities.len() as f64;
+    let uniform = 1.0 / as_f64(probabilities.len());
     let peak = probabilities.iter().copied().fold(0.0, f64::max);
-    // A uniform distribution rescaled in floating point can peak a hair below `uniform`.
     ((peak - uniform) / (1.0 - uniform)).clamp(0.0, 1.0)
 }
 
@@ -301,42 +283,28 @@ pub(crate) fn score_confidence(probabilities: &[f64]) -> f64 {
     if probabilities.len() <= 1 {
         return 1.0;
     }
-    let probabilities = normalized(probabilities);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "score rubrics have at most ten levels"
-    )]
-    let (mode, levels) = (argmax(&probabilities) as f64, probabilities.len() as f64);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "score rubrics have at most ten levels"
-    )]
+    let mode = as_f64(argmax(probabilities));
     let distance_from_mode: f64 = probabilities
         .iter()
         .enumerate()
-        .map(|(level, p)| p * (level as f64 - mode).abs())
+        .map(|(level, p)| p * (as_f64(level) - mode).abs())
         .sum();
+    let levels = as_f64(probabilities.len());
     let center = (levels - 1.0) / 2.0;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "score rubrics have at most ten levels"
-    )]
     let uniform_spread = (0..probabilities.len())
-        .map(|level| (level as f64 - center).abs())
+        .map(|level| (as_f64(level) - center).abs())
         .sum::<f64>()
         / levels;
     (1.0 - distance_from_mode / uniform_spread).clamp(0.0, 1.0)
 }
 
-/// Rescaled to sum to 1; an all-zero input becomes uniform.
-fn normalized(probabilities: &[f64]) -> Vec<f64> {
-    let total: f64 = probabilities.iter().sum();
-    if total == 0.0 {
-        #[expect(clippy::cast_precision_loss, reason = "the number of options is small")]
-        let uniform = 1.0 / probabilities.len() as f64;
-        return vec![uniform; probabilities.len()];
-    }
-    probabilities.iter().map(|p| p / total).collect()
+/// A count of options or rubric levels, or an index into one, as a float.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "option and level counts are far below where `f64` stops representing integers"
+)]
+fn as_f64(n: usize) -> f64 {
+    n as f64
 }
 
 /// The index of the first largest value.
@@ -354,15 +322,16 @@ fn argmax(values: &[f64]) -> usize {
 /// between sentences.
 ///
 /// A reply holding a second object is ambiguous — a draft and its revision, say — so it
-/// is rejected rather than read as either.
+/// is rejected rather than read as either. So is an object that repeats a key: parsing
+/// it into a `Value` would keep only the last of two answers to one question.
 fn json_object(reply: &str) -> Result<&str, String> {
     let Some(start) = reply.find('{') else {
         return Err("the reply contains no JSON object".to_string());
     };
     let from_object = reply.get(start..).unwrap_or_default();
-    let mut values = serde_json::Deserializer::from_str(from_object).into_iter::<IgnoredAny>();
+    let mut values = serde_json::Deserializer::from_str(from_object).into_iter::<NoRepeatedKeys>();
     match values.next() {
-        Some(Ok(_)) => {
+        Some(Ok(NoRepeatedKeys)) => {
             let (object, rest) = from_object.split_at(values.byte_offset());
             if rest.contains('{') {
                 return Err(
@@ -371,6 +340,9 @@ fn json_object(reply: &str) -> Result<&str, String> {
             }
             Ok(object)
         }
+        // A repeated key is well-formed JSON with a meaning problem, which the error
+        // describes itself.
+        Some(Err(e)) if e.is_data() => Err(e.to_string()),
         Some(Err(e)) => Err(format!("the reply is not a JSON object ({e})")),
         None => Err("the reply contains no JSON object".to_string()),
     }
@@ -463,11 +435,7 @@ fn list(labels: &[&str]) -> String {
 
 /// `value` as compact JSON, cut short when long.
 fn quote(value: &Value) -> String {
-    let text = value.to_string();
-    match text.char_indices().nth(MAX_QUOTED_VALUE_CHARS) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text,
-    }
+    crate::truncated(&value.to_string(), MAX_QUOTED_VALUE_CHARS)
 }
 
 #[cfg(test)]
@@ -513,7 +481,7 @@ mod tests {
                 score: actual_score,
                 confidence: actual_confidence,
                 ..
-            } = score_answer(&levels, &probabilities)
+            } = score_answer(&levels, &["0", "1", "2", "3", "4"], &probabilities)
             else {
                 panic!("expected a score");
             };
@@ -695,19 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fenced_reply_is_read() {
-        let reply = format!(
-            "```json\n{}\n```",
-            json!({"answers": {
-                "is_urgent": 0.1,
-                "team": {"billing": 0.0, "sales": 0.0, "technical": 1.0},
-                "tone": {"0": 1.0, "1": 0.0, "2": 0.0}
-            }})
-        );
-        parse_reply(&reply, &sample_questions(), AnswerMode::Probabilities).expect("fenced JSON");
-    }
-
-    #[test]
     fn long_values_are_quoted_in_part() {
         let long = Value::String("x".repeat(500));
         let quoted = quote(&long);
@@ -808,13 +763,13 @@ mod tests {
             answers,
             usage: None,
         };
-        evaluate_api::check_answers(questions, &response)?;
+        evaluate_api::check_answers("judge", questions, &response).map_err(|e| e.to_string())?;
         Ok(response.answers)
     }
 
-    /// Regression: twenty equal masses of 0.05 rescale to a peak a hair below uniform,
-    /// and the confidence computed from it came out negative, which `check_answers`
-    /// rejects, turning a valid reply into a failed evaluation.
+    /// Regression: twenty equal masses of 0.05 came out with a confidence a hair below
+    /// zero, which `check_answers` rejects, turning a valid reply into a failed
+    /// evaluation.
     #[test]
     fn a_uniform_choice_has_zero_confidence() {
         let options: Vec<String> = (0..20).map(|i| format!("option_{i:02}")).collect();

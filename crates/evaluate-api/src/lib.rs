@@ -188,6 +188,16 @@ impl From<String> for NonNullEntry {
     }
 }
 
+impl From<&NonNullEntry> for EntryType {
+    fn from(value: &NonNullEntry) -> Self {
+        match value {
+            NonNullEntry::String(text) => Self::String(text.clone()),
+            NonNullEntry::Array(items) => Self::Array(items.clone()),
+            NonNullEntry::Object(fields) => Self::Object(fields.clone()),
+        }
+    }
+}
+
 /// Distinguishes an omitted field from an explicit JSON `null` and a present value.
 ///
 /// Serde's `Option<T>` collapses JSON `null` to `None`, which would drop nested
@@ -459,10 +469,11 @@ pub trait Evaluate: Send + Sync + Debug {
     /// should substitute their upstream model id before calling the remote API.
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
-    /// Optional health check (e.g. list models). Default is a no-op.
-    async fn health(&self) -> Result<()> {
-        Ok(())
-    }
+    /// Checks the model can answer, e.g. by listing the provider's models.
+    ///
+    /// No default: a wrapper that inherited one would silently skip the check of the
+    /// model it wraps, so every implementation says what its health is.
+    async fn health(&self) -> Result<()>;
 }
 
 #[cfg(test)]

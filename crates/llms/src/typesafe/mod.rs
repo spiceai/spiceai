@@ -28,14 +28,13 @@ mod list_models;
 use list_models::ModelsResponse;
 pub use list_models::TypeSafeModelLister;
 
-use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use evaluate_api::{
     AuthenticationFailedSnafu, Evaluate, EvaluateRequest, EvaluateResponse, HealthCheckFailedSnafu,
-    InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu, PermissionDeniedSnafu, Question,
+    InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu, PermissionDeniedSnafu,
     RateLimitedSnafu, RatePermitFailedSnafu, Result, ServiceUnavailableSnafu,
 };
 use reqwest::{Client, StatusCode};
@@ -118,23 +117,6 @@ impl TypeSafe {
     fn models_url(&self) -> String {
         format!("{}/v1/models", self.base_url)
     }
-
-    /// Every question asked must come back answered, with an answer of the matching
-    /// kind and a value inside the domain the question defined. A 200 that drops,
-    /// re-types, or answers outside its own options is a wrong result, not a success,
-    /// so it is surfaced as an unparseable response rather than published.
-    fn ensure_answers_match(
-        &self,
-        asked: &BTreeMap<String, Question>,
-        response: &EvaluateResponse,
-    ) -> Result<()> {
-        evaluate_api::check_answers(asked, response).map_err(|detail| {
-            evaluate_api::Error::UnparseableResponse {
-                model: self.name.clone(),
-                response: detail,
-            }
-        })
-    }
 }
 
 /// Whether the id is a `jev-<numeric version>` pin (`jev-1.13.0`) rather than an alias.
@@ -216,7 +198,9 @@ impl Evaluate for TypeSafe {
                         response: format!("{e}; body={body}"),
                     }
                 })?;
-                self.ensure_answers_match(&asked, &parsed)?;
+                // A 200 that drops, re-types, or answers outside its own options is a
+                // wrong result, not a success.
+                evaluate_api::check_answers(&self.name, &asked, &parsed)?;
                 Ok(parsed)
             }
             StatusCode::UNAUTHORIZED => AuthenticationFailedSnafu {

@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
+use evaluate_chat::ChatEvaluator;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
 use llms::chat::DistributedBackendSetting;
+use llms::evaluate::Evaluate;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
@@ -69,15 +71,25 @@ use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and without the Spice
-/// runtime tools.
+/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/evaluate`
+/// uses it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
     pub chat: Arc<dyn Chat>,
     /// The same model — same provider client, system prompt and parameter defaults — with
-    /// no runtime tools, for callers that send it content they do not trust, such as an
-    /// evaluation's `state`, which must not be able to steer a tool call.
-    pub without_tools: Arc<dyn Chat>,
+    /// no runtime tools.
+    without_tools: Arc<dyn Chat>,
+}
+
+impl LoadedChatModel {
+    /// The evaluator `/v1/evaluate` uses for this model, which the Spicepod names `name`.
+    ///
+    /// It calls the model without runtime tools: an evaluation's `state` is untrusted
+    /// input and must not be able to steer a tool call.
+    #[must_use]
+    pub fn evaluator(&self, name: &str) -> Arc<dyn Evaluate> {
+        Arc::new(ChatEvaluator::new(name, Arc::clone(&self.without_tools)))
+    }
 }
 
 // Default recursion limit for tool usage to prevent infinite loops.
