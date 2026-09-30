@@ -151,6 +151,8 @@ pub(crate) struct LayerSplitter {
     /// Keys of every layer written so far. 16 bits per key: a false positive
     /// here costs one tombstone.
     written_keys: ChainedBloom,
+    /// Append validation supplies its own cross-layer key deletions.
+    collect_tombstones: bool,
     layer: usize,
     layer_rows: usize,
     max_layer_rows: usize,
@@ -164,11 +166,31 @@ impl LayerSplitter {
         max_layer_rows: usize,
         reservation: MemoryReservation,
     ) -> Self {
+        Self::with_tombstones(resolver, int64_key, max_layer_rows, reservation, true)
+    }
+
+    /// Split an append without building overwrite-specific tombstones.
+    pub(crate) fn for_append(
+        resolver: KeyResolver,
+        max_layer_rows: usize,
+        reservation: MemoryReservation,
+    ) -> Self {
+        Self::with_tombstones(resolver, None, max_layer_rows, reservation, false)
+    }
+
+    fn with_tombstones(
+        resolver: KeyResolver,
+        int64_key: Option<usize>,
+        max_layer_rows: usize,
+        reservation: MemoryReservation,
+        collect_tombstones: bool,
+    ) -> Self {
         Self {
             resolver,
             int64_key,
             layer_keys: ChainedBloom::new(3),
             written_keys: ChainedBloom::new(1),
+            collect_tombstones,
             layer: 0,
             layer_rows: 0,
             max_layer_rows: max_layer_rows.max(1),
@@ -176,6 +198,10 @@ impl LayerSplitter {
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Bloom filters deliberately hash separate 64-bit halves of each 128-bit digest"
+    )]
     fn route(&mut self, batch: &RecordBatch) -> super::Result<Option<Routed>> {
         let resolved = self.resolver.resolve_batch(batch)?;
         if resolved.batch.num_rows() == 0 {
@@ -199,7 +225,7 @@ impl LayerSplitter {
         }
         // In the first layer every key written so far is in the current layer,
         // which rule 1 has just ruled out, so a hit there is a false positive.
-        let superseding: Vec<usize> = if self.layer == 0 {
+        let superseding: Vec<usize> = if !self.collect_tombstones || self.layer == 0 {
             Vec::new()
         } else {
             resolved
@@ -212,12 +238,18 @@ impl LayerSplitter {
         };
         for &digest in &resolved.digests {
             self.layer_keys.insert(layer_hash(digest));
-            self.written_keys.insert(written_hash(digest));
+            if self.collect_tombstones {
+                self.written_keys.insert(written_hash(digest));
+            }
         }
         self.layer_rows += rows;
         self.reservation
             .try_resize(self.layer_keys.memory_bytes() + self.written_keys.memory_bytes())?;
-        let tombstones = self.tombstones(&resolved.batch, &superseding)?;
+        let tombstones = if self.collect_tombstones {
+            self.tombstones(&resolved.batch, &superseding)?
+        } else {
+            LayerTombstones::default()
+        };
         Ok(Some(Routed {
             batch: resolved.batch,
             starts_layer,

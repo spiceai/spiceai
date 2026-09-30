@@ -101,6 +101,7 @@ async fn table(
         VortexConfig {
             deletion_mode: mode,
             inline_max_rows: 0,
+            stream_publish_interval_ms: 0,
             compaction_background_interval_ms: 3_600_000,
             compaction_trigger_protected_snapshots: 2,
             ..VortexConfig::default()
@@ -126,6 +127,146 @@ async fn reopen(
         .open("t")
         .await
         .expect("reopen")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_keeps_last_copy_through_reopen_and_compaction() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for dedup in [
+            UpsertDedup::None,
+            UpsertDedup::DropIdentical,
+            UpsertDedup::KeepLast,
+        ] {
+            let label = format!("{mode:?}/{dedup:?}");
+            let (provider, catalog, runtime_env, _dir) = table(mode, dedup).await;
+            write(
+                &provider,
+                InsertOp::Append,
+                vec![batch(&[(1, "old"), (9, "old")])],
+            )
+            .await
+            .expect("seed");
+            write(&provider, InsertOp::Append, repeated_across_batches())
+                .await
+                .expect("streaming append");
+            let expected = (
+                owned(&[
+                    (1, "c"),
+                    (2, "c"),
+                    (3, "a"),
+                    (4, "b"),
+                    (5, "c"),
+                    (6, "d"),
+                    (9, "old"),
+                ]),
+                7,
+            );
+            let check = |stage: &str, actual: (Vec<(i64, String)>, i64)| {
+                eprintln!("{label} {stage}: {:?} COUNT(*) {}", actual.0, actual.1);
+                assert_eq!(actual, expected, "{label} {stage}");
+            };
+            check("after append", visible(&provider).await);
+            let provider = reopen(&catalog, &runtime_env, dedup).await;
+            check("after reopen", visible(&provider).await);
+            provider
+                .compact_protected_snapshots_subset(8)
+                .await
+                .expect("merge");
+            check("after protected merge", visible(&provider).await);
+            provider
+                .sort_and_rewrite_data(64 * 1024 * 1024)
+                .await
+                .expect("rewrite");
+            check("after full rewrite", visible(&provider).await);
+            let provider = reopen(&catalog, &runtime_env, dedup).await;
+            check("after second reopen", visible(&provider).await);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_failure_leaves_previous_rows() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+            .await
+            .expect("seed");
+        let error = write(
+            &provider,
+            InsertOp::Append,
+            vec![
+                batch(&[(1, "a"), (2, "a")]),
+                batch(&[(2, "b")]),
+                batch(&[(5, "c"), (5, "d")]),
+            ],
+        )
+        .await
+        .expect_err("in-batch duplicate");
+        eprintln!("{mode:?} failed append: {error}");
+        assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_append_drop_keeps_first_copy() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, catalog, _dir) = create_cdc_table_with_schema(
+            "t",
+            Arc::clone(&runtime_env),
+            schema(),
+            vec!["id".to_string()],
+            VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 0,
+                stream_publish_interval_ms: 0,
+                compaction_background_interval_ms: 3_600_000,
+                compaction_trigger_protected_snapshots: 2,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothing(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        write(&provider, InsertOp::Append, vec![batch(&[(9, "old")])])
+            .await
+            .expect("seed");
+        write(&provider, InsertOp::Append, repeated_across_batches())
+            .await
+            .expect("streaming drop append");
+        let expected = (
+            owned(&[
+                (1, "a"),
+                (2, "a"),
+                (3, "a"),
+                (4, "b"),
+                (5, "c"),
+                (6, "d"),
+                (9, "old"),
+            ]),
+            7,
+        );
+        assert_eq!(visible(&provider).await, expected);
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        assert_eq!(visible(&provider).await, expected);
+        provider
+            .compact_protected_snapshots_subset(8)
+            .await
+            .expect("merge");
+        assert_eq!(visible(&provider).await, expected);
+        provider
+            .sort_and_rewrite_data(64 * 1024 * 1024)
+            .await
+            .expect("rewrite");
+        assert_eq!(visible(&provider).await, expected);
+        let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
+        assert_eq!(visible(&provider).await, expected);
+    }
 }
 
 /// `[(1,a),(2,a),(3,a)]`, `[(4,b),(2,b)]`, `[(2,c),(5,c),(1,c)]`, `[(6,d)]`: key 2
