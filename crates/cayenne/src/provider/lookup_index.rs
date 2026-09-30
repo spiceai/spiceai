@@ -170,6 +170,32 @@ impl LookupIndexExplainOutcome {
     }
 }
 
+/// Why a lookup on an indexed table scanned instead of using its index,
+/// reported in `EXPLAIN` beside `lookup_index_outcome=not_applicable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LookupIndexScanReason {
+    /// The filters give no indexed key a value for every one of its columns:
+    /// an equality, an `IN` list, or an `OR` of equalities on each.
+    NoKeyPinned,
+    /// The columns' values combine into more key tuples than a lookup probes.
+    TooManyKeys,
+    /// The key tuples match more candidate rows than a lookup reads.
+    TooManyCandidates,
+    /// A value cannot be cast to its key column's type.
+    ValueNotIndexable,
+}
+
+impl LookupIndexScanReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoKeyPinned => "no_key_pinned",
+            Self::TooManyKeys => "too_many_keys",
+            Self::TooManyCandidates => "too_many_candidates",
+            Self::ValueNotIndexable => "value_not_indexable",
+        }
+    }
+}
+
 /// Stable, scan-local lookup-index evidence carried into `EXPLAIN`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LookupIndexExplain {
@@ -177,6 +203,8 @@ pub(crate) struct LookupIndexExplain {
     pub(crate) outcome: LookupIndexExplainOutcome,
     pub(crate) candidate_files: Option<usize>,
     pub(crate) candidate_rows: Option<u64>,
+    /// Why the lookup scanned, when an indexed table's lookup did.
+    pub(crate) reason: Option<LookupIndexScanReason>,
 }
 
 impl LookupIndexExplain {
@@ -193,10 +221,10 @@ impl LookupIndexExplain {
             Unbuilt => 2,
             Selected => 3,
         };
-        let outcome = if rank(other.outcome) > rank(self.outcome) {
-            other.outcome
+        let (outcome, reason) = if rank(other.outcome) > rank(self.outcome) {
+            (other.outcome, other.reason)
         } else {
-            self.outcome
+            (self.outcome, self.reason.or(other.reason))
         };
         let sum_files = match (self.candidate_files, other.candidate_files) {
             (None, None) => None,
@@ -209,6 +237,7 @@ impl LookupIndexExplain {
             outcome,
             candidate_files: sum_files,
             candidate_rows: sum_rows,
+            reason: (outcome == NotApplicable).then_some(reason).flatten(),
         }
     }
 
@@ -218,6 +247,15 @@ impl LookupIndexExplain {
             outcome: LookupIndexExplainOutcome::NotApplicable,
             candidate_files: None,
             candidate_rows: None,
+            reason: None,
+        }
+    }
+
+    /// An indexed table's lookup that scanned, and why.
+    pub(crate) fn scanned(shape: Option<String>, reason: LookupIndexScanReason) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::not_applicable(shape)
         }
     }
 
@@ -227,6 +265,7 @@ impl LookupIndexExplain {
             outcome,
             candidate_files: None,
             candidate_rows: None,
+            reason: None,
         }
     }
 
@@ -241,6 +280,7 @@ impl LookupIndexExplain {
             outcome,
             candidate_files,
             candidate_rows: Some(candidate_rows),
+            reason: None,
         }
     }
 }
@@ -1284,6 +1324,9 @@ pub(crate) struct LookupIndexState {
     /// The snapshot and file set last reconciled against, so an unchanged one
     /// does no work and every reconcile sees a distinct file set.
     reconciled: Mutex<Option<(String, FileSetVersion)>>,
+    /// The table's current data files as last reconciled, which coverage is
+    /// reported against.
+    live_files: Mutex<Option<Arc<HashSet<String>>>>,
     /// Whether a background merge is running.
     merging: AtomicBool,
     schedule: Mutex<BuildSchedule>,
@@ -1341,6 +1384,7 @@ impl LookupIndexState {
             publish_lock: Mutex::new(()),
             reservation: Mutex::new(None),
             reconciled: Mutex::new(None),
+            live_files: Mutex::new(None),
             merging: AtomicBool::new(false),
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
@@ -1456,6 +1500,40 @@ impl LookupIndexState {
         }
     }
 
+    /// Reports, per key, how many of the table's current data files its runs
+    /// cover and how many they do not yet, on `cayenne_lookup_index_files`.
+    /// Nothing is reported until a scan has listed the table's files.
+    fn report_coverage(&self) {
+        for (label, covered, uncovered) in self.coverage().unwrap_or_default() {
+            for (coverage, files) in [("covered", covered), ("uncovered", uncovered)] {
+                telemetry::cayenne::track_lookup_index_files(
+                    u64::try_from(files).unwrap_or(u64::MAX),
+                    &[
+                        telemetry::KeyValue::new("table", self.table_name.clone()),
+                        telemetry::KeyValue::new("shape", label.to_string()),
+                        telemetry::KeyValue::new("coverage", coverage),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Per key, its label and how many of the table's current data files its
+    /// runs cover and do not cover; `None` before a scan has listed them.
+    fn coverage(&self) -> Option<Vec<(&str, usize, usize)>> {
+        let live = self.live_files.lock().clone()?;
+        Some(
+            self.shapes
+                .iter()
+                .map(|shape| {
+                    let view = shape.index.view();
+                    let covered = live.iter().filter(|file| view.covers(file)).count();
+                    (shape.label.as_str(), covered, live.len() - covered)
+                })
+                .collect(),
+        )
+    }
+
     /// Resident bytes of every key's runs.
     fn run_bytes(&self) -> usize {
         self.shapes
@@ -1525,6 +1603,7 @@ impl LookupIndexState {
             self.repin();
         }
         self.refusal_reported.store(false, Ordering::Relaxed);
+        self.report_coverage();
         self.counters
             .builds_published
             .fetch_add(1, Ordering::Relaxed);
@@ -1604,6 +1683,9 @@ impl LookupIndexState {
             *reconciled = Some((snapshot_id.to_string(), file_set));
         }
         let live: HashSet<&str> = live.map(file_name).collect();
+        *self.live_files.lock() = Some(Arc::new(
+            live.iter().map(|&name| name.to_string()).collect(),
+        ));
         let publishing = self.publish_lock.lock();
         let retired: usize = self
             .shapes
@@ -1615,6 +1697,7 @@ impl LookupIndexState {
             self.repin();
         }
         drop(publishing);
+        self.report_coverage();
         // The runs a rewrite replaced have retired: now an overfull filter
         // is rebuilt over only the keys still live.
         self.maybe_merge();
@@ -1856,7 +1939,10 @@ impl LookupIndexState {
         values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
     ) -> LookupProbe {
         let Some(shape) = self.matched_shape(values_for) else {
-            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                None,
+                LookupIndexScanReason::NoKeyPinned,
+            ));
         };
         let label = self.shape_label(shape).to_string();
         let Some(index) = index else {
@@ -1866,18 +1952,28 @@ impl LookupIndexState {
                 LookupIndexExplainOutcome::Unbuilt,
             ));
         };
+        // `matched_shape` found every column pinned, so a missing product is
+        // one past the bound.
         let Some(keys) = key_tuples(&self.specs[shape].columns, values_for) else {
-            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(label)));
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                Some(label),
+                LookupIndexScanReason::TooManyKeys,
+            ));
         };
         // One key keeps every candidate, as an equality lookup always has;
         // several are bounded like a runtime key set.
         let max_rows = (keys.len() > 1).then_some(RUNTIME_INDEX_MAX_ROWS);
-        let hit = self.shapes[shape]
-            .encode_keys(&keys)
-            .ok()
-            .and_then(|encoded| index.probe_keys(shape, &encoded, max_rows));
-        let Some(hit) = hit else {
-            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(label)));
+        let Ok(encoded) = self.shapes[shape].encode_keys(&keys) else {
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                Some(label),
+                LookupIndexScanReason::ValueNotIndexable,
+            ));
+        };
+        let Some(hit) = index.probe_keys(shape, &encoded, max_rows) else {
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                Some(label),
+                LookupIndexScanReason::TooManyCandidates,
+            ));
         };
         LookupProbe::Selection(LookupSelection {
             state: Arc::clone(self),
@@ -3368,6 +3464,44 @@ mod tests {
                 "an unpublished run holds nothing"
             );
         }
+    }
+
+    /// Coverage counts the table's current files per key: none before a scan
+    /// has listed them, then the files a published run holds against the
+    /// rest, following publishes and retirements.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coverage_counts_each_keys_covered_and_uncovered_files() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let state = keyed_state(&pool);
+        assert_eq!(state.coverage(), None, "no file set listed yet");
+        let files = ["a.vortex", "b.vortex", "c.vortex"];
+        state.reconcile(
+            "s1",
+            FileSetVersion::default(),
+            files
+                .iter()
+                .map(|file| format!("table/snapshot/{file}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str),
+        );
+        assert_eq!(
+            state.coverage(),
+            Some(vec![("tenant", 0, 3), ("(tenant, service)", 0, 3)])
+        );
+        write(
+            &state,
+            &[(
+                "a.vortex",
+                0,
+                keyed_batch(&[Some(1); 2], &[Some("x"), Some("y")]),
+            )],
+        )
+        .await;
+        assert_eq!(
+            state.coverage(),
+            Some(vec![("tenant", 1, 2), ("(tenant, service)", 1, 2)])
+        );
     }
 
     /// A batch that arrives after its write's index was finished has no run

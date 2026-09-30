@@ -322,7 +322,8 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     .join("\n");
     assert!(
         fallback.contains("lookup_index=none")
-            && fallback.contains("lookup_index_outcome=not_applicable"),
+            && fallback.contains("lookup_index_outcome=not_applicable")
+            && fallback.contains("lookup_index_reason=no_key_pinned"),
         "memory-mode fallback did not explain why the index was skipped:\n{fallback}"
     );
 
@@ -458,6 +459,13 @@ async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
         (after.selected, after.empty),
         (before.selected, before.empty),
         "a product past the bound must not be probed: {after:?}"
+    );
+    let explain = query(&indexed, "indexed", &format!("EXPLAIN {too_many}"))
+        .await
+        .join("\n");
+    assert!(
+        explain.contains("lookup_index_reason=too_many_keys"),
+        "a lookup past the key bound did not say why it scanned:\n{explain}"
     );
 }
 
