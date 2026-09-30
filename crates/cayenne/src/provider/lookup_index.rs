@@ -117,7 +117,7 @@ use vortex_session::VortexSession;
 
 /// Runtime index scans accept only small exact build-side key sets, and a
 /// literal lookup at most this many key tuples.
-const RUNTIME_INDEX_MAX_KEYS: usize = 2_048;
+pub(crate) const RUNTIME_INDEX_MAX_KEYS: usize = 2_048;
 /// Candidate rows may scale with the table, but stay within a fixed memory bound.
 const RUNTIME_INDEX_MIN_ROWS: usize = 2_048;
 const RUNTIME_INDEX_MAX_ROWS: usize = 1_000_000;
@@ -1875,7 +1875,7 @@ impl LookupIndexState {
 
 /// Every key tuple the columns' equality values pin: their cartesian
 /// product, `None` past [`RUNTIME_INDEX_MAX_KEYS`] tuples.
-fn key_tuples(
+pub(crate) fn key_tuples(
     columns: &[String],
     values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
 ) -> Option<Vec<Vec<ScalarValue>>> {

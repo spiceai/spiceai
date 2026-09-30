@@ -379,6 +379,88 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     println!("memory-mode index counters: {end:?}");
 }
 
+/// `IN` lists on the columns of a compound key are answered from the index,
+/// one probe per query over every tuple the lists pin: an equality with a list,
+/// lists on both columns (their cartesian product), a list holding NULL, and a
+/// short list the planner rewrites into `OR`s all return exactly what the
+/// unindexed table returns. A product past the lookup bound scans instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let indexed = memory_table(&fixture, Arc::clone(&env), "indexed", &INDEXES, false).await;
+    let plain = memory_table(&fixture, Arc::clone(&env), "plain", &[], false).await;
+    let refresh: Vec<RecordBatch> = (0..4)
+        .map(|chunk| rows(chunk * 10_000, 10_000, "v1"))
+        .collect();
+    overwrite(&indexed, refresh.clone()).await;
+    overwrite(&plain, refresh).await;
+
+    let service = |id: i64| format!("'SV{id:032x}'");
+    let answered = [
+        // Consecutive integers, which the planner rewrites into a BETWEEN.
+        "SELECT * FROM {t} WHERE \"TenantId\" = 5 AND \"PoolId\" IN (1, 2, 3, 4)".to_string(),
+        "SELECT * FROM {t} WHERE \"TenantId\" = 5 AND \"PoolId\" IN (1, 3, 5, 8)".to_string(),
+        "SELECT * FROM {t} WHERE \"TenantId\" IN (5, 6, 7, 8) AND \"PoolId\" IN (1, NULL, 3, 4)"
+            .to_string(),
+        "SELECT * FROM {t} WHERE \"TenantId\" IN (5, 6) AND \"PoolId\" IN (2, 3)".to_string(),
+        format!(
+            "SELECT * FROM {{t}} WHERE \"TenantId\" = 5 AND \"ServiceId\" IN ({}, {}, {}, {})",
+            service(5),
+            service(102),
+            service(199),
+            service(999_999),
+        ),
+    ];
+    let mut found_rows = 0;
+    for sql in &answered {
+        let before = counters(&indexed);
+        let found = query(&indexed, "indexed", sql).await;
+        assert_eq!(found, query(&plain, "plain", sql).await, "{sql}");
+        found_rows += found.len();
+        let after = counters(&indexed);
+        assert_eq!(
+            (after.selected + after.empty) - (before.selected + before.empty),
+            1,
+            "{sql} was not answered from the index: {before:?} -> {after:?}"
+        );
+        assert_eq!(after.unbuilt, before.unbuilt, "{sql}: {after:?}");
+        let explain = query(&indexed, "indexed", &format!("EXPLAIN {sql}"))
+            .await
+            .join("\n");
+        assert!(
+            explain.contains("lookup_index_outcome=selected"),
+            "{sql} did not plan an index lookup:\n{explain}"
+        );
+    }
+    assert!(
+        found_rows > 50,
+        "the lookups returned too few rows to prove anything: {found_rows}"
+    );
+
+    // 60 tenants by 40 pools is 2,400 tuples, past the 2,048 bound.
+    let tenants: Vec<String> = (0..60).map(|tenant| tenant.to_string()).collect();
+    let pools: Vec<String> = (0..40).map(|pool| pool.to_string()).collect();
+    let too_many = format!(
+        "SELECT * FROM {{t}} WHERE \"TenantId\" IN ({}) AND \"PoolId\" IN ({})",
+        tenants.join(", "),
+        pools.join(", ")
+    );
+    let before = counters(&indexed);
+    assert_eq!(
+        query(&indexed, "indexed", &too_many).await,
+        query(&plain, "plain", &too_many).await
+    );
+    let after = counters(&indexed);
+    assert_eq!(
+        (after.selected, after.empty),
+        (before.selected, before.empty),
+        "a product past the bound must not be probed: {after:?}"
+    );
+}
+
 /// An upsert leaves the superseded version of a row in memory, hidden only by a
 /// tombstone. A lookup must never return it, and must return the new version.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

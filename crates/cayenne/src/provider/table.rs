@@ -35469,12 +35469,19 @@ impl CayenneTableProvider {
         let Some(indexer) = &self.mem_tier_index else {
             return Ok(None);
         };
-        let scalar_for = |column: &str| {
+        let column_type = |column: &str| {
+            self.table_metadata
+                .schema
+                .field_with_name(column)
+                .ok()
+                .map(|field| field.data_type().clone())
+        };
+        let values_for = |column: &str| {
             filters
                 .iter()
-                .find_map(|filter| bare_column_scalar_for(filter, column))
+                .find_map(|filter| bare_column_values_for(filter, column, column_type(column)))
         };
-        let Some(probe) = indexer.probe_key(&scalar_for) else {
+        let Some(probe) = indexer.probe_key(&values_for) else {
             return Ok(Some((
                 None,
                 super::lookup_index::LookupIndexExplain::not_applicable(None),
@@ -35646,10 +35653,17 @@ impl CayenneTableProvider {
         super::lookup_index::LookupIndexExplain,
     )> {
         let index_state = self.lookup_index.as_ref()?;
+        let column_type = |column: &str| {
+            self.table_metadata
+                .schema
+                .field_with_name(column)
+                .ok()
+                .map(|field| field.data_type().clone())
+        };
         let values_for = |column: &str| {
             filters
                 .iter()
-                .find_map(|filter| bare_column_values_for(filter, column))
+                .find_map(|filter| bare_column_values_for(filter, column, column_type(column)))
         };
         let Some(shape) = index_state.matched_shape(&values_for) else {
             return Some((
@@ -35957,11 +35971,20 @@ fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
 /// through conjunctions. A NULL value matches nothing, so it is kept for the
 /// index to drop. The column side must be bare for the reason
 /// [`bare_column_scalar_for`] gives.
-fn bare_column_values_for(expr: &Expr, name: &str) -> Option<Vec<ScalarValue>> {
+///
+/// A non-negated `BETWEEN` of integer bounds pins an integer column
+/// (`column_type`) to every value in the range, up to the lookup bound: the
+/// planner rewrites an `IN` list of consecutive integers into one. On any other
+/// column type a range holds values no enumeration lists, so it pins nothing.
+fn bare_column_values_for(
+    expr: &Expr,
+    name: &str,
+    column_type: Option<DataType>,
+) -> Option<Vec<ScalarValue>> {
     match expr {
         Expr::BinaryExpr(bin) if bin.op == Operator::Or => {
-            let mut values = bare_column_values_for(&bin.left, name)?;
-            values.extend(bare_column_values_for(&bin.right, name)?);
+            let mut values = bare_column_values_for(&bin.left, name, column_type.clone())?;
+            values.extend(bare_column_values_for(&bin.right, name, column_type)?);
             Some(values)
         }
         // A branch that is never true selects no row: the planner folds
@@ -35976,10 +35999,60 @@ fn bare_column_values_for(expr: &Expr, name: &str) -> Option<Vec<ScalarValue>> {
         {
             in_list.list.iter().map(evaluated_literal).collect()
         }
-        Expr::BinaryExpr(bin) if bin.op == Operator::And => bare_column_values_for(&bin.left, name)
-            .or_else(|| bare_column_values_for(&bin.right, name)),
+        Expr::Between(between)
+            if !between.negated
+                && column_type.as_ref().is_some_and(DataType::is_integer)
+                && matches!(between.expr.as_ref(), Expr::Column(col) if col.name == name) =>
+        {
+            integer_range(
+                &evaluated_literal(&between.low)?,
+                &evaluated_literal(&between.high)?,
+            )
+        }
+        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
+            bare_column_values_for(&bin.left, name, column_type.clone())
+                .or_else(|| bare_column_values_for(&bin.right, name, column_type))
+        }
         _ => bare_column_scalar_for(expr, name).map(|value| vec![value]),
     }
+}
+
+/// Every integer from `low` to `high` inclusive, as `BETWEEN` selects them:
+/// none when a bound is NULL or the range is empty, and `None` — no
+/// enumeration — past the lookup bound or when a bound is not an integer.
+fn integer_range(low: &ScalarValue, high: &ScalarValue) -> Option<Vec<ScalarValue>> {
+    fn as_i128(value: &ScalarValue) -> Option<i128> {
+        match value {
+            ScalarValue::Int8(v) => v.map(i128::from),
+            ScalarValue::Int16(v) => v.map(i128::from),
+            ScalarValue::Int32(v) => v.map(i128::from),
+            ScalarValue::Int64(v) => v.map(i128::from),
+            ScalarValue::UInt8(v) => v.map(i128::from),
+            ScalarValue::UInt16(v) => v.map(i128::from),
+            ScalarValue::UInt32(v) => v.map(i128::from),
+            ScalarValue::UInt64(v) => v.map(i128::from),
+            _ => None,
+        }
+    }
+    if low.is_null() || high.is_null() {
+        return Some(Vec::new());
+    }
+    let (low, high) = (as_i128(low)?, as_i128(high)?);
+    if high < low {
+        return Some(Vec::new());
+    }
+    let bound = i128::try_from(super::lookup_index::RUNTIME_INDEX_MAX_KEYS).ok()?;
+    if high - low >= bound {
+        return None;
+    }
+    (low..=high)
+        .map(|value| {
+            i64::try_from(value)
+                .map(|value| ScalarValue::Int64(Some(value)))
+                .or_else(|_| u64::try_from(value).map(|value| ScalarValue::UInt64(Some(value))))
+                .ok()
+        })
+        .collect()
 }
 
 /// The constant `expr` evaluates to: a literal, or casts applied to one. `None`
@@ -38280,6 +38353,75 @@ mod tests {
 
     fn url(s: &str) -> String {
         s.to_string()
+    }
+
+    /// The planner rewrites an `IN` list of consecutive integers into a
+    /// `BETWEEN`, so a range on an integer key column pins the values it covers.
+    /// On any other type, a negated range, or past the bound, it pins nothing.
+    #[test]
+    fn integer_between_pins_every_value_of_its_range() {
+        use datafusion::prelude::{col, lit};
+        let int = Some(DataType::Int64);
+        let range = col("b").between(lit(3_i64), lit(6_i64));
+        assert_eq!(
+            bare_column_values_for(&range, "b", int.clone()),
+            Some((3..=6).map(|v| ScalarValue::Int64(Some(v))).collect())
+        );
+        assert_eq!(bare_column_values_for(&range, "a", int.clone()), None);
+        assert_eq!(
+            bare_column_values_for(&range, "b", Some(DataType::Float64)),
+            None,
+            "a float range holds values no enumeration lists"
+        );
+        assert_eq!(
+            bare_column_values_for(
+                &col("b").not_between(lit(3_i64), lit(6_i64)),
+                "b",
+                int.clone()
+            ),
+            None
+        );
+        assert_eq!(
+            bare_column_values_for(&col("b").between(lit(6_i64), lit(3_i64)), "b", int.clone()),
+            Some(Vec::new()),
+            "an empty range matches no row"
+        );
+        assert_eq!(
+            bare_column_values_for(
+                &col("b").between(lit(ScalarValue::Int64(None)), lit(3_i64)),
+                "b",
+                int.clone()
+            ),
+            Some(Vec::new()),
+            "a NULL bound matches no row"
+        );
+        let bound =
+            i64::try_from(super::super::lookup_index::RUNTIME_INDEX_MAX_KEYS).expect("fits");
+        assert_eq!(
+            bare_column_values_for(
+                &col("b").between(lit(0_i64), lit(bound - 1)),
+                "b",
+                int.clone()
+            )
+            .map(|values| values.len()),
+            Some(super::super::lookup_index::RUNTIME_INDEX_MAX_KEYS)
+        );
+        assert_eq!(
+            bare_column_values_for(&col("b").between(lit(0_i64), lit(bound)), "b", int.clone()),
+            None,
+            "a range past the bound is not enumerated"
+        );
+        // Through a conjunction, beside an equality on another column.
+        let both = col("a")
+            .eq(lit(7_i64))
+            .and(col("b").between(lit(1_i64), lit(2_i64)));
+        assert_eq!(
+            bare_column_values_for(&both, "b", int),
+            Some(vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ])
+        );
     }
 
     /// The per-file row cap must keep a full file's right-sized PK bloom
