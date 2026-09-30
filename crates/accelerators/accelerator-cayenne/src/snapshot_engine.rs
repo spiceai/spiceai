@@ -818,11 +818,10 @@ mod tests {
 
             // A key the unpersisted write holds: found by reading its files in
             // full, and the lookup that did so asks for them to be indexed.
-            assert_eq!(
-                lookup(&reader, 27_003).await,
-                1,
-                "a lookup is correct while behind"
-            );
+            // Two queries meet the uncovered files at once: each is correct,
+            // and only one background build starts between them.
+            let (first, second) = tokio::join!(lookup(&reader, 27_003), lookup(&reader, 28_004));
+            assert_eq!((first, second), (1, 1), "lookups are correct while behind");
             let deadline = Instant::now() + Duration::from_mins(1);
             let caught_up = loop {
                 let verification = reader
@@ -840,9 +839,9 @@ mod tests {
             };
             assert!(caught_up.agrees(), "{caught_up:?}");
             let counters = reader.lookup_index_counters().expect("indexed");
-            assert!(
-                counters.builds_started >= 1,
-                "the catch-up came from a background build: {counters:?}"
+            assert_eq!(
+                counters.builds_started, 1,
+                "two concurrent lookups started exactly one background build: {counters:?}"
             );
             let before = counters;
             assert_eq!(lookup(&reader, 27_003).await, 1);
