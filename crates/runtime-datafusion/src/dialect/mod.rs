@@ -424,7 +424,7 @@ mod tests {
         postgres_can_evaluate_expression,
     };
     use crate::function_support::bigquery_can_evaluate_expression;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
     use datafusion::functions::expr_fn::{concat, upper};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace};
@@ -1164,6 +1164,135 @@ mod tests {
                  `{name}`; one here would send DuckDB a call it answers differently"
             );
         }
+    }
+
+    /// Regression test for #13887: `BigQuery` holds at most six sub-second
+    /// digits, and its rendering of a text-to-timestamp cast strips the rest
+    /// before parsing (`REGEXP_REPLACE(…, r'(\.\d{6})\d+', r'\1')`), so a cast
+    /// into a nanosecond timestamp — `DataFusion`'s default `TIMESTAMP`, the
+    /// ordinary spelling — parses text carrying seven to nine digits to an
+    /// earlier instant than the same cast evaluated locally. The cast has to
+    /// stay local, whichever string type carries the text, whether the operand
+    /// is a column or a literal, and whether or not the target names a zone.
+    #[test]
+    fn a_text_cast_into_a_nanosecond_timestamp_stays_local_on_bigquery() {
+        let scope = scope_of(&[
+            ("s", DataType::Utf8),
+            ("l", DataType::LargeUtf8),
+            ("v", DataType::Utf8View),
+            (
+                "k",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            ),
+        ]);
+        let targets = [
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ];
+        for operand in [
+            col("s"),
+            col("l"),
+            col("v"),
+            col("k"),
+            lit("2026-01-15T10:30:00.390436170Z"),
+        ] {
+            for target in &targets {
+                for expr in [
+                    cast(operand.clone(), target.clone()),
+                    try_cast(operand.clone(), target.clone()),
+                ] {
+                    assert!(
+                        !bigquery_can_evaluate_expression(&expr, Some(&scope)),
+                        "BigQuery truncates the text under {expr}, so it must stay local"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half of #13887: `BIGNUMERIC` holds 38 fractional digits, and
+    /// `BigQuery` rounds a scale past that away silently where it refuses an
+    /// integer overflow outright, so a cast into a wider scale stays local.
+    /// Only `Decimal256` can name such a scale.
+    #[test]
+    fn a_decimal_cast_past_bignumeric_scale_stays_local_on_bigquery() {
+        let scope = scope_of(&[
+            ("d", DataType::Decimal256(76, 38)),
+            ("f", DataType::Float64),
+        ]);
+        for expr in [
+            cast(col("d"), DataType::Decimal256(76, 42)),
+            try_cast(col("d"), DataType::Decimal256(76, 39)),
+            cast(col("f"), DataType::Decimal256(76, 40)),
+            cast(lit(1.5_f64), DataType::Decimal256(76, 50)),
+        ] {
+            assert!(
+                !bigquery_can_evaluate_expression(&expr, Some(&scope)),
+                "BigQuery rounds the scale of {expr} away, so it must stay local"
+            );
+        }
+    }
+
+    /// The complement: the refusal costs only the casts it is about. A text
+    /// cast into a microsecond or coarser timestamp truncates the same digits
+    /// on both sides, a timestamp or a date cast into nanoseconds has no digits
+    /// to lose, a decimal scale `BIGNUMERIC` holds is exact, and everything
+    /// else the policy admitted before still federates.
+    #[test]
+    fn every_other_cast_still_federates_on_bigquery() {
+        let scope = scope_of(&[
+            ("s", DataType::Utf8),
+            ("us", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("dt", DataType::Date32),
+            ("d", DataType::Decimal256(76, 38)),
+            ("n", DataType::Int64),
+        ]);
+        for expr in [
+            cast(col("s"), DataType::Timestamp(TimeUnit::Microsecond, None)),
+            try_cast(col("s"), DataType::Timestamp(TimeUnit::Millisecond, None)),
+            cast(col("s"), DataType::Timestamp(TimeUnit::Second, None)),
+            cast(col("us"), DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            cast(col("dt"), DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            cast(col("s"), DataType::Date32),
+            cast(col("s"), DataType::Utf8View),
+            cast(col("d"), DataType::Decimal256(76, 38)),
+            cast(col("d"), DataType::Decimal128(38, 38)),
+            cast(col("n"), DataType::Decimal256(76, 2)),
+            cast(col("d"), DataType::Float64),
+            col("s"),
+            col("s").like(lit("u%")),
+            col("us").gt(col("us")),
+        ] {
+            assert!(
+                bigquery_can_evaluate_expression(&expr, Some(&scope)),
+                "BigQuery renders {expr} faithfully, so it must keep federating"
+            );
+        }
+    }
+
+    /// With no scope a column's type cannot be proven, so its cast into a
+    /// nanosecond timestamp is refused rather than assumed not to be over
+    /// text; a cast into a coarser unit is not this check's to refuse, and a
+    /// literal carries its own type.
+    #[test]
+    fn bigquery_declines_a_nanosecond_timestamp_cast_whose_operand_type_cannot_be_read() {
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        assert!(!bigquery_can_evaluate_expression(
+            &cast(col("a"), nanos.clone()),
+            None
+        ));
+        assert!(bigquery_can_evaluate_expression(
+            &cast(col("a"), DataType::Timestamp(TimeUnit::Microsecond, None)),
+            None
+        ));
+        assert!(!bigquery_can_evaluate_expression(
+            &cast(lit("2026-01-15T10:30:00.390436170Z"), nanos.clone()),
+            None
+        ));
+        assert!(bigquery_can_evaluate_expression(
+            &cast(lit(ScalarValue::Date32(Some(0))), nanos),
+            None
+        ));
     }
 
     #[test]

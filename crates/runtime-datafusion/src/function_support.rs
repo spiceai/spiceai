@@ -677,4 +677,59 @@ mod tests {
             &batches
         );
     }
+
+    /// Regression test for #13887, through the `BigQuery` policy: a plan
+    /// casting text into a nanosecond timestamp, in a projection or a filter,
+    /// stays local, while the same cast into a microsecond timestamp — the
+    /// precision `BigQuery`'s own `TIMESTAMP` holds — federates as before.
+    #[test]
+    fn a_text_cast_into_a_nanosecond_timestamp_is_not_federated_to_bigquery() {
+        use arrow::datatypes::TimeUnit;
+        use datafusion::prelude::cast;
+        let support = deny_spice_functions_for_bigquery_table_providers();
+        let text_and_id = || {
+            vec![
+                Field::new("s", DataType::Utf8, true),
+                Field::new("id", DataType::Int64, true),
+            ]
+        };
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let instant_ns = lit(ScalarValue::TimestampNanosecond(
+            Some(1_768_473_000_390_436_170),
+            None,
+        ));
+        let instant_us = lit(ScalarValue::TimestampMicrosecond(
+            Some(1_768_473_000_390_436),
+            None,
+        ));
+        for plan in [
+            plan_projecting(cast(col("s"), nanos.clone())),
+            plan_over(
+                text_and_id(),
+                Some(cast(col("s"), nanos.clone()).gt(instant_ns)),
+                col("id"),
+            ),
+        ] {
+            assert!(
+                contains_unsupported_functions(&plan, &support)
+                    .expect("the support check must not error"),
+                "the BigQuery policy must keep this plan local:\n{plan}"
+            );
+        }
+        for plan in [
+            plan_projecting(cast(col("s"), micros.clone())),
+            plan_over(
+                text_and_id(),
+                Some(cast(col("s"), micros).gt(instant_us)),
+                col("id"),
+            ),
+        ] {
+            assert!(
+                !contains_unsupported_functions(&plan, &support)
+                    .expect("the support check must not error"),
+                "the BigQuery policy must still federate:\n{plan}"
+            );
+        }
+    }
 }
