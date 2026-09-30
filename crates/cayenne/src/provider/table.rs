@@ -55692,7 +55692,7 @@ mod tests {
 
         assert!(
             provider
-                .rewrite_current_snapshot_for_compaction_tracked()
+                .rewrite_current_snapshot_for_compaction_tracked(None)
                 .await
                 .expect("rewrite succeeds"),
             "the rewrite must commit a new snapshot"
