@@ -90,16 +90,29 @@ fn run(shape: Shape, runs: usize) {
                     }
                 })
                 .collect();
-            let start = Instant::now();
+            // Whichever runs second finds the keys' runs already in cache, so
+            // the two take turns going first.
             let mut single = 0_usize;
-            for key in &keys {
-                view.candidates(key, |_| single += 1);
-            }
-            single_ns.push(start.elapsed().as_nanos() as f64 / list as f64);
-            let start = Instant::now();
             let mut batched = 0_usize;
-            batch(&view, &keys, &mut batched);
-            batch_ns.push(start.elapsed().as_nanos() as f64 / list as f64);
+            let mut time_single = || {
+                let start = Instant::now();
+                for key in &keys {
+                    view.candidates(key, |_| single += 1);
+                }
+                start.elapsed().as_nanos() as f64 / list as f64
+            };
+            let mut time_batched = || {
+                let start = Instant::now();
+                batch(&view, &keys, &mut batched);
+                start.elapsed().as_nanos() as f64 / list as f64
+            };
+            if c % 2 == 0 {
+                single_ns.push(time_single());
+                batch_ns.push(time_batched());
+            } else {
+                batch_ns.push(time_batched());
+                single_ns.push(time_single());
+            }
             assert_eq!(
                 single, batched,
                 "the batch finds what the keys find one by one"
