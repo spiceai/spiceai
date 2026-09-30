@@ -1234,11 +1234,14 @@ impl CacheFallback {
             } => input
                 .into_plan()
                 .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
                 .ok()?
                 .execute(partition, context)
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
                 .ok()?
                 .try_collect()
                 .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
                 .ok()?,
         };
         let batches: Vec<RecordBatch> = batches
@@ -2733,6 +2736,7 @@ impl CachingScanInput {
                     .scan_and_optimize(accelerator.as_ref(), &filters_to_reapply)
                     .await?;
                 if input.schema() != schema {
+                    tracing::debug!(expected = ?schema, actual = ?input.schema(), "Cache fallback schema mismatch");
                     return Err(DataFusionError::Execution(
                         "The cached response schema changed while fetching the origin".to_string(),
                     ));
