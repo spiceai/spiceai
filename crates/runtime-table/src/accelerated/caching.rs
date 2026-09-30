@@ -36,6 +36,7 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
@@ -2466,6 +2467,13 @@ impl CachingAccelerationScanExec {
     ) -> Self {
         let max_age = Some(effective_max_age(max_age));
 
+        // A cache lookup needs every accelerator partition before deciding whether
+        // to fetch the source, including when distribution optimization is skipped.
+        let input = if input.properties().partitioning.partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
         let plan_properties = Arc::new(
             input
                 .properties()
@@ -6198,6 +6206,110 @@ mod tests {
         ) -> DataFusionResult<SendableRecordBatchStream> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.execute(partition, context)
+        }
+    }
+
+    #[tokio::test]
+    async fn caching_scan_coalesces_input_on_construction_and_rewrite() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos(),
+        )
+        .expect("timestamp");
+        let input = |partitions: usize| -> Arc<dyn ExecutionPlan> {
+            let batches: Vec<_> = (0..partitions)
+                .map(|partition| vec![http_row(&schema, now, &format!("cached-{partition}"))])
+                .collect();
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&batches, Arc::clone(&schema), None)
+                    .expect("partitioned cache input"),
+            )))
+        };
+        for partitions in [1, 2, 4] {
+            let source = Arc::new(MockHttpTableProvider::with_status(503, "origin error"));
+            let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+                Arc::clone(&schema),
+                vec![],
+            ));
+            let in_flight: InFlightRevalidations =
+                Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+            let exec: Arc<dyn ExecutionPlan> = Arc::new(CachingAccelerationScanExec::new(
+                input(partitions),
+                Some(Duration::from_mins(1)),
+                None,
+                StaleIfError::Disabled,
+                source,
+                accelerator,
+                "partitioned_cache".to_string(),
+                Handle::current(),
+                vec![col("request_path").eq(lit("/api/test"))],
+                None,
+                None,
+                Arc::new(Mutex::new(())),
+                in_flight,
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                tx,
+            ));
+            for (expected_partitions, plan) in [
+                (partitions, Arc::clone(&exec)),
+                (
+                    4,
+                    Arc::clone(&exec)
+                        .with_new_children(vec![input(4)])
+                        .expect("rewrite to partitioned input"),
+                ),
+                (
+                    partitions,
+                    Arc::clone(&exec)
+                        .with_new_children(vec![Arc::clone(exec.children()[0])])
+                        .expect("rewrite with existing input"),
+                ),
+            ] {
+                assert_eq!(plan.properties().partitioning.partition_count(), 1);
+                assert_eq!(
+                    plan.children()[0]
+                        .properties()
+                        .partitioning
+                        .partition_count(),
+                    1
+                );
+                let display = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert_eq!(
+                    display.matches("CoalescePartitionsExec").count(),
+                    usize::from(expected_partitions > 1),
+                    "{display}"
+                );
+                let batches =
+                    datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+                        .await
+                        .expect("collect every cached partition without optimizer rules");
+                let mut content: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column_by_name("content")
+                            .expect("content")
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .expect("string content")
+                            .iter()
+                            .map(|value| value.expect("cached content").to_string())
+                    })
+                    .collect();
+                content.sort();
+                assert_eq!(
+                    content,
+                    (0..expected_partitions)
+                        .map(|partition| format!("cached-{partition}"))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 
