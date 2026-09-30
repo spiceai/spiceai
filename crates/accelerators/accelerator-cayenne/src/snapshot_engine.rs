@@ -48,6 +48,12 @@ limitations under the License.
 //! directory at export time and re-anchored at the reader's data directory
 //! on import, making the snapshot portable across nodes with different
 //! local layouts.
+//!
+//! With `snapshots_compaction: enabled` the engine does not archive the live
+//! data directory at all: it captures the table's visible view under the
+//! write lock and, once the lock is released, re-encodes that view into a
+//! scratch table whose single snapshot — no deletion files, no protected
+//! snapshots — is what gets archived (see [`crate::snapshot_compaction`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,11 +61,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cayenne::MetadataCatalog;
 use cayenne::metastore::snapshot::DatasetMetastoreSlice;
+use datafusion::datasource::TableProvider;
 use runtime_acceleration::snapshot::engine::{
     DirectoryArchiveExtra, DirectorySnapshotPlan, SnapshotEngine, SnapshotEngineError,
 };
 use snafu::{ResultExt, Snafu};
 use tokio::fs;
+
+use crate::snapshot_compaction::CompactionCapture;
 
 /// Well-known archive entry path for a Cayenne dataset's metastore slice.
 /// The dataset name is included so multiple per-dataset slices can coexist
@@ -131,6 +140,9 @@ pub struct CayenneSnapshotEngine {
     /// the absolute paths stored in the metastore as a strict prefix; the
     /// import-side anchor is where the new paths will be re-rooted.
     data_dir_anchor: PathBuf,
+    /// `snapshots_compaction: enabled`: publish a compacted copy of the table
+    /// instead of the live layout.
+    compaction: bool,
 }
 
 impl CayenneSnapshotEngine {
@@ -143,7 +155,21 @@ impl CayenneSnapshotEngine {
             catalog,
             dataset_name: dataset_name.into(),
             data_dir_anchor,
+            compaction: false,
         }
+    }
+
+    /// Enables or disables snapshot compaction (`snapshots_compaction`).
+    #[must_use]
+    pub fn with_compaction(mut self, compaction: bool) -> Self {
+        self.compaction = compaction;
+        self
+    }
+
+    /// Whether this engine compacts snapshots before publishing them.
+    #[must_use]
+    pub fn compaction(&self) -> bool {
+        self.compaction
     }
 
     /// Returns the dataset name this engine snapshots.
@@ -167,6 +193,44 @@ impl CayenneSnapshotEngine {
         // at the call site, which renders Display).
         SnapshotEngineError::from_display(err.to_string())
     }
+
+    /// The compacting plan: capture the live table's view now (under the
+    /// write lock), re-encode it into a scratch table once the lock is
+    /// released, and archive the scratch data directory in place of the live
+    /// one. The live metadata directory is still archived (minus
+    /// `cayenne.db*`), exactly as in the uncompacted plan.
+    async fn compacted_plan(
+        &self,
+        dirs: &[(PathBuf, String)],
+        live_table: &Arc<dyn TableProvider>,
+    ) -> Result<DirectorySnapshotPlan, SnapshotEngineError> {
+        let capture = CompactionCapture::capture(
+            &self.catalog,
+            &self.dataset_name,
+            &self.data_dir_anchor,
+            live_table,
+        )
+        .await
+        .map_err(SnapshotEngineError::from_display)?;
+
+        let metadata_dirs: Vec<(PathBuf, String)> = dirs
+            .iter()
+            .filter(|(_, prefix)| prefix.starts_with("metadata"))
+            .cloned()
+            .collect();
+        let slice_archive_path = slice_archive_path(&self.dataset_name);
+
+        Ok(DirectorySnapshotPlan {
+            skip_relative_paths: METASTORE_FILES.iter().map(PathBuf::from).collect(),
+            extra_entries: Vec::new(),
+            deferred: Some(Box::pin(async move {
+                capture
+                    .materialize(metadata_dirs, METASTORE_FILES, slice_archive_path)
+                    .await
+                    .map_err(SnapshotEngineError::from_display)
+            })),
+        })
+    }
 }
 
 #[async_trait]
@@ -183,13 +247,14 @@ impl SnapshotEngine for CayenneSnapshotEngine {
     }
 
     fn supports_compaction(&self) -> bool {
-        false
+        true
     }
 
     async fn prepare_directory_snapshot(
         &self,
-        _dirs: &[(PathBuf, String)],
+        dirs: &[(PathBuf, String)],
         dataset_name: &str,
+        live_table: Option<&Arc<dyn TableProvider>>,
     ) -> Result<DirectorySnapshotPlan, SnapshotEngineError> {
         // Sanity: refuse to snapshot a dataset other than the one we were
         // constructed for.
@@ -198,6 +263,15 @@ impl SnapshotEngine for CayenneSnapshotEngine {
                 "CayenneSnapshotEngine constructed for dataset '{}' but asked to snapshot '{}'",
                 self.dataset_name, dataset_name
             )));
+        }
+
+        if self.compaction {
+            if let Some(live_table) = live_table {
+                return self.compacted_plan(dirs, live_table).await;
+            }
+            tracing::warn!(
+                "Snapshot of dataset '{dataset_name}' is being published without compaction: this snapshot is taken from the on-disk layout, not the running table, so `snapshots_compaction: enabled` cannot apply to it. The dataset's regular snapshots are compacted."
+            );
         }
 
         // 1. Export the per-dataset metastore slice.
@@ -228,6 +302,7 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         Ok(DirectorySnapshotPlan {
             skip_relative_paths: skip,
             extra_entries: extras,
+            deferred: None,
         })
     }
 
@@ -380,7 +455,7 @@ mod tests {
         ];
 
         let plan = engine
-            .prepare_directory_snapshot(&dirs, "trips")
+            .prepare_directory_snapshot(&dirs, "trips", None)
             .await
             .expect("prepare_directory_snapshot");
 
@@ -424,7 +499,7 @@ mod tests {
         );
 
         let err = engine
-            .prepare_directory_snapshot(&[], "riders")
+            .prepare_directory_snapshot(&[], "riders", None)
             .await
             .expect_err("must reject mismatched dataset name");
         assert!(err.to_string().contains("trips"));

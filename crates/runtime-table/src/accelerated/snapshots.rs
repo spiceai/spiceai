@@ -543,12 +543,13 @@ pub async fn create_checkpoint_and_snapshot(
         };
 
         match snapshot_manager
-            .create_snapshot(
+            .create_snapshot_with_table(
                 checkpoint_schema,
                 lock_guard,
                 updated_at,
                 row_count,
                 force_create,
+                accelerator.map(Arc::clone),
             )
             .await
         {

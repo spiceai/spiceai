@@ -21,6 +21,7 @@ use aws_sdk_credential_bridge::object_store_builder::{
 };
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
+use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use object_store::{
     GetOptions, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
@@ -675,6 +676,11 @@ pub struct SnapshotManager {
     /// The acceleration engine type (duckdb, sqlite, cayenne, etc.).
     engine: AccelerationEngine,
     snapshot_engine: Arc<dyn SnapshotEngine>,
+    /// `snapshots_compaction: enabled` on the dataset. Whether it takes effect
+    /// depends on `snapshot_engine.supports_compaction()`, which may only be
+    /// known once an engine-specific override is installed via
+    /// [`Self::with_snapshot_engine`].
+    compaction_enabled: bool,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
@@ -926,31 +932,46 @@ impl SnapshotManager {
 
         let snapshot_engine = create_snapshot_engine(&engine, compaction_enabled);
 
-        if compaction_enabled {
-            if snapshot_engine.supports_compaction() {
-                tracing::info!(dataset = %dataset_name, "Snapshot compaction enabled");
-            } else {
-                tracing::warn!(dataset = %dataset_name, "Snapshot compaction enabled but engine does not support it");
-            }
-        }
-
         let network_retry_strategy = RetryBackoffBuilder::new()
             .max_retries(Some(NETWORK_RETRY_MAX))
             .build();
 
-        Some(Self {
+        let manager = Self {
             dataset_name,
             snapshots_location: path,
             snapshot_location_uri,
             layout,
             engine,
             snapshot_engine,
+            compaction_enabled,
             object_store: store,
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
-        })
+        };
+
+        // Cayenne's engine lives outside this crate and is installed afterwards
+        // through `with_snapshot_engine`, which reports compaction support for
+        // it; reporting here against the placeholder engine would be wrong.
+        if !matches!(manager.engine, AccelerationEngine::Cayenne) {
+            manager.log_compaction_support();
+        }
+
+        Some(manager)
+    }
+
+    /// Reports whether `snapshots_compaction: enabled` takes effect with the
+    /// installed snapshot engine.
+    fn log_compaction_support(&self) {
+        if !self.compaction_enabled {
+            return;
+        }
+        if self.snapshot_engine.supports_compaction() {
+            tracing::info!(dataset = %self.dataset_name, "Snapshot compaction enabled");
+        } else {
+            tracing::warn!(dataset = %self.dataset_name, "Snapshot compaction enabled but engine does not support it");
+        }
     }
 
     /// Creates a `SnapshotManager` for metadata-only queries (list/get/set snapshots).
@@ -1021,6 +1042,7 @@ impl SnapshotManager {
             layout: AccelerationLayout::None,
             engine: AccelerationEngine::Cayenne,
             snapshot_engine,
+            compaction_enabled: false,
             object_store: store,
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
@@ -1042,6 +1064,7 @@ impl SnapshotManager {
     #[must_use]
     pub fn with_snapshot_engine(mut self, engine: Arc<dyn SnapshotEngine>) -> Self {
         self.snapshot_engine = engine;
+        self.log_compaction_support();
         self
     }
 
@@ -1306,6 +1329,36 @@ impl SnapshotManager {
         row_count: Option<u64>,
         force_create: ForceCreate,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
+        self.create_snapshot_with_table(
+            schema,
+            lock_guard,
+            last_updated_at,
+            row_count,
+            force_create,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_snapshot`] with the accelerator's live table, which a
+    /// snapshot engine that compacts directory-layout snapshots reads instead
+    /// of the on-disk layout (see
+    /// [`SnapshotEngine::prepare_directory_snapshot`]). Without it, such an
+    /// engine archives the layout as-is.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::create_snapshot`]; an engine's deferred build failing
+    /// surfaces as [`SnapshotUploadError::PrepareUpload`].
+    pub async fn create_snapshot_with_table(
+        &self,
+        schema: &SchemaRef,
+        lock_guard: OwnedMutexGuard<()>,
+        last_updated_at: Option<i64>,
+        row_count: Option<u64>,
+        force_create: ForceCreate,
+        live_table: Option<Arc<dyn TableProvider>>,
+    ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
         // If no existing snapshots (in metadata or as actual files), treat as force_create.
         // This ensures at least one snapshot exists at all times.
         let force_create = if force_create.0 {
@@ -1370,8 +1423,13 @@ impl SnapshotManager {
                     .await?
             }
             AccelerationLayout::Directories { dirs } => {
-                self.create_directory_snapshot(dirs, &destination_location, lock_guard)
-                    .await?
+                self.create_directory_snapshot(
+                    dirs,
+                    &destination_location,
+                    lock_guard,
+                    live_table.as_ref(),
+                )
+                .await?
             }
         };
 
@@ -1478,28 +1536,29 @@ impl SnapshotManager {
     /// Creates a snapshot from directory-based accelerator (e.g., Cayenne).
     ///
     /// Archives multiple directories into a tar file before upload.
+    ///
+    /// The engine's plan decides what is archived and when the write lock is
+    /// released: a plain plan archives the live directories under the lock
+    /// (they change as soon as writes resume), whereas a plan carrying a
+    /// [`engine::DeferredDirectorySnapshot`] has already captured the view it
+    /// needs, so the lock is released first and the build's own scratch
+    /// directories are archived.
     async fn create_directory_snapshot(
         &self,
         dirs: &[(PathBuf, String)],
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
+        live_table: Option<&Arc<dyn TableProvider>>,
     ) -> Result<(u64, String), SnapshotUploadError> {
         use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         // Step 0: Ask the engine for any per-directory skip list / extras.
         let plan = self
             .snapshot_engine
-            .prepare_directory_snapshot(dirs, &self.dataset_name)
+            .prepare_directory_snapshot(dirs, &self.dataset_name, live_table)
             .await
             .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
-        let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
-        let extras: Vec<(String, Vec<u8>)> = plan
-            .extra_entries
-            .into_iter()
-            .map(|e| (e.archive_path, e.bytes))
-            .collect();
 
-        // Step 1: Create a temporary tar archive of all directories
         let temp_archive_path = std::env::temp_dir().join(format!(
             "snapshot_{}_{}_{}.tar",
             self.dataset_name,
@@ -1507,25 +1566,82 @@ impl SnapshotManager {
             uuid::Uuid::now_v7()
         ));
 
-        let total_archived =
-            archive_directories_to_file_with_plan(dirs, &temp_archive_path, &skip_paths, &extras)
+        let archive_result = if let Some(deferred) = plan.deferred {
+            // Step 1a: Release the lock — the engine captured what it needs.
+            drop(lock_guard);
+            tracing::debug!(
+                "Lock released before deferred snapshot build. dataset={}",
+                self.dataset_name
+            );
+
+            let materialized = deferred
                 .await
-                .map_err(|source| SnapshotUploadError::ArchiveCreate {
-                    path: temp_archive_path.clone(),
-                    source: std::io::Error::other(source.to_string()),
-                })?;
+                .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            let skip_paths: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
+            let extras: Vec<(String, Vec<u8>)> = materialized
+                .extra_entries
+                .into_iter()
+                .map(|e| (e.archive_path, e.bytes))
+                .collect();
+
+            let result = archive_directories_to_file_with_plan(
+                &materialized.dirs,
+                &temp_archive_path,
+                &skip_paths,
+                &extras,
+            )
+            .await;
+
+            for dir in &materialized.cleanup_dirs {
+                if let Err(err) = fs::remove_dir_all(dir).await
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        "Failed to remove the scratch directory left by building the snapshot of dataset {}; remove {} by hand to reclaim its disk space. Cause: {err}",
+                        self.dataset_name,
+                        dir.display()
+                    );
+                }
+            }
+
+            result
+        } else {
+            // Step 1b: Archive the live directories while the lock is held.
+            let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+            let extras: Vec<(String, Vec<u8>)> = plan
+                .extra_entries
+                .into_iter()
+                .map(|e| (e.archive_path, e.bytes))
+                .collect();
+
+            let result = archive_directories_to_file_with_plan(
+                dirs,
+                &temp_archive_path,
+                &skip_paths,
+                &extras,
+            )
+            .await;
+
+            // Step 2: Release the lock - queries can resume
+            drop(lock_guard);
+            tracing::debug!(
+                "Lock released after archive creation. dataset={}",
+                self.dataset_name
+            );
+
+            result
+        };
+
+        let total_archived =
+            archive_result.map_err(|source| SnapshotUploadError::ArchiveCreate {
+                path: temp_archive_path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
 
         tracing::debug!(
             "Created tar archive for snapshot. dataset={} archive_size={}",
             self.dataset_name,
             total_archived
-        );
-
-        // Step 2: Release the lock - queries can resume
-        drop(lock_guard);
-        tracing::debug!(
-            "Lock released after archive creation. dataset={}",
-            self.dataset_name
         );
 
         // Step 3: Upload the tar archive (with retry for transient network errors)
@@ -3514,6 +3630,7 @@ mod tests {
             layout: AccelerationLayout::File { path: local_path },
             engine: engine.clone(),
             snapshot_engine,
+            compaction_enabled,
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),
@@ -6332,6 +6449,7 @@ mod tests {
             layout: AccelerationLayout::None,
             engine: AccelerationEngine::Cayenne,
             snapshot_engine,
+            compaction_enabled: false,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
             checkpointer_factory: None,
@@ -6977,6 +7095,7 @@ mod tests {
             layout: AccelerationLayout::None,
             engine: AccelerationEngine::Cayenne,
             snapshot_engine,
+            compaction_enabled: false,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
             checkpointer_factory: None,

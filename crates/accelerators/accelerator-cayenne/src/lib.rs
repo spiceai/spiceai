@@ -21,6 +21,7 @@ pub(crate) mod autotune;
 mod imds;
 pub mod partitioned_insert_strategy;
 pub mod s3;
+pub mod snapshot_compaction;
 pub mod snapshot_engine;
 
 use std::any::Any;
@@ -4232,12 +4233,17 @@ impl DataAccelerator for CayenneAccelerator {
                 return None;
             }
         };
+        let compaction = matches!(
+            acceleration.snapshots_compaction,
+            spicepod::acceleration::SnapshotsCompaction::Enabled
+        );
         Some(Arc::new(
             crate::snapshot_engine::CayenneSnapshotEngine::new(
                 catalog,
                 source.name().to_string(),
                 PathBuf::from(dir_path),
-            ),
+            )
+            .with_compaction(compaction),
         ))
     }
 

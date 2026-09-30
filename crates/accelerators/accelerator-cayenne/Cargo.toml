@@ -72,6 +72,7 @@ rusqlite.workspace = true
 turso-shared.workspace = true
 itertools.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "fs"] }
 
 [dev-dependencies]
