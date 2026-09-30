@@ -557,17 +557,19 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 ///
 /// This is kept outside clap's `requires = "cloud"` relationship so the CLI
 /// can explain what the region selects and how to correct the invocation.
-/// `spice connect` never takes `--cloud`: it enrolls the directory rather than
-/// querying a runtime, so advising `--cloud` there would send the user to a
-/// flag that does nothing for them.
+/// `spice connect` never takes `--cloud`: it only retains the deprecated
+/// `spice connect <org>/<pod>` alias of `spice add`, which adds a Spicepod to
+/// this directory rather than querying a runtime, so advising `--cloud` there
+/// would send the user to a flag that does nothing for them.
 fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
     if cli.cloud_region.is_none() || cli.cloud {
         return Ok(());
     }
     let message = if matches!(cli.command, Commands::Connect(_)) {
         "--cloud-region does not apply to spice connect: it selects the Spice.ai Cloud region \
-         that --cloud queries, and connect enrolls this directory rather than querying a \
-         runtime. Drop it."
+         that --cloud queries, and spice connect only retains the deprecated <org>/<pod> alias \
+         of spice add, which adds a Spicepod to this directory rather than querying a runtime. \
+         Drop it."
     } else {
         "--cloud-region requires --cloud: it selects which Spice.ai Cloud region to query. Pass \
          --cloud alongside it to target Spice.ai Cloud, or drop it to use the local runtime."
