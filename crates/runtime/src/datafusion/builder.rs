@@ -2184,15 +2184,22 @@ mod tests {
         }
     }
 
-    /// `json_get(x, k)::string` federates, because `register_all` also installs
-    /// the rewrite that turns a cast of `json_get` into the typed accessor.
+    /// A cast of `json_get` federates where a typed accessor does, because
+    /// `register_all` also installs the rewrite that turns the cast into one.
     ///
     /// That is why the guidance can offer the cast form as an alternative to
-    /// editing every call: `CAST(… AS VARCHAR)` becomes `json_get_str`,
-    /// `AS BIGINT` becomes `json_get_int`, `AS DOUBLE` becomes `json_get_float`
-    /// — and those are the names the `BigQuery` deny-list carves out, so the
-    /// statement pushes down. A bare `json_get` stays a JSON union with no SQL
-    /// type to unparse into, and stays local.
+    /// editing every call: `AS BIGINT` becomes `json_get_int`, `AS DOUBLE`
+    /// becomes `json_get_float`, `AS BOOLEAN` becomes `json_get_bool` — and those
+    /// are the names the `BigQuery` deny-list carves out, so the statement pushes
+    /// down. A bare `json_get` stays a JSON union with no SQL type to unparse into,
+    /// and stays local.
+    ///
+    /// A cast to a string type is the exception. It becomes `json_as_text`, not
+    /// `json_get_str`, because a cast answers for every JSON node (`7` is `'7'`,
+    /// an object its JSON text), where `json_get_str` answers only for a JSON
+    /// string. `json_as_text` has no faithful `BigQuery` rendering (see
+    /// `json_extraction_keeps_the_semantics_the_pushdown_guidance_assumes`), so
+    /// that form stays local; `json_get_str` is what pushes a string read down.
     ///
     /// Losing the rewrite would not fail a query; it would quietly stop the cast
     /// form from federating, which is the whole point of recommending it.
@@ -2213,7 +2220,7 @@ mod tests {
             .expect("register the document table");
 
         for (cast_to, expected) in [
-            ("VARCHAR", "json_get_str"),
+            ("VARCHAR", "json_as_text"),
             ("BIGINT", "json_get_int"),
             ("DOUBLE", "json_get_float"),
             ("BOOLEAN", "json_get_bool"),
@@ -2230,8 +2237,7 @@ mod tests {
                 .to_string();
             assert!(
                 plan.contains(expected),
-                "a cast to {cast_to} has to become {expected}, which the BigQuery \
-                 deny-list carves out: {plan}"
+                "a cast to {cast_to} has to become {expected}: {plan}"
             );
         }
     }

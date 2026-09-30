@@ -8710,6 +8710,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "arrow_tools",
  "base64 0.22.1",
  "bytes",
  "futures",

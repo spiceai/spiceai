@@ -567,14 +567,14 @@ mod tests {
     /// A literal carries its own type, so an all-literal call still federates
     /// with no scope: the refusal must cost only the calls it is about.
     ///
-    /// A binary *literal* is refused on two independent paths, and each is
-    /// asserted separately because only one of them is this check's.
-    /// `duckdb_can_translate` consults the type guard *before* the unparser,
-    /// and a `ScalarValue::Binary` reports `Binary` with or without a scope, so
-    /// the guard is what answers `false` here. The `expr_to_sql` assertion
-    /// establishes the other path — the renderer would have refused it too,
-    /// with `NotImplemented("Unsupported scalar: Binary")` — so neither can be
-    /// removed on the assumption that the other still covers a binary literal.
+    /// A binary *literal* is refused by the type guard alone.
+    /// `duckdb_can_translate` consults the guard *before* the unparser, and a
+    /// `ScalarValue::Binary` reports `Binary` with or without a scope, so the
+    /// guard is what answers `false` here. The renderer behind it does not
+    /// refuse: it spells a binary literal as a hex string literal (`X'ff'`), so
+    /// the `expr_to_sql` assertion pins that nothing but the guard keeps the call
+    /// local, and the guard cannot be removed on the assumption that the renderer
+    /// covers it.
     ///
     /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
     /// its type is readable only against a scope. That is why the scope is what
@@ -599,8 +599,9 @@ mod tests {
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         assert!(
-            unparser.expr_to_sql(&binary_literal).is_err(),
-            "and the renderer behind the guard refuses it as well"
+            unparser.expr_to_sql(&binary_literal).is_ok(),
+            "the renderer behind the guard spells a binary literal, so the guard is the only \
+             refusal"
         );
     }
 

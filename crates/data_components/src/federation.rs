@@ -1565,6 +1565,15 @@ mod tests {
             for (scope_kind, plan, relation) in derived_scope_shapes(&inner, output_name) {
                 for (dialect_name, dialect) in federation_dialects() {
                     let arm = format!("{dialect_name}/{output_kind}/{scope_kind}");
+                    if refused_where_the_engine_flattens_the_scope(
+                        dialect_name,
+                        dialect.as_ref(),
+                        output_kind == "volatile",
+                        scope_kind,
+                        &plan,
+                    ) {
+                        continue;
+                    }
                     let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
 
                     // The shape the issue is about only exists once the projection is a
@@ -1618,6 +1627,15 @@ mod tests {
             Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
         for (scope_kind, plan, _) in derived_scope_shapes(&volatile, "random()") {
             for (dialect_name, dialect) in federation_dialects() {
+                if refused_where_the_engine_flattens_the_scope(
+                    dialect_name,
+                    dialect.as_ref(),
+                    true,
+                    scope_kind,
+                    &plan,
+                ) {
+                    continue;
+                }
                 let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
                 // The call renders as `random()`; a reference to its output renders as
                 // a quoted identifier, so counting the unquoted call counts evaluations.
@@ -1633,6 +1651,209 @@ mod tests {
                      did and the query answers with rows the SELECT list never saw: {sql}"
                 );
             }
+        }
+    }
+
+    /// The fragment every refusal of a volatile-output scope carries, on a dialect
+    /// whose engine flattens the derived table (fork PR #227).
+    const VOLATILE_SCOPE_REFUSAL: &str =
+        "projection output that cannot be repeated is not supported for this dialect";
+
+    /// Whether this arm is one fork PR #227 refuses on `dialect`, asserting the
+    /// refusal when it is.
+    ///
+    /// An engine that flattens a derived table into the query selecting from it
+    /// evaluates a volatile output again for a predicate reading it, so the scope
+    /// that repairs the filtered shape everywhere else returns rows the predicate
+    /// excluded there — `SQLite` measured (492 of 990 returned rows below the bound
+    /// on 3.51; 476 of 974 through `spiced`), `MySQL` documented (bugs.mysql.com/106198).
+    /// Such a dialect answers `false` to `derived_table_evaluates_volatile_outputs_once`
+    /// and the unparser refuses the arm rather than emit it, which costs the pushdown
+    /// and never a row. Asked of the dialect rather than of its name, so a dialect
+    /// that opts out later is covered without editing this list.
+    fn refused_where_the_engine_flattens_the_scope(
+        dialect_name: &str,
+        dialect: &dyn Dialect,
+        volatile: bool,
+        scope_kind: &str,
+        plan: &LogicalPlan,
+    ) -> bool {
+        if dialect.derived_table_evaluates_volatile_outputs_once()
+            || !volatile
+            || scope_kind != "filtered"
+        {
+            return false;
+        }
+        let err = Unparser::new(dialect)
+            .plan_to_sql(plan)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{dialect_name} must refuse a filter on a volatile output read through a \
+                     derived table it does not fix"
+                )
+            });
+        assert!(
+            err.to_string().contains(VOLATILE_SCOPE_REFUSAL),
+            "{dialect_name} refused the filtered volatile arm for another reason: {err}"
+        );
+        true
+    }
+
+    /// `Projection(t.a, random() AS r)` with `filter` applied directly on it — the
+    /// shape `SELECT * FROM (SELECT a, random() AS r FROM t) WHERE r > 0.5` plans
+    /// to, since the optimizer cannot push a filter through a volatile projection.
+    fn filter_on_volatile_projection(filter: Expr) -> LogicalPlan {
+        let volatile =
+            Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
+        LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .project(vec![col("t.a"), volatile.alias("r")])
+            .expect("project")
+            .filter(filter)
+            .expect("filter")
+            .build()
+            .expect("build")
+    }
+
+    /// Regression test for #12751 and #13445, fixed by fork PR #227: a `Filter`
+    /// directly over a `Projection` is folded into one `SELECT`, whose `WHERE` binds
+    /// against the relations read rather than against the `SELECT` list. A
+    /// predicate reading a volatile output therefore has nowhere to bind in that
+    /// `SELECT`: the alias is not visible from `WHERE` (`PostgreSQL` and `MySQL`
+    /// reject `WHERE (r > 0.5)`), and inlining `random()` draws a second value —
+    /// which is exactly how the engines that do accept the alias resolve it
+    /// (measured on `SQLite`: 517 of 990 returned rows had `r` below the bound).
+    ///
+    /// The repair moves the projection into a derived table and applies the
+    /// predicate from the `SELECT` above it, by name, so the expression is
+    /// evaluated once. This guard pins the two halves of that: the `WHERE` sits
+    /// outside the derived table, and the volatile call is rendered exactly once.
+    #[test]
+    fn a_filter_on_a_volatile_projection_output_is_applied_above_the_projection() {
+        let plan = filter_on_volatile_projection(col("r").gt(lit(0.5)));
+        for (dialect_name, dialect) in federation_dialects() {
+            if refused_where_the_engine_flattens_the_scope(
+                dialect_name,
+                dialect.as_ref(),
+                true,
+                "filtered",
+                &plan,
+            ) {
+                continue;
+            }
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+
+            let derived_at = first_offset_of(&sql, "FROM (SELECT ");
+            let where_at = last_offset_of(&sql, "WHERE ");
+            assert!(
+                where_at > derived_at && paren_depth_at(&sql, where_at) == 0,
+                "{dialect_name}: the predicate has to be applied from the SELECT that reads the \
+                 derived table, not inside it beside the SELECT list it cannot see: {sql}"
+            );
+            let quoted = sql.matches("\"random()\"").count() + sql.matches("`random()`").count();
+            let evaluations = sql.matches("random()").count().saturating_sub(quoted);
+            assert_eq!(
+                evaluations, 1,
+                "{dialect_name}: the volatile call is evaluated {evaluations} times, so the \
+                 predicate can observe a value the SELECT list never showed: {sql}"
+            );
+        }
+    }
+
+    /// The other half of the same fold, fixed by the same fork PR: a predicate
+    /// reading an *aliased* output the projection can repeat — `t.a + t.b AS s`,
+    /// filtered as `s > 1` — used to be emitted as `WHERE (s > 1)`, which
+    /// `PostgreSQL` rejects (`column "s" does not exist`). The expression is now
+    /// inlined the way an unnamed output's always was, so the `WHERE` reads the
+    /// relation's own columns.
+    #[test]
+    fn a_filter_on_an_aliased_projection_output_is_inlined() {
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .project(vec![(col("t.a") + col("t.b")).alias("s")])
+            .expect("project")
+            .filter(col("s").gt(lit(1)))
+            .expect("filter")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let where_clause = &sql[last_offset_of(&sql, "WHERE ")..];
+            assert!(
+                where_clause.contains(") > 1"),
+                "{dialect_name}: the WHERE has to compare the inlined expression, not the \
+                 SELECT-list alias no engine lets it see: {sql}"
+            );
+            for alias_reference in ["s > 1", "\"s\" > 1", "`s` > 1"] {
+                assert!(
+                    !where_clause.contains(alias_reference),
+                    "{dialect_name}: the WHERE still reads the alias `s`, which binds to \
+                     nothing there: {sql}"
+                );
+            }
+        }
+    }
+
+    /// The `SQLite` side of the same fork PR, spelled out for every route to the
+    /// scope: the filter that would build it, a filter already above a derived
+    /// projection, and the alias pushdown that would otherwise decline into one.
+    /// Each is refused rather than emitted, because `SQLite` flattens the derived
+    /// table and evaluates the volatile call again.
+    #[test]
+    fn sqlite_refuses_every_route_to_a_volatile_output_scope() {
+        let scoped_here = filter_on_volatile_projection(col("r").gt(lit(0.5)));
+        let already_derived = LogicalPlanBuilder::from(scoped_here.clone())
+            .project(vec![col("t.a")])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        let aliased = LogicalPlanBuilder::from(scoped_here.clone())
+            .alias("sq")
+            .expect("alias")
+            .build()
+            .expect("build");
+        // The shape Spice's federation path presents for
+        // `SELECT * FROM (SELECT a, random() AS r FROM t) sq WHERE sq.r > 0.5`:
+        // the filter above the alias, under the outer projection the path keeps.
+        // Measured through `spiced` on the previous pin: 481 of 1009 rows returned
+        // had `r <= 0.5` on `SQLite`.
+        let above_the_alias = LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .project(vec![
+                col("t.a"),
+                Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]))
+                    .alias("r"),
+            ])
+            .expect("project")
+            .alias("sq")
+            .expect("alias")
+            .filter(col("sq.r").gt(lit(0.5)))
+            .expect("filter")
+            .project(vec![col("sq.a"), col("sq.r")])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        for (route, plan) in [
+            ("the filter that would build the scope", scoped_here),
+            (
+                "a filter already above a derived projection",
+                already_derived,
+            ),
+            ("the alias pushdown", aliased),
+            (
+                "a filter above the alias under a taken SELECT list",
+                above_the_alias,
+            ),
+        ] {
+            let err = Unparser::new(&SqliteDialect {})
+                .plan_to_sql(&plan)
+                .err()
+                .unwrap_or_else(|| panic!("sqlite must refuse {route}"));
+            assert!(
+                err.to_string().contains(VOLATILE_SCOPE_REFUSAL),
+                "{route}: sqlite refused for another reason: {err}"
+            );
         }
     }
 

@@ -63,6 +63,7 @@ mod null_aware_anti_join {
     use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use ballista_scheduler::physical_optimizer::join_selection::JoinSelection;
+    use ballista_scheduler::planner::{DefaultDistributedPlanner, DistributedPlanner};
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::config::ConfigOptions;
     use datafusion::execution::TaskContext;
@@ -113,10 +114,10 @@ mod null_aware_anti_join {
     /// exercises. Which side is larger: a larger build side makes a swap look
     /// profitable, so the rule has to decline it, while a larger probe side makes it
     /// rebuild the join in place and carry `null_aware` across that rebuild. And the
-    /// mode it arrives in: a join that reaches the rule already `Partitioned` takes a
-    /// different arm, which has to correct it to `CollectLeft` — partitioned
-    /// null-aware state is only ever partition-local, so the NULL one partition sees
-    /// would not be seen by the others.
+    /// mode it arrives in: a join that reaches the scheduler already `Partitioned` has
+    /// to be lowered to `CollectLeft` over one probe partition — partitioned null-aware
+    /// state is only ever partition-local, so the NULL one partition sees would not be
+    /// seen by the others.
     fn not_in_join_in_mode(
         probes: &[Option<i64>],
         values: &[Option<i64>],
@@ -222,22 +223,18 @@ mod null_aware_anti_join {
         assert!(!selected.contains(&7));
     }
 
-    /// A null-aware join that reaches the rule already `Partitioned` takes a
-    /// different arm from the ones above, and PR #58's second commit is what makes
-    /// that arm correct it to `CollectLeft`. It has to: the null-aware build state
-    /// (`probe_side_has_null`) is per-partition, so under `Partitioned` the NULL one
-    /// partition sees is invisible to the others and each answers its own slice as if
-    /// no NULL existed.
+    /// A null-aware join that reaches the scheduler already `Partitioned` has to run as
+    /// one task: the null-aware build state (`probe_side_has_null`) is per-partition, so
+    /// under `Partitioned` the NULL one partition sees is invisible to the others and each
+    /// answers its own slice as if no NULL existed.
     ///
-    /// Asserted on the shape rather than the rows, because the rows cannot distinguish
-    /// this arm today. The difference the correction makes only appears across more
-    /// than one partition — with a single partition, per-partition NULL state *is* the
-    /// global state, so `Partitioned` and `CollectLeft` answer identically and the
-    /// assertion would hold with the patch reverted. More than one partition cannot be
-    /// executed either: the rule forces `CollectLeft` without coalescing the left
-    /// input, and `HashJoinExec` refuses `CollectLeft` with a multi-partition left
-    /// side. That is the same defect a distributed `NOT IN` hits, and it is tracked
-    /// separately; until it is fixed the mode is the only observable this arm has.
+    /// `JoinSelection` leaves the mode of such a join alone, as `DataFusion`'s rule does.
+    /// What corrects it is Ballista's distributed planner, which lowers it to a
+    /// `CollectLeft` join over a coalesced probe side while it splits the plan into
+    /// stages. So the guard plans the join into stages the way the scheduler does for a
+    /// submitted job, and asserts on the join those stages hold: `CollectLeft`, and a
+    /// single output partition — one task, which is what makes the NULL visible to the
+    /// whole probe side.
     #[test]
     fn a_partitioned_null_aware_join_is_corrected_to_collect_left() {
         let plan = optimized(not_in_join_in_mode(
@@ -246,18 +243,49 @@ mod null_aware_anti_join {
             PartitionMode::Partitioned,
             4,
         ));
-        let join = plan
+        let stages = DefaultDistributedPlanner::new()
+            .plan_query_stages(
+                &"null-aware-not-in".to_string().into(),
+                plan,
+                &ConfigOptions::new(),
+            )
+            .expect("the null-aware join plans into stages");
+
+        let mut joins = Vec::new();
+        let mut pending: Vec<Arc<dyn ExecutionPlan>> = stages
+            .iter()
+            .map(|stage| Arc::clone(stage) as Arc<dyn ExecutionPlan>)
+            .collect();
+        while let Some(node) = pending.pop() {
+            pending.extend(node.children().into_iter().cloned());
+            if node.downcast_ref::<HashJoinExec>().is_some() {
+                joins.push(node);
+            }
+        }
+        let [join] = joins.as_slice() else {
+            panic!(
+                "expected exactly one hash join across the stages, found {}",
+                joins.len()
+            );
+        };
+        let join_exec = join
             .downcast_ref::<HashJoinExec>()
-            .expect("the rewrite is still a hash join");
+            .expect("collected as a hash join");
 
         assert_eq!(
-            *join.partition_mode(),
+            *join_exec.partition_mode(),
             PartitionMode::CollectLeft,
             "a null-aware anti join left in Partitioned mode keeps its NULL state per-partition, \
              so each partition answers as though no NULL existed"
         );
-        assert_eq!(*join.join_type(), JoinType::LeftAnti);
-        assert!(join.null_aware);
+        assert_eq!(
+            join.properties().output_partitioning().partition_count(),
+            1,
+            "the null-aware join has to run as one task, or the partitions that do not see the \
+             NULL answer as though none existed"
+        );
+        assert_eq!(*join_exec.join_type(), JoinType::LeftAnti);
+        assert!(join_exec.null_aware);
     }
 
     /// The shape behind those results: a null-aware join is only valid as `LeftAnti`,

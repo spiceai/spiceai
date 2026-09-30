@@ -676,12 +676,14 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(data_type.clone())
+        let builder = ArrayData::builder(data_type.clone())
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets and child data are well formed. The `entries` nullability
+        // declaration is the one thing `ArrayData::validate` rejects, and reproducing it
+        // is the point of the fixture: it is what a non-conforming server sends.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
