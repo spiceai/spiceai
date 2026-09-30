@@ -79,10 +79,12 @@ struct LoadTableResponse {
 /// or `glue:` dataset, a table in an Iceberg or Glue catalog, or an Iceberg DDL
 /// table) is returned as that Iceberg table: its current metadata and metadata
 /// location, loaded from its catalog on every request, so an Iceberg client
-/// reads the same rows Spice does. Any other table (accelerated, with columns
-/// Spice computes such as embeddings, a view, or a source that is not Iceberg)
-/// is refused with `400`, naming the reason: query it with SQL through Spice
-/// instead.
+/// reads the snapshot Spice's next query reads. A column added to the table
+/// outside Spice reaches the client at once, while Spice keeps the columns the
+/// table had when it was registered until it is reloaded. Any other table
+/// (accelerated, with columns Spice computes such as embeddings, a view, or a
+/// source that is not Iceberg) is refused with `400`, naming the reason: query
+/// it with SQL through Spice instead.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/namespaces/{namespace}/tables/{table}",
