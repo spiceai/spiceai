@@ -1832,13 +1832,14 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].num_rows(), 1);
 
-            // Verify zero handling
+            // Verify zero handling: SQL `=` compares floats by IEEE 754 value, so
+            // `-0.0 = 0.0` holds and row 7 matches alongside the three `0.0` rows.
             let result = ctx
                 .sql("SELECT COUNT(*) as cnt FROM boundary_test WHERE float_val = 0.0")
                 .await?
                 .collect()
                 .await?;
-            let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
+            let expected = ["+-----+", "| cnt |", "+-----+", "| 4   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
             Ok(())
