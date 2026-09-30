@@ -12755,6 +12755,30 @@ impl CayenneTableProvider {
         Ok(Some(indices))
     }
 
+    /// Resolve repeated keys in a buffered write before conflict validation
+    /// observes any of its rows.
+    pub(crate) fn collapse_buffered_write(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        let Some(policy) = super::key_conflicts::ConflictPolicy::new(
+            self.table_metadata.on_conflict.as_ref(),
+            self.upsert_dedup,
+        ) else {
+            return Ok(batches);
+        };
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok(batches);
+        };
+        let resolver = super::key_conflicts::KeyResolver::new(
+            self.table_name(),
+            self.table_schema().as_ref(),
+            &pk_indices,
+            policy,
+        )?;
+        resolver.collapse_write(batches)
+    }
+
     /// Build a `RowConverter` for the primary key columns.
     fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
         let table_schema = self.table_schema();
@@ -46380,7 +46404,7 @@ mod tests {
         shards: usize,
         max_bytes: i64,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-        let (provider, catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+        let (mut provider, catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
             table_name,
             runtime_env,
             VortexConfig {
@@ -46394,6 +46418,8 @@ mod tests {
             },
         )
         .await;
+        // These equivalence schedules intentionally repeat keys within a batch.
+        provider.upsert_dedup = crate::provider::key_conflicts::UpsertDedup::KeepLast;
         assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
         assert_eq!(
             provider.mem_tier_shard_count(),
@@ -46453,6 +46479,148 @@ mod tests {
             .await
             .expect("sharded CDC upsert burst");
         write.in_memory_epoch()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn buffered_cdc_writes_resolve_repeated_keys_in_single_and_sharded_tiers() {
+        use crate::provider::key_conflicts::UpsertDedup;
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        for shards in [1, 4] {
+            for (on_conflict, dedup, expected) in [
+                (
+                    OnConflict::DoNothingAll,
+                    UpsertDedup::None,
+                    Some(vec![(1, 10), (2, 20), (9, 90)]),
+                ),
+                (
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+                    UpsertDedup::None,
+                    None,
+                ),
+                (
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+                    UpsertDedup::DropIdentical,
+                    Some(vec![(1, 40), (2, 20), (9, 90)]),
+                ),
+                (
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+                    UpsertDedup::KeepLast,
+                    Some(vec![(1, 40), (2, 20), (9, 90)]),
+                ),
+            ] {
+                let ctx = SessionContext::new();
+                let (mut provider, catalog, _tmp) = create_cdc_table_with_on_conflict(
+                    "buffered_cdc_keys",
+                    ctx.runtime_env(),
+                    VortexConfig {
+                        cdc_durability: crate::metadata::CdcDurability::Memory,
+                        deletion_mode: crate::metadata::DeletionMode::Key,
+                        cdc_mem_tier_shards: shards,
+                        ..VortexConfig::default()
+                    },
+                    on_conflict,
+                )
+                .await;
+                provider.upsert_dedup = dedup;
+                provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+                assert!(provider.is_cdc_mem_tier_armed(), "CDC memory path is armed");
+                let schema = provider.table_schema();
+                let seed = single_batch_stream(id_value_batch(Arc::clone(&schema), &[9], &[90]));
+                let seed_write = provider
+                    .write_cdc_append_stream(seed, &ctx.task_ctx())
+                    .await
+                    .expect("seed CDC row");
+                assert!(
+                    seed_write.in_memory_epoch().is_some(),
+                    "seed used the memory tier"
+                );
+                let second_value = if dedup == UpsertDedup::DropIdentical {
+                    10
+                } else {
+                    30
+                };
+                let batches = vec![
+                    id_value_batch(Arc::clone(&schema), &[1, 1, 2], &[10, second_value, 20]),
+                    id_value_batch(Arc::clone(&schema), &[1], &[40]),
+                ];
+                let stream = Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                ));
+                let result = provider
+                    .write_cdc_append_stream(stream, &ctx.task_ctx())
+                    .await;
+                if let Some(rows) = expected {
+                    let write = result.expect("accepted CDC write");
+                    assert!(
+                        write.in_memory_epoch().is_some(),
+                        "write used the memory tier"
+                    );
+                    assert_eq!(
+                        collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
+                        rows
+                    );
+                    assert_eq!(
+                        query_count_star(&ctx, &provider, "buffered_cdc_keys").await,
+                        i64::try_from(rows.len()).expect("row count fits i64")
+                    );
+                } else {
+                    let Err(_) = result else {
+                        panic!("plain upsert must reject repeated key in one batch");
+                    };
+                    assert_eq!(
+                        collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
+                        vec![(9, 90)]
+                    );
+                }
+                if dedup == UpsertDedup::DropIdentical {
+                    let before_failure =
+                        collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await;
+                    let schema = provider.table_schema();
+                    let failing = Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        futures::stream::iter(
+                            vec![
+                                id_value_batch(Arc::clone(&schema), &[1, 1], &[50, 60]),
+                                id_value_batch(schema, &[1], &[70]),
+                            ]
+                            .into_iter()
+                            .map(Ok),
+                        ),
+                    ));
+                    let Err(_) = provider
+                        .write_cdc_append_stream(failing, &ctx.task_ctx())
+                        .await
+                    else {
+                        panic!("different rows under one key must fail");
+                    };
+                    assert_eq!(
+                        collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
+                        before_failure
+                    );
+                }
+                let before_reopen =
+                    collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await;
+                provider
+                    .checkpoint_mem_tier()
+                    .await
+                    .expect("checkpoint CDC tier");
+                let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+                    .with_upsert_dedup(dedup)
+                    .open("buffered_cdc_keys")
+                    .await
+                    .expect("reopen checkpointed CDC table");
+                assert_eq!(
+                    collect_id_value_pairs(&ctx, &reopened, "buffered_cdc_keys").await,
+                    before_reopen
+                );
+                assert_eq!(
+                    query_count_star(&ctx, &reopened, "buffered_cdc_keys").await,
+                    i64::try_from(before_reopen.len()).expect("row count fits i64")
+                );
+            }
+        }
     }
 
     /// Replay an apply schedule through a fresh table at shard count `n` and
@@ -68922,5 +69090,4 @@ mod tests {
              discard its keyset, which rebuilds the whole keyset on every write"
         );
     }
-
 }
