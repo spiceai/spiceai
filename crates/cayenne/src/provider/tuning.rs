@@ -84,6 +84,17 @@ pub(crate) const BAKE_BACKPRESSURE_RATIO: f64 = 1.0;
 /// latency is well under the offered-load interval.
 const HEALTHY_RATIO: f64 = 0.5;
 
+/// Apply-deficit ratio (`apply_vs_arrival`) beyond which a violated ingest goal
+/// takes the throughput-cliff fast path: the buffer levers (commit and spill
+/// amortization) recover a few percent of apply time, so a deficit this large
+/// can only be closed by encode parallelism. The goal ladder's buffers-first
+/// order spent 16 dwells on levers that could not help while the backlog grew at
+/// the full deficit rate (the closed-loop harness measured 366 s of lag built in
+/// the 230 s before the first shard was added after a 6× shift, more than the
+/// untouched warm start accumulated). ~2× separates a real cliff from the
+/// [`BEHIND_RATIO`] band the additive ladder is designed for.
+const APPLY_CLIFF_RATIO: f64 = 2.0;
+
 /// Read-amplification (small-file count) above which compaction is judged to be
 /// behind and should run more aggressively.
 const READ_AMP_HIGH: usize = 8;
@@ -199,6 +210,19 @@ const SLOW_TIER_MEM_DRAIN_OFFSET: f64 = 0.07;
 /// well before CPU credits deplete and the vCPUs throttle to a low baseline — a
 /// cliff the busy-fraction sampler cannot see coming.
 const CPU_PRESSURE_OK_BURSTABLE: f64 = 0.50;
+
+/// Hysteresis band below the CPU growth gate ([`CPU_PRESSURE_OK`] /
+/// [`CPU_PRESSURE_OK_BURSTABLE`]) at which a query-admission reserve is RELEASED
+/// on the CPU signal alone. The reserve is grown while CPU is contended (busy
+/// fraction at/over the gate) and its own effect — shedding queries — lowers the
+/// busy fraction, so releasing at the very same threshold makes the two moves
+/// chase each other every dwell (the closed-loop harness measured 221 direction
+/// reversals in 240 ticks with one threshold). Releasing only once CPU is
+/// comfortably below the gate gives the pair the band the memory rule already
+/// has ([`MEM_PRESSURE_HIGH`] vs [`MEM_PRESSURE_OK`]). The other release
+/// triggers (ingest goal met with apply headroom, query SLO violated) are
+/// unaffected.
+const CPU_RELEASE_HYSTERESIS: f64 = 0.15;
 
 /// Idle horizon for [`QueryObservations::qph`]: with no query observed within this
 /// window the table is treated as having no QPH signal (the goal is skipped) rather
@@ -414,11 +438,22 @@ fn adaptive_inline_flush_bounds_for_budget(
 /// up to 4× the configured size for scan-heavy query goals and shrink to ½ — never
 /// below a 64 MiB floor, never above 2 GiB — always bounded by the static config.
 /// A configured size of `0` (size-rolling disabled) is left for the caller to pin.
+///
+/// The ceiling is kept at least at the warm start (as the memtable and mem-tier
+/// bounds do), so the range is ordered for ANY warm start: a configured size
+/// above 4 GiB has a half-size floor above the 2 GiB ceiling, and clamping the
+/// ceiling to `[lo, CEIL]` there panicked (`clamp` with `min > max`) on every
+/// control tick — the pure-decision sweep caught it. Such a size is simply held
+/// (never grown past itself, never shrunk below half).
 pub(crate) fn adaptive_target_file_size_bounds(initial_bytes: i64) -> (i64, i64) {
     const FLOOR: i64 = 64 * MIB;
     const CEIL: i64 = 2048 * MIB;
     let lo = (initial_bytes / 2).max(FLOOR);
-    let hi = initial_bytes.saturating_mul(4).clamp(lo, CEIL);
+    let hi = initial_bytes
+        .saturating_mul(4)
+        .min(CEIL)
+        .max(initial_bytes)
+        .max(lo);
     (lo, hi)
 }
 
@@ -1367,12 +1402,26 @@ impl IngestSnapshot {
     /// `true` (the CPU rule is inert). Single source of truth for the gate, shared
     /// by both decide ladders and [`binding_constraint`].
     fn cpu_ok(&self) -> bool {
-        let gate = if self.cpu_burstable {
+        self.cpu_pressure.is_none_or(|p| p < self.cpu_gate())
+    }
+
+    /// CPU is comfortably free — the release-side twin of [`Self::cpu_ok`], a
+    /// [`CPU_RELEASE_HYSTERESIS`] band below the growth gate, so a reserve grown
+    /// under contention is not handed back by the relief it created. Unknown
+    /// pressure ⇒ `true` (the CPU rule is inert).
+    fn cpu_uncontended(&self) -> bool {
+        self.cpu_pressure
+            .is_none_or(|p| p < self.cpu_gate() - CPU_RELEASE_HYSTERESIS)
+    }
+
+    /// The CPU growth gate for this host ([`CPU_PRESSURE_OK_BURSTABLE`] on a
+    /// T-family burstable instance, else [`CPU_PRESSURE_OK`]).
+    fn cpu_gate(&self) -> f64 {
+        if self.cpu_burstable {
             CPU_PRESSURE_OK_BURSTABLE
         } else {
             CPU_PRESSURE_OK
-        };
-        self.cpu_pressure.is_none_or(|p| p < gate)
+        }
     }
 
     /// The data volume is on a slow/networked tier — the continuous,
@@ -1714,13 +1763,47 @@ pub(crate) struct Adjustment {
 // Query-side observations (pushed down from the runtime)
 // ---------------------------------------------------------------------------
 
-/// Latency histogram bucket upper-bounds in ms (log-spaced). p99 is read as the
-/// bucket whose running cumulative count first crosses 99%; an implicit
-/// `(60s, +inf)` overflow bucket sits beyond the last bound.
-const LAT_BUCKET_BOUNDS_MS: [f64; 15] = [
-    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0,
-    20_000.0, 60_000.0,
-];
+/// Ratio between consecutive latency-histogram bucket bounds. Log-spaced at
+/// 1.25× so a bucket's upper bound overstates the true p99 by at most 25 %:
+/// together with evaluating a goal's *violation* on the bucket's LOWER bound
+/// ([`Goals::query_violation`]), quantization can never manufacture a violation
+/// of a goal the table meets, and a real violation is detected within one bucket
+/// (≤ 25 %) of the deadband. The coarse 2–2.5× layout this replaced reported a
+/// 110 ms p99 as the 200 ms bucket against a 150 ms goal — a phantom +33 %.
+const LAT_BUCKET_RATIO: f64 = 1.25;
+
+/// Number of finite bucket bounds: `1.25^50 ≈ 70 s`, so the ladder spans 1 ms to
+/// beyond the 60 s the coarse layout ended at. An implicit `(~70s, +inf)`
+/// overflow bucket sits beyond the last bound.
+const LAT_BUCKET_COUNT: usize = 51;
+
+/// Latency histogram bucket upper-bounds in ms: the geometric ladder
+/// `1.25^k`, `k = 0..LAT_BUCKET_COUNT`. p99 is read as the bucket whose running
+/// cumulative count first crosses 99 %.
+const LAT_BUCKET_BOUNDS_MS: [f64; LAT_BUCKET_COUNT] = lat_bucket_bounds_ms();
+
+const fn lat_bucket_bounds_ms() -> [f64; LAT_BUCKET_COUNT] {
+    let mut bounds = [0.0; LAT_BUCKET_COUNT];
+    let mut bound = 1.0;
+    let mut i = 0;
+    while i < LAT_BUCKET_COUNT {
+        bounds[i] = bound;
+        bound *= LAT_BUCKET_RATIO;
+        i += 1;
+    }
+    bounds
+}
+
+/// The LOWER bound of the histogram bucket whose upper bound is `upper_ms` — the
+/// optimistic end of the p99 interval the histogram actually knows (`0` for the
+/// first bucket). Consecutive bounds differ by exactly [`LAT_BUCKET_RATIO`].
+fn p99_bucket_lower_ms(upper_ms: f64) -> f64 {
+    if upper_ms <= LAT_BUCKET_BOUNDS_MS[0] {
+        0.0
+    } else {
+        upper_ms / LAT_BUCKET_RATIO
+    }
+}
 
 /// Per-table query-side observations, fed by the runtime on query completion and
 /// read by the per-table tuner on its background tick. Lock-free: a fixed bucket
@@ -1775,11 +1858,14 @@ impl QueryObservations {
     }
 
     /// p99 latency estimate (upper bound of the bucket where the running cumulative
-    /// count crosses 99%), or `None` if no queries have been recorded.
+    /// count crosses 99%), or `None` if no queries have been recorded. The
+    /// histogram knows an interval, not a point: the true p99 lies in
+    /// `(upper / LAT_BUCKET_RATIO, upper]`, which is why the goal controller
+    /// evaluates a violation on the lower end ([`Goals::query_violation`]).
     #[must_use]
     pub fn p99_latency_ms(&self) -> Option<f64> {
-        // Two passes directly over the 16 atomics (no heap alloc): total, then the
-        // bucket where the running count crosses 99%.
+        // Two passes directly over the bucket atomics (no heap alloc): total, then
+        // the bucket where the running count crosses 99%.
         let total: u64 = self
             .lat_buckets
             .iter()
@@ -2005,6 +2091,23 @@ impl Goal {
     fn comfortably_met(self, measured: Option<f64>) -> bool {
         matches!(self.normalized_error(measured), Some(e) if e <= -GOAL_RELAX_FRACTION)
     }
+
+    /// [`Self::comfortably_met`], with an unavailable measurement counting as
+    /// "no objection". A goal that cannot be measured — no query has run yet
+    /// (p99 `None`), the query side went idle (QPH `None` past `QPH_IDLE_MS`), a
+    /// source that carries no commit timestamp (lag `None`) — cannot veto handing
+    /// a resource back: nothing the tighten tiers took can be serving it. Without
+    /// this an unmeasured goal froze the controller at its aggressive extreme
+    /// (every write shard, a 2 s compaction interval) for as long as the table
+    /// lived — the closed-loop harness measured it over a 30-minute idle phase.
+    /// Used only by the relax / release gates; the tighten path already treats an
+    /// unmeasured goal as not violated, so the pair is consistent: unmeasured ⇒
+    /// neither tighten nor veto. The relax tier stays gated on the legacy healthy
+    /// predicate, so relaxing on an unmeasured goal is exactly as safe as relaxing
+    /// with no goal configured.
+    fn comfortably_met_or_unmeasured(self, measured: Option<f64>) -> bool {
+        measured.is_none() || self.comfortably_met(measured)
+    }
 }
 
 /// Operator-configured tuning goals (each `None` when unset) plus the convergence
@@ -2104,25 +2207,41 @@ impl Goals {
     }
 
     /// Max violation among the query-side goals — drives the query tier's step size.
+    ///
+    /// The latency goal is evaluated on the LOWER bound of the p99 histogram
+    /// bucket (`s.query_latency_p99_ms` carries the bucket's upper bound — see
+    /// [`QueryObservations::p99_latency_ms`]): the histogram knows an interval,
+    /// not a point, and a violation is claimed only when even its optimistic end
+    /// is past the deadband. Evaluating the upper bound manufactured violations
+    /// from quantization alone — every query at 110 ms read as the 200 ms bucket
+    /// against a 150 ms goal (+33 %, past the 20 % deadband), and the closed-loop
+    /// harness measured 69 phantom "query-latency goal" moves ending in an
+    /// infeasible-SLO verdict. [`Self::query_comfortably_met`] keeps the upper
+    /// bound (the pessimistic end), the hysteresis-consistent direction: never
+    /// tighten on an uncertain violation, never relax on an uncertain margin.
     fn query_violation(self, s: &IngestSnapshot) -> f64 {
-        let lat = self
-            .query_latency_p99
-            .map_or(0.0, |g| g.violation(s.query_latency_p99_ms));
+        let lat = self.query_latency_p99.map_or(0.0, |g| {
+            g.violation(s.query_latency_p99_ms.map(p99_bucket_lower_ms))
+        });
         let qph = self.qph.map_or(0.0, |g| g.violation(s.qph));
         lat.max(qph)
     }
 
-    /// Are all *active* goals comfortably met? Gate for the healthy-relax tier.
+    /// Are all *active* goals comfortably met (an unmeasured goal counting as no
+    /// objection — see [`Goal::comfortably_met_or_unmeasured`])? Gate for the
+    /// healthy-relax tier.
     fn all_comfortably_met(self, s: &IngestSnapshot) -> bool {
         self.replication_lag
-            .is_none_or(|g| g.comfortably_met(s.replication_lag_secs))
+            .is_none_or(|g| g.comfortably_met_or_unmeasured(s.replication_lag_secs))
             && self
                 .freshness
-                .is_none_or(|g| g.comfortably_met(s.freshness_secs))
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.freshness_secs))
             && self
                 .query_latency_p99
-                .is_none_or(|g| g.comfortably_met(s.query_latency_p99_ms))
-            && self.qph.is_none_or(|g| g.comfortably_met(s.qph))
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.query_latency_p99_ms))
+            && self
+                .qph
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.qph))
     }
 
     /// Are the ingest-side goals (replication-lag + freshness) comfortably met?
@@ -2138,10 +2257,10 @@ impl Goals {
     /// "release on violated" is a stable negative-feedback brake, not a latch.
     fn ingest_comfortably_met(self, s: &IngestSnapshot) -> bool {
         self.replication_lag
-            .is_none_or(|g| g.comfortably_met(s.replication_lag_secs))
+            .is_none_or(|g| g.comfortably_met_or_unmeasured(s.replication_lag_secs))
             && self
                 .freshness
-                .is_none_or(|g| g.comfortably_met(s.freshness_secs))
+                .is_none_or(|g| g.comfortably_met_or_unmeasured(s.freshness_secs))
     }
 
     /// Are the query-side goals (query-latency-p99 + QPH) comfortably met? The
@@ -2595,7 +2714,7 @@ pub(crate) fn decide_with_goals(
     // deliberately NOT shrunk here — there is no memory pressure, and keeping them
     // sized leaves the table ready for the next burst at no query/CPU cost.
     if s.apply_vs_arrival < HEALTHY_RATIO && s.read_amp <= READ_AMP_LOW && mem_ok {
-        return relax_step(cur, b);
+        return relax_step(cur, b, b.compaction_background_interval_ms.1);
     }
 
     None
@@ -2671,10 +2790,17 @@ fn decide_goal(
 
     // (1b) Release the query-admission reserve as soon as its justification is gone
     // OR it has overshot a query SLO. Three triggers, all safe/stable:
-    //   - CPU no longer contended (`cpu_ok`) — shedding queries can't help the apply
-    //     if CPU isn't the bottleneck, so nothing to relieve;
-    //   - the ingest goal is comfortably met (`ingest_comfortably_met`) — the apply
-    //     caught up, the reserve's whole reason is gone;
+    //   - CPU comfortably uncontended (`cpu_uncontended`: a hysteresis band UNDER
+    //     the growth gate, not the gate itself) — shedding queries can't help the
+    //     apply if CPU isn't the bottleneck, so nothing to relieve. The band
+    //     matters: the reserve's own effect lowers CPU, and releasing at the
+    //     growth threshold re-grows it next dwell (a measured limit cycle);
+    //   - the ingest goal is comfortably met (`ingest_comfortably_met`) AND the
+    //     apply has real headroom (`apply_vs_arrival < HEALTHY_RATIO`) — the apply
+    //     caught up, the reserve's whole reason is gone. The headroom conjunct is
+    //     the same rule the relax tier applies: a goal met only *because* the
+    //     reserve keeps the apply afloat is re-violated by the release (measured
+    //     as a ~100 s grow/release sawtooth), so "met" alone is not enough;
     //   - a query SLO (QPH or query-latency) is now VIOLATED (`query_violated`) — the
     //     throttle has borrowed too much query capacity and pushed a query goal past
     //     target, so back off. This is the QUERY-SLO BRAKE: throttling moves QPH/
@@ -2686,7 +2812,9 @@ fn decide_goal(
     // honoring the query SLOs) is high priority. Fast handback (legacy ±⅓ step);
     // the bound floor is 0.
     if cur.query_admission_reserve > 0
-        && (cpu_ok || goals.ingest_comfortably_met(s) || query_violated)
+        && (s.cpu_uncontended()
+            || (goals.ingest_comfortably_met(s) && s.apply_vs_arrival < HEALTHY_RATIO)
+            || query_violated)
         && let Some(v) = clamp_move_usize(
             cur.query_admission_reserve,
             shrink_usize(cur.query_admission_reserve),
@@ -2872,6 +3000,47 @@ fn decide_goal(
     // gated so extra shards (= more files) never fire while a query goal is
     // violated, read-amp is high, or the stream is delete-heavy.
     if ingest_violated {
+        // The resource gates the write-shard lever always carries (more shards =
+        // more files, uploads, commits, key churn, in-flight buffers): never while
+        // a query goal is violated, never mutation-heavy, never CPU-, I/O- or
+        // publish-bound, never under memory pressure.
+        let shards_allowed =
+            !query_violated && mem_ok && !mutation_heavy && cpu_ok && !io_bound && !publish_bound;
+        // (3a) Throughput cliff: the apply is behind by more than amortization can
+        // recover (`APPLY_CLIFF_RATIO`), so go to encode parallelism FIRST — the
+        // ingest analogue of the I/O-cliff fast path — with the legacy ×1.5 step
+        // rather than the additive crawl. If read-amp is what withholds shards
+        // (a trigger the relax tier raised), lower the trigger this tick so the
+        // next one can add the shard; the buffers-first order below stays for the
+        // ordinary [`BEHIND_RATIO`] band it was designed for.
+        if s.apply_vs_arrival > APPLY_CLIFF_RATIO && shards_allowed {
+            if s.read_amp > READ_AMP_LOW
+                && let Some(v) = clamp_move_usize(
+                    cur.compaction_trigger_files,
+                    shrink_usize(cur.compaction_trigger_files),
+                    b.compaction_trigger_files,
+                )
+            {
+                return Some(Adjustment {
+                    actuator: Actuator::CompactionTriggerFiles,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "replication-lag goal, apply cliff: lower compaction trigger → drain small files so write shards can be added",
+                });
+            }
+            if s.read_amp <= READ_AMP_LOW
+                && let Some(v) = clamp_move_usize(
+                    cur.write_concurrency.max(1),
+                    grow_usize(cur.write_concurrency.max(1)),
+                    b.write_concurrency,
+                )
+            {
+                return Some(Adjustment {
+                    actuator: Actuator::WriteConcurrency,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "replication-lag goal, apply cliff: raise write concurrency first (buffers cannot close a 2× deficit)",
+                });
+            }
+        }
         // Buffer growth is withheld under a freshness violation (see the mem-tier
         // grow gate below): when data is too slow to become queryable, growing
         // buffers is the wrong direction. Under a pure LAG violation it fires as
@@ -2917,13 +3086,8 @@ fn decide_goal(
         // grow move: each extra shard is another in-flight encode buffer and
         // inline memtable, so near the budget this lever converts a lag
         // violation into an OOM kill.
-        if !query_violated
+        if shards_allowed
             && s.read_amp <= READ_AMP_LOW
-            && mem_ok
-            && !mutation_heavy
-            && cpu_ok
-            && !io_bound
-            && !publish_bound
             && let Some(v) = clamp_move_usize(
                 cur.write_concurrency.max(1),
                 goal_grow_usize(cur.write_concurrency.max(1), b.write_concurrency, ingest_v),
@@ -3019,13 +3183,38 @@ fn decide_goal(
         });
     }
 
-    // (4) Healthy-relax: every active goal comfortably met and memory ok → hand
-    // resources back, one per tick, smallest-goal-impact first. Relaxing need not
-    // be incremental, so it reuses the legacy ±50% steps. The memory buffers are
-    // deliberately NOT shrunk here (no memory pressure; keep them sized for the
-    // next burst).
-    if goals.all_comfortably_met(s) && mem_ok {
-        return relax_step(cur, b);
+    // (4) Healthy-relax: every active goal comfortably met, memory ok, AND the
+    // legacy healthy predicate — apply well under the offered-load interval and
+    // read-amp low. A goal being comfortably met is necessary but not sufficient
+    // to hand a resource back: the relax tier sheds write shards, and a shard
+    // shed at ρ≈0.9 (lag fine, apply barely keeping up) saturates the apply, the
+    // lag goal violates, the ingest tier re-adds the shard, and the two tiers
+    // limit-cycle (the closed-loop harness measured 116 direction reversals of
+    // `write_concurrency` per hour on a steady ρ≈0.9 stream, and a never-worse-
+    // than-static violation — the untouched warm start simply kept up). The
+    // headroom gate is what makes a ×2/3 shard step safe: at apply < 0.5 the
+    // step lands at ≤ 0.75, still keeping up. Relaxing need not be incremental,
+    // so it reuses the legacy ±50% steps. The memory buffers are deliberately NOT
+    // shrunk here (no memory pressure; keep them sized for the next burst).
+    if goals.all_comfortably_met(s)
+        && mem_ok
+        && s.apply_vs_arrival < HEALTHY_RATIO
+        && s.read_amp <= READ_AMP_LOW
+    {
+        // The compaction interval is also the controller's own tick (the
+        // background compactor sleeps the live interval and runs the control step
+        // on each wake), so in goal mode it is never relaxed past the goal dwell:
+        // a controller that lengthened its clock to 60 s could not take its
+        // `STEPS_PER_WINDOW` steps inside the window it promised, and the
+        // closed-loop harness measured a shift reacted to 50 s late and then
+        // walked at 50 s per step. An interval already above the dwell (e.g. the
+        // 10 s CDC warm start) is left where it is — never raised further.
+        let dwell_ms = u64::try_from(goals.dwell().as_millis()).unwrap_or(u64::MAX);
+        let interval_ceiling = b
+            .compaction_background_interval_ms
+            .1
+            .min(dwell_ms.max(b.compaction_background_interval_ms.0));
+        return relax_step(cur, b, interval_ceiling);
     }
 
     None
@@ -3037,8 +3226,10 @@ fn decide_goal(
 /// incremental). The memory buffers (memtable, mem-tier) are deliberately NOT
 /// shrunk here (no memory pressure; keep them sized for the next burst). Returns
 /// `None` when every lever is already at its efficient extreme. The caller gates
-/// on the appropriate healthy / all-goals-met + memory-ok condition.
-fn relax_step(cur: &ActuatorValues, b: &TuningBounds) -> Option<Adjustment> {
+/// on the appropriate healthy / all-goals-met + memory-ok condition, and passes
+/// the interval ceiling it allows (the static ceiling on the legacy path; the
+/// goal dwell in goal mode — an interval already above it is left alone).
+fn relax_step(cur: &ActuatorValues, b: &TuningBounds, interval_ceiling: u64) -> Option<Adjustment> {
     if let Some(v) = clamp_move_usize(
         cur.write_concurrency.max(1),
         shrink_usize(cur.write_concurrency.max(1)),
@@ -3061,11 +3252,13 @@ fn relax_step(cur: &ActuatorValues, b: &TuningBounds) -> Option<Adjustment> {
             reason: "healthy: relax the compaction trigger to reduce background churn",
         });
     }
-    if let Some(v) = clamp_move_u64(
-        cur.compaction_background_interval_ms,
-        grow_u64(cur.compaction_background_interval_ms),
-        b.compaction_background_interval_ms,
-    ) {
+    if cur.compaction_background_interval_ms < interval_ceiling
+        && let Some(v) = clamp_move_u64(
+            cur.compaction_background_interval_ms,
+            grow_u64(cur.compaction_background_interval_ms),
+            (b.compaction_background_interval_ms.0, interval_ceiling),
+        )
+    {
         return Some(Adjustment {
             actuator: Actuator::CompactionIntervalMs,
             new_value: v,
@@ -3165,6 +3358,16 @@ fn shrink_i64(v: i64) -> i64 {
 // Additive (not multiplicative) so the convergence guarantee holds against the
 // linear range. The result is clamped to `[floor, ceiling]` by `clamp_move_*` at
 // the call site, exactly like the legacy steps.
+//
+// A SHRINK is additionally capped at the legacy ×2/3 step — never more than a
+// third of the current value per tick (at least 1 unit) — because an additive
+// `range / N` measured against a wide range is most of a small current value: a
+// 256 MiB mem-tier against a 2 GiB range was cut to its 64 MiB floor in one move,
+// and a 10 s compaction interval to 2.75 s — the shape of the L-20 incident
+// (#11893, a 1 GiB tier collapsed to 67 MiB). Growth stays purely additive:
+// every raise is memory-gated and ceiling-clamped, and the window promise (N
+// steps span the range) is pinned for the tighten direction by
+// `lag_goal_converges_to_ceiling_within_window_steps`.
 
 /// Per-tick goal-mode step magnitude for an actuator with the given `range`,
 /// scaled by `violation` in `[0, 1]`. At least 1 so a tiny range still moves.
@@ -3185,13 +3388,25 @@ fn goal_grow_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
     v.saturating_add(step)
 }
 
+/// Per-tick goal-mode SHRINK magnitude for a current value `v` over `range`: the
+/// additive step ([`goal_step_magnitude_u64`]) capped at the legacy ×2/3 step, so
+/// one tick never removes more than a third of the current value (and at least 1
+/// unit, so a tiny value still makes progress).
+fn goal_shrink_step_u64(v: u64, range: u64, violation: f64) -> u64 {
+    let additive = goal_step_magnitude_u64(range, violation);
+    let multiplicative = v.saturating_sub(shrink_u64(v)).max(1);
+    additive.min(multiplicative)
+}
+
 /// Shrink an `i64` actuator by one goal-mode step (the `saturating_sub` twin of
-/// [`goal_grow_i64`]). The result is clamped to `[floor, ceiling]` by
-/// `clamp_move_i64` at the call site — the floor (e.g. [`MEM_TIER_MIN_BYTES`])
-/// bounds how far the freshness lever can shrink the mem-tier.
+/// [`goal_grow_i64`], capped per [`goal_shrink_step_u64`]). The result is clamped
+/// to `[floor, ceiling]` by `clamp_move_i64` at the call site — the floor (e.g.
+/// [`MEM_TIER_MIN_BYTES`]) bounds how far the freshness lever can shrink the
+/// mem-tier.
 fn goal_shrink_i64(v: i64, (lo, hi): (i64, i64), violation: f64) -> i64 {
     let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(0);
-    let step = i64::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(i64::MAX);
+    let cur = u64::try_from(v.max(0)).unwrap_or(0);
+    let step = i64::try_from(goal_shrink_step_u64(cur, range, violation)).unwrap_or(i64::MAX);
     v.saturating_sub(step)
 }
 
@@ -3202,12 +3417,13 @@ fn goal_grow_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usize 
 }
 
 fn goal_shrink_u64(v: u64, (lo, hi): (u64, u64), violation: f64) -> u64 {
-    v.saturating_sub(goal_step_magnitude_u64(hi.saturating_sub(lo), violation))
+    v.saturating_sub(goal_shrink_step_u64(v, hi.saturating_sub(lo), violation))
 }
 
 fn goal_shrink_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usize {
     let range = u64::try_from(hi.saturating_sub(lo)).unwrap_or(u64::MAX);
-    let step = usize::try_from(goal_step_magnitude_u64(range, violation)).unwrap_or(usize::MAX);
+    let cur = u64::try_from(v).unwrap_or(u64::MAX);
+    let step = usize::try_from(goal_shrink_step_u64(cur, range, violation)).unwrap_or(usize::MAX);
     v.saturating_sub(step)
 }
 
@@ -4970,9 +5186,13 @@ mod tests {
         obs.record_query(5_000.0); // the top-1% outlier
         assert_eq!(obs.total_queries(), 100);
         let p99 = obs.p99_latency_ms().expect("p99");
-        // 99% threshold is reached within the 5ms bucket; the lone slow query is
-        // the 100th (top 1%), so p99 reports the 5ms bucket bound.
-        assert!((p99 - 5.0).abs() < f64::EPSILON, "p99 ~5ms, got {p99}");
+        // The 99% threshold is reached inside the bucket holding 5 ms; the lone
+        // slow query is the 100th (top 1%), so p99 reports that bucket's upper
+        // bound — within one bucket ratio of 5 ms, nowhere near the 5 s outlier.
+        assert!(
+            (5.0..=5.0 * LAT_BUCKET_RATIO).contains(&p99),
+            "p99 must report the bucket holding 5 ms, got {p99}"
+        );
     }
 
     #[test]
@@ -5903,5 +6123,460 @@ mod tests {
         record_query_latency("never_registered_zzz", 1.0);
         deregister_query_observations("regtest_unique_tbl");
         record_query_latency("regtest_unique_tbl", 9.0); // post-deregister: no-op
+    }
+
+    /// Goal-mode relax needs apply headroom, not just a comfortably-met goal: a
+    /// lag goal far under target while the apply barely keeps up (ρ≈0.9) must NOT
+    /// shed a shard — that saturates the apply and starts a relax/tighten limit
+    /// cycle (measured in the closed-loop harness: 116 write-concurrency
+    /// reversals per hour). With real headroom (ρ=0.2) the shed still happens.
+    #[test]
+    fn goal_relax_requires_apply_headroom() {
+        let goals = lag_goal(5.0);
+        let b = bounds();
+        let cur = actuators();
+        let no_headroom = IngestSnapshot {
+            replication_lag_secs: Some(0.3),
+            apply_vs_arrival: 0.9,
+            read_amp: 1,
+            ..snap()
+        };
+        assert!(
+            goal_decide(&no_headroom, &cur, &b, &goals).is_none(),
+            "lag comfortably met but apply at 0.9 of the arrival gap: hold, do not shed"
+        );
+        let read_amp_high = IngestSnapshot {
+            replication_lag_secs: Some(0.3),
+            apply_vs_arrival: 0.2,
+            read_amp: READ_AMP_LOW + 1,
+            ..snap()
+        };
+        assert!(
+            goal_decide(&read_amp_high, &cur, &b, &goals).is_none(),
+            "lag comfortably met but read-amp elevated: hold, do not relax compaction"
+        );
+        let headroom = IngestSnapshot {
+            replication_lag_secs: Some(0.3),
+            apply_vs_arrival: 0.2,
+            read_amp: 1,
+            ..snap()
+        };
+        let adj = goal_decide(&headroom, &cur, &b, &goals).expect("headroom ⇒ relax");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        assert!(adj.new_value < cur.write_concurrency as u64);
+    }
+
+    /// A goal-mode SHRINK never removes more than a third of the current value in
+    /// one tick, however large the violation: the additive `range / N` step is
+    /// capped at the legacy ×2/3 step. Pins the fix for the L-20 shape (a 256 MiB
+    /// mem-tier cut to its floor in one move; a 10 s compaction interval cut to
+    /// 2.75 s) measured in the closed-loop harness.
+    #[test]
+    fn goal_shrink_is_capped_at_a_third_per_tick() {
+        let b = bounds();
+        // Freshness massively violated with the apply behind ⇒ the mem-tier shrink
+        // lever, against a 2 GiB range from a 256 MiB current value.
+        let s = IngestSnapshot {
+            freshness_secs: Some(1_000.0),
+            apply_vs_arrival: 1.5,
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let cur = actuators();
+        let adj = goal_decide(&s, &cur, &b, &goals).expect("a shrink move");
+        assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
+        let floor_of_step = cur.mem_tier_max_bytes as u64 * 2 / 3;
+        assert!(
+            adj.new_value < cur.mem_tier_max_bytes as u64 && adj.new_value >= floor_of_step,
+            "one tick may remove at most a third: {} -> {} (min {floor_of_step})",
+            cur.mem_tier_max_bytes,
+            adj.new_value
+        );
+        // Query-latency goal massively violated with the memtable already at its
+        // ceiling ⇒ the compaction-interval shrink, against a 58 s range from 10 s.
+        let s = IngestSnapshot {
+            query_latency_p99_ms: Some(60_000.0),
+            ..snap()
+        };
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            ..actuators()
+        };
+        let adj = goal_decide(&s, &cur, &b, &latency_goal_for_test(100.0)).expect("a move");
+        assert_eq!(adj.actuator, Actuator::CompactionIntervalMs);
+        assert!(
+            adj.new_value >= cur.compaction_background_interval_ms * 2 / 3,
+            "interval {} -> {} exceeds the ×2/3 cap",
+            cur.compaction_background_interval_ms,
+            adj.new_value
+        );
+        // The pure helper: a tiny value still steps by at least 1.
+        assert_eq!(goal_shrink_u64(2, (0, 1_000_000), 1.0), 1);
+        assert_eq!(goal_shrink_u64(1, (0, 1_000_000), 1.0), 0);
+    }
+
+    fn latency_goal_for_test(ms: f64) -> Goals {
+        Goals::from_targets(None, None, Some(ms), None, Duration::from_mins(1))
+    }
+
+    /// A query-latency goal the table meets is never reported violated by the
+    /// histogram's quantization: the goal is evaluated on the bucket's lower
+    /// bound, and the 1.25× buckets keep that bound within one bucket of the true
+    /// p99. Regression guard for the phantom moves + infeasible verdict the
+    /// closed-loop harness measured with the coarse buckets and upper-bound
+    /// evaluation.
+    #[test]
+    fn query_latency_goal_is_not_violated_by_bucket_quantization() {
+        let goals = latency_goal_for_test(150.0);
+        // Every query at 118 ms: the true p99 is under the 150 ms goal.
+        let obs = QueryObservations::new();
+        for _ in 0..200 {
+            obs.record_query(118.0);
+        }
+        let upper = obs.p99_latency_ms().expect("p99");
+        assert!(
+            (118.0..=118.0 * LAT_BUCKET_RATIO).contains(&upper),
+            "bucket bound {upper}"
+        );
+        let met = IngestSnapshot {
+            query_latency_p99_ms: Some(upper),
+            ..snap()
+        };
+        assert!(
+            goals.query_violation(&met).abs() < f64::EPSILON,
+            "a met goal must not read as violated (bucket upper bound {upper})"
+        );
+        assert!(
+            goal_decide(&met, &actuators(), &bounds(), &goals).is_none(),
+            "no query-tier move on a met goal"
+        );
+        // Every query at 240 ms (+60 %): a genuine violation, detected.
+        let obs = QueryObservations::new();
+        for _ in 0..200 {
+            obs.record_query(240.0);
+        }
+        let violated = IngestSnapshot {
+            query_latency_p99_ms: obs.p99_latency_ms(),
+            ..snap()
+        };
+        assert!(
+            goals.query_violation(&violated) > 0.0,
+            "a +60% p99 is a violation"
+        );
+        // The bucket series is a 1.25× geometric ladder from 1 ms past 60 s.
+        assert!((LAT_BUCKET_BOUNDS_MS[0] - 1.0).abs() < f64::EPSILON);
+        for w in LAT_BUCKET_BOUNDS_MS.windows(2) {
+            assert!((w[1] / w[0] - LAT_BUCKET_RATIO).abs() < 1e-9);
+        }
+        let last = LAT_BUCKET_BOUNDS_MS
+            .iter()
+            .copied()
+            .last()
+            .expect("non-empty ladder");
+        assert!(
+            last > 60_000.0,
+            "the ladder must reach past 60 s, top bound {last}"
+        );
+        assert!((p99_bucket_lower_ms(1.0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// A configured goal whose metric is unavailable (no queries yet, an idle
+    /// query side) must not veto the relax tier: with the lag goal comfortably
+    /// met and the plant healthy, resources are handed back. A goal that IS
+    /// measured and merely met (not comfortably) still vetoes. Regression guard
+    /// for the shards + 2 s compaction interval left at their extremes through a
+    /// 30-minute idle phase in the closed-loop harness.
+    #[test]
+    fn unmeasured_goal_does_not_block_relax() {
+        let b = bounds();
+        let cur = actuators();
+        let healthy_lag_met = IngestSnapshot {
+            replication_lag_secs: Some(1.0),
+            query_latency_p99_ms: None,
+            qph: None,
+            apply_vs_arrival: 0.2,
+            read_amp: 1,
+            ..snap()
+        };
+        let lag_and_latency = lag_and_latency_goal_for_test(5.0, 200.0);
+        let adj = goal_decide(&healthy_lag_met, &cur, &b, &lag_and_latency)
+            .expect("an unmeasured latency goal cannot veto relax");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        assert!(adj.new_value < cur.write_concurrency as u64);
+        let lag_and_qph =
+            Goals::from_targets(Some(5.0), None, None, Some(1000.0), Duration::from_mins(1));
+        let adj = goal_decide(&healthy_lag_met, &cur, &b, &lag_and_qph)
+            .expect("an idle (None) QPH goal cannot veto relax");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+        // Measured but only just met (−7 %, inside the relax hysteresis): veto holds.
+        let measured_not_comfortable = IngestSnapshot {
+            query_latency_p99_ms: Some(186.0),
+            ..healthy_lag_met
+        };
+        assert!(
+            goal_decide(&measured_not_comfortable, &cur, &b, &lag_and_latency).is_none(),
+            "a measured goal without relax headroom still vetoes"
+        );
+    }
+
+    fn lag_and_latency_goal_for_test(lag_secs: f64, ms: f64) -> Goals {
+        Goals::from_targets(Some(lag_secs), None, Some(ms), None, Duration::from_mins(1))
+    }
+
+    /// Under an apply cliff (deficit beyond `APPLY_CLIFF_RATIO`) a violated lag
+    /// goal raises write shards FIRST, with the legacy ×1.5 step; in the ordinary
+    /// behind band the buffers-first order is unchanged. If read-amp withholds
+    /// shards, the cliff path lowers the compaction trigger instead. Regression
+    /// guard for the 16-dwell buffer crawl the closed-loop harness measured after
+    /// a 6× shift.
+    #[test]
+    fn apply_cliff_raises_write_concurrency_before_buffers() {
+        let goals = lag_goal(5.0);
+        let b = bounds();
+        let one_shard = ActuatorValues {
+            write_concurrency: 1,
+            ..actuators()
+        };
+        let cliff = IngestSnapshot {
+            replication_lag_secs: Some(60.0),
+            apply_vs_arrival: 3.0,
+            read_amp: 1,
+            ..snap()
+        };
+        let adj = goal_decide(&cliff, &one_shard, &b, &goals).expect("a move");
+        assert_eq!(
+            adj.actuator,
+            Actuator::WriteConcurrency,
+            "cliff ⇒ shards first"
+        );
+        assert_eq!(adj.new_value, 2, "legacy ×1.5 step from 1 (at least +1)");
+        let mild = IngestSnapshot {
+            apply_vs_arrival: 1.5,
+            ..cliff
+        };
+        let adj = goal_decide(&mild, &one_shard, &b, &goals).expect("a move");
+        assert_eq!(
+            adj.actuator,
+            Actuator::InlineFlushBytes,
+            "ordinary behind band keeps the buffers-first order"
+        );
+        let cliff_read_amp_high = IngestSnapshot {
+            read_amp: READ_AMP_LOW + 5,
+            ..cliff
+        };
+        let relaxed_trigger = ActuatorValues {
+            compaction_trigger_files: 32,
+            ..one_shard
+        };
+        let adj = goal_decide(&cliff_read_amp_high, &relaxed_trigger, &b, &goals).expect("a move");
+        assert_eq!(
+            adj.actuator,
+            Actuator::CompactionTriggerFiles,
+            "read-amp withholds shards ⇒ lower the trigger first"
+        );
+        assert!(adj.new_value < 32);
+        // Cliff with the shard gates closed (mutation-heavy) falls through to the
+        // ordinary ladder rather than adding shards.
+        let cliff_mutations = IngestSnapshot {
+            delete_fraction: 0.5,
+            ..cliff
+        };
+        let adj = goal_decide(&cliff_mutations, &one_shard, &b, &goals).expect("a move");
+        assert_ne!(adj.actuator, Actuator::WriteConcurrency);
+    }
+
+    /// The target-file-size bounds are ordered (`floor <= ceiling`) and contain
+    /// the warm start for any configured size, including sizes above 4 GiB whose
+    /// half-size floor exceeds the 2 GiB ceiling — the case that panicked in
+    /// `clamp` on every control tick.
+    #[test]
+    fn target_file_size_bounds_are_ordered_for_any_warm_start() {
+        let mib = 1024 * 1024_i64;
+        for initial in [
+            0,
+            1,
+            64 * mib,
+            512 * mib,
+            4096 * mib,
+            5000 * mib,
+            65_536 * mib,
+            i64::MAX / 8,
+        ] {
+            let (lo, hi) = adaptive_target_file_size_bounds(initial);
+            assert!(
+                lo <= hi,
+                "unordered bounds ({lo}, {hi}) for warm start {initial}"
+            );
+            assert!(
+                initial <= hi,
+                "warm start {initial} above its own ceiling {hi}"
+            );
+        }
+        // Above 4 GiB the size is held: half-size floor, ceiling at the warm start.
+        assert_eq!(
+            adaptive_target_file_size_bounds(5000 * mib),
+            (2500 * mib, 5000 * mib)
+        );
+        // The documented shape for ordinary sizes is unchanged.
+        assert_eq!(
+            adaptive_target_file_size_bounds(256 * mib),
+            (128 * mib, 1024 * mib)
+        );
+    }
+
+    /// In goal mode the relax tier never lengthens the compaction interval — the
+    /// controller's own tick — past the goal dwell, and leaves an interval already
+    /// above the dwell where it is. The legacy ladder still relaxes to the static
+    /// ceiling.
+    #[test]
+    fn goal_relax_never_lengthens_the_interval_past_the_dwell() {
+        let goals = lag_goal(5.0); // 60 s window ⇒ 7.5 s dwell
+        let b = bounds();
+        let healthy = IngestSnapshot {
+            replication_lag_secs: Some(0.5),
+            apply_vs_arrival: 0.2,
+            read_amp: 1,
+            ..snap()
+        };
+        // Shards and trigger at their efficient extremes: the interval is next.
+        let below_dwell = ActuatorValues {
+            write_concurrency: 1,
+            compaction_trigger_files: b.compaction_trigger_files.1,
+            compaction_background_interval_ms: 6_000,
+            ..actuators()
+        };
+        let adj = goal_decide(&healthy, &below_dwell, &b, &goals).expect("a move");
+        assert_eq!(adj.actuator, Actuator::CompactionIntervalMs);
+        assert_eq!(adj.new_value, 7_500, "relaxed up to, not past, the dwell");
+        let above_dwell = ActuatorValues {
+            compaction_background_interval_ms: 10_000,
+            ..below_dwell
+        };
+        assert!(
+            goal_decide(&healthy, &above_dwell, &b, &goals).is_none(),
+            "an interval above the dwell is left alone (never raised, never lowered)"
+        );
+        // Legacy ladder: unchanged, relaxes toward the static ceiling.
+        let legacy_healthy = IngestSnapshot {
+            replication_lag_secs: None,
+            ..healthy
+        };
+        let adj = decide_fresh(&legacy_healthy, &above_dwell, &b).expect("legacy relax");
+        assert_eq!(adj.actuator, Actuator::CompactionIntervalMs);
+        assert_eq!(adj.new_value, 15_000);
+    }
+
+    /// The reserve's release triggers must not undo the relief they serve: the
+    /// CPU trigger sits a hysteresis band UNDER the growth gate (inside the band a
+    /// held reserve neither grows nor releases on CPU; below it releases), and the
+    /// ingest-goal-met trigger needs apply headroom (a lag goal met only because
+    /// the reserve keeps the apply afloat is not released). Regression guards for
+    /// the grow/release chase (221 reversals in 240 ticks) and the ~100 s sawtooth
+    /// the closed-loop harness measured.
+    #[test]
+    fn query_admission_reserve_release_is_hysteretic_and_headroom_gated() {
+        let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
+        let b = bounds();
+        // Freshness behind, shrink lever exhausted (mem-tier at floor), a reserve
+        // already held: the only reserve-related moves left are grow/release.
+        let reserve_held = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
+            query_admission_reserve: 3,
+            ..actuators()
+        };
+        let decide = |s: &IngestSnapshot| {
+            decide_with_goals(s, &reserve_held, &b, ms(60_000), ms(30_000), 0, &goals)
+        };
+        // CPU inside the band (just under the growth gate): neither grow nor release.
+        let in_band = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(CPU_PRESSURE_OK - CPU_RELEASE_HYSTERESIS / 2.0),
+            ..snap()
+        };
+        assert!(
+            !matches!(
+                decide(&in_band),
+                Some(adj) if adj.actuator == Actuator::QueryAdmissionReserve
+            ),
+            "inside the hysteresis band the reserve must neither grow nor release"
+        );
+        // CPU below the band: comfortably uncontended ⇒ release.
+        let below_band = IngestSnapshot {
+            freshness_secs: Some(60.0),
+            cpu_pressure: Some(CPU_PRESSURE_OK - CPU_RELEASE_HYSTERESIS - 0.05),
+            ..snap()
+        };
+        let adj = decide(&below_band).expect("CPU comfortably free ⇒ release a slot");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+        assert!((adj.new_value as usize) < 3, "released toward 0");
+        // Ingest goal comfortably met but the apply barely keeps up (0.9 of the
+        // arrival gap) under contention: the reserve is what keeps it met — hold.
+        let met_no_headroom = IngestSnapshot {
+            freshness_secs: Some(1.0),
+            cpu_pressure: Some(0.95),
+            apply_vs_arrival: 0.9,
+            ..snap()
+        };
+        assert!(
+            !matches!(
+                decide(&met_no_headroom),
+                Some(adj) if adj.actuator == Actuator::QueryAdmissionReserve
+            ),
+            "goal met without apply headroom must not release the reserve"
+        );
+        // Same, with real headroom ⇒ release.
+        let met_headroom = IngestSnapshot {
+            freshness_secs: Some(1.0),
+            cpu_pressure: Some(0.95),
+            apply_vs_arrival: 0.2,
+            ..snap()
+        };
+        let adj = decide(&met_headroom).expect("goal met with headroom ⇒ release");
+        assert_eq!(adj.actuator, Actuator::QueryAdmissionReserve);
+
+        // Closed loop against a plant where each reserved slot relieves 7.5% of
+        // CPU (0.89 with none held): the reserve must settle, not chase itself.
+        let live = LiveActuators::new(ActuatorValues {
+            query_admission_reserve: 0,
+            ..reserve_held
+        });
+        let mut last_sign = 0i8;
+        let mut reversals = 0u32;
+        for _ in 0..40 {
+            let cur = live.values();
+            let cpu = 0.89 - 0.075 * cur.query_admission_reserve as f64;
+            let s = IngestSnapshot {
+                freshness_secs: Some(60.0),
+                cpu_pressure: Some(cpu),
+                ..snap()
+            };
+            let Some(adj) = decide_with_goals(&s, &cur, &b, ms(60_000), ms(30_000), 0, &goals)
+            else {
+                continue;
+            };
+            if adj.actuator != Actuator::QueryAdmissionReserve {
+                live.apply(&adj);
+                continue;
+            }
+            let sign: i8 = if adj.new_value as usize > cur.query_admission_reserve {
+                1
+            } else {
+                -1
+            };
+            if last_sign != 0 && sign != last_sign {
+                reversals += 1;
+            }
+            last_sign = sign;
+            live.apply(&adj);
+        }
+        assert!(
+            reversals <= 1,
+            "the reserve chased its own CPU relief: {reversals} direction reversals"
+        );
+        assert!(
+            live.values().query_admission_reserve > 0,
+            "under sustained contention the reserve settles above zero"
+        );
     }
 }
