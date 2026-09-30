@@ -235,7 +235,7 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
 /// character in it — so a rewrite would trade a failed query for wrong rows.
 ///
 /// A cast from a fractional value into an integer stays local too, because
-/// MySQL rounds it where `DataFusion` truncates
+/// `MySQL` rounds it where `DataFusion` truncates
 /// ([`crate::dialect::mysql_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
@@ -581,7 +581,7 @@ mod tests {
     /// Regression test for #14482, through every policy whose engine rounds a
     /// fractional value cast into an integer where `DataFusion` truncates: a
     /// plan holding such a cast, in a projection or a filter, must stay local
-    /// on `DuckDB` (both accessors), `PostgreSQL` and MySQL. The same policies
+    /// on `DuckDB` (both accessors), `PostgreSQL` and `MySQL`. The same policies
     /// decide the scan-level filter pushdown, so a filter over the cast is kept
     /// out of the pushed-down scan too rather than pre-applied by the engine
     /// with its own rounding.

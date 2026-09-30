@@ -248,7 +248,7 @@ pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -
     integer_cast_is_renderable(expr, scope)
 }
 
-/// Whether MySQL evaluates this non-function expression node the way
+/// Whether `MySQL` evaluates this non-function expression node the way
 /// `DataFusion` does — today, a cast from a fractional value into an integer is
 /// the one shape it does not (see [`integer_cast_is_renderable`]).
 #[must_use]
@@ -262,7 +262,7 @@ pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> b
 /// `DataFusion` truncates toward zero: `CAST(1.5 AS INT)` is `1` and
 /// `CAST(-1.5 AS INT)` is `-1`, and a `DECIMAL` is divided by its scale in
 /// integer arithmetic (`arrow-cast`'s `cast_decimal_to_integer`), so
-/// `CAST(2.49 AS INT)` is `2` too. `DuckDB`, `PostgreSQL` and MySQL round to
+/// `CAST(2.49 AS INT)` is `2` too. `DuckDB`, `PostgreSQL` and `MySQL` round to
 /// the nearest integer instead — `2`, `-2` and `2` — so a cast pushed to any
 /// of them answers a different value than the same cast evaluated locally, and
 /// a filter over it selects different rows, with no error anywhere (issue
@@ -677,7 +677,7 @@ mod tests {
         ));
     }
 
-    /// Regression test for #14482: `DuckDB`, `PostgreSQL` and MySQL round a
+    /// Regression test for #14482: `DuckDB`, `PostgreSQL` and `MySQL` round a
     /// fractional value cast into an integer where `DataFusion` truncates, so
     /// the cast has to stay local on each of them — `CAST` and `TRY_CAST`, from
     /// every floating-point and decimal operand, into every integer width, and
