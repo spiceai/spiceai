@@ -3220,6 +3220,24 @@ pub mod cayenne {
             })
             .record(files, dimensions);
     }
+
+    static LOOKUP_INDEX_PERSISTED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the bytes a table's persisted secondary index runs take on
+    /// disk. `dimensions` carries `table`.
+    pub fn track_lookup_index_persisted_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_PERSISTED_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_lookup_index_persisted_bytes")
+                    .with_description(
+                        "Bytes a Cayenne table's persisted secondary index runs take on disk.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(bytes, dimensions);
+    }
 }
 
 #[cfg(test)]

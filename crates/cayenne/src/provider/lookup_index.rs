@@ -1472,8 +1472,12 @@ impl LookupIndexState {
         {
             return;
         }
-        let runs = persisted_runs.load().await;
+        let (runs, bytes) = persisted_runs.load().await;
+        persisted_runs.report_bytes(bytes);
         let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
+        *self.live_files.lock() = Some(Arc::new(
+            live.iter().map(|&name| name.to_string()).collect(),
+        ));
         let added: usize = runs.iter().flatten().map(IndexRun::heap_bytes).sum();
         let loaded: usize = runs.iter().map(Vec::len).sum();
         {
@@ -1495,8 +1499,18 @@ impl LookupIndexState {
                 return;
             }
         }
+        self.report_coverage();
         if loaded > 0 {
-            tracing::debug!(table = %self.table_name, runs = loaded, "Loaded persisted secondary index runs");
+            // A file counts as covered once every key's runs hold it.
+            let covered = self
+                .coverage()
+                .and_then(|keys| keys.iter().map(|&(_, covered, _)| covered).min())
+                .unwrap_or(0);
+            tracing::info!(
+                table = %self.table_name,
+                "{}",
+                persisted_runs_loaded_message(&self.table_name, loaded, bytes, covered, live.len())
+            );
         }
     }
 
@@ -2404,14 +2418,17 @@ impl PersistedRuns {
             .list_index_runs(&self.table_id)
             .await
             .map_err(|e| format!("list persisted runs: {e}"))?;
-        let mut existing: HashSet<(String, String)> = registered
+        let mut existing: HashMap<(String, String), u64> = registered
             .into_iter()
-            .map(|record| (record.index_key, record.run_name))
+            .map(|record| ((record.index_key, record.run_name), record.size_bytes))
             .collect();
+        // The bytes of every run this sync leaves persisted.
+        let mut persisted = 0_u64;
         for (view, key) in views.iter().zip(&self.keys) {
             for run in view.run_list() {
                 let name = run_file_name(&run);
-                if existing.remove(&(key.clone(), name.clone())) {
+                if let Some(size) = existing.remove(&(key.clone(), name.clone())) {
+                    persisted = persisted.saturating_add(size);
                     continue;
                 }
                 let row_count = run.len() as u64;
@@ -2434,13 +2451,15 @@ impl PersistedRuns {
                     .register_index_run(&record)
                     .await
                     .map_err(|e| format!("register {path}: {e}"))?;
+                persisted = persisted.saturating_add(record.size_bytes);
             }
         }
         // What is left is registered but no longer wanted: runs merged or
         // retired since, and runs of a key the table no longer has.
-        for (key, name) in existing {
+        for (key, name) in existing.into_keys() {
             self.remove(&key, &name).await?;
         }
+        self.report_bytes(persisted);
         Ok(())
     }
 
@@ -2460,13 +2479,14 @@ impl PersistedRuns {
     /// Every key's persisted runs. A registered run whose file cannot be read
     /// is unregistered and deleted, and a file no run is registered for, left
     /// by a write that stopped before registering it, is deleted.
-    async fn load(&self) -> Vec<Vec<IndexRun>> {
+    async fn load(&self) -> (Vec<Vec<IndexRun>>, u64) {
         let mut all: Vec<Vec<IndexRun>> = self.keys.iter().map(|_| Vec::new()).collect();
+        let mut bytes = 0_u64;
         let registered = match self.catalog.list_index_runs(&self.table_id).await {
             Ok(registered) => registered,
             Err(error) => {
                 tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded: the persisted runs could not be listed");
-                return all;
+                return (all, bytes);
             }
         };
         let mut kept: HashSet<object_store::path::Path> = HashSet::new();
@@ -2482,6 +2502,7 @@ impl PersistedRuns {
             match self.read(&path).await {
                 Ok(run) => {
                     kept.insert(path);
+                    bytes = bytes.saturating_add(record.size_bytes);
                     all[slot].push(run);
                 }
                 Err(error) => {
@@ -2493,7 +2514,14 @@ impl PersistedRuns {
             }
         }
         self.delete_unregistered(&kept).await;
-        all
+        (all, bytes)
+    }
+
+    fn report_bytes(&self, bytes: u64) {
+        telemetry::cayenne::track_lookup_index_persisted_bytes(
+            bytes,
+            &[telemetry::KeyValue::new("table", self.table_name.clone())],
+        );
     }
 
     async fn read(&self, path: &object_store::path::Path) -> Result<IndexRun, String> {
@@ -2530,6 +2558,32 @@ impl PersistedRuns {
             }
         }
     }
+}
+
+/// The line a reopened table logs once it has loaded its persisted runs.
+fn persisted_runs_loaded_message(
+    table_name: &str,
+    runs: usize,
+    bytes: u64,
+    covered: usize,
+    files: usize,
+) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a size shown to one decimal place of a MiB"
+    )]
+    let mib = bytes as f64 / f64::from(1_u32 << 20);
+    let coverage = if covered >= files {
+        format!("covering all {files} of its files")
+    } else {
+        format!(
+            "covering {covered} of its {files} files; the other {} are indexed in the background",
+            files - covered
+        )
+    };
+    format!(
+        "Dataset '{table_name}' (cayenne): loaded {runs} persisted secondary index runs ({mib:.1} MiB on disk), {coverage}"
+    )
 }
 
 /// A persisted run's name: a digest of the run's files and size, so the same run
@@ -3501,6 +3555,18 @@ mod tests {
         assert_eq!(
             state.coverage(),
             Some(vec![("tenant", 1, 2), ("(tenant, service)", 1, 2)])
+        );
+    }
+
+    #[test]
+    fn the_loaded_runs_message_names_the_table_its_size_and_its_coverage() {
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 3, 5 << 20, 20, 20),
+            "Dataset 'orders' (cayenne): loaded 3 persisted secondary index runs (5.0 MiB on disk), covering all 20 of its files"
+        );
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 3, 3 << 19, 18, 20),
+            "Dataset 'orders' (cayenne): loaded 3 persisted secondary index runs (1.5 MiB on disk), covering 18 of its 20 files; the other 2 are indexed in the background"
         );
     }
 
