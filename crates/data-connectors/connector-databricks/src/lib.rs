@@ -1706,7 +1706,7 @@ mod tests {
                     secrecy::SecretString::from("10"),
                 ),
                 (
-                    "databricks_client_timeout".to_string(),
+                    "client_timeout".to_string(),
                     secrecy::SecretString::from("45s"),
                 ),
             ],
