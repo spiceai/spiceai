@@ -1049,8 +1049,14 @@ impl CayenneCatalog {
         // cold store. No inline payload: a graduation's content is the cold files
         // registered below, and the overwrite clear correctly drops the warm
         // tier's inline corpus along with everything else keyed on the old snapshot.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
-            .await?;
+        self.commit_overwrite_in_txn(
+            txn,
+            table_id,
+            new_snapshot_id,
+            None,
+            &crate::metadata::OverwriteLayering::default(),
+        )
+        .await?;
         // One statement per file rather than `execute_many`: each row carries
         // a statistics blob and a primary-key bloom of up to
         // `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, so binding them all at once would
@@ -1091,7 +1097,7 @@ impl CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
-        layers: &[crate::metadata::OverwriteLayer],
+        layering: &crate::metadata::OverwriteLayering,
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -1153,10 +1159,15 @@ impl CayenneCatalog {
                 })?;
         }
 
-        // The overwrite's protected layers and their tombstones, after the batch
-        // above cleared the previous ones, so the transaction publishes exactly the
-        // state an overwrite followed by one upsert per layer would leave.
-        for layer in layers {
+        // The deletes that hide the copies later copies superseded, after the batch
+        // above cleared the previous ones: position deletion vectors on the main
+        // snapshot, or protected layers with their key tombstones — the state an
+        // overwrite followed by one upsert per layer would leave.
+        for chunk in layering.delete_files.chunks(32_000 / 10) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+        for layer in &layering.layers {
             let mut payload = crate::provider::on_conflict::PreparedOnConflictDurablePayload {
                 table_id: table_id.to_string(),
                 delete_files: layer.delete_files.clone(),
@@ -3551,7 +3562,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
-        layers: &[crate::metadata::OverwriteLayer],
+        layering: &crate::metadata::OverwriteLayering,
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -3574,7 +3585,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, layers)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, layering)
                 .await
             {
                 Ok(()) => match tx.commit().await {

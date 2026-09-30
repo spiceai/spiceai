@@ -66,6 +66,7 @@ limitations under the License.
 //! either the complete pre-overwrite table or the complete post-overwrite one.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
@@ -86,7 +87,7 @@ use super::table::{
 };
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
-use crate::metadata::{InlinedData, OverwriteLayer};
+use crate::metadata::{InlinedData, OverwriteLayer, OverwriteLayering};
 use crate::metastore::MetastoreTransaction;
 
 /// A prepared overwrite: data has been written to a new snapshot directory
@@ -114,12 +115,18 @@ pub struct PreparedOverwrite {
     /// buffered until it is committed and published — the whole span over which
     /// the buffered batches and the serialized blob are resident.
     _inline_admission: Option<OwnedSemaphorePermit>,
-    /// Protected layers above the main snapshot, for keys the incoming data
-    /// repeats across record batches; see [`super::overwrite_layers`].
-    layers: Vec<OverwriteLayer>,
-    /// Each layer's tombstones in the encoding the in-memory index takes, in the
-    /// order of `layers`.
+    /// What resolves the keys the incoming data repeats across record batches:
+    /// protected layers above the main snapshot (a key-deletion table), or
+    /// position deletes on it (a position-deletion table); see
+    /// [`super::overwrite_layers`].
+    layering: OverwriteLayering,
+    /// Each protected layer's tombstones in the encoding the in-memory index
+    /// takes, in the order of `layering.layers`.
     layer_tombstones: Vec<LayerTombstones>,
+    /// The file-local positions `layering.delete_files` hide, per data file.
+    position_deletions: HashMap<String, Vec<u32>>,
+    /// Rows that stay live when position deletes hide some written rows.
+    live_rows: Option<u64>,
 }
 
 impl std::fmt::Debug for PreparedOverwrite {
@@ -130,7 +137,8 @@ impl std::fmt::Debug for PreparedOverwrite {
             .field("row_count", &self.row_count)
             .field("has_write_guard", &self.write_guard.is_some())
             .field("inlined", &self.inlined.is_some())
-            .field("layers", &self.layers.len())
+            .field("layers", &self.layering.layers.len())
+            .field("position_deleted_files", &self.position_deletions.len())
             .finish_non_exhaustive()
     }
 }
@@ -196,7 +204,7 @@ impl PreparedOverwrite {
                 self.table_id(),
                 &self.new_snapshot_id,
                 self.inlined.as_ref(),
-                &self.layers,
+                &self.layering,
             )
             .await
     }
@@ -221,7 +229,7 @@ impl PreparedOverwrite {
                 self.table_id(),
                 &self.new_snapshot_id,
                 self.inlined.as_ref(),
-                &self.layers,
+                &self.layering,
             )
             .await
     }
@@ -310,6 +318,7 @@ impl PreparedOverwrite {
         // inline counters must go from "old corpus" to "these rows" without a
         // window in which the new snapshot is paired with an empty inline view.
         let layers: Vec<OverwriteLayerPublish<'_>> = self
+            .layering
             .layers
             .iter()
             .zip(&self.layer_tombstones)
@@ -332,6 +341,7 @@ impl PreparedOverwrite {
                         sequence_number: inlined.sequence_number,
                     }),
                 &layers,
+                &self.position_deletions,
             )
             .await?;
         drop(layers);
@@ -395,7 +405,12 @@ impl PreparedOverwrite {
             .table
             .prune_snapshot_manifest_to(
                 &std::iter::once(self.new_snapshot_id.as_str())
-                    .chain(self.layers.iter().map(|layer| layer.snapshot_id.as_str()))
+                    .chain(
+                        self.layering
+                            .layers
+                            .iter()
+                            .map(|layer| layer.snapshot_id.as_str()),
+                    )
                     .collect::<Vec<_>>(),
             )
             .await
@@ -415,12 +430,12 @@ impl PreparedOverwrite {
         // repopulates it when the accumulator has rows. The catalog row was
         // already cleared atomically with the snapshot pointer flip.
         self.table
-            .reset_table_stats_after_overwrite(&self.write_stats_acc)
+            .reset_table_stats_after_overwrite(&self.write_stats_acc, self.live_rows)
             .await;
         // The accumulator counted every copy the layers wrote, and which of them
         // a tombstone supersedes is only known probabilistically, so the count is
         // an upper bound until compaction folds the layers.
-        if !self.layers.is_empty() {
+        if !self.layering.layers.is_empty() {
             self.table.taint_persisted_row_count_exactness().await;
         }
 
@@ -459,9 +474,12 @@ impl PreparedOverwrite {
         // by the catalog.
         let table_path = self.table.table_path();
         if !table_path.starts_with("s3://") {
-            for snapshot_id in std::iter::once(self.new_snapshot_id.as_str())
-                .chain(self.layers.iter().map(|layer| layer.snapshot_id.as_str()))
-            {
+            for snapshot_id in std::iter::once(self.new_snapshot_id.as_str()).chain(
+                self.layering
+                    .layers
+                    .iter()
+                    .map(|layer| layer.snapshot_id.as_str()),
+            ) {
                 let snapshot_dir = self.table.snapshot_dir_path_for(snapshot_id);
                 match tokio::fs::remove_dir_all(&snapshot_dir).await {
                     Ok(()) => {}
@@ -475,7 +493,14 @@ impl PreparedOverwrite {
                     }
                 }
             }
-            remove_layer_deletion_vectors(&self.layers).await;
+            remove_deletion_vectors(
+                self.layering
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.delete_files)
+                    .chain(&self.layering.delete_files),
+            )
+            .await;
         }
         Ok(())
     }
@@ -687,8 +712,10 @@ impl CayenneTableProvider {
                     write_stats_acc: inlined.stats,
                     inlined: Some(inlined.data),
                     _inline_admission: Some(inlined.admission),
-                    layers: Vec::new(),
+                    layering: OverwriteLayering::default(),
                     layer_tombstones: Vec::new(),
+                    position_deletions: HashMap::new(),
+                    live_rows: None,
                 });
             }
             OverwriteAdmission::Fallback(stream) => stream,
@@ -761,6 +788,9 @@ impl CayenneTableProvider {
         // so the index is complete when the write is — no second pass over the
         // finished files, and nothing to rebuild after the flip.
         let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
+        // On a table that deletes by position every layer is written into the
+        // main snapshot, so its writes feed the same lookup index.
+        let layer_observer = lookup_index_observer.as_ref().map(Arc::clone);
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
@@ -807,6 +837,41 @@ impl CayenneTableProvider {
             }
         };
 
+        // On a table that deletes by position, the later layers join the main
+        // snapshot and position deletes hide the copies they supersede, so the
+        // refresh publishes one snapshot and no key tombstone. Written before the
+        // manifest below, which must list their files.
+        let mut in_place = None;
+        if self.should_capture_positions()
+            && let Some(mut source) = layer_source.take()
+        {
+            match self
+                .write_overwrite_layers_in_place(
+                    &mut source,
+                    &new_snapshot_id,
+                    LayerWrite {
+                        target_size_bytes,
+                        target_partitions,
+                        write_policy,
+                    },
+                    layer_observer,
+                    &write_stats_acc,
+                )
+                .await
+            {
+                Ok(written) => in_place = Some(written),
+                Err(error) => {
+                    self.discard_lookup_index_build();
+                    if !is_s3 {
+                        let _ =
+                            tokio::fs::remove_dir_all(self.snapshot_dir_path_for(&new_snapshot_id))
+                                .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
         // written by this single commit, so that range is exact. Reserving `S`
@@ -852,6 +917,29 @@ impl CayenneTableProvider {
         // The layers above the main snapshot, each from the sequences reserved
         // after the main snapshot's `S`, so every layer's tombstones sort above
         // the main snapshot's rows.
+        // The in-place layers' position deletes, at a sequence above the main
+        // snapshot's `S`, like every delete a later write records against it.
+        if let Some(in_place) = in_place.as_mut()
+            && !in_place.position_deletions.is_empty()
+        {
+            match self
+                .write_position_deletion_vectors(&in_place.position_deletions)
+                .await
+            {
+                Ok(files) => in_place.delete_files = files,
+                Err(error) => {
+                    self.discard_lookup_index_build();
+                    if !is_s3 {
+                        let _ =
+                            tokio::fs::remove_dir_all(self.snapshot_dir_path_for(&new_snapshot_id))
+                                .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let row_count =
+            row_count.saturating_add(in_place.as_ref().map_or(0, |in_place| in_place.rows));
         let (row_count, layers, layer_tombstones) = match layer_source {
             None => (row_count, Vec::new(), Vec::new()),
             Some(mut source) => match self
@@ -888,9 +976,126 @@ impl CayenneTableProvider {
             write_stats_acc,
             inlined: None,
             _inline_admission: None,
-            layers,
+            layering: OverwriteLayering {
+                layers,
+                delete_files: in_place
+                    .as_mut()
+                    .map(|in_place| std::mem::take(&mut in_place.delete_files))
+                    .unwrap_or_default(),
+            },
             layer_tombstones,
+            live_rows: in_place
+                .as_ref()
+                .map(|in_place| row_count - in_place.deleted_rows),
+            position_deletions: in_place
+                .map(|in_place| in_place.position_deletions)
+                .unwrap_or_default(),
         })
+    }
+
+    /// Write every layer after the main snapshot into the main snapshot itself, on
+    /// a table that deletes by position, and locate the copies they supersede.
+    ///
+    /// The layers still order the copies of a key — a batch repeating a key of the
+    /// current layer starts the next one — but nothing orders them by sequence.
+    /// Instead, once every layer is written, a read-back of the lower layers' key
+    /// columns finds each copy whose key has a later one, for position deletes to
+    /// hide: the refresh publishes one snapshot and no key tombstone. Every layer's
+    /// write feeds the snapshot's lookup index.
+    async fn write_overwrite_layers_in_place(
+        &self,
+        source: &mut LayerSource,
+        snapshot_id: &str,
+        write: LayerWrite,
+        observer: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
+        write_stats_acc: &ColumnStatsAccumulator,
+    ) -> Result<InPlaceLayers> {
+        let mut file_layers: HashMap<String, usize> = self
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await?
+            .into_iter()
+            .map(|(name, _)| (name, 0))
+            .collect();
+        let mut rows: u64 = 0;
+        let mut layer = 0;
+        while let Some(stream) = source.next_layer() {
+            layer += 1;
+            let (layer_rows, _files, layer_stats) = self
+                .write_to_snapshot_range_partitioned(
+                    stream,
+                    write.target_size_bytes,
+                    snapshot_id,
+                    write.target_partitions,
+                    None,
+                    write.write_policy,
+                    Some(RangePartitioning::hashed_run_sorted()),
+                    observer.as_ref().map(Arc::clone),
+                )
+                .await?;
+            write_stats_acc.merge_from(&layer_stats);
+            rows = rows.saturating_add(layer_rows);
+            for (name, _) in self.list_snapshot_files_with_sizes(snapshot_id).await? {
+                file_layers.entry(name).or_insert(layer);
+            }
+        }
+        if !self.table_path().starts_with("s3://") {
+            Self::sync_snapshot_dir(&self.snapshot_dir_path_for(snapshot_id)).await?;
+        }
+        let mut tombstones = source.take_tombstones();
+        drop_superseded_tombstones(&mut tombstones);
+        // Each tombstoned key's last copy is in the layer that holds its highest
+        // tombstone; every copy below it is superseded.
+        let superseded: HashMap<u128, usize, hash_index::PrehashedBuildHasher> = tombstones
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, tombstones)| {
+                tombstones
+                    .digests
+                    .iter()
+                    .map(move |&digest| (digest, layer))
+            })
+            .collect();
+        drop(tombstones);
+        let position_deletions = self
+            .locate_superseded_copies(snapshot_id, &file_layers, &superseded)
+            .await
+            .map_err(|source| super::Error::Catalog { source })?;
+        let deleted_rows = position_deletions
+            .values()
+            .map(|rows| rows.len() as u64)
+            .sum();
+        Ok(InPlaceLayers {
+            rows,
+            deleted_rows,
+            delete_files: Vec::new(),
+            position_deletions,
+        })
+    }
+
+    /// Write position deletion vectors for `position_deletions`, at a fresh
+    /// sequence, for an overwrite to commit with its snapshot.
+    async fn write_position_deletion_vectors(
+        &self,
+        position_deletions: &HashMap<String, Vec<u32>>,
+    ) -> Result<Vec<crate::metadata::DeleteFile>> {
+        let sequence = self.reserve_sequences_local(1).await?;
+        let mut metadata = self.metadata().clone();
+        metadata.current_sequence_number = sequence;
+        let specs = position_deletions
+            .iter()
+            .map(|(file, rows)| {
+                super::delete::DeletionVectorWriteSpec::new_position_based_sorted(
+                    file.clone(),
+                    rows.iter().map(|&row| u64::from(row)).collect(),
+                )
+            })
+            .collect();
+        Ok(super::delete::DeletionVectorWriter::new(&metadata)
+            .write(specs)
+            .await?
+            .into_iter()
+            .map(|written| written.delete_file)
+            .collect())
     }
 
     /// Write every layer after the main snapshot as a protected snapshot, then the
@@ -1009,7 +1214,7 @@ impl CayenneTableProvider {
                     let _ =
                         tokio::fs::remove_dir_all(self.snapshot_dir_path_for(snapshot_id)).await;
                 }
-                remove_layer_deletion_vectors(&layers).await;
+                remove_deletion_vectors(layers.iter().flat_map(|layer| &layer.delete_files)).await;
             }
             return Err(error);
         }
@@ -1019,20 +1224,55 @@ impl CayenneTableProvider {
 
 /// Keep, for each key, only the tombstone of the highest layer that records it.
 fn drop_superseded_tombstones(layers: &mut [LayerTombstones]) {
-    let mut int64_seen = std::collections::HashSet::new();
-    let mut row_seen: std::collections::HashSet<Box<[u8]>> = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     for layer in layers.iter_mut().rev() {
-        layer.pk_i64.retain(|pk| int64_seen.insert(*pk));
-        layer.row_keys.retain(|key| row_seen.insert(key.clone()));
+        let keep: Vec<bool> = layer
+            .digests
+            .iter()
+            .map(|&digest| seen.insert(digest))
+            .collect();
+        let mut kept = keep.iter();
+        layer
+            .digests
+            .retain(|_| kept.next().copied().unwrap_or(true));
+        if !layer.pk_i64.is_empty() {
+            let mut kept = keep.iter();
+            layer
+                .pk_i64
+                .retain(|_| kept.next().copied().unwrap_or(true));
+        }
+        if !layer.row_keys.is_empty() {
+            let mut kept = keep.iter();
+            layer
+                .row_keys
+                .retain(|_| kept.next().copied().unwrap_or(true));
+        }
     }
+}
+
+/// How a layered overwrite writes each layer after the main snapshot.
+#[derive(Clone, Copy)]
+struct LayerWrite {
+    target_size_bytes: usize,
+    target_partitions: usize,
+    write_policy: super::delta_encoding::WritePolicy,
+}
+
+/// What [`CayenneTableProvider::write_overwrite_layers_in_place`] wrote.
+struct InPlaceLayers {
+    rows: u64,
+    deleted_rows: u64,
+    delete_files: Vec<crate::metadata::DeleteFile>,
+    position_deletions: HashMap<String, Vec<u32>>,
 }
 
 /// Best-effort removal of the deletion-vector files of layers that were never
 /// committed; a file left behind is swept as an orphan.
-async fn remove_layer_deletion_vectors(layers: &[OverwriteLayer]) {
-    let paths: Vec<std::path::PathBuf> = layers
-        .iter()
-        .flat_map(|layer| layer.delete_files.iter())
+async fn remove_deletion_vectors<'a>(
+    files: impl IntoIterator<Item = &'a crate::metadata::DeleteFile>,
+) {
+    let paths: Vec<std::path::PathBuf> = files
+        .into_iter()
         .map(|file| std::path::PathBuf::from(&file.path))
         .collect();
     super::delete::cleanup_uncommitted_delete_paths(&paths).await;

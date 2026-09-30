@@ -702,15 +702,15 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// Returns an error if the transaction cannot be committed.
     ///
-    /// `layers` are the protected snapshots the overwrite publishes above its
-    /// main snapshot for keys its incoming data repeats across record batches;
-    /// see [`crate::metadata::OverwriteLayer`].
+    /// `layering` holds what the overwrite commits to resolve keys its incoming
+    /// data repeats across record batches; see
+    /// [`crate::metadata::OverwriteLayering`].
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
-        layers: &[crate::metadata::OverwriteLayer],
+        layering: &crate::metadata::OverwriteLayering,
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.

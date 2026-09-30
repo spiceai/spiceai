@@ -5727,11 +5727,24 @@ impl CayenneTableProvider {
         new_snapshot_id: &str,
         inlined_rows: Option<InlinedOverwritePublish>,
         layers: &[OverwriteLayerPublish<'_>],
+        position_deletions: &HashMap<String, Vec<u32>>,
     ) -> Result<Option<u64>> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
         let layer_deletions = self.build_overwrite_layer_deletions(layers);
+        let position_deletions: Option<PositionBitmap> =
+            (!position_deletions.is_empty()).then(|| {
+                position_deletions
+                    .iter()
+                    .map(|(file, rows)| {
+                        (
+                            file.clone(),
+                            Arc::new(PositionDeletionVector::new(rows.iter().copied().collect())),
+                        )
+                    })
+                    .collect()
+            });
         let discarded_epoch = {
             let _fence = self.listing_fence.write().await;
             // An overwrite replaces every row, including the rows still in the
@@ -5752,6 +5765,7 @@ impl CayenneTableProvider {
                 inlined_rows,
                 layers,
                 layer_deletions,
+                position_deletions,
             );
             discarded_epoch
         };
@@ -5913,6 +5927,7 @@ impl CayenneTableProvider {
         inlined_rows: Option<InlinedOverwritePublish>,
         layers: &[OverwriteLayerPublish<'_>],
         layer_deletions: Option<OverwriteLayerDeletions>,
+        position_deletions: Option<PositionBitmap>,
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
         // and every step here is synchronous, while a scan-view capture holds
@@ -5960,6 +5975,14 @@ impl CayenneTableProvider {
                 self.refresh_deletion_memory_accounting();
             }
             _ => {}
+        }
+        // The position deletes that hide the copies an overwrite written in place
+        // superseded; see `write_overwrite_layers_in_place`.
+        if let Some(position_deletions) = position_deletions {
+            self.pk_deletion_strategy
+                .position_cache()
+                .store(Arc::new(position_deletions));
+            self.refresh_deletion_memory_accounting();
         }
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
@@ -12533,7 +12556,7 @@ impl CayenneTableProvider {
     /// deletes: a PK table (`Int64Pk`/`RowConverterBased`) whose resolved
     /// [`DeletionMode`] is `Position`. PK-less tables use the `PositionBased`
     /// strategy directly and never reach this read-back.
-    fn should_capture_positions(&self) -> bool {
+    pub(crate) fn should_capture_positions(&self) -> bool {
         !self.pk_deletion_strategy.is_position_based()
             && self.context.deletion_mode().resolved(true).is_position()
     }
@@ -12746,7 +12769,7 @@ impl CayenneTableProvider {
                 if already_captured.contains(&file_path) {
                     continue;
                 }
-                let entries = sink
+                let mut entries = sink
                     .scan_file_for_all_positions(
                         &file_path,
                         &object_store,
@@ -12757,6 +12780,21 @@ impl CayenneTableProvider {
                     .map_err(|err| CatalogError::InvalidOperationNoSource {
                         message: format!("Position capture: read-back scan failed: {err}"),
                     })?;
+                // A row a position delete already hides is not the key's live copy:
+                // located there, a later upsert of the key would aim its position
+                // delete at a dead row, leaving only its key tombstone to hide the
+                // live one.
+                if let Some(deleted) = self
+                    .pk_deletion_strategy
+                    .position_cache()
+                    .load()
+                    .get(file_path.as_ref())
+                {
+                    entries.retain(|(_, position)| {
+                        u32::try_from(*position)
+                            .map_or(true, |position| !deleted.contains(position))
+                    });
+                }
 
                 // Re-lock to publish: upgrade existing keyset entries in place
                 // (no byte-budget change — `RowLocation` is a fixed-size enum).
@@ -12792,6 +12830,137 @@ impl CayenneTableProvider {
         self.publish_single_keyset_bytes(keyset_bytes);
 
         Ok(())
+    }
+
+    /// File-local positions of the copies an in-place overwrite superseded, per
+    /// file of `snapshot_id`: a row is superseded when its key's last copy is in a
+    /// later layer (`superseded` maps a key digest to the layer of its last copy;
+    /// `file_layers` maps each data file name to the layer that wrote it).
+    ///
+    /// Reads only the key columns, and only of files in a layer below some key's
+    /// last copy. File keys are the object-store locations the scan's position
+    /// plan looks deletes up by, as for position capture.
+    pub(crate) async fn locate_superseded_copies(
+        &self,
+        snapshot_id: &str,
+        file_layers: &HashMap<String, usize>,
+        superseded: &HashMap<u128, usize, PrehashedBuildHasher>,
+    ) -> CatalogResult<HashMap<String, Vec<u32>>> {
+        let mut located = HashMap::new();
+        let Some(highest_layer) = superseded.values().copied().max() else {
+            return Ok(located);
+        };
+        let invalid = |message: String| CatalogError::InvalidOperationNoSource { message };
+        let pk_indices = self
+            .primary_key_indices()
+            .map_err(|err| invalid(format!("Overwrite: failed to resolve primary key: {err}")))?
+            .unwrap_or_default();
+        let converter = self
+            .build_pk_converter(&pk_indices)
+            .map_err(|err| invalid(format!("Overwrite: failed to build key converter: {err}")))?;
+        let pk_column_names = self.table_metadata.primary_key.clone();
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url)
+            .map_err(|err| invalid(format!("Overwrite: invalid snapshot URL: {err}")))?;
+        // Without statistics: a file's statistics are cached (in memory and in the
+        // metastore) the first time they are read, and read now — before the
+        // position deletes found here are installed — they would count the rows
+        // those deletes hide.
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        )
+        .with_collect_stat(false);
+        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+        let listed = self
+            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                state: &state,
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: &[],
+                snapshot_id,
+                limit: None,
+                scan_schema,
+                captured_files: None,
+            })
+            .await
+            .map_err(|err| invalid(format!("Overwrite: failed to list snapshot files: {err}")))?;
+        let object_store = state
+            .runtime_env()
+            .object_store(&table_url)
+            .map_err(|err| invalid(format!("Overwrite: failed to resolve object store: {err}")))?;
+        let sink = CayenneDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            self.table_schema(),
+            &[],
+            self.pk_deletion_strategy.clone(),
+            Arc::clone(&self.table_memory),
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
+            Vec::new(),
+            InsertRecordHandling::Apply,
+            Arc::clone(&self.protected_snapshots),
+            Arc::clone(self.context.runtime_env()),
+            None,
+            Arc::clone(&self.seq_allocator),
+        );
+        for file_group in &listed.file_groups {
+            for partitioned_file in file_group.iter() {
+                let location = partitioned_file.object_meta.location.to_string();
+                let Some(&layer) = partitioned_file
+                    .object_meta
+                    .location
+                    .filename()
+                    .and_then(|name| file_layers.get(name))
+                else {
+                    continue;
+                };
+                if layer >= highest_layer {
+                    continue;
+                }
+                let entries = sink
+                    .scan_file_for_all_positions(
+                        &location,
+                        &object_store,
+                        &pk_column_names,
+                        &converter,
+                    )
+                    .await
+                    .map_err(|err| invalid(format!("Overwrite: key read-back failed: {err}")))?;
+                let mut positions: Vec<u32> = entries
+                    .iter()
+                    .filter(|(key, _)| {
+                        superseded
+                            .get(&super::pk_index::pk_digest(key))
+                            .is_some_and(|&last| last > layer)
+                    })
+                    .map(|(_, position)| {
+                        u32::try_from(*position).map_err(|_| {
+                            invalid(format!(
+                                "Overwrite of table {}: row {position} of file {location} exceeds \
+                                 the position-delete range; lower `cayenne_target_file_size_mb`",
+                                self.table_metadata.table_name
+                            ))
+                        })
+                    })
+                    .collect::<CatalogResult<_>>()?;
+                if !positions.is_empty() {
+                    positions.sort_unstable();
+                    located.insert(location, positions);
+                }
+            }
+        }
+        Ok(located)
     }
 
     /// Returns the column indices for the configured primary key, if any.
@@ -23713,6 +23882,7 @@ impl CayenneTableProvider {
                 None,
                 &[],
                 None,
+                None,
             );
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
@@ -27587,10 +27757,16 @@ impl CayenneTableProvider {
     pub(crate) async fn reset_table_stats_after_overwrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
+        live_rows: Option<u64>,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         self.clear_cached_table_statistics_unlocked();
-        let new_rows = accumulator.row_count();
+        // The accumulator counts every row written; an overwrite that hid some of
+        // them with position deletes passes the rows that stay live.
+        let new_rows = live_rows.map_or_else(
+            || accumulator.row_count(),
+            |rows| i64::try_from(rows).unwrap_or(i64::MAX),
+        );
         self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
             .await;
     }
@@ -41601,7 +41777,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id, None, &[])
+                        .publish_overwrite_snapshot(&overwrite_id, None, &[], &HashMap::new())
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);
@@ -53561,7 +53737,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id, None, &[])
+                        .publish_overwrite_snapshot(&overwrite_id, None, &[], &HashMap::new())
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);

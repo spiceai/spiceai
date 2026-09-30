@@ -739,10 +739,22 @@ impl CayenneDeletionSink {
                 pk_indices.as_deref().unwrap_or(&[])
             };
 
+            // Vortex hands a string or binary column back in its view form
+            // (`Utf8View`); the keyset's converter encodes the table schema's type,
+            // so cast each key column to it first.
             let pk_columns: Vec<arrow::array::ArrayRef> = indices
                 .iter()
-                .map(|&i| Arc::clone(batch.column(i)))
-                .collect();
+                .zip(pk_column_names)
+                .map(|(&i, name)| {
+                    let column = batch.column(i);
+                    match self.schema.field_with_name(name) {
+                        Ok(field) if field.data_type() != column.data_type() => {
+                            arrow::compute::cast(column, field.data_type()).map_err(Error::from)
+                        }
+                        _ => Ok(Arc::clone(column)),
+                    }
+                })
+                .collect::<crate::provider::Result<_>>()?;
             let rows = converter
                 .convert_columns(&pk_columns)
                 .map_err(Error::from)?;

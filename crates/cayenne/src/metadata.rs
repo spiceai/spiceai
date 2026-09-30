@@ -2078,6 +2078,17 @@ pub struct TableStatistics {
     pub ndv_sketches: Option<Vec<u8>>,
 }
 
+/// What an overwrite commits beyond its main snapshot to resolve the keys its
+/// incoming data repeats across record batches.
+#[derive(Debug, Clone, Default)]
+pub struct OverwriteLayering {
+    /// Protected layers above the main snapshot, on a table that deletes by key.
+    pub layers: Vec<OverwriteLayer>,
+    /// Position deletion vectors hiding the main snapshot's superseded copies,
+    /// on a table that deletes by position.
+    pub delete_files: Vec<DeleteFile>,
+}
+
 /// A protected snapshot an overwrite publishes above its main snapshot, with
 /// the key tombstones that hide the copies it supersedes in the layers below.
 ///

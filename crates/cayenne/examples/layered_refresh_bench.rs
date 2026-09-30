@@ -155,6 +155,11 @@ async fn main() {
     let policy = arg("--policy", "upsert");
     let keys: usize = arg("--keys", "1000000").parse().expect("keys");
     let passes: usize = arg("--passes", "1").parse().expect("passes");
+    let deletion_mode = match arg("--deletion-mode", "position").as_str() {
+        "key" => cayenne::metadata::DeletionMode::Key,
+        "position" => cayenne::metadata::DeletionMode::Position,
+        other => panic!("unknown deletion mode {other}"),
+    };
     let dir = tempfile::tempdir().expect("temp dir");
     let metadata_dir = dir.path().join("metadata");
     std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
@@ -182,6 +187,7 @@ async fn main() {
             base_path: dir.path().join("data").display().to_string(),
             partition_column: None,
             vortex_config: VortexConfig {
+                deletion_mode,
                 inline_max_rows: 0,
                 compaction_background_interval_ms: 3_600_000,
                 ..VortexConfig::default()
@@ -209,7 +215,7 @@ async fn main() {
         .expect("layers")
         .len();
     println!(
-        "policy={policy} keys={keys} passes={passes} rows_in={} rows_written={written} layers={layers} refresh_s={refresh_s:.2} rows_per_s={:.0}",
+        "policy={policy} deletion_mode={deletion_mode:?} keys={keys} passes={passes} rows_in={} rows_written={written} layers={layers} refresh_s={refresh_s:.2} rows_per_s={:.0}",
         keys * passes,
         (keys * passes) as f64 / refresh_s,
     );

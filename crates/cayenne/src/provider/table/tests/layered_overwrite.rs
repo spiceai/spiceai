@@ -365,6 +365,159 @@ async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// A key-deletion table publishes the later copies as protected layers; a
+/// position-deletion table publishes one snapshot whose superseded copies are
+/// hidden by position.
+fn assert_layered_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
+    let position_deleted: u64 = provider
+        .pk_deletion_strategy
+        .position_cache()
+        .load()
+        .values()
+        .map(|deletes| deletes.len())
+        .sum();
+    if mode == DeletionMode::Position {
+        assert!(
+            provider.protected_snapshot_ids().is_empty(),
+            "{mode:?}: layers"
+        );
+        assert_eq!(position_deleted, 3, "{mode:?}: superseded copies");
+        assert!(
+            !provider.has_pending_deletions(),
+            "{mode:?}: key tombstones"
+        );
+    } else {
+        assert!(
+            provider.protected_snapshot_ids().len() >= 2,
+            "{mode:?}: layers"
+        );
+        assert_eq!(position_deleted, 0, "{mode:?}: position deletes");
+    }
+}
+
+/// After a layered overwrite on a position-deletion table, position capture and
+/// a later upsert of the repeated keys still leave exactly one row per key.
+#[tokio::test(flavor = "multi_thread")]
+async fn position_capture_after_a_layered_overwrite_locates_the_live_copy() {
+    let (provider, _catalog, _runtime_env, _dir) =
+        table(DeletionMode::Position, UpsertDedup::None).await;
+    write(&provider, InsertOp::Overwrite, repeated_across_batches())
+        .await
+        .expect("layered overwrite");
+    // Rebuild the keyset from a scan, then locate its keys by read-back.
+    write(&provider, InsertOp::Append, vec![batch(&[(7, "x")])])
+        .await
+        .expect("warm the keyset");
+    provider.run_position_capture().await.expect("capture");
+    write(
+        &provider,
+        InsertOp::Append,
+        vec![batch(&[(2, "e"), (1, "e")])],
+    )
+    .await
+    .expect("upsert superseded keys");
+    let (rows, count) = visible(&provider).await;
+    assert_eq!(
+        rows,
+        owned(&[
+            (1, "e"),
+            (2, "e"),
+            (3, "a"),
+            (4, "b"),
+            (5, "c"),
+            (6, "d"),
+            (7, "x")
+        ])
+    );
+    assert_eq!(count, 7);
+}
+
+/// A composite, non-`Int64` key must be identified the same way by the write
+/// and by the read-back that locates its superseded copies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layered_overwrite_resolves_a_string_key_in_both_modes() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let rows_of = |rows: &[(&str, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from_iter_values(rows.iter().map(|(k, _)| *k))),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|(_, v)| *v))),
+                ],
+            )
+            .expect("batch")
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let (mut provider, _catalog, _dir) = create_cdc_table_with_schema(
+            "t",
+            Arc::clone(&runtime_env),
+            Arc::clone(&schema),
+            vec!["k".to_string()],
+            VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "k".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.collapse_window_bytes = 1;
+        let ctx = SessionContext::new();
+        let source = MemorySourceConfig::try_new_exec(
+            &[vec![
+                rows_of(&[("a", 1), ("b", 1)]),
+                rows_of(&[("a", 2)]),
+                rows_of(&[("b", 3), ("c", 3)]),
+            ]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("source");
+        let plan = provider
+            .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx()).await.expect("overwrite");
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        let batches = ctx
+            .sql("SELECT k, v FROM t ORDER BY k")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let keys = batch.column(0).as_string::<i32>();
+            let values = batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            for row in 0..batch.num_rows() {
+                rows.push((keys.value(row).to_string(), values.value(row)));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), 2),
+                ("b".to_string(), 3),
+                ("c".to_string(), 3)
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwrite() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
@@ -372,10 +525,7 @@ async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwri
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("layered overwrite");
-        assert!(
-            provider.protected_snapshot_ids().len() >= 2,
-            "{mode:?}: layers"
-        );
+        assert_layered_shape(&provider, mode);
         write(
             &provider,
             InsertOp::Append,
