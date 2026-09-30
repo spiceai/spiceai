@@ -52,7 +52,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use object_store::ObjectStore;
@@ -132,6 +132,260 @@ pub(crate) struct PersistedLease {
     pub attempted: u64,
     pub expires_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+}
+
+impl PersistedRateControlState {
+    fn fresh(window: Duration) -> Self {
+        Self {
+            schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+            updated_at_unix_ms: unix_millis(SystemTime::now()),
+            window_ms: duration_millis_u64(window),
+            limiters: HashMap::new(),
+        }
+    }
+
+    fn is_current_schema(&self) -> bool {
+        self.schema_version == PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION
+    }
+
+    /// Mark the state as written now, by this schema version, for this window
+    /// length.
+    fn stamp(&mut self, now: SystemTime, window: Duration) {
+        self.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION;
+        self.updated_at_unix_ms = unix_millis(now);
+        self.window_ms = duration_millis_u64(window);
+    }
+
+    fn limiter_mut(&mut self, key: &str) -> Option<&mut PersistedLimiter> {
+        self.limiters.get_mut(key)
+    }
+
+    /// The limiter for `key`, created at `burst` if absent. The stored burst
+    /// always tracks the live config.
+    fn limiter_entry(&mut self, key: &str, burst: u64) -> &mut PersistedLimiter {
+        let limiter = self
+            .limiters
+            .entry(key.to_string())
+            .or_insert_with(|| PersistedLimiter::new(burst));
+        limiter.burst_per_window = burst;
+        limiter
+    }
+}
+
+impl PersistedLimiter {
+    fn new(burst: u64) -> Self {
+        Self {
+            burst_per_window: burst,
+            windows: HashMap::new(),
+        }
+    }
+
+    /// Drop windows older than the retention horizon.
+    fn retain_recent_windows(&mut self, now_window: u64) {
+        self.windows.retain(|id, _| {
+            id.parse::<u64>()
+                .ok()
+                .is_some_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
+        });
+    }
+
+    fn window_mut(&mut self, window_id: u64) -> Option<&mut PersistedWindow> {
+        self.windows.get_mut(&window_id.to_string())
+    }
+
+    /// The record for `window_id`, created with `burst_if_absent` budget if absent.
+    fn window_entry(&mut self, window_id: u64, burst_if_absent: u64) -> &mut PersistedWindow {
+        self.windows
+            .entry(window_id.to_string())
+            .or_insert_with(|| PersistedWindow::new(burst_if_absent))
+    }
+
+    /// Exponentially weighted (recent weighted highest) demand over the previous `lookback_windows`
+    ///  completed windows.
+    ///
+    /// Only fully completed windows contribute: sourcing the signal from the
+    /// in-progress window's partial data made leases oscillate within a window
+    /// as different ticks observed different partial counts. The EWMA also
+    /// keeps a hot replica visible across a single missing or zero publish.
+    fn ewma_demand(
+        &self,
+        instance: &str,
+        now_window: u64,
+        burst: u64,
+        lookback_windows: u64,
+    ) -> DemandSample {
+        let mut demand = DemandSample::default();
+        for age in 0..lookback_windows {
+            let Some(source_window) = now_window.saturating_sub(1).checked_sub(age) else {
+                break;
+            };
+            // e.g. 16, 8, 4, 2, 1 for lookback=5.
+            let weight = 1_u128 << (lookback_windows - 1 - age);
+            if let Some(window) = self.windows.get(&source_window.to_string()) {
+                demand.accumulate(window.classified_demand(instance, burst).weighted(weight));
+            }
+        }
+        demand
+    }
+}
+
+impl PersistedWindow {
+    fn new(burst: u64) -> Self {
+        Self {
+            budget_remaining: burst,
+            leases: HashMap::new(),
+        }
+    }
+
+    fn total_granted(&self) -> u64 {
+        self.leases.values().map(|lease| lease.granted).sum()
+    }
+
+    fn granted_for(&self, instance: &str) -> u64 {
+        self.leases.get(instance).map_or(0, |lease| lease.granted)
+    }
+
+    fn granted_by_others(&self, instance: &str) -> u64 {
+        self.leases
+            .iter()
+            .filter(|(id, _)| id.as_str() != instance)
+            .map(|(_, lease)| lease.granted)
+            .sum()
+    }
+
+    fn lease_mut(&mut self, instance: &str) -> Option<&mut PersistedLease> {
+        self.leases.get_mut(instance)
+    }
+
+    fn drop_expired(&mut self, now: SystemTime) {
+        let now_ms = unix_millis(now);
+        self.leases
+            .retain(|_, lease| lease.expires_at_unix_ms > now_ms);
+    }
+
+    /// `budget_remaining` is a cache of `burst - total_granted`; recompute it
+    /// from the surviving leases rather than trust the stored value.
+    fn recompute_budget_remaining(&mut self, burst: u64) {
+        self.budget_remaining = burst.saturating_sub(self.total_granted());
+    }
+
+    /// Demand this window signals for `instance`, and for the cluster.
+    fn classified_demand(&self, instance: &str, burst: u64) -> DemandSample {
+        DemandSample {
+            mine: u128::from(
+                self.leases
+                    .get(instance)
+                    .map_or(0, |lease| lease.classified_demand(burst)),
+            ),
+            total: self
+                .leases
+                .values()
+                .map(|lease| u128::from(lease.classified_demand(burst)))
+                .sum(),
+        }
+    }
+
+    /// Record `lease` for `instance`. Returns whether the window changed, and
+    /// therefore whether the shared state must be written back.
+    fn publish(&mut self, instance: &str, lease: PersistedLease) -> bool {
+        if self
+            .leases
+            .get(instance)
+            .is_some_and(|existing| existing.matches_counts(&lease))
+        {
+            return false;
+        }
+        self.leases.insert(instance.to_string(), lease);
+        true
+    }
+}
+
+impl PersistedLease {
+    /// Demand this lease signals to peers.
+    ///
+    /// A replica that consumed everything it was granted is **saturated** — we
+    /// don't know how much more it would have used, so it counts as the full
+    /// cluster burst. A replica that did not consume its full grant signals
+    /// demand equal to its observed `acquire()` call rate.
+    fn classified_demand(&self, burst: u64) -> u64 {
+        if self.granted > 0 && self.consumed >= self.granted {
+            burst
+        } else {
+            self.attempted.max(self.consumed)
+        }
+    }
+
+    /// Whether two leases carry the same published values. Timestamps are
+    /// excluded: re-stamping identical counts on every tick would dirty the
+    /// shared state and force a needless OCC write.
+    fn matches_counts(&self, other: &Self) -> bool {
+        self.granted == other.granted
+            && self.consumed == other.consumed
+            && self.attempted == other.attempted
+    }
+
+    /// Raise the published counts to at least `attempted`/`consumed`. Returns
+    /// whether anything changed.
+    fn merge_counts(&mut self, counts: WindowCounts, now: SystemTime) -> bool {
+        if counts.attempted <= self.attempted && counts.consumed <= self.consumed {
+            return false;
+        }
+        self.attempted = self.attempted.max(counts.attempted);
+        self.consumed = self.consumed.max(counts.consumed);
+        self.updated_at_unix_ms = unix_millis(now);
+        true
+    }
+}
+
+/// Weighted demand over a span of windows: this replica's share against the
+/// cluster total. Weighted sums exceed `u64` range, hence `u128`.
+#[derive(Debug, Clone, Copy, Default)]
+struct DemandSample {
+    mine: u128,
+    total: u128,
+}
+
+impl DemandSample {
+    fn weighted(self, weight: u128) -> Self {
+        Self {
+            mine: self.mine * weight,
+            total: self.total * weight,
+        }
+    }
+
+    fn accumulate(&mut self, other: Self) {
+        self.mine += other.mine;
+        self.total += other.total;
+    }
+
+    /// Tokens this replica should claim out of `burst`.
+    ///
+    /// Every replica claims a slice proportional to its demand. With no
+    /// persisted demand yet, `local_demand_hint` — this replica's in-progress
+    /// `acquire()` count — decides instead of fair-share: a hot replica
+    /// reclaims idle budget, an idle one holds only the minimum lease.
+    fn demand_signal(self, burst: u64, local_demand_hint: u64) -> u64 {
+        match (self.total, self.mine) {
+            (0, _) if local_demand_hint > 0 => burst,
+            (0, _) | (_, 0) => min_lease(burst),
+            (total, mine) => u64::try_from((u128::from(burst) * mine) / total).unwrap_or(burst),
+        }
+    }
+}
+
+/// Counts a replica publishes for a window alongside its lease.
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowCounts {
+    consumed: u64,
+    attempted: u64,
+}
+
+/// Final demand and consumption of a window that rolled before its tail was
+/// published.
+#[derive(Debug, Clone, Copy)]
+struct PendingPublish {
+    window_id: u64,
+    counts: WindowCounts,
 }
 
 /// Configuration for a single leased rate limiter (one quota on one origin).
@@ -217,6 +471,17 @@ impl LeasedBucketMetrics {
     pub fn lease_refresh_errors_total(&self) -> u64 {
         self.lease_refresh_errors_total.load(Ordering::Relaxed)
     }
+
+    /// Record the outcome of a successful lease acquisition.
+    fn record_lease(&self, granted: u64, cluster_budget_remaining: u64, elapsed: Duration) {
+        self.lease_granted.store(granted, Ordering::Relaxed);
+        self.cluster_budget_remaining
+            .store(cluster_budget_remaining, Ordering::Relaxed);
+        self.last_lease_acquire_micros.store(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -233,22 +498,181 @@ struct LeasedBucketInner {
     next_window_id: u64,
     granted_next_window: u64,
     consumed_next_window: u64,
-    /// Final demand and consumption of a window that rolled before its tail
-    /// was published. `(window_id, attempted_count, consumed_count)`. The
-    /// next refresh writes these back to the rolled-out window's lease
-    /// record so peers see the full counts. Cleared on successful publish.
-    pending_window_publish: Option<(u64, u64, u64)>,
+    /// Counts latched at a window roll. The next refresh writes these back
+    /// to the rolled-out window's lease record so peers see the full counts.
+    /// Cleared on successful publish.
+    pending_window_publish: Option<PendingPublish>,
     /// Local GCRA/TAT pacing state for the current window. A successful
     /// acquire advances this theoretical arrival time by
     /// `window_duration / granted_this_window`, spreading the leased tokens
     /// across the whole window instead of allowing an immediate burst.
-    pacing_tat_ns: u64,
-    /// Timestamp the current lease was last refreshed (ms).
-    last_lease_refresh_ms: u64,
-    /// Wall-clock end of the latest pre-leased window (ms).
-    lease_expires_at_ms: u64,
+    /// `None` until the first acquire of a window, and reset on every roll.
+    ///
+    /// `Instant`, not `SystemTime`: this measures elapsed time on one replica
+    /// and is never shared, so it must not follow wall-clock adjustments. A
+    /// backward step would stall a replica that still holds lease; a forward
+    /// step would release the burst that pacing exists to prevent.
+    pacing_tat: Option<Instant>,
+    /// Highest window this replica holds a grant for. `None` until the first
+    /// successful lease, which counts as expired.
+    ///
+    /// Deliberately *not* advanced by a window roll: once the clock passes
+    /// this window and the store is unreachable, the replica has no budget
+    /// left to spend and must fail closed.
+    leased_through: Option<u64>,
     /// Set when the most recent lease attempt failed.
     last_attempt_failed: bool,
+}
+
+impl LeasedBucketInner {
+    fn new(window_id: u64) -> Self {
+        Self {
+            current_window_id: window_id,
+            granted_this_window: 0,
+            consumed_this_window: 0,
+            attempted_this_window: 0,
+            next_window_id: window_id + 1,
+            granted_next_window: 0,
+            consumed_next_window: 0,
+            pending_window_publish: None,
+            pacing_tat: None,
+            leased_through: None,
+            last_attempt_failed: false,
+        }
+    }
+
+    /// Counts to publish for the in-progress window.
+    fn live_counts(&self) -> WindowCounts {
+        WindowCounts {
+            consumed: self.consumed_this_window,
+            attempted: self.attempted_this_window,
+        }
+    }
+
+    /// Register one unit of demand, whether or not a token is ever granted.
+    fn register_demand(&mut self) {
+        self.attempted_this_window = self.attempted_this_window.saturating_add(1);
+    }
+
+    /// Roll over per-window state if the window has changed.
+    ///
+    /// Promotes the pre-leased next window into the current slot when the
+    /// clock advances by exactly one window — eliminating the dead-zone that
+    /// would otherwise occur while the persistence task fetches a fresh lease
+    /// at each window boundary. If the clock has skipped by more than one
+    /// window the pre-leased slot is discarded and both slots reset.
+    fn roll_to(&mut self, now_window: u64) {
+        if now_window == self.current_window_id {
+            return;
+        }
+        self.latch_pending_publish();
+        if now_window == self.next_window_id {
+            self.promote_next();
+        } else {
+            self.reset_to(now_window);
+        }
+        // leased_through is preserved so the fail-closed check can see that
+        // the clock has outrun the last lease.
+    }
+
+    /// Capture the final counts of the window being rolled out of, so the
+    /// next refresh can publish them to peers. Counts registered between the
+    /// last refresh tick and the roll would otherwise be lost.
+    fn latch_pending_publish(&mut self) {
+        if self.attempted_this_window > 0 || self.consumed_this_window > 0 {
+            self.pending_window_publish = Some(PendingPublish {
+                window_id: self.current_window_id,
+                counts: self.live_counts(),
+            });
+        }
+    }
+
+    fn promote_next(&mut self) {
+        self.current_window_id = self.next_window_id;
+        self.granted_this_window = self.granted_next_window;
+        self.consumed_this_window = self.consumed_next_window;
+        self.start_window();
+    }
+
+    fn reset_to(&mut self, now_window: u64) {
+        self.current_window_id = now_window;
+        self.granted_this_window = 0;
+        self.consumed_this_window = 0;
+        self.start_window();
+    }
+
+    /// Tail shared by both roll paths: clear the demand and pacing counters,
+    /// and open an empty pre-lease slot for the window after the current one.
+    fn start_window(&mut self) {
+        self.attempted_this_window = 0;
+        self.pacing_tat = None;
+        self.next_window_id = self.current_window_id + 1;
+        self.granted_next_window = 0;
+        self.consumed_next_window = 0;
+    }
+
+    /// Adopt the grants from a successful lease refresh.
+    fn adopt_lease(&mut self, now_window: u64, lease: LeaseGrants) {
+        self.roll_to(now_window);
+        self.granted_this_window = lease.current;
+        // The next-window id may already match if an earlier tick pre-leased
+        // it; either way we adopt the latest grant value.
+        self.next_window_id = now_window + 1;
+        self.granted_next_window = lease.next;
+        self.leased_through = Some(now_window + 1);
+        self.last_attempt_failed = false;
+    }
+
+    /// Whether the store is failing and the lease has fully expired, so no
+    /// further request may be admitted.
+    fn is_fail_closed(&self, now_window: u64) -> bool {
+        self.last_attempt_failed
+            && self
+                .leased_through
+                .is_none_or(|leased_through| now_window > leased_through)
+    }
+
+    /// Take one token from the local lease if the GCRA pacer allows it at
+    /// `now`.
+    fn try_take_paced_token(&mut self, now: Instant, window: Duration) -> PacingStep {
+        // Cap every wait at a fraction of the window so the caller re-checks
+        // for a window roll even if no notify arrives (e.g. this replica is
+        // the only consumer and the persistence task is slow).
+        let max_wait = window / 4;
+        if self.consumed_this_window >= self.granted_this_window {
+            return PacingStep::Wait(max_wait); // Out of local lease.
+        }
+
+        if let Some(tat) = self.pacing_tat
+            && let Some(remaining) = tat.checked_duration_since(now)
+            && !remaining.is_zero()
+        {
+            return PacingStep::Wait(remaining.min(max_wait));
+        }
+
+        // The pacer has caught up with the clock, so the next theoretical
+        // arrival is one interval from now.
+        self.consumed_this_window += 1;
+        let interval = pacing_interval(window, self.granted_this_window);
+        self.pacing_tat = Some(now.checked_add(interval).unwrap_or(now));
+        PacingStep::Granted
+    }
+}
+
+/// Grants adopted from one successful lease refresh: the tokens for the
+/// current window and the pre-lease for the next.
+#[derive(Debug, Clone, Copy)]
+struct LeaseGrants {
+    current: u64,
+    next: u64,
+}
+
+/// Outcome of one pacing attempt against the local lease.
+enum PacingStep {
+    /// A token was taken; the caller may proceed.
+    Granted,
+    /// No token is available yet. Re-check after this long.
+    Wait(Duration),
 }
 
 /// A leased token bucket that gates requests against a cluster-wide budget.
@@ -270,24 +694,10 @@ impl LeasedBucket {
         let object_state = Arc::new(
             ObjectState::new(Arc::clone(&config.store)).with_prefix(config.prefix.clone()),
         );
-        let now_ms = unix_millis_now();
-        let window_id = window_id_for(now_ms, &config.window_duration);
+        let window_id = window_id_for(SystemTime::now(), config.window_duration);
         Arc::new(Self {
             object_state,
-            inner: Mutex::new(LeasedBucketInner {
-                current_window_id: window_id,
-                granted_this_window: 0,
-                consumed_this_window: 0,
-                attempted_this_window: 0,
-                next_window_id: window_id + 1,
-                granted_next_window: 0,
-                consumed_next_window: 0,
-                pending_window_publish: None,
-                pacing_tat_ns: 0,
-                last_lease_refresh_ms: 0,
-                lease_expires_at_ms: 0,
-                last_attempt_failed: false,
-            }),
+            inner: Mutex::new(LeasedBucketInner::new(window_id)),
             notify: Notify::new(),
             metrics: Arc::new(LeasedBucketMetrics::default()),
             config,
@@ -316,105 +726,40 @@ impl LeasedBucket {
         // so peers' demand-weighted lease calculations see true demand rather
         // than the throttled effective rate.
         {
-            let now_ms = unix_millis_now();
-            let now_window = window_id_for(now_ms, &self.config.window_duration);
+            let now_window = window_id_for(SystemTime::now(), self.config.window_duration);
             let mut inner = self.inner.lock().await;
-            Self::roll_window_locked(&mut inner, now_window);
-            inner.attempted_this_window = inner.attempted_this_window.saturating_add(1);
+            inner.roll_to(now_window);
+            inner.register_demand();
         }
 
         loop {
-            let current_time_ms = unix_millis_now();
-            let now_window = window_id_for(current_time_ms, &self.config.window_duration);
+            // Two clocks, deliberately: `SystemTime` places us in a
+            // cluster-wide window, `Instant` paces tokens within it.
+            let now = SystemTime::now();
+            let now_window = window_id_for(now, self.config.window_duration);
 
             let wait = {
                 let mut inner = self.inner.lock().await;
+                inner.roll_to(now_window);
 
-                Self::roll_window_locked(&mut inner, now_window);
-
-                let wait = if inner.consumed_this_window < inner.granted_this_window {
-                    let pacing_now_ns = unix_nanos_now();
-                    let interval_ns =
-                        pacing_interval_ns(self.config.window_duration, inner.granted_this_window);
-                    if inner.pacing_tat_ns <= pacing_now_ns {
-                        inner.consumed_this_window += 1;
-                        inner.pacing_tat_ns = pacing_now_ns
-                            .max(inner.pacing_tat_ns)
-                            .saturating_add(interval_ns);
-                        return Ok(());
+                match inner.try_take_paced_token(Instant::now(), self.config.window_duration) {
+                    PacingStep::Granted => return Ok(()),
+                    PacingStep::Wait(wait) => {
+                        if inner.is_fail_closed(now_window) {
+                            self.metrics
+                                .fail_closed_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(Error::FailClosed {
+                                origin: self.config.origin.clone(),
+                            });
+                        }
+                        wait
                     }
-
-                    let wait_ns = inner.pacing_tat_ns.saturating_sub(pacing_now_ns);
-                    nanos_to_duration(wait_ns).min(self.config.window_duration / 4)
-                } else {
-                    // Out of local lease.
-                    self.config.window_duration / 4
-                };
-
-                // Fail-closed condition: store is failing and our lease has fully expired.
-                if inner.last_attempt_failed && current_time_ms >= inner.lease_expires_at_ms {
-                    self.metrics
-                        .fail_closed_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::FailClosed {
-                        origin: self.config.origin.clone(),
-                    });
                 }
-
-                // Otherwise wait. Cap wait at a fraction of the window so we
-                // re-check window roll even if no notify arrives (e.g. replica
-                // is the only one consuming and the persistence task is slow).
-                wait
             };
 
             let _ = tokio::time::timeout(wait, self.notify.notified()).await;
         }
-    }
-
-    /// Roll over per-window state if the window has changed. Caller must hold
-    /// the inner lock.
-    ///
-    /// Promotes the pre-leased `next_window` into the current slot when the
-    /// clock advances by exactly one window — eliminating the dead-zone that
-    /// would otherwise occur while the persistence task fetches a fresh
-    /// lease at each window boundary. If the clock has skipped by more than
-    /// one window the pre-leased slot is discarded and both slots reset.
-    fn roll_window_locked(inner: &mut LeasedBucketInner, now_window: u64) {
-        if now_window == inner.current_window_id {
-            return;
-        }
-        // Capture the final demand and consumption of the window we're
-        // rolling out of so the next refresh can publish them to peers.
-        // Otherwise counts registered between the last refresh tick and the
-        // window roll would be lost.
-        if inner.attempted_this_window > 0 || inner.consumed_this_window > 0 {
-            inner.pending_window_publish = Some((
-                inner.current_window_id,
-                inner.attempted_this_window,
-                inner.consumed_this_window,
-            ));
-        }
-        if now_window == inner.next_window_id {
-            inner.current_window_id = inner.next_window_id;
-            inner.granted_this_window = inner.granted_next_window;
-            inner.consumed_this_window = inner.consumed_next_window;
-            inner.attempted_this_window = 0;
-            inner.pacing_tat_ns = 0;
-            inner.next_window_id = now_window + 1;
-            inner.granted_next_window = 0;
-            inner.consumed_next_window = 0;
-        } else {
-            inner.current_window_id = now_window;
-            inner.granted_this_window = 0;
-            inner.consumed_this_window = 0;
-            inner.attempted_this_window = 0;
-            inner.pacing_tat_ns = 0;
-            inner.next_window_id = now_window + 1;
-            inner.granted_next_window = 0;
-            inner.consumed_next_window = 0;
-        }
-        // last_lease_refresh_ms / lease_expires_at_ms preserved so
-        // fail-closed logic can compare against the old expiry.
     }
 
     /// Refresh the lease for the current window **and** pre-lease the next
@@ -423,174 +768,109 @@ impl LeasedBucket {
     ///
     /// Pre-leasing the next window keeps S3 latency off the critical path:
     /// when the window rolls, [`Self::acquire`] promotes the pre-leased slot
-    /// into the current slot via [`Self::roll_window_locked`] without
+    /// into the current slot via [`LeasedBucketInner::roll_to`] without
     /// blocking on a fresh OCC round-trip.
     pub async fn refresh_lease(self: &Arc<Self>) -> Result<()> {
         let started = std::time::Instant::now();
-        let now_ms = unix_millis_now();
-        let window_ms = duration_millis_u64(self.config.window_duration);
-        let now_window = window_id_for(now_ms, &self.config.window_duration);
+        let now = SystemTime::now();
+        let window = self.config.window_duration;
+        let now_window = window_id_for(now, window);
 
-        let (last_consumed_for_publish, last_attempted_for_publish, pending_publish) = {
+        let (live_counts, pending_publish) = {
             let mut inner = self.inner.lock().await;
-            (
-                inner.consumed_this_window,
-                inner.attempted_this_window,
-                inner.pending_window_publish.take(),
-            )
+            (inner.live_counts(), inner.pending_window_publish.take())
         };
 
         for attempt in 0..MAX_LEASE_RETRIES {
-            let read = self.read_state().await;
-            let mut state = match read {
-                Ok(state) => state.unwrap_or_else(|| fresh_state(window_ms)),
+            // State written under an older schema is treated as empty; the
+            // previous PR was never shipped so no migration is required.
+            let mut state = match self.read_state().await {
+                Ok(state) => state
+                    .filter(PersistedRateControlState::is_current_schema)
+                    .unwrap_or_else(|| PersistedRateControlState::fresh(window)),
                 Err(e) => {
                     self.note_failure();
                     return Err(e);
                 }
             };
+            state.stamp(now, window);
 
-            // If existing schema is not v2, treat as empty (logged once in caller).
-            if state.schema_version != PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION {
-                state = fresh_state(window_ms);
-            }
-            state.window_ms = window_ms;
-            state.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION;
-            state.updated_at_unix_ms = now_ms;
+            if let Some(limiter) = state.limiter_mut(&self.config.limiter_key) {
+                limiter.retain_recent_windows(now_window);
 
-            // Drop windows older than retention horizon.
-            if let Some(limiter) = state.limiters.get_mut(&self.config.limiter_key) {
-                limiter.windows.retain(|id, _| {
-                    id.parse::<u64>()
-                        .ok()
-                        .is_some_and(|id| id + STALE_WINDOW_RETENTION >= now_window)
-                });
-            }
-
-            // Publish any pending counts that were latched at a window roll
-            // between refresh ticks. Best-effort: if the rolled-out window
-            // has already been pruned from state, drop the pending values
-            // and move on.
-            if let Some((pending_window, pending_attempted, pending_consumed)) = pending_publish
-                && let Some(limiter) = state.limiters.get_mut(&self.config.limiter_key)
-                && let Some(window) = limiter.windows.get_mut(&pending_window.to_string())
-                && let Some(lease) = window.leases.get_mut(&self.config.instance_id)
-            {
-                let updated =
-                    pending_attempted > lease.attempted || pending_consumed > lease.consumed;
-                if updated {
-                    lease.attempted = lease.attempted.max(pending_attempted);
-                    lease.consumed = lease.consumed.max(pending_consumed);
-                    lease.updated_at_unix_ms = now_ms;
+                // Publish any counts latched at a window roll between refresh
+                // ticks. Best-effort: if the rolled-out window has already
+                // been pruned from state, drop the pending values and move on.
+                if let Some(pending) = pending_publish
+                    && let Some(lease) = limiter
+                        .window_mut(pending.window_id)
+                        .and_then(|window| window.lease_mut(&self.config.instance_id))
+                {
+                    lease.merge_counts(pending.counts, now);
                 }
             }
 
             let current = self.process_window(
                 &mut state,
                 now_window,
-                now_ms,
-                last_consumed_for_publish,
-                last_attempted_for_publish,
-                last_attempted_for_publish,
+                now,
+                live_counts,
+                live_counts.attempted,
             );
             let next = self.process_window(
                 &mut state,
                 now_window + 1,
-                now_ms,
-                0,
-                0,
-                last_attempted_for_publish,
+                now,
+                WindowCounts::default(),
+                live_counts.attempted,
             );
 
             let dirty = current.dirty || next.dirty;
-
-            if !dirty {
-                self.apply_local_lease(
-                    now_window,
-                    now_ms,
-                    current.granted,
-                    next.granted,
-                    next.expires_at_ms,
-                )
-                .await;
-                self.metrics
-                    .lease_granted
-                    .store(current.granted, Ordering::Relaxed);
-                self.metrics
-                    .cluster_budget_remaining
-                    .store(current.budget_remaining_after, Ordering::Relaxed);
-                self.metrics.last_lease_acquire_micros.store(
-                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                return Ok(());
-            }
-
-            match self.write_state(state).await {
-                Ok(WriteOutcome::Written) => {
-                    self.apply_local_lease(
-                        now_window,
-                        now_ms,
-                        current.granted,
-                        next.granted,
-                        next.expires_at_ms,
-                    )
-                    .await;
-                    self.metrics
-                        .lease_granted
-                        .store(current.granted, Ordering::Relaxed);
-                    self.metrics
-                        .cluster_budget_remaining
-                        .store(current.budget_remaining_after, Ordering::Relaxed);
-                    self.metrics.last_lease_acquire_micros.store(
-                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                    self.notify.notify_waiters();
-                    return Ok(());
-                }
-                Ok(WriteOutcome::Conflict) => {
-                    self.metrics
-                        .lease_acquire_conflicts_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    if attempt + 1 == MAX_LEASE_RETRIES {
-                        self.note_failure();
-                        return Err(Error::ConflictExhausted {
-                            origin: self.config.origin.clone(),
-                        });
+            if dirty {
+                match self.write_state(state).await {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::Conflict) => {
+                        self.metrics
+                            .lease_acquire_conflicts_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        if attempt + 1 == MAX_LEASE_RETRIES {
+                            self.note_failure();
+                            return Err(Error::ConflictExhausted {
+                                origin: self.config.origin.clone(),
+                            });
+                        }
+                        continue;
                     }
-                    // retry
-                }
-                Err(e) => {
-                    self.note_failure();
-                    return Err(e);
+                    Err(e) => {
+                        self.note_failure();
+                        return Err(e);
+                    }
                 }
             }
+
+            {
+                let mut inner = self.inner.lock().await;
+                inner.adopt_lease(
+                    now_window,
+                    LeaseGrants {
+                        current: current.granted,
+                        next: next.granted,
+                    },
+                );
+            }
+            self.metrics.record_lease(
+                current.granted,
+                current.budget_remaining_after,
+                started.elapsed(),
+            );
+            if dirty {
+                // Only a write can have changed what waiters are owed.
+                self.notify.notify_waiters();
+            }
+            return Ok(());
         }
 
         unreachable!("loop body always returns within MAX_LEASE_RETRIES iterations")
-    }
-
-    /// Apply lease grants for the current and next windows to local state.
-    async fn apply_local_lease(
-        &self,
-        now_window: u64,
-        now_ms: u64,
-        current_grant: u64,
-        next_grant: u64,
-        next_expires_at_ms: u64,
-    ) {
-        let mut inner = self.inner.lock().await;
-        Self::roll_window_locked(&mut inner, now_window);
-        inner.granted_this_window = current_grant;
-        // Refresh the next-window slot. The window id may already match if a
-        // previous tick already pre-leased it; either way we adopt the latest
-        // grant value.
-        inner.next_window_id = now_window + 1;
-        inner.granted_next_window = next_grant;
-        inner.lease_expires_at_ms = next_expires_at_ms;
-        inner.last_lease_refresh_ms = now_ms;
-        inner.last_attempt_failed = false;
     }
 
     /// Compute and apply this replica's lease for a single window inside the
@@ -601,123 +881,35 @@ impl LeasedBucket {
         &self,
         state: &mut PersistedRateControlState,
         window_id: u64,
-        now_ms: u64,
-        last_consumed: u64,
-        last_attempted: u64,
+        now: SystemTime,
+        counts: WindowCounts,
         local_demand_hint: u64,
     ) -> WindowOutcome {
+        let instance = self.config.instance_id.as_str();
+        let burst = self.config.burst_per_window;
         let window_ms = duration_millis_u64(self.config.window_duration);
         let window_end_ms = (window_id + 1).saturating_mul(window_ms);
-        let now_window = window_id_for(now_ms, &self.config.window_duration);
-        // Use only *fully completed* windows as the demand signal source for
-        // both the current and next windows. Sourcing from the in-progress
-        // window's partial data caused leases to oscillate wildly within a
-        // window as different ticks observed different partial counts. EWMA
-        // over completed windows gives a stable, smoothed signal that is
-        // resilient to a single missing/zero publish.
+        let now_window = window_id_for(now, self.config.window_duration);
 
-        let limiter = state
-            .limiters
-            .entry(self.config.limiter_key.clone())
-            .or_insert_with(|| PersistedLimiter {
-                burst_per_window: self.config.burst_per_window,
-                windows: HashMap::new(),
-            });
-        limiter.burst_per_window = self.config.burst_per_window;
+        let limiter = state.limiter_entry(&self.config.limiter_key, burst);
 
-        // Read the smoothed demand signal from recent completed windows before
-        // taking a mutable borrow on `limiter.windows` for the entry below.
-        //
-        // Demand classification: a replica that consumed everything it was
-        // granted is **saturated** — we don't know how much more it would
-        // have used, so we treat its demand as the full cluster burst. A
-        // replica that did not consume its full grant signals demand equal
-        // to its observed `attempted` (true `acquire()` call rate). EWMA is
-        // computed over this classified demand, not raw `attempted`, so a
-        // grant-bound hot replica remains visible as high demand.
-        let burst = self.config.burst_per_window;
-        let classify = |lease: &PersistedLease| -> u64 {
-            if lease.granted > 0 && lease.consumed >= lease.granted {
-                burst
-            } else {
-                lease.attempted.max(lease.consumed)
-            }
-        };
-        let mut my_ewma_demand: u128 = 0;
-        let mut total_ewma_demand: u128 = 0;
-        for age in 0..DEMAND_EWMA_LOOKBACK_WINDOWS {
-            let Some(source_window) = now_window.saturating_sub(1).checked_sub(age) else {
-                break;
-            };
-            let weight_shift = DEMAND_EWMA_LOOKBACK_WINDOWS - 1 - age;
-            let weight = 1_u128 << weight_shift; // 16, 8, 4, 2, 1 for lookback=5.
-            if let Some(window) = limiter.windows.get(&source_window.to_string()) {
-                my_ewma_demand += u128::from(
-                    window
-                        .leases
-                        .get(&self.config.instance_id)
-                        .map_or(0, classify),
-                ) * weight;
-                total_ewma_demand += window
-                    .leases
-                    .values()
-                    .map(classify)
-                    .map(u128::from)
-                    .sum::<u128>()
-                    * weight;
-            }
-        }
-
-        let window = limiter
-            .windows
-            .entry(window_id.to_string())
-            .or_insert_with(|| PersistedWindow {
-                budget_remaining: self.config.burst_per_window,
-                leases: HashMap::new(),
-            });
-
-        // Drop expired leases in this window (only relevant for the current
-        // window; a future window's lease cannot have expired).
-        window
-            .leases
-            .retain(|_, lease| lease.expires_at_unix_ms > now_ms);
-
-        // Recompute budget_remaining from surviving leases (defensive).
-        let leased: u64 = window.leases.values().map(|l| l.granted).sum();
-        window.budget_remaining = self.config.burst_per_window.saturating_sub(leased);
-
-        let my_existing = window
-            .leases
-            .get(&self.config.instance_id)
-            .map_or(0, |l| l.granted);
-        let others_leased: u64 = window
-            .leases
-            .iter()
-            .filter(|(k, _)| k.as_str() != self.config.instance_id.as_str())
-            .map(|(_, l)| l.granted)
-            .sum();
-        let max_possible_for_me = self.config.burst_per_window.saturating_sub(others_leased);
-
-        // Demand-weighted share: every replica claims a slice of the cluster
-        // burst proportional to its EWMA-smoothed, saturation-aware demand.
-        // If there is no persisted demand yet, use local in-progress demand
-        // as a bootstrap signal instead of fair-share: a hot replica should
-        // reclaim idle budget, while an idle replica should hold only the
-        // minimum lease.
-        let demand_signal = if total_ewma_demand > 0 && my_ewma_demand > 0 {
-            let share = (u128::from(burst) * my_ewma_demand) / total_ewma_demand;
-            u64::try_from(share).unwrap_or(burst)
-        } else if total_ewma_demand > 0 {
-            min_lease(burst)
-        } else if local_demand_hint > 0 {
-            burst
-        } else {
-            min_lease(burst)
-        };
-
-        let demand = demand_signal
+        // Read the smoothed demand signal before taking a mutable borrow on
+        // the window below.
+        let demand = limiter
+            .ewma_demand(instance, now_window, burst, DEMAND_EWMA_LOOKBACK_WINDOWS)
+            .demand_signal(burst, local_demand_hint)
             .max(min_lease(burst))
             .min(max_lease_per_replica(burst));
+
+        let window = limiter.window_entry(window_id, burst);
+
+        // Only the current window can hold expired leases; a future window's
+        // lease cannot have expired yet.
+        window.drop_expired(now);
+        window.recompute_budget_remaining(burst);
+
+        let my_existing = window.granted_for(instance);
+        let max_possible_for_me = burst.saturating_sub(window.granted_by_others(instance));
 
         // Pick the new grant.
         //
@@ -736,37 +928,23 @@ impl LeasedBucket {
 
         // Always re-publish so peers see updated `consumed`/`attempted`
         // counters even when our `granted` value is unchanged.
-        let needs_publish = match window.leases.get(&self.config.instance_id) {
-            Some(existing) => {
-                existing.granted != new_grant
-                    || existing.consumed != last_consumed
-                    || existing.attempted != last_attempted
-            }
-            None => true,
-        };
+        let dirty = window.publish(
+            instance,
+            PersistedLease {
+                granted: new_grant,
+                consumed: counts.consumed,
+                attempted: counts.attempted,
+                expires_at_unix_ms: window_end_ms,
+                updated_at_unix_ms: unix_millis(now),
+            },
+        );
 
-        if needs_publish {
-            window.leases.insert(
-                self.config.instance_id.clone(),
-                PersistedLease {
-                    granted: new_grant,
-                    consumed: last_consumed,
-                    attempted: last_attempted,
-                    expires_at_unix_ms: window_end_ms,
-                    updated_at_unix_ms: now_ms,
-                },
-            );
-        }
-
-        // Recompute budget_remaining defensively from final lease state.
-        let total_leased: u64 = window.leases.values().map(|l| l.granted).sum();
-        window.budget_remaining = burst.saturating_sub(total_leased);
+        window.recompute_budget_remaining(burst);
 
         WindowOutcome {
             granted: new_grant,
             budget_remaining_after: window.budget_remaining,
-            expires_at_ms: window_end_ms,
-            dirty: needs_publish,
+            dirty,
         }
     }
 
@@ -775,10 +953,9 @@ impl LeasedBucket {
             .lease_refresh_errors_total
             .fetch_add(1, Ordering::Relaxed);
         // Mark inner state as failing so acquire() can fail closed once the
-        // lease expires. We don't need the inner lock in async to set this
-        // since `last_attempt_failed` is set under the next lease attempt's
-        // lock; for now, we use a try_lock-like approach via blocking_lock
-        // which is safe because this is only called from refresh_lease.
+        // lease expires. Best-effort: `try_lock` keeps this synchronous, and
+        // a contended lock means another lease attempt is already in flight
+        // and will set the flag itself.
         if let Ok(mut inner) = self.inner.try_lock() {
             inner.last_attempt_failed = true;
         }
@@ -832,7 +1009,6 @@ enum WriteOutcome {
 struct WindowOutcome {
     granted: u64,
     budget_remaining_after: u64,
-    expires_at_ms: u64,
     /// Whether the persisted state was modified and must therefore be written
     /// back. Two reasons we'd skip a write: (a) we already had a lease at the
     /// desired size in this window from a previous tick, or (b) demand is
@@ -840,18 +1016,14 @@ struct WindowOutcome {
     dirty: bool,
 }
 
-fn fresh_state(window_ms: u64) -> PersistedRateControlState {
-    PersistedRateControlState {
-        schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
-        updated_at_unix_ms: unix_millis_now(),
-        window_ms,
-        limiters: HashMap::new(),
-    }
-}
-
-fn window_id_for(now_ms: u64, window: &Duration) -> u64 {
-    let w = duration_millis_u64(*window).max(1);
-    now_ms / w
+/// The window containing `now`.
+///
+/// Both operands are truncated to whole milliseconds before dividing. Window
+/// ids are JSON map keys in the shared file, so this truncation is part of the
+/// wire contract: dividing at finer resolution would place replicas of
+/// different versions in different windows.
+fn window_id_for(now: SystemTime, window: Duration) -> u64 {
+    unix_millis(now) / duration_millis_u64(window).max(1)
 }
 
 fn min_lease(burst_per_window: u64) -> u64 {
@@ -872,39 +1044,243 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn duration_nanos_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+/// Spacing between paced tokens: one window divided by the tokens leased for
+/// it. An unleased replica paces at the full window length.
+fn pacing_interval(window: Duration, granted: u64) -> Duration {
+    let interval = if granted == 0 {
+        window
+    } else {
+        window / u32::try_from(granted).unwrap_or(u32::MAX)
+    };
+    interval.max(Duration::from_nanos(1))
 }
 
-fn pacing_interval_ns(window: Duration, granted: u64) -> u64 {
-    if granted == 0 {
-        return duration_nanos_u64(window).max(1);
-    }
-    (duration_nanos_u64(window) / granted).max(1)
-}
-
-fn nanos_to_duration(nanos: u64) -> Duration {
-    Duration::from_nanos(nanos)
-}
-
-fn unix_millis_now() -> u64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => duration_millis_u64(d),
-        Err(_) => 0,
-    }
-}
-
-fn unix_nanos_now() -> u64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => duration_nanos_u64(d),
-        Err(_) => 0,
-    }
+/// Unix-epoch milliseconds, the encoding the shared JSON file uses. The only
+/// place time crosses from the typed domain into the persisted one.
+///
+/// A clock before the epoch reads as 0, matching the persisted encoding's
+/// floor rather than failing a lease refresh.
+fn unix_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, duration_millis_u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_snapshot;
     use object_store::memory::InMemory;
+    use serde_json::Value;
+
+    /// A populated state covering every persisted field: a limiter with one
+    /// window and two leases, one reporting counts and one idle.
+    fn wire_format_fixture() -> PersistedRateControlState {
+        let mut leases = HashMap::new();
+        leases.insert(
+            "replica-a".to_string(),
+            PersistedLease {
+                granted: 7,
+                consumed: 5,
+                attempted: 12,
+                expires_at_unix_ms: 1_700_000_001_000,
+                updated_at_unix_ms: 1_700_000_000_500,
+            },
+        );
+        leases.insert(
+            "replica-b".to_string(),
+            PersistedLease {
+                granted: 2,
+                consumed: 0,
+                attempted: 0,
+                expires_at_unix_ms: 1_700_000_001_000,
+                updated_at_unix_ms: 1_700_000_000_500,
+            },
+        );
+
+        let mut windows = HashMap::new();
+        windows.insert(
+            "1700000000".to_string(),
+            PersistedWindow {
+                budget_remaining: 1,
+                leases,
+            },
+        );
+
+        let mut limiters = HashMap::new();
+        limiters.insert(
+            "requests_per_second:burst=10:replenish_ns=100000000".to_string(),
+            PersistedLimiter {
+                burst_per_window: 10,
+                windows,
+            },
+        );
+
+        PersistedRateControlState {
+            schema_version: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+            updated_at_unix_ms: 1_700_000_000_500,
+            window_ms: 1_000,
+            limiters,
+        }
+    }
+
+    /// Serialize with every object's keys sorted. The persisted types are
+    /// `HashMap`-backed and this workspace builds `serde_json` with
+    /// `preserve_order`, so unsorted output would vary run to run.
+    fn canonical_json(state: &PersistedRateControlState) -> String {
+        fn sort_keys(value: Value) -> Value {
+            match value {
+                Value::Object(map) => {
+                    let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+                    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    Value::Object(
+                        entries
+                            .into_iter()
+                            .map(|(key, value)| (key, sort_keys(value)))
+                            .collect(),
+                    )
+                }
+                Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
+                scalar => scalar,
+            }
+        }
+
+        let value = serde_json::to_value(state).expect("state serializes to JSON");
+        serde_json::to_string_pretty(&sort_keys(value)).expect("JSON pretty-prints")
+    }
+
+    /// Pins the on-disk JSON. Replicas of different runtime versions read and
+    /// write one shared file per origin, so any change to a field name, a
+    /// field's presence or a map key encoding breaks a mixed-version cluster.
+    /// Update this snapshot only alongside a `schema_version` bump.
+    #[test]
+    fn persisted_state_json_is_stable() {
+        assert_snapshot!(canonical_json(&wire_format_fixture()), @r###"
+        {
+          "limiters": {
+            "requests_per_second:burst=10:replenish_ns=100000000": {
+              "burst_per_window": 10,
+              "windows": {
+                "1700000000": {
+                  "budget_remaining": 1,
+                  "leases": {
+                    "replica-a": {
+                      "attempted": 12,
+                      "consumed": 5,
+                      "expires_at_unix_ms": 1700000001000,
+                      "granted": 7,
+                      "updated_at_unix_ms": 1700000000500
+                    },
+                    "replica-b": {
+                      "attempted": 0,
+                      "consumed": 0,
+                      "expires_at_unix_ms": 1700000001000,
+                      "granted": 2,
+                      "updated_at_unix_ms": 1700000000500
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "schema_version": 3,
+          "updated_at_unix_ms": 1700000000500,
+          "window_ms": 1000
+        }
+        "###);
+    }
+
+    #[test]
+    fn persisted_state_round_trips() {
+        let state = wire_format_fixture();
+        let encoded = serde_json::to_string(&state).expect("state serializes");
+        let decoded: PersistedRateControlState =
+            serde_json::from_str(&encoded).expect("state deserializes");
+        assert_eq!(state, decoded);
+    }
+
+    /// `consumed` and `attempted` are `#[serde(default)]`. A file written by a
+    /// replica that predates them must still load, with the counts at zero.
+    #[test]
+    fn persisted_state_reads_lease_without_optional_counts() {
+        const ON_DISK: &str = r#"{
+            "schema_version": 3,
+            "updated_at_unix_ms": 1700000000500,
+            "window_ms": 1000,
+            "limiters": {
+                "requests_per_second:burst=10:replenish_ns=100000000": {
+                    "burst_per_window": 10,
+                    "windows": {
+                        "1700000000": {
+                            "budget_remaining": 3,
+                            "leases": {
+                                "replica-a": {
+                                    "granted": 7,
+                                    "expires_at_unix_ms": 1700000001000,
+                                    "updated_at_unix_ms": 1700000000500
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let state: PersistedRateControlState =
+            serde_json::from_str(ON_DISK).expect("older v3 file deserializes");
+
+        assert_eq!(
+            state.schema_version,
+            PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(state.window_ms, 1000);
+
+        let limiter = state
+            .limiters
+            .get("requests_per_second:burst=10:replenish_ns=100000000")
+            .expect("limiter present");
+        assert_eq!(limiter.burst_per_window, 10);
+
+        let window = limiter.windows.get("1700000000").expect("window present");
+        assert_eq!(window.budget_remaining, 3);
+
+        let lease = window.leases.get("replica-a").expect("lease present");
+        assert_eq!(lease.granted, 7);
+        assert_eq!(lease.expires_at_unix_ms, 1_700_000_001_000);
+        assert_eq!(lease.updated_at_unix_ms, 1_700_000_000_500);
+        assert_eq!(lease.consumed, 0, "missing `consumed` defaults to zero");
+        assert_eq!(lease.attempted, 0, "missing `attempted` defaults to zero");
+    }
+
+    /// `lookback_windows` bounds how far back the EWMA reaches, and the
+    /// weights halve with age. A lookback of 1 sees only the window that just
+    /// completed; a wider lookback picks up the older one at half the weight.
+    #[test]
+    fn ewma_demand_honours_lookback_windows() {
+        let lease = |granted, attempted| PersistedLease {
+            granted,
+            consumed: 0,
+            attempted,
+            expires_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let window = |attempted| PersistedWindow {
+            budget_remaining: 0,
+            leases: HashMap::from([("a".to_string(), lease(0, attempted))]),
+        };
+
+        // Windows 8 and 9 completed; window 10 is in progress.
+        let limiter = PersistedLimiter {
+            burst_per_window: 100,
+            windows: HashMap::from([("8".to_string(), window(1)), ("9".to_string(), window(4))]),
+        };
+
+        // Lookback 1: only window 9, at weight 1.
+        assert_eq!(limiter.ewma_demand("a", 10, 100, 1).mine, 4);
+        // Lookback 2: window 9 at weight 2, window 8 at weight 1.
+        assert_eq!(limiter.ewma_demand("a", 10, 100, 2).mine, 4 * 2 + 1);
+        // The in-progress window never contributes.
+        assert_eq!(limiter.ewma_demand("a", 9, 100, 1).mine, 1);
+    }
 
     fn config_for(burst: u64, instance: &str, window: Duration) -> LeasedBucketConfig {
         LeasedBucketConfig {

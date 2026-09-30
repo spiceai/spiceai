@@ -100,10 +100,11 @@ impl QuotaDefinition {
     }
 
     /// Cluster-wide tokens permitted in one `window_duration`.
+    ///
+    /// Quota replenishes one token every `replenish_interval`. So in
+    /// `window` time, `window / replenish_interval` tokens are permitted.
+    /// Round to nearest, but at least 1.
     fn burst_per_window(&self, window: Duration) -> u64 {
-        // Quota replenishes one token every `replenish_interval`. So in
-        // `window` time, `window / replenish_interval` tokens are permitted.
-        // Round to nearest, but at least 1.
         let replenish_ns = self.quota.replenish_interval().as_nanos().max(1);
         let window_ns = window.as_nanos();
         let tokens = window_ns / replenish_ns;
