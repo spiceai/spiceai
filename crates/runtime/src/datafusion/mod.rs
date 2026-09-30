@@ -5685,6 +5685,17 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
+    // Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for dataset '{}': {}",
+            dataset.name,
+            runtime_acceleration::acceleration::CAYENNE_DATALAKE_SNAPSHOT_REASON
+        );
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
