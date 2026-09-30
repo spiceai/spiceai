@@ -219,6 +219,17 @@ const MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL: u64 = 32;
 /// error.
 const MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES: u64 = 3;
 
+/// How a rebuild of the maintained-aggregate views from the visible table state
+/// ended, when it did not error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintainedAggregateRebuild {
+    /// The views were rebuilt from a scan that no write changed while it ran.
+    Rebuilt,
+    /// A write became visible while the scan ran, so the scanned rows match no
+    /// single epoch; the registry was left stale for a later attempt.
+    Superseded,
+}
+
 /// Floor for the derived retained-index budget, applied only where the pool can
 /// afford it. Below this an index is too small to serve any useful table, so a
 /// modest pool is lifted to the floor rather than left with a share no index can
@@ -1938,6 +1949,16 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by `load_existing_pk_index` after its fenced capture
+    /// and before its scans, so a test can run a checkpoint in the window a keyset
+    /// rebuild reads the table after that capture. Consumed on first fire.
+    #[cfg(test)]
+    test_post_keyset_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by `rebuild_maintained_aggregates_from_visible_state`
+    /// after its scan has been read, so a test can land a write inside that scan's
+    /// window. Consumed on first fire.
+    #[cfg(test)]
+    test_post_maintained_aggregate_scan_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired after a full current-snapshot rewrite finishes its
     /// off-fence re-encode and before it takes the listing fence to commit, so a
     /// test can publish a protected snapshot the rewrite's scan never folded.
@@ -9029,6 +9050,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
@@ -11116,6 +11141,12 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             #[cfg(test)]
+            test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
+            #[cfg(test)]
+            test_post_maintained_aggregate_scan_hook: Arc::clone(
+                &self.test_post_maintained_aggregate_scan_hook,
+            ),
+            #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
@@ -12080,11 +12111,7 @@ impl CayenneTableProvider {
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
         if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            for location in keyset.locations_mut() {
-                if matches!(location, RowLocation::Inlined) {
-                    *location = RowLocation::FileUnlocated;
-                }
-            }
+            keyset.relocate_inlined_to_file_unlocated();
         } else {
             // An index checked out for validation is not in the cell, so its entries
             // keep saying `Inlined` for rows this checkpoint just moved into files.
@@ -12098,18 +12125,16 @@ impl CayenneTableProvider {
         // in lockstep so a post-checkpoint upsert tombstones a flushed key by file,
         // not as a phantom inline conflict. At N=1 the sharded cache is empty.
         let mut sharded = self.sharded_pk_keyset_cache.lock();
-        if let Some(ShardedPkIndex::Exact(keysets)) = sharded.as_mut() {
-            for keyset in keysets.iter_mut() {
-                for location in keyset.locations_mut() {
-                    if matches!(location, RowLocation::Inlined) {
-                        *location = RowLocation::FileUnlocated;
-                    }
-                }
-            }
-        } else if sharded.is_none() {
-            // Checked out for validation (or cold, where this is a no-op) — see the
-            // single-index arm above.
-            self.sharded_pk_keyset_pending.lock().invalidate();
+        if let Some(index) = sharded.as_mut() {
+            index.relocate_inlined_to_file_unlocated();
+        } else {
+            // Checked out for validation (or cold, where this is a no-op): have the
+            // restore relabel it instead of discarding it, which would cost the next
+            // apply a full-table keyset rebuild under `write_lock`. Why that is sound
+            // for this index: `PendingPkKeys::relocate_inlined_after_flush`.
+            self.sharded_pk_keyset_pending
+                .lock()
+                .relocate_inlined_after_flush();
         }
     }
 
@@ -12375,6 +12400,11 @@ impl CayenneTableProvider {
             return;
         }
         let mut index = index;
+        if restored.relocates_inlined() {
+            // A checkpoint moved the inline rows into files while the index was out
+            // (see `PendingPkKeys::relocate_inlined_after_flush`).
+            index.relocate_inlined_to_file_unlocated();
+        }
         let mut drop_index = false;
         // The per-shard index carries existence and location only — per-key OCC
         // stamps live on the table-wide keyset — so the recorded sequence has no
@@ -13007,9 +13037,13 @@ impl CayenneTableProvider {
         // together under the WRITE fence, so resolving cold after this block would
         // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
         // snapshot and the post-promotion cold manifest.
+        // Warm the inline cache off the fence, so the fenced read below is a cache
+        // hit in the common case (the shape `capture_raw_scan_input` uses).
+        self.read_inlined_batches_if_present().await?;
         let (
             mem_snapshots,
             staged_keys,
+            inlined_batches,
             protected_snapshots,
             current_snapshot_id,
             cold_files,
@@ -13028,6 +13062,12 @@ impl CayenneTableProvider {
             // registration, so reading both here leaves a key in this capture or in
             // the `current_snapshot_id` scan below — never in neither.
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
+            // The inline rows join the same fenced instant: a checkpoint registers the
+            // file it flushed them into as a protected snapshot and clears them under
+            // the WRITE fence, so read after the scans below, the rows of a checkpoint
+            // landing in between would be in neither this snapshot list nor the
+            // inline corpus — and their keys missing from the rebuilt index.
+            let inlined_batches = self.read_inlined_batches_if_present().await?;
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
@@ -13074,12 +13114,15 @@ impl CayenneTableProvider {
             (
                 mem_snapshots,
                 staged_keys,
+                inlined_batches,
                 protected_snapshots,
                 current_snapshot_id,
                 cold_files,
                 scan_guard,
             )
         };
+        #[cfg(test)]
+        self.run_test_post_keyset_capture_hook().await;
 
         let ctx = self.create_session_context();
         // Only read PK columns - no need to load all columns for keyset building
@@ -13233,15 +13276,13 @@ impl CayenneTableProvider {
             );
         }
 
-        if self.cached_inlined_row_count() > 0 {
-            let inlined_batches = self.read_inlined_batches().await?;
-            self.process_visible_inlined_batches_into_keyset(
-                &inlined_batches,
-                pk_indices,
-                converter,
-                &mut keyset,
-            )?;
-        }
+        // The inline rows (read under the fence at the top).
+        self.process_visible_inlined_batches_into_keyset(
+            &inlined_batches,
+            pk_indices,
+            converter,
+            &mut keyset,
+        )?;
 
         // Finally fold in the un-checkpointed mem-tier keys (snapshotted at the top).
         Self::fold_mem_tier_keys_into_keyset(&mem_snapshots, pk_indices, converter, &mut keyset)?;
@@ -13444,11 +13485,14 @@ impl CayenneTableProvider {
     /// Fold the post-checkpoint delta — every protected snapshot and inline entry
     /// (all created after the checkpoint, since compaction clears both) — into a
     /// bloom loaded from the sidecar, making it a superset of all current keys.
+    /// `protected_snapshots` and `inlined_batches` must be captured under one
+    /// listing fence (see `load_existing_pk_index`).
     async fn extend_bloom_with_protected_and_inline(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
         protected_snapshots: &HashMap<String, i64>,
+        inlined_batches: &[RecordBatch],
         bloom: &mut PkBloom,
     ) -> Result<()> {
         let ctx = self.create_session_context();
@@ -13476,12 +13520,9 @@ impl CayenneTableProvider {
             }
         }
 
-        if self.cached_inlined_row_count() > 0 {
-            let inlined_batches = self.read_inlined_batches().await?;
-            for batch in &inlined_batches {
-                // Inlined batches carry the full table schema, so use pk_indices directly.
-                Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
-            }
+        for batch in inlined_batches {
+            // Inlined batches carry the full table schema, so use pk_indices directly.
+            Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
         }
         Ok(())
     }
@@ -13616,19 +13657,33 @@ impl CayenneTableProvider {
         // The mem-tier snapshot is taken inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
         // or already durable in the protected/current scan.
-        let (mem_snapshots, staged_keys, protected_snapshots, current_snapshot_id, _scan_guard) = {
+        // Warm the inline cache off the fence (see `load_existing_pk_index`); a stale
+        // sidecar falls back to that full rebuild, which reuses it.
+        self.read_inlined_batches_if_present().await?;
+        let (mem_snapshots, staged_keys, inlined_batches, protected_snapshots, _scan_guard) = {
             let _fence = self.listing_fence.read().await;
+            let current_snapshot_id = self.get_current_snapshot_id();
+            // Gate on the snapshot tag before reading anything else: the bloom covers
+            // the full current snapshot only if nothing rewrote it since the
+            // checkpoint (compaction re-persists). The cold bloom is gated on the
+            // same id for the reason in the doc comment.
+            if checkpoint_snapshot != current_snapshot_id
+                || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
+            {
+                return Ok(None);
+            }
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
                 .shards()
                 .iter()
                 .map(ArcSwap::load_full)
                 .collect();
-            // Same fenced instant as the full rebuild captures them in, and for the
-            // same reason — see `load_existing_pk_index`.
+            // The staged keys and the inline rows join the same fenced instant as the
+            // full rebuild captures them in, and for the same reasons — see
+            // `load_existing_pk_index`.
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
+            let inlined_batches = self.read_inlined_batches_if_present().await?;
             let protected_snapshots = self.protected_snapshots.load_full();
-            let current_snapshot_id = self.get_current_snapshot_id();
             // Pin the snapshot dirs this path reads (the protected snapshots folded
             // by `extend_bloom_with_protected_and_inline` below) against the
             // retired-dir sweep for the whole read. The current snapshot is served
@@ -13645,20 +13700,12 @@ impl CayenneTableProvider {
             (
                 mem_snapshots,
                 staged_keys,
+                inlined_batches,
                 protected_snapshots,
-                current_snapshot_id,
                 scan_guard,
             )
         };
 
-        // Gate on the snapshot tag: the bloom covers the full current snapshot
-        // only if nothing rewrote it since the checkpoint (compaction re-persists).
-        // The cold bloom is gated on the same id for the reason in the doc comment.
-        if checkpoint_snapshot != current_snapshot_id
-            || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
-        {
-            return Ok(None);
-        }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
             return Ok(None);
         };
@@ -13681,6 +13728,7 @@ impl CayenneTableProvider {
             pk_indices,
             converter,
             &protected_snapshots,
+            &inlined_batches,
             &mut bloom,
         )
         .await?;
@@ -25772,23 +25820,55 @@ impl CayenneTableProvider {
 
     async fn rebuild_maintained_aggregates_from_visible_state(
         &self,
-    ) -> datafusion_common::Result<()> {
+    ) -> datafusion_common::Result<MaintainedAggregateRebuild> {
         if self.maintained_aggregates.is_empty() {
-            return Ok(());
+            return Ok(MaintainedAggregateRebuild::Rebuilt);
         }
 
         let ctx = self.create_session_context();
         let session_state = Arc::new(ctx.state());
-        // NOTE: the scan is deliberately unprojected. The views resolve their
-        // group-by, aggregate-input, and PK columns as indices into the TABLE
-        // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
-        // the columns out from under them. Projecting requires re-resolving every
-        // view against the projected schema; until that lands, correctness wins
-        // over the wasted materialization.
-        let plan =
-            <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None).await?;
-        let batches = collect(plan, session_state.task_ctx()).await?;
-        let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
+        // Take the epoch and the scan's snapshot together under `write_lock`, which
+        // every write that changes the visible rows holds while it does so, so the
+        // snapshot is the state at exactly this epoch. Planning captures the
+        // snapshot; the read below runs after the lock is released.
+        let (plan, epoch) = {
+            let _write_guard = self.write_lock.lock().await;
+            let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
+            // NOTE: the scan is deliberately unprojected. The views resolve their
+            // group-by, aggregate-input, and PK columns as indices into the TABLE
+            // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
+            // the columns out from under them. Projecting requires re-resolving every
+            // view against the projected schema; until that lands, correctness wins
+            // over the wasted materialization.
+            let plan = <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None)
+                .await?;
+            (plan, epoch)
+        };
+        let mut stream = datafusion_physical_plan::execute_stream(plan, session_state.task_ctx())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+            // Stop reading once a write is published: the rebuild is superseded
+            // (below), so the rest of the table would be read for nothing.
+            if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
+                break;
+            }
+        }
+        #[cfg(test)]
+        self.run_test_post_maintained_aggregate_scan_hook().await;
+        // A write that became visible while the scan ran is not in these rows, and
+        // its delta reached a stale registry, which dropped it. Marked fresh, the
+        // views would be served without that write's rows, so leave the registry
+        // stale and let a later attempt rebuild it.
+        if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
+            self.mark_maintained_aggregates_stale();
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                epoch,
+                "Maintained aggregate rebuild superseded by a write during its scan; the registry stays stale until a later attempt"
+            );
+            return Ok(MaintainedAggregateRebuild::Superseded);
+        }
         // Capture stats before `batches` is moved into the blocking task.
         let batch_count = batches.len();
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
@@ -25810,7 +25890,7 @@ impl CayenneTableProvider {
             rows = row_count,
             "Initialized maintained aggregate state from visible table snapshot"
         );
-        Ok(())
+        Ok(MaintainedAggregateRebuild::Rebuilt)
     }
 
     /// Rebuild a stale maintained-aggregate registry, rate-limited.
@@ -25865,13 +25945,15 @@ impl CayenneTableProvider {
             .rebuild_maintained_aggregates_from_visible_state()
             .await
         {
-            Ok(()) if !self.maintained_aggregates.is_stale() => {
+            // Logged at debug where it happened; the next interval retries.
+            Ok(MaintainedAggregateRebuild::Superseded) => {}
+            Ok(MaintainedAggregateRebuild::Rebuilt) if !self.maintained_aggregates.is_stale() => {
                 tracing::info!(
                     table = %self.table_metadata.table_name,
                     "Maintained aggregate state rebuilt after staleness; queries are served from maintained state again"
                 );
             }
-            Ok(()) => {
+            Ok(MaintainedAggregateRebuild::Rebuilt) => {
                 tracing::warn!(
                     table = %self.table_metadata.table_name,
                     retained_bytes = retained,
@@ -26832,6 +26914,26 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_post_snapshot_list_hook(&self) {
         let hook = self.test_post_snapshot_list_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-keyset-capture hook, if one is
+    /// installed. See [`Self::test_post_keyset_capture_hook`].
+    #[cfg(test)]
+    async fn run_test_post_keyset_capture_hook(&self) {
+        let hook = self.test_post_keyset_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-maintained-aggregate-scan hook, if one
+    /// is installed. See [`Self::test_post_maintained_aggregate_scan_hook`].
+    #[cfg(test)]
+    async fn run_test_post_maintained_aggregate_scan_hook(&self) {
+        let hook = self.test_post_maintained_aggregate_scan_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -28071,6 +28173,15 @@ impl CayenneTableProvider {
         // Cache miss: populate both `batches` and `view` together.
         self.populate_inlined_cache(current_gen).await?;
         Ok((*self.inlined_cache.load().batches).clone())
+    }
+
+    /// [`Self::read_inlined_batches`], skipped when the table holds no inline rows.
+    async fn read_inlined_batches_if_present(&self) -> Result<Vec<RecordBatch>> {
+        if self.cached_inlined_row_count() > 0 {
+            self.read_inlined_batches().await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Return the per-entry inline view, building and caching it on first access
@@ -37725,7 +37836,13 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                     // this, on a delete-heavy table the bake wins every tick, the
                     // size-tier leveler never runs, and protected snapshots (full-copy
                     // data files) accumulate on disk (the footprint regression).
-                    Ok(true) => baked = true,
+                    Ok(true) => {
+                        baked = true;
+                        // What this bake could not prune tells the adaptive
+                        // controller whether the trigger is within its reach.
+                        self.context
+                            .record_bake_residual(self.pk_deletion_snapshot().delete_len());
+                    }
                     Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
                     Err(e) => return Err(e.to_string()),
                 }
@@ -56769,6 +56886,110 @@ mod tests {
         );
     }
 
+    /// A stale maintained-aggregate registry is rebuilt from a full scan while CDC
+    /// writes continue. A write that becomes visible during that scan is in neither
+    /// the scanned rows nor the registry, which dropped its delta while stale, so
+    /// the rebuild must not mark the views fresh: served from them, the aggregate
+    /// would leave that write's rows out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintained_aggregate_rebuild_does_not_serve_a_write_its_scan_missed() {
+        use std::sync::atomic::Ordering;
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "ma_rebuild_scan_race",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first CDC write prepares");
+        write.finish().await.expect("first CDC write publishes");
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        assert_eq!(
+            collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
+            vec![(1, 1, 10), (2, 1, 20)],
+            "precondition: the registry serves the first write"
+        );
+
+        // Stale, as after a durable delete, then a rebuild whose scan a write lands in.
+        provider.mark_maintained_aggregates_stale();
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let schema = Arc::clone(&schema);
+            *provider.test_post_maintained_aggregate_scan_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let task_ctx = SessionContext::new().task_ctx();
+                    let write = provider_in_hook
+                        .write_cdc_append_stream(
+                            single_batch_stream(id_value_batch(schema, &[3], &[30])),
+                            &task_ctx,
+                        )
+                        .await
+                        .expect("CDC write during the rebuild scan prepares");
+                    write
+                        .finish()
+                        .await
+                        .expect("CDC write during the rebuild scan publishes");
+                    // Let the applier take in (and, while stale, drop) that write's delta.
+                    let published = provider_in_hook
+                        .maintained_aggregate_epoch
+                        .load(Ordering::Acquire);
+                    let applied = test_framework::utils::wait_until_true(
+                        std::time::Duration::from_secs(5),
+                        || async {
+                            provider_in_hook.maintained_aggregates.epoch_for_test() >= published
+                        },
+                    )
+                    .await;
+                    assert!(
+                        applied,
+                        "the applier never took in the delta of the write made during the scan"
+                    );
+                })
+            }));
+        }
+        let _ = provider
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+            .expect("rebuild runs");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "ma_rebuild_scan_race").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "precondition: the table holds the write made during the rebuild scan"
+        );
+        let epoch = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+        if let Some(served) = provider
+            .maintained_aggregates
+            .batch_for_aggregate(&aggregate_exec, epoch)
+            .expect("maintained serve must not error")
+        {
+            assert_eq!(
+                collect_id_count_sum(&served),
+                vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+                "a served maintained aggregate must include every visible row"
+            );
+        }
+
+        // With no write during its scan, the next rebuild restores serving, complete.
+        let _ = provider
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+            .expect("rebuild runs");
+        assert_eq!(
+            collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+            "a rebuild with no write during its scan serves every row"
+        );
+    }
+
     /// N>1 mem-tier CDC: DELETE retracts maintained aggregates (pre-bump epoch +
     /// serial post-join feed). Before this fix, `append_delete_intents_sharded`
     /// passed `None` for retract rows, so a Fresh registry kept counting deleted
@@ -68927,6 +69148,271 @@ mod tests {
             ),
         }
     }
+
+    /// A checkpoint that moves the inline rows into files while an apply has the
+    /// per-shard index checked out must not cost that index: the flush changes
+    /// where rows live, not which keys are live. The restore relabels the `Inlined`
+    /// entries committed before the flush and caches the index; discarding it would
+    /// make the next apply rebuild the index from a full-table key scan under
+    /// `write_lock`.
+    #[tokio::test]
+    async fn an_inline_flush_during_a_sharded_checkout_relabels_instead_of_discarding() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_inline_flush",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+
+        // One inline commit lands before the flush, one after it.
+        let flushed = pk_digest_set_for_ids(&converter, &[7]);
+        let flushed_digest = flushed
+            .iter_with_digest()
+            .next()
+            .expect("one flushed key")
+            .0;
+        provider.record_pk_keys_with_location(&flushed, &RowLocation::Inlined, 11);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        let still_inline = pk_digest_set_for_ids(&converter, &[8]);
+        let still_inline_digest = still_inline
+            .iter_with_digest()
+            .next()
+            .expect("one still-inline key")
+            .0;
+        provider.record_pk_keys_with_location(&still_inline, &RowLocation::Inlined, 12);
+
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                let location_of = |digest: u128| {
+                    keysets
+                        .iter()
+                        .find_map(|keyset| keyset.location_by_digest(digest))
+                        .cloned()
+                };
+                assert!(
+                    matches!(
+                        location_of(flushed_digest),
+                        Some(RowLocation::FileUnlocated)
+                    ),
+                    "id=7 was committed inline before the flush moved it into a file: an \
+                     `Inlined` entry would supersede only the inline copy and leave the file \
+                     copy live"
+                );
+                assert!(
+                    matches!(location_of(still_inline_digest), Some(RowLocation::Inlined)),
+                    "id=8 was committed inline after the flush and is still inline"
+                );
+            }
+            other => panic!(
+                "the per-shard index must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next apply), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The per-shard index is a Bloom once the keyset outgrows its budget (the
+    /// form every large CH-benCH table runs in at SF-1000; a discard of it reports
+    /// `kind=bloom, reason=invalidated`). A Bloom carries no
+    /// row locations, so an inline flush during its checkout has nothing to
+    /// relabel and must not cost the index: the restore keeps it and replays the
+    /// keys committed while it was out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inline_flush_during_a_sharded_checkout_keeps_a_bloom_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
+            &ctx,
+            "pk_sharded_checkout_inline_flush_bloom",
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Bloom(_))
+            ),
+            "precondition: the over-budget per-shard index is a Bloom"
+        );
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard Bloom is checked out");
+
+        // A key committed inline while the index is out, then the checkpoint's
+        // inline flush, then the restore.
+        let committed = pk_digest_set_for_ids(&converter, &[1_000_000]);
+        let committed_key: Vec<u8> = {
+            let (_, key) = committed
+                .iter_with_digest()
+                .next()
+                .expect("one committed key");
+            let bytes: &[u8] = key.as_ref();
+            bytes.to_vec()
+        };
+        provider.record_pk_keys_with_location(&committed, &RowLocation::Inlined, 1_000_001);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Bloom(blooms)) => {
+                let shard = crate::provider::pk_index::shard_of_pk(&committed_key, blooms.len());
+                assert!(
+                    blooms[shard].maybe_contains(&committed_key),
+                    "the restore must replay the key committed during the checkout"
+                );
+            }
+            other => panic!(
+                "the per-shard Bloom must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next apply), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// A checkpoint can land while an apply rebuilds the per-shard index: after the
+    /// rebuild's fenced capture of the snapshot list, before it has read the rest
+    /// of the table. The checkpoint registers the file it flushes the inline rows
+    /// into as a protected snapshot that capture does not list, then clears them,
+    /// so the rebuild must have read the inline rows inside the same fence. The
+    /// index survives the flush (see `relocate_inlined_after_flush`), so a key it
+    /// misses stays missing for every later apply, and the next upsert of that key
+    /// leaves two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_during_a_sharded_keyset_rebuild_keeps_the_flushed_inline_keys() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_rebuild_inline_flush",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // RAM-tier rows for the checkpoint to flush, and key 7 in the inline corpus.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1), (101, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        assert!(
+            !provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: key 7 must be in the inline corpus"
+        );
+
+        // A cold cache, so the next checkout rebuilds the index from the table, and
+        // a checkpoint that runs right after the rebuild's fenced capture.
+        provider.clear_cached_pk_keyset();
+        let checkpointed = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let checkpointed = Arc::clone(&checkpointed);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint during the keyset rebuild");
+                    checkpointed.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard index is rebuilt and checked out");
+        assert!(
+            checkpointed.load(Ordering::SeqCst),
+            "precondition: the checkpoint ran inside the rebuild"
+        );
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+        provider.store_sharded_pk_index(checked_out);
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => assert!(
+                keysets
+                    .iter()
+                    .any(|keyset| keyset.location_by_digest(key_7).is_some()),
+                "the rebuilt index must hold key 7, whose row the checkpoint moved into a \
+                 file the rebuild's snapshot list does not name"
+            ),
+            other => panic!(
+                "the rebuilt per-shard index must survive the checkpoint's inline flush, \
+                 present={}",
+                other.is_some()
+            ),
+        }
+
+        // What a missing key costs: the next upsert of key 7 must replace its row,
+        // not add a second one.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_sharded_rebuild_inline_flush")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value"
+        );
+    }
+
     /// A checked-out index that is never restored must not blind the checkout
     /// mechanism for the rest of the process — regression test for #13267.
     ///
