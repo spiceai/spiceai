@@ -942,7 +942,15 @@ impl ExecutionPlan for PartitionedUnionExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        self.inner_union.try_swapping_with_projection(projection)
+        // `try_swapping_with_projection` implementations read the projection's
+        // input as the node being swapped with, so re-root it on the inner union
+        // (whose schema this node shares) before delegating.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.inner_union),
+            projection.schema().as_ref(),
+        )?;
+        self.inner_union.try_swapping_with_projection(&projection)
     }
 
     fn gather_filters_for_pushdown(

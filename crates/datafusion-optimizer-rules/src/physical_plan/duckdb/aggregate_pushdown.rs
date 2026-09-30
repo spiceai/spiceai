@@ -238,7 +238,17 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(swapped) = self.input.try_swapping_with_projection(projection)? {
+        // Implementations of `try_swapping_with_projection` read the projection's
+        // input as the node being swapped with (a `ProjectionExec` collapses the
+        // chain starting there, `CoalescePartitionsExec` rebuilds from its child),
+        // so the projection is re-rooted on the input before it is handed down.
+        // This node's schema is its input's, so the expressions carry over.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.input),
+            projection.schema().as_ref(),
+        )?;
+        if let Some(swapped) = self.input.try_swapping_with_projection(&projection)? {
             Ok(Some(Self::new(self.logical_plan.clone(), swapped)))
         } else {
             Ok(None)
@@ -340,5 +350,75 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
 
     fn schema_check(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+    use datafusion::physical_plan::displayable;
+
+    /// A projection above the marker, over a projection the marker holds, must
+    /// collapse beneath the marker. Delegated without re-rooting, the inner
+    /// `ProjectionExec` hands the projection back still above the marker, and
+    /// the projection pushdown nests markers on every step without bound.
+    #[test]
+    fn projection_over_marked_projection_collapses_beneath_the_marker() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let scan = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+            .expect("memory scan should be created");
+        let id = col("id", &schema).expect("id column should exist");
+        let inner = Arc::new(
+            ProjectionExec::try_new(
+                vec![(Arc::clone(&id), "a".to_string()), (id, "b".to_string())],
+                scan,
+            )
+            .expect("inner projection should be created"),
+        );
+        let logical_plan = LogicalPlanBuilder::empty(false)
+            .build()
+            .expect("empty logical plan should build");
+        let marker: Arc<dyn ExecutionPlan> =
+            DuckDBAggregatePushdownMarkerExec::new(logical_plan, inner);
+        let marker_schema = marker.schema();
+        let outer = ProjectionExec::try_new(
+            vec![
+                (col("b", &marker_schema).expect("b column"), "x".to_string()),
+                (col("a", &marker_schema).expect("a column"), "y".to_string()),
+            ],
+            Arc::clone(&marker),
+        )
+        .expect("outer projection should be created");
+
+        let swapped = marker
+            .try_swapping_with_projection(&outer)
+            .expect("projection swap should be attempted")
+            .expect("the projections should collapse");
+        let child = swapped.children()[0];
+        assert!(
+            swapped.is::<DuckDBAggregatePushdownMarkerExec>()
+                && child.is::<ProjectionExec>()
+                && !child.children()[0].is::<DuckDBAggregatePushdownMarkerExec>(),
+            "expected one projection beneath the marker, got:\n{}",
+            displayable(swapped.as_ref()).indent(true)
+        );
+        assert_eq!(swapped.schema(), outer.schema());
+
+        let optimized = ProjectionPushdown::new()
+            .optimize(Arc::new(outer), &ConfigOptions::default())
+            .expect("projection pushdown should succeed");
+        let rendered = displayable(optimized.as_ref()).indent(true).to_string();
+        assert_eq!(
+            rendered
+                .matches("DuckDBAggregatePushdownMarkerExec")
+                .count(),
+            1,
+            "projection pushdown must not nest markers:\n{rendered}"
+        );
     }
 }

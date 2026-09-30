@@ -1278,8 +1278,22 @@ impl ExecutionPlan for CayenneAccelerationExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // `try_swapping_with_projection` is called with a projection whose input is
+        // the receiver, and implementations read that input: `ProjectionExec`
+        // collapses the chain starting at `projection.input()`. Handing the inner
+        // plan a projection whose input is this wrapper would make an inner
+        // `ProjectionExec` find no chain and return the projection unchanged, still
+        // above this wrapper; rewrapping that nests a copy of this node on every
+        // step of the pushdown's descent, without bound. So the projection is
+        // re-rooted on the inner plan first. The wrapper's schema is the inner
+        // plan's, so the expressions and output schema carry over unchanged.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.inner),
+            projection.schema().as_ref(),
+        )?;
         self.inner
-            .try_swapping_with_projection(projection)
+            .try_swapping_with_projection(&projection)
             .map(|plan| {
                 plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
             })
@@ -2347,6 +2361,64 @@ mod tests {
             swapped.is::<CayenneAccelerationExec>(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
+    }
+
+    /// A projection above the wrapper, over a projection the wrapper holds, must
+    /// collapse into one projection beneath the wrapper. If the outer projection is
+    /// delegated without re-rooting it, the inner `ProjectionExec` hands it back
+    /// still above the wrapper and the projection pushdown nests wrappers without
+    /// bound.
+    #[test]
+    fn projection_over_wrapped_projection_collapses_beneath_the_wrapper() {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+
+        let scan = one_partition_plan();
+        let id = col("id", &scan.schema()).expect("id column should exist");
+        let inner = Arc::new(
+            ProjectionExec::try_new(
+                vec![(Arc::clone(&id), "a".to_string()), (id, "b".to_string())],
+                scan,
+            )
+            .expect("inner projection should be created"),
+        );
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(CayenneAccelerationExec::new(inner));
+        let exec_schema = exec.schema();
+        let outer = ProjectionExec::try_new(
+            vec![
+                (col("b", &exec_schema).expect("b column"), "x".to_string()),
+                (col("a", &exec_schema).expect("a column"), "y".to_string()),
+            ],
+            Arc::clone(&exec),
+        )
+        .expect("outer projection should be created");
+
+        let swapped = exec
+            .try_swapping_with_projection(&outer)
+            .expect("projection swap should be attempted")
+            .expect("the projections should collapse");
+        let child = swapped.children()[0];
+        assert!(
+            swapped.is::<CayenneAccelerationExec>()
+                && child.is::<ProjectionExec>()
+                && child.children()[0].is::<DataSourceExec>(),
+            "expected one projection beneath the wrapper, got:\n{}",
+            datafusion::physical_plan::displayable(swapped.as_ref()).indent(true)
+        );
+        assert_eq!(swapped.schema(), outer.schema());
+
+        let optimized = ProjectionPushdown::new()
+            .optimize(Arc::new(outer), &ConfigOptions::default())
+            .expect("projection pushdown should succeed");
+        let rendered = datafusion::physical_plan::displayable(optimized.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(
+            rendered.matches("CayenneAccelerationExec").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("ProjectionExec").count(), 1, "{rendered}");
     }
 
     #[test]
