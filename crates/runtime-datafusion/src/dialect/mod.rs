@@ -424,7 +424,6 @@ mod tests {
         postgres_can_evaluate_expression,
     };
     use crate::function_support::bigquery_can_evaluate_expression;
-    use std::sync::Arc;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::DFSchema;
     use datafusion::functions::expr_fn::{concat, upper};
@@ -433,6 +432,7 @@ mod tests {
     use datafusion::prelude::{Expr, cast, col, lit, try_cast};
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
+    use std::sync::Arc;
 
     /// The [`ScalarFunction`] inside a call built by `DataFusion`'s own
     /// `expr_fn` helpers, so these guards run against the real UDFs rather
