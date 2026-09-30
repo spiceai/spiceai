@@ -2202,7 +2202,12 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
 /// setting. A Cayenne snapshot carries only its own dataset's metastore slice, never the
 /// shared `cayenne.db`, so a dataset with snapshots enabled places no constraint on one
 /// that has them disabled. The runtime used to refuse such a pod outright and load neither
-/// dataset (#14562); both must load, and only the enabled dataset may publish.
+/// dataset (#14562).
+///
+/// First start: both datasets load, and only the enabled dataset publishes. Restart from
+/// wiped local state with both sources shrunk: the enabled dataset bootstraps from its
+/// snapshot beside the disabled one, which reloads from its source — each dataset's row
+/// count says where it came from.
 #[tokio::test]
 async fn snapshot_int_test_cayenne_mixed_snapshot_settings_share_metadata_dir() -> Result<()> {
     let _guard = init_tracing(Some(
@@ -2254,7 +2259,9 @@ async fn snapshot_int_test_cayenne_mixed_snapshot_settings_share_metadata_dir() 
                 ("file_format".to_string(), "csv".to_string()),
                 ("csv_has_header".to_string(), "true".to_string()),
             ]);
-            let cayenne_acceleration = |data_dir: &Path, snapshots: DatasetSnapshotBehavior| {
+            let cayenne_acceleration = |data_dir: &Path,
+                                        metadata_dir: &Path,
+                                        snapshots: DatasetSnapshotBehavior| {
                 Acceleration {
                     mode: Mode::File,
                     engine: Some("cayenne".to_string()),
@@ -2275,46 +2282,64 @@ async fn snapshot_int_test_cayenne_mixed_snapshot_settings_share_metadata_dir() 
             };
 
             // Dataset 1 has snapshots fully enabled (create and bootstrap); dataset 2 opts
-            // out entirely.
-            let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
-            dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
-            dataset1.acceleration = Some(cayenne_acceleration(
-                &data_dir1,
-                DatasetSnapshotBehavior::Enabled,
-            ));
+            // out entirely. Built by a closure because the restart below declares the
+            // same pod again over different local directories.
+            let build_app = |name: &str, data_dir1: &Path, data_dir2: &Path, metadata_dir: &Path| {
+                let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
+                dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
+                dataset1.acceleration = Some(cayenne_acceleration(
+                    data_dir1,
+                    metadata_dir,
+                    DatasetSnapshotBehavior::Enabled,
+                ));
 
-            let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
-            dataset2.params = Some(Params::from_string_map(dataset_params));
-            dataset2.acceleration = Some(cayenne_acceleration(
-                &data_dir2,
-                DatasetSnapshotBehavior::Disabled,
-            ));
+                let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
+                dataset2.params = Some(Params::from_string_map(dataset_params.clone()));
+                dataset2.acceleration = Some(cayenne_acceleration(
+                    data_dir2,
+                    metadata_dir,
+                    DatasetSnapshotBehavior::Disabled,
+                ));
 
-            let app = AppBuilder::new("snapshot_mixed_settings_test")
-                .with_snapshots(Snapshots {
-                    enabled: true,
-                    location: Some(format!("file://{}/", snapshot_dir.display())),
-                    bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Warn,
-                    params: None,
-                })
-                .with_dataset(dataset1)
-                .with_dataset(dataset2)
-                .build();
+                AppBuilder::new(name)
+                    .with_snapshots(Snapshots {
+                        enabled: true,
+                        location: Some(format!("file://{}/", snapshot_dir.display())),
+                        bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Warn,
+                        params: None,
+                    })
+                    .with_dataset(dataset1)
+                    .with_dataset(dataset2)
+                    .build()
+            };
+            let count_rows = |runtime: Arc<Runtime>, dataset: &'static str| async move {
+                let batches = run_query(&runtime, &format!("SELECT COUNT(*) FROM {dataset}"))
+                    .await
+                    .with_context(|| format!("Counting rows of {dataset}"))?;
+                batches
+                    .first()
+                    .map(|batch| batch.column(0).as_primitive::<Int64Type>().value(0))
+                    .ok_or_else(|| anyhow!("COUNT(*) over {dataset} returned no rows"))
+            };
 
             configure_test_datafusion();
 
-            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            let runtime = Arc::new(
+                Runtime::builder()
+                    .with_app(build_app(
+                        "snapshot_mixed_settings_test",
+                        &data_dir1,
+                        &data_dir2,
+                        &metadata_dir,
+                    ))
+                    .build()
+                    .await,
+            );
             load_runtime(Arc::clone(&runtime)).await?;
 
             // Both datasets load and serve every source row.
             for dataset in ["taxi_trips_1", "taxi_trips_2"] {
-                let batches = run_query(&runtime, &format!("SELECT COUNT(*) FROM {dataset}"))
-                    .await
-                    .with_context(|| format!("Counting rows of {dataset}"))?;
-                let count = batches
-                    .first()
-                    .map(|batch| batch.column(0).as_primitive::<Int64Type>().value(0))
-                    .ok_or_else(|| anyhow!("COUNT(*) over {dataset} returned no rows"))?;
+                let count = count_rows(Arc::clone(&runtime), dataset).await?;
                 assert_eq!(
                     count, expected_rows,
                     "{dataset} must serve every source row alongside a dataset with a different snapshot setting"
@@ -2348,6 +2373,58 @@ async fn snapshot_int_test_cayenne_mixed_snapshot_settings_share_metadata_dir() 
                     .as_ref()
                     .is_some_and(|metadata| metadata.get("taxi_trips_2").is_none()),
                 "taxi_trips_2 (snapshots disabled) must not publish a snapshot; store metadata: {metadata:?}"
+            );
+
+            runtime.shutdown().await;
+
+            // Restart on a node with none of that local state, with both sources shrunk to
+            // a few rows. The enabled dataset must come back from its snapshot (every
+            // original row) while the disabled dataset, which never had one, reloads from
+            // its shrunk source. The bootstrap decision is per dataset, so the disabled
+            // sibling opening the shared metastore first must not make the enabled one
+            // skip its snapshot.
+            //
+            // The fresh node is modelled with new directories rather than by deleting the
+            // first ones: within one process Cayenne keeps the metastore handle open per
+            // metadata directory, so a deleted-and-recreated directory would be read
+            // through the stale handle, which no real restart does.
+            let restart_data_dir1 = temp_dir.path().join("restart_cayenne_data1");
+            let restart_data_dir2 = temp_dir.path().join("restart_cayenne_data2");
+            let restart_metadata_dir = temp_dir.path().join("restart_cayenne_metadata");
+            let shrunk_rows: i64 = 7;
+            let shrunk_csv: String = sample_csv_contents
+                .lines()
+                .take(usize::try_from(shrunk_rows).context("Shrunk row count")? + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for path in [&sample_source_path1, &sample_source_path2] {
+                fs::write(path, &shrunk_csv)
+                    .await
+                    .with_context(|| format!("Shrinking {}", path.display()))?;
+            }
+
+            let runtime = Arc::new(
+                Runtime::builder()
+                    .with_app(build_app(
+                        "snapshot_mixed_settings_test_restart",
+                        &restart_data_dir1,
+                        &restart_data_dir2,
+                        &restart_metadata_dir,
+                    ))
+                    .build()
+                    .await,
+            );
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            let restored = count_rows(Arc::clone(&runtime), "taxi_trips_1").await?;
+            assert_eq!(
+                restored, expected_rows,
+                "taxi_trips_1 (snapshots enabled) must bootstrap from its snapshot beside a disabled sibling, not reload from its shrunk source"
+            );
+            let reloaded = count_rows(Arc::clone(&runtime), "taxi_trips_2").await?;
+            assert_eq!(
+                reloaded, shrunk_rows,
+                "taxi_trips_2 (snapshots disabled) must reload from its source, not from any snapshot"
             );
 
             runtime.shutdown().await;
