@@ -22,7 +22,9 @@ use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
+use runtime_acceleration::snapshot::{
+    ForceCreate, SnapshotManager, SnapshotWriteLock, metrics as snapshot_metrics,
+};
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
 use std::pin::Pin;
@@ -497,7 +499,12 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) {
+    let lock_wait_started = std::time::Instant::now();
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
+    let lock = SnapshotWriteLock {
+        wait: lock_wait_started.elapsed(),
+        ..SnapshotWriteLock::new(lock_guard)
+    };
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
     // in-place / live schema evolution (e.g. Cayenne CDC) that widened the
@@ -512,6 +519,7 @@ pub async fn create_checkpoint_and_snapshot(
     } else {
         checkpoint_schema
     };
+    let checkpoint_started = std::time::Instant::now();
     if let Err(e) = checkpointer
         .checkpoint(checkpoint_schema, refresh_sql)
         .await
@@ -534,18 +542,21 @@ pub async fn create_checkpoint_and_snapshot(
             i => Some(i),
         };
 
+        let checkpoint = checkpoint_started.elapsed();
         // Get the current row count from the accelerator using the `DataFrame` API.
         // This must be done after checkpoint while holding the write lock to ensure atomicity.
+        let row_count_started = std::time::Instant::now();
         let row_count = if let Some(accelerator) = accelerator {
             get_row_count(accelerator, dataset_name).await
         } else {
             None
         };
+        let lock = lock.with_phases(checkpoint, row_count_started.elapsed());
 
         match snapshot_manager
             .create_snapshot_with_table(
                 checkpoint_schema,
-                lock_guard,
+                lock,
                 updated_at,
                 row_count,
                 force_create,

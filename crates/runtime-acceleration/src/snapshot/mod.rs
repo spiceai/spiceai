@@ -45,7 +45,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::{
@@ -706,6 +706,62 @@ impl std::fmt::Debug for SnapshotManager {
     }
 }
 
+/// The accelerator write lock a snapshot is created under, with when it was
+/// acquired and what already ran under it, so the manager can report how long
+/// the lock was held and by which phase.
+pub struct SnapshotWriteLock {
+    pub guard: OwnedMutexGuard<()>,
+    pub acquired_at: Instant,
+    /// How long the caller waited to acquire the lock.
+    pub wait: Duration,
+    /// Time the caller spent checkpointing under the lock, if it did.
+    pub checkpoint: Duration,
+    /// Time the caller spent counting rows under the lock, if it did.
+    pub row_count: Duration,
+}
+
+impl SnapshotWriteLock {
+    /// A lock taken just now, with nothing yet run under it.
+    #[must_use]
+    pub fn new(guard: OwnedMutexGuard<()>) -> Self {
+        Self {
+            guard,
+            acquired_at: Instant::now(),
+            wait: Duration::ZERO,
+            checkpoint: Duration::ZERO,
+            row_count: Duration::ZERO,
+        }
+    }
+
+    /// Records the phases the caller ran under the lock before handing it over.
+    #[must_use]
+    pub fn with_phases(mut self, checkpoint: Duration, row_count: Duration) -> Self {
+        self.checkpoint = checkpoint;
+        self.row_count = row_count;
+        self
+    }
+}
+
+/// Where the time of one snapshot went. Logged at debug so the lock hold and
+/// its phases can be compared across configurations.
+#[derive(Debug, Default)]
+struct SnapshotPhases {
+    lock_wait: Duration,
+    checkpoint: Duration,
+    row_count: Duration,
+    /// Engine preparation under the lock (metastore slice export; for a
+    /// compacting engine, the live-table capture).
+    prepare: Duration,
+    /// Total time the accelerator write lock was held.
+    lock_held: Duration,
+    /// An engine's deferred build, run after the lock was released.
+    build: Duration,
+    archive: Duration,
+    upload: Duration,
+    archive_bytes: u64,
+    deferred: bool,
+}
+
 pub struct ForceCreate(pub bool);
 
 impl Not for ForceCreate {
@@ -1331,7 +1387,7 @@ impl SnapshotManager {
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
         self.create_snapshot_with_table(
             schema,
-            lock_guard,
+            SnapshotWriteLock::new(lock_guard),
             last_updated_at,
             row_count,
             force_create,
@@ -1353,7 +1409,7 @@ impl SnapshotManager {
     pub async fn create_snapshot_with_table(
         &self,
         schema: &SchemaRef,
-        lock_guard: OwnedMutexGuard<()>,
+        lock: SnapshotWriteLock,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         force_create: ForceCreate,
@@ -1412,6 +1468,12 @@ impl SnapshotManager {
             "Uploading snapshot"
         );
 
+        let mut phases = SnapshotPhases {
+            lock_wait: lock.wait,
+            checkpoint: lock.checkpoint,
+            row_count: lock.row_count,
+            ..SnapshotPhases::default()
+        };
         let (total_bytes, checksum) = match &self.layout {
             AccelerationLayout::None => {
                 return Err(SnapshotUploadError::AdapterDisabled {
@@ -1419,15 +1481,17 @@ impl SnapshotManager {
                 });
             }
             AccelerationLayout::File { path } => {
-                self.create_file_snapshot(path, &destination_location, lock_guard)
+                self.create_file_snapshot(path, &destination_location, lock.guard)
                     .await?
             }
             AccelerationLayout::Directories { dirs } => {
                 self.create_directory_snapshot(
                     dirs,
                     &destination_location,
-                    lock_guard,
+                    lock.guard,
+                    lock.acquired_at,
                     live_table.as_ref(),
+                    &mut phases,
                 )
                 .await?
             }
@@ -1461,6 +1525,23 @@ impl SnapshotManager {
             sha = %checksum,
             "Snapshot created"
         );
+        if matches!(self.layout, AccelerationLayout::Directories { .. }) {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            tracing::debug!(
+                dataset = %self.dataset_name,
+                deferred = phases.deferred,
+                lock_wait_ms = format_args!("{:.1}", ms(phases.lock_wait)),
+                checkpoint_ms = format_args!("{:.1}", ms(phases.checkpoint)),
+                row_count_ms = format_args!("{:.1}", ms(phases.row_count)),
+                prepare_ms = format_args!("{:.1}", ms(phases.prepare)),
+                lock_held_ms = format_args!("{:.1}", ms(phases.lock_held)),
+                build_ms = format_args!("{:.1}", ms(phases.build)),
+                archive_ms = format_args!("{:.1}", ms(phases.archive)),
+                upload_ms = format_args!("{:.1}", ms(phases.upload)),
+                archive_bytes = phases.archive_bytes,
+                "Snapshot phases"
+            );
+        }
 
         Ok(Some(destination_location))
     }
@@ -1548,16 +1629,20 @@ impl SnapshotManager {
         dirs: &[(PathBuf, String)],
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
+        lock_acquired_at: Instant,
         live_table: Option<&Arc<dyn TableProvider>>,
+        phases: &mut SnapshotPhases,
     ) -> Result<(u64, String), SnapshotUploadError> {
         use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         // Step 0: Ask the engine for any per-directory skip list / extras.
+        let prepare_started = Instant::now();
         let plan = self
             .snapshot_engine
             .prepare_directory_snapshot(dirs, &self.dataset_name, live_table)
             .await
             .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+        phases.prepare = prepare_started.elapsed();
 
         let temp_archive_path = std::env::temp_dir().join(format!(
             "snapshot_{}_{}_{}.tar",
@@ -1569,14 +1654,18 @@ impl SnapshotManager {
         let archive_result = if let Some(deferred) = plan.deferred {
             // Step 1a: Release the lock — the engine captured what it needs.
             drop(lock_guard);
+            phases.lock_held = lock_acquired_at.elapsed();
+            phases.deferred = true;
             tracing::debug!(
                 "Lock released before deferred snapshot build. dataset={}",
                 self.dataset_name
             );
 
+            let build_started = Instant::now();
             let materialized = deferred
                 .await
                 .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            phases.build = build_started.elapsed();
             let skip_paths: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
             let extras: Vec<(String, Vec<u8>)> = materialized
                 .extra_entries
@@ -1584,6 +1673,7 @@ impl SnapshotManager {
                 .map(|e| (e.archive_path, e.bytes))
                 .collect();
 
+            let archive_started = Instant::now();
             let result = archive_directories_to_file_with_plan(
                 &materialized.dirs,
                 &temp_archive_path,
@@ -1591,6 +1681,7 @@ impl SnapshotManager {
                 &extras,
             )
             .await;
+            phases.archive = archive_started.elapsed();
 
             for dir in &materialized.cleanup_dirs {
                 if let Err(err) = fs::remove_dir_all(dir).await
@@ -1614,6 +1705,7 @@ impl SnapshotManager {
                 .map(|e| (e.archive_path, e.bytes))
                 .collect();
 
+            let archive_started = Instant::now();
             let result = archive_directories_to_file_with_plan(
                 dirs,
                 &temp_archive_path,
@@ -1621,9 +1713,11 @@ impl SnapshotManager {
                 &extras,
             )
             .await;
+            phases.archive = archive_started.elapsed();
 
             // Step 2: Release the lock - queries can resume
             drop(lock_guard);
+            phases.lock_held = lock_acquired_at.elapsed();
             tracing::debug!(
                 "Lock released after archive creation. dataset={}",
                 self.dataset_name
@@ -1638,6 +1732,7 @@ impl SnapshotManager {
                 source: std::io::Error::other(source.to_string()),
             })?;
 
+        phases.archive_bytes = total_archived;
         tracing::debug!(
             "Created tar archive for snapshot. dataset={} archive_size={}",
             self.dataset_name,
@@ -1645,6 +1740,7 @@ impl SnapshotManager {
         );
 
         // Step 3: Upload the tar archive (with retry for transient network errors)
+        let upload_started = Instant::now();
         let upload_result = retry(self.network_retry_strategy.clone(), || async {
             self.upload_snapshot_file(&temp_archive_path, destination_location)
                 .await
@@ -1663,6 +1759,8 @@ impl SnapshotManager {
                 })
         })
         .await;
+
+        phases.upload = upload_started.elapsed();
 
         // Step 4: Cleanup temp archive
         let _ = fs::remove_file(&temp_archive_path).await;
