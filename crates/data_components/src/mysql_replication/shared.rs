@@ -595,8 +595,7 @@ fn snapshot_boundary_envelope(
 
 struct MemberHandle {
     dataset_name: String,
-    schema: SchemaRef,
-    /// `schema`'s derived change-batch schemas, shared by every
+    /// The dataset's schema and its derived change-batch schemas, shared by every
     /// [`MysqlChangeRows`] this member hands downstream.
     change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
@@ -894,7 +893,6 @@ async fn attach_member(
         member_key.clone(),
         Arc::new(MemberHandle {
             dataset_name: dataset_name.clone(),
-            schema: Arc::clone(&schema),
             change_schemas: Arc::new(ChangeBatchSchemas::new(&schema)),
             primary_keys: primary_keys.clone(),
             layout: Mutex::new(Arc::new(MemberLayout {
@@ -1717,7 +1715,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                             &params,
                             &mkey.0,
                             &mkey.1,
-                            &member.schema,
+                            member.change_schemas.dataset(),
                             &old_layout,
                             &member.primary_keys,
                             &member.dataset_name,
@@ -2078,7 +2076,7 @@ async fn handle_statement(
                 let batch = {
                     let g = lock(&member.layout);
                     build_change_batch(
-                        &member.schema,
+                        member.change_schemas.dataset(),
                         &member.primary_keys,
                         &g.column_map,
                         &[truncate_change()],
@@ -2140,7 +2138,7 @@ async fn handle_statement(
                     &source.params,
                     &mkey.0,
                     &mkey.1,
-                    &member.schema,
+                    member.change_schemas.dataset(),
                     &old_layout,
                     &member.primary_keys,
                     &member.dataset_name,
@@ -2376,7 +2374,7 @@ async fn rebootstrap_member(
     let signal = snapshot_boundary_envelope(
         source,
         key,
-        &member.schema,
+        member.change_schemas.dataset(),
         member.dataset_name.clone(),
         true,
     )?;
@@ -2475,7 +2473,7 @@ async fn poll_head_and_heartbeat(
             continue;
         }
         match readiness_heartbeat(
-            &member.schema,
+            member.change_schemas.dataset(),
             source_now_ms,
             member.ready_lag,
             &member.dataset_name,
@@ -2593,7 +2591,6 @@ mod tests {
         let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
         let member = Arc::new(MemberHandle {
             dataset_name: "orders".to_string(),
-            schema: test_schema(),
             change_schemas: Arc::new(ChangeBatchSchemas::new(&test_schema())),
             primary_keys: vec!["id".to_string()],
             layout: Mutex::new(Arc::new(MemberLayout {
@@ -2732,7 +2729,7 @@ mod tests {
             let envelope = snapshot_boundary_envelope(
                 &source,
                 &member_key,
-                &member.schema,
+                member.change_schemas.dataset(),
                 member.dataset_name.clone(),
                 history_unavailable,
             )

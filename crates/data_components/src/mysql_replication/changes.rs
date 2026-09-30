@@ -94,12 +94,7 @@ impl MysqlChangeRows {
         // Both metadata figures are computed WITHOUT decoding, from the buffered
         // wire size (`rows_data()` is a byte-slice accessor, no row parse).
         let wire_bytes: usize = events.iter().map(|e| e.rows_data().len()).sum();
-        let per_row_fixed: usize = change_schemas
-            .dataset()
-            .fields()
-            .iter()
-            .map(|f| arrow_fixed_width(f.data_type()))
-            .sum();
+        let per_row_fixed = change_schemas.per_row_fixed();
         // Row count can't be known without decoding a MySQL rows event, so this
         // is an estimate: wire bytes over a per-row floor, never below one row
         // per event. Over/under-estimating only affects builder pre-allocation;
@@ -226,7 +221,7 @@ fn warn_decoder_fallback_once(tme: &TableMapEvent<'_>, error: &super::Error) {
 /// types (whose bytes are already reflected in the buffered wire size). Used
 /// only to floor the coalescing byte estimate at the real Arrow footprint;
 /// mirrors `postgres_replication::changes::arrow_fixed_width`.
-fn arrow_fixed_width(data_type: &DataType) -> usize {
+pub(super) fn arrow_fixed_width(data_type: &DataType) -> usize {
     match data_type {
         DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
         DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,

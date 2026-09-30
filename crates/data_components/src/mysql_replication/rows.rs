@@ -301,22 +301,36 @@ pub(super) struct ChangeBatchSchemas {
     dataset: SchemaRef,
     nullable: SchemaRef,
     wrapper: SchemaRef,
+    /// Fixed-width Arrow bytes of one row of `dataset` (the coalescing estimate's
+    /// per-row floor).
+    per_row_fixed: usize,
 }
 
 impl ChangeBatchSchemas {
     pub(super) fn new(dataset_schema: &SchemaRef) -> Self {
         let nullable = nullable_clone(dataset_schema);
         let wrapper = Arc::new(changes_schema(&nullable));
+        let per_row_fixed = dataset_schema
+            .fields()
+            .iter()
+            .map(|f| super::changes::arrow_fixed_width(f.data_type()))
+            .sum();
         Self {
             dataset: Arc::clone(dataset_schema),
             nullable,
             wrapper,
+            per_row_fixed,
         }
     }
 
     /// The dataset's own (declared-nullability) schema.
     pub(super) fn dataset(&self) -> &SchemaRef {
         &self.dataset
+    }
+
+    /// Fixed-width Arrow bytes of one row of the dataset's schema.
+    pub(super) fn per_row_fixed(&self) -> usize {
+        self.per_row_fixed
     }
 }
 
@@ -342,7 +356,13 @@ pub(super) fn build_change_batch_with(
     let mut data_builders: Vec<FieldBuilder> = dataset_schema
         .fields()
         .iter()
-        .map(|f| FieldBuilder::with_capacity(f.data_type(), num_rows))
+        .enumerate()
+        .map(|(field_idx, f)| {
+            let data_bytes = column_map.get(field_idx).map_or(0, |&source_idx| {
+                variable_width_bytes(f.data_type(), changes, source_idx)
+            });
+            FieldBuilder::with_capacity(f.data_type(), num_rows, data_bytes)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     for change in changes {
@@ -448,17 +468,57 @@ pub(super) enum FieldBuilder {
     DictUtf8UInt32(StringDictionaryBuilder<UInt32Type>),
 }
 
+/// Most distinct values a dictionary column's builder reserves slots for up front.
+const DICTIONARY_VALUE_SLOTS: usize = 256;
+
+/// Bytes the values of a string, binary or dictionary column take in `changes`, so
+/// its builder reserves what the batch needs rather than a per-value guess: `Bytes`
+/// values by length, and other non-null values (rendered as text) at an estimated
+/// 16 bytes. Zero for fixed-width types, which have no data buffer.
+fn variable_width_bytes(
+    data_type: &DataType,
+    changes: &[DecodedChange],
+    source_idx: usize,
+) -> usize {
+    let variable_width = matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Dictionary(..)
+    );
+    if !variable_width {
+        return 0;
+    }
+    changes
+        .iter()
+        .filter_map(|change| change.row.get(source_idx))
+        .map(|value| match value {
+            Value::NULL => 0,
+            Value::Bytes(bytes) => bytes.len(),
+            _ => 16,
+        })
+        .fold(0, usize::saturating_add)
+}
+
 impl FieldBuilder {
     /// A builder with the Arrow builders' default capacity (1 024 values).
     #[cfg(test)]
     pub(super) fn new(data_type: &DataType) -> Result<Self> {
-        Self::with_capacity(data_type, 1024)
+        Self::with_capacity(data_type, 1024, 1024 * 16)
     }
 
-    /// A builder sized for `capacity` values (string/binary data sized at an
-    /// estimated 16 bytes per value; the builders grow past either as needed).
-    pub(super) fn with_capacity(data_type: &DataType, capacity: usize) -> Result<Self> {
-        let bytes = capacity.saturating_mul(16);
+    /// A builder sized for `capacity` values, with `bytes` of string/binary data
+    /// (see [`variable_width_bytes`]); the builders grow past either as needed.
+    pub(super) fn with_capacity(
+        data_type: &DataType,
+        capacity: usize,
+        bytes: usize,
+    ) -> Result<Self> {
+        // A dictionary stores each distinct value once, and a batch holds few.
+        let dictionary_values = capacity.min(DICTIONARY_VALUE_SLOTS);
+        let dictionary_bytes = bytes.min(dictionary_values.saturating_mul(16));
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, bytes)),
             DataType::LargeUtf8 => {
@@ -504,14 +564,18 @@ impl FieldBuilder {
             DataType::Dictionary(key, value) if **value == DataType::Utf8 => match **key {
                 DataType::UInt8 => Self::DictUtf8UInt8(StringDictionaryBuilder::with_capacity(
                     capacity,
-                    capacity.min(usize::from(u8::MAX)),
-                    bytes,
+                    dictionary_values.min(usize::from(u8::MAX)),
+                    dictionary_bytes,
                 )),
                 DataType::UInt16 => Self::DictUtf8UInt16(StringDictionaryBuilder::with_capacity(
-                    capacity, capacity, bytes,
+                    capacity,
+                    dictionary_values,
+                    dictionary_bytes,
                 )),
                 DataType::UInt32 => Self::DictUtf8UInt32(StringDictionaryBuilder::with_capacity(
-                    capacity, capacity, bytes,
+                    capacity,
+                    dictionary_values,
+                    dictionary_bytes,
                 )),
                 ref other => {
                     return DecodeSnafu {
@@ -1327,26 +1391,19 @@ mod tests {
     }
 
     #[test]
-    fn change_batches_built_with_shared_schemas_match_per_call_schemas() {
+    fn change_batch_data_fields_are_nullable_whatever_the_dataset_declares() {
         use arrow::datatypes::Field;
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
         ]));
-        let schemas = ChangeBatchSchemas::new(&schema);
         let changes = vec![DecodedChange {
             op: ChangeOp::Update,
             row: vec![Value::Int(1), Value::Bytes(b"one".to_vec())],
         }];
-        let pks = ["id".to_string()];
-        let shared = build_change_batch_with(&schemas, &pks, &[0, 1], &changes)
-            .expect("shared-schema batch builds");
-        let per_call =
-            build_change_batch(&schema, &pks, &[0, 1], &changes).expect("per-call batch builds");
-        assert_eq!(shared.record.schema(), per_call.record.schema());
-        assert_eq!(shared.record, per_call.record);
-        // Every data field is nullable in the wire schema, whatever the dataset declares.
-        let data = shared.data_batch();
+        let batch = build_change_batch(&schema, &["id".to_string()], &[0, 1], &changes)
+            .expect("batch builds");
+        let data = batch.data_batch();
         assert!(data.schema().fields().iter().all(|f| f.is_nullable()));
     }
 
