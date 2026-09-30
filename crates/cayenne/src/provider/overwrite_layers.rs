@@ -59,11 +59,14 @@ use super::key_conflicts::KeyResolver;
 /// a layered overwrite holds for the layer it is writing.
 pub(crate) const MAX_LAYER_ROWS: usize = 8 * 1024 * 1024;
 
-/// Capacity of the first filter of a [`ChainedBloom`]; each next filter doubles it.
-const FIRST_FILTER_KEYS: usize = 64 * 1024;
+/// Capacity of the first filter of a [`ChainedBloom`], small so a write of a few
+/// rows allocates a few kilobytes; each next filter is [`FILTER_GROWTH`] times
+/// larger, so a full layer of [`MAX_LAYER_ROWS`] keys is probed through eight.
+const FIRST_FILTER_KEYS: usize = 1024;
+const FILTER_GROWTH: usize = 4;
 
 /// A bloom filter that grows: when its newest split-block filter reaches the key
-/// count it was sized for, it adds one twice as large. A probe checks them all.
+/// count it was sized for, it adds a larger one. A probe checks them all.
 struct ChainedBloom {
     filters: Vec<SplitBlockBloomFilter>,
     /// Keys in the newest filter.
@@ -89,7 +92,7 @@ impl ChainedBloom {
 
     fn insert(&mut self, hash: u64) {
         if self.newest_keys >= self.newest_capacity {
-            self.newest_capacity = (self.newest_capacity * 2).max(FIRST_FILTER_KEYS);
+            self.newest_capacity = (self.newest_capacity * FILTER_GROWTH).max(FIRST_FILTER_KEYS);
             self.filters
                 .push(SplitBlockBloomFilter::new(self.newest_capacity * self.density));
             self.newest_keys = 0;

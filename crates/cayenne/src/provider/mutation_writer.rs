@@ -1160,7 +1160,7 @@ impl<'a> AppendMutationWriter<'a> {
         if streaming && let Some(resolver) = self.table.key_resolver()? {
             let reservation =
                 MemoryConsumer::new(format!("CayenneAppendKeys[{}]", self.table.table_name()))
-                    .register(&self.table.runtime_env().memory_pool);
+                    .register(&self.task_context.memory_pool());
             if resolver.policy() == ConflictPolicy::KeepFirst {
                 let data = Box::pin(FirstCopyFilter::new(data, resolver, reservation));
                 let prepared = self.table.prepare_stream_for_insert(data).await?;
