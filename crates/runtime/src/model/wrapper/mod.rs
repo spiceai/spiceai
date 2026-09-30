@@ -629,7 +629,7 @@ mod call_dependent_defaults {
     }
 
     /// A `stream` default would turn a non-streaming call into one `chat_request`
-    /// refuses ("When stream is true, use Chat::create_stream"); the call decides.
+    /// refuses (`When stream is true, use Chat::create_stream`); the call decides.
     #[test]
     fn a_stream_default_is_never_applied() {
         let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
