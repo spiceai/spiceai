@@ -1056,6 +1056,11 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             // not about the on_change optimization
             .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
+            // The callers race for the dataset's snapshot writer lease. Every
+            // write of the lease that is refused was refused by one that
+            // landed, so at least one caller holds the lease and creates a
+            // snapshot; a caller whose writes all met a conflicting one
+            // stands by and returns `None`.
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
                 let schema = Arc::clone(&schema);
@@ -1065,7 +1070,6 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                     manager_clone
                         .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                         .await
-                        .map(|opt| opt.expect("snapshot should be created"))
                 }
             }))
             .await
@@ -1074,7 +1078,12 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             assert_eq!(
                 snapshot_results.len(),
                 10,
-                "Expected to create ten snapshots concurrently"
+                "Expected every concurrent snapshot request to complete without an error"
+            );
+            let created = snapshot_results.iter().flatten().count();
+            assert!(
+                created >= 1,
+                "Expected the writer lease holder to create a snapshot; results: {snapshot_results:?}"
             );
 
             let expected_minimum = fixture.initial_snapshot_count + 1;

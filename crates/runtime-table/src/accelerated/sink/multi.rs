@@ -28,7 +28,6 @@ use datafusion::{
     execution::{RecordBatchStream, SessionState},
     logical_expr::dml::InsertOp,
     physical_plan::collect,
-    prelude::SessionContext,
 };
 use futures::{Stream, StreamExt};
 use tokio::sync::{Barrier, BarrierWaitResult, broadcast, watch};
@@ -146,7 +145,7 @@ impl MultiSink {
         let (tx, _) = broadcast::channel::<RecordBatch>(32);
         let mut join_set = JoinSet::new();
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
 
         let (parent_complete_tx, parent_complete_rx) = watch::channel(false);
         let child_barrier = Arc::new(Barrier::new(self.synchronized_tables.len()));
