@@ -1076,7 +1076,7 @@ impl Runtime {
                         status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    if !err.is_retriable() {
+                    if connector_error_is_permanent(&err) {
                         error_spaced!(spaced_tracer, "{}{err}", "");
                         return PermanentDatasetFailureSnafu {
                             dataset: ds.name.clone(),
@@ -2367,6 +2367,22 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
     }
 }
 
+/// Whether a connector error is a configuration problem that no retry can clear.
+///
+/// A source that could not be reached is not, even though
+/// [`DataConnectorError::is_retriable`](dataconnector::DataConnectorError::is_retriable)
+/// reports `UnableToConnectInvalidHostOrPort` as unretriable: connectors report a
+/// database that is down or still starting (connection refused, timed out) that way,
+/// and it must recover the dataset on its own once it is reachable. Rejected
+/// credentials and TLS failures stay permanent — they are configuration errors.
+fn connector_error_is_permanent(err: &dataconnector::DataConnectorError) -> bool {
+    !err.is_retriable()
+        && !matches!(
+            err,
+            dataconnector::DataConnectorError::UnableToConnectInvalidHostOrPort { .. }
+        )
+}
+
 /// Returns `true` when a boxed connector-construction error is a configuration
 /// error that no retry can clear.
 ///
@@ -2383,7 +2399,7 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
 /// inherit "permanent" from this arm.
 fn is_permanent_dataset_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     if let Some(err) = source.downcast_ref::<dataconnector::DataConnectorError>() {
-        return !err.is_retriable();
+        return connector_error_is_permanent(err);
     }
     matches!(
         source.downcast_ref::<runtime_parameters::Error>(),
@@ -4122,6 +4138,55 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             is_permanent_dataset_failure(&err),
             "an out-of-vocabulary parameter value is a pure function of the Spicepod"
         );
+    }
+
+    /// Regression test for #14609: a source that is down when the dataset loads
+    /// reports `UnableToConnectInvalidHostOrPort`, which
+    /// `DataConnectorError::is_retriable` lists as unretriable. The dataset must keep
+    /// retrying so it recovers once the source is reachable. Rejected credentials and
+    /// TLS failures are configuration errors and stay permanent.
+    #[test]
+    fn an_unreachable_source_stays_retriable_but_rejected_credentials_do_not() {
+        let component = crate::dataconnector::ConnectorComponent::Dataset(Arc::new(
+            crate::component::dataset::DatasetSpec::new(
+                "postgres:public.orders",
+                TableReference::bare("orders"),
+            ),
+        ));
+        let boxed =
+            |source: dataconnector::DataConnectorError| Error::UnableToInitializeDataConnector {
+                source: Box::new(source),
+            };
+
+        let unreachable = boxed(
+            dataconnector::DataConnectorError::UnableToConnectInvalidHostOrPort {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+                host: "db".to_string(),
+                port: "5432".to_string(),
+            },
+        );
+        assert!(
+            !is_permanent_dataset_failure(&unreachable),
+            "a source that cannot be reached right now must be retried: {unreachable}"
+        );
+
+        for configuration_error in [
+            dataconnector::DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                dataconnector: "postgres".to_string(),
+                connector_component: component.clone(),
+            },
+            dataconnector::DataConnectorError::UnableToConnectTlsError {
+                dataconnector: "postgres".to_string(),
+                connector_component: component,
+            },
+        ] {
+            let err = boxed(configuration_error);
+            assert!(
+                is_permanent_dataset_failure(&err),
+                "a credential or TLS misconfiguration must not be retried: {err}"
+            );
+        }
     }
 
     /// An error type neither downcast recognises must not be assumed permanent —
