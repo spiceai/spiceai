@@ -1847,6 +1847,9 @@ pub struct CayenneTableProvider {
     /// How a scan reuses a cached [`ScanView`]. Set from `refresh_mode` at
     /// construction; see [`ScanViewReuse`] and [`Self::scan_view_at_current_input`].
     scan_view_reuse: ScanViewReuse,
+    /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
+    /// write resolves a key it repeats; see [`super::key_conflicts`].
+    upsert_dedup: super::key_conflicts::UpsertDedup,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -2711,6 +2714,7 @@ pub struct CayenneTableProviderBuilder {
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
+    upsert_dedup: super::key_conflicts::UpsertDedup,
     secondary_indexes: Vec<Vec<String>>,
 }
 
@@ -2832,6 +2836,7 @@ struct CayenneTableProviderOpenOptions {
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
+    upsert_dedup: super::key_conflicts::UpsertDedup,
     secondary_indexes: Vec<Vec<String>>,
 }
 
@@ -2850,6 +2855,7 @@ impl CayenneTableProviderBuilder {
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
+            upsert_dedup: super::key_conflicts::UpsertDedup::None,
             secondary_indexes: Vec::new(),
         }
     }
@@ -2932,6 +2938,15 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Set the `upsert` refinement of the dataset's `on_conflict` (`upsert_dedup` or
+    /// `upsert_dedup_by_row_id`). Not persisted: it comes from the acceleration's
+    /// settings on every load, as `on_conflict` does.
+    #[must_use]
+    pub fn with_upsert_dedup(mut self, dedup: super::key_conflicts::UpsertDedup) -> Self {
+        self.upsert_dedup = dedup;
+        self
+    }
+
     /// Maintain a secondary index on each column set, one per `indexes` entry of
     /// the acceleration. A query whose filters pin every column of one of them
     /// to an equality literal reads only the rows holding that key.
@@ -2961,6 +2976,7 @@ impl CayenneTableProviderBuilder {
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
+            upsert_dedup: self.upsert_dedup,
             secondary_indexes: self.secondary_indexes,
         };
 
@@ -2988,6 +3004,7 @@ impl CayenneTableProviderBuilder {
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
+            upsert_dedup: self.upsert_dedup,
             secondary_indexes: self.secondary_indexes,
         };
 
@@ -8765,6 +8782,7 @@ impl CayenneTableProvider {
             maintained_aggregate_specs,
             durable_write_back,
             scan_view_reuse,
+            upsert_dedup,
             secondary_indexes,
         } = options;
 
@@ -9045,6 +9063,7 @@ impl CayenneTableProvider {
             pk_column_indices,
             durable_write_back,
             scan_view_reuse,
+            upsert_dedup,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -11079,6 +11098,7 @@ impl CayenneTableProvider {
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
+            upsert_dedup: self.upsert_dedup,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -12745,33 +12765,6 @@ impl CayenneTableProvider {
         }
 
         Ok(RowConverter::new(sort_fields)?)
-    }
-
-    /// Check every replacement row against the other rows in the same overwrite.
-    pub(crate) fn validate_overwrite_primary_keys(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> Result<SendableRecordBatchStream> {
-        let Some(pk_indices) = self.primary_key_indices()? else {
-            return Ok(stream);
-        };
-        let converter = self.build_pk_converter(&pk_indices)?;
-        Ok(Box::pin(
-            super::pk_validation::OverwritePrimaryKeyValidationStream::new(
-                stream,
-                pk_indices,
-                converter,
-                self.table_metadata.table_name.clone(),
-                if matches!(
-                    self.table_metadata.on_conflict.as_ref(),
-                    Some(OnConflict::Upsert(_))
-                ) {
-                    super::pk_validation::OverwriteConflictAction::Reject
-                } else {
-                    super::pk_validation::OverwriteConflictAction::Drop
-                },
-            ),
-        ))
     }
 
     /// Partition `batch` into `n` sub-batches by `hash(pk) % n`, where the PK is
@@ -68929,4 +68922,5 @@ mod tests {
              discard its keyset, which rebuilds the whole keyset on every write"
         );
     }
+
 }

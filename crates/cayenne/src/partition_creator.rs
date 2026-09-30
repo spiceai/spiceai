@@ -80,6 +80,7 @@ pub struct CayennePartitionCreator {
     /// Scan-view reuse inherited from the parent dataset (read-only `changes` =
     /// timed lag, otherwise invalidate on write).
     scan_view_reuse: ScanViewReuse,
+    upsert_dedup: crate::provider::UpsertDedup,
     secondary_indexes: Vec<Vec<String>>,
 }
 
@@ -155,6 +156,7 @@ impl CayennePartitionCreator {
             compaction_semaphore: None,
             accepts_direct_partition_writes: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
+            upsert_dedup: crate::provider::UpsertDedup::None,
             secondary_indexes: Vec::new(),
         }
     }
@@ -183,6 +185,14 @@ impl CayennePartitionCreator {
         self
     }
 
+    /// Set the `upsert` refinement of the dataset's `on_conflict`, forwarded to
+    /// every partition table.
+    #[must_use]
+    pub fn with_upsert_dedup(mut self, dedup: crate::provider::UpsertDedup) -> Self {
+        self.upsert_dedup = dedup;
+        self
+    }
+
     /// Maintain the parent dataset's secondary indexes in every partition. See
     /// [`crate::CayenneTableProviderBuilder::with_secondary_indexes`].
     #[must_use]
@@ -201,6 +211,7 @@ impl CayennePartitionCreator {
         .with_context(Arc::clone(&self.context))
         .with_retention_filters(self.retention_filters.clone())
         .with_scan_view_reuse(self.scan_view_reuse)
+        .with_upsert_dedup(self.upsert_dedup)
         .with_secondary_indexes(self.secondary_indexes.clone());
         if let Some(ref rb) = self.time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(rb.clone());

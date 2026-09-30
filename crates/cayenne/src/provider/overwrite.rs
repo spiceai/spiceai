@@ -587,7 +587,6 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<PreparedOverwrite> {
-        let data = self.validate_overwrite_primary_keys(data)?;
         // Read the split points off the table being replaced before taking the
         // write lock, so the sampling scan never holds it. A replace that lands
         // in the inline tier below ignores the plan.

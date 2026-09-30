@@ -33,12 +33,11 @@ use datafusion::{
     logical_expr::{Expr, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-        coalesce_partitions::CoalescePartitionsExec, execution_plan::EmissionType,
-        metrics::MetricsSet, stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, metrics::MetricsSet,
+        stream::RecordBatchStreamAdapter,
     },
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 
 use datafusion_table_providers::util::constraints::UpsertOptions;
 
@@ -55,7 +54,6 @@ pub struct UpsertDedupTableProvider {
     /// Constraints for deduplication (e.g., primary key)
     /// Stored explicitly because the inner provider may not expose constraints
     constraints: Constraints,
-    whole_stream_on_overwrite: bool,
 }
 
 impl UpsertDedupTableProvider {
@@ -75,16 +73,7 @@ impl UpsertDedupTableProvider {
             inner,
             upsert_options,
             constraints,
-            whole_stream_on_overwrite: false,
         }
-    }
-
-    /// Resolve duplicates across all batches of an overwrite, as required by
-    /// accelerators that publish the replacement without per-batch upserts.
-    #[must_use]
-    pub fn with_whole_stream_on_overwrite(mut self) -> Self {
-        self.whole_stream_on_overwrite = true;
-        self
     }
 
     /// Returns true if deduplication is needed based on the upsert options.
@@ -167,16 +156,11 @@ impl TableProvider for UpsertDedupTableProvider {
         }
 
         // Wrap the input with a deduplication execution plan
-        let whole_stream = self.whole_stream_on_overwrite && op == InsertOp::Overwrite;
-        let input = if whole_stream && input.output_partitioning().partition_count() > 1 {
-            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
-        let dedup_exec = Arc::new(
-            UpsertDedupExec::new(input, constraints, self.upsert_options.clone())
-                .with_whole_stream(whole_stream),
-        );
+        let dedup_exec = Arc::new(UpsertDedupExec::new(
+            input,
+            constraints,
+            self.upsert_options.clone(),
+        ));
 
         self.inner.insert_into(state, dedup_exec, op).await
     }
@@ -242,7 +226,6 @@ struct UpsertDedupExec {
     input: Arc<dyn ExecutionPlan>,
     constraints: Constraints,
     upsert_options: UpsertOptions,
-    whole_stream: bool,
     properties: Arc<PlanProperties>,
 }
 
@@ -257,7 +240,8 @@ impl UpsertDedupExec {
         // guaranteed no longer holds on the output. Carrying the input's
         // equivalence properties across would let an optimizer treat this node
         // as still sorted and drop a sort the plan actually needs. Partitioning,
-        // boundedness are unchanged, so only the ordering is dropped.
+        // emission and boundedness are unchanged, so only the ordering is
+        // dropped.
         let input_properties = input.properties();
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(input.schema()),
@@ -269,22 +253,8 @@ impl UpsertDedupExec {
             input,
             constraints,
             upsert_options,
-            whole_stream: false,
             properties,
         }
-    }
-
-    fn with_whole_stream(mut self, whole_stream: bool) -> Self {
-        self.whole_stream = whole_stream;
-        if whole_stream {
-            self.properties = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(self.input.schema()),
-                self.input.properties().partitioning.clone(),
-                EmissionType::Final,
-                self.input.properties().boundedness,
-            ));
-        }
-        self
     }
 }
 
@@ -330,14 +300,11 @@ impl ExecutionPlan for UpsertDedupExec {
                 "UpsertDedupExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(
-            Self::new(
-                Arc::clone(&children[0]),
-                self.constraints.clone(),
-                self.upsert_options.clone(),
-            )
-            .with_whole_stream(self.whole_stream),
-        ))
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.constraints.clone(),
+            self.upsert_options.clone(),
+        )))
     }
 
     fn execute(
@@ -349,27 +316,6 @@ impl ExecutionPlan for UpsertDedupExec {
         let schema = self.schema();
         let constraints = self.constraints.clone();
         let upsert_options = self.upsert_options.clone();
-
-        if self.whole_stream {
-            let validated = futures::stream::once(async move {
-                let batches: Vec<_> = input_stream.try_collect().await?;
-                let options =
-                    datafusion_table_providers::util::constraints::UpsertOptions::default()
-                        .with_remove_duplicates(upsert_options.remove_duplicates)
-                        .with_last_write_wins(upsert_options.last_write_wins);
-                let batches =
-                    datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        batches,
-                        &constraints,
-                        &options,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                Ok::<_, DataFusionError>(futures::stream::iter(batches.into_iter().map(Ok)))
-            })
-            .try_flatten();
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)));
-        }
 
         // Create a stream that validates constraints and applies deduplication to each batch.
         let stream_schema = Arc::clone(&schema);
@@ -449,29 +395,6 @@ pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash
             upsert_options,
             constraints,
         ))
-    } else {
-        provider
-    }
-}
-
-/// Wraps a provider whose overwrite path must resolve duplicates across batches.
-///
-/// This buffers an entire overwrite when deduplication is enabled.
-#[must_use]
-pub fn wrap_with_upsert_dedup_for_overwrite<
-    T: TableProvider + 'static,
-    S: std::hash::BuildHasher,
->(
-    provider: Arc<T>,
-    options: &std::collections::HashMap<String, String, S>,
-    constraints: Constraints,
-) -> Arc<dyn TableProvider> {
-    let upsert_options = extract_upsert_options(options);
-    if upsert_options.remove_duplicates || upsert_options.last_write_wins {
-        Arc::new(
-            UpsertDedupTableProvider::new(provider, upsert_options, constraints)
-                .with_whole_stream_on_overwrite(),
-        )
     } else {
         provider
     }
@@ -794,53 +717,6 @@ mod tests {
             vec![(1, "second".to_string()), (1, "third".to_string())],
             "each batch deduplicates independently"
         );
-    }
-
-    #[tokio::test]
-    async fn overwrite_last_write_wins_across_batches() {
-        let input = source(&[vec![
-            batch(&[(1, "first"), (2, "other")]),
-            batch(&[(1, "last")]),
-        ]]);
-        let dedup = Arc::new(
-            UpsertDedupExec::new(input, pk_constraints(), last_write_wins())
-                .with_whole_stream(true),
-        );
-
-        assert_eq!(
-            rows_of(dedup).await,
-            vec![(1, "last".to_string()), (2, "other".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn overwrite_remove_duplicates_across_batches() {
-        let input = source(&[vec![
-            batch(&[(1, "same"), (2, "other")]),
-            batch(&[(1, "same")]),
-        ]]);
-        let dedup = Arc::new(
-            UpsertDedupExec::new(input, pk_constraints(), remove_duplicates())
-                .with_whole_stream(true),
-        );
-
-        assert_eq!(
-            rows_of(dedup).await,
-            vec![(1, "same".to_string()), (2, "other".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn overwrite_remove_duplicates_rejects_conflicting_values() {
-        let input = source(&[vec![batch(&[(1, "first")]), batch(&[(1, "second")])]]);
-        let dedup = Arc::new(
-            UpsertDedupExec::new(input, pk_constraints(), remove_duplicates())
-                .with_whole_stream(true),
-        );
-
-        collect(dedup, Arc::new(TaskContext::default()))
-            .await
-            .expect_err("different rows with the same key must fail");
     }
 
     /// The dedup node must sit between the input and the accelerator's sink, or

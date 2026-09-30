@@ -87,6 +87,7 @@ pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
+pub(crate) mod key_conflicts;
 pub(crate) mod lookup_index;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_metrics;
@@ -137,6 +138,7 @@ pub use mem_tier_budget::{
     try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use on_conflict::PreparedOnConflictDeletionPublish;
+pub use key_conflicts::UpsertDedup;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use pk_keyset_budget::{
