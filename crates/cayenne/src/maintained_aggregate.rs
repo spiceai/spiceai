@@ -516,6 +516,17 @@ impl ExecutionPlan for MaintainedAggregateExec {
         self.inner.properties()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
     }
@@ -2451,6 +2462,7 @@ mod tests {
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::{cast, col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion_common::cast::{
         as_float64_array, as_int64_array, as_string_array, as_uint64_array,
     };
@@ -2759,7 +2771,7 @@ mod tests {
         let exec = Arc::new(MaintainedAggregateExec::try_new(batch())?);
 
         assert_eq!(exec.children().len(), 1);
-        let required_distribution = exec.required_input_distribution();
+        let required_distribution = exec.input_distribution_requirements().into_per_child();
         assert_eq!(required_distribution.len(), 1);
         assert!(matches!(
             required_distribution.as_slice(),
@@ -2770,12 +2782,14 @@ mod tests {
         assert!(required_ordering[0].is_none());
         assert_eq!(exec.maintains_input_order(), vec![true]);
         assert_eq!(exec.benefits_from_input_partitioning(), vec![false]);
+        let recompute = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
         Arc::clone(&exec)
-            .with_new_children(Vec::new())
+            .replace_children(Vec::new(), recompute)
             .expect_err("missing maintained aggregate child should be rejected");
 
         let replacement = MemorySourceConfig::try_new_exec(&[vec![batch()]], schema(), None)?;
-        let rewritten = exec.with_new_children(vec![replacement])?;
+        let rewritten = exec.replace_children(vec![replacement], recompute)?;
+
         assert_eq!(rewritten.children().len(), 1);
 
         Ok(())

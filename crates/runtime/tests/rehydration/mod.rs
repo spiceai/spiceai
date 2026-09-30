@@ -33,7 +33,7 @@ use crate::init_tracing;
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };

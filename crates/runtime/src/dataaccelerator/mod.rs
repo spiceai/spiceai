@@ -859,7 +859,7 @@ mod accelerator_compat_tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
-                location: location.clone(),
+                locations: vec![location.clone()],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -2126,7 +2126,7 @@ mod accelerator_compat_tests {
                 let external_table = CreateExternalTable {
                     schema: df_schema,
                     name: TableReference::bare(format!("test_bool_{:?}", engine)),
-                    location: location.clone(),
+                    locations: vec![location.clone()],
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,

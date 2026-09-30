@@ -18,7 +18,7 @@ use arrow_flight::{
     FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult, flight_descriptor::DescriptorType,
 };
 use arrow_ipc::writer::IpcWriteOptions;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use tonic::{Request, Response, Status};
 
 use crate::{datafusion::request_context_extension::get_current_datafusion, flight::metrics};

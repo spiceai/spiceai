@@ -44,6 +44,7 @@ use arrow_tools::schema::verify_schema;
 use cache::{CacheProbe, PlanOrCached};
 use datafusion::{
     common::ParamValues,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
     logical_expr::LogicalPlan,
@@ -52,7 +53,6 @@ use datafusion::{
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
-    sql::TableReference,
 };
 use datafusion_functions_json::{JsonUnionEncoder, JsonUnionValue};
 use error_code::ErrorCode;
@@ -583,7 +583,10 @@ impl Query {
             return None;
         }
 
-        let statistics = match physical_plan.partition_statistics(None) {
+        let statistics = match datafusion::physical_plan::StatisticsContext::new().compute(
+            physical_plan.as_ref(),
+            &datafusion::physical_plan::StatisticsArgs::new(),
+        ) {
             Ok(statistics) => statistics,
             Err(error) => {
                 tracing::debug!(%error, "Unable to estimate Flight result size for adaptive batch size");
@@ -1119,6 +1122,7 @@ impl Query {
                 .map_err(|e| Error::JobSubmissionFailed {
                     message: e.to_string(),
                 })?
+                .to_string()
         };
 
         tracing::debug!(
@@ -2778,7 +2782,12 @@ fn strip_root_order_preserving_repartition(
     let plan = if Arc::ptr_eq(children[0], &rewritten_child) {
         plan
     } else {
-        plan.with_new_children(vec![rewritten_child])?
+        plan.replace_children(
+            vec![rewritten_child],
+            datafusion::physical_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )?
     };
 
     if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
@@ -4803,6 +4812,17 @@ mod tests {
 
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         }
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -1316,7 +1316,7 @@ impl CayenneDeletionSink {
 
         let physical_filters = filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props))
+            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<datafusion_common::Result<Vec<_>>>()?;
 
         Ok(physical_filters)

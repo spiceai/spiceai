@@ -37,7 +37,7 @@ use arrow::datatypes::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
-use vortex::arrow::FromArrowType;
+use vortex::error::VortexResult;
 
 /// Joint accumulator state held under a single mutex so `update()` and
 /// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`
@@ -110,7 +110,11 @@ impl ColumnStatsAccumulator {
     /// for every NDV-tracked column. Used by every write that produces a
     /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,
     /// compaction, overwrite), where NDV is computed once at file birth.
-    pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new(schema: &arrow_schema::Schema) -> VortexResult<Self> {
         Self::new_with_ndv(schema, true)
     }
 
@@ -124,22 +128,22 @@ impl ColumnStatsAccumulator {
     /// synchronous CDC hot loop — whose rows are re-sketched for free when they
     /// later spill to a Vortex file at checkpoint. Min/max/null-count stats are
     /// maintained regardless of this flag.
-    pub(crate) fn new_with_ndv(schema: &arrow_schema::Schema, compute_ndv: bool) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new_with_ndv(
+        schema: &arrow_schema::Schema,
+        compute_ndv: bool,
+    ) -> VortexResult<Self> {
         let num_cols = schema.fields().len();
-        let dtypes: Vec<vortex::dtype::DType> = schema
+        // Converted the way the Vortex writer converts the table schema, so each
+        // column's statistics are typed like the column in the file.
+        let dtypes = schema
             .fields()
             .iter()
-            .map(|f| {
-                vortex::dtype::DType::from_arrow((
-                    f.data_type(),
-                    if f.is_nullable() {
-                        vortex::dtype::Nullability::Nullable
-                    } else {
-                        vortex::dtype::Nullability::NonNullable
-                    },
-                ))
-            })
-            .collect();
+            .map(|f| crate::stats::ARROW_SESSION.from_arrow_field(f))
+            .collect::<VortexResult<Vec<vortex::dtype::DType>>>()?;
         // NDV sketches only for NDV-tracked columns (integers, strings, temporal);
         // other columns get `None` so the write path skips them. When
         // `compute_ndv` is false every slot is `None`, so `update` folds nothing
@@ -152,7 +156,7 @@ impl ColumnStatsAccumulator {
                     .then(crate::hll::HyperLogLog::new)
             })
             .collect();
-        Self {
+        Ok(Self {
             state: std::sync::Mutex::new(ColumnStatsState {
                 columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
                 seeded: vec![false; num_cols],
@@ -161,7 +165,7 @@ impl ColumnStatsAccumulator {
             dtypes,
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
-        }
+        })
     }
 
     /// Whether to maintain an NDV sketch for `dt`. Covers the types whose
@@ -698,8 +702,9 @@ impl ColumnStatsAccumulator {
             return None;
         };
 
-        let file_stats = crate::stats::build_file_statistics(state.columns.clone(), &self.schema);
-        match crate::stats::serialize_file_statistics(&file_stats) {
+        match crate::stats::build_file_statistics(state.columns.clone(), &self.schema)
+            .and_then(|file_stats| crate::stats::serialize_file_statistics(&file_stats))
+        {
             Ok(bytes) => Some((bytes, row_count)),
             Err(e) => {
                 tracing::warn!("Failed to serialize file statistics: {e}");
@@ -749,7 +754,7 @@ mod tests {
             Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("amount", DataType::Float64, true),
         ]);
-        let acc = ColumnStatsAccumulator::new(&schema);
+        let acc = ColumnStatsAccumulator::new(&schema).expect("supported schema");
 
         // 100 distinct ids, 4 distinct names (each repeated 25x), 10 distinct
         // dates, 7 distinct timestamps, and floats (which must not get a sketch).
@@ -895,7 +900,7 @@ mod tests {
         assert_null_count_only(&stats.column_statistics[1], 1);
 
         // The persisted path still produces a blob for the table.
-        let acc = ColumnStatsAccumulator::new(&schema);
+        let acc = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         acc.update(&batch);
         let (_, rows) = acc
             .to_file_statistics_blob_with_row_count()

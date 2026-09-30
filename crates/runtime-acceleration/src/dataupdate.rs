@@ -29,7 +29,7 @@ use futures::TryStreamExt;
 pub use runtime_query_engine::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 const DATA_UPDATE_BROADCAST_CAPACITY: usize = 100;
 
@@ -335,6 +335,17 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -371,9 +382,9 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::common::TableReference;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::sql::TableReference;
 
     fn one_column_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int32Array::from(values))])

@@ -27,9 +27,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::Result as DataFusionResult,
     physical_plan::{PhysicalExpr, SendableRecordBatchStream},
-    sql::{TableReference, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
@@ -143,6 +144,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
     use datafusion::catalog::Session;
     use datafusion::common::Column;
+    use datafusion::common::TableReference;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::DefaultTableSource;
@@ -164,7 +166,6 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,

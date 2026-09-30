@@ -107,9 +107,8 @@ use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::{
-    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, include_by_index,
 };
-use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
 /// Bits reserved for the file-local row position inside a packed posting.
@@ -910,7 +909,7 @@ impl RuntimeLookupSelection {
             .into_iter()
             .map(|(path, positions)| {
                 let plan = VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::from(positions)));
+                    .with_selection(include_by_index(&Buffer::from(positions)));
                 (path, Arc::new(plan))
             })
             .collect();
@@ -918,8 +917,7 @@ impl RuntimeLookupSelection {
             index,
             plans,
             empty: Arc::new(
-                VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+                VortexAccessPlan::default().with_selection(include_by_index(&Buffer::empty())),
             ),
         }
     }
@@ -1213,9 +1211,8 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
             // would read it.
             return table_plan;
         };
-        let selected = VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
-            Buffer::copy_from(candidates.as_slice()),
-        ));
+        let selected = VortexAccessPlan::default()
+            .with_selection(include_by_index(&Buffer::copy_from(candidates.as_slice())));
         self.state
             .counters
             .access_plans_attached
@@ -2891,14 +2888,17 @@ async fn read_back(
 
         let vxf = session
             .open_options()
-            .open_object_store(store, &file.path)
+            .open_object_store(store, object_store::path::Path::from(file.path.as_str()))
             .await
             .map_err(|e| format!("open {}: {e}", file.path))?;
+        let file_projection = projection
+            .bind(vxf.dtype())
+            .map_err(|e| format!("bind projection {}: {e}", file.path))?;
 
         let mut stream = vxf
             .scan()
             .map_err(|e| format!("scan {}: {e}", file.path))?
-            .with_projection(projection.clone())
+            .with_projection(file_projection)
             .into_stream()
             .map_err(|e| format!("stream {}: {e}", file.path))?;
 
@@ -2950,6 +2950,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+    use vortex_scan::selection::Selection;
 
     fn unbounded_pool() -> Arc<dyn MemoryPool> {
         Arc::new(UnboundedMemoryPool::default())
@@ -3312,9 +3313,8 @@ mod tests {
         let deleted: roaring::RoaringTreemap = [3u64, 9].into_iter().collect();
         let table_plan =
             VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(deleted));
-        let candidates = VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
-            Buffer::from_iter([1u64, 3, 5, 9]),
-        ));
+        let candidates = VortexAccessPlan::default()
+            .with_selection(include_by_index(&Buffer::from_iter([1u64, 3, 5, 9])));
         let Some(Selection::IncludeByIndex(kept)) =
             candidates.intersect(&table_plan).selection().cloned()
         else {

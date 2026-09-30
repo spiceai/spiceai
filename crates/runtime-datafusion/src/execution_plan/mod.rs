@@ -103,6 +103,7 @@ pub fn wrap_with_filter(
         &joined_filters,
         &input_dfschema,
         session_state.execution_props(),
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
     )?;
 
     let filtered_input = FilterExec::try_new(physical_expr, input)?;
@@ -134,6 +135,7 @@ pub(crate) fn filter_plan(
         &joined_filters,
         &input_dfschema,
         scan_params.state.execution_props(),
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
     )?;
 
     let filtered_input = FilterExec::try_new(physical_expr, input)?;

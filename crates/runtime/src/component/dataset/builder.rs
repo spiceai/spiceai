@@ -24,7 +24,7 @@ use super::{
 use crate::Runtime;
 use crate::component::access::AccessMode;
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
 use spicepod::{

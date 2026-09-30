@@ -275,80 +275,83 @@ mod null_aware_anti_join {
     }
 }
 
-/// Guards the reset-partition status handling the `spiceai/datafusion-ballista`
-/// fork carries (fork PR #53).
+/// Guards the late-status handling for a task whose executor was lost.
 ///
-/// An executor that is lost — or merely heartbeat-timed-out — has its stages reset,
-/// and a reset clears the per-partition task info. Its status updates are already
-/// on the wire when that happens, so the scheduler receives a status for a
-/// partition it no longer has a task for. Upstream
-/// `RunningStage::update_task_info` unwraps that `None`, and the panic lands on
-/// the scheduler event-loop worker: the event channel closes, and from then on
-/// every job submission and every executor heartbeat fails with `Fail to send
-/// event due to channel closed`. One late packet wedges the whole cluster, and
-/// nothing in the failure names the query that caused it.
+/// An executor that is lost — or merely heartbeat-timed-out — has its stages reset:
+/// `RunningStage::reset_tasks` marks the executor's tasks failed (`ResultLost`) and
+/// returns their partitions to the pending pool. Its status updates are already on
+/// the wire when that happens, so the scheduler then receives a status for a task
+/// it has reset. The `spiceai/datafusion-ballista` fork refused such a status (fork
+/// PR #53) because upstream once unwrapped the missing task info, and the panic
+/// landed on the scheduler event-loop worker: the event channel closed, and from
+/// then on every job submission and every executor heartbeat failed with `Fail to
+/// send event due to channel closed`. Upstream now tracks tasks in an append-only
+/// list and refuses the late status itself; this guard keeps that behaviour pinned.
 ///
-/// Asserted against the patched function directly, on a stage driven into the
-/// state a reset leaves behind. `RunningStage::task_infos` and `TaskInfo` are
-/// public, so the test launches a task on each of two executors by hand and then
-/// has `RunningStage::reset_tasks` — the function the lost-executor path calls —
-/// clear the one on the executor that is gone. Driving the real
-/// `reset_stages_on_lost_executor` would be closer still, but the scheduler's
-/// task-issuing API (`ExecutionGraph::pop_next_task`) is `#[cfg(test)]` on the
-/// fork, so it is unreachable from here — and being `#[cfg(test)]` is also why the
-/// fork's own coverage of this leaves with the branch that gets re-cut.
+/// Asserted against the function directly, on a stage driven into the state a reset
+/// leaves behind: one task is launched on each of two executors by drawing their
+/// partitions from `RunningStage::pending`, as the scheduler's binder does, and
+/// `reset_tasks` — the function the lost-executor path calls — then resets the one
+/// on the executor that is gone.
 ///
-/// Both halves of the patched function are asserted: the stale status for the
-/// reset partition is refused, and an ordinary status for the partition whose
-/// executor is still there is accepted. A guard that checked only the refusal
-/// would pass just as well on a regression that refused *every* status.
+/// Both halves are asserted: the stale status for the reset task is refused and
+/// leaves the reset intact, and an ordinary status for the task whose executor is
+/// still there is accepted. A guard that checked only the refusal would pass just
+/// as well on a regression that refused *every* status.
 #[cfg(test)]
 mod stale_status_for_a_reset_partition {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use ballista_core::extension::SessionConfigExt;
+    use ballista_core::serde::protobuf::failed_task::FailedReason;
     use ballista_core::serde::protobuf::{
-        RunningTask, ShuffleWritePartition, SuccessfulTask, TaskStatus, task_status,
+        FailedTask, RunningTask, ShuffleWritePartition, SuccessfulTask, TaskStatus, task_status,
     };
     use ballista_scheduler::state::execution_stage::{RunningStage, TaskInfo};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::context::SessionConfig;
     use datafusion::physical_plan::empty::EmptyExec;
 
-    const TASK_ID: usize = 7;
+    const LOST_TASK: usize = 0;
+    const LIVE_TASK: usize = 1;
     const LOST_EXECUTOR: &str = "executor-that-is-lost";
     const LIVE_EXECUTOR: &str = "executor-still-here";
 
-    /// The status an executor sends when a task finishes.
-    fn completed(partition_id: u32, executor_id: &str) -> TaskStatus {
+    /// The status an executor sends when task `task_id` finishes.
+    fn completed(task_id: usize, partition_id: u64, executor_id: &str) -> TaskStatus {
         TaskStatus {
-            task_id: u32::try_from(TASK_ID).expect("a small test task id fits in u32"),
+            task_id: u32::try_from(task_id).expect("a small test task id fits in u32"),
             job_id: "job".to_string(),
             stage_id: 1,
             stage_attempt_num: 0,
-            partition_id,
-            launch_time: 0,
-            start_exec_time: 0,
-            end_exec_time: 0,
-            metrics: vec![],
             status: Some(task_status::Status::Successful(SuccessfulTask {
                 executor_id: executor_id.to_owned(),
                 partitions: vec![ShuffleWritePartition {
-                    partition_id: u64::from(partition_id),
+                    partition_id,
                     path: format!("/job/1/{partition_id}"),
                     num_batches: 1,
                     num_rows: 1,
                     num_bytes: 1,
+                    ..Default::default()
                 }],
+                ..Default::default()
             })),
+            ..Default::default()
         }
     }
 
-    /// A task launched on `executor_id`, as the scheduler records it at launch.
-    fn running_on(executor_id: &str) -> TaskInfo {
-        TaskInfo {
-            task_id: TASK_ID,
+    /// Binds the next pending partition of `stage` into a task running on
+    /// `executor_id`, the way the scheduler's binder does.
+    fn launch_on(stage: &mut RunningStage, executor_id: &str) {
+        let partitions = stage.pending.next_slice(1);
+        assert_eq!(
+            partitions.len(),
+            1,
+            "the stage had a partition left to bind"
+        );
+        stage.task_infos.push(TaskInfo {
+            task_id: stage.task_infos.len(),
             executor_id: executor_id.to_owned(),
             scheduled_time: 0,
             launch_time: 0,
@@ -358,12 +361,14 @@ mod stale_status_for_a_reset_partition {
             task_status: task_status::Status::Running(RunningTask {
                 executor_id: executor_id.to_owned(),
             }),
-        }
+            global_input_partition_ids: partitions,
+            vcores_consumed: 1,
+        });
     }
 
     /// A two-partition stage with a task running on each of two executors, of
-    /// which the first has just been lost: partition 0 is reset, partition 1 still
-    /// has its task.
+    /// which the first has just been lost: its task is reset and its partition is
+    /// pending again, and the other executor's task is still running.
     fn stage_after_losing_an_executor() -> RunningStage {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let mut stage = RunningStage::new(
@@ -375,8 +380,9 @@ mod stale_status_for_a_reset_partition {
             HashMap::new(),
             Arc::new(SessionConfig::new_with_ballista()),
         );
-        stage.task_infos[0] = Some(running_on(LOST_EXECUTOR));
-        stage.task_infos[1] = Some(running_on(LIVE_EXECUTOR));
+        launch_on(&mut stage, LOST_EXECUTOR);
+        launch_on(&mut stage, LIVE_EXECUTOR);
+        assert_eq!(stage.available_tasks(), 0, "both partitions were bound");
 
         assert_eq!(
             stage.reset_tasks(LOST_EXECUTOR),
@@ -386,73 +392,75 @@ mod stale_status_for_a_reset_partition {
         assert_eq!(
             stage.available_tasks(),
             1,
-            "the reset must leave the lost executor's partition with no task",
-        );
-        assert_eq!(
-            stage.scheduled_tasks(),
-            1,
-            "the reset must leave the other executor's task in place",
+            "the reset must return the lost executor's partition to pending",
         );
         stage
     }
 
-    /// A status for a partition that no longer has a task scheduled on it must be
-    /// refused, and the stage must be left as the reset left it.
+    fn is_reset(stage: &RunningStage, task_id: usize) -> bool {
+        matches!(
+            &stage.task_infos[task_id].task_status,
+            task_status::Status::Failed(FailedTask {
+                failed_reason: Some(FailedReason::ResultLost(_)),
+                ..
+            })
+        )
+    }
+
+    /// A late status for a task that was reset must be refused, and the stage must
+    /// be left as the reset left it.
     #[test]
     fn a_status_for_a_partition_with_no_scheduled_task_is_refused() {
         let mut stage = stage_after_losing_an_executor();
 
-        let accepted = stage.update_task_info(0, completed(0, LOST_EXECUTOR));
+        let accepted = stage.update_task_info(LOST_TASK, completed(LOST_TASK, 0, LOST_EXECUTOR));
 
         assert!(
             !accepted,
-            "a status for a partition whose task was reset must be refused; unwrapping the \
-             missing task info panics on the scheduler's event-loop worker and closes the event \
-             channel, after which no job submission or executor heartbeat is accepted at all"
+            "a status for a task whose executor was lost must be refused; accepting it \
+             would record output that lives on an executor that is gone"
+        );
+        assert!(
+            is_reset(&stage, LOST_TASK),
+            "the refused status overwrote the reset, so a packet from an executor that is \
+             gone partly undid it",
         );
         assert_eq!(
             stage.available_tasks(),
             1,
-            "the refused status still marked the partition scheduled, so a packet from an \
-             executor that is gone partly undid the reset",
-        );
-        assert_eq!(
-            stage.scheduled_tasks(),
-            1,
-            "the refused status was recorded as a scheduled task",
+            "the reset partition must stay pending for rescheduling",
         );
     }
 
-    /// A status for a partition whose task is still scheduled must be accepted and
-    /// recorded, exactly as before the patch.
+    /// A status for a task whose executor is still there must be accepted and
+    /// recorded, exactly as without a reset.
     #[test]
     fn a_status_for_a_partition_whose_task_is_still_scheduled_is_accepted() {
         let mut stage = stage_after_losing_an_executor();
 
-        let accepted = stage.update_task_info(1, completed(1, LIVE_EXECUTOR));
+        let accepted = stage.update_task_info(LIVE_TASK, completed(LIVE_TASK, 1, LIVE_EXECUTOR));
 
         assert!(
             accepted,
-            "an ordinary status for a partition whose task is still scheduled must be accepted; \
-             a guard that stopped at the refusal could not tell the patch from one that refuses \
-             every status"
+            "an ordinary status for a task whose executor is still there must be accepted; \
+             a guard that stopped at the refusal could not tell the behaviour from one that \
+             refuses every status"
         );
         assert!(
             matches!(
-                stage.task_infos[1].as_ref().map(|info| &info.task_status),
-                Some(task_status::Status::Successful(_))
+                &stage.task_infos[LIVE_TASK].task_status,
+                task_status::Status::Successful(_)
             ),
-            "the accepted status was not recorded against its partition",
+            "the accepted status was not recorded against its task",
         );
-        assert_eq!(
-            stage.scheduled_tasks(),
-            1,
-            "accepting a status must not change which partitions have a task",
+        assert!(
+            is_reset(&stage, LOST_TASK),
+            "accepting a status must not touch the reset task"
         );
         assert_eq!(
             stage.available_tasks(),
             1,
-            "the reset partition must stay available for rescheduling",
+            "the reset partition must stay pending for rescheduling",
         );
     }
 }

@@ -510,6 +510,17 @@ impl ExecutionPlan for FlightExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -623,9 +634,9 @@ mod tests {
     };
     use bytes::Bytes;
     use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::dialect::DefaultDialect;
     use flight_client::{Credentials, FlightClient};
     use std::net::SocketAddr;

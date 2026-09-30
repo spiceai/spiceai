@@ -26,7 +26,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::{collections::HashMap, time::SystemTime};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 
 use crate::cluster_state::{

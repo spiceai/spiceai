@@ -29,12 +29,12 @@ use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
     common::Column,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionContext,
     functions_aggregate::expr_fn::{array_agg, first_value},
     logical_expr::{Aggregate, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
-    sql::TableReference,
 };
 use datafusion_expr::ident;
 use itertools::Itertools;
