@@ -31,7 +31,7 @@ limitations under the License.
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
 //! so it takes a bounded share of a core. With the hidden
-//! `SPICE_CAYENNE_INDEX_SIDECARS=enabled` switch (for testing), each run also
+//! `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled` switch (for testing), each run also
 //! persists as a file under the table's `_lookup_index` directory, registered
 //! in the metastore, so a reopened table loads its runs instead of reading its
 //! files back; otherwise nothing is persisted.
@@ -474,10 +474,10 @@ impl Shape {
         })
     }
 
-    /// Identifies this key's sidecars: its label, its encoded types and the
-    /// persisted format, so a sidecar is only ever read back by the key and
+    /// Identifies this key's persisted runs: its label, its encoded types and the
+    /// persisted format, so a persisted run is only ever read back by the key and
     /// format that wrote it.
-    fn sidecar_key(&self) -> u64 {
+    fn persisted_key(&self) -> u64 {
         let mut descriptor = format!("{}|{}", self.label, key_index::persist::VERSION);
         for data_type in &self.encoded_types {
             descriptor.push('|');
@@ -1294,7 +1294,7 @@ pub(crate) struct LookupIndexState {
     /// table the pool cannot fit warns once rather than on every write.
     refusal_reported: AtomicBool,
     /// Where the runs persist, when they do.
-    sidecars: std::sync::OnceLock<Arc<Sidecars>>,
+    persisted_runs: std::sync::OnceLock<Arc<PersistedRuns>>,
     counters: Counters,
     /// The table's scan-input version. Scan views pin the published view, so
     /// every change to it must invalidate the cached views, or scans keep
@@ -1345,7 +1345,7 @@ impl LookupIndexState {
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
             refusal_reported: AtomicBool::new(false),
-            sidecars: std::sync::OnceLock::new(),
+            persisted_runs: std::sync::OnceLock::new(),
             counters: Counters::default(),
             scan_input_version,
         });
@@ -1377,8 +1377,8 @@ impl LookupIndexState {
         let rows = views
             .first()
             .map_or(0, |view| view.run_list().iter().map(|run| run.len()).sum());
-        if let Some(sidecars) = self.sidecars.get() {
-            sidecars.schedule(views.clone());
+        if let Some(persisted_runs) = self.persisted_runs.get() {
+            persisted_runs.schedule(views.clone());
         }
         let view = LookupIndexView {
             views,
@@ -1393,12 +1393,12 @@ impl LookupIndexState {
         self.scan_input_version.fetch_add(1, Ordering::Release);
     }
 
-    /// Persists every key's runs as sidecar files under `root`, registered in
+    /// Persists every key's runs as run files under `root`, registered in
     /// the table's metastore, and loads the registered ones, so a reopened
-    /// table reads back only the files no sidecar covers. `live` lists the
-    /// files a reader can see now. A sidecar that cannot be read is deleted
+    /// table reads back only the files no persisted run covers. `live` lists the
+    /// files a reader can see now. A persisted run that cannot be read is deleted
     /// and its files are indexed again.
-    pub(crate) async fn open_sidecars(
+    pub(crate) async fn open_persisted_runs(
         self: &Arc<Self>,
         store: Arc<dyn ObjectStore>,
         catalog: Arc<dyn MetadataCatalog>,
@@ -1406,7 +1406,7 @@ impl LookupIndexState {
         root: &object_store::path::Path,
         live: Vec<String>,
     ) {
-        let sidecars = Arc::new(Sidecars {
+        let persisted_runs = Arc::new(PersistedRuns {
             table_name: self.table_name.clone(),
             store,
             catalog,
@@ -1415,16 +1415,20 @@ impl LookupIndexState {
             keys: self
                 .shapes
                 .iter()
-                .map(|shape| format!("{:016x}", shape.sidecar_key()))
+                .map(|shape| format!("{:016x}", shape.persisted_key()))
                 .collect(),
             loaded: AtomicBool::new(false),
             pending: Mutex::new(None),
             syncing: AtomicBool::new(false),
         });
-        if self.sidecars.set(Arc::clone(&sidecars)).is_err() {
+        if self
+            .persisted_runs
+            .set(Arc::clone(&persisted_runs))
+            .is_err()
+        {
             return;
         }
-        let runs = sidecars.load().await;
+        let runs = persisted_runs.load().await;
         let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
         let added: usize = runs.iter().flatten().map(IndexRun::heap_bytes).sum();
         let loaded: usize = runs.iter().map(Vec::len).sum();
@@ -1438,8 +1442,8 @@ impl LookupIndexState {
                 self.charge(self.run_bytes());
             }
             // From here every change to the runs is persisted, and the first
-            // sync removes the sidecars of files that are gone.
-            sidecars.loaded.store(true, Ordering::Release);
+            // sync removes the persisted runs of files that are gone.
+            persisted_runs.loaded.store(true, Ordering::Release);
             self.repin();
             drop(publishing);
             if !fits {
@@ -1448,7 +1452,7 @@ impl LookupIndexState {
             }
         }
         if loaded > 0 {
-            tracing::debug!(table = %self.table_name, runs = loaded, "Loaded secondary index runs from sidecars");
+            tracing::debug!(table = %self.table_name, runs = loaded, "Loaded persisted secondary index runs");
         }
     }
 
@@ -2226,18 +2230,18 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
 
-/// Whether a table's secondary index runs persist as sidecar files. Hidden,
-/// for testing: `SPICE_CAYENNE_INDEX_SIDECARS=enabled`.
-pub(crate) const SIDECARS_ENV: &str = "SPICE_CAYENNE_INDEX_SIDECARS";
+/// Whether a table's secondary index runs persist as run files. Hidden,
+/// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
+pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
 
 /// Every key's runs, persisted one file per run under the table's
 /// `_lookup_index` directory, which snapshot cleanup never sweeps.
 ///
-/// A sidecar is named after the run's content, so persisting is a stateless
+/// A persisted run is named after the run's content, so persisting is a stateless
 /// sync of the directory against the live runs: write the missing, delete the
 /// rest. It holds file names only, which the module's note on file names makes
 /// safe to trust: at load a run covers only the files still live.
-pub(crate) struct Sidecars {
+pub(crate) struct PersistedRuns {
     table_name: String,
     store: Arc<dyn ObjectStore>,
     /// Records which runs are persisted. A run is registered only once its
@@ -2258,7 +2262,7 @@ pub(crate) struct Sidecars {
     syncing: AtomicBool,
 }
 
-impl Sidecars {
+impl PersistedRuns {
     /// Persists `views`' runs in the background, coalescing with any sync
     /// already running.
     fn schedule(self: &Arc<Self>, views: Vec<IndexView>) {
@@ -2273,8 +2277,8 @@ impl Sidecars {
             self.syncing.store(false, Ordering::Release);
             return;
         };
-        let sidecars = Arc::clone(self);
-        runtime.spawn(async move { sidecars.sync().await });
+        let persisted_runs = Arc::clone(self);
+        runtime.spawn(async move { persisted_runs.sync().await });
     }
 
     async fn sync(&self) {
@@ -2289,7 +2293,7 @@ impl Sidecars {
                 return;
             };
             if let Err(error) = self.sync_views(&views).await {
-                tracing::debug!(table = %self.table_name, %error, "Secondary index sidecars were not synced; the next change retries");
+                tracing::debug!(table = %self.table_name, %error, "Persisted secondary index runs were not synced; the next change retries");
             }
         }
     }
@@ -2310,14 +2314,14 @@ impl Sidecars {
             .collect();
         for (view, key) in views.iter().zip(&self.keys) {
             for run in view.run_list() {
-                let name = sidecar_name(&run);
+                let name = run_file_name(&run);
                 if existing.remove(&(key.clone(), name.clone())) {
                     continue;
                 }
                 let row_count = run.len() as u64;
                 let bytes = tokio::task::spawn_blocking(move || run.to_bytes())
                     .await
-                    .map_err(|e| format!("encode sidecar: {e}"))?;
+                    .map_err(|e| format!("encode persisted run: {e}"))?;
                 let record = IndexRunRecord {
                     table_id: self.table_id.clone(),
                     index_key: key.clone(),
@@ -2375,7 +2379,7 @@ impl Sidecars {
             let Some(slot) = self.keys.iter().position(|key| *key == record.index_key) else {
                 // Persisted for a key the table no longer has.
                 if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
-                    tracing::debug!(table = %self.table_name, sidecar = %path, %error, "A secondary index sidecar of a removed index was not deleted; the next sync retries");
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "A persisted secondary index run of a removed index was not deleted; the next sync retries");
                 }
                 continue;
             };
@@ -2385,9 +2389,9 @@ impl Sidecars {
                     all[slot].push(run);
                 }
                 Err(error) => {
-                    tracing::debug!(table = %self.table_name, sidecar = %path, %error, "Deleting a secondary index sidecar that cannot be read; its files are indexed again");
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "Deleting a persisted secondary index run that cannot be read; its files are indexed again");
                     if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
-                        tracing::debug!(table = %self.table_name, sidecar = %path, %error, "An unreadable secondary index sidecar was not deleted; the next sync retries");
+                        tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unreadable persisted secondary index run was not deleted; the next sync retries");
                     }
                 }
             }
@@ -2417,7 +2421,7 @@ impl Sidecars {
         let listed: Vec<ObjectMeta> = match self.store.list(Some(&self.root)).try_collect().await {
             Ok(listed) => listed,
             Err(error) => {
-                tracing::debug!(table = %self.table_name, %error, "Unregistered secondary index sidecars were not listed; the next open retries");
+                tracing::debug!(table = %self.table_name, %error, "Unregistered persisted secondary index runs were not listed; the next open retries");
                 return;
             }
         };
@@ -2426,15 +2430,15 @@ impl Sidecars {
                 continue;
             }
             if let Err(error) = self.store.delete(&meta.location).await {
-                tracing::debug!(table = %self.table_name, sidecar = %meta.location, %error, "An unregistered secondary index sidecar was not deleted; the next open retries");
+                tracing::debug!(table = %self.table_name, run_file = %meta.location, %error, "An unregistered persisted secondary index run was not deleted; the next open retries");
             }
         }
     }
 }
 
-/// A sidecar's name: a digest of the run's files and size, so the same run
+/// A persisted run's name: a digest of the run's files and size, so the same run
 /// always has the same name.
-fn sidecar_name(run: &IndexRun) -> String {
+fn run_file_name(run: &IndexRun) -> String {
     let mut descriptor = Vec::new();
     for file in run.files() {
         descriptor.extend_from_slice(&(file.len() as u64).to_le_bytes());

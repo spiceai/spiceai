@@ -2716,24 +2716,25 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
-    index_sidecars: IndexSidecars,
+    index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
 }
 
-/// Whether a table's secondary index runs persist as sidecar files, so a
+/// Whether a table's secondary index runs persist as run files, so a
 /// reopened table reads back only the files none covers. Hidden, for testing;
-/// the default comes from `SPICE_CAYENNE_INDEX_SIDECARS=enabled`.
+/// the default comes from `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum IndexSidecars {
+pub enum IndexPersistence {
     #[default]
     Disabled,
     Enabled,
 }
 
-impl IndexSidecars {
+impl IndexPersistence {
     fn from_env() -> Self {
-        if std::env::var(super::lookup_index::SIDECARS_ENV).is_ok_and(|value| value == "enabled") {
+        if std::env::var(super::lookup_index::PERSISTENCE_ENV).is_ok_and(|value| value == "enabled")
+        {
             Self::Enabled
         } else {
             Self::Disabled
@@ -2870,7 +2871,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
-    index_sidecars: IndexSidecars,
+    index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
 }
 
@@ -2890,7 +2891,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
-            index_sidecars: IndexSidecars::from_env(),
+            index_persistence: IndexPersistence::from_env(),
             index_word_bits: None,
         }
     }
@@ -2986,12 +2987,12 @@ impl CayenneTableProviderBuilder {
         self
     }
 
-    /// Whether the secondary index runs persist as sidecar files. Hidden, for
+    /// Whether the secondary index runs persist as run files. Hidden, for
     /// testing.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_index_sidecars(mut self, sidecars: IndexSidecars) -> Self {
-        self.index_sidecars = sidecars;
+    pub fn with_index_persistence(mut self, persistence: IndexPersistence) -> Self {
+        self.index_persistence = persistence;
         self
     }
 
@@ -3023,7 +3024,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
-            index_sidecars: self.index_sidecars,
+            index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
         };
 
@@ -3057,7 +3058,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
-            index_sidecars: self.index_sidecars,
+            index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
         };
 
@@ -8799,7 +8800,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
-            index_sidecars,
+            index_persistence,
             index_word_bits,
         } = options;
 
@@ -9301,8 +9302,8 @@ impl CayenneTableProvider {
         // deduplicates concurrent scans on it). The first scan therefore pays one
         // build; every subsequent scan of the same state hits `latest_complete`.
 
-        if index_sidecars == IndexSidecars::Enabled {
-            provider.open_lookup_index_sidecars().await;
+        if index_persistence == IndexPersistence::Enabled {
+            provider.open_persisted_lookup_index().await;
         }
 
         Ok(provider)
@@ -9311,7 +9312,7 @@ impl CayenneTableProvider {
     /// Loads the secondary index runs persisted beside the table, and persists
     /// every later change to them. Best-effort: the files no loaded run covers
     /// are indexed as usual.
-    async fn open_lookup_index_sidecars(&self) {
+    async fn open_persisted_lookup_index(&self) {
         let Some(state) = &self.lookup_index else {
             return;
         };
@@ -9335,13 +9336,13 @@ impl CayenneTableProvider {
                     .map(|file| file.object_meta.location.to_string())
                     .collect(),
                 Err(error) => {
-                    tracing::debug!(table = %self.table_metadata.table_name, %error, "Secondary index sidecars were not loaded: the table's files could not be listed");
+                    tracing::debug!(table = %self.table_metadata.table_name, %error, "Persisted secondary index runs were not loaded: the table's files could not be listed");
                     return;
                 }
             }
         };
         state
-            .open_sidecars(
+            .open_persisted_runs(
                 store,
                 Arc::clone(&self.catalog),
                 self.table_metadata.table_id.clone(),

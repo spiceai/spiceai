@@ -34,7 +34,7 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::lookup_index::{IndexSidecars, LookupIndexCounters};
+use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters};
 use cayenne::metadata::{CreateTableOptions, IndexRunRecord, VortexConfig};
 use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
@@ -126,7 +126,7 @@ async fn open_with(
         name,
         indexes,
         vortex_config,
-        IndexSidecars::Disabled,
+        IndexPersistence::Disabled,
     )
     .await
 }
@@ -137,7 +137,7 @@ async fn open_configured(
     name: &str,
     indexes: &[&[&str]],
     vortex_config: VortexConfig,
-    sidecars: IndexSidecars,
+    persistence: IndexPersistence,
 ) -> Arc<CayenneTableProvider> {
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
     let options = CreateTableOptions {
@@ -154,7 +154,7 @@ async fn open_configured(
     Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
-            .with_index_sidecars(sidecars)
+            .with_index_persistence(persistence)
             .with_secondary_indexes(
                 indexes
                     .iter()
@@ -766,8 +766,8 @@ fn vortex_files(
     }
 }
 
-/// Sidecar files persisted under `dir`.
-fn sidecar_count(dir: &std::path::Path) -> usize {
+/// Run files persisted under `dir`.
+fn run_file_count(dir: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -775,7 +775,7 @@ fn sidecar_count(dir: &std::path::Path) -> usize {
         .map(|entry| entry.expect("dir entry").path())
         .map(|path| {
             if path.is_dir() {
-                sidecar_count(&path)
+                run_file_count(&path)
             } else {
                 usize::from(path.extension().is_some_and(|ext| ext == "run"))
             }
@@ -798,46 +798,46 @@ async fn registered_runs(fixture: &common::TestFixture, name: &str) -> Vec<Index
         .expect("list persisted runs")
 }
 
-/// Waits until at least `runs` runs are registered and every sidecar file on
+/// Waits until at least `runs` runs are registered and every run file on
 /// disk is a registered one.
 async fn wait_for_persisted_runs(fixture: &common::TestFixture, name: &str, runs: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let registered = registered_runs(fixture, name).await.len();
-        let files = sidecar_count(&fixture.data_path);
+        let files = run_file_count(&fixture.data_path);
         if registered >= runs && files == registered {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "the runs were not persisted: {registered} registered, {files} sidecar files"
+            "the runs were not persisted: {registered} registered, {files} run files"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-/// Every sidecar file under `dir`.
-fn sidecar_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+/// Every run file under `dir`.
+fn run_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
-            sidecar_files(&path, found);
+            run_files(&path, found);
         } else if path.extension().is_some_and(|ext| ext == "run") {
             found.push(path);
         }
     }
 }
 
-/// The metastore, not a directory listing, decides which sidecars a reopened
-/// table loads. A sidecar file with no registered run (a write that stopped
+/// The metastore, not a directory listing, decides which persisted runs a reopened
+/// table loads. A run file with no registered run (a write that stopped
 /// before registering it) is deleted; a registered run whose file cannot be
 /// read, or is missing, is unregistered and its files are indexed again. The
 /// loaded index still agrees with a read-back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
+async fn the_metastore_decides_which_persisted_runs_a_reopened_table_loads() {
     const ROWS: usize = 20_000;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
@@ -854,7 +854,7 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
         name,
         &[&KEY],
         config(),
-        IndexSidecars::Enabled,
+        IndexPersistence::Enabled,
     )
     .await;
     overwrite(&table, rows(0, ROWS)).await;
@@ -866,7 +866,7 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
 
     let registered = registered_runs(&fixture, name).await;
     let mut files = Vec::new();
-    sidecar_files(&fixture.data_path, &mut files);
+    run_files(&fixture.data_path, &mut files);
     let file_of = |record: &IndexRunRecord| {
         files
             .iter()
@@ -883,10 +883,10 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
     // A registered run whose file is corrupt.
     let corrupt = registered[0].clone();
     let corrupt_file = file_of(&corrupt);
-    std::fs::write(&corrupt_file, b"not a run").expect("corrupt a sidecar");
-    // A sidecar file no run is registered for.
+    std::fs::write(&corrupt_file, b"not a run").expect("corrupt a persisted run");
+    // A run file no run is registered for.
     let orphan_file = corrupt_file.with_file_name("00000000deadbeef.run");
-    std::fs::copy(file_of(&registered[1]), &orphan_file).expect("write an orphan sidecar");
+    std::fs::copy(file_of(&registered[1]), &orphan_file).expect("write an orphan persisted run");
     // A registered run with no file.
     let phantom = IndexRunRecord {
         run_name: "00000000feedface.run".to_string(),
@@ -904,7 +904,7 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
         name,
         &[&KEY],
         config(),
-        IndexSidecars::Enabled,
+        IndexPersistence::Enabled,
     )
     .await;
     let after: Vec<String> = registered_runs(&fixture, name)
@@ -914,7 +914,7 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
         .collect();
     assert!(
         !orphan_file.exists(),
-        "a sidecar file with no registered run must be deleted at open"
+        "a run file with no registered run must be deleted at open"
     );
     assert!(
         !after.contains(&corrupt.run_name) && !corrupt_file.exists(),
@@ -933,7 +933,9 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
         .verify_lookup_index_against_read_back()
         .await
         .expect("verify");
-    println!("after reopening with a corrupt, an orphan and a phantom sidecar: {verification:?}");
+    println!(
+        "after reopening with a corrupt, an orphan and a phantom persisted run: {verification:?}"
+    );
     assert!(verification.agrees(), "{verification:?}");
     assert!(
         verification.uncovered_files > 0,
@@ -943,18 +945,18 @@ async fn the_metastore_decides_which_sidecars_a_reopened_table_loads() {
     assert_eq!(dynamic_lookup(&reopened, name, &ids).await, ids);
 }
 
-/// With sidecars, a reopened table loads its index runs instead of reading
+/// With persisted runs, a reopened table loads its index runs instead of reading
 /// its files back: on reopen every file is covered before any build runs, and
 /// the loaded runs agree row for row with a read-back. Without them the same
 /// reopen starts uncovered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reopened_table_loads_its_runs_from_sidecars() {
+async fn a_reopened_table_loads_its_persisted_runs() {
     const ROWS: usize = 20_000;
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
     let env = Arc::new(RuntimeEnv::default());
-    let name = "sidecars";
+    let name = "persisted_runs";
     let config = || VortexConfig {
         target_vortex_file_size_mb: 1,
         ..VortexConfig::default()
@@ -965,7 +967,7 @@ async fn a_reopened_table_loads_its_runs_from_sidecars() {
         name,
         &[&KEY],
         config(),
-        IndexSidecars::Enabled,
+        IndexPersistence::Enabled,
     )
     .await;
     overwrite(&table, rows(0, ROWS)).await;
@@ -982,14 +984,14 @@ async fn a_reopened_table_loads_its_runs_from_sidecars() {
         name,
         &[&KEY],
         config(),
-        IndexSidecars::Enabled,
+        IndexPersistence::Enabled,
     )
     .await;
     let verification = reopened
         .verify_lookup_index_against_read_back()
         .await
         .expect("verify");
-    println!("after reopening with sidecars: {verification:?}");
+    println!("after reopening with persisted runs: {verification:?}");
     assert!(verification.agrees(), "{verification:?}");
     assert_eq!(
         (
@@ -997,7 +999,7 @@ async fn a_reopened_table_loads_its_runs_from_sidecars() {
             counters(&reopened).builds_started
         ),
         (0, 0),
-        "a reopened table must be covered by its sidecars, not by a build: {verification:?}"
+        "a reopened table must be covered by its persisted runs, not by a build: {verification:?}"
     );
     let before = counters(&reopened);
     lookup(&reopened, name, rows_i64 * 2 + 7).await;
@@ -1018,7 +1020,7 @@ async fn a_reopened_table_loads_its_runs_from_sidecars() {
         name,
         &[&KEY],
         config(),
-        IndexSidecars::Disabled,
+        IndexPersistence::Disabled,
     )
     .await;
     let verification = without
@@ -1027,6 +1029,6 @@ async fn a_reopened_table_loads_its_runs_from_sidecars() {
         .expect("verify");
     assert!(
         verification.files == 0 && verification.uncovered_files > 0,
-        "without sidecars a reopened table starts uncovered: {verification:?}"
+        "without persisted runs a reopened table starts uncovered: {verification:?}"
     );
 }
