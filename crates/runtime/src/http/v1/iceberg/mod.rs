@@ -30,6 +30,7 @@ use serde::{self, Deserialize, Serialize};
 
 mod error;
 pub mod namespace;
+mod passthrough;
 pub mod tables;
 
 /// Get Iceberg API config
