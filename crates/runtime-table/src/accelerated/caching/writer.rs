@@ -306,7 +306,7 @@ impl CacheWriter {
 
     #[cfg(test)]
     pub(super) async fn send(&self, request: CacheWriteRequest) -> Result<()> {
-        let claims = Arc::new(parking_lot::Mutex::new(Default::default()));
+        let claims = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let super::ClaimOutcome::Leader(claim) =
             CacheKeyClaim::acquire(&claims, request.cache_key.clone(), None)
         else {
@@ -592,7 +592,7 @@ mod tests {
                 .get_dataset_status(&writer.0.dataset)
                 .and_then(|status| status.error_message().map(str::to_owned));
             let claims: InFlightRevalidations =
-                Arc::new(parking_lot::Mutex::new(Default::default()));
+                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
             let _write_guard = writer.0.write_mutex.lock().await;
             for _ in 0..3 {
                 let ClaimOutcome::Leader(claim) =
@@ -717,7 +717,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
         let (writer, paused, batch) = fixture(Arc::clone(&pool));
         let in_flight: InFlightRevalidations =
-            Arc::new(parking_lot::Mutex::new(Default::default()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let ClaimOutcome::Leader(claim) = CacheKeyClaim::acquire(&in_flight, "key".into(), None)
         else {
             panic!("first fetch owns the key");
@@ -766,7 +766,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
         let (writer, _, batch) = fixture(Arc::clone(&pool));
         let in_flight: InFlightRevalidations =
-            Arc::new(parking_lot::Mutex::new(Default::default()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let ClaimOutcome::Leader(claim) = CacheKeyClaim::acquire(&in_flight, "key".into(), None)
         else {
             panic!("first fetch owns the key");
@@ -800,7 +800,8 @@ mod tests {
             &writer.0.context.runtime_env().memory_pool,
             &pool
         ));
-        let claims: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(Default::default()));
+        let claims: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let super::super::ClaimOutcome::Leader(claim) =
             CacheKeyClaim::acquire(&claims, "key".into(), None)
         else {

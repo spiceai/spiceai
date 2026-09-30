@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -149,16 +150,37 @@ def lint_recipe() -> str:
 
 
 def tracked_files() -> tuple[list[str], list[str]]:
-    """Every tracked path in the repo, plus notes if git could not be read."""
+    """Tracked paths from Git's index or JJ's recorded working-copy tree, or errors."""
+    use_jj = (REPO / ".jj").exists() and not (REPO / ".git").exists()
+    command = (
+        [
+            "jj",
+            "file",
+            "list",
+            "--ignore-working-copy",
+            "--no-pager",
+            "--color",
+            "never",
+            "--template",
+            'json(path) ++ "\\n"',
+        ]
+        if use_jj
+        else ["git", "ls-files", "-z"]
+    )
     try:
         listing = subprocess.run(
-            ["git", "ls-files", "-z"],
+            command,
             cwd=REPO,
             capture_output=True,
             check=True,
             text=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
+        if use_jj:
+            paths = [json.loads(line) for line in listing.splitlines()]
+            if not all(isinstance(path, str) for path in paths):
+                return [], ["could not list tracked files (JJ returned non-string paths)"]
+            return paths, []
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
         return [], [f"could not list tracked files ({error})"]
     return [p for p in listing.split("\0") if p], []
 

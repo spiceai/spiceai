@@ -16,8 +16,11 @@ limitations under the License.
 
 #![recursion_limit = "256"]
 
+#[cfg(any(feature = "models", feature = "kafka"))]
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
+#[cfg(any(feature = "models", feature = "kafka"))]
 use tracing::subscriber::DefaultGuard;
+#[cfg(any(feature = "models", feature = "kafka"))]
 use tracing_subscriber::EnvFilter;
 
 mod docker;
@@ -31,6 +34,7 @@ mod utils;
 #[cfg(feature = "models")]
 mod workers;
 
+#[cfg(any(feature = "models", feature = "kafka"))]
 pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
     "integration_models=debug,runtime=TRACE,search=TRACE,llms=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
 );
@@ -40,12 +44,14 @@ pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
 /// Sizing derived from the CPU budget — `target_partitions` above all, but also
 /// worker-thread counts and encode permits — would otherwise follow the host and
 /// make explain-plan snapshots machine-dependent.
+#[cfg(any(feature = "models", feature = "kafka"))]
 const TEST_CPU_CORES: usize = 3;
 
 /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
 ///
 /// 1) Pins the CPU budget, and with it `target_partitions`, to [`TEST_CPU_CORES`].
 /// 2) Disables coalesce batches and repartition joins for terser plans.
+#[cfg(any(feature = "models", feature = "kafka"))]
 fn configure_test_datafusion() {
     pin_test_cpu_budget();
 
@@ -67,6 +73,7 @@ fn configure_test_datafusion() {
 /// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
 /// and every caller asks for the same value, so each call after the first is an
 /// expected no-op rather than an error worth surfacing.
+#[cfg(any(feature = "models", feature = "kafka"))]
 fn pin_test_cpu_budget() {
     let config = cpu_budget::CpuConfig::from_sources(None, None, Some(&TEST_CPU_CORES.to_string()));
     match cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect()) {
@@ -75,6 +82,7 @@ fn pin_test_cpu_budget() {
     }
 }
 
+#[cfg(any(feature = "models", feature = "kafka"))]
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),

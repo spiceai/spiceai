@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -325,6 +328,78 @@ check(
     derived_from('\tCLIPPY_CONF_DIR=".ci" cargo clippy'),
     [".ci/clippy.toml"],
 )
+
+print("tracked_files")
+
+with tempfile.TemporaryDirectory() as tmp, patch.object(
+    check_rust_gate_paths, "REPO", Path(tmp)
+):
+    repo = Path(tmp)
+    paths = ["Cargo.toml", "crates/example/src/line\nbreak.rs", 'quoted"path.rs']
+    for layout in ("git", "jj", "colocated"):
+        if layout == "git":
+            (repo / ".git").mkdir()
+        elif layout == "jj":
+            (repo / ".git").rmdir()
+            (repo / ".jj").mkdir()
+        else:
+            (repo / ".git").write_text("gitdir: unused-test-path\n", encoding="utf-8")
+        listing = (
+            "".join(json.dumps(path) + "\n" for path in paths)
+            if layout == "jj"
+            else "\0".join(paths) + "\0"
+        )
+        with patch.object(
+            check_rust_gate_paths.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=listing),
+        ) as run:
+            check(f"{layout} preserves path delimiters", tracked_files(), (paths, []))
+            expected_command = (
+                [
+                    "jj",
+                    "file",
+                    "list",
+                    "--ignore-working-copy",
+                    "--no-pager",
+                    "--color",
+                    "never",
+                    "--template",
+                    'json(path) ++ "\\n"',
+                ]
+                if layout == "jj"
+                else ["git", "ls-files", "-z"]
+            )
+            check(
+                f"{layout} uses its tracked-file command",
+                run.call_args.args,
+                (expected_command,),
+            )
+            check(
+                f"{layout} reads the requested repository",
+                run.call_args.kwargs["cwd"],
+                repo,
+            )
+        with patch.object(
+            check_rust_gate_paths.subprocess,
+            "run",
+            side_effect=subprocess.CalledProcessError(128, expected_command),
+        ) as run:
+            tracked, notes = tracked_files()
+            check(f"{layout} listing failure returns no paths", tracked, [])
+            check(f"{layout} listing failure is reported", len(notes), 1)
+            check(f"{layout} listing failure does not fall back", run.call_count, 1)
+
+    (repo / ".git").unlink()
+    for invalid in ("not JSON\n", '{"path": "Cargo.toml"}\n'):
+        with patch.object(
+            check_rust_gate_paths.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=invalid),
+        ):
+            tracked, notes = tracked_files()
+            check("invalid JJ output returns no paths", tracked, [])
+            check("invalid JJ output is reported", len(notes), 1)
 
 print("live tree")
 

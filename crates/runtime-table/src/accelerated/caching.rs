@@ -2267,7 +2267,7 @@ impl CacheRefreshHelper {
         schema: SchemaRef,
         filters: &[Expr],
         in_flight_revalidations: &InFlightRevalidations,
-        batch_write_tx: CacheWriteSender,
+        batch_write_tx: &CacheWriteSender,
         namespace: CacheNamespace,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
@@ -2761,7 +2761,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     Arc::clone(&schema_clone),
                     &filters,
                     &in_flight_revalidations,
-                    batch_write_tx.clone(),
+                    &batch_write_tx,
                     namespace,
                 )
             } else {
@@ -4363,7 +4363,7 @@ mod tests {
             Arc::clone(&schema),
             &access_filters,
             &in_flight_revalidations,
-            batch_write_tx,
+            &batch_write_tx,
             CacheNamespace::Public,
         );
 

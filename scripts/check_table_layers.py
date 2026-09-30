@@ -65,6 +65,7 @@ ALLOWED: dict[str, str] = {
     "DelayedNativeTableProvider": "test double",
     "CountingAccelerator": "test double",
     "GatedSource": "test double",
+    "PausedInsert": "test-only insert gate and fault injector; write walks must not bypass it",
 }
 
 STRUCT = re.compile(r"(?:pub(?:\([^)]*\))? )?struct (\w+)\s*\{([^}]*)\}")
