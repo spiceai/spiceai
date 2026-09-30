@@ -582,6 +582,14 @@ impl Error {
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
                 | Self::SnapshotCreationBatchesShouldBePositive
+                // A `refresh_sql` the refresh cannot honor (e.g. `DISTINCT ON`
+                // without a matching primary key), found when the table is built.
+                | Self::UnableToBuildAcceleratedTable {
+                    source: AcceleratedTableBuilderError::AcceleratedTableError {
+                        source: accelerated::Error::InvalidRefreshSql { .. }
+                    },
+                    ..
+                }
         )
     }
 }

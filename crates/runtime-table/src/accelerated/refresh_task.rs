@@ -1691,10 +1691,26 @@ impl RefreshTask {
             None => refresh.sql.clone(),
         };
 
+        if let Some(sql) = &effective_sql
+            && let Err(e) =
+                super::validate_refresh_sql_distinct_on(sql, &self.accelerator, refresh.mode, false)
+        {
+            tracing::error!("Failed to refresh dataset '{dataset_name}': {e}");
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: DataFusionError::Plan(e.to_string()),
+                },
+            ));
+        }
+
         // Extract SQL string and partition filters from RefreshSQL
         let sql_string = effective_sql
             .as_ref()
-            .map(super::refresh::RefreshSQL::to_sql);
+            .map(super::refresh::RefreshSQL::to_scan_sql);
+        let distinct_on = effective_sql
+            .as_ref()
+            .and_then(super::refresh::RefreshSQL::distinct_on)
+            .cloned();
         if let Some(ref s) = effective_sql {
             s.extend_effective_partition_filters(&mut filters);
         }
@@ -1705,6 +1721,7 @@ impl RefreshTask {
             let update_type_for_runtime = update_type.clone();
             let provider_for_runtime = Arc::clone(&federated_provider);
             let sql_for_runtime = sql_string.clone();
+            let distinct_on_for_runtime = distinct_on.clone();
             let request_context = RequestContext::current(AsyncMarker::new().await);
             let span = Span::current();
 
@@ -1737,6 +1754,7 @@ impl RefreshTask {
                         provider_for_runtime,
                         sql_for_runtime,
                         filters_for_runtime,
+                        distinct_on_for_runtime.as_ref(),
                     )
                     .await
                     .map_err(check_and_mark_retriable_error)?;
@@ -1773,6 +1791,7 @@ impl RefreshTask {
             federated_provider,
             sql_string,
             filters,
+            distinct_on.as_ref(),
         )
         .await
         .map_err(check_and_mark_retriable_error);

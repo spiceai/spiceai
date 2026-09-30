@@ -70,6 +70,8 @@ mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
+#[cfg(all(feature = "duckdb", not(target_os = "windows")))]
+mod refresh_sql_distinct_on;
 #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 mod reload_file_accelerated;
 mod retention_arrow;
