@@ -22,6 +22,8 @@ pub mod dml_guard;
 pub mod error;
 pub mod execution_plan;
 pub mod extension;
+#[cfg(test)]
+mod fork_backport_guards;
 pub mod function_support;
 pub mod join_accumulator;
 pub mod managed_runtime;

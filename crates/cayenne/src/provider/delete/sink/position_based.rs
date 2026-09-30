@@ -619,7 +619,7 @@ impl CayenneDeletionSink {
                     })
                     .collect::<crate::provider::Result<Vec<_>>>()?;
 
-                let is_already_deleted = u32::try_from(row_position).ok().is_some_and(|pos| {
+                let is_already_deleted = u32::try_from(row_position).is_ok_and(|pos| {
                     already_deleted
                         .as_ref()
                         .is_some_and(|deletion_vector| deletion_vector.contains(pos))
@@ -957,12 +957,13 @@ fn build_vortex_filter(
         })
         .collect::<datafusion_common::Result<Vec<_>>>()?;
 
-    // Convert to Vortex expressions and combine with AND.
+    // Convert to Vortex expressions and combine with AND. A DELETE removes the
+    // rows its predicate is TRUE for, so each filter converts as a predicate.
     // When direct conversion fails (e.g., struct() IN-list from composite-key
     // deletes), try decomposing the expression into Vortex-compatible form.
     let mut combined: Option<vortex::expr::Expression> = None;
     for phys_filter in &physical_filters {
-        let vortex_expr = match expr_convertor.convert(phys_filter.as_ref()) {
+        let vortex_expr = match expr_convertor.convert_predicate(phys_filter.as_ref()) {
             Ok(expr) => expr,
             Err(_) => {
                 match try_decompose_struct_in_list(phys_filter.as_ref(), &expr_convertor, df_schema)
