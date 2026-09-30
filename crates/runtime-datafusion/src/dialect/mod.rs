@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock};
 
+use arrow_schema::DataType;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
@@ -262,20 +263,29 @@ pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> b
 /// `CAST(-1.5 AS INT)` is `-1`, and a `DECIMAL` is divided by its scale in
 /// integer arithmetic (`arrow-cast`'s `cast_decimal_to_integer`), so
 /// `CAST(2.49 AS INT)` is `2` too. `DuckDB`, `PostgreSQL` and MySQL round to
-/// the nearest integer instead — `2`, `-2` and `2` — and their `TRY_CAST`
-/// rounds the same way, so a cast pushed to any of them answers a different
-/// value than the same cast evaluated locally, and a filter over it selects
-/// different rows, with no error anywhere (issue #14482). Measured on `DuckDB`
-/// v1.4.4, `PostgreSQL` 18.6 and `MariaDB` 11.8: each answers `2`, `-2`, `3`
-/// for `CAST(1.5 AS INT)`, `CAST(-1.5 AS INT)`, `CAST(2.5 AS INT)`.
+/// the nearest integer instead — `2`, `-2` and `2` — so a cast pushed to any
+/// of them answers a different value than the same cast evaluated locally, and
+/// a filter over it selects different rows, with no error anywhere (issue
+/// #14482). Measured on `DuckDB` v1.4.4, `PostgreSQL` 18.6 and `MariaDB` 11.8:
+/// each answers `2`, `-2`, `3` for `CAST(1.5 AS INT)`, `CAST(-1.5 AS INT)`,
+/// `CAST(2.5 AS INT)`. `BigQuery` documents the same rounding (`CAST(1.5 AS
+/// INT64)` is `2`) and is refused on that documentation, not on a measurement.
+/// A `TRY_CAST` is refused alongside: `DuckDB`'s rounds like its `CAST`, and
+/// the engines that have no `TRY_CAST` at all would fail the query rather than
+/// answer it.
 ///
 /// The cast therefore stays local when its target is an integer type and its
 /// operand is a floating-point or decimal value — or cannot be proven not to
 /// be. `scope` is the schema the operand resolves against and is `None` where
 /// the type cannot be read; a column whose type will not resolve is refused
 /// rather than assumed integral, because assuming wrong is a wrong answer and
-/// refusing costs only the pushdown. A literal carries its own type and needs
-/// no scope. A cast from an integer, a boolean or a string is not this
+/// refusing costs only the pushdown. A table scan's own filter pushdown hands
+/// its filters to this check against the scan's *unqualified* schema while
+/// the filters name their columns with the table's qualifier, so a plain
+/// column that does not resolve as written is looked up by its bare name
+/// before it is given up on; an ambiguous bare name still counts as
+/// unresolved. A literal carries its own type and needs no scope. A cast from
+/// an integer, a boolean or a string is not this
 /// check's to refuse: the engines agree on an integral operand, and a
 /// fractional *string* fails `DataFusion`'s own cast rather than answering a
 /// different row.
@@ -296,13 +306,34 @@ pub(crate) fn integer_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) 
         return true;
     }
     let empty = DFSchema::empty();
-    match operand.get_type(scope.unwrap_or(&empty)) {
-        Ok(data_type) => !(data_type.is_floating() || data_type.is_decimal()),
-        // Deliberately not propagated: a node whose type will not resolve is
-        // treated as fractional, because unprovable and unsafe are the same
-        // answer for a check that must not admit a cast it cannot vouch for.
-        Err(_) => false,
+    match operand_type(operand, scope.unwrap_or(&empty)) {
+        Some(data_type) => !(data_type.is_floating() || data_type.is_decimal()),
+        // A node whose type will not resolve is treated as fractional, because
+        // unprovable and unsafe are the same answer for a check that must not
+        // admit a cast it cannot vouch for.
+        None => false,
     }
+}
+
+/// The type `operand` has in `scope`, or `None` where it cannot be read.
+///
+/// A plain column that does not resolve as written is retried by its bare
+/// name: the scan-level filter pushdown resolves against the scan's own
+/// unqualified schema while the filter names `t.n`, and refusing every such
+/// cast would cost the pushdown of an integral operand the engines agree on.
+/// An ambiguous bare name resolves to nothing, and the resolution error is
+/// deliberately not propagated — see the caller.
+fn operand_type(operand: &Expr, scope: &DFSchema) -> Option<DataType> {
+    if let Ok(data_type) = operand.get_type(scope) {
+        return Some(data_type);
+    }
+    let Expr::Column(column) = operand else {
+        return None;
+    };
+    scope
+        .field_with_unqualified_name(column.name())
+        .ok()
+        .map(|field| field.data_type().clone())
 }
 
 /// Names of the functions [`new_bigquery_dialect`] rewrites to native
@@ -392,6 +423,8 @@ mod tests {
         integer_cast_is_renderable, mysql_can_evaluate_expression, new_duckdb_dialect,
         postgres_can_evaluate_expression,
     };
+    use crate::function_support::bigquery_can_evaluate_expression;
+    use std::sync::Arc;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::DFSchema;
     use datafusion::functions::expr_fn::{concat, upper};
@@ -678,10 +711,11 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let engines: [(&str, fn(&Expr, Option<&DFSchema>) -> bool); 3] = [
+        let engines: [(&str, fn(&Expr, Option<&DFSchema>) -> bool); 4] = [
             ("DuckDB", duckdb_can_evaluate_expression),
             ("PostgreSQL", postgres_can_evaluate_expression),
             ("MySQL", mysql_can_evaluate_expression),
+            ("BigQuery", bigquery_can_evaluate_expression),
         ];
         for (engine, can_evaluate) in engines {
             for operand in &operands {
@@ -733,6 +767,47 @@ mod tests {
             assert!(postgres_can_evaluate_expression(&expr, Some(&scope)));
             assert!(mysql_can_evaluate_expression(&expr, Some(&scope)));
         }
+    }
+
+    /// The scan's own filter pushdown resolves against the scan's unqualified
+    /// schema while its filters name `t.n`: a qualified column is then looked
+    /// up by its bare name, so an integral operand still federates and a
+    /// fractional one is still refused. A name the scope does not hold, or
+    /// holds twice, resolves to nothing and is refused.
+    #[test]
+    fn a_qualified_column_is_resolved_by_name_against_the_scans_own_schema() {
+        let scope = scope_of(&[("n", DataType::Int64), ("f", DataType::Float64)]);
+        assert!(integer_cast_is_renderable(
+            &cast(col("t.n"), DataType::Int32),
+            Some(&scope)
+        ));
+        assert!(!integer_cast_is_renderable(
+            &cast(col("t.f"), DataType::Int32),
+            Some(&scope)
+        ));
+        assert!(!integer_cast_is_renderable(
+            &cast(col("t.x"), DataType::Int32),
+            Some(&scope)
+        ));
+
+        let ambiguous = DFSchema::new_with_metadata(
+            vec![
+                (
+                    Some("a".into()),
+                    Arc::new(Field::new("n", DataType::Int64, true)),
+                ),
+                (
+                    Some("b".into()),
+                    Arc::new(Field::new("n", DataType::Int64, true)),
+                ),
+            ],
+            std::collections::HashMap::new(),
+        )
+        .expect("two qualified columns of one name");
+        assert!(!integer_cast_is_renderable(
+            &cast(col("c.n"), DataType::Int32),
+            Some(&ambiguous)
+        ));
     }
 
     /// A literal carries its own type, so an all-literal call still federates

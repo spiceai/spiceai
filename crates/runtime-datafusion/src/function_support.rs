@@ -195,9 +195,14 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
 /// `LOWER` is not known to preserve Unicode, collation, pattern, and escape
 /// semantics, so either positive or negated case-insensitive `LIKE` stays
 /// local. Binary operator variants are intentionally outside this policy.
+///
+/// A cast from a fractional value into an integer stays local too: `BigQuery`
+/// documents that it rounds one where `DataFusion` truncates
+/// ([`crate::dialect::integer_cast_is_renderable`]).
 #[must_use]
-pub fn bigquery_can_evaluate_expression(expr: &Expr, _schema: Option<&DFSchema>) -> bool {
+pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     !matches!(expr, Expr::Like(like) if like.case_insensitive)
+        && crate::dialect::integer_cast_is_renderable(expr, schema)
 }
 
 /// `SQLite`-flavored deny-list as a value, for
@@ -597,6 +602,10 @@ mod tests {
                 deny_spice_functions_for_postgres_table_providers(),
             ),
             ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
         ] {
             for plan in [
                 plan_over_fractions(None, cast(col("f"), DataType::Int32)),
