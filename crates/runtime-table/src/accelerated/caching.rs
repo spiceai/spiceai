@@ -2735,13 +2735,19 @@ impl CachingScanInput {
                 let input = scan_params
                     .scan_and_optimize(accelerator.as_ref(), &filters_to_reapply)
                     .await?;
-                if input.schema() != schema {
+                if input.schema().fields() != schema.fields() {
                     tracing::debug!(expected = ?schema, actual = ?input.schema(), "Cache fallback schema mismatch");
                     return Err(DataFusionError::Execution(
                         "The cached response schema changed while fetching the origin".to_string(),
                     ));
                 }
-                Ok(input)
+                // Physical scans may omit schema-level table metadata. Keep the
+                // deferred node's output schema without accepting changed fields.
+                if input.schema() == schema {
+                    Ok(input)
+                } else {
+                    Ok(Arc::new(SchemaCastScanExec::new(input, schema)))
+                }
             }
         }
     }

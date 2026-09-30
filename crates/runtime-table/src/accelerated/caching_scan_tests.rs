@@ -473,6 +473,25 @@ async fn fallback_reads_replacements_and_evictions_after_outer_planning() {
 }
 
 #[tokio::test]
+async fn fallback_accepts_scan_schema_without_table_metadata() {
+    for transport_error in [false, true] {
+        let fixture = Fixture::source_first(503).await;
+        fixture.source.fail.store(transport_error, Ordering::SeqCst);
+        let plan = fixture.plan(QUERY).await;
+        let expected_schema = plan.schema();
+        let scan_schema = Arc::new(Schema::new(fixture.cache.schema.fields().clone()));
+        *fixture.cache.batches.write() =
+            vec![vec![row(&scan_schema, "key=a", "cached", 200, "system")]];
+        let batches = collect(plan, fixture.ctx.task_ctx())
+            .await
+            .expect("fallback with matching fields");
+        assert_eq!(contents(&batches), ["cached"]);
+        assert_eq!(batches[0].schema(), expected_schema);
+        assert_eq!(fixture.cache.scans.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn fallback_rejects_a_changed_storage_schema() {
     let fixture = Fixture::source_first(503).await;
     let plan = fixture.plan(QUERY).await;
