@@ -3967,7 +3967,7 @@ impl DataAccelerator for CayenneAccelerator {
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            let write_provider = upsert_dedup::wrap_with_upsert_dedup_for_overwrite(
                 cayenne_table,
                 &cmd.options,
                 cmd.constraints.clone(),
@@ -4152,7 +4152,7 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            let write_provider = upsert_dedup::wrap_with_upsert_dedup_for_overwrite(
                 partition_provider,
                 &cmd.options,
                 cmd.constraints.clone(),

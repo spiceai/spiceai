@@ -112,9 +112,14 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
   until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
 
-For a table with a primary key, a full refresh checks key uniqueness across the
-entire incoming stream before publishing the replacement, in both storage modes.
-A repeated or null key fails the refresh and leaves the prior table visible.
+For a table with a primary key, a full refresh resolves or validates key
+conflicts across the entire incoming stream before publishing the replacement,
+in both storage modes. `on_conflict: upsert` rejects a repeated key;
+`upsert_dedup` removes identical rows but rejects conflicting values; and
+`upsert_dedup_by_row_id` keeps the last row for each key. A null key fails the
+refresh and leaves the prior table visible. The two deduplication modes buffer
+the incoming overwrite in memory to resolve conflicts across batches, including
+when the acceleration uses `mode: file`.
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,

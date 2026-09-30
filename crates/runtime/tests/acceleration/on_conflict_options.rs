@@ -318,6 +318,45 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_no
     Ok::<(), anyhow::Error>(())
 }
 
+/// A Cayenne full refresh must apply last-write-wins across source batches.
+#[tokio::test]
+#[expect(clippy::expect_used)]
+async fn test_cayenne_full_refresh_dedup_by_row_id_across_batches() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let mut rows = vec![vec![Some("a"), Some("first")]; 8_192];
+            rows.push(vec![Some("a"), Some("last")]);
+            let mut data_builder =
+                TestCsvDataBuilder::with_columns(&["foo", "bar"]).add_batch(&rows);
+            data_builder.flush_to_file();
+
+            let mut dataset = data_builder.dataset("test");
+            dataset.acceleration = Some(
+                yaml::from_str("enabled: true\nengine: cayenne\nmode: memory\nrefresh_mode: full")
+                    .expect("Cayenne acceleration"),
+            );
+            let dataset = set_primary_key(dataset, "foo");
+            let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::UpsertDedupByRowId);
+            let app = AppBuilder::new("test_cayenne_full_refresh_dedup_by_row_id_across_batches")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            Arc::new(rt.clone()).load_components().await;
+            runtime_ready_check(&rt).await;
+
+            let result = get_query_result(&rt, "SELECT foo, bar FROM test").await;
+            assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_value(result, "foo", "a", "bar", "last").await;
+        })
+        .await;
+
+    Ok(())
+}
+
 #[expect(clippy::expect_used)]
 async fn get_query_result(rt: &Runtime, sql: &str) -> Vec<RecordBatch> {
     rt.datafusion()
