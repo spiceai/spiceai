@@ -85,7 +85,7 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::{
     array::{
@@ -98,26 +98,31 @@ use arrow::{
         StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
         Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        new_empty_array,
+        UInt64Array, make_array, new_empty_array,
     },
     buffer::{NullBuffer, OffsetBuffer},
-    compute::{CastOptions, cast, cast_with_options},
+    compute::{CastOptions, cast, cast_with_options, take},
     datatypes::{
         DataType, Field, FieldRef, IntervalDayTime, IntervalMonthDayNano, Schema, SchemaRef,
         TimeUnit, i256,
     },
+    row::{RowConverter, SortField},
 };
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{SchemaExt, utils::quote_identifier},
+    common::{
+        SchemaExt,
+        tree_node::{TreeNode, TreeNodeRecursion},
+        utils::quote_identifier,
+    },
     datasource::{
         TableProvider,
         sink::{DataSink, DataSinkExec},
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -543,6 +548,7 @@ impl TursoTableProvider {
             columns.push(Self::column_from_turso_values(
                 rows,
                 col_idx,
+                field.name(),
                 field.data_type(),
             )?);
         }
@@ -557,7 +563,10 @@ impl TursoTableProvider {
     /// The inverse of [`scalar_value_to_turso`], and it must stay one: a type that function stores
     /// but this one cannot rebuild is a column that writes without error and cannot be read back.
     ///
-    /// Recurses for `Dictionary`, whose values the write path stores unwrapped.
+    /// Recurses for `Dictionary`, whose values the write path stores unwrapped. `column` is the
+    /// field's name, so an error names the column at fault rather than leaving a dataset with
+    /// several columns of the same type to guess. It is user-chosen, so every message escapes
+    /// it: a name carrying a newline must not break a message that has to stay on one line.
     #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
@@ -567,6 +576,7 @@ impl TursoTableProvider {
     fn column_from_turso_values(
         rows: &[Vec<TursoValue>],
         col_idx: usize,
+        column: &str,
         data_type: &DataType,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let column: ArrayRef = match data_type {
@@ -777,7 +787,7 @@ impl TursoTableProvider {
             // reads as NULL rather than being padded or truncated to fit.
             DataType::FixedSizeBinary(width) => {
                 let expected = usize::try_from(*width).map_err(|_| {
-                        format!("Failed to read a column from Turso: {width} is not a valid fixed-size binary width")
+                        format!("Failed to read the column '{}' from Turso: {width} is not a valid fixed-size binary width", column.escape_debug())
                     })?;
                 let values = rows.iter().map(|row| match row.get(col_idx) {
                     Some(TursoValue::Blob(b)) if b.len() == expected => Some(b.as_slice()),
@@ -1131,19 +1141,22 @@ impl TursoTableProvider {
                 )
             }
             // `scalar_value_to_turso` stores a dictionary value unwrapped, so what is stored is
-            // whatever the value type stores. Rebuild that, then re-encode.
-            DataType::Dictionary(_, value_type) => {
-                let values = Self::column_from_turso_values(rows, col_idx, value_type)?;
-                cast(&values, data_type)?
+            // whatever the value type stores. Rebuild that, then dictionary-encode it directly:
+            // `cast` packs only primitive, string and binary value types, so a dictionary over a
+            // list, map, boolean, duration or interval column would write but fail every scan.
+            DataType::Dictionary(key_type, value_type) => {
+                let values = Self::column_from_turso_values(rows, col_idx, column, value_type)?;
+                dictionary_encode(&values, key_type, data_type, column)?
             }
             // Rebuilding an unhandled type as a string only defers the failure to
             // `RecordBatch::try_new`, which reports it as a mismatch against whichever column
             // it compares first, so name the type here instead.
             other => {
                 return Err(format!(
-                        "Failed to read a column from Turso: the {other} type is not supported by the Turso accelerator. \
+                        "Failed to read the column '{}' from Turso: the {other} type is not supported by the Turso accelerator. \
                         Cast the column to a supported type, or accelerate this dataset with a different engine. \
-                        See: https://spiceai.org/docs/components/data-accelerators/turso"
+                        See: https://spiceai.org/docs/components/data-accelerators/turso",
+                        column.escape_debug()
                     )
                     .into());
             }
@@ -1220,23 +1233,6 @@ impl TursoTableProvider {
             Ok(ast)
         })
     }
-
-    /// Returns `true` if the expression contains any subquery or outer reference column.
-    fn contains_subquery_or_outer_ref(expr: &Expr) -> bool {
-        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-        let mut found = false;
-        let _ = expr.apply(|e| match e {
-            Expr::ScalarSubquery(_)
-            | Expr::InSubquery(_)
-            | Expr::Exists(_)
-            | Expr::OuterReferenceColumn(_, _) => {
-                found = true;
-                Ok(TreeNodeRecursion::Stop)
-            }
-            _ => Ok(TreeNodeRecursion::Continue),
-        });
-        found
-    }
 }
 
 #[async_trait]
@@ -1258,12 +1254,16 @@ impl TableProvider for TursoTableProvider {
 
         let mut filter_push_down = vec![];
         for filter in filters {
-            // Expressions containing subqueries or outer references must not be pushed down.
-            // For federated providers, subqueries are handled at the plan level and pushing them
-            // into `TableScan.full_filters` is not beneficial. Subqueries may also reference tables
-            // in other databases not accessible from this Turso connection, and outer references
-            // refer to columns from an enclosing query that the table provider cannot resolve.
-            let pushdown = if Self::contains_subquery_or_outer_ref(filter) {
+            // An expression the scan cannot evaluate — a subquery in any of its
+            // forms, an outer reference, an unnest — must stay above the scan for
+            // decorrelation. The federation analyzer runs filter pushdown over the
+            // whole plan before decorrelation, so a subquery accepted here is written
+            // into the scan and rendered as Turso SQL verbatim: `v > ANY (SELECT …)`
+            // is a syntax error there (issue #14041), and a subquery may also name a
+            // table this connection cannot reach. The shared helper is exhaustive
+            // over `Expr`, so a new variant is a build failure rather than a filter
+            // the unparser happens to render and Turso then rejects.
+            let pushdown = if util::expr::cannot_be_evaluated_at_scan(filter) {
                 TableProviderFilterPushDown::Unsupported
             } else {
                 match unparser.expr_to_sql(filter) {
@@ -1364,6 +1364,23 @@ impl TursoTableProvider {
     }
 }
 
+/// Whether any expression of `plan`, including those of the subqueries nested in
+/// its expressions, is a quantified comparison (`ANY`/`ALL`).
+fn plan_contains_set_comparison(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            found = expr.exists(|e| Ok(matches!(e, Expr::SetComparison(_))))?;
+            if found {
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
 #[async_trait]
 impl SQLExecutor for TursoTableProvider {
     fn name(&self) -> &str {
@@ -1372,6 +1389,17 @@ impl SQLExecutor for TursoTableProvider {
 
     fn compute_context(&self) -> Option<String> {
         Some(self.pool.db_path().to_string())
+    }
+
+    /// A quantified comparison (`ANY`/`ALL`) has no spelling in Turso's SQL
+    /// grammar, and the federation analyzer resolves the subqueries under
+    /// `EXISTS`, `IN` and scalar subqueries but not the one under a
+    /// `SetComparison`, so a plan carrying one would be rendered verbatim and
+    /// rejected with a syntax error (issue #14041). Refusing the plan makes the
+    /// analyzer federate its children instead and leaves the comparison to
+    /// `DataFusion`, which rewrites it into `EXISTS` form and decorrelates it.
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        !plan_contains_set_comparison(plan)
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
@@ -2104,14 +2132,11 @@ fn convert_timestamp_to_turso(
 /// A type this function cannot represent returns an error rather than `NULL`, so a column the
 /// accelerator cannot store fails the write instead of reading back as a column of nulls.
 ///
-/// # Read support is narrower
+/// # Read support must stay as wide
 ///
-/// [`TursoTableProvider::values_to_record_batch`] reconstructs fewer types than this function
-/// stores: a list only with `Int32` elements, a map only from `Utf8` to `Int32`, and neither
-/// `LargeList`, `FixedSizeList`, `Dictionary`, `Float16` nor `FixedSizeBinary` at all. A column of
-/// one of those types fails its scan with an Arrow schema mismatch whatever is stored for it, so
-/// writing the value faithfully is what makes the stored data correct once the read side catches
-/// up. See #12631.
+/// [`TursoTableProvider::values_to_record_batch`] is the inverse of this function. A type this
+/// function stores but that one cannot rebuild is a column that writes without error and can
+/// never be read back, so a new arm here needs its counterpart there.
 #[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
@@ -2447,6 +2472,107 @@ struct DecodedMaps {
     values: ArrayRef,
     lengths: Vec<usize>,
     validity: Vec<bool>,
+}
+
+/// Dictionary-encodes `values` as `dictionary_type`, whose keys are `key_type`.
+///
+/// `arrow::compute::cast` packs only primitive, string and binary value types into a dictionary,
+/// so a dictionary over a list, map, boolean, duration or interval column that the write path
+/// stored without complaint would fail every scan with a raw `CastError`. This builds the array
+/// directly instead. Distinct values are found through the row format (see [`row_encodable`]),
+/// so the dictionary is as compact as `cast` makes one and the keys a scan needs grow with the
+/// distinct values, not the row count; a value type the row format cannot express at all gets
+/// one entry per row. Either way a NULL stays a NULL key, and a column with more entries than
+/// `key_type` can index is refused with an error that names the column and the key type rather
+/// than an Arrow-internal one.
+fn dictionary_encode(
+    values: &ArrayRef,
+    key_type: &DataType,
+    dictionary_type: &DataType,
+    column: &str,
+) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+    let (keys, distinct): (Vec<Option<u64>>, ArrayRef) =
+        if let Some(encodable) = row_encodable(values) {
+            let rows = RowConverter::new(vec![SortField::new(encodable.data_type().clone())])?
+                .convert_columns(std::slice::from_ref(&encodable))?;
+            let rows: Vec<_> = rows.iter().collect();
+            let mut key_of_row: HashMap<&[u8], u64> = HashMap::new();
+            let mut distinct_indices: Vec<u64> = Vec::new();
+            let keys = (0..values.len())
+                .map(|index| {
+                    if values.is_null(index) {
+                        return None;
+                    }
+                    let next_key = distinct_indices.len() as u64;
+                    let key = *key_of_row.entry(rows[index].as_ref()).or_insert_with(|| {
+                        distinct_indices.push(index as u64);
+                        next_key
+                    });
+                    Some(key)
+                })
+                .collect();
+            let distinct = take(values.as_ref(), &UInt64Array::from(distinct_indices), None)?;
+            (keys, distinct)
+        } else {
+            let keys = (0..values.len())
+                .map(|index| (!values.is_null(index)).then_some(index as u64))
+                .collect();
+            (keys, Arc::clone(values))
+        };
+
+    let data = cast_with_options(
+        &UInt64Array::from(keys),
+        key_type,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to read the dictionary column '{}' from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
+            Re-create the dataset with a wider dictionary key type, or accelerate it with a different engine. \
+            See: https://spiceai.org/docs/components/data-accelerators/turso",
+            column.escape_debug(),
+            distinct.len()
+        )
+    })?
+    .to_data()
+    .into_builder()
+    .data_type(dictionary_type.clone())
+    .add_child_data(distinct.to_data())
+    .build()?;
+    Ok(make_array(data))
+}
+
+/// The array whose rows stand in for `values` in the row format: `values` itself where the row
+/// format supports its type, a map as the list of entry structs it is stored as (the row format
+/// encodes lists and structs but not maps), or `None` when neither is encodable.
+///
+/// Re-reading a map as a list is exact: a `MapArray` is a `ListArray` of its entries with a
+/// different type tag, so equal maps encode to equal rows and different maps to different ones.
+fn row_encodable(values: &ArrayRef) -> Option<ArrayRef> {
+    let supports = |array: &ArrayRef| {
+        RowConverter::supports_fields(&[SortField::new(array.data_type().clone())])
+    };
+    if supports(values) {
+        return Some(Arc::clone(values));
+    }
+    let DataType::Map(entries_field, _) = values.data_type() else {
+        return None;
+    };
+    let map = values.as_any().downcast_ref::<MapArray>()?;
+    let entries: ArrayRef = Arc::new(map.entries().clone());
+    let list: ArrayRef = Arc::new(
+        GenericListArray::<i32>::try_new(
+            Arc::clone(entries_field),
+            map.offsets().clone(),
+            entries,
+            map.nulls().cloned(),
+        )
+        .ok()?,
+    );
+    supports(&list).then_some(list)
 }
 
 /// Rebuilds a `List` or `LargeList` column, which differ only in the width of their offsets.
@@ -2977,12 +3103,13 @@ impl VisitorMut for TursoBetweenVisitor {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, Int32Builder, Int64Array, Int64Builder, ListBuilder, MapBuilder, StringArray,
-        StringBuilder,
+        ArrayRef, DictionaryArray, FixedSizeListBuilder, Int32Builder, Int64Array, Int64Builder,
+        ListArray, ListBuilder, MapBuilder, StringArray, StringBuilder,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::prelude::SessionContext;
     use datafusion::sql::sqlparser::parser::Parser;
 
     async fn create_turso_sink(table_name: &str) -> (Arc<TursoConnectionPool>, TursoDataSink) {
@@ -3089,6 +3216,211 @@ mod tests {
             let _ = stmt.visit(&mut visitor);
         }
         stmts[0].to_string()
+    }
+
+    /// The quantified comparisons #14041 reports, each paired with the ids it
+    /// returns over [`quantified_comparison_fixture`]. The expected ids are the
+    /// ones the same fixture yields through every other accelerator.
+    const QUANTIFIED_COMPARISON_QUERIES: &[(&str, &[i64])] = &[
+        (
+            "SELECT id FROM items WHERE v > ANY (SELECT val FROM details)",
+            &[1, 2, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details)",
+            &[2, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE id > ALL (SELECT item_id FROM details)",
+            &[],
+        ),
+        (
+            "SELECT id FROM items WHERE v > ALL (SELECT val FROM details WHERE val > 100)",
+            &[1, 2, 3, 4],
+        ),
+        (
+            "SELECT id FROM items WHERE v > ANY (SELECT val FROM details WHERE item_id = id)",
+            &[2],
+        ),
+        (
+            "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details WHERE item_id = id)",
+            &[2, 3, 4],
+        ),
+    ];
+
+    /// Two Turso tables registered through the federation analyzer, the way the
+    /// runtime registers an accelerator. The analyzer runs filter pushdown over
+    /// the whole plan before decorrelation, so a `WHERE` the provider accepts
+    /// as `Exact` is written into the scan and rendered as Turso SQL verbatim.
+    async fn quantified_comparison_fixture() -> (Arc<TursoConnectionPool>, SessionContext) {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        for sql in [
+            "CREATE TABLE items (id INTEGER, v INTEGER)",
+            "INSERT INTO items VALUES (1, 10), (2, 20), (3, NULL), (4, 40)",
+            "CREATE TABLE details (item_id INTEGER, val INTEGER)",
+            "INSERT INTO details VALUES (1, 10), (1, 20), (2, 5), (NULL, 7)",
+        ] {
+            conn.execute(sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+
+        let ctx = SessionContext::new_with_state(datafusion_federation::default_session_state());
+        for (table, schema) in [
+            ("items", items_schema()),
+            (
+                "details",
+                Arc::new(Schema::new(vec![
+                    Field::new("item_id", DataType::Int64, true),
+                    Field::new("val", DataType::Int64, false),
+                ])),
+            ),
+        ] {
+            let provider = Arc::new(TursoTableProvider::new(
+                schema,
+                table.to_string(),
+                Arc::clone(&pool),
+            ));
+            let federated = provider
+                .create_federated_table_provider()
+                .expect("federated table provider should be created");
+            ctx.register_table(table, Arc::new(federated))
+                .expect("table should register");
+        }
+        (pool, ctx)
+    }
+
+    fn items_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]))
+    }
+
+    fn sorted_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("the query returns BIGINT ids")
+                    .iter()
+                    .flatten()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn quantified_comparisons_are_answered_rather_than_pushed_into_turso_sql() {
+        let (_pool, ctx) = quantified_comparison_fixture().await;
+        let mut failures = Vec::new();
+        for &(query, expected) in QUANTIFIED_COMPARISON_QUERIES {
+            let result = async { ctx.sql(query).await?.collect().await }.await;
+            match result {
+                Ok(batches) => {
+                    let ids = sorted_ids(&batches);
+                    if ids != expected {
+                        failures.push(format!("{query}: expected {expected:?}, got {ids:?}"));
+                    }
+                }
+                Err(error) => failures.push(format!("{query}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "an ANY/ALL comparison must stay above the scan for decorrelation, not be rendered \
+             as Turso SQL:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_comparison_filter_is_declined_for_pushdown() {
+        let (pool, ctx) = quantified_comparison_fixture().await;
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT id FROM items WHERE v > ANY (SELECT val FROM details)")
+            .await
+            .expect("the statement should plan");
+        let mut predicate = None;
+        plan.apply(|node| {
+            if let LogicalPlan::Filter(filter) = node {
+                predicate = Some(filter.predicate.clone());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("the plan walk cannot fail");
+        let predicate = predicate.expect("the statement has a WHERE clause");
+        assert!(
+            matches!(predicate, Expr::SetComparison(_)),
+            "the premise: the planner keeps ANY/ALL as a SetComparison, got {predicate}"
+        );
+
+        let provider = TursoTableProvider::new(items_schema(), "items".to_string(), pool);
+        let support = TableProvider::supports_filters_pushdown(&provider, &[&predicate])
+            .expect("pushdown support should be reported");
+        assert_eq!(
+            support,
+            vec![TableProviderFilterPushDown::Unsupported],
+            "a filter the scan cannot evaluate must be declined, not claimed Exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_carrying_a_set_comparison_is_refused_for_federation() {
+        let (pool, ctx) = quantified_comparison_fixture().await;
+        let provider = TursoTableProvider::new(items_schema(), "items".to_string(), pool);
+        let plan_for = |sql: &'static str| {
+            let state = ctx.state();
+            async move {
+                state
+                    .create_logical_plan(sql)
+                    .await
+                    .expect("the statement should plan")
+            }
+        };
+
+        let quantified =
+            plan_for("SELECT id FROM items WHERE v > ANY (SELECT val FROM details)").await;
+        assert!(
+            !SQLExecutor::can_execute_plan(&provider, &quantified),
+            "Turso has no ANY/ALL, so the plan must stay with DataFusion:\n{}",
+            quantified.display_indent()
+        );
+
+        // Nested one level down, where a walk that ignores subqueries misses it.
+        let nested = plan_for(
+            "SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val > ANY (SELECT v FROM items))",
+        )
+        .await;
+        assert!(
+            !SQLExecutor::can_execute_plan(&provider, &nested),
+            "a comparison inside a subquery is rendered too:\n{}",
+            nested.display_indent()
+        );
+
+        // The control: the shapes the analyzer does resolve keep federating.
+        let control =
+            plan_for("SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id) AND v > 5")
+                .await;
+        assert!(
+            SQLExecutor::can_execute_plan(&provider, &control),
+            "EXISTS and plain filters are still federated:\n{}",
+            control.display_indent()
+        );
     }
 
     #[tokio::test]
@@ -3686,6 +4018,15 @@ mod tests {
         };
         assert_eq!(millis, 5_000, "5s should convert to 5000ms");
     }
+    /// The map `{"k": 1}` as a one-row `Utf8` to `Int64` map scalar.
+    fn single_entry_map() -> ScalarValue {
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        map.keys().append_value("k");
+        map.values().append_value(1);
+        map.append(true).expect("map row should append");
+        ScalarValue::Map(Arc::new(map.finish()))
+    }
+
     /// Builds a `ScalarValue::List` holding one list of nullable `Int32` elements.
     fn int32_list_scalar(elements: Vec<Option<i32>>) -> ScalarValue {
         let mut builder = ListBuilder::new(Int32Builder::new());
@@ -4546,6 +4887,171 @@ mod tests {
             .expect("a dictionary column should be readable");
         assert!(batch.column(0).is_valid(0));
         assert!(batch.column(0).is_null(1), "a NULL should stay NULL");
+    }
+
+    /// A dictionary over a nested, boolean, duration or interval value type round-trips. `cast`
+    /// cannot dictionary-pack any of those value types, so the reader has to build the dictionary
+    /// itself; a column it could not would write without error and never read back.
+    #[test]
+    fn test_values_to_record_batch_reads_a_dictionary_over_each_unpackable_value_type() {
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(int32_list_scalar(vec![Some(7)])),
+        ));
+
+        let mut fixed = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fixed.values().append_value(1);
+        fixed.values().append_value(2);
+        fixed.append(true);
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::UInt8),
+            Box::new(ScalarValue::FixedSizeList(Arc::new(fixed.finish()))),
+        ));
+
+        // The row format cannot encode a map; it is re-read as the list of entry structs it is.
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(single_entry_map()),
+        ));
+
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int16),
+            Box::new(ScalarValue::Boolean(Some(true))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::DurationMillisecond(Some(1_500))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::IntervalYearMonth(Some(14))),
+        ));
+    }
+
+    /// Rows holding the same value share one dictionary entry, a NULL stays a NULL key, and the
+    /// keys are built as the type the column declares.
+    #[test]
+    fn test_values_to_record_batch_dictionary_encodes_repeated_nested_values_once() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                )))),
+            ),
+            true,
+        )]));
+        let stored = |elements: Vec<Option<i32>>| {
+            scalar_value_to_turso(int32_list_scalar(elements), TimestampFormat::default())
+                .expect("a list should be storable")
+        };
+        let rows = vec![
+            vec![stored(vec![Some(1), Some(2)])],
+            vec![stored(vec![Some(3)])],
+            vec![stored(vec![Some(1), Some(2)])],
+            vec![TursoValue::Null],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a dictionary of lists should be readable");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("dictionary values should be lists");
+        assert_eq!(
+            values.len(),
+            2,
+            "two distinct lists should make two entries"
+        );
+        assert_eq!(
+            dictionary.keys().value(0),
+            dictionary.keys().value(2),
+            "equal lists should share an entry"
+        );
+        assert_ne!(dictionary.keys().value(0), dictionary.keys().value(1));
+        assert!(dictionary.is_null(3), "a NULL should stay NULL");
+        let first_key =
+            usize::try_from(dictionary.keys().value(0)).expect("a key should index the values");
+        let first = values.value(first_key);
+        let elements = first
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("elements should be Int32");
+        assert_eq!(elements.values(), &[1, 2]);
+    }
+
+    /// Equal maps share one dictionary entry too, so the keys a scan needs grow with the distinct
+    /// maps rather than with the rows: a run of NULLs and repeated maps longer than the key type's
+    /// range reads back, where one key per row would have overflowed it.
+    #[test]
+    fn test_values_to_record_batch_dictionary_of_maps_shares_entries_past_the_key_range() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(single_entry_map().data_type()),
+            ),
+            true,
+        )]));
+        let stored = scalar_value_to_turso(single_entry_map(), TimestampFormat::default())
+            .expect("a map should be storable");
+        // 128 NULL rows push every later row position past an Int8 key, then 129 equal maps.
+        let rows: Vec<Vec<TursoValue>> = std::iter::repeat_n(vec![TursoValue::Null], 128)
+            .chain(std::iter::repeat_n(vec![stored], 129))
+            .collect();
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("repeated maps need one key, however many rows hold them");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        assert_eq!(
+            dictionary.values().len(),
+            1,
+            "equal maps should share one entry"
+        );
+        assert!(dictionary.is_null(0) && dictionary.is_null(127));
+        assert!(dictionary.is_valid(128) && dictionary.is_valid(256));
+        assert_eq!(dictionary.keys().value(128), dictionary.keys().value(256));
+    }
+
+    /// A column with more distinct values than its declared key type can index is refused with an
+    /// error that names the key type, not with an Arrow-internal message.
+    #[test]
+    fn test_values_to_record_batch_names_a_dictionary_whose_keys_overflow() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        // Int8 keys index 128 entries; one more distinct value has nowhere to go.
+        let rows: Vec<Vec<TursoValue>> = (0..129)
+            .map(|i| vec![TursoValue::Text(format!("v{i}"))])
+            .collect();
+
+        let Err(e) = TursoTableProvider::values_to_record_batch(&rows, &schema) else {
+            panic!("129 distinct values cannot be indexed by Int8 keys");
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains("column 'c'")
+                && message.contains("Int8")
+                && message.contains("129 entries"),
+            "the error should name the column, the key type and the entry count: {message}"
+        );
     }
 
     /// `FixedSizeBinary` had no arm, and a blob of another width cannot fill the cell.

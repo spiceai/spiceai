@@ -304,7 +304,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             dataset: dataset.to_string(),
-            session_config: SessionConfig::default(),
+            session_config: util::session_state::session_config(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,
@@ -461,6 +461,18 @@ impl CayenneContext {
     #[must_use]
     pub fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
+    }
+
+    /// Get the explicit multi-dimensional clustering columns.
+    #[must_use]
+    pub fn cluster_by(&self) -> &[String] {
+        &self.config.cluster_by
+    }
+
+    /// Whether the operator configured multi-dimensional clustering.
+    #[must_use]
+    pub fn has_cluster_by(&self) -> bool {
+        !self.config.cluster_by.is_empty()
     }
 
     /// Whether [`Self::sort_columns`] is an operator statement of intent rather

@@ -91,6 +91,8 @@ pub enum Error {
         "The input format {input_format} for table '{table}' is not supported. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     InvalidInputFormat { input_format: String, table: String },
+    #[snafu(display("{}", unsupported_transactional_orc_message(table)))]
+    UnsupportedTransactionalOrc { table: String },
     #[snafu(display(
         "No storage descriptor found for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
@@ -202,7 +204,7 @@ impl GlueDataConnector {
                 source: Box::new(e),
             }
         })? {
-            input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
+            input_format @ (InputFormat::Parquet | InputFormat::Csv | InputFormat::Orc) => {
                 create_s3_provider(
                     context,
                     input_format,
@@ -316,14 +318,23 @@ pub enum InputFormat {
     // Json,
     // Xml,
     Parquet,
-    // Orc,
+    Orc,
     Iceberg,
 }
 
 /// The formats above, for the user-facing message naming what Spice can read.
 /// It lives beside the variants so enabling one of the commented-out formats
 /// does not leave a diagnostic claiming Spice cannot read it.
-pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, iceberg";
+pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, orc, iceberg";
+
+/// Listing `file_extension` Glue sets when `InputFormat` already selected
+/// Parquet or ORC. Shared listing then accepts extensionless Hive objects.
+const GLUE_FORMAT_SELECTED_FILE_EXTENSION: &str = "*";
+
+fn glue_format_selected_file_extension(input_format: InputFormat) -> Option<&'static str> {
+    matches!(input_format, InputFormat::Parquet | InputFormat::Orc)
+        .then_some(GLUE_FORMAT_SELECTED_FILE_EXTENSION)
+}
 
 impl InputFormat {
     /// Return the file format of the [`InputFormat`]. For
@@ -333,9 +344,35 @@ impl InputFormat {
         match self {
             InputFormat::Csv => "csv",
             InputFormat::Parquet => "parquet",
+            InputFormat::Orc => "orc",
             InputFormat::Iceberg => "iceberg",
         }
     }
+}
+
+/// Hive and Glue store boolean table properties as strings. These are the
+/// values writers emit for a true property (`transactional=true`).
+fn hive_table_parameter_is_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "1"
+    )
+}
+
+fn is_hive_transactional(table: &Table) -> bool {
+    table
+        .parameters
+        .as_ref()
+        .and_then(|params| params.get("transactional"))
+        .is_some_and(|value| hive_table_parameter_is_true(value))
+}
+
+/// User-facing refusal for Hive ACID ORC. Catalog listing records the table
+/// as unreadable through the same [`InputFormat::try_from`] error.
+fn unsupported_transactional_orc_message(table: &str) -> String {
+    format!(
+        "Cannot read Hive ACID/transactional ORC table '{table}', so queries against it will not resolve. Spice does not support Hive ACID snapshot semantics (`base_*`, `delta_*`, `delete_delta_*`). Export or materialize the current snapshot into a genuinely non-transactional ORC location and register that table instead. See: https://docs.spiceai.org/components/data-connectors/glue"
+    )
 }
 
 impl TryFrom<&Table> for InputFormat {
@@ -362,16 +399,23 @@ impl TryFrom<&Table> for InputFormat {
             });
         };
 
-        Ok(match input_format {
-            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
-            "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
-            input_format => {
-                return Err(Error::InvalidInputFormat {
-                    input_format: input_format.to_string(),
-                    table: table.name().to_string(),
-                });
+        match input_format {
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Ok(Self::Parquet),
+            "org.apache.hadoop.mapred.TextInputFormat" => Ok(Self::Csv),
+            "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat" => {
+                ensure!(
+                    !is_hive_transactional(table),
+                    UnsupportedTransactionalOrcSnafu {
+                        table: table.name().to_string(),
+                    }
+                );
+                Ok(Self::Orc)
             }
-        })
+            input_format => Err(Error::InvalidInputFormat {
+                input_format: input_format.to_string(),
+                table: table.name().to_string(),
+            }),
+        }
     }
 }
 
@@ -545,10 +589,16 @@ async fn create_s3_provider(
                 params.insert("csv_delimiter".to_string(), delimiter.as_str().into());
             }
         }
-        InputFormat::Parquet => {
+        InputFormat::Parquet | InputFormat::Orc => {
             dataset
                 .params
                 .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+            // Glue's InputFormat is authoritative. Hive often writes
+            // extensionless objects (`000000_0`); `*` tells listing to accept
+            // those plus the format suffix and to skip job-marker files.
+            if let Some(file_extension) = glue_format_selected_file_extension(input_format) {
+                params.insert("file_extension".into(), file_extension.into());
+            }
         }
         InputFormat::Iceberg => {}
     }
@@ -624,5 +674,101 @@ mod tests {
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
+
+    fn orc_glue_table(name: &str, transactional: Option<&str>) -> Table {
+        let descriptor = aws_sdk_glue::types::StorageDescriptor::builder()
+            .input_format("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat")
+            .build();
+        let mut builder = Table::builder().name(name).storage_descriptor(descriptor);
+        if let Some(value) = transactional {
+            builder = builder.parameters("transactional", value);
+        }
+        builder.build().expect("a Glue ORC table with a name")
+    }
+
+    #[test]
+    fn orc_glue_tables_use_the_listing_orc_format() {
+        assert_eq!(InputFormat::Orc.file_format(), "orc");
+    }
+
+    #[test]
+    fn hive_table_parameter_is_true_accepts_hive_truthy_values() {
+        for value in ["true", "TRUE", " True ", "yes", "YES", "1"] {
+            assert!(
+                hive_table_parameter_is_true(value),
+                "{value} is a Hive true table property"
+            );
+        }
+        for value in ["false", "FALSE", "no", "0", "", "maybe"] {
+            assert!(
+                !hive_table_parameter_is_true(value),
+                "{value} is not a Hive true table property"
+            );
+        }
+    }
+
+    #[test]
+    fn transactional_orc_glue_tables_are_refused() {
+        for value in ["true", "TRUE", "yes", "1"] {
+            let table = orc_glue_table("acid_orders", Some(value));
+            let err = InputFormat::try_from(&table)
+                .expect_err("a transactional ORC Glue table must be refused");
+            assert!(
+                matches!(err, Error::UnsupportedTransactionalOrc { ref table } if table == "acid_orders"),
+                "transactional={value} must be UnsupportedTransactionalOrc, got {err:?}"
+            );
+            let message = err.to_string();
+            assert_eq!(
+                message,
+                unsupported_transactional_orc_message("acid_orders")
+            );
+            assert!(
+                message.contains("Export or materialize")
+                    && message.contains("genuinely non-transactional ORC location"),
+                "directs the user to a rewritten snapshot, not a property flip: {message}"
+            );
+            assert!(
+                !message.contains("`transactional` to `false`")
+                    && !message.contains("transactional=false"),
+                "must not suggest flipping Glue `transactional`: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "the refusal must stay on one line: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_transactional_orc_glue_tables_map_to_orc() {
+        for table in [
+            orc_glue_table("orders", None),
+            orc_glue_table("orders", Some("false")),
+            orc_glue_table("orders", Some("0")),
+            orc_glue_table("orders", Some("no")),
+        ] {
+            assert_eq!(
+                InputFormat::try_from(&table).expect("ordinary ORC must map"),
+                InputFormat::Orc
+            );
+        }
+    }
+
+    #[test]
+    fn glue_parquet_and_orc_enable_extensionless_hive_listing() {
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Orc),
+            Some("*")
+        );
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Parquet),
+            Some("*")
+        );
+        assert_eq!(glue_format_selected_file_extension(InputFormat::Csv), None);
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Iceberg),
+            None
+        );
     }
 }

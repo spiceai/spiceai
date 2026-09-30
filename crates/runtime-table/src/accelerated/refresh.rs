@@ -24,7 +24,7 @@ use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId};
-use crate::accelerated::refresh_task::RefreshTask;
+use crate::accelerated::refresh_task::{RefreshOutcome, RefreshTask};
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
     create_periodic_snapshot_callback, spawn_snapshot_interval_task,
@@ -1124,9 +1124,10 @@ impl Refresher {
                     Some((request_id, res)) = on_refresh_complete.recv() => {
                         tracing::debug!("Received refresh task completion callback for request {request_id}: {res:?}");
 
-                        let refresh_succeeded = matches!(&res, Ok(()));
+                        let refresh_succeeded = res.is_ok();
                         // A retention failure can happen after a successful write, so cached
                         // query results must be invalidated even though the refresh reports an error.
+                        // An `UpToDate` refresh wrote nothing, so cached results stay valid.
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
                         if refresh_succeeded {
@@ -1295,10 +1296,10 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
         .as_nanos()
 }
 
-fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
+fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) -> bool {
     matches!(
         result,
-        Ok(()) | Err(super::Error::FailedToApplyRetentionSql { .. })
+        Ok(RefreshOutcome::Refreshed) | Err(super::Error::FailedToApplyRetentionSql { .. })
     )
 }
 
@@ -1495,7 +1496,12 @@ mod tests {
 
     #[test]
     fn test_refresh_result_changed_accelerator() {
-        assert!(refresh_result_changed_accelerator(&Ok(())));
+        assert!(refresh_result_changed_accelerator(&Ok(
+            RefreshOutcome::Refreshed
+        )));
+        assert!(!refresh_result_changed_accelerator(&Ok(
+            RefreshOutcome::UpToDate
+        )));
 
         assert!(refresh_result_changed_accelerator(&Err(
             super::super::Error::FailedToApplyRetentionSql {
@@ -1811,6 +1817,7 @@ mod tests {
 
     async fn setup_and_test(
         status: Arc<status::RuntimeStatus>,
+        dataset: &TableReference,
         source_data: Vec<&str>,
         existing_data: Vec<&str>,
         expected_size: usize,
@@ -1845,7 +1852,7 @@ mod tests {
         let refresh_completion = RefreshCompletion::new();
         let mut refresher = Refresher::new(
             status,
-            TableReference::bare("test"),
+            dataset.clone(),
             federated,
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
@@ -1895,6 +1902,7 @@ mod tests {
         let status = status::RuntimeStatus::new();
         setup_and_test(
             Arc::clone(&status),
+            &TableReference::bare("test"),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
@@ -1902,6 +1910,7 @@ mod tests {
         .await;
         setup_and_test(
             Arc::clone(&status),
+            &TableReference::bare("test"),
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![
                 "1970-01-01",
@@ -1914,6 +1923,7 @@ mod tests {
         .await;
         setup_and_test(
             Arc::clone(&status),
+            &TableReference::bare("test"),
             vec![],
             vec![
                 "1970-01-01",
@@ -1932,7 +1942,11 @@ mod tests {
         /// global, so the family holds one series per dataset any concurrently
         /// running test has registered. Select the series by its `dataset`
         /// label — reading the first one makes this assertion depend on which
-        /// other tests happen to be in flight.
+        /// other tests happen to be in flight. The label value must also be
+        /// unique to this test: every test's `RuntimeStatus` records into the
+        /// same series for a given name, so a sibling refreshing a dataset
+        /// called `test` overwrites this one's `Ready` (regression test for
+        /// #13708).
         async fn wait_until_ready_status(
             registry: &prometheus::Registry,
             dataset: &str,
@@ -1964,14 +1978,13 @@ mod tests {
 
         let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
 
+        let dataset = TableReference::bare("refresh_status_change_to_ready");
         let status = status::RuntimeStatus::new();
-        status.update_dataset(
-            &TableReference::bare("test"),
-            status::ComponentStatus::Refreshing,
-        );
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
 
         setup_and_test(
             Arc::clone(&status),
+            &dataset,
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
@@ -1982,7 +1995,7 @@ mod tests {
         assert!(
             wait_until_ready_status(
                 &registry,
-                "test",
+                dataset.table(),
                 status::ComponentStatus::Ready,
                 60,
                 Duration::from_millis(50)
@@ -1991,17 +2004,14 @@ mod tests {
             "Status did not change to Ready within timeout"
         );
 
-        status.update_dataset(
-            &TableReference::bare("test"),
-            status::ComponentStatus::Refreshing,
-        );
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
 
-        setup_and_test(Arc::clone(&status), vec![], vec![], 0).await;
+        setup_and_test(Arc::clone(&status), &dataset, vec![], vec![], 0).await;
 
         assert!(
             wait_until_ready_status(
                 &registry,
-                "test",
+                dataset.table(),
                 status::ComponentStatus::Ready,
                 60,
                 Duration::from_millis(50)

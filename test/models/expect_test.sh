@@ -169,6 +169,38 @@ assert_reports 'Sending "how many issues?"'
 assert_reports 'exited with status 3'
 assert_silent_about 'REACHED THE END'
 
+# SPICE_CHAT_EXPECT_TIMEOUT overrides the script default when it is a positive
+# integer, and is rejected when it is not.
+helper_case 'SPICE_CHAT_EXPECT_TIMEOUT overrides the default' '
+set ::env(SPICE_CHAT_EXPECT_TIMEOUT) 7
+set t [repl_timeout_seconds 120]
+if {$t != 7} { send_user "got $t\n"; exit 1 }
+send_user "OVERRIDE_OK\n"
+exit 0
+'
+assert_status 0
+assert_reports 'OVERRIDE_OK'
+
+helper_case 'absent SPICE_CHAT_EXPECT_TIMEOUT keeps the default' '
+unset -nocomplain ::env(SPICE_CHAT_EXPECT_TIMEOUT)
+set t [repl_timeout_seconds 120]
+if {$t != 120} { send_user "got $t\n"; exit 1 }
+send_user "DEFAULT_OK\n"
+exit 0
+'
+assert_status 0
+assert_reports 'DEFAULT_OK'
+
+helper_case 'rejects a non-integer SPICE_CHAT_EXPECT_TIMEOUT' '
+set ::env(SPICE_CHAT_EXPECT_TIMEOUT) not-a-number
+repl_timeout_seconds 30
+send_user "REACHED THE END\n"
+exit 0
+'
+assert_status 1
+assert_reports 'SPICE_CHAT_EXPECT_TIMEOUT must be a positive integer'
+assert_silent_about 'REACHED THE END'
+
 # A healthy exchange still runs to completion: the helpers must not turn a
 # working interaction into a failure.
 helper_case 'healthy exchange' '
@@ -219,6 +251,7 @@ set -u
 mode=$1
 exit_before=${SPICE_FAKE_EXIT_BEFORE_TURN:-0}
 exit_after=${SPICE_FAKE_EXIT_AFTER_TURN:-0}
+sleep_secs=${SPICE_FAKE_SLEEP_SECONDS:-0}
 
 # Records how the script invoked us, so a test can check that the runtime
 # endpoint was passed through rather than left at the CLI default.
@@ -239,6 +272,10 @@ while IFS= read -r line; do
 
   if [ "$exit_before" -ne 0 ] && [ "$turn" -ge "$exit_before" ]; then
     exit 44
+  fi
+
+  if [ "$sleep_secs" -gt 0 ]; then
+    sleep "$sleep_secs"
   fi
 
   if [ "$mode" = 'search' ]; then
@@ -295,6 +332,15 @@ script_case 'chat_01_simple.exp when the REPL exits before answering' chat_01_si
 assert_status 1
 assert_reports 'Waiting for the response to'
 assert_reports 'exited with status 44'
+assert_silent_about 'Model returned expected response'
+
+# A generation that outlives the chat expect budget must fail as a timeout, not
+# as a hang of the 120s default. The stand-in sleeps 3s; 1s is enough to trip.
+script_case 'chat_01_simple.exp times out when generation exceeds SPICE_CHAT_EXPECT_TIMEOUT' chat_01_simple.exp \
+  SPICE_CHAT_EXPECT_TIMEOUT=1 \
+  SPICE_FAKE_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'Timeout waiting for expected response'
 assert_silent_about 'Model returned expected response'
 
 script_case 'search_01.exp when the REPL exits before answering' search_01.exp \

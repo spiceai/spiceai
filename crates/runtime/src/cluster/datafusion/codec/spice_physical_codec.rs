@@ -20,6 +20,7 @@ use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
+use data_components::http::provider::{HttpExec, HttpTableProvider};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
@@ -42,9 +43,9 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_execution_plans::{IcebergScanExec, UdtfExec};
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_proto::{
-    BytesProcessedExecNode, CayenneAccelerationExecNode, IcebergHashColumn, IcebergPartitioning,
-    IcebergTableScanExecNode, SchemaCastScanExecNode, SpicePhysicalPlanNode, UdtfExecNode,
-    spice_physical_plan_node,
+    BytesProcessedExecNode, CayenneAccelerationExecNode, HttpExecNode, HttpPartition,
+    IcebergHashColumn, IcebergPartitioning, IcebergTableScanExecNode, SchemaCastScanExecNode,
+    SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -147,6 +148,67 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 })?;
 
                 Ok(Arc::new(UdtfExec::new(args, inner_plan)))
+            }
+            Some(spice_physical_plan_node::Node::HttpExec(node)) => {
+                if !inputs.is_empty() {
+                    return exec_err!("HttpExec must not have input execution plans");
+                }
+
+                let runtime = self.runtime()?;
+                let table_ref = TableReference::from(node.table_ref.as_str());
+                let schema = datafusion_common::Schema::decode(&*node.projected_schema)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let projected_schema = Arc::new(Schema::try_from(&schema)?);
+                let limit = node
+                    .limit
+                    .map(|limit| {
+                        usize::try_from(limit).map_err(|_| {
+                            DataFusionError::Internal(format!(
+                                "HTTP scan recipe for {table_ref} has limit {limit} that does not fit in usize"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+
+                let registered = runtime.df.get_table_sync(&table_ref).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "HTTP table {table_ref} is not registered on this executor; cannot reconstruct the distributed scan"
+                    ))
+                })?;
+                let Some(provider) = spice_table::find_concrete::<HttpTableProvider>(
+                    registered.as_ref(),
+                    spice_table::LayerWalk::Read,
+                ) else {
+                    return exec_err!(
+                        "registered provider for {table_ref} is not an HttpTableProvider; distributed HTTP scans require the HTTP data connector"
+                    );
+                };
+                if provider.table_reference() != Some(&table_ref) {
+                    return exec_err!(
+                        "registered HTTP provider for {table_ref} has a different table identity; cannot reconstruct the distributed scan"
+                    );
+                }
+                validate_http_projected_schema(&table_ref, &projected_schema, &provider.schema())?;
+
+                let partitions = node
+                    .partitions
+                    .into_iter()
+                    .map(|partition| {
+                        (
+                            partition.path,
+                            partition.query,
+                            partition.body,
+                            partition.request_headers,
+                        )
+                    })
+                    .collect();
+
+                Ok(Arc::new(HttpExec::new(
+                    projected_schema,
+                    Arc::new(provider.clone()),
+                    partitions,
+                    limit,
+                )))
             }
             Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
                 let runtime = self.runtime()?;
@@ -290,6 +352,46 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     schema: schema_buf,
                 })),
             }
+        } else if let Some(http_exec) = node.downcast_ref::<HttpExec>() {
+            let Some(table_ref) = http_exec.provider().table_reference() else {
+                return exec_err!(
+                    "HttpExec provider has no registered table reference; cannot serialize the scan for distributed execution"
+                );
+            };
+            let mut schema_buf = Vec::new();
+            let serialized_schema =
+                datafusion_common::Schema::try_from(Arc::clone(http_exec.projected_schema()))?;
+            serialized_schema
+                .encode(&mut schema_buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let limit = http_exec
+                .limit()
+                .map(|limit| {
+                    u64::try_from(limit).map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "HttpExec limit {limit} does not fit in u64; cannot serialize the scan for distributed execution"
+                        ))
+                    })
+                })
+                .transpose()?;
+
+            SpicePhysicalPlanNode {
+                node: Some(spice_physical_plan_node::Node::HttpExec(HttpExecNode {
+                    table_ref: table_ref.to_quoted_string(),
+                    projected_schema: schema_buf,
+                    partitions: http_exec
+                        .partitions()
+                        .iter()
+                        .map(|partition| HttpPartition {
+                            path: partition.0.clone(),
+                            query: partition.1.clone(),
+                            body: partition.2.clone(),
+                            request_headers: partition.3.clone(),
+                        })
+                        .collect(),
+                    limit,
+                })),
+            }
         } else if let Some(scan_exec) = node.downcast_ref::<IcebergScanExec>() {
             // Serialize the scan recipe (table ref + projection/filters/limit).
             // The executor replays `TableProvider::scan` with these to re-derive
@@ -373,6 +475,30 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         self.runtime()?.df.ctx.udf(name)
     }
+}
+
+fn validate_http_projected_schema(
+    table_ref: &TableReference,
+    projected_schema: &Schema,
+    provider_schema: &Schema,
+) -> Result<()> {
+    for field in projected_schema.fields() {
+        let provider_field = provider_schema.field_with_name(field.name()).map_err(|_| {
+            DataFusionError::Execution(format!(
+                "HTTP scan recipe for {table_ref} projects unknown field '{}'",
+                field.name()
+            ))
+        })?;
+        if provider_field.data_type() != field.data_type() {
+            return exec_err!(
+                "HTTP scan recipe for {table_ref} projects field '{}' as {:?}, but the registered provider uses {:?}",
+                field.name(),
+                field.data_type(),
+                provider_field.data_type()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Returns the concrete [`IcebergTableProvider`] behind a cluster wrapper's inner
@@ -502,11 +628,14 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::{JoinType, NullEquality};
+    use datafusion::datasource::MemTable;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_expr::expressions::col;
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use std::collections::HashMap;
 
     fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -516,6 +645,250 @@ mod tests {
         )]));
         MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
             .expect("memory exec should be valid")
+    }
+
+    fn http_provider(
+        table_ref: Option<TableReference>,
+        header_value: &'static str,
+    ) -> HttpTableProvider {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cluster-config", HeaderValue::from_static(header_value));
+        let provider = HttpTableProvider::new(
+            url::Url::parse("http://127.0.0.1:1/users").expect("test URL should parse"),
+            reqwest::Client::new(),
+            "json".to_string(),
+            false,
+        )
+        .with_headers(headers);
+        match table_ref {
+            Some(table_ref) => provider.with_table_reference(table_ref),
+            None => provider,
+        }
+    }
+
+    fn encoded_schema(schema: &Schema) -> Vec<u8> {
+        let mut buf = Vec::new();
+        datafusion_common::Schema::try_from(schema)
+            .expect("test schema should serialize")
+            .encode(&mut buf)
+            .expect("test schema should encode");
+        buf
+    }
+
+    fn http_recipe(node: HttpExecNode) -> Vec<u8> {
+        SpicePhysicalPlanNode {
+            node: Some(spice_physical_plan_node::Node::HttpExec(node)),
+        }
+        .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn http_exec_round_trips_recipe_and_rebinds_executor_provider() {
+        let table_ref = TableReference::bare("users.v1");
+        let sender_header = "sender-only-secret";
+        let executor_header = "executor-local-secret";
+        let sender_provider = Arc::new(http_provider(Some(table_ref.clone()), sender_header));
+        let provider_schema = sender_provider.schema();
+        let projected_schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                provider_schema
+                    .field_with_name("request_query")
+                    .expect("request_query should exist")
+                    .clone(),
+                provider_schema
+                    .field_with_name("content")
+                    .expect("content should exist")
+                    .clone(),
+            ],
+            HashMap::from([("test-metadata".to_string(), "retained".to_string())]),
+        ));
+        let partitions = vec![
+            (
+                None,
+                Some(String::new()),
+                Some("sender-body".to_string()),
+                None,
+            ),
+            (
+                Some("later".to_string()),
+                Some("page=2".to_string()),
+                None,
+                Some("x-request: executor-visible".to_string()),
+            ),
+        ];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(HttpExec::new(
+            Arc::clone(&projected_schema),
+            sender_provider,
+            partitions.clone(),
+            Some(0),
+        ));
+
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let executor_provider: Arc<dyn TableProvider> =
+            Arc::new(http_provider(Some(table_ref.clone()), executor_header));
+        let wrapped_provider = data_components::metadata_enriched_table_provider(
+            executor_provider,
+            HashMap::from([("description".to_string(), "wrapped provider".to_string())]),
+            data_components::FieldMetadata::new(),
+        );
+        runtime
+            .datafusion()
+            .ctx
+            .register_table(table_ref.clone(), wrapped_provider)
+            .expect("executor provider should register");
+        let codec = SpicePhysicalCodec::new(Arc::clone(&runtime)).expect("codec should build");
+
+        let proto = PhysicalPlanNode::try_from_physical_plan(plan, codec.as_ref())
+            .expect("HTTP scan should serialize through the production physical-plan path");
+        let bytes = proto.encode_to_vec();
+        assert!(
+            !bytes
+                .windows(sender_header.len())
+                .any(|window| window == sender_header.as_bytes()),
+            "scheduler-local headers must not be serialized into the plan"
+        );
+
+        let decoded_proto =
+            PhysicalPlanNode::decode(bytes.as_slice()).expect("physical plan should decode");
+        let task_ctx = runtime.datafusion().ctx.state().task_ctx();
+        let decoded = decoded_proto
+            .try_into_physical_plan(task_ctx.as_ref(), codec.as_ref())
+            .expect("HTTP scan should deserialize through the production physical-plan path");
+        let decoded = decoded
+            .downcast_ref::<HttpExec>()
+            .expect("round-tripped plan should be HttpExec");
+
+        assert_eq!(
+            decoded.projected_schema().as_ref(),
+            projected_schema.as_ref()
+        );
+        assert_eq!(decoded.partitions(), partitions.as_slice());
+        assert_eq!(decoded.limit(), Some(0));
+        assert_eq!(decoded.provider().table_reference(), Some(&table_ref));
+        assert_eq!(
+            decoded
+                .provider()
+                .custom_headers()
+                .get("x-cluster-config")
+                .expect("executor header should be present"),
+            HeaderValue::from_static(executor_header)
+        );
+    }
+
+    #[tokio::test]
+    async fn http_exec_rejects_invalid_recipes() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let http_table_ref = TableReference::bare("http_users");
+        let registered_http_provider: Arc<dyn TableProvider> = Arc::new(http_provider(
+            Some(http_table_ref.clone()),
+            "executor-local-secret",
+        ));
+        runtime
+            .datafusion()
+            .ctx
+            .register_table(http_table_ref.clone(), registered_http_provider)
+            .expect("HTTP provider should register");
+
+        let wrong_table_ref = TableReference::bare("memory_users");
+        let memory_schema = Arc::new(Schema::new(vec![Field::new(
+            "content",
+            DataType::Utf8,
+            false,
+        )]));
+        runtime
+            .datafusion()
+            .ctx
+            .register_table(
+                wrong_table_ref.clone(),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&memory_schema), vec![vec![]])
+                        .expect("memory table should build"),
+                ),
+            )
+            .expect("memory provider should register");
+
+        let codec = SpicePhysicalCodec::new(Arc::clone(&runtime)).expect("codec should build");
+        let task_ctx = runtime.datafusion().ctx.state().task_ctx();
+        let provider_schema = runtime
+            .datafusion()
+            .get_table_sync(&http_table_ref)
+            .expect("HTTP table should resolve")
+            .schema();
+        let valid_schema = encoded_schema(provider_schema.as_ref());
+        let recipe = |table_ref: &TableReference, projected_schema: Vec<u8>| HttpExecNode {
+            table_ref: table_ref.to_quoted_string(),
+            projected_schema,
+            partitions: vec![HttpPartition {
+                path: None,
+                query: None,
+                body: None,
+                request_headers: None,
+            }],
+            limit: None,
+        };
+
+        let missing = http_recipe(recipe(
+            &TableReference::bare("missing_users"),
+            valid_schema.clone(),
+        ));
+        let err = codec
+            .try_decode(&missing, &[], task_ctx.as_ref())
+            .expect_err("an unregistered HTTP table should fail");
+        assert!(err.to_string().contains("is not registered"), "{err}");
+
+        let wrong_provider = http_recipe(recipe(&wrong_table_ref, valid_schema.clone()));
+        let err = codec
+            .try_decode(&wrong_provider, &[], task_ctx.as_ref())
+            .expect_err("a non-HTTP provider should fail");
+        assert!(
+            err.to_string().contains("not an HttpTableProvider"),
+            "{err}"
+        );
+
+        let err = codec
+            .try_decode(
+                &http_recipe(recipe(&http_table_ref, valid_schema)),
+                &[memory_exec("input")],
+                task_ctx.as_ref(),
+            )
+            .expect_err("HttpExec with an input should fail");
+        assert!(err.to_string().contains("must not have input"), "{err}");
+
+        let malformed = http_recipe(recipe(&http_table_ref, vec![0xff]));
+        codec
+            .try_decode(&malformed, &[], task_ctx.as_ref())
+            .expect_err("a malformed projected schema should fail");
+
+        let incompatible = http_recipe(recipe(
+            &http_table_ref,
+            encoded_schema(&Schema::new(vec![Field::new(
+                "content",
+                DataType::Int64,
+                false,
+            )])),
+        ));
+        let err = codec
+            .try_decode(&incompatible, &[], task_ctx.as_ref())
+            .expect_err("an incompatible projected schema should fail");
+        assert!(
+            err.to_string().contains("registered provider uses"),
+            "{err}"
+        );
+
+        let anonymous_provider = Arc::new(http_provider(None, "sender-only-secret"));
+        let anonymous = HttpExec::new(
+            anonymous_provider.schema(),
+            anonymous_provider,
+            vec![(None, None, None, None)],
+            None,
+        );
+        let err = codec
+            .try_encode(Arc::new(anonymous), &mut Vec::new())
+            .expect_err("an anonymous HTTP provider should not serialize");
+        assert!(
+            err.to_string().contains("no registered table reference"),
+            "{err}"
+        );
     }
 
     #[test]

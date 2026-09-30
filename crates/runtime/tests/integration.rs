@@ -225,8 +225,6 @@ fn configure_test_datafusion() {
 
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config.options_mut().execution.target_partitions = TEST_CPU_CORES;
-
             config.options_mut().execution.coalesce_batches = false;
 
             config.options_mut().optimizer.repartition_joins = false;
@@ -237,10 +235,8 @@ fn configure_test_datafusion() {
 
 /// Pin the process-wide CPU budget to [`TEST_CPU_CORES`].
 ///
-/// Setting `target_partitions` on the default session config is not enough on its
-/// own: with `runtime.query.target_partitions` unset the session builder sizes
-/// partitions from the CPU budget, overwriting whatever the config carried. Both
-/// are pinned to the same constant so they cannot disagree.
+/// Every session sizes `target_partitions` from the CPU budget, so pinning the
+/// budget is what makes plans reproducible across machines.
 ///
 /// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
 /// and all 300-odd callers ask for the same value, so every call after the first
@@ -328,6 +324,9 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Spark Connect plans include Databricks connection details. Those identify
+                // the test fixture, not the plan being asserted.
+                (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),
             ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);

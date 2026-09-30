@@ -21,6 +21,7 @@ use std::{
 };
 
 use crate::maintained_aggregate::MaintainedAggregateRegistry;
+use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -136,6 +137,9 @@ pub struct CayenneAccelerationExec {
     /// table provider's `scan()`, which costs the message a name and nothing
     /// else — no execution behaviour reads this.
     table_name: Option<Arc<str>>,
+    /// The point-lookup index decision made while planning this scan. This is
+    /// stable plan metadata for `EXPLAIN`; execution does not consult it.
+    lookup_index: Option<LookupIndexExplain>,
 }
 
 impl CayenneAccelerationExec {
@@ -151,6 +155,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -167,6 +172,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -187,6 +193,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -210,6 +217,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -234,6 +242,13 @@ impl CayenneAccelerationExec {
     #[must_use]
     pub(crate) fn with_table_name(mut self, table_name: impl Into<Arc<str>>) -> Self {
         self.table_name = Some(table_name.into());
+        self
+    }
+
+    /// Attaches the scan-local lookup-index decision for `EXPLAIN`.
+    #[must_use]
+    pub(crate) fn with_lookup_index(mut self, lookup_index: Option<LookupIndexExplain>) -> Self {
+        self.lookup_index = lookup_index;
         self
     }
 
@@ -262,6 +277,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             optimizer_column_overlay: self.optimizer_column_overlay.clone(),
             table_name: self.table_name.clone(),
+            lookup_index: self.lookup_index.clone(),
         }
     }
 
@@ -345,16 +361,21 @@ impl CayenneAccelerationExec {
         plan_has_pushed_filter(&self.inner)
     }
 
-    /// Like [`Self::has_pushed_filter`] but detects a predicate pushed onto a file
-    /// source ANYWHERE in the wrapped plan — including below a deletion-filter exec
-    /// on a merge-on-read table (which [`Self::has_pushed_filter`]'s shallow walk
-    /// stops above). The maintained-aggregate rewrite's soundness guard uses this:
-    /// a maintained view answers the unfiltered relation, so it must decline when a
-    /// query predicate has narrowed the scan — even when a pending-tombstone
-    /// deletion-filter exec sits between the scan wrapper and the source.
+    /// Whether this scan produces every live row of the table: nothing in the
+    /// wrapped plan filters or limits rows. A maintained aggregate view describes
+    /// exactly that relation, so the maintained-aggregate rewrite may substitute the
+    /// view for this scan only when this returns `true`. See
+    /// [`plan_scans_whole_relation`].
     #[must_use]
-    pub(crate) fn has_pushed_filter_deep(&self) -> bool {
-        plan_has_pushed_filter_deep(&self.inner)
+    pub(crate) fn scans_whole_relation(&self) -> bool {
+        plan_scans_whole_relation(&self.inner)
+    }
+
+    /// Whether every column this scan outputs is the stored table column of the
+    /// same name. See [`plan_outputs_table_columns`].
+    #[must_use]
+    pub(crate) fn outputs_table_columns(&self) -> bool {
+        plan_outputs_table_columns(&self.inner)
     }
 
     /// Push additional dynamic filters into the underlying file source.
@@ -540,32 +561,83 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .any(|config| config.file_source().filter().is_some())
 }
 
-/// Like [`plan_has_pushed_filter`] but walks the ENTIRE subtree (every descendant,
-/// not just the identity-preserving whitelist), so a query predicate pushed onto a
-/// file source BELOW a non-passthrough operator is still detected. The critical
-/// case is a merge-on-read table with pending tombstones: `scan()` wraps the Vortex
-/// `DataSourceExec` in a deletion-filter exec (which is NOT identity-preserving, so
-/// [`plan_has_pushed_filter`] stops above it), and a Vortex-convertible `WHERE` is
-/// pushed THROUGH that exec onto the source. The aggregate-rewrite soundness guard
-/// must see that predicate — otherwise a maintained / whole-file aggregate silently
-/// serves the unfiltered relation for a filtered query. Over-detection is sound for
-/// that guard: it only ever causes a decline (the real scan+aggregate runs).
-/// Distinct from [`plan_has_pushed_filter`], which is intentionally shallow because
-/// the deletion-filter exec's delete-aware `num_rows` math must NOT see a filtered
-/// (subset) count as a whole-table count.
-pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// Whether `plan` produces every live row of the table it scans: no node in the
+/// subtree filters or limits rows.
+///
+/// A query's `WHERE` or `LIMIT` does not have to stay above the scan. Physical
+/// `FilterPushdown` hands a predicate to a Vortex source that accepts it, and to
+/// a `FilterExec` inside the scan when a branch cannot evaluate it: the in-memory
+/// branch that `scan()` already wraps in the query's filters absorbs it, and
+/// `UnionExec` wraps each rejecting branch in its own `FilterExec`. Either way the
+/// `FilterExec` above the scan is removed. A `LIMIT` in a subquery becomes a fetch
+/// inside the scan. So the scan's own subtree is the only place to look.
+///
+/// The walk fails closed: only nodes known to pass every row through (and every
+/// child of theirs) count, so an operator added later is treated as narrowing the
+/// scan until it is listed here. The deletion-filter execs are listed because they
+/// remove only rows that are no longer live, which is the relation a maintained
+/// view describes. Any fetch fails the check, and a file source fails it when it
+/// carries a predicate (static or dynamic). An in-memory source never carries one.
+#[expect(deprecated)]
+pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.fetch().is_some() {
+        return false;
+    }
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
-        return data_source_exec
+        let source = data_source_exec.data_source();
+        if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+            return config.file_source().filter().is_none();
+        }
+        return source
+            .downcast_ref::<datafusion::datasource::memory::MemorySourceConfig>()
+            .is_some();
+    }
+    let passes_every_row = plan.is::<CayenneAccelerationExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
+        || plan.is::<datafusion_physical_plan::empty::EmptyExec>()
+        || plan.is::<crate::provider::delete::KeyBasedDeletionFilterExec>()
+        || plan.is::<crate::provider::delete::Int64PkDeletionFilterExec>();
+    passes_every_row && plan.children().into_iter().all(plan_scans_whole_relation)
+}
+
+/// Whether every column `plan` outputs is the table column of the same name, with
+/// its stored values: every projection in the subtree, a `ProjectionExec` or one
+/// pushed into a file source, selects a column under that column's own name.
+///
+/// A projection pushed into the scan can compute a value and name it after a
+/// table column (`c + 1 AS c`), and nothing above the scan can tell that column
+/// from the stored one. A maintained view and a dynamic filter both describe the
+/// stored values, so neither applies to such a column.
+pub(crate) fn plan_outputs_table_columns(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let selects_own_column = |expr: &Arc<dyn PhysicalExpr>, alias: &str| {
+        expr.downcast_ref::<Column>()
+            .is_some_and(|column| column.name() == alias)
+    };
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>()
+        && !projection
+            .expr()
+            .iter()
+            .all(|projected| selects_own_column(&projected.expr, &projected.alias))
+    {
+        return false;
+    }
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
+        && let Some(config) = data_source_exec
             .data_source()
             .downcast_ref::<FileScanConfig>()
-            .is_some_and(|config| config.file_source().filter().is_some());
+        && let Some(projection) = config.file_source().projection()
+        && !projection
+            .iter()
+            .all(|projected| selects_own_column(&projected.expr, &projected.alias))
+    {
+        return false;
     }
-    for child in plan.children() {
-        if plan_has_pushed_filter_deep(child) {
-            return true;
-        }
-    }
-    false
+    plan.children().into_iter().all(plan_outputs_table_columns)
 }
 
 /// Splits the file-backed scans under `plan` decode CONCURRENTLY, summed across the
@@ -909,7 +981,22 @@ impl DisplayAs for CayenneAccelerationExec {
         write!(
             f,
             "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
-        )
+        )?;
+        if let Some(lookup) = &self.lookup_index {
+            write!(
+                f,
+                ", lookup_index={}, lookup_index_outcome={}",
+                lookup.shape.as_deref().unwrap_or("none"),
+                lookup.outcome.as_str()
+            )?;
+            if let Some(candidate_files) = lookup.candidate_files {
+                write!(f, ", candidate_files={candidate_files}")?;
+            }
+            if let Some(candidate_rows) = lookup.candidate_rows {
+                write!(f, ", candidate_rows={candidate_rows}")?;
+            }
+        }
+        Ok(())
     }
 }
 

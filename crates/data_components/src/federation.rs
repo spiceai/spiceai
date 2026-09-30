@@ -139,23 +139,38 @@ mod tests {
 
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
+    use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
+    use datafusion::catalog::Session;
     use datafusion::common::Column;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::DefaultTableSource;
     use datafusion::datasource::TableProvider;
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::context::SessionContext;
     use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::logical_expr::TableType;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
         TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
         expr::ScalarFunction,
     };
+    use datafusion::logical_expr::{DmlStatement, WriteOp};
+    use datafusion::logical_expr::{exists, not_exists};
+    use datafusion::optimizer::analyzer::AnalyzerRule;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
         MySqlDialect, PostgreSqlDialect, SqliteDialect,
     };
+    use datafusion_federation::FederationAnalyzerRule;
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -1433,15 +1448,12 @@ mod tests {
             ),
             (
                 // Reached through a relation alias, so the enclosing reference is
-                // qualified — and the alias carries no column list, so it names the
-                // relation without naming any of its columns. An alias that *does* carry
-                // one already names every output and must be left alone; that half is
-                // reachable only from parsed SQL, so the fork's own round-trip tests are
-                // what guard it. The scan here carries no projection, which is the half of
-                // the alias class the naming repairs — with one pushed down the output
-                // cannot be named at all, which
-                // `a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references`
-                // pins.
+                // qualified. The scan here carries no projection, which is the half of
+                // the alias class the #206 naming walk repairs. A scan projection
+                // pushed down under the alias is named by a column list on the alias
+                // itself (fork PR #221), which
+                // `a_projected_scan_under_an_alias_names_the_output_its_scope_references`
+                // guards.
                 "aliased",
                 projected()
                     .alias("x")
@@ -1473,32 +1485,13 @@ mod tests {
         &list[..end]
     }
 
-    /// The derived table's own `SELECT` list — what it exposes to the scope that
-    /// encloses it.
-    ///
-    /// Narrower than "everything after the derived table starts", because `AS`
-    /// introduces relation aliases as well as column aliases (`FROM t AS s`, `) AS s`)
-    /// and those are emitted whether or not the outputs are named. A guard that reads
-    /// the wider region cannot tell a named output from an unnamed one.
-    fn derived_select_list(sql: &str) -> &str {
-        let opens = "FROM (SELECT ";
-        let list = &sql[first_offset_of(sql, opens) + opens.len()..];
-        let Some(end) = list.find(" FROM ") else {
-            panic!("expected the derived table's own FROM clause in: {sql}");
-        };
-        &list[..end]
-    }
-
     /// Everything the enclosing `SELECT` list draws from — the derived table and the
     /// alias it is attached to.
     ///
-    /// Deliberately wider than `derived_select_list`: the repair for the remaining
-    /// half of #12751 names the *relation's* columns on the alias it attaches
-    /// (`) AS s ("t.a + t.b")`), which lands after the derived table closes and so
-    /// falls outside the derived `SELECT` list entirely. A guard that reads only that
-    /// list cannot see that repair land. Searching for a specific column is what makes
-    /// the wider region safe here — the reason `derived_select_list` is narrow is that
-    /// a bare `AS` matches the relation aliases too.
+    /// Wider than the derived `SELECT` list: fork PR #221 names the *relation's*
+    /// columns on the alias it attaches (`) AS s ("t.a + t.b")`), which lands after
+    /// the derived table closes. Searching for a specific column is what makes the
+    /// wider region safe — a bare `AS` would also match the relation aliases.
     fn from_clause(sql: &str) -> &str {
         let Some(start) = sql.find(" FROM ") else {
             panic!("expected a FROM clause after the SELECT list: {sql}");
@@ -1548,8 +1541,8 @@ mod tests {
     /// computed expression, a literal, a literal whose logical name carries each
     /// dialect's own quote character, and a volatile call — across every enclosing
     /// shape the naming walk handles (`derived_scope_shapes`) — every shape it can
-    /// repair, which is not every shape #12751 reports: a projected scan under a
-    /// relation alias still cannot be named, and the test below this one pins that.
+    /// repair. A projected scan under a relation alias is named by a column list
+    /// on the alias (fork PR #221), which the test below this one guards.
     /// The volatile output is
     /// the one the flattened-`SELECT` repair (#12599) cannot help: inlining a
     /// volatile expression evaluates it a second time in a clause that can observe a
@@ -1642,30 +1635,211 @@ mod tests {
         }
     }
 
-    /// The half of #12751 that fork PR #206 does not fix, pinned so the repair is
-    /// noticed rather than quietly leaving this shape unguarded.
+    /// The identifier a `DISTINCT ON` groups by, taken from the emitted
+    /// `DISTINCT ON (<key>)` rather than from the plan, so a guard reads the key the
+    /// remote engine will resolve rather than the one the plan meant.
+    fn distinct_on_key(sql: &str) -> &str {
+        let open = first_offset_of(sql, "DISTINCT ON (") + "DISTINCT ON (".len();
+        let Some(close) = sql[open..].find(')') else {
+            panic!("expected the DISTINCT ON key list to close in: {sql}");
+        };
+        &sql[open..open + close]
+    }
+
+    /// An identifier with whatever quoting a dialect wrapped it in removed, so two
+    /// spellings of the same name compare equal.
+    fn unquoted(identifier: &str) -> &str {
+        identifier
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches(['[', ']'])
+    }
+
+    /// Every `AS <identifier>` binding emitted at `depth`, as the bare identifiers
+    /// they bind. Depth is what separates the `DISTINCT ON`'s own select list from
+    /// the derived table beneath it, which legitimately binds the same name.
+    fn as_bindings_at_depth(sql: &str, depth: usize) -> Vec<&str> {
+        sql.match_indices(" AS ")
+            .filter(|(at, _)| paren_depth_at(sql, *at) == depth)
+            .map(|(at, keyword)| {
+                let rest = &sql[at + keyword.len()..];
+                let end = rest
+                    .find([',', ')'])
+                    .unwrap_or(rest.len())
+                    .min(rest.find(" FROM ").unwrap_or(rest.len()));
+                unquoted(&rest[..end])
+            })
+            .collect()
+    }
+
+    /// The plan shape that lets a `DISTINCT ON` output alias capture the key: an
+    /// input column whose name is also the logical name of the computed output, so
+    /// naming that output rebinds the key to it.
     ///
-    /// A scan projection pushed down under a relation alias is requalified onto the
-    /// alias before the derived table is built, so the only name the derived table can
-    /// report for the output — `s.a + s.b` — is not the one the enclosing scope holds
-    /// for it, `t.a + t.b`:
+    /// The enclosing projection is what makes the `DISTINCT ON` a derived table
+    /// whose outputs another scope binds, which is the only shape the naming pass
+    /// runs on at all.
+    fn distinct_on_over_key_named_output(
+        key: Expr,
+        input_alias: &str,
+        select_expr: Expr,
+        output_reference: &str,
+        relation_alias: Option<&str>,
+    ) -> LogicalPlan {
+        let scanned = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int32, false),
+            ]),
+            None,
+        )
+        .expect("scan")
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias(input_alias),
+        ])
+        .expect("projection naming an input column after the computed output");
+        let scanned = match relation_alias {
+            Some(alias) => scanned.alias(alias).expect("relation alias"),
+            None => scanned,
+        };
+        scanned
+            .distinct_on(
+                vec![key.clone()],
+                vec![select_expr],
+                Some(vec![key.sort(true, false)]),
+            )
+            .expect("distinct on")
+            .limit(0, Some(5))
+            .expect("limit")
+            .project(vec![Expr::Column(Column::new_unqualified(
+                output_reference,
+            ))])
+            .expect("enclosing projection")
+            .build()
+            .expect("build")
+    }
+
+    /// Naming a `DISTINCT ON`'s computed output must not change which key it groups
+    /// by. `PostgreSQL` resolves a bare name in `DISTINCT ON` and `ORDER BY` against
+    /// the output list before the input columns, so aliasing the output to the name
+    /// the key already spells rebinds the key from the input column to the output —
+    /// the same rows grouped by a different key, in valid SQL with an unchanged
+    /// reported schema, which is the worst shape this can take.
+    ///
+    /// Only a Spice patch to the `spiceai/datafusion` fork declines that alias (fork
+    /// PR #209). Its three arms are the three ways the key reaches the remote engine
+    /// as a bare name: spelled exactly, spelled in another case (quoting does not say
+    /// how an engine compares identifiers — `DuckDB` folds even quoted ones), and
+    /// carried by an `OuterReferenceColumn`, which unparses through the same path as
+    /// a column and so cannot be told apart from one.
+    ///
+    /// Leaving the output unnamed keeps the enclosing scope's reference unbound,
+    /// which is #13444 — the pre-existing bug, not a new wrong answer. This guard is
+    /// for the wrong answer.
+    #[test]
+    fn a_distinct_on_output_is_not_named_over_its_own_key() {
+        for (arm, key, input_alias) in [
+            (
+                "bare",
+                Expr::Column(Column::new_unqualified("a + b")),
+                "a + b",
+            ),
+            (
+                "case-folded",
+                Expr::Column(Column::new_unqualified("A + B")),
+                "A + B",
+            ),
+            (
+                "correlated",
+                Expr::OuterReferenceColumn(
+                    Arc::new(Field::new("a + b", DataType::Int32, false)),
+                    Column::new_unqualified("a + b"),
+                ),
+                "a + b",
+            ),
+        ] {
+            let plan = distinct_on_over_key_named_output(
+                key,
+                input_alias,
+                col("a") + col("b"),
+                "a + b",
+                None,
+            );
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                let key = unquoted(distinct_on_key(&sql)).to_lowercase();
+                let depth = paren_depth_at(&sql, first_offset_of(&sql, "DISTINCT ON ("));
+
+                let captured = as_bindings_at_depth(&sql, depth)
+                    .into_iter()
+                    .find(|binding| binding.to_lowercase() == key);
+                assert!(
+                    captured.is_none(),
+                    "{dialect_name}/{arm}: the DISTINCT ON output is named {}, which is the identifier its own key spells, so the remote engine groups by the output instead of by the input column: {sql}",
+                    captured.unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// The assumption that keeps the refusal above narrow, and the reason it is not
+    /// simply "never name a `DISTINCT ON` output": only a *bare* key can be captured.
+    /// A qualified key resolves to the relation in both clauses whatever the output
+    /// list holds, so naming still applies there — and has to, or the enclosing
+    /// scope's reference goes unbound for a shape that was never at risk.
+    #[test]
+    fn a_distinct_on_output_is_named_over_a_qualified_key() {
+        let plan = distinct_on_over_key_named_output(
+            Expr::Column(Column::new(Some(TableReference::bare("d")), "a + b")),
+            "a + b",
+            col("d.a") + col("d.b"),
+            "d.a + d.b",
+            Some("d"),
+        );
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let key = unquoted(distinct_on_key(&sql)).to_lowercase();
+            let depth = paren_depth_at(&sql, first_offset_of(&sql, "DISTINCT ON ("));
+
+            // The `DISTINCT ON` emits one select item, so any binding at its own depth
+            // is that item's alias. Asserted by presence rather than by spelling: a
+            // dialect may sanitise the identifier it derives from the logical name —
+            // `BigQuery` renders `d.a + d.b` as `d_46a + d_46b` — and which name it
+            // picks is not what this guard is about.
+            let bindings = as_bindings_at_depth(&sql, depth);
+            assert!(
+                !bindings.is_empty(),
+                "{dialect_name}: the output of a DISTINCT ON with a qualified key is unnamed, so the enclosing scope's reference does not bind: {sql}"
+            );
+            assert!(
+                !bindings.iter().any(|b| b.to_lowercase() == key),
+                "{dialect_name}: the qualified key and the output alias are the same identifier, so naming the output captured the key: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for the remaining half of #12751, fixed by fork PR #221
+    /// (refs #13140): a scan projection pushed down under a relation alias is
+    /// requalified onto the alias before the derived table is built, so the
+    /// derived `SELECT` list cannot report the name the enclosing scope holds.
+    /// The repair names the relation's columns on the alias it attaches:
     ///
     /// ```sql
-    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s
+    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) FROM t AS s) AS s ("t.a + t.b")
     /// ```
     ///
-    /// Naming the output cannot close that gap, which is why the fix above does not
-    /// try: both names are right for their own scope, and the repair is for the
-    /// enclosing scope to name the relation's columns on the alias it attaches. The
-    /// fork pins the same rendering in `test_subquery_alias_over_pushed_down_scan_
-    /// still_unbindable`; this is the repo-side canary for it.
-    ///
-    /// Projection pushdown is an ordinary optimized shape, so this is a live defect on
-    /// the federated pushdown path, and it is what keeps #12751 open. This test fails
-    /// once the gap is repaired: move the shape into `derived_scope_shapes` and close
-    /// #12751, rather than re-pinning the rendering below.
+    /// Asked of the whole `FROM` clause rather than of the derived `SELECT`
+    /// list, because that is where the column list lands — after the derived
+    /// table closes. A dialect that inlines instead (`BigQuery`) still has to
+    /// expose the same identifier somewhere in that clause, or the outer
+    /// reference cannot bind.
     #[test]
-    fn a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references() {
+    fn a_projected_scan_under_an_alias_names_the_output_its_scope_references() {
         let plan = LogicalPlanBuilder::scan("t", two_column_source(), Some(vec![0, 1]))
             .expect("scan t with a pushed-down projection")
             .project(vec![col("t.a") + col("t.b")])
@@ -1678,38 +1852,20 @@ mod tests {
             .expect("build");
         for (dialect_name, dialect) in federation_dialects() {
             let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
-            let list = derived_select_list(&sql);
-
-            // The derived table does name an output — this is the requalified name, not
-            // the absence of naming that preceded the fix — so the pin below is about
-            // *which* name it reports, not about whether it reports one. Read from the
-            // derived SELECT list alone: `AS` also introduces the relation aliases
-            // (`FROM t AS s`, `) AS s`), which are present either way, so a search over
-            // the whole statement would hold on the pre-#206 rendering too and this
-            // assertion would distinguish nothing.
             assert!(
-                list.contains(" AS "),
-                "{dialect_name}: the derived table names no output at all, which is the \
-                 pre-#206 behaviour rather than the gap this pins: {sql}"
+                sql.contains("FROM (SELECT "),
+                "{dialect_name}: the projection flattened into one SELECT, so this guard is \
+                 not looking at the derived-table shape it is for: {sql}"
             );
 
             // `column_of` panics unless the enclosing reference is qualified by `s`,
             // which is what makes the requalification the subject of this guard.
-            //
-            // Asked of the whole `FROM` clause rather than of the derived `SELECT`
-            // list, because the two ways a pin bump can close this gap land in
-            // different places: naming the derived output puts the name inside the
-            // list, while naming the relation's columns on the alias — the repair the
-            // comment above says this shape actually needs — puts it after the derived
-            // table closes. Reading only the list would leave this sentinel green
-            // through exactly the fix it exists to catch. Today the enclosing scope is
-            // the one place the name appears at all.
             let column = column_of(outer_reference(&sql), Some("s"));
             assert!(
-                !from_clause(&sql).contains(column),
-                "{dialect_name}: the derived table now exposes {column}, so this shape binds and \
-                 the remaining half of #12751 is repaired — move it into \
-                 `derived_scope_shapes` and close the issue instead of re-pinning this: {sql}"
+                from_clause(&sql).contains(column),
+                "{dialect_name}: the alias does not expose {column}, which is the identifier \
+                 the enclosing scope references, so the remote engine cannot bind the \
+                 statement: {sql}"
             );
         }
     }
@@ -2160,7 +2316,7 @@ mod tests {
 
         let postgres = unparse_with("postgres", &PostgreSqlDialect {}, &plan);
         assert!(
-            postgres.contains("(key)"),
+            postgres.contains(r#"("key")"#) || postgres.contains("(key)"),
             "this plan no longer unparses to a column alias list on any dialect, so there \
              is nothing for the BigQuery arms above to have inlined: {postgres}"
         );
@@ -2216,5 +2372,411 @@ mod tests {
                  {default_sql}"
             );
         }
+    }
+
+    /// A federated batch that does not fit its declared schema must fail, not come
+    /// back with a NULL where the value was.
+    ///
+    /// `SchemaCastScanExec` coerces every batch a remote returns to the schema the
+    /// plan declared, through `datafusion_federation`'s `try_cast_to`. Arrow's
+    /// default cast is the *safe* one: a value the target type cannot hold becomes
+    /// NULL instead of an error. So a federated column read one width too narrow —
+    /// a remote `BIGINT` the plan typed `INT`, which is what a schema inferred from
+    /// one driver and used against another gives — returns NULLs where the remote
+    /// returned numbers, on a query that reports success. The fork casts with
+    /// `safe: false` instead (federation PR #67), which makes it a failed query.
+    ///
+    /// The overflow arm is the point: the whole value of the patch is that the case
+    /// stops being silent. The in-range arm is the control, because a cast that
+    /// refused everything would satisfy the first assertion by itself.
+    #[test]
+    fn a_federated_value_too_wide_for_its_declared_type_is_an_error_not_a_null() {
+        use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch};
+        use datafusion_federation::schema_cast::record_convert::try_cast_to;
+
+        let remote = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let declared = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+
+        let overflowing = Int64Array::from(vec![i64::from(i32::MAX) + 1]);
+
+        // The counterfactual, run here rather than asserted in prose: Arrow's
+        // default cast is the one `try_cast_to` used before the patch, and it
+        // answers this very value with a NULL and no error. Without this arm the
+        // assertion below would also hold on a build where nothing could overflow.
+        let safe = datafusion::arrow::compute::cast(&overflowing, &DataType::Int32)
+            .expect("arrow's safe cast reports no error at all");
+        assert_eq!(
+            safe.null_count(),
+            1,
+            "the safe cast is the behaviour the patch replaces: it turns the overflow into a NULL"
+        );
+
+        let batch = RecordBatch::try_new(Arc::clone(&remote), vec![Arc::new(overflowing) as _])
+            .expect("an Int64 batch matching its own schema");
+        assert!(
+            try_cast_to(batch, Arc::clone(&declared)).is_err(),
+            "one past i32::MAX has to fail the cast; the safe cast above hands it back as NULL, \
+             so the query answers with a NULL where the remote sent a number and reports no error"
+        );
+
+        let in_range = RecordBatch::try_new(
+            Arc::clone(&remote),
+            vec![Arc::new(Int64Array::from(vec![7_i64]))],
+        )
+        .expect("an Int64 batch matching its own schema");
+        let cast = try_cast_to(in_range, declared).expect("7 is representable as an i32");
+        assert_eq!(
+            cast.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("the column was cast to Int32")
+                .value(0),
+            7,
+            "a value the target type holds still has to come through it"
+        );
+    }
+
+    /// A `TableSource` the federation analyzer recognises as federated, so a plan
+    /// built on it is one the analyzer will try to wrap.
+    fn federated_table_source() -> Arc<dyn TableSource> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        Arc::new(DefaultTableSource::new(Arc::new(
+            create_spice_federated_table_provider(
+                test_sql_table(),
+                schema,
+                TableReference::bare("t"),
+                None,
+            ),
+        )))
+    }
+
+    /// Nothing under a DML plan may be federated.
+    ///
+    /// The analyzer federates the largest sub-tree that draws on one provider,
+    /// and the input of a `DELETE` over a federated table is such a sub-tree. It
+    /// must be left alone: the unparser has no `dml_to_sql`, so a federated node
+    /// under a `Dml` cannot be rendered at all, and `DataFusion`'s physical
+    /// planner dispatches `delete_from`/`update` by matching `LogicalPlan::Dml`,
+    /// which it cannot do once the rows it owns have been replaced by an
+    /// extension node. The fork returns a DML plan untouched (federation PR #73).
+    ///
+    /// The assertion is on the *input*, not on the root, because the root is a
+    /// `Dml` either way — losing the patch federates what is under it rather than
+    /// replacing it. And the input has to be a shape the analyzer really does
+    /// federate, or the assertion holds for the wrong reason; the control
+    /// establishes that, and a `Limit` is used rather than a filter because a
+    /// filter is pushed into the scan before federation runs, collapsing the plan
+    /// to a bare `TableScan` that the adaptor serves itself and the analyzer
+    /// leaves alone.
+    ///
+    /// The fork gives a third reason for the patch — that a wrapped `Dml` is
+    /// invisible to a write-permission validator that walks for it. That is the
+    /// fork's rationale rather than something reproduced here:
+    /// `validate_sql_query_operations` runs on the plan `create_logical_plan`
+    /// returns, and analyzer rules have not run at that point.
+    #[test]
+    fn nothing_under_a_dml_plan_is_federated_by_the_analyzer() {
+        let source = federated_table_source();
+        let rows_to_delete = || {
+            LogicalPlanBuilder::scan("t", Arc::clone(&source), None)
+                .expect("scan the federated table")
+                .limit(0, Some(3))
+                .expect("limit the scan")
+                .build()
+                .expect("build the input plan")
+        };
+
+        let control = FederationAnalyzerRule::new()
+            .analyze(rows_to_delete(), &ConfigOptions::default())
+            .expect("the analyzer accepts a federated plan");
+        assert!(
+            contains_a_federated_node(&control),
+            "the control: this shape is one the analyzer does federate, which is what gives \
+             the assertion below teeth. Shape was:\n{}",
+            control.display_indent()
+        );
+
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            TableReference::bare("t"),
+            Arc::clone(&source),
+            WriteOp::Delete,
+            Arc::new(rows_to_delete()),
+        ));
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(dml, &ConfigOptions::default())
+            .expect("the analyzer accepts a DML plan");
+
+        let LogicalPlan::Dml(statement) = &analyzed else {
+            panic!(
+                "a Dml plan has to stay a Dml plan, got:\n{}",
+                analyzed.display_indent()
+            );
+        };
+        assert!(
+            !contains_a_federated_node(statement.input.as_ref()),
+            "a federated node under a Dml is a DELETE that can be neither rendered nor \
+             dispatched. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// Whether any node of `plan` is an extension node, which is what federation
+    /// wraps a sub-tree in.
+    fn contains_a_federated_node(plan: &LogicalPlan) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if matches!(node, LogicalPlan::Extension(_)) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        found
+    }
+
+    /// A `Limit` over a scan of the federated table: the subquery both `EXISTS`
+    /// guards below put inside their predicate.
+    ///
+    /// A `Limit` rather than a bare scan or a filter, for the reason the DML guard
+    /// above gives: a bare scan is served by the `FederatedTableProviderAdaptor`
+    /// itself and never wrapped, and a filter is pushed into the scan before
+    /// federation runs, collapsing to the same thing.
+    fn federated_subquery() -> Arc<LogicalPlan> {
+        Arc::new(
+            LogicalPlanBuilder::scan("t", federated_table_source(), None)
+                .expect("scan the federated table")
+                .limit(0, Some(1))
+                .expect("limit the scan")
+                .build()
+                .expect("build the subquery"),
+        )
+    }
+
+    /// A scan of a table that is *not* federated, filtered by `predicate`.
+    ///
+    /// The outer table is deliberately local. That way the statement cannot
+    /// federate as one unit, so the only thing that can carry a federated node is
+    /// the subquery itself, and the assertions cannot be satisfied by the outer
+    /// plan being wrapped instead.
+    fn statement_filtered_by(predicate: Expr) -> LogicalPlan {
+        // A real provider, not a `LogicalTableSource`: the analyzer resolves every
+        // scan through `source_as_provider`, which refuses anything else outright
+        // ("TableSource was not DefaultTableSource").
+        let local: Arc<dyn TableSource> =
+            Arc::new(DefaultTableSource::new(Arc::new(EmptyTable::new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            ))));
+        LogicalPlanBuilder::scan("local", local, None)
+            .expect("scan the local table")
+            .filter(predicate)
+            .expect("filter on the subquery predicate")
+            .build()
+            .expect("build the statement")
+    }
+
+    /// An `EXISTS` subquery over a federated table has to be federated.
+    ///
+    /// `Expr::Exists` fell through the analyzer's expression walk, so the tables
+    /// inside an `EXISTS` subquery were invisible to the provider verdict and the
+    /// subquery was never federated. It then runs locally — one scan per table
+    /// reference, every join and aggregate evaluated here — while the statement
+    /// around it federates. Fork PR #74 handles the expression in both halves of
+    /// the walk: counting the subquery's tables toward the verdict, and federating
+    /// the subquery's own plan.
+    #[test]
+    fn an_exists_subquery_over_a_federated_table_is_federated() {
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(
+                statement_filtered_by(exists(federated_subquery())),
+                &ConfigOptions::default(),
+            )
+            .expect("the analyzer accepts a statement with an EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped — otherwise the assertion below could be met by the wrong node. \
+             Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert_eq!(
+            federated_exists_negation(&analyzed),
+            Some(false),
+            "the subquery's only table is federated, so the subquery has to be pushed to \
+             that provider rather than run here a scan at a time. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// The same, for `NOT EXISTS`, which has to come back still negated.
+    ///
+    /// The patch does not wrap the existing expression — it rebuilds it, carrying
+    /// `negated` across by hand. Reconstructing it with the flag reset federates
+    /// exactly as well and returns the complement of the rows asked for, which the
+    /// guard above cannot see: it builds only the non-negated shape, and a
+    /// federated node is present either way. So this asserts the flag, not just
+    /// the wrapping.
+    #[test]
+    fn a_not_exists_subquery_is_federated_and_stays_negated() {
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(
+                statement_filtered_by(not_exists(federated_subquery())),
+                &ConfigOptions::default(),
+            )
+            .expect("the analyzer accepts a statement with a NOT EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert_eq!(
+            federated_exists_negation(&analyzed),
+            Some(true),
+            "a federated NOT EXISTS that comes back as EXISTS returns the complement of the \
+             rows the statement asked for, and reports success doing it. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// A provider that reports which of its methods was reached, and nothing else.
+    ///
+    /// An error rather than a plan because the call arriving is the whole
+    /// observation — building a real `ExecutionPlan` would add machinery the
+    /// assertion does not read.
+    #[derive(Debug)]
+    struct RecordingDmlProvider {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingDmlProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "scan reached the inner provider".to_string(),
+            ))
+        }
+
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "delete_from reached the inner provider".to_string(),
+            ))
+        }
+
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "update reached the inner provider".to_string(),
+            ))
+        }
+    }
+
+    /// The adaptor has to forward `delete_from` and `update` to the provider it
+    /// wraps.
+    ///
+    /// The fork PR that returns DML plans unwrapped carries these two delegations
+    /// as well, and they are independent of it: a re-cut could keep the analyzer's
+    /// early return and drop either method. `TableProvider` defaults both to
+    /// reporting the operation unsupported, so losing one compiles — and the
+    /// `DELETE` or `UPDATE` it stops is exactly the one the early return exists to
+    /// keep working, which is why the guard above cannot stand in for this. The
+    /// fork's own `delete_from_delegates_to_inner_provider` and
+    /// `update_delegates_to_inner_provider` leave with the branch that gets
+    /// re-cut.
+    #[tokio::test]
+    async fn the_adaptor_forwards_dml_to_the_provider_it_wraps() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let executor: Arc<dyn SQLExecutor> =
+            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_schema(
+            Arc::new(SQLFederationProvider::new(executor)),
+            RemoteTableRef::from(TableReference::bare("t")),
+            Arc::clone(&schema),
+        ));
+        let adaptor = FederatedTableProviderAdaptor::new_with_provider(
+            source,
+            Arc::new(RecordingDmlProvider { schema }),
+        );
+        let state = SessionContext::new().state();
+
+        let deleted = adaptor
+            .delete_from(&state, vec![])
+            .await
+            .expect_err("the recording provider reports the call rather than planning it");
+        assert!(
+            deleted
+                .to_string()
+                .contains("delete_from reached the inner provider"),
+            "the adaptor did not forward `delete_from`, so a DELETE against a federated \
+             table is refused as unsupported: {deleted}"
+        );
+
+        let updated = adaptor
+            .update(&state, vec![], vec![])
+            .await
+            .expect_err("the recording provider reports the call rather than planning it");
+        assert!(
+            updated
+                .to_string()
+                .contains("update reached the inner provider"),
+            "the adaptor did not forward `update`, so an UPDATE against a federated table \
+             is refused as unsupported: {updated}"
+        );
+    }
+
+    /// The `negated` flag of the first `EXISTS` subquery in `plan` that came back
+    /// federated, or `None` when no `EXISTS` subquery was federated at all.
+    ///
+    /// One accessor for both halves of the contract: that the subquery reached the
+    /// provider, and that it still asks the question it was written to ask.
+    fn federated_exists_negation(plan: &LogicalPlan) -> Option<bool> {
+        let mut negated = None;
+        plan.apply(|node| {
+            for expr in node.expressions() {
+                expr.apply(|e| {
+                    if let Expr::Exists(exists) = e
+                        && contains_a_federated_node(exists.subquery.subquery.as_ref())
+                    {
+                        negated = Some(exists.negated);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walking an expression cannot fail");
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        negated
     }
 }

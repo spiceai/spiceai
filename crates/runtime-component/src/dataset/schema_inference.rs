@@ -154,9 +154,24 @@ pub fn apply_inferred_schema(
         .as_ref()
         .map(|pk| pk.iter().map(ToString::to_string).collect());
 
-    // 2) Secondary indexes — only when the user configured none.
+    // 2) Secondary indexes — only when the user configured none, and never for
+    // DuckDB. A DuckDB upsert sets every non-key column, and an update that sets an
+    // indexed column is executed as a delete plus an insert, so each change to a row
+    // gives it a new row id. DuckDB's primary-key index holds at most two row ids per
+    // key, so the third version of a key written while a query that began before the
+    // second is still running fails to commit ("write-write conflict on key"), and
+    // for a change stream that stops replication of the dataset (#13929). Without a
+    // secondary index the upsert updates the row in place and never adds a row id.
     let mut applied_indexes = 0usize;
-    if constraints_applicable && acceleration.indexes.is_empty() {
+    let infer_indexes = constraints_applicable && acceleration.indexes.is_empty();
+    if infer_indexes && engine == Engine::DuckDB {
+        if !inferred.indexes.is_empty() {
+            tracing::debug!(
+                dataset = %dataset_name,
+                "Skipping inferred secondary indexes; a DuckDB upsert that sets an indexed column rewrites the row, which fails to commit while an older query is still reading it"
+            );
+        }
+    } else if infer_indexes {
         for index in &inferred.indexes {
             if !index.columns.iter().all(|c| has_column(c)) {
                 continue;
@@ -225,17 +240,23 @@ fn apply_inferred_sort(
         return false;
     }
 
+    // Each key is the *external* spelling the engine's parameter validation
+    // accepts: a `ParameterSpec::component` param must carry the engine prefix
+    // (`arrow_sort_columns`, `cayenne_sort_columns`), while DuckDB's
+    // `on_refresh_sort_columns` is a `ParameterSpec::runtime` param and takes
+    // none. An unprefixed component key is dropped by `runtime_parameters` with a
+    // user-facing warning about a parameter the user never wrote (#14023).
     let engine = acceleration.engine.to_unpartitioned();
     let key = match engine {
         Engine::DuckDB => "on_refresh_sort_columns",
-        Engine::Arrow => "sort_columns",
+        Engine::Arrow => "arrow_sort_columns",
         Engine::Cayenne => "cayenne_sort_columns",
         // Sqlite / Turso / PostgreSQL accelerators have no sort param.
         _ => return false,
     };
 
     // For `refresh_mode: changes`, skip engines whose sort param drives the
-    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `sort_columns`): a
+    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `arrow_sort_columns`): a
     // refresh-time sort is a no-op for a change stream and risks perturbing the
     // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
     // the background compaction rewrite, not the change stream (which stays
@@ -245,11 +266,15 @@ fn apply_inferred_sort(
         return false;
     }
 
-    // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
-    // Checked before the DuckDB constraint guard below so an explicitly-sorted
-    // dataset is reported as user-configured, not as a constraint-preservation skip.
+    // Respect any user-configured sort param. Cayenne and Arrow also read the
+    // unprefixed `sort_columns` straight from the acceleration params, so a user
+    // who wrote that spelling has configured a sort even though validation warns
+    // about the missing prefix. Checked before the DuckDB constraint guard below
+    // so an explicitly-sorted dataset is reported as user-configured, not as a
+    // constraint-preservation skip.
     let user_configured = acceleration.params.contains_key(key)
-        || (engine == Engine::Cayenne && acceleration.params.contains_key("sort_columns"));
+        || (matches!(engine, Engine::Cayenne | Engine::Arrow)
+            && acceleration.params.contains_key("sort_columns"));
     if user_configured {
         return false;
     }
@@ -597,6 +622,72 @@ mod tests {
         ));
     }
 
+    // Regression test for #13929: an inferred secondary index turned every DuckDB CDC
+    // upsert into a delete plus an insert, which fails to commit under concurrent reads.
+    #[test]
+    fn duckdb_skips_inferred_secondary_indexes_for_changes() {
+        let mut acc = accel(Engine::DuckDB);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["last".to_string(), "first".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "first", "last", "email"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+
+        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+        assert!(matches!(
+            acc.on_conflict.get(&col_ref(&["id"])),
+            Some(OnConflictBehavior::Upsert(_))
+        ));
+        assert!(
+            acc.indexes.is_empty(),
+            "no inferred secondary index may reach a DuckDB acceleration: {:?}",
+            acc.indexes
+        );
+    }
+
+    #[test]
+    fn duckdb_keeps_user_configured_indexes_for_changes() {
+        let mut acc = accel(Engine::DuckDB);
+        acc.indexes.insert(col_ref(&["email"]), IndexType::Unique);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![InferredIndex {
+                columns: vec!["last".to_string()],
+                unique: false,
+            }],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "last", "email"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+
+        assert_eq!(acc.indexes.len(), 1);
+        assert_eq!(
+            acc.indexes.get(&col_ref(&["email"])),
+            Some(&IndexType::Unique)
+        );
+    }
+
     #[test]
     fn duckdb_skips_inferred_sort_when_user_primary_key_configured() {
         // DuckDB's on-refresh sort rewrites the table without preserving
@@ -801,9 +892,41 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params.get("sort_columns").map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC, id ASC")
         );
+        // The unprefixed spelling is what Arrow's parameter validation rejects
+        // with a warning; inference must never write it (#14023).
+        assert!(!acc.params.contains_key("sort_columns"));
+    }
+
+    #[test]
+    fn arrow_respects_user_sort_param_in_either_spelling() {
+        // `arrow_sort_columns` is the validated spelling; the Arrow accelerator
+        // also reads a bare `sort_columns` from the acceleration params, so both
+        // count as user-configured and neither is overridden by inference.
+        for user_key in ["arrow_sort_columns", "sort_columns"] {
+            let mut acc = accel(Engine::Arrow);
+            acc.params
+                .insert(user_key.to_string(), "custom".to_string());
+            let inferred = InferredSchema {
+                sort_columns: vec![sort("created_at", true)],
+                ..InferredSchema::default()
+            };
+            apply_inferred_schema(
+                &mut acc,
+                &inferred,
+                &schema(&["created_at"]),
+                "ds",
+                RefreshMode::Full,
+            );
+            assert_eq!(acc.params.len(), 1, "user key {user_key}");
+            assert_eq!(
+                acc.params.get(user_key).map(String::as_str),
+                Some("custom"),
+                "user key {user_key}"
+            );
+        }
     }
 
     #[test]

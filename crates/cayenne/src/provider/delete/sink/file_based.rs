@@ -40,7 +40,6 @@ use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::TaskContext;
-use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
@@ -246,6 +245,12 @@ impl FileBasedDeletionSink {
         let mut retired_cache_paths = HashSet::new();
         let mut delete_error = None;
 
+        if !eligible_files.is_empty() {
+            // The write lock and listing fence keep new captures out until the
+            // deletion finishes. Reject cached views before unlinking any file.
+            self.provider.invalidate_scan_views_before_file_removal();
+        }
+
         for (meta, num_rows) in eligible_files {
             let row_count = num_rows.unwrap_or(0);
             let Ok(rows) = u64::try_from(row_count) else {
@@ -348,7 +353,7 @@ impl FileBasedDeletionSink {
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
         // shared ListingTable and are unaffected by this SessionContext.
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
 

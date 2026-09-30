@@ -52,3 +52,20 @@ pub(crate) fn shared_component(dataset_name: &str) -> ConnectorComponent {
 
     ConnectorComponent::from(&dataset)
 }
+
+/// The nested connection must request `pageInfo` and wire a `node(id:)` pager.
+pub(crate) fn assert_nested_pager_wired(
+    params: &crate::GitHubTableGraphQLParams,
+    connection_prefix: &str,
+) {
+    let query = params.query.to_string();
+    let rest = query.split(connection_prefix).nth(1).unwrap_or("");
+    assert!(
+        rest.contains("hasNextPage") && rest.contains("endCursor"),
+        "{connection_prefix} must request pageInfo, got:\n{query}"
+    );
+    assert!(
+        params.nested_pager.is_some(),
+        "must page overflow via node(id:)"
+    );
+}

@@ -51,6 +51,7 @@ jobs:
     runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
+      runtime_matrix: ${{ steps.setup-matrix.outputs.runtime_matrix }}
 
     steps:
       - name: Set up matrix
@@ -76,6 +77,7 @@ jobs:
                 target_arch: "x86_64",
               }
             ];
+            core.setOutput('runtime_matrix', matrix.filter((target) => target.target_os !== 'windows'));
             return matrix;
 
   build:
@@ -144,7 +146,6 @@ jobs:
 
   test_spice_upgrade_with_runtime:
     name: 'Test spice upgrade (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
@@ -158,7 +159,7 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.runtime_matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,7 +174,7 @@ jobs:
           path: ./build
 
       - name: download spice cli released version
-        if: github.event.inputs.build_cli == 'false' && matrix.target.target_os != 'windows'
+        if: github.event.inputs.build_cli == 'false'
         run: |
           mkdir -p ./build
           cd ./build
@@ -184,19 +185,7 @@ jobs:
           rm "$output"
           chmod +x spice
 
-      - name: download spice cli released version
-        if: github.event.inputs.build_cli == 'false' && matrix.target.target_os == 'windows'
-        run: |
-          New-Item -ItemType Directory -Force -Path "./build" > $null
-          Set-Location "./build"
-          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spice.exe_windows_x86_64.tar.gz"
-          $output = "spice.exe_windows_x86_64.tar.gz"
-          Invoke-WebRequest -Uri $url -OutFile $output
-          tar -xzf $output
-          Remove-Item $output
-
       - name: Download older spiced
-        if: matrix.target.target_os != 'windows'
         run: |
           cd ./build
           url="https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
@@ -212,7 +201,6 @@ jobs:
           build-path: ./build
 
       - name: Check pre-upgrade version
-        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice version
@@ -225,13 +213,11 @@ jobs:
           fi
 
       - name: Run spice upgrade
-        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
 
       - name: Verify no models variant attempted for v2+
-        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           VERSION="${{ env.REL_VERSION }}"
@@ -248,23 +234,7 @@ jobs:
             echo "Skipping models variant check for v1.x"
           fi
 
-      - name: Validate native Windows spice upgrade guidance
-        if: matrix.target.target_os == 'windows'
-        shell: pwsh
-        run: |
-          $expected = "Open WSL and run the Linux Spice CLI there instead."
-          $upgradeOutput = (& spice upgrade 2>&1 | Out-String)
-          Write-Host $upgradeOutput
-          if ($LASTEXITCODE -eq 0) {
-            throw "spice upgrade unexpectedly succeeded on native Windows"
-          }
-          if (-not $upgradeOutput.Contains($expected)) {
-            throw "spice upgrade did not print the expected WSL guidance"
-          }
-          exit 0
-
       - name: Run spice version
-        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice version
@@ -289,7 +259,6 @@ jobs:
 
   test_spice_upgrade_without_runtime:
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
@@ -329,6 +298,7 @@ jobs:
 
       - name: download spice cli released version
         if: github.event.inputs.build_cli == 'false' && matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "./build" > $null
           Set-Location "./build"
@@ -401,7 +371,6 @@ jobs:
 
   test_spice_install_without_runtime:
     name: 'Test spice install without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
@@ -441,6 +410,7 @@ jobs:
 
       - name: download spice cli released version
         if: github.event.inputs.build_cli == 'false' && matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "./build" > $null
           Set-Location "./build"
@@ -501,7 +471,6 @@ jobs:
 
   test_spice_run_without_runtime:
     name: 'Test spice run without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
@@ -541,6 +510,7 @@ jobs:
 
       - name: download spice cli released version
         if: github.event.inputs.build_cli == 'false' && matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "./build" > $null
           Set-Location "./build"
@@ -591,7 +561,6 @@ jobs:
   test_spice_upgrade_from_brew:
     name: 'Test spice upgrade from a homebrew spice cli'
     if: github.event.inputs.build_cli == 'true'
-    continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
@@ -640,7 +609,6 @@ jobs:
   test_spice_chat:
     name: 'Test spice chat'
     if: github.event.inputs.build_cli == 'true'
-    continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}

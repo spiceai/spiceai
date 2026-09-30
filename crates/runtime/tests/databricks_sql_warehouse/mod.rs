@@ -36,24 +36,24 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
 
 #[expect(clippy::expect_used)]
 fn get_params() -> Params {
-    let _ = std::env::var("TEST_DATABRICKS_HOST").expect("TEST_DATABRICKS_HOST is not set");
-    let _ = std::env::var("TEST_DATABRICKS_TOKEN").expect("TEST_DATABRICKS_TOKEN is not set");
-    let _ = std::env::var("TEST_DATABRICKS_SQL_WAREHOUSE_ID")
-        .expect("TEST_DATABRICKS_SQL_WAREHOUSE_ID is not set");
+    let _ = std::env::var("NEW_DATABRICKS_HOST").expect("NEW_DATABRICKS_HOST is not set");
+    let _ = std::env::var("NEW_DATABRICKS_TOKEN").expect("NEW_DATABRICKS_TOKEN is not set");
+    let _ = std::env::var("NEW_DATABRICKS_SQL_WAREHOUSE_ID")
+        .expect("NEW_DATABRICKS_SQL_WAREHOUSE_ID is not set");
 
     Params::from_string_map(
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:TEST_DATABRICKS_HOST }".to_string(),
+                "${ env:NEW_DATABRICKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
+                "${ env:NEW_DATABRICKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_sql_warehouse_id".to_string(),
-                "${ env:TEST_DATABRICKS_SQL_WAREHOUSE_ID }".to_string(),
+                "${ env:NEW_DATABRICKS_SQL_WAREHOUSE_ID }".to_string(),
             ),
             ("client_timeout".to_string(), "120s".to_string()),
             ("mode".to_string(), "sql_warehouse".to_string()),
@@ -330,7 +330,7 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_foreign_test")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.foreign_table",
+                    "spice_integration_tests_lakebase.tpch.region",
                     "foreign_table",
                 ))
                 .build();

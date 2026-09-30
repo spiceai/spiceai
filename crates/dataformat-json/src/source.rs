@@ -157,10 +157,19 @@ impl FileSource for SpiceJsonSource {
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
         let new_projection = self.projection.source.try_merge(projection)?;
-        let split_projection =
-            SplitProjection::new(self.table_schema.file_schema(), &new_projection);
-        source.projection = split_projection;
+        source.projection =
+            SplitProjection::new_with_table_schema(&self.table_schema, &new_projection);
         Ok(Some(Arc::new(source)))
+    }
+
+    fn with_metadata_cols(
+        &self,
+        metadata_cols: Vec<datafusion_datasource::metadata::MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        let mut source = self.clone();
+        source.table_schema = source.table_schema.with_metadata_cols(metadata_cols);
+        source.projection = SplitProjection::unprojected(&source.table_schema);
+        Some(Arc::new(source))
     }
 
     fn projection(&self) -> Option<&ProjectionExprs> {

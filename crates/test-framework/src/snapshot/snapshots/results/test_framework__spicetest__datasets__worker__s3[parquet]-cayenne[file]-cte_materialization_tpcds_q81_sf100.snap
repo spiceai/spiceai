@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q81"
+---
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+-------------+-----------------+----------+--------+---------------+---------------+------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | ca_street_number | ca_street_name | ca_street_type | ca_suite_number | ca_city     | ca_county       | ca_state | ca_zip | ca_country    | ca_gmt_offset | ca_location_type | ctr_total_return |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+-------------+-----------------+----------+--------+---------------+---------------+------------------+------------------+
+| AAAAAAAAAAAIGBAA | Sir          | Melvin       | Meador      | 317              | 5th Highland   | Court          | Suite 130       | Glendale    | Victoria County | TX       | 73951  | United States | -6.00         | apartment        | 4917.57          |
+| AAAAAAAAAAAILAAA | Sir          | Ricardo      | Rutledge    | 221              | Church Maple   | Road           | Suite 390       | Fairfield   | Atascosa County | TX       | 76192  | United States | -6.00         | single family    | 7899.00          |
+| AAAAAAAAAAAJBAAA | Sir          | Michael      | Gonzalez    | 672              | Railroad       | Lane           | Suite 470       | Farmington  | Dawson County   | TX       | 79145  | United States | -6.00         | apartment        | 1802.09          |
+| AAAAAAAAAAAMJBAA | Ms.          | Fannie       | Carey       | 278              | Center Cherry  | RD             | Suite F         | Belmont     | Atascosa County | TX       | 70191  | United States | -6.00         | apartment        | 4526.42          |
+| AAAAAAAAAAAPAAAA | Mr.          | Robert       | Cox         | 115              | Dogwood Ridge  | Lane           | Suite 380       | Riverdale   | Archer County   | TX       | 79391  | United States | -6.00         | condo            | 2667.52          |
+| AAAAAAAAAABHHBAA | Mr.          | Christopher  | Harris      | 164              | Twelfth        | Avenue         | Suite S         | Oakland     | Jack County     | TX       | 79843  | United States | -6.00         | single family    | 3857.76          |
+| AAAAAAAAAABJFBAA | Dr.          | Philip       | Mcginnis    | 540              | Pine 1st       | Pkwy           | Suite H         | Mount Zion  | Burnet County   | TX       | 78054  | United States | -6.00         | single family    | 3630.87          |
+| AAAAAAAAAABKMAAA | Ms.          | Sheryl       | Rowe        | 390              | Hickory        | Ct.            | Suite O         | Wilson      | Fisher County   | TX       | 76971  | United States | -6.00         | apartment        | 2558.92          |
+| AAAAAAAAAABKMBAA | Ms.          | Velma        | Thompson    | 560              | 13th           | Avenue         | Suite 210       | Salem       | Upshur County   | TX       | 78048  | United States | -6.00         | condo            | 1994.91          |
+| AAAAAAAAAACECAAA | Mr.          | George       | Yang        | 124              | Ridge Cedar    | Ave            | Suite W         | Piney Grove | Angelina County | TX       | 78274  | United States | -6.00         | single family    | 3881.70          |
++------------------+--------------+--------------+-------------+------------------+----------------+----------------+-----------------+-------------+-----------------+----------+--------+---------------+---------------+------------------+------------------+

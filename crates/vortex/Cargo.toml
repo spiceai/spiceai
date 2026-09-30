@@ -67,5 +67,17 @@ name = "schema_field_lookup"
 harness = false
 name = "filter_pushdown_not"
 
+[[bench]]
+harness = false
+name = "in_list_kernel"
+
+[[bench]]
+harness = false
+name = "in_list_pruning"
+
+[[bench]]
+harness = false
+name = "in_list_pruning_power"
+
 [lints]
 workspace = true

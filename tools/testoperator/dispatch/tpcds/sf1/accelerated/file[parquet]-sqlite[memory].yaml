@@ -5,6 +5,7 @@ tests:
     query_overrides: sqlite
     runner_type: spiceai-dev-runners
     ready_wait: 600
+    validate_results: true
   throughput:
     spicepod_path: accelerated/file[parquet]-sqlite[memory].yaml
     query_set: tpcds

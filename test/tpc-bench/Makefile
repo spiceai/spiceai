@@ -311,13 +311,44 @@ mysql-init:
 
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
+# MySQL's LOAD DATA reads an empty field as the column type's zero value - an empty
+# integer field lands as 0, never NULL - while PostgreSQL's `\copy ... CSV` reads that
+# same empty field as NULL. dsdgen writes a NULL as an empty field (and the DuckDB
+# tpcds/tpch extensions export with QUOTE '', so they write one too), so loading these
+# files into MySQL unchanged replaces every NULL foreign key with 0. The MySQL arms then
+# benchmark different data from every other arm seeded from the same files, and nothing
+# downstream can tell: row counts still match, and only a query keying on NULL-ness
+# disagrees. tpcds_q76, whose three predicates are all `IS NULL`, is that query.
+#
+# The repair is type-directed rather than a rewrite of the data file, because the file
+# cannot distinguish a NULL from an empty string and a blanket rewrite would null the
+# empty strings too - `time_dim.t_meal_time` is 50,400 empty strings and zero NULLs.
+# `mysql-null-spec.awk` turns the table's own column types into a LOAD DATA spec that
+# NULLIFs only the columns where an empty field cannot be anything but NULL, and binds
+# text columns positionally so they keep their empty strings. The tables must already
+# exist, which `mysql-*-init` guarantees.
+#
+# TPC-H contains no NULLs and no empty strings, so `mysql-load` was never wrong; it uses
+# the same spec so the two loaders cannot drift.
+#
+# Each loader refuses an empty spec rather than loading without one. The generator
+# prints nothing for an empty column listing, and awk in a pipeline hides the exit
+# status of the `mysql` feeding it, so a server the recipe cannot reach would
+# otherwise load every table with no spec at all - reinstating the zero-for-NULL
+# corruption above, under a recipe that still reports success.
+MYSQL_NULL_SPEC = awk -f ./mysql-null-spec.awk
+MYSQL_COLUMN_TYPES = SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='$(DB_NAME)' AND table_name=
+
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
 mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
+		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-init' first so the tables exist." >&2; exit 1; }; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
@@ -353,7 +384,10 @@ mysql-tpcds-load:
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
 		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
+		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-tpcds-init' first so the tables exist." >&2; exit 1; }; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 

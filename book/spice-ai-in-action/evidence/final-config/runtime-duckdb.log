@@ -1,0 +1,38 @@
+2026-09-08T02:42:25.761060Z  INFO spiced: Starting runtime v2.3.0-unstable-build.b286009302+models
+2026-09-08T02:42:25.766040Z  INFO cpu_budget: CPU budget: 16 cores (source: the CPUs available to this process; host reports 16, declared CPU request unset, cgroup share unset, cgroup limit unset) → 16 main worker threads, 15 per dedicated runtime pool, 16 target partitions
+2026-09-08T02:42:25.766099Z  INFO cpu_budget: CPU budget derived sizing: main_runtime_worker_threads=16, dedicated_runtime_worker_threads=15, target_partitions=16, scan_split_concurrency=16, vortex_parallelism=16, max_concurrent_queries=64, cayenne_encode_permits=12, cayenne_write_concurrency_ceiling=16, cayenne_compaction_permits=16, cayenne_upload_concurrency=16, cayenne_max_concurrent_file_scans=16, metastore_pool_connections=16, embedding_pool_threads=16, duckdb_threads=16, cluster_executor_concurrent_tasks=16
+2026-09-08T02:42:25.769672Z  INFO runtime::builder: Vortex segment cache installed: 2048 MB shared across all Cayenne tables
+2026-09-08T02:42:25.770170Z  WARN runtime::builder: Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the 128.00 GiB available to this process: 5 DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about 102.40 GiB here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at 11.52 GiB each, and the query memory limit at 57.60 GiB. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit. For details, visit: https://spiceai.org/docs/reference/memory total_memory_bytes=137438953472 query_pool_bytes=61847529062 duckdb_unset_instances=5 duckdb_per_instance_bytes=12369002496 duckdb_unset_instance_paths=[".spice/duckdb/articles.db", ".spice/duckdb/customers.db", ".spice/duckdb/order_items.db", ".spice/duckdb/orders.db", ".spice/duckdb/returns.db"]
+2026-09-08T02:42:25.770286Z  INFO runtime::init::caching: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+2026-09-08T02:42:25.770435Z  INFO runtime::init::caching: Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-09-08T02:42:25.770483Z  INFO runtime::init::caching: Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-09-08T02:42:25.770744Z  INFO runtime::datafusion::builder: runtime.query.max_concurrent_queries not set; sized from the CPU budget max_concurrent_queries=64
+2026-09-08T02:42:25.770811Z  INFO runtime::datafusion::builder: runtime.query.target_partitions not set; sized from the CPU budget target_partitions=16
+2026-09-08T02:42:25.770818Z  INFO runtime::datafusion::builder: runtime.query.eager_aggregation not set; defaulting to spiced default eager_aggregation=true
+2026-09-08T02:42:25.773122Z  INFO runtime::datafusion: Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables) encode_budget=12
+2026-09-08T02:42:25.773153Z  INFO runtime::datafusion: Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention) max_concurrent_queries=64
+2026-09-08T02:42:25.773166Z  INFO runtime::datafusion: Cayenne dynamic-tuning memory budget active (cgroup-aware) memory_budget=137438953472
+2026-09-08T02:42:25.773188Z  INFO runtime::datafusion: Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently) pk_keyset_budget_bytes=8589934592 total_memory=137438953472
+2026-09-08T02:42:25.775727Z  INFO runtime::init::task_history: Task history enabled: retention_period=28800s, retention_check_interval=900s
+2026-09-08T02:42:25.946065Z  INFO runtime::init::dataset: Loading datasets: 5 tasks dispatched, 0 skipped at accelerator init (of 5 total; localpod datasets may be chained).
+2026-09-08T02:42:25.946076Z  INFO runtime::init::dataset: Dataset customers initializing...
+2026-09-08T02:42:25.946082Z  INFO runtime::init::dataset: Dataset orders initializing...
+2026-09-08T02:42:25.946141Z  INFO runtime::init::dataset: Dataset order_items initializing...
+2026-09-08T02:42:25.946076Z  INFO runtime::init::dataset: Dataset articles initializing...
+2026-09-08T02:42:25.946095Z  INFO runtime::init::dataset: Dataset returns initializing...
+2026-09-08T02:42:25.974046Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:15052
+2026-09-08T02:42:25.976072Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:18091
+2026-09-08T02:42:26.034698Z  INFO runtime::init::dataset: Dataset orders registered (file://data/orders.csv), acceleration (duckdb:file), results cache enabled. duration_ms=62
+2026-09-08T02:42:26.034729Z  INFO runtime::init::dataset: Dataset articles registered (file://data/articles.csv), acceleration (duckdb:file), results cache enabled. duration_ms=61
+2026-09-08T02:42:26.034844Z  INFO runtime::init::dataset: Dataset returns registered (file://data/returns.csv), acceleration (duckdb:file), results cache enabled. duration_ms=61
+2026-09-08T02:42:26.034863Z  INFO runtime::init::dataset: Dataset customers registered (file://data/customers.csv), acceleration (duckdb:file), results cache enabled. duration_ms=61
+2026-09-08T02:42:26.034891Z  INFO runtime::init::dataset: Dataset order_items registered (file://data/order_items.csv), acceleration (duckdb:file), results cache enabled. duration_ms=61
+2026-09-08T02:42:26.035647Z  INFO runtime::datafusion: Initializing view paid_orders
+2026-09-08T02:42:26.035807Z  INFO runtime::datafusion: Initializing view daily_sales
+2026-09-08T02:42:26.036000Z  WARN runtime::datafusion: Dependent table paid_orders for view daily_sales does not exist, retrying...
+2026-09-08T02:42:26.036673Z  INFO runtime::datafusion: View paid_orders registered.
+2026-09-08T02:42:27.037670Z  INFO runtime::datafusion: Dependent table paid_orders for view daily_sales found
+2026-09-08T02:42:27.039145Z  INFO runtime::datafusion: View daily_sales registered.
+2026-09-08T02:42:27.052409Z  INFO runtime: All components are loaded. Spice runtime is ready!
+2026-09-08T02:42:27.464229Z  INFO runtime: Shutdown initiated; waiting up to 30s for connections to drain
+2026-09-08T02:42:27.474817Z  INFO spiced: Goodbye!

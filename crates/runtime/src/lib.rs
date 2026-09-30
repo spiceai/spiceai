@@ -106,6 +106,7 @@ pub mod extension;
 pub use runtime_table::federated;
 pub mod flight;
 mod http;
+pub use http::v1::datasets::dataset_infos_with_status;
 
 pub mod http_types {
     pub use crate::http::v1::queries::SubmitQueryRequest;
@@ -665,6 +666,10 @@ pub struct Runtime {
     rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    /// Sync MCP schemas + epoch. Streamable HTTP rebuilds when this bumps
+    /// so rmcp cannot keep a cached `get_tool == None` after a tool appears.
+    #[cfg(feature = "mcp")]
+    mcp_schemas: Arc<runtime_tools::mcp::server::McpSchemaSnapshot>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
@@ -698,6 +703,10 @@ pub struct Runtime {
     /// (`read_provider`) calls so that startup loads and on-demand loads both
     /// honor `runtime.dataset_load_parallelism`.
     dataset_load_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// The dataset loads still retrying, so a Spicepod change can stop the load
+    /// of a configuration it replaces or removes.
+    dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
 
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
@@ -744,6 +753,11 @@ impl Runtime {
         Arc::clone(&self.secrets)
     }
 
+    #[cfg(feature = "mcp")]
+    pub(crate) fn refresh_mcp_tool_schemas(&self, tools: &HashMap<String, Tooling>) {
+        self.mcp_schemas.replace_from_map(tools);
+    }
+
     #[must_use]
     pub fn secrets_weak(&self) -> Weak<RwLock<secrets::Secrets>> {
         Arc::downgrade(&self.secrets)
@@ -762,6 +776,11 @@ impl Runtime {
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         self.llm_runtime_stores.completion_llms()
+    }
+
+    #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<crate::model::EvaluateModelStore>> {
+        self.llm_runtime_stores.evaluate_models()
     }
 
     #[must_use]

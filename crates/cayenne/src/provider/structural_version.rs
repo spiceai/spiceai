@@ -14,21 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A seqlock-style version gate for FORCED structural table events whose mutation
-//! runs OFF the listing fence and could otherwise tear a straddling scan-view
-//! capture. Today the sole wired writer is **live schema-evolution** (its all-shards
-//! mem-tier flush runs off-fence — see `begin_mutation` at the widen site); the
-//! primitive is deliberately general so other off-fence discontinuities can adopt it.
+//! A seqlock-style version gate for forced events that invalidate cached scan
+//! views. Live schema evolution brackets its off-fence all-shards mem-tier flush
+//! so a straddling capture is retried. File-based retention advances the generation
+//! under the listing write fence before unlinking files: even a lag-tolerant scan
+//! must discard a cached view whose files are about to be removed.
 //!
-//! Ordinary CDC churn (append / row-delete / upsert / checkpoint / compaction) does
+//! Ordinary CDC churn (append / logical row-delete / upsert / checkpoint / compaction) does
 //! NOT touch this, and neither do the FENCE-SERIALIZED snapshot events (truncate /
 //! full-table delete / `INSERT OVERWRITE` / reopen): the listing fence already
-//! serializes their capture, so they advance only the additive `scan_input_version`
-//! and are served bounded-stale. Only an off-fence discontinuity that would make a
-//! previously-computed scan view semantically WRONG (not merely stale) advances this.
-//! This lets the demand-driven scan-view cache serve bounded-stale views freely for
-//! everything else while GUARANTEEING that a scan capture straddling a schema-evolve
-//! is discarded and retried rather than built into a pre-evolution bundle.
+//! serializes their capture, so they advance only the additive `scan_input_version`.
+//! A discontinuity that makes a cached view unusable or semantically wrong,
+//! rather than merely stale, advances this. A `WithinLag` serve may
+//! reuse a cached view across ordinary writes, but a capture that straddles a
+//! schema-evolve is discarded and retried rather than built into a pre-evolution
+//! bundle.
 //!
 //! Protocol (odd = mutation in flight, even = stable), a versioned seqlock:
 //! - Forced-event writer: [`StructuralVersion::begin_mutation`] bumps the counter
@@ -37,13 +37,13 @@ limitations under the License.
 //!   guard is live at a time — the odd/even pair is a generation MARKER, not a
 //!   mutual-exclusion mechanism.
 //! - Demand capture (seqlock reader): [`StructuralVersion::read_validated_async`]
-//!   (and the sync [`StructuralVersion::read_validated`] reference impl) captures an
+//!   (and [`StructuralVersion::read_validated`] around cache-hit selection) captures an
 //!   even `v0`, runs the capture, and returns the output stamped with `v0` ONLY if
 //!   the counter is still `v0` afterwards — so a capture that raced a forced event
 //!   is DISCARDED and retried rather than built into a torn or pre-event view.
-//! - Key generation: [`StructuralVersion::current`] is folded into the demand cache's
-//!   `ScanViewKey`, so a live schema-evolution mints a fresh identity (a read-current
-//!   fast-path serve is gated on it); there is no wait/republish gate.
+//! - Key generation: the version from [`StructuralVersion::read_validated_async`]
+//!   is folded into the demand cache's `ScanViewKey`, so a live schema-evolution
+//!   mints a fresh identity. Both reuse fast paths require the generation to match.
 //!
 //! The primitive lives here — not smeared across the mutation call sites — with
 //! its own loom model, so the concurrency proof is local and audited once. See
@@ -70,15 +70,8 @@ impl StructuralVersion {
         }
     }
 
-    /// The current structural generation. The demand cache reads this at capture,
-    /// folds it into the `ScanViewKey`, and (on the read-current fast path) compares
-    /// it so a stale-tolerant serve is never a pre-evolution bundle.
-    ///
-    /// May observe an ODD (in-flight) value; the demand capture only keys on an even,
-    /// validated generation (`read_validated_async` retries an odd/torn read), so an
-    /// odd `v` observed here simply forces a rebuild rather than being trusted.
-    /// `Acquire` so an observer of a forced bump also observes the writer's data swaps
-    /// that preceded it (release/acquire with the guard's increments).
+    /// Observe the generation for test assertions without validating a capture.
+    #[cfg(test)]
     pub(crate) fn current(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
@@ -112,15 +105,6 @@ impl StructuralVersion {
     /// after its odd bump), release/acquire makes `v1` observe that bump (`>= odd`)
     /// and the equality check fails. The `Acquire` fence before `v1` covers any
     /// non-`ArcSwap` reads inside `build`. The loom model verifies this.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "sync reference impl exercised by the unit tests + loom model; production \
-                      captures across an `.await` via `read_validated_async`, which mirrors this \
-                      exact load ordering"
-        )
-    )]
     pub(crate) fn read_validated<T>(&self, build: impl FnOnce() -> T) -> Option<(u64, T)> {
         let v0 = self.version.load(Ordering::Acquire);
         if v0 & 1 != 0 {

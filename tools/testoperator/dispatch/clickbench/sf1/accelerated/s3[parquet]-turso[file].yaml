@@ -5,3 +5,10 @@ tests:
     query_overrides: turso
     runner_type: spiceai-dev-large-runners
     ready_wait: 1800
+    # This arm's acceleration holds only part of the source, because a runner
+    # cannot hold all of ClickBench: its `refresh_sql` ends in `LIMIT 10000000`.
+    # The `__test_reference.*` clone drops acceleration and reads every row, so it
+    # answers a different question: an arrow arm holding 100,000 of 1,000,000 rows
+    # failed 37 of 43 queries, starting with `COUNT(*)`. A `LIMIT` subset also keeps
+    # unspecified rows, so no reference could be built for it.
+    validate_results: false

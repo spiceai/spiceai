@@ -36,6 +36,7 @@ use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
+use super::VortexRuntimeAccessPlanProvider;
 use super::opener::VortexOpener;
 use super::segment_cache::SharedSegmentCache;
 use crate::ProjectionPushdown;
@@ -82,6 +83,11 @@ pub struct VortexSource {
     /// the fan-out only multiplies per-split Vortex footer-opens the lookup never
     /// needs. Default `true`, preserving full-scan read parallelism.
     allow_repartitioning: bool,
+    /// Optional provider retained until file-open time so runtime predicates can
+    /// contribute row selections after dynamic filters have been populated.
+    runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
+    /// Column whose equality predicates are answered from per-file key blocks.
+    key_column: Option<Arc<str>>,
 }
 
 impl VortexSource {
@@ -113,6 +119,8 @@ impl VortexSource {
             target_partitions: None,
             options: VortexTableOptions::default(),
             allow_repartitioning: true,
+            runtime_access_plan_provider: None,
+            key_column: None,
         }
     }
 
@@ -196,6 +204,32 @@ impl VortexSource {
     #[must_use]
     pub fn with_repartitioning(mut self, allow: bool) -> Self {
         self.allow_repartitioning = allow;
+        self
+    }
+
+    /// Retains an access-plan provider for runtime predicate-based planning.
+    #[must_use]
+    pub fn with_runtime_access_plan_provider(
+        mut self,
+        provider: Arc<dyn VortexRuntimeAccessPlanProvider>,
+    ) -> Self {
+        self.runtime_access_plan_provider = Some(provider);
+        self
+    }
+
+    /// Answers equality predicates on `column` from per-file key blocks: a scan of
+    /// whole files filtered by `column = <integer literal>` reads only the rows of
+    /// the blocks whose minimum and maximum hold the literal, and skips a file with
+    /// none.
+    ///
+    /// The first such lookup on a file reads the column once to find those bounds,
+    /// which later scans of the file reuse, so this suits a key that is looked up
+    /// repeatedly, such as a primary key. The bounds are cached by file path, size
+    /// and modification time, so this is only sound for files that are never
+    /// rewritten in place.
+    #[must_use]
+    pub fn with_key_column(mut self, column: impl Into<Arc<str>>) -> Self {
+        self.key_column = Some(column.into());
         self
     }
 
@@ -288,6 +322,11 @@ impl FileSource for VortexSource {
             object_store_url: Arc::from(base_config.object_store_url.as_str()),
             projection_pushdown: self.options.projection_pushdown.enabled(),
             scan_concurrency: Some(scan_concurrency),
+            runtime_access_plan_provider: self
+                .runtime_access_plan_provider
+                .as_ref()
+                .map(Arc::clone),
+            key_column: self.key_column.as_ref().map(Arc::clone),
         };
 
         Ok(Arc::new(opener))

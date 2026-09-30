@@ -21,17 +21,29 @@ limitations under the License.
 //! source, load it, query it, confirm a full refresh ATOMICALLY REPLACES the in-RAM
 //! tier, and confirm no data files are written to disk. Uses a `file://` source so
 //! it needs no Docker/credentials and runs unconditionally in CI on Linux.
+//!
+//! The DML cases at the bottom cover #12008: `mode: memory` makes the RAM
+//! mem-tier the permanent store, and Cayenne's deletion sink scans only the
+//! durable tiers, so a statement whose row selection has to FIND rows finds
+//! none. Each is paired with a `mode: file` control running the same statements
+//! against the same fixture — the control is the oracle, and the two arms differ
+//! in exactly one input.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::ensure;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use arrow::util::pretty::pretty_format_batches;
 use datafusion::{assert_batches_eq, sql::TableReference};
 use futures::TryStreamExt;
-use runtime::Runtime;
+use runtime::{Runtime, accelerated::AcceleratedTable};
+use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
 use spicepod::{
-    acceleration::{Acceleration, Mode, RefreshMode},
-    component::dataset::Dataset,
+    acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
+    component::{access::AccessMode, dataset::Dataset},
+    param::Params,
 };
 
 use crate::utils::{runtime_ready_check, test_request_context};
@@ -176,4 +188,655 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
             Ok(())
         })
         .await
+}
+
+// ── #12008: DML against a `mode: memory` Cayenne acceleration ──────────────
+//
+// One `cfg` for the whole section rather than one per test: the engine is not
+// built on Windows, so without it the helpers below compile there with no callers.
+#[cfg(not(target_os = "windows"))]
+mod dml {
+    use super::*;
+    use super::{execute_sql, refresh};
+
+    /// A request context that bypasses the results cache, so a `SELECT` after a
+    /// mutation reflects the accelerator rather than a cached answer.
+    fn no_cache_context() -> Arc<RequestContext> {
+        Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_user_agent(UserAgent::from_ua_str(&format!(
+                    "spiceci/{}",
+                    env!("CARGO_PKG_VERSION")
+                )))
+                .with_cache_control(CacheControl::NoCache)
+                .build(),
+        )
+    }
+
+    /// Stand up a one-dataset runtime whose `table_name` is a Cayenne acceleration in
+    /// `mode`, over a five-row CSV, and assert the two preconditions every DML case
+    /// below depends on.
+    ///
+    /// `primary_key` + `on_conflict` is what routes writes to the accelerator alone
+    /// (`select_accelerated_write_mode`), which is how a client statement reaches
+    /// Cayenne rather than the file source.
+    ///
+    /// Returns the temp dir alongside the runtime because the CSV source lives in it
+    /// and must outlive the runtime.
+    async fn cayenne_dml_runtime(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(tempfile::TempDir, Arc<Runtime>), anyhow::Error> {
+        let temp_dir = tempfile::tempdir()?;
+        let csv = temp_dir.path().join(format!("{table_name}.csv"));
+        std::fs::write(
+            &csv,
+            "id,name,value\n\
+         1,alpha,100\n\
+         2,beta,200\n\
+         3,gamma,300\n\
+         4,delta,400\n\
+         5,epsilon,500\n",
+        )?;
+
+        crate::configure_test_datafusion();
+
+        let is_memory = matches!(mode, Mode::Memory);
+        let mode_label = format!("{mode:?}");
+
+        // A file acceleration needs somewhere to put its Vortex files and its
+        // metastore; a memory acceleration builds both in RAM and takes neither.
+        let params = if is_memory {
+            None
+        } else {
+            let mut params = HashMap::new();
+            params.insert(
+                "cayenne_file_path".to_string(),
+                temp_dir.path().join("cayenne").display().to_string(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                temp_dir.path().join("metadata").display().to_string(),
+            );
+            Some(Params::from_string_map(params))
+        };
+
+        let mut dataset = Dataset::new(format!("file://{}", csv.display()), table_name);
+        dataset.access = AccessMode::ReadWrite;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode,
+            refresh_mode: Some(RefreshMode::Full),
+            params,
+            primary_key: Some("id".to_string()),
+            on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+            ..Acceleration::default()
+        });
+
+        let app = AppBuilder::new("test_cayenne_memory_dml")
+            .with_dataset(dataset)
+            .build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
+        }
+        runtime_ready_check(&rt).await;
+
+        // Premise: the acceleration really resolved to the residency this arm is
+        // about. Without this a `mode: memory` arm would still fail if it had
+        // silently fallen back to a file acceleration, and the failure would say
+        // nothing about the mem-tier.
+        let table = rt
+            .datafusion()
+            .get_table(&TableReference::bare(table_name))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("table '{table_name}' not found"))?;
+        let accelerated_table = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .ok_or_else(|| anyhow::anyhow!("table '{table_name}' is not an AcceleratedTable"))?;
+        let accelerator = accelerated_table.get_accelerator();
+        // The accelerator may be wrapped in `SpiceTable` layers; walk down to the
+        // Cayenne provider itself.
+        let cayenne = accelerator
+            .downcast_ref::<cayenne::CayenneTableProvider>()
+            .or_else(|| {
+                spice_table::nodes(accelerator.as_ref(), spice_table::LayerWalk::Read).find_map(
+                    |node| {
+                        node.base_provider()
+                            .downcast_ref::<cayenne::CayenneTableProvider>()
+                    },
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("accelerator is not a CayenneTableProvider"))?;
+        ensure!(
+            cayenne.is_memory_resident_mode() == is_memory,
+            "precondition: acceleration mode {mode_label} must resolve to \
+         is_memory_resident_mode() == {is_memory}, got {}",
+            cayenne.is_memory_resident_mode()
+        );
+        // Premise: client writes go to the accelerator, so the statements below are
+        // Cayenne's and not the file connector's. `on_conflict` is what buys that
+        // routing (`select_accelerated_write_mode`); without it a client write is
+        // sent WriteThrough to the source and never reaches this code at all.
+        ensure!(
+            accelerated_table.is_accelerator_only(),
+            "precondition: on_conflict must route client writes to the accelerator alone, \
+             otherwise the statements below never reach Cayenne"
+        );
+
+        Ok((temp_dir, rt))
+    }
+
+    /// The `count` a DML statement reported. Every mutation below asserts this as
+    /// well as the resulting rows: the count is what a client is told changed, and a
+    /// path that removes the right rows while reporting the wrong number is still
+    /// wrong (`with_exact_count` makes a user DELETE an exact count, not an estimate).
+    fn reported_count(batches: &[RecordBatch]) -> u64 {
+        batches
+            .first()
+            .and_then(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+            })
+            .and_then(|a| a.values().first())
+            .copied()
+            .expect("a DML result must carry a UInt64 count column")
+    }
+
+    /// Rows whose primary key appears more than once. Empty is the only correct
+    /// answer for a table declaring `primary_key: id` with `on_conflict: upsert`.
+    async fn duplicate_keys(
+        rt: &Arc<Runtime>,
+        table_name: &str,
+    ) -> Result<Vec<RecordBatch>, anyhow::Error> {
+        execute_sql(
+        rt,
+        &format!(
+            "SELECT id, COUNT(*) AS n FROM {table_name} GROUP BY id HAVING COUNT(*) > 1 ORDER BY id"
+        ),
+    )
+    .await
+    }
+
+    /// `DELETE … WHERE`, per-key and range.
+    async fn filtered_delete_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+            .scope(async {
+                let mode_label = format!("{mode:?}");
+                let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+                let result =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                let expected = [
+                    "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |",
+                    "+----+",
+                ];
+                assert_batches_eq!(expected, &result);
+
+                let deleted =
+                    execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id = 2")).await?;
+                let after =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                eprintln!(
+                    "[{mode_label}] DELETE WHERE id = 2 reported:\n{}\nrows now:\n{}",
+                    pretty_format_batches(&deleted)?,
+                    pretty_format_batches(&after)?
+                );
+                assert_eq!(
+                    reported_count(&deleted),
+                    1,
+                    "exactly one row matches `id = 2`"
+                );
+                let expected = [
+                    "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 4  |", "| 5  |", "+----+",
+                ];
+                assert_batches_eq!(expected, &after);
+
+                let deleted =
+                    execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id > 3")).await?;
+                let after =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                eprintln!(
+                    "[{mode_label}] DELETE WHERE id > 3 reported:\n{}\nrows now:\n{}",
+                    pretty_format_batches(&deleted)?,
+                    pretty_format_batches(&after)?
+                );
+                assert_eq!(
+                    reported_count(&deleted),
+                    2,
+                    "exactly two rows match `id > 3`"
+                );
+                let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
+                assert_batches_eq!(expected, &after);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// `UPDATE … WHERE`, which `UpdateExec` runs as delete-then-insert, so its
+    /// delete leg hits the same gap. The failure is not a no-op: the insert leg
+    /// still lands, so the row is DUPLICATED under a declared primary key.
+    async fn update_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+        .scope(async {
+            let mode_label = format!("{mode:?}");
+            let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+            let updated = execute_sql(
+                &rt,
+                &format!("UPDATE {table_name} SET value = 999 WHERE id = 2"),
+            )
+            .await?;
+            let after = execute_sql(
+                &rt,
+                &format!("SELECT id, value FROM {table_name} ORDER BY id, value"),
+            )
+            .await?;
+            eprintln!(
+                "[{mode_label}] UPDATE SET value = 999 WHERE id = 2 reported:\n{}\nrows now:\n{}",
+                pretty_format_batches(&updated)?,
+                pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&updated),
+                1,
+                "exactly one row matches `id = 2`"
+            );
+            let expected = [
+                "+----+-------+",
+                "| id | value |",
+                "+----+-------+",
+                "| 1  | 100   |",
+                "| 2  | 999   |",
+                "| 3  | 300   |",
+                "| 4  | 400   |",
+                "| 5  | 500   |",
+                "+----+-------+",
+            ];
+            assert_batches_eq!(expected, &after);
+
+            // Asserted on its own so a regression that changes the surviving
+            // value still fails here: the duplicate is what makes this data
+            // corruption rather than a lost update.
+            let dupes = duplicate_keys(&rt, table_name).await?;
+            eprintln!(
+                "[{mode_label}] duplicate primary keys after UPDATE:\n{}",
+                pretty_format_batches(&dupes)?
+            );
+            assert_batches_eq!(["++", "++"], &dupes);
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// `INSERT` of a primary key that already exists.
+    ///
+    /// No `DELETE` is involved, which is what makes this a defect of its own rather
+    /// than a consequence of the delete gap: the memory-mode standard-DML append
+    /// (`write_batches_memory_mode`) passes `OnConflictDeletions::default()`, so the
+    /// prior version is never superseded.
+    async fn upsert_insert_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+        .scope(async {
+            let mode_label = format!("{mode:?}");
+            let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+            let inserted = execute_sql(
+                &rt,
+                &format!("INSERT INTO {table_name} (id, name, value) VALUES (3, 'gamma2', 3333)"),
+            )
+            .await?;
+            let after = execute_sql(
+                &rt,
+                &format!("SELECT id, name, value FROM {table_name} ORDER BY id, value"),
+            )
+            .await?;
+            eprintln!(
+                "[{mode_label}] INSERT (3, gamma2, 3333) over existing PK 3 reported:\n{}\nrows now:\n{}",
+                pretty_format_batches(&inserted)?,
+                pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&inserted),
+                1,
+                "one row was inserted — not the mem-tier epoch"
+            );
+            let expected = [
+                "+----+---------+-------+",
+                "| id | name    | value |",
+                "+----+---------+-------+",
+                "| 1  | alpha   | 100   |",
+                "| 2  | beta    | 200   |",
+                "| 3  | gamma2  | 3333  |",
+                "| 4  | delta   | 400   |",
+                "| 5  | epsilon | 500   |",
+                "+----+---------+-------+",
+            ];
+            assert_batches_eq!(expected, &after);
+
+            let dupes = duplicate_keys(&rt, table_name).await?;
+            eprintln!(
+                "[{mode_label}] duplicate primary keys after INSERT:\n{}",
+                pretty_format_batches(&dupes)?
+            );
+            assert_batches_eq!(["++", "++"], &dupes);
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// A `DELETE` over an upsert history must count the rows a scan SERVES, not the
+    /// raw versions the store happens to hold.
+    ///
+    /// After `INSERT (3, gamma2)` supersedes `(3, gamma)`, the superseded version is
+    /// still resident and hidden by its successor's tombstone. `DELETE WHERE id = 3`
+    /// must report ONE row, and a predicate matching only the hidden version must
+    /// report NONE and remove nothing a client can see.
+    async fn delete_over_upsert_history_by_mode(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+        .scope(async {
+            let mode_label = format!("{mode:?}");
+            let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+            execute_sql(
+                &rt,
+                &format!("INSERT INTO {table_name} (id, name, value) VALUES (3, 'gamma2', 3333)"),
+            )
+            .await?;
+
+            // Matches only the SUPERSEDED version, which no scan serves.
+            let deleted = execute_sql(
+                &rt,
+                &format!("DELETE FROM {table_name} WHERE name = 'gamma'"),
+            )
+            .await?;
+            let after = execute_sql(
+                &rt,
+                &format!("SELECT id, name FROM {table_name} WHERE id = 3 ORDER BY name"),
+            )
+            .await?;
+            eprintln!(
+                "[{mode_label}] DELETE WHERE name = 'gamma' (superseded version only) reported:\n{}\nid=3 rows now:\n{}",
+                pretty_format_batches(&deleted)?,
+                pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&deleted),
+                0,
+                "no row a scan serves matches `name = 'gamma'` — the superseded version is not one"
+            );
+            let expected = [
+                "+----+--------+",
+                "| id | name   |",
+                "+----+--------+",
+                "| 3  | gamma2 |",
+                "+----+--------+",
+            ];
+            assert_batches_eq!(expected, &after);
+
+            // Matches the LIVE version. One row, not two.
+            let deleted =
+                execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id = 3")).await?;
+            let after = execute_sql(
+                &rt,
+                &format!("SELECT id FROM {table_name} WHERE id = 3"),
+            )
+            .await?;
+            eprintln!(
+                "[{mode_label}] DELETE WHERE id = 3 over an upsert history reported:\n{}\nid=3 rows now:\n{}",
+                pretty_format_batches(&deleted)?,
+                pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&deleted),
+                1,
+                "one row is served for id = 3, however many versions the store holds"
+            );
+            assert_batches_eq!(["++", "++"], &after);
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Deleting ONLY the live version of an upserted key must not bring its
+    /// superseded predecessor back.
+    ///
+    /// After `INSERT (3, 'gamma2')` supersedes `(3, 'gamma')`, the tombstone hiding
+    /// `gamma` lives in the SAME segment as `gamma2` — the only row that segment
+    /// holds — so `DELETE WHERE name = 'gamma2'` empties it. That is the shape
+    /// `delete_over_upsert_history_by_mode` never reaches: it removes the hidden
+    /// `gamma` before touching the live row, so its segments never empty with a
+    /// tombstone still owed.
+    ///
+    /// This is NOT a guard for the rebuild's segment-preservation rule, though it
+    /// looks like one. Making `retain_rows` drop emptied segments leaves this test
+    /// green, because scans read the tier-level tombstone aggregate that the
+    /// rebuild carries over whole, not the per-segment copies. Preservation keeps
+    /// those two representations in agreement for consumers that re-fold the
+    /// aggregate from segments, and none of those run in memory mode — so the rule
+    /// has no observable consequence a test at this level can reach.
+    async fn delete_live_version_only_by_mode(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+            .scope(async {
+                let mode_label = format!("{mode:?}");
+                let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+                execute_sql(
+                    &rt,
+                    &format!(
+                        "INSERT INTO {table_name} (id, name, value) VALUES (3, 'gamma2', 3333)"
+                    ),
+                )
+                .await?;
+                let before = execute_sql(
+                    &rt,
+                    &format!("SELECT id, name FROM {table_name} WHERE id = 3 ORDER BY name"),
+                )
+                .await?;
+                // Precondition: exactly one version of key 3 is served, so the delete
+                // below is aimed at the live one and the other is genuinely hidden.
+                let expected = [
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 3  | gamma2 |",
+                    "+----+--------+",
+                ];
+                assert_batches_eq!(expected, &before);
+
+                let deleted = execute_sql(
+                    &rt,
+                    &format!("DELETE FROM {table_name} WHERE name = 'gamma2'"),
+                )
+                .await?;
+                let after = execute_sql(
+                    &rt,
+                    &format!("SELECT id, name FROM {table_name} WHERE id = 3 ORDER BY name"),
+                )
+                .await?;
+                eprintln!(
+                    "[{mode_label}] DELETE WHERE name = 'gamma2' (the live version only) reported:\n{}\nid=3 rows now:\n{}",
+                    pretty_format_batches(&deleted)?,
+                    pretty_format_batches(&after)?
+                );
+                assert_eq!(
+                    reported_count(&deleted),
+                    1,
+                    "one row is served for name = 'gamma2'"
+                );
+                assert_batches_eq!(
+                    ["++", "++"],
+                    &after
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A full refresh that replaces the tier with a DISJOINT key set must not leave
+    /// a primary-key cache describing the rows it replaced.
+    ///
+    /// The append records the keys it wrote so a later write supersedes them. An
+    /// overwrite replaces the tier wholesale, so those keys are gone and the
+    /// replacement's were never recorded — and the two directions of staleness are
+    /// not symmetric. A key the overwrite REMOVED that the cache still lists costs
+    /// only a redundant tombstone on re-insert, which masks nothing. A key the
+    /// overwrite INTRODUCED that the cache does not list is the damaging one: an
+    /// upsert reads it as new, supersedes nothing, and leaves two live rows under
+    /// one primary key.
+    ///
+    /// Reproduced before the fix: re-inserting the refreshed key returned two rows.
+    async fn overwrite_then_upsert_by_mode(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+            .scope(async {
+                let mode_label = format!("{mode:?}");
+                let (temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+                // A client INSERT records key 99 in the primary-key cache.
+                execute_sql(
+                    &rt,
+                    &format!(
+                        "INSERT INTO {table_name} (id, name, value) VALUES (99, 'ninetynine', 99)"
+                    ),
+                )
+                .await?;
+
+                // Full refresh replaces the tier with keys the cache has never seen.
+                let csv = temp_dir.path().join(format!("{table_name}.csv"));
+                std::fs::write(&csv, "id,name,value\n7,seven,7\n8,eight,8\n")?;
+                refresh(&rt, table_name).await?;
+                let after_refresh =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                let expected = ["+----+", "| id |", "+----+", "| 7  |", "| 8  |", "+----+"];
+                assert_batches_eq!(expected, &after_refresh);
+
+                // Re-insert a key the REFRESH introduced. A stale cache does not know
+                // it is resident, so nothing supersedes and both versions stay live.
+                let inserted = execute_sql(
+                    &rt,
+                    &format!("INSERT INTO {table_name} (id, name, value) VALUES (7, 'seven2', 77)"),
+                )
+                .await?;
+                let after = execute_sql(
+                    &rt,
+                    &format!("SELECT id, name FROM {table_name} WHERE id = 7 ORDER BY name"),
+                )
+                .await?;
+                eprintln!(
+                    "[{mode_label}] INSERT over a key the refresh introduced reported:\n{}\nid=7 rows now:\n{}",
+                    pretty_format_batches(&inserted)?,
+                    pretty_format_batches(&after)?
+                );
+                let expected = [
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 7  | seven2 |",
+                    "+----+--------+",
+                ];
+                assert_batches_eq!(expected, &after);
+
+                let dupes = duplicate_keys(&rt, table_name).await?;
+                eprintln!(
+                    "[{mode_label}] duplicate primary keys after the refresh + insert:\n{}",
+                    pretty_format_batches(&dupes)?
+                );
+                assert_batches_eq!(["++", "++"], &dupes);
+
+                Ok(())
+            })
+            .await
+    }
+
+    // ── control arms: `mode: file`, where all three statements work ──
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_filtered_delete() -> Result<(), anyhow::Error> {
+        filtered_delete_by_mode(Mode::File, "file_mode_delete_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_update() -> Result<(), anyhow::Error> {
+        update_by_mode(Mode::File, "file_mode_update_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_upsert_insert() -> Result<(), anyhow::Error> {
+        upsert_insert_by_mode(Mode::File, "file_mode_upsert_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
+        delete_over_upsert_history_by_mode(Mode::File, "file_mode_history_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_delete_live_version_only() -> Result<(), anyhow::Error> {
+        delete_live_version_only_by_mode(Mode::File, "file_mode_live_only_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_overwrite_then_upsert() -> Result<(), anyhow::Error> {
+        overwrite_then_upsert_by_mode(Mode::File, "file_mode_overwrite_test").await
+    }
+
+    // ── reproduction arms: `mode: memory` (#12008 and its upsert sibling) ──
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_filtered_delete() -> Result<(), anyhow::Error> {
+        filtered_delete_by_mode(Mode::Memory, "memory_mode_delete_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_update() -> Result<(), anyhow::Error> {
+        update_by_mode(Mode::Memory, "memory_mode_update_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_upsert_insert() -> Result<(), anyhow::Error> {
+        upsert_insert_by_mode(Mode::Memory, "memory_mode_upsert_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
+        delete_over_upsert_history_by_mode(Mode::Memory, "memory_mode_history_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_delete_live_version_only() -> Result<(), anyhow::Error> {
+        delete_live_version_only_by_mode(Mode::Memory, "memory_mode_live_only_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_overwrite_then_upsert() -> Result<(), anyhow::Error> {
+        overwrite_then_upsert_by_mode(Mode::Memory, "memory_mode_overwrite_test").await
+    }
 }

@@ -38,7 +38,7 @@ use cayenne::optimizer_rules::{
 };
 #[cfg(not(windows))]
 use cayenne::{
-    CayenneTableProvider,
+    CayenneCteMaterialization, CayenneCteMaterializationPlanner, CayenneTableProvider,
     logical_optimizer::{
         CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys,
         CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
@@ -87,7 +87,7 @@ use datafusion_optimizer_rules::{
         cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown, PartitionOnlyScanRewrite,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
         flightsql::broadcast_join::{ExecutorAddressProvider, FlightSQLBroadcastJoinPushdown},
     },
@@ -103,7 +103,7 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
+use spicepod::component::runtime::{CteMaterialization, SpillCompression as SpiceSpillCompression};
 use spicepod::metric::Metrics;
 use tokio::{
     runtime::Handle,
@@ -328,6 +328,16 @@ impl Default for CayenneOptimizerRules {
     }
 }
 
+/// Whether queries build the output preview that `runtime.task_history` records in its
+/// `captured_output` column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputPreview {
+    /// Build it: task history is enabled and `captured_output` records it.
+    Build,
+    /// Skip it: nothing records it.
+    Skip,
+}
+
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
@@ -338,10 +348,12 @@ pub struct DataFusionBuilder {
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
     eager_aggregation_max_pushed_groups: Option<usize>,
+    cte_materialization: CteMaterialization,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    output_preview: OutputPreview,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
@@ -427,10 +439,12 @@ impl DataFusionBuilder {
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
             eager_aggregation_max_pushed_groups: None,
+            cte_materialization: CteMaterialization::Disabled,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
             task_history_enabled: true,
+            output_preview: OutputPreview::Build,
             caching: None,
             spill_compression: None,
             cluster_config: None,
@@ -457,6 +471,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_task_history(mut self, task_history: bool) -> Self {
         self.task_history_enabled = task_history;
+        self
+    }
+
+    /// Whether queries build the output preview; see
+    /// `DataFusion::task_history_captured_output`.
+    #[must_use]
+    pub fn with_output_preview(mut self, output_preview: OutputPreview) -> Self {
+        self.output_preview = output_preview;
         self
     }
 
@@ -505,6 +527,16 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
         self.eager_aggregation_max_pushed_groups = cap;
+        self
+    }
+
+    /// Materialize multi-reference CTEs on the Cayenne query path.
+    ///
+    /// `CteMaterialization::Disabled` (the default) keeps `DataFusion`'s inlining
+    /// behavior. `Auto` registers the Cayenne CTE materialization optimizer.
+    #[must_use]
+    pub fn cte_materialization(mut self, cte_materialization: CteMaterialization) -> Self {
+        self.cte_materialization = cte_materialization;
         self
     }
 
@@ -992,9 +1024,21 @@ impl DataFusionBuilder {
 
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            // Answer a `GROUP BY`/`DISTINCT` over only partition columns from the
+            // directory listing instead of scanning every file. Registered before
+            // `BytesProcessedPhysicalOptimizer` so it rewrites the bare scan.
+            .with_physical_optimizer_rule(Arc::new(PartitionOnlyScanRewrite::new()));
 
-        state = with_spice_logical_optimizers(state, self.cayenne_optimizer_rules);
+        if self.cte_materialization.is_auto() {
+            tracing::info!("Applied runtime.query.cte_materialization=auto");
+        }
+
+        state = with_spice_logical_optimizers(
+            state,
+            self.cayenne_optimizer_rules,
+            self.cte_materialization,
+        );
 
         #[cfg(not(windows))]
         {
@@ -1071,14 +1115,16 @@ impl DataFusionBuilder {
             }
         }
 
+        // Rules a primary-key point lookup cannot trigger are skipped while one is planned.
+        super::point_lookup::wrap_skippable_rules(&mut state);
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc` and
-        // `date_trunc` (scalar) and `avg` (aggregate): `register_all` would register
+        // Register Spark-compatible functions, but skip Spark's `trunc`,
+        // `date_trunc` and `date_part` (scalar) and `avg` (aggregate): `register_all` would register
         // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
         // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
         // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
@@ -1094,7 +1140,15 @@ impl DataFusionBuilder {
             // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
             // federated filter comparing a timestamp against one loses the type
             // its comparison needs and is pushed down as a pair BigQuery refuses.
-            if matches!(udf.name(), "trunc" | "date_trunc") {
+            //
+            // Spark `date_part` counts `dow` from Sunday = 1, where the built-in
+            // counts from Sunday = 0 as the SQL reference documents — and so does
+            // `EXTRACT(DOW FROM …)`, which the planner binds straight to the
+            // built-in, never through the registry. Registered over the built-in,
+            // the two spellings of one weekday answered a day apart
+            // (spiceai/spiceai#13920). Spark's also takes only a timestamp or a
+            // date, so `date_part('hour', <time>)` stopped planning.
+            if matches!(udf.name(), "trunc" | "date_trunc" | "date_part") {
                 continue;
             }
             let name = udf.name().to_string();
@@ -1156,8 +1210,8 @@ impl DataFusionBuilder {
 
         // Add cache invalidation optimizer rule if caching is enabled
         if let Some(caching) = &self.caching {
-            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
-                Arc::downgrade(caching),
+            ctx.add_optimizer_rule(super::point_lookup::skippable_optimizer_rule(Arc::new(
+                CacheInvalidationOptimizerRule::new(Arc::downgrade(caching)),
             )));
         }
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
@@ -1226,35 +1280,39 @@ impl DataFusionBuilder {
             };
 
         if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
-            ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-                ctx.state().catalog_list(),
-                &ddl_enabled_catalogs,
-                Arc::clone(&ddl_extension_store),
-                Arc::clone(cayenne_ddl_handler),
-                SPICE_DEFAULT_SCHEMA,
-                SPICE_DEFAULT_CATALOG,
+            ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(Arc::new(
+                datafusion_ddl::DdlAnalyzerRule::new(
+                    ctx.state().catalog_list(),
+                    &ddl_enabled_catalogs,
+                    Arc::clone(&ddl_extension_store),
+                    Arc::clone(cayenne_ddl_handler),
+                    SPICE_DEFAULT_SCHEMA,
+                    SPICE_DEFAULT_CATALOG,
+                ),
             )));
         }
 
         // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
         // Federation runs as the first of these (see `AnalyzerRulesBuilder::include_federation`).
         for rule in AnalyzerRulesBuilder::default().build() {
-            ctx.add_analyzer_rule(rule);
+            ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(rule));
         }
         for rule in self.additional_analyzer_rules {
             ctx.add_analyzer_rule(rule);
         }
 
         // Iceberg DDL analyzer rule.
-        ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-            ctx.state().catalog_list(),
-            &ddl_enabled_catalogs,
-            Arc::clone(&ddl_extension_store),
-            Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
-                &datafusion_ref,
-            ))),
-            SPICE_DEFAULT_SCHEMA,
-            SPICE_DEFAULT_CATALOG,
+        ctx.add_analyzer_rule(super::point_lookup::skippable_analyzer_rule(Arc::new(
+            datafusion_ddl::DdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+                Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
+                    &datafusion_ref,
+                ))),
+                SPICE_DEFAULT_SCHEMA,
+                SPICE_DEFAULT_CATALOG,
+            ),
         )));
 
         DataFusion {
@@ -1283,6 +1341,7 @@ impl DataFusionBuilder {
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
+            task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
@@ -1312,6 +1371,7 @@ impl DataFusionBuilder {
 fn with_spice_logical_optimizers(
     mut state: SessionStateBuilder,
     cayenne_optimizer_rules: CayenneOptimizerRules,
+    cte_materialization: CteMaterialization,
 ) -> SessionStateBuilder {
     let trailing_rules = state.optimizer_rules().take().unwrap_or_default();
     let mut optimizer_rules = state
@@ -1322,6 +1382,9 @@ fn with_spice_logical_optimizers(
     insert_regexp_match_null_check_rewrite(&mut optimizer_rules);
     #[cfg(not(windows))]
     {
+        if cte_materialization.is_auto() {
+            insert_cayenne_cte_materialization(&mut optimizer_rules);
+        }
         if cayenne_optimizer_rules.filter_propagation() {
             insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
         }
@@ -1339,9 +1402,31 @@ fn with_spice_logical_optimizers(
         }
     }
     #[cfg(windows)]
-    let _ = cayenne_optimizer_rules;
+    {
+        let _ = cayenne_optimizer_rules;
+        let _ = cte_materialization;
+    }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_cte_materialization(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Run first so the two inlined CTE copies are still identical, before
+    // projection/filter pushdown specializes each reference.
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_cte_materialization")
+    {
+        rules.insert(
+            0,
+            Arc::new(
+                CayenneCteMaterialization::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
+    }
 }
 
 fn insert_regexp_match_null_check_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
@@ -1872,12 +1957,12 @@ fn runtime_env_with_effective_memory_limit_and_object_store_registry(
     #[expect(clippy::cast_possible_truncation)]
     let effective_memory_bytes = effective_memory_limit as usize;
 
-    let memory_pool = Arc::new(TrackConsumersPool::new(
-        // The runtime supports only 64-bit platforms, so casting u64 to usize
-        // will not truncate on supported targets.
-        GreedyMemoryPool::new(effective_memory_bytes),
-        topn,
-    ));
+    // Greedy first-come, but spillable operators (`ExternalSorter`) cannot
+    // take the last 1/16 of the pool. A coalesced TPC-DS Q97 sort-merge held
+    // 103.6 GiB of 107.50 GiB and the cayenne store_sales scan could not get
+    // 1 MiB (regression for #13918).
+    let memory_pool =
+        super::query_memory_pool::tracked_query_memory_pool(effective_memory_bytes, topn);
 
     let mut runtime_env_builder = RuntimeEnvBuilder::default()
         .with_object_store_registry(object_store_registry)
@@ -1972,6 +2057,8 @@ pub(crate) fn default_extension_planners(
         Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
+        #[cfg(not(windows))]
+        Arc::new(CayenneCteMaterializationPlanner),
     ];
     planners
 }
@@ -2003,6 +2090,8 @@ mod tests {
     #[cfg(not(windows))]
     use datafusion_expr::{Expr, LogicalPlan};
 
+    #[cfg(not(windows))]
+    use super::CteMaterialization;
     use super::{
         CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
         DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
@@ -2570,14 +2659,90 @@ mod tests {
         );
 
         // Spark's *other* functions must still be there — the skip is meant to
-        // be two names, not a disabled registration.
+        // be three names, not a disabled registration.
         assert!(
             df.ctx
                 .state()
                 .scalar_functions()
                 .contains_key("array_append"),
-            "only `trunc` and `date_trunc` are skipped; the rest of the Spark \
-             functions must still register"
+            "only `trunc`, `date_trunc` and `date_part` are skipped; the rest of \
+             the Spark functions must still register"
+        );
+    }
+
+    /// The built session keeps the **built-in** `date_part`, not Spark's.
+    ///
+    /// Spark's `date_part` counts `dow` from Sunday = 1. The built-in counts
+    /// from Sunday = 0, as the SQL reference documents, and so does
+    /// `EXTRACT(DOW FROM …)`, which the planner binds straight to the built-in
+    /// and never through the registry. Registered over the built-in, the two
+    /// spellings of one weekday answered a day apart; and Spark's signature
+    /// takes only a timestamp or a date, so `date_part` over a time stopped
+    /// planning (regression test for #13920).
+    ///
+    /// Through `DataFusionBuilder::build` for the same reason as the
+    /// `date_trunc` guard above: the thing that can regress is the registration
+    /// loop's skip.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_date_part() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        // 2026-01-04 is a Sunday: the one weekday the two conventions name
+        // differently at a glance, 0 documented and 1 under Spark's.
+        let weekday = df
+            .ctx
+            .sql(
+                "SELECT date_part('dow', DATE '2026-01-04') AS via_date_part, \
+                 EXTRACT(DOW FROM DATE '2026-01-04') AS via_extract",
+            )
+            .await
+            .expect("plan the weekday extraction")
+            .collect()
+            .await
+            .expect("run the weekday extraction");
+        datafusion::assert_batches_eq!(
+            [
+                "+---------------+-------------+",
+                "| via_date_part | via_extract |",
+                "+---------------+-------------+",
+                "| 0             | 0           |",
+                "+---------------+-------------+",
+            ],
+            &weekday
+        );
+
+        // Spark's overload takes only a timestamp or a date, so a time and an
+        // interval are the arguments that stop planning if the built-in is
+        // shadowed; and Spark's declares `Int32` for every field where the
+        // built-in returns `Float64` for `epoch`, which the shadowed session
+        // reports as an internal schema-assertion failure.
+        let other_shapes = df
+            .ctx
+            .sql(
+                "SELECT date_part('hour', TIME '12:34:56') AS over_a_time, \
+                 date_part('hour', INTERVAL '5 hours') AS over_an_interval, \
+                 date_part('epoch', TIMESTAMP '1970-01-01T00:01:00') AS epoch_seconds",
+            )
+            .await
+            .expect("plan date_part over a time, an interval and for epoch")
+            .collect()
+            .await
+            .expect("run date_part over a time, an interval and for epoch");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------------+------------------+---------------+",
+                "| over_a_time | over_an_interval | epoch_seconds |",
+                "+-------------+------------------+---------------+",
+                "| 12          | 5                | 60.0          |",
+                "+-------------+------------------+---------------+",
+            ],
+            &other_shapes
         );
     }
 
@@ -2674,7 +2839,7 @@ mod tests {
             "target_partitions wired through DataFusionBuilder should be visible on the session config"
         );
 
-        // Sanity check the inverse — None leaves DataFusion's default in place.
+        // Sanity check the inverse — None sizes the fan-out from the CPU budget.
         let df_default = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::default()),
@@ -2682,7 +2847,7 @@ mod tests {
         )
         .target_partitions(None)
         .build();
-        assert_ne!(
+        assert_eq!(
             df_default
                 .ctx
                 .state()
@@ -2690,8 +2855,8 @@ mod tests {
                 .options()
                 .execution
                 .target_partitions,
-            4,
-            "Without an override target_partitions should fall back to DataFusion's default"
+            cpu_budget::cpu_budget().target_partitions(),
+            "Without an override target_partitions should fall back to the CPU budget"
         );
     }
 
@@ -2875,6 +3040,47 @@ mod tests {
                 "CayenneAntiJoinSortMergeRewriter",
             ],
             "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cte_materialization_when_auto() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df_disabled = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            !df_disabled
+                .ctx
+                .state()
+                .optimizers()
+                .iter()
+                .any(|rule| rule.name() == "cayenne_cte_materialization"),
+            "default cte_materialization=disabled must not register the Cayenne CTE rewrite"
+        );
+
+        let df_auto = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cte_materialization(CteMaterialization::Auto)
+        .build();
+        let state = df_auto.ctx.state();
+        let names: Vec<&str> = state.optimizers().iter().map(|rule| rule.name()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("cayenne_cte_materialization"),
+            "cte_materialization=auto must insert the Cayenne CTE rewrite first so both inlined copies are still identical: {names:?}"
         );
     }
 

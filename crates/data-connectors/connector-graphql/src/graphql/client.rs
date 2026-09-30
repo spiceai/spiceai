@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
+use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc, time::Instant};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -46,6 +46,7 @@ use url::Url;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchReceiverStream};
+use futures::future::try_join_all;
 
 pub enum Auth {
     Basic(String, Option<String>),
@@ -95,6 +96,83 @@ pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send 
 pub enum UnnestBehavior {
     Depth(usize),
     Custom(UnnestHandler),
+}
+
+/// Follow-up pages for a connection nested under a GraphQL `node(id:)` parent.
+///
+/// GitHub (and similar APIs) cap a nested `first:` at 100 and will not paginate
+/// that connection inside the parent list query. When `pageInfo.hasNextPage` is
+/// set, the client fetches the remaining child pages one parent at a time so
+/// the scan stays complete without re-reading every sibling.
+#[derive(Debug, Clone)]
+pub struct NestedConnectionPager {
+    /// Response key of the nested connection, e.g. `reviews`.
+    pub connection_key: &'static str,
+    /// Parent field holding the GraphQL node id, e.g. `pull_request_id`.
+    pub parent_id_key: &'static str,
+    /// GraphQL type used in `... on Type`.
+    pub type_condition: &'static str,
+    /// Selection set inside `nodes { ... }` of a follow-up page.
+    pub node_selection: &'static str,
+    /// `first:` of each follow-up page. Must be the API's nested-connection max.
+    pub page_size: u32,
+}
+
+impl NestedConnectionPager {
+    fn next_page_query(&self, node_id: &str, cursor: &str) -> String {
+        format!(
+            r#"{{
+                node(id: "{id}") {{
+                    ... on {ty} {{
+                        {conn}(first: {n}, after: "{cursor}") {{
+                            pageInfo {{
+                                hasNextPage
+                                endCursor
+                            }}
+                            totalCount
+                            nodes {{
+                                {fields}
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            id = escape_graphql_string(node_id),
+            ty = self.type_condition,
+            conn = self.connection_key,
+            n = self.page_size,
+            cursor = escape_graphql_string(cursor),
+            fields = self.node_selection,
+        )
+    }
+}
+
+fn escape_graphql_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Cursor pages to follow before calling it a loop, for an outer connection or a
+/// nested one. A server that never clears `hasNextPage` must not hang the scan.
+const MAX_PAGINATION_ITERATIONS: usize = 1000;
+
+fn nested_connection<'a>(parent: &'a Value, pager: &NestedConnectionPager) -> Option<&'a Value> {
+    parent.get(pager.connection_key)
+}
+
+fn nested_page_info<'a>(connection: &'a Value, field: &str) -> Option<&'a Value> {
+    connection.get("pageInfo").and_then(|info| info.get(field))
+}
+
+fn nested_has_next(connection: &Value) -> bool {
+    nested_page_info(connection, "hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn nested_end_cursor(connection: &Value) -> Option<&str> {
+    nested_page_info(connection, "endCursor")
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
 }
 
 impl std::fmt::Debug for UnnestBehavior {
@@ -367,10 +445,6 @@ impl PaginationParameters {
 }
 
 impl PaginationParameters {
-    fn reduce_limit(&self, l: usize) -> usize {
-        l.saturating_sub(self.pagination_argument.size())
-    }
-
     /// Parses the GraphQL query and returns the appropriate [`PaginationParameters`] if the query
     /// contains a `pageInfo` field (and therefore involved pagination). Alongside the parameters,
     /// it also infers the standard JSON pointer to the paginated data as expected when
@@ -725,6 +799,7 @@ pub struct GraphQLClient {
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
+    nested_pager: Option<NestedConnectionPager>,
 }
 
 #[derive(Clone)]
@@ -926,7 +1001,14 @@ impl GraphQLClient {
             rate_limiter,
             rate_controller,
             semaphore,
+            nested_pager: None,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn with_nested_pager(mut self, pager: Option<NestedConnectionPager>) -> Self {
+        self.nested_pager = pager;
+        self
     }
 
     #[must_use]
@@ -995,14 +1077,23 @@ impl GraphQLClient {
                 query,
                 limit,
                 cursor.as_deref(),
-                error_checker,
+                error_checker.clone(),
                 query_cost,
                 close_connection,
                 page_size_override,
             )
             .await?;
 
-        self.process_response(query, schema.as_ref(), limit, cursor.as_deref(), &response)
+        self.process_response(
+            query,
+            schema.as_ref(),
+            limit,
+            cursor.as_deref(),
+            &response,
+            error_checker,
+            query_cost,
+        )
+        .await
     }
 
     /// Sends one query and returns its decoded response once every check that can
@@ -1038,6 +1129,7 @@ impl GraphQLClient {
         }
 
         // Check rate limit before executing the query
+        let github_rate_limit_started = Instant::now();
         if let Some(rate_limiter) = &self.rate_limiter {
             rate_limiter
                 .check_rate_limit()
@@ -1046,7 +1138,9 @@ impl GraphQLClient {
                     message: format!("{e}"),
                 })?;
         }
+        let github_rate_limit_wait = github_rate_limit_started.elapsed();
 
+        let weighted_limiter_started = Instant::now();
         let rate_controller_permit = if let Some(rate_controller) = &self.rate_controller {
             Some(
                 rate_controller
@@ -1059,6 +1153,7 @@ impl GraphQLClient {
         } else {
             None
         };
+        let weighted_limiter_wait = weighted_limiter_started.elapsed();
 
         let query_string = query.to_string_with_page_size(
             limit,
@@ -1097,6 +1192,7 @@ impl GraphQLClient {
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
+        let semaphore_started = Instant::now();
         let permit = if let Some(semaphore) = &self.semaphore {
             Some(
                 semaphore
@@ -1109,7 +1205,9 @@ impl GraphQLClient {
         } else {
             None
         };
+        let semaphore_wait = semaphore_started.elapsed();
 
+        let http_started = Instant::now();
         let response = request.send().await.context(ReqwestInternalSnafu)?;
 
         if let Some(permit) = permit {
@@ -1131,6 +1229,27 @@ impl GraphQLClient {
 
         // Get the response body as text first, so we can log it if JSON parsing fails
         let response_text = response.text().await.context(ReqwestInternalSnafu)?;
+        let http_elapsed = http_started.elapsed();
+
+        let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
+        tracing::debug!(
+            endpoint = %self.endpoint,
+            query_cost,
+            page_size_override,
+            has_cursor = cursor.is_some(),
+            github_rate_limit_wait_ms = github_rate_limit_wait.as_millis(),
+            weighted_limiter_wait_ms = weighted_limiter_wait.as_millis(),
+            semaphore_wait_ms = semaphore_wait.as_millis(),
+            http_ms = http_elapsed.as_millis(),
+            response_bytes = response_text.len(),
+            http_status = status.as_u16(),
+            ratelimit_limit = header("x-ratelimit-limit"),
+            ratelimit_remaining = header("x-ratelimit-remaining"),
+            ratelimit_used = header("x-ratelimit-used"),
+            ratelimit_resource = header("x-ratelimit-resource"),
+            ratelimit_reset = header("x-ratelimit-reset"),
+            "GraphQL page fetch"
+        );
 
         // Try to parse as JSON
         let response: serde_json::Value = serde_json::from_str(&response_text)
@@ -1160,8 +1279,9 @@ impl GraphQLClient {
                 }
             })?;
 
-        // Log the full response for debugging
-        tracing::debug!(
+        // Full payload is only useful when debugging a malformed page; per-page
+        // timing lives on the `GraphQL page fetch` line above.
+        tracing::trace!(
             "GraphQL response: {}",
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}"))
         );
@@ -1217,16 +1337,140 @@ impl GraphQLClient {
         Ok(json_pointer)
     }
 
+    /// Remaining nested-connection pages for parents whose first page was truncated.
+    ///
+    /// Each overflow parent is fetched independently so two truncated children
+    /// on one outer page do not serialize. Pages of one parent stay sequential
+    /// because GitHub's `after:` cursor requires the previous page.
+    async fn fetch_nested_overflow_pages(
+        &self,
+        parents: &[Value],
+        pager: &NestedConnectionPager,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+    ) -> Result<Vec<Value>> {
+        let fetches = parents.iter().filter_map(|parent| {
+            nested_connection(parent, pager)
+                .filter(|connection| nested_has_next(connection))
+                .map(|_| {
+                    self.fetch_remaining_nested_pages(
+                        parent,
+                        pager,
+                        error_checker.clone(),
+                        query_cost,
+                    )
+                })
+        });
+
+        let extra_parents = try_join_all(fetches).await?;
+        Ok(extra_parents.into_iter().flatten().collect())
+    }
+
+    async fn fetch_remaining_nested_pages(
+        &self,
+        parent: &Value,
+        pager: &NestedConnectionPager,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+    ) -> Result<Vec<Value>> {
+        let Some(connection) = nested_connection(parent, pager) else {
+            return Ok(Vec::new());
+        };
+        let Some(cursor) = nested_end_cursor(connection) else {
+            return Err(Error::InvalidObjectAccess {
+                message: format!(
+                    "Nested connection '{}' reported more pages but no endCursor.",
+                    pager.connection_key
+                ),
+            });
+        };
+        let Some(parent_id) = parent.get(pager.parent_id_key).and_then(Value::as_str) else {
+            return Err(Error::InvalidObjectAccess {
+                message: format!(
+                    "Nested connection '{}' needs parent id field '{}'.",
+                    pager.connection_key, pager.parent_id_key
+                ),
+            });
+        };
+
+        // The parent's own fields, without the first page this loop replaces on
+        // every iteration.
+        let mut parent_fields = parent.as_object().cloned().unwrap_or_default();
+        parent_fields.remove(pager.connection_key);
+
+        let mut extras = Vec::new();
+        let mut cursor = cursor.to_string();
+        for _ in 0..MAX_PAGINATION_ITERATIONS {
+            let mut query: GraphQLQuery =
+                Arc::<str>::from(pager.next_page_query(parent_id, &cursor)).try_into()?;
+            // The follow-up query already names `after:`; do not let outer-page
+            // pagination rewrite it.
+            query.pagination_parameters = None;
+            let mut response = self
+                .fetch_checked(
+                    &query,
+                    None,
+                    None,
+                    error_checker.clone(),
+                    query_cost,
+                    false,
+                    None,
+                )
+                .await?;
+
+            let next_connection = response
+                .get_mut("data")
+                .and_then(|data| data.get_mut("node"))
+                .and_then(|node| node.get_mut(pager.connection_key))
+                .map(Value::take);
+            let Some(next_connection) = next_connection else {
+                return Err(Error::InvalidObjectAccess {
+                    message: format!(
+                        "Follow-up page for '{}' returned no connection.",
+                        pager.connection_key
+                    ),
+                });
+            };
+
+            let has_next = nested_has_next(&next_connection);
+            let next_cursor = nested_end_cursor(&next_connection).map(str::to_string);
+
+            let mut synthetic = parent_fields.clone();
+            synthetic.insert(pager.connection_key.to_string(), next_connection);
+            extras.push(Value::Object(synthetic));
+
+            if !has_next {
+                return Ok(extras);
+            }
+            cursor = next_cursor.ok_or_else(|| Error::InvalidObjectAccess {
+                message: format!(
+                    "Follow-up page for '{}' was truncated without an endCursor.",
+                    pager.connection_key
+                ),
+            })?;
+        }
+
+        Err(Error::InvalidObjectAccess {
+            message: format!(
+                "Nested connection '{}' exceeded {MAX_PAGINATION_ITERATIONS} follow-up pages.",
+                pager.connection_key
+            ),
+        })
+    }
+
     /// Turn a decoded GraphQL response body into record batches, resolving the schema each page is
     /// parsed with. Split out from `execute_inner` so the page-shape handling — null payload, empty
     /// page, repeated cursor — is reachable without an HTTP round trip.
-    fn process_response(
+    #[expect(clippy::too_many_arguments)]
+    async fn process_response(
         &self,
         query: &GraphQLQuery,
         schema: Option<&SchemaRef>,
         limit: Option<usize>,
         cursor: Option<&str>,
         response: &serde_json::Value,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
         let json_pointer = self.resolve_json_pointer(query)?;
 
@@ -1286,6 +1530,13 @@ impl GraphQLClient {
             return self.empty_page(schema, next_cursor);
         }
 
+        if let Some(pager) = &self.nested_pager {
+            let extra_parents = self
+                .fetch_nested_overflow_pages(&unwrapped, pager, error_checker, query_cost)
+                .await?;
+            unwrapped.extend(extra_parents);
+        }
+
         unwrapped = match self.unnest_parameters.behavior {
             UnnestBehavior::Depth(0) => unwrapped,
             UnnestBehavior::Depth(_) | UnnestBehavior::Custom(_) => {
@@ -1339,7 +1590,11 @@ impl GraphQLClient {
             }
         }
 
-        let limit_reached = query.limit_reached(limit, res.len());
+        // A `LIMIT` is a row count, so this page is measured in rows. One JSON object
+        // currently yields one single-row batch, which is why `res.len()` agreed; nothing
+        // holds that, and the paginated scan debits its remaining limit in rows.
+        let page_rows: usize = res.iter().map(RecordBatch::num_rows).sum();
+        let limit_reached = query.limit_reached(limit, page_rows);
 
         Ok(GraphQLQueryResult {
             records: res,
@@ -1359,12 +1614,14 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> SendableRecordBatchStream {
-        const MAX_PAGINATION_ITERATIONS: usize = 1000;
         let mut builder = RecordBatchReceiverStream::builder(table_schema, 2);
         let tx = builder.tx();
 
         // Spawn the task that will fetch and send the GraphQL record batches
         builder.spawn(async move {
+            let scan_started = Instant::now();
+            let mut total_rows = 0usize;
+
             // Track pagination iterations to prevent infinite loops
             let mut pagination_count = 0;
 
@@ -1380,7 +1637,18 @@ impl GraphQLClient {
             )
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let mut limit = limit;
+
+            let first_page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
+            total_rows += first_page_rows;
+            tracing::debug!(
+                page = 0,
+                page_rows = first_page_rows,
+                total_rows,
+                has_next = result.cursor.is_some(),
+                query_cost,
+                elapsed_ms = scan_started.elapsed().as_millis(),
+                "GraphQL page"
+            );
 
             for batch in result.records {
                 tx.send(Ok(batch)).await.map_err(|_| {
@@ -1389,6 +1657,12 @@ impl GraphQLClient {
             }
 
             if result.limit_reached {
+                tracing::debug!(
+                    pages = 1,
+                    total_rows,
+                    elapsed_ms = scan_started.elapsed().as_millis(),
+                    "GraphQL scan complete"
+                );
                 return Ok(());
             }
 
@@ -1414,16 +1688,24 @@ impl GraphQLClient {
                     break;
                 }
 
-                if let Some(p) = query.pagination_parameters.as_ref()
-                    && let Some(value) = limit
-                {
-                    limit = Some(p.reduce_limit(value));
+                // What the next page may still ask for: the rows the caller wanted, less
+                // the rows already emitted. Never less the page size the query declares —
+                // a gateway-error retry shrinks the page below that size, and a
+                // connection-style API may return a short page of its own accord, so the
+                // declared size retires rows the scan never fetched (#14308).
+                let remaining_limit = match limit {
+                    Some(requested) => {
+                        let remaining = requested.saturating_sub(total_rows);
 
-                    // Stop if limit is exhausted
-                    if limit == Some(0) {
-                        break;
+                        // Stop if limit is exhausted
+                        if remaining == 0 {
+                            break;
+                        }
+
+                        Some(remaining)
                     }
-                }
+                    None => None,
+                };
 
                 previous_cursor = Some(next_cursor_val.clone());
 
@@ -1432,13 +1714,25 @@ impl GraphQLClient {
                     &self,
                     &query,
                     Some(Arc::clone(&gql_schema)),
-                    limit,
+                    remaining_limit,
                     Some(next_cursor_val),
                     error_checker.clone(),
                     query_cost,
                 )
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+                let page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
+                total_rows += page_rows;
+                tracing::debug!(
+                    page = pagination_count,
+                    page_rows,
+                    total_rows,
+                    has_next = result.cursor.is_some(),
+                    query_cost,
+                    elapsed_ms = scan_started.elapsed().as_millis(),
+                    "GraphQL page"
+                );
 
                 for batch in result.records {
                     tx.send(Ok(batch)).await.map_err(|_| {
@@ -1450,6 +1744,12 @@ impl GraphQLClient {
                     break;
                 }
             }
+            tracing::debug!(
+                pages = pagination_count + 1,
+                total_rows,
+                elapsed_ms = scan_started.elapsed().as_millis(),
+                "GraphQL scan complete"
+            );
             Ok(())
         });
 
@@ -1519,6 +1819,14 @@ impl GraphQLClient {
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
+                            if matches!(
+                                &e,
+                                Error::JsonDecodeError { status, .. } if status.is_success()
+                            ) {
+                                // Truncated HTTP 200: the pooled connection is
+                                // likely half-closed. Retry on a new TCP stream.
+                                close_conn.store(true, Ordering::Relaxed);
+                            }
                             if is_gateway_error(&e) {
                                 close_conn.store(true, Ordering::Relaxed);
                                 // Shrink the per-page size for the next retry.
@@ -1897,6 +2205,158 @@ mod tests {
         }
     }
 
+    /// The nested-pagination path end to end over a mock server: an outer page
+    /// whose child connection is truncated, the `node(id:)` follow-ups, and the
+    /// terminal page. The live full-history tests are `#[ignore]`, so without
+    /// this nothing guards the feature in CI.
+    mod nested_pagination {
+        use std::sync::Arc;
+
+        use arrow::array::{Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use serde_json::{Value, json};
+        use url::Url;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{
+            GraphQLQuery, NestedConnectionPager, UnnestBehavior, UnnestHandler,
+        };
+
+        const OUTER_QUERY: &str = "query { view(first: 10) {
+            nodes { id reviews(first: 2) { totalCount pageInfo { hasNextPage endCursor } nodes { id } } }
+            pageInfo { hasNextPage endCursor }
+        } }";
+
+        fn reviews_page(nodes: &[&str], has_next: bool, end_cursor: &str) -> Value {
+            json!({
+                "totalCount": 5,
+                "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                "nodes": nodes.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+            })
+        }
+
+        #[tokio::test]
+        async fn follow_up_pages_emit_every_child_once_and_request_cursors_in_order() {
+            let server = MockServer::start().await;
+
+            // Most specific first: the follow-ups are keyed on their cursor.
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c2\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R5"], false, "c3")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4"], true, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            // Flatten each parent into one row per review, the way the GitHub
+            // connector's fan-out does, so every child is countable.
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            // The provider normally stamps the client's pointer onto the query;
+            // inference would otherwise walk into the nested connection.
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            let result = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("the nested connection to be completed");
+
+            let mut ids: Vec<String> = Vec::new();
+            for batch in &result.records {
+                let column = batch
+                    .column_by_name("id")
+                    .expect("the id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id to be a string column");
+                for i in 0..column.len() {
+                    ids.push(column.value(i).to_string());
+                }
+            }
+
+            assert_eq!(
+                ids,
+                vec!["R1", "R2", "R3", "R4", "R5"],
+                "every child of the truncated connection must be emitted exactly once"
+            );
+
+            // `after:` forces the pages of one parent to be sequential.
+            let bodies: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                .collect();
+            let cursor_order: Vec<&str> = bodies
+                .iter()
+                .filter_map(|b| {
+                    if b.contains(r#"after: \"c1\""#) {
+                        Some("c1")
+                    } else if b.contains(r#"after: \"c2\""#) {
+                        Some("c2")
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                cursor_order,
+                vec!["c1", "c2"],
+                "follow-up pages of one parent must be requested in cursor order"
+            );
+        }
+    }
+
     mod empty_page_schema {
         use std::sync::Arc;
 
@@ -1942,9 +2402,16 @@ mod tests {
             let query =
                 GraphQLQuery::try_from(Arc::<str>::from(query_str)).expect("query to parse");
 
-            client
-                .process_response(&query, schema_override, None, cursor, response)
-                .expect("an empty page is a valid response, not an error")
+            futures::executor::block_on(client.process_response(
+                &query,
+                schema_override,
+                None,
+                cursor,
+                response,
+                None,
+                None,
+            ))
+            .expect("an empty page is a valid response, not an error")
         }
 
         /// Regression test for #13004: a first page with no rows must not discard the configured
@@ -2079,6 +2546,50 @@ mod tests {
                     .sum::<usize>(),
                 1
             );
+        }
+    }
+
+    mod nested_connection_pager {
+        use std::sync::Arc;
+
+        use crate::graphql::client::{GraphQLQuery, NestedConnectionPager};
+
+        fn pager() -> NestedConnectionPager {
+            NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "pull_request_id",
+                type_condition: "PullRequest",
+                node_selection: "id\nstate",
+                page_size: 100,
+            }
+        }
+
+        #[test]
+        fn follow_up_query_parses_and_keeps_the_after_cursor() {
+            let query_str = pager().next_page_query("PR_1", "Y3Vyc29y");
+            let mut query = GraphQLQuery::try_from(Arc::<str>::from(query_str.as_str()))
+                .expect("follow-up query must parse");
+            query.pagination_parameters = None;
+            let rendered = query
+                .to_string_with_page_size(None, None, None)
+                .expect("follow-up query must render");
+
+            assert!(
+                rendered.contains("after:") && rendered.contains("Y3Vyc29y"),
+                "clearing pagination_parameters must keep the after cursor, got:\n{rendered}"
+            );
+            assert!(rendered.contains("... on PullRequest") || rendered.contains("PullRequest"));
+        }
+
+        #[test]
+        fn follow_up_query_escapes_quotes_in_ids_and_cursors() {
+            let query_str = pager().next_page_query(r#"id"x"#, r#"cur"sor"#);
+            assert!(
+                query_str.contains(r#"id\"x"#) && query_str.contains(r#"cur\"sor"#),
+                "quotes in node ids and cursors must be escaped, got:\n{query_str}"
+            );
+            GraphQLQuery::try_from(Arc::<str>::from(query_str.as_str()))
+                .expect("escaped follow-up query must parse");
         }
     }
 
@@ -3011,5 +3522,238 @@ mod tests {
         let result = super::format_query_with_context(query, 2, 3);
         assert!(result.contains("  users {"), "should show the error line");
         assert!(result.contains('^'), "should show the caret marker");
+    }
+
+    /// A page can carry fewer rows than the query's declared page size — a
+    /// gateway-error retry shrinks it, and a connection-style API may short one
+    /// of its own accord. The remaining-`LIMIT` counter has to follow the rows
+    /// that actually arrived: debiting the declared size retires rows the scan
+    /// never fetched, so it ends early and answers short while reporting success
+    /// (regression tests for #14308).
+    mod limit_accounting {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::TableProvider;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use serde_json::{Value, json};
+        use url::Url;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{GraphQLQuery, UnnestBehavior};
+        use crate::graphql::provider::GraphQLTableProviderBuilder;
+
+        /// The page size the query declares, and the one the shrink ladder is
+        /// seeded from: `100 -> 55` on the first gateway error.
+        const DECLARED_PAGE_SIZE: usize = 100;
+        /// Rows the endpoint can serve — far more than the requested limit, so
+        /// a short answer is never end-of-data.
+        const SOURCE_ROWS: usize = 500;
+        /// The `LIMIT` from the failing CI query.
+        const REQUESTED_LIMIT: usize = 125;
+
+        /// Built from `DECLARED_PAGE_SIZE` so the size the query declares and the
+        /// size the assertions talk about cannot drift apart.
+        fn query() -> String {
+            format!(
+                "query {{ commits(first: {DECLARED_PAGE_SIZE}) {{
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{ id }}
+        }} }}"
+            )
+        }
+
+        /// A connection-style endpoint: it serves the `first:` each request
+        /// asks for — capped by `page_cap`, the way an API free to short a page
+        /// does — hands back a cursor while rows remain, and can fail its very
+        /// first request with a 502 so the client shrinks its page size once,
+        /// the sequence logged in the run this issue was filed from.
+        struct Connection {
+            gateway_error_pending: AtomicBool,
+            source_rows: usize,
+            page_cap: Option<usize>,
+        }
+
+        impl Connection {
+            fn new(source_rows: usize) -> Self {
+                Self {
+                    gateway_error_pending: AtomicBool::new(false),
+                    source_rows,
+                    page_cap: None,
+                }
+            }
+
+            fn with_one_gateway_error(self) -> Self {
+                self.gateway_error_pending.store(true, Ordering::SeqCst);
+                self
+            }
+
+            fn with_page_cap(mut self, cap: usize) -> Self {
+                self.page_cap = Some(cap);
+                self
+            }
+
+            /// The page this request asks for: the `first:` the client rendered, read
+            /// back with the same parser the client builds the query from, and the
+            /// offset its `after:` cursor names.
+            fn page_request(query: &str) -> (usize, usize) {
+                let first = GraphQLQuery::try_from(Arc::<str>::from(query))
+                    .expect("the client always sends a parseable query")
+                    .pagination_parameters
+                    .expect("the client always names a page size")
+                    .pagination_argument
+                    .size();
+
+                // Cursors are this endpoint's own, minted below as `c{offset}`; the
+                // query parser drops `after:`, so read it off the rendered document.
+                let offset = query
+                    .split_once("after: \"c")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .and_then(|(digits, _)| digits.parse::<usize>().ok())
+                    .unwrap_or(0);
+
+                (first, offset)
+            }
+        }
+
+        impl Respond for Connection {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                if self.gateway_error_pending.swap(false, Ordering::SeqCst) {
+                    return ResponseTemplate::new(502).set_body_string("<html>Bad gateway</html>");
+                }
+
+                let body: Value =
+                    serde_json::from_slice(&request.body).expect("a JSON request body");
+                let query = body
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .expect("the request carries its query");
+
+                let (first, offset) = Self::page_request(query);
+                let wanted = self.page_cap.map_or(first, |cap| std::cmp::min(first, cap));
+                let served = std::cmp::min(wanted, self.source_rows.saturating_sub(offset));
+                let next = offset + served;
+                let nodes: Vec<Value> = (offset..next)
+                    .map(|i| json!({"id": format!("r{i}")}))
+                    .collect();
+
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"commits": {
+                    "pageInfo": {
+                        "hasNextPage": next < self.source_rows,
+                        "endCursor": format!("c{next}"),
+                    },
+                    "nodes": nodes,
+                }}}))
+            }
+        }
+
+        /// Runs `QUERY` against `endpoint` through the table provider, the way a
+        /// `SELECT … LIMIT n` reaches it, and returns the rows it answered with.
+        async fn scan_rows(endpoint: Connection, limit: Option<usize>) -> (usize, usize) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(endpoint)
+                .mount(&server)
+                .await;
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/commits/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let provider = GraphQLTableProviderBuilder::new(client)
+                .build_without_validation(&query())
+                .expect("provider to build without validation");
+
+            let ctx = SessionContext::new();
+            let plan = provider
+                .scan(&ctx.state(), None, &[], limit)
+                .await
+                .expect("scan to plan");
+            let batches: Vec<RecordBatch> = collect(plan, ctx.task_ctx())
+                .await
+                .expect("the scan to succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+
+            (batches.iter().map(RecordBatch::num_rows).sum(), requests)
+        }
+
+        /// The reported failure: one 502 shrinks the page 100 -> 55, and the scan
+        /// stops 45 rows short of the `LIMIT` with a successful result.
+        #[tokio::test]
+        async fn a_limit_spanning_a_shrunk_page_returns_every_requested_row() {
+            let (rows, _) = scan_rows(
+                Connection::new(SOURCE_ROWS).with_one_gateway_error(),
+                Some(REQUESTED_LIMIT),
+            )
+            .await;
+
+            assert_eq!(
+                rows, REQUESTED_LIMIT,
+                "a source holding {SOURCE_ROWS} rows must answer LIMIT {REQUESTED_LIMIT} in full; \
+                 a page shrunk below the declared size of {DECLARED_PAGE_SIZE} must not retire \
+                 rows the scan never fetched"
+            );
+        }
+
+        /// The shrink makes it systematic, but the defect is the accounting, so a
+        /// short page over-debits with no error anywhere in sight.
+        #[tokio::test]
+        async fn a_short_page_with_no_gateway_error_still_answers_the_limit() {
+            let (rows, _) = scan_rows(
+                Connection::new(SOURCE_ROWS).with_page_cap(40),
+                Some(REQUESTED_LIMIT),
+            )
+            .await;
+
+            assert_eq!(
+                rows, REQUESTED_LIMIT,
+                "an endpoint that serves 40 rows per page still owes every one of the \
+                 {REQUESTED_LIMIT} requested rows"
+            );
+        }
+
+        /// The counter must not run the other way either: a limit inside a
+        /// single page still costs exactly one request.
+        #[tokio::test]
+        async fn a_limit_inside_one_page_stops_after_one_request() {
+            let (rows, requests) = scan_rows(Connection::new(SOURCE_ROWS), Some(10)).await;
+
+            assert_eq!(rows, 10, "LIMIT 10 is answered by the first page");
+            assert_eq!(
+                requests, 1,
+                "a limit the first page already satisfies must not fetch another page"
+            );
+        }
+
+        /// A source with fewer rows than the limit is end-of-data, not a short
+        /// page: the scan ends when the cursor does, with what exists.
+        #[tokio::test]
+        async fn a_source_smaller_than_the_limit_ends_the_scan() {
+            let (rows, _) = scan_rows(Connection::new(30), Some(REQUESTED_LIMIT)).await;
+
+            assert_eq!(
+                rows, 30,
+                "a scan that runs out of rows answers with the rows there are"
+            );
+        }
     }
 }

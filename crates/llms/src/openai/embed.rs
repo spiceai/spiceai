@@ -124,11 +124,11 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> EmbedResult<CreateEmbeddingResponse> {
-        if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed((&req).into()).await
+    ) -> EmbedResult<Arc<CreateEmbeddingResponse>> {
+        if let Some(cached) = self.get_cached_embed((&req).into()).await
+            && let CachedEmbeddingResult::Response(response) = cached.as_ref()
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::clone(response));
         }
 
         let outer_model = req.model.clone();
@@ -152,13 +152,17 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
 
         resp.model = outer_model;
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        let resp = std::sync::Arc::new(resp);
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::clone(&resp)),
+        )
+        .await;
 
         Ok(resp)
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Arc<Vec<Vec<f32>>>> {
         // Batch requests to match OpenAI API limits: max_tokens_per_request and max array size.
         let embed_batches: Vec<EmbeddingInput> = chunk_embedding_input(&input);
         tracing::trace!(
@@ -188,9 +192,10 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
                     retry(retry_strategy, async || {
-                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed((&req).into()).await {
-                            return Ok(cached);
-                        }
+                        if let Some(cached) = self.get_cached_embed((&req).into()).await
+                            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref() {
+                                return Ok(std::sync::Arc::clone(vectors));
+                            }
 
                         let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
                         let start = Instant::now();
@@ -220,7 +225,8 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                 RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
                             })?;
 
-                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(embeddings.clone())).await;
+                        let embeddings = std::sync::Arc::new(embeddings);
+                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(std::sync::Arc::clone(&embeddings))).await;
 
                         Ok(embeddings)
                     })
@@ -229,13 +235,21 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
             })
             .collect();
 
-        let combined_results: Vec<Vec<f32>> = try_join_all(embed_futures)
-            .await?
+        let batches = try_join_all(embed_futures).await?;
+        // A single batch is handed back as-is so the shared handle survives.
+        // `try_from` gives the element back by value on the one-element case
+        // and returns the vector otherwise, so no `expect` is needed.
+        let batches = match <[_; 1]>::try_from(batches) {
+            Ok([single]) => return Ok(single),
+            Err(batches) => batches,
+        };
+        // Each batch that is not shared with the cache is moved out of its
+        // `Arc` rather than copied vector by vector.
+        let combined: Vec<Vec<f32>> = batches
             .into_iter()
-            .flatten()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
             .collect();
-
-        Ok(combined_results)
+        Ok(std::sync::Arc::new(combined))
     }
 
     fn size(&self) -> i32 {

@@ -47,9 +47,7 @@ impl GraphQLContext for MilestonesTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (milestones) + 2 issue-count connections per milestone
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(3)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
