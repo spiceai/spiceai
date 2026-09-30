@@ -1850,6 +1850,9 @@ pub struct CayenneTableProvider {
     /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
     /// write resolves a key it repeats; see [`super::key_conflicts`].
     upsert_dedup: super::key_conflicts::UpsertDedup,
+    /// Bytes of input a streaming upsert write collapses in memory before it
+    /// splits the rest into layers; see [`super::overwrite_layers::CollapseWindow`].
+    pub(crate) collapse_window_bytes: usize,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -9119,6 +9122,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             upsert_dedup,
+            collapse_window_bytes: super::overwrite_layers::COLLAPSE_WINDOW_BYTES,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -11154,6 +11158,7 @@ impl CayenneTableProvider {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             upsert_dedup: self.upsert_dedup,
+            collapse_window_bytes: self.collapse_window_bytes,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),

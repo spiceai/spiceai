@@ -40,7 +40,7 @@ limitations under the License.
 //! Under `drop` the first copy of a key wins, so a later copy must be dropped
 //! outright; that needs an exact answer, which [`FirstCopyFilter`] keeps.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -54,11 +54,15 @@ use futures::Stream;
 use hash_index::{PrehashedBuildHasher, SplitBlockBloomFilter};
 use parking_lot::Mutex;
 
-use super::key_conflicts::KeyResolver;
+use super::key_conflicts::{KeyResolver, ResolvedBatch};
 
 /// Rows one layer holds at most. Bounds the per-layer filter, and so the memory
 /// a layered overwrite holds for the layer it is writing.
 pub(crate) const MAX_LAYER_ROWS: usize = 8 * 1024 * 1024;
+
+/// Bytes of input a [`CollapseWindow`] holds before it resolves the keys they
+/// repeat; the memory an upsert refresh or append holds for it.
+pub(crate) const COLLAPSE_WINDOW_BYTES: usize = 128 * 1024 * 1024;
 
 /// Capacity of the first filter of a [`ChainedBloom`], small so a write of a few
 /// rows allocates a few kilobytes; each next filter is [`FILTER_GROWTH`] times
@@ -120,6 +124,8 @@ pub(crate) struct LayerTombstones {
     pub(crate) pk_i64: Vec<i64>,
     /// Encoded primary keys, for every other key shape.
     pub(crate) row_keys: Vec<Box<[u8]>>,
+    /// The key digest of every tombstoned key, in the same order.
+    pub(crate) digests: Vec<u128>,
 }
 
 impl LayerTombstones {
@@ -199,12 +205,15 @@ impl LayerSplitter {
         }
     }
 
+    fn resolve(&self, batch: &RecordBatch) -> super::Result<ResolvedBatch> {
+        self.resolver.resolve_batch(batch)
+    }
+
     #[expect(
         clippy::cast_possible_truncation,
         reason = "Bloom filters deliberately hash separate 64-bit halves of each 128-bit digest"
     )]
-    fn route(&mut self, batch: &RecordBatch) -> super::Result<Option<Routed>> {
-        let resolved = self.resolver.resolve_batch(batch)?;
+    fn route(&mut self, resolved: ResolvedBatch) -> super::Result<Option<Routed>> {
         if resolved.batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -249,7 +258,7 @@ impl LayerSplitter {
             self.layer_keys.capacity() * (size_of::<u64>() + 1) + self.written_keys.memory_bytes(),
         )?;
         let tombstones = if self.collect_tombstones {
-            self.tombstones(&resolved.batch, &superseding)?
+            self.tombstones(&resolved, &superseding)?
         } else {
             LayerTombstones::default()
         };
@@ -260,31 +269,119 @@ impl LayerSplitter {
         }))
     }
 
-    fn tombstones(&self, batch: &RecordBatch, rows: &[usize]) -> super::Result<LayerTombstones> {
+    fn tombstones(
+        &self,
+        resolved: &ResolvedBatch,
+        rows: &[usize],
+    ) -> super::Result<LayerTombstones> {
         if rows.is_empty() {
             return Ok(LayerTombstones::default());
         }
+        let digests = rows.iter().map(|&row| resolved.digests[row]).collect();
         if let Some(index) = self.int64_key {
-            let keys = batch.column(index).as_primitive::<Int64Type>();
+            let keys = resolved.batch.column(index).as_primitive::<Int64Type>();
             return Ok(LayerTombstones {
                 pk_i64: rows.iter().map(|&row| keys.value(row)).collect(),
                 row_keys: Vec::new(),
+                digests,
             });
         }
-        let encoded = self.resolver.encode_keys(batch)?;
+        let encoded = self.resolver.encode_keys(&resolved.batch)?;
         Ok(LayerTombstones {
             pk_i64: Vec::new(),
             row_keys: rows
                 .iter()
                 .map(|&row| Box::<[u8]>::from(encoded.row(row).as_ref()))
                 .collect(),
+            digests,
         })
+    }
+}
+
+/// Collapses the batches of a bounded window of the input — the last copy of a
+/// key within the window wins — before the splitter sees them, so a key the
+/// window repeats never opens a layer or leaves a tombstone. Each batch is
+/// resolved on arrival, so the work done per poll stays one batch's worth.
+pub(crate) struct CollapseWindow {
+    max_bytes: usize,
+    batches: Vec<ResolvedBatch>,
+    bytes: usize,
+    /// The window position of each key's last copy.
+    survivor: HashMap<u128, (usize, usize), PrehashedBuildHasher>,
+    reservation: MemoryReservation,
+}
+
+impl CollapseWindow {
+    pub(crate) fn new(max_bytes: usize, reservation: MemoryReservation) -> Self {
+        Self {
+            max_bytes: max_bytes.max(1),
+            batches: Vec::new(),
+            bytes: 0,
+            survivor: HashMap::with_hasher(PrehashedBuildHasher),
+            reservation,
+        }
+    }
+
+    fn push(&mut self, resolved: ResolvedBatch) -> super::Result<()> {
+        let index = self.batches.len();
+        for (row, &digest) in resolved.digests.iter().enumerate() {
+            self.survivor.insert(digest, (index, row));
+        }
+        self.bytes += resolved.batch.get_array_memory_size();
+        self.batches.push(resolved);
+        // hashbrown: one control byte per bucket beside each digest and position.
+        self.reservation.try_resize(
+            self.bytes
+                + self.survivor.capacity() * (size_of::<u128>() + size_of::<(usize, usize)>() + 1),
+        )?;
+        Ok(())
+    }
+
+    fn is_full(&self) -> bool {
+        self.bytes >= self.max_bytes
+    }
+
+    fn drain(&mut self) -> super::Result<VecDeque<ResolvedBatch>> {
+        let mut out = VecDeque::with_capacity(self.batches.len());
+        for (index, resolved) in std::mem::take(&mut self.batches).into_iter().enumerate() {
+            let keep: BooleanArray = resolved
+                .digests
+                .iter()
+                .enumerate()
+                .map(|(row, digest)| Some(self.survivor.get(digest) == Some(&(index, row))))
+                .collect();
+            let kept = keep.true_count();
+            if kept == 0 {
+                continue;
+            }
+            if kept == keep.len() {
+                out.push_back(resolved);
+                continue;
+            }
+            let digests = resolved
+                .digests
+                .iter()
+                .zip(keep.values().iter())
+                .filter_map(|(&digest, kept)| kept.then_some(digest))
+                .collect();
+            out.push_back(ResolvedBatch {
+                batch: filter_record_batch(&resolved.batch, &keep)?,
+                digests,
+            });
+        }
+        self.survivor.clear();
+        self.bytes = 0;
+        self.reservation.free();
+        Ok(out)
     }
 }
 
 struct LayerSourceState {
     input: SendableRecordBatchStream,
     splitter: LayerSplitter,
+    window: Option<CollapseWindow>,
+    /// Resolved batches waiting to be routed.
+    ready: VecDeque<ResolvedBatch>,
     /// The batch that opened the next layer, held until that layer's stream starts.
     carry: Option<Routed>,
     /// Tombstones of each layer, indexed by layer.
@@ -301,12 +398,20 @@ pub(crate) struct LayerSource {
 }
 
 impl LayerSource {
-    pub(crate) fn new(input: SendableRecordBatchStream, splitter: LayerSplitter) -> Self {
+    /// `window` collapses bounded windows of the input before they are routed;
+    /// only for policies under which the last copy of a key wins.
+    pub(crate) fn new(
+        input: SendableRecordBatchStream,
+        splitter: LayerSplitter,
+        window: Option<CollapseWindow>,
+    ) -> Self {
         let schema = input.schema();
         Self {
             state: Arc::new(Mutex::new(LayerSourceState {
                 input,
                 splitter,
+                window,
+                ready: VecDeque::new(),
                 carry: None,
                 tombstones: Vec::new(),
                 exhausted: false,
@@ -360,6 +465,7 @@ impl LayerStream {
         let tombstones = &mut state.tombstones[layer];
         tombstones.pk_i64.extend(routed.tombstones.pk_i64);
         tombstones.row_keys.extend(routed.tombstones.row_keys);
+        tombstones.digests.extend(routed.tombstones.digests);
         routed.batch
     }
 }
@@ -372,36 +478,51 @@ impl Stream for LayerStream {
         if this.done {
             return Poll::Ready(None);
         }
-        let mut state = this.state.lock();
+        let mut guard = this.state.lock();
+        let state = &mut *guard;
         if !this.started {
             this.started = true;
             if this.layer > 0
                 && let Some(carry) = state.carry.take()
             {
-                return Poll::Ready(Some(Ok(Self::accept(&mut state, this.layer, carry))));
+                return Poll::Ready(Some(Ok(Self::accept(state, this.layer, carry))));
             }
         }
         loop {
+            if let Some(resolved) = state.ready.pop_front() {
+                let routed = match state.splitter.route(resolved) {
+                    Ok(Some(routed)) => routed,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        this.done = true;
+                        return Poll::Ready(Some(Err(error.into())));
+                    }
+                };
+                if routed.starts_layer {
+                    state.carry = Some(routed);
+                    this.done = true;
+                    return Poll::Ready(None);
+                }
+                return Poll::Ready(Some(Ok(Self::accept(state, this.layer, routed))));
+            }
             if state.exhausted {
                 this.done = true;
                 return Poll::Ready(None);
             }
-            match state.input.as_mut().poll_next(cx) {
+            let step: super::Result<()> = match state.input.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
-                    let routed = match state.splitter.route(&batch) {
-                        Ok(Some(routed)) => routed,
-                        Ok(None) => continue,
-                        Err(error) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(error.into())));
+                    state.splitter.resolve(&batch).and_then(|resolved| {
+                        match state.window.as_mut() {
+                            None => state.ready.push_back(resolved),
+                            Some(window) => {
+                                window.push(resolved)?;
+                                if window.is_full() {
+                                    state.ready = window.drain()?;
+                                }
+                            }
                         }
-                    };
-                    if routed.starts_layer {
-                        state.carry = Some(routed);
-                        this.done = true;
-                        return Poll::Ready(None);
-                    }
-                    return Poll::Ready(Some(Ok(Self::accept(&mut state, this.layer, routed))));
+                        Ok(())
+                    })
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.done = true;
@@ -409,8 +530,16 @@ impl Stream for LayerStream {
                 }
                 Poll::Ready(None) => {
                     state.exhausted = true;
+                    match state.window.as_mut() {
+                        Some(window) => window.drain().map(|ready| state.ready = ready),
+                        None => Ok(()),
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
+            };
+            if let Err(error) = step {
+                this.done = true;
+                return Poll::Ready(Some(Err(error.into())));
             }
         }
     }
@@ -531,13 +660,21 @@ mod tests {
         batches: Vec<RecordBatch>,
         max_layer_rows: usize,
     ) -> (Vec<Vec<(i64, String)>>, Vec<LayerTombstones>) {
+        windowed_layers(batches, max_layer_rows, None).await
+    }
+
+    async fn windowed_layers(
+        batches: Vec<RecordBatch>,
+        max_layer_rows: usize,
+        window: Option<CollapseWindow>,
+    ) -> (Vec<Vec<(i64, String)>>, Vec<LayerTombstones>) {
         let splitter = LayerSplitter::new(
             resolver(ConflictPolicy::UpsertKeepLast),
             Some(0),
             max_layer_rows,
             reservation(),
         );
-        let mut source = LayerSource::new(input(batches), splitter);
+        let mut source = LayerSource::new(input(batches), splitter, window);
         let mut out = Vec::new();
         while let Some(mut layer) = source.next_layer() {
             let mut rows = Vec::new();
@@ -606,6 +743,39 @@ mod tests {
             vec![owned(&[(1, "a"), (2, "b")]), owned(&[(3, "c")])]
         );
         assert!(tombstones.iter().all(LayerTombstones::is_empty));
+    }
+
+    #[tokio::test]
+    async fn a_window_collapses_repeats_it_holds_without_a_layer() {
+        let batches = vec![
+            batch(&[(1, "a"), (2, "b")]),
+            batch(&[(1, "c"), (3, "d")]),
+            batch(&[(2, "e")]),
+        ];
+        let (layers, tombstones) = windowed_layers(
+            batches,
+            MAX_LAYER_ROWS,
+            Some(CollapseWindow::new(COLLAPSE_WINDOW_BYTES, reservation())),
+        )
+        .await;
+        assert_eq!(layers, vec![owned(&[(1, "c"), (3, "d"), (2, "e")])]);
+        assert!(tombstones.iter().all(LayerTombstones::is_empty));
+    }
+
+    #[tokio::test]
+    async fn a_repeat_across_windows_still_opens_a_layer() {
+        // A one-byte window flushes after every batch.
+        let (layers, tombstones) = windowed_layers(
+            vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "c")])],
+            MAX_LAYER_ROWS,
+            Some(CollapseWindow::new(1, reservation())),
+        )
+        .await;
+        assert_eq!(
+            layers,
+            vec![owned(&[(1, "a"), (2, "b")]), owned(&[(1, "c")])]
+        );
+        assert_eq!(tombstones[1].pk_i64, vec![1]);
     }
 
     #[tokio::test]

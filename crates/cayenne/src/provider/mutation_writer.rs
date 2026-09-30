@@ -85,7 +85,9 @@ use super::key_conflicts::ConflictPolicy;
 use super::mem_tier_budget;
 use super::on_conflict::PreparedOnConflictDeletionPublish;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
-use super::overwrite_layers::{FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS};
+use super::overwrite_layers::{
+    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS,
+};
 use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
@@ -1175,9 +1177,17 @@ impl<'a> AppendMutationWriter<'a> {
                     )
                     .await;
             }
+            let window_reservation = reservation.new_empty();
             let splitter = LayerSplitter::for_append(resolver, MAX_LAYER_ROWS, reservation);
             return self
-                .write_layered_append(LayerSource::new(data, splitter))
+                .write_layered_append(LayerSource::new(
+                    data,
+                    splitter,
+                    Some(CollapseWindow::new(
+                        self.table.collapse_window_bytes,
+                        window_reservation,
+                    )),
+                ))
                 .await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;

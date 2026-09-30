@@ -78,7 +78,7 @@ use super::column_stats::ColumnStatsAccumulator;
 use super::key_conflicts::ConflictPolicy;
 use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_layers::{
-    FirstCopyFilter, LayerSource, LayerSplitter, LayerTombstones, MAX_LAYER_ROWS,
+    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, LayerTombstones, MAX_LAYER_ROWS,
 };
 use super::table::{
     CayenneTableProvider, InlinedOverwritePublish, OverwriteLayerPublish, OverwriteRangePlan,
@@ -715,13 +715,21 @@ impl CayenneTableProvider {
                 Box::pin(FirstCopyFilter::new(data, resolver, reservation))
             }
             Some(resolver) => {
+                let window_reservation = reservation.new_empty();
                 let splitter = LayerSplitter::new(
                     resolver,
                     self.int64_tombstone_key(),
                     MAX_LAYER_ROWS,
                     reservation,
                 );
-                let mut source = LayerSource::new(data, splitter);
+                let mut source = LayerSource::new(
+                    data,
+                    splitter,
+                    Some(CollapseWindow::new(
+                        self.collapse_window_bytes,
+                        window_reservation,
+                    )),
+                );
                 let main = source.next_layer().ok_or_else(|| super::Error::Internal {
                     table: self.table_name().to_string(),
                     message: "an overwrite's input yielded no first layer".to_string(),

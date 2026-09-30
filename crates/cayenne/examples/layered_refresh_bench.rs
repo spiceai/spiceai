@@ -213,6 +213,35 @@ async fn main() {
         keys * passes,
         (keys * passes) as f64 / refresh_s,
     );
+    // Vortex files per snapshot directory (the main snapshot and each layer).
+    let mut files_per_dir: Vec<usize> = std::fs::read_dir(dir.path().join("data"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|table| table.path().is_dir())
+        .flat_map(|table| {
+            std::fs::read_dir(table.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter(|snapshot| snapshot.path().is_dir())
+        .map(|snapshot| {
+            std::fs::read_dir(snapshot.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|f| f.path().extension().is_some_and(|e| e == "vortex"))
+                .count()
+        })
+        .filter(|&n| n > 0)
+        .collect();
+    files_per_dir.sort_unstable();
+    println!(
+        "  snapshot dirs with files={} vortex files per dir={files_per_dir:?} input batches={}",
+        files_per_dir.len(),
+        (keys * passes).div_ceil(BATCH)
+    );
     ctx.register_table(
         "t",
         Arc::clone(&provider) as Arc<dyn datafusion::datasource::TableProvider>,

@@ -121,6 +121,9 @@ async fn table(
     )
     .await;
     provider.upsert_dedup = dedup;
+    // Flush the collapse window after every batch, so repeats across batches
+    // exercise the layers.
+    provider.collapse_window_bytes = 1;
     (provider, catalog, runtime_env, dir)
 }
 
@@ -492,4 +495,24 @@ async fn drop_keeps_the_first_copy_across_batches() {
         )
     );
     assert!(provider.protected_snapshot_ids().is_empty());
+}
+
+/// Repeats the collapse window holds are resolved in memory: the refresh
+/// publishes one snapshot, with no layer and no tombstone.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeats_within_the_collapse_window_publish_one_snapshot() {
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (mut provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        provider.collapse_window_bytes =
+            super::super::super::overwrite_layers::COLLAPSE_WINDOW_BYTES;
+        write(&provider, InsertOp::Overwrite, repeated_across_batches())
+            .await
+            .expect("overwrite");
+        assert_eq!(visible(&provider).await, (last_copies(), 6), "{mode:?}");
+        assert!(
+            provider.protected_snapshot_ids().is_empty(),
+            "{mode:?}: no layers"
+        );
+        assert!(!provider.has_pending_deletions(), "{mode:?}: no tombstones");
+    }
 }
