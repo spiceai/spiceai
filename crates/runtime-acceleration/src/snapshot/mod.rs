@@ -8524,12 +8524,8 @@ mod tests {
         artifact.uri = artifact.uri.replace(SNAPSHOT_URI_PREFIX, writer_location);
         assert!(artifact.uri.starts_with(writer_location));
 
-        let restored_from = Arc::new(Mutex::new(None));
-        let index = Arc::new(MockSnapshotIndex {
-            identity,
-            should_fail: false,
-            restored_from: Arc::clone(&restored_from),
-        });
+        let index = Arc::new(MockSnapshotIndex::new(identity, false));
+        let restored_from = Arc::clone(&index.restored_from);
         manager.set_indexes(vec![index]).await;
 
         manager
