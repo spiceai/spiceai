@@ -181,6 +181,22 @@ pub fn apply_inferred_schema(
             if pk_set.as_ref() == Some(&index_set) {
                 continue; // duplicates the primary key
             }
+            // An index the engine would refuse at registration is dropped here
+            // instead: the user never declared it, so it must not become a
+            // configuration error that keeps the whole dataset from loading.
+            if let Some((column, data_type)) =
+                unindexable_column(engine, effective_schema, &index.columns)
+            {
+                let warning = inferred_index_skip_warning(
+                    dataset_name,
+                    engine,
+                    &index.columns,
+                    column,
+                    data_type,
+                );
+                tracing::warn!("{warning}");
+                continue;
+            }
             let index_type = if index.unique {
                 IndexType::Unique
             } else {
