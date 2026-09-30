@@ -486,11 +486,20 @@ mod tests {
     /// A scan of `t(id, a)` with `a` binary, filtered by `predicate` and
     /// projecting `projection` — the shapes #14355 measured.
     fn plan_over_binary(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("a", DataType::Binary, true),
-        ]);
-        let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
+        plan_over(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("a", DataType::Binary, true),
+            ],
+            predicate,
+            projection,
+        )
+    }
+
+    /// A scan of `t` with `fields`, filtered by `predicate` and projecting
+    /// `projection`.
+    fn plan_over(fields: Vec<Field>, predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
+        let mut plan = table_scan(Some("t"), &Schema::new(fields), None).expect("scan t");
         if let Some(predicate) = predicate {
             plan = plan.filter(predicate).expect("filter");
         }
@@ -553,19 +562,15 @@ mod tests {
     /// A scan of `t(id, f, d)` with `f` a float and `d` a decimal, filtered by
     /// `predicate` and projecting `projection` — the shapes #14482 measured.
     fn plan_over_fractions(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("f", DataType::Float64, true),
-            Field::new("d", DataType::Decimal128(10, 2), true),
-        ]);
-        let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
-        if let Some(predicate) = predicate {
-            plan = plan.filter(predicate).expect("filter");
-        }
-        plan.project(vec![projection])
-            .expect("project")
-            .build()
-            .expect("build plan")
+        plan_over(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("f", DataType::Float64, true),
+                Field::new("d", DataType::Decimal128(10, 2), true),
+            ],
+            predicate,
+            projection,
+        )
     }
 
     /// Regression test for #14482, through every policy whose engine rounds a
