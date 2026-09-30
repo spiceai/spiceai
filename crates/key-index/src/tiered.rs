@@ -287,7 +287,7 @@ impl IndexRun {
 }
 
 impl IndexRun {
-    /// Persist as a standalone sidecar file (see [`crate::persist`]).
+    /// Persist as a standalone file (see [`crate::persist`]).
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
@@ -314,13 +314,13 @@ impl IndexRun {
         out
     }
 
-    /// Read a sidecar written by [`Self::to_bytes`]. Its words must ascend and
+    /// Read a run written by [`Self::to_bytes`]. Its words must ascend and
     /// its offsets must fall inside its postings: a run read out of order
     /// would miss rows.
     ///
     /// # Errors
     ///
-    /// When `bytes` are not a complete, intact sidecar of this kind and
+    /// When `bytes` are not a complete, intact run of this kind and
     /// version.
     pub fn from_bytes(bytes: &[u8]) -> crate::persist::Result<Self> {
         use crate::persist::Error;
