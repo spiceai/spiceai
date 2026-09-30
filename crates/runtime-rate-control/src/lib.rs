@@ -56,7 +56,8 @@ pub use adaptive::{
     AdaptiveController, AdaptiveRateControl, AdaptiveRateControlError,
     DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, DEFAULT_ADAPTIVE_WINDOW, RequestOutcome,
 };
-use leased::{LeasedBucket, LeasedBucketConfig, LeasedBucketMetrics};
+pub use leased::LeasedBucketMetrics;
+use leased::{LeasedAdaptiveConfig, LeasedBucket, LeasedBucketConfig};
 
 const DEFAULT_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(90);
 
@@ -73,6 +74,42 @@ const DEFAULT_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(90);
 const ADAPTIVE_WEIGHT_RESOLUTION: u32 = 100;
 
 type GovernorRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
+
+/// The cluster adaptive decay half-life, in whole windows.
+///
+/// The shared state records request outcomes per window, so one window is the
+/// shortest half-life it can express. An unset `rate_control_window` therefore
+/// takes the window itself — the `refresh_interval` — rather than the
+/// single-node [`DEFAULT_ADAPTIVE_WINDOW`], and an explicit value is quantised
+/// to the nearest whole number of windows, floored at one.
+///
+/// A half-life of exactly one window is the least robust setting against
+/// failures grouped at one end of a window; the worst case is a factor of
+/// `2 ^ (window / half_life)`, which is 2 here and 1.15 at five windows. That
+/// matters only while an origin is failing or recovering, so it is the right
+/// default and the wrong thing to be stuck with — hence the rounding is logged
+/// rather than silent.
+fn half_life_windows(origin: &str, configured: Option<Duration>, window: Duration) -> u64 {
+    let Some(configured) = configured else {
+        return 1;
+    };
+    let window_ms = duration_millis_u64(window).max(1);
+    let configured_ms = duration_millis_u64(configured);
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "both are millisecond durations; the quotient is a small window count"
+    )]
+    let windows = (((configured_ms as f64) / (window_ms as f64)).round() as u64).max(1);
+    let effective_ms = windows.saturating_mul(window_ms);
+    if effective_ms != configured_ms {
+        tracing::info!(
+            "Cluster rate control for origin '{origin}' rounded `rate_control_window` from {configured_ms}ms to {effective_ms}ms, which is {windows} x the {window_ms}ms `refresh_interval`. The shared state records request outcomes one window at a time, so the reaction and recovery half-life is a whole number of windows."
+        );
+    }
+    windows
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -406,7 +443,10 @@ impl RateControllerBuilder {
         // and a healthy request charges `ADAPTIVE_WEIGHT_RESOLUTION` cells, so the adaptive weight
         // has sub-integer resolution (see [`ADAPTIVE_WEIGHT_RESOLUTION`]). Without
         // adaptive control the resolution is 1 and nothing is scaled.
-        let resolution = if self.adaptive.is_some() {
+        // Cluster mode is excluded: it scales the budget, not the charge, and
+        // leased buckets are never resolution-scaled, so a `resolution` above 1
+        // would only mis-size the concurrency semaphore.
+        let resolution = if self.adaptive.is_some() && self.persistence.is_none() {
             ADAPTIVE_WEIGHT_RESOLUTION
         } else {
             1
@@ -436,6 +476,24 @@ impl RateControllerBuilder {
         let mut local_limiters: Vec<(Arc<GovernorRateLimiter>, u32)> = Vec::new();
         let mut leased_buckets: Vec<Arc<LeasedBucket>> = Vec::new();
 
+        // In cluster mode the coefficient is agreed through the shared file, so
+        // the adaptive settings go to the leased buckets and no local controller
+        // is built. A local coefficient would throttle each replica on its own
+        // view, and the demand-weighted share would then hand the released
+        // budget to a healthier replica: the throttle would move rather than the
+        // load on the origin fall.
+        let cluster_adaptive = self.persistence.as_ref().and_then(|persistence| {
+            self.adaptive.map(|control| LeasedAdaptiveConfig {
+                k: control.k(),
+                failure_threshold: control.failure_threshold(),
+                half_life_windows: half_life_windows(
+                    &persistence.origin,
+                    control.configured_window(),
+                    persistence.window_duration,
+                ),
+            })
+        });
+
         for (index, quota_def) in self.quotas.into_iter().enumerate() {
             let fallback_name = format!("quota-{index}");
             let limiter_key = quota_def.persistence_key(&fallback_name);
@@ -444,9 +502,9 @@ impl RateControllerBuilder {
                 // Leased buckets are deliberately NOT `resolution`-scaled. Their
                 // `acquire()` registers one unit of cluster demand per call, so
                 // charging `resolution` tokens would inflate the demand-weighted
-                // lease sharing across replicas. Adaptive mode is rejected at
-                // configuration time when cluster rate control is set, so a leased
-                // bucket never has an adaptive weight to apply.
+                // lease sharing across replicas. A leased bucket throttles by
+                // scaling the cluster budget it leases against, not by charging
+                // a fractional weight, so it never needs the resolution trick.
                 let burst_per_window = quota_def.burst_per_window(persistence.window_duration);
                 leased_buckets.push(LeasedBucket::new(LeasedBucketConfig {
                     store: Arc::clone(&persistence.store),
@@ -457,6 +515,7 @@ impl RateControllerBuilder {
                     window_duration: persistence.window_duration,
                     limiter_key,
                     burst_per_window,
+                    adaptive: cluster_adaptive,
                 }));
             } else {
                 let quota = scale_quota_rate(quota_def.quota, resolution);
@@ -474,12 +533,16 @@ impl RateControllerBuilder {
         // The adaptive controller names the same origin in its log lines, so it
         // takes it from the target. `with_adaptive` always sets an origin, so
         // the fallback is unreachable.
-        let adaptive = self.adaptive.map(|control| {
-            Arc::new(AdaptiveController::new(
-                control,
-                target.as_origin().unwrap_or_default(),
-            ))
-        });
+        let adaptive = cluster_adaptive
+            .is_none()
+            .then_some(self.adaptive)
+            .flatten()
+            .map(|control| {
+                Arc::new(AdaptiveController::new(
+                    control,
+                    target.as_origin().unwrap_or_default(),
+                ))
+            });
 
         RateController::new(
             jitter,
@@ -757,8 +820,9 @@ impl RateController {
             }
         }
         // Cluster leased buckets: each acquire consumes one token, may wait.
-        // Adaptive mode and cluster rate control are mutually exclusive (rejected
-        // at configuration time), so each request charges exactly one token.
+        // Always exactly one token, in both modes: a leased bucket throttles by
+        // leasing against a smaller cluster budget, not by charging a heavier
+        // weight, so the charge never carries the adaptive coefficient.
         for bucket in &self.leased_buckets {
             bucket.acquire().await.map_err(|e| match e {
                 leased::Error::FailClosed { origin } => Error::ClusterBudgetExhausted { origin },
@@ -824,21 +888,66 @@ impl RateController {
         })
     }
 
-    /// Record the outcome of one request, feeding the adaptive controller (a
-    /// no-op when adaptive control is disabled).
+    /// Record the outcome of one request, feeding whichever adaptive control is
+    /// in force (a no-op when adaptive control is disabled).
+    ///
+    /// Exactly one of the two arms does work: local mode builds an
+    /// [`AdaptiveController`], cluster mode builds none and publishes the counts
+    /// through the leased buckets instead.
+    ///
+    /// An origin has at most two rate quotas, so at most two buckets hold the
+    /// same numbers. Each publishes its own copy under its own limiter key on
+    /// its own write, and the copies can differ by one tick — which is fine,
+    /// because each bucket scales only its own budget and the invariant is per
+    /// limiter.
+    ///
+    /// Only an *upstream* outcome belongs here. A request that never reached the
+    /// origin, such as one that ran out of `rate_control_acquire_timeout`, must
+    /// not be recorded: counting it would close a loop where throttling produces
+    /// the acquire timeouts that deepen the throttle. The connectors record
+    /// outcomes only after the permit is held and the request has been sent, so
+    /// an acquire timeout returns before any call reaches this method.
     pub fn record_outcome(&self, outcome: RequestOutcome) {
         if let Some(adaptive) = &self.adaptive {
             adaptive.record(outcome);
         }
+        for bucket in &self.leased_buckets {
+            bucket.record_outcome(outcome);
+        }
     }
 
     /// The adaptive admission coefficient in `[0, 1]`, or `None` when adaptive
-    /// control is disabled. Computed live, so it reflects window decay.
+    /// control is disabled.
+    ///
+    /// In local mode this is computed live, so it reflects window decay. In
+    /// cluster mode it is the ratio the shared file fixed for the window this
+    /// replica last leased, so every replica reports the same value. An origin
+    /// with both a per-second and a per-minute quota reports the tighter of the
+    /// two, keeping the single-coefficient contract of local mode.
     #[must_use]
     pub fn admission_coefficient(&self) -> Option<f64> {
-        self.adaptive
-            .as_ref()
-            .map(|adaptive| adaptive.admission_coefficient())
+        if let Some(adaptive) = &self.adaptive {
+            return Some(adaptive.admission_coefficient());
+        }
+        self.leased_buckets
+            .iter()
+            .filter_map(|bucket| bucket.admission_coefficient())
+            .min_by(f64::total_cmp)
+    }
+
+    /// Snapshot of the cluster budget each leased bucket is currently spending
+    /// against, as `(limiter_key, effective_burst)` pairs. Empty in local mode.
+    #[must_use]
+    pub fn cluster_effective_bursts(&self) -> Vec<(String, u64)> {
+        self.leased_buckets
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket.limiter_key().to_string(),
+                    bucket.metrics().cluster_effective_burst(),
+                )
+            })
+            .collect()
     }
 
     /// The real-valued weight (in scaled cells) one request wants to charge right
@@ -924,7 +1033,15 @@ impl RateController {
         // request actually paid for the origin's failures, which the
         // admission-coefficient gauge (intensity) does not count.
         let desired_weight = self.adaptive_desired_weight();
-        if desired_weight.round() > f64::from(self.resolution) {
+        // Local mode throttles by charging more than the healthy baseline;
+        // cluster mode throttles by leasing against a smaller budget. Either way
+        // this request paid for the throttle, which is what the counter reports.
+        if desired_weight.round() > f64::from(self.resolution)
+            || self
+                .leased_buckets
+                .iter()
+                .any(|bucket| bucket.is_throttling())
+        {
             self.metrics.record_adaptive_throttle();
         }
 
