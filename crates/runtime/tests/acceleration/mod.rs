@@ -35,6 +35,8 @@ mod cayenne_append_timestamptz;
 mod cayenne_maintained_aggregates;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
+#[cfg(not(target_os = "windows"))]
+mod cayenne_on_conflict_batches;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
