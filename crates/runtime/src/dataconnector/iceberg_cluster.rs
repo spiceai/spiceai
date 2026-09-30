@@ -135,7 +135,9 @@ impl TableLayer for IcebergClusterTableProvider {
         // Exhaustive on purpose: a wildcard would answer a future walk kind
         // for this layer without anyone deciding what it should say.
         match walk {
-            LayerWalk::Read | LayerWalk::Index => Some(below),
+            // Serialising a scan for a remote node changes no row a scan
+            // returns, so the Iceberg table beneath can stand in for it.
+            LayerWalk::Read | LayerWalk::Index | LayerWalk::Passthrough => Some(below),
             // Serialising a scan for a remote node is all this layer does; a
             // source, CDC, write or retention walk has no meaning through it.
             LayerWalk::CdcDetection

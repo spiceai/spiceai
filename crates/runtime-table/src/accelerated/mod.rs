@@ -2033,6 +2033,9 @@ impl TableLayer for AcceleratedTable {
             LayerWalk::Write | LayerWalk::RetentionDelete | LayerWalk::Index => {
                 Some(&self.accelerator)
             }
+            // Queries are answered from the acceleration, which can lag or
+            // differ from the source, so neither side stands in for this table.
+            LayerWalk::Passthrough => None,
         }
     }
 
@@ -2056,7 +2059,8 @@ impl TableLayer for AcceleratedTable {
             | LayerWalk::Source
             | LayerWalk::CdcDetection
             | LayerWalk::Write
-            | LayerWalk::RetentionDelete => None,
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Passthrough => None,
         }
     }
 
