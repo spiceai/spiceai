@@ -28,9 +28,8 @@ limitations under the License.
 //! 2. **Multi-dataset clobbering**: `cayenne.db` contains rows for *every*
 //!    dataset sharing the metadata directory. Two datasets snapshotting the
 //!    same `cayenne.db` and extracting on a fresh reader would each clobber
-//!    the other's metastore rows, which is why
-//!    `validate_cayenne_snapshot_consistency` currently rejects multi-dataset
-//!    metastore directories.
+//!    the other's metastore rows — including those of a dataset that never
+//!    snapshots at all.
 //!
 //! 3. **Init race / sidecars** (#10649): the reader's eager metastore
 //!    initialization opens `cayenne.db`, creating `cayenne.db-wal` /
@@ -42,7 +41,10 @@ limitations under the License.
 //! metastore "slice" (versioned JSON, see
 //! [`cayenne::metastore::snapshot::DatasetMetastoreSlice`]) and inserts it
 //! into the tar at a well-known archive path. On the extract side it reads
-//! the slice back and atomically imports it into the local metastore.
+//! the slice back and atomically imports it into the local metastore,
+//! replacing only that dataset's rows. Datasets sharing a metadata directory
+//! therefore snapshot independently: each may enable, disable, only create or
+//! only bootstrap without constraining the others.
 //!
 //! Path columns in the slice are rewritten relative to the writer's data
 //! directory at export time and re-anchored at the reader's data directory
