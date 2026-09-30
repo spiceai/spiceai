@@ -8,6 +8,7 @@ mod write_observer;
 pub use cache::synthetic_object_meta;
 mod deferred_projection;
 mod format;
+mod key_blocks;
 pub mod metrics;
 mod opener;
 mod reader;
