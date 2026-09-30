@@ -1,6 +1,6 @@
 [package]
 name = "key-index"
-description = "Primary-key and secondary indexes over compound Arrow keys: a ROWEX adaptive radix tree, frozen and tiered runs"
+description = "Secondary indexes over compound Arrow keys: immutable sorted runs, one per write"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
