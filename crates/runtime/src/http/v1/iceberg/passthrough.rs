@@ -181,6 +181,8 @@ mod tests {
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use spice_table::{IndexLayer, TableLayer};
 
+    use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
+
     /// An in-memory catalog holding one table with three rows, so the table has
     /// a current snapshot and a metadata file.
     async fn catalog_with_rows() -> (Arc<dyn Catalog>, TableIdent) {
@@ -291,6 +293,25 @@ mod tests {
             passthrough_source(&transformed).err(),
             Some(NotServedAsIceberg::Transformed)
         );
+    }
+
+    /// The cluster layer scans the table it wraps, so passthrough serves that
+    /// table even when a rebuild has put a different base beneath the layer.
+    #[tokio::test]
+    async fn the_cluster_layer_serves_the_table_it_scans() {
+        let (catalog, ident) = catalog_with_rows().await;
+        let scanned: Arc<dyn TableProvider> = Arc::new(provider_for(&catalog, &ident).await);
+        let cluster = Arc::new(IcebergClusterTableProvider::new(
+            TableReference::bare("orders"),
+            Arc::clone(&scanned),
+        ));
+        let rebuilt: Arc<dyn TableProvider> = SpiceTable::over(cluster, mem_table());
+
+        let source = passthrough_source(&rebuilt).expect("the scanned Iceberg table is reached");
+        let expected = scanned
+            .downcast_ref::<IcebergTableProvider>()
+            .expect("the scanned table is an Iceberg table");
+        assert!(std::ptr::eq(source, expected));
     }
 
     #[tokio::test]
