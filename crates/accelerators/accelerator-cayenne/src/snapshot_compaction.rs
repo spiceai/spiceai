@@ -917,6 +917,147 @@ mod tests {
         assert_eq!(plan.extra_entries.len(), 1);
     }
 
+    /// The rewrite runs after the write lock is released, so the snapshot it
+    /// captured can be retired meanwhile. The captured plan's `SnapshotScanRef`
+    /// keeps the retired directory from being swept until the rewrite has read
+    /// it: overwrite the live table after the capture, wait past the sweep's
+    /// grace with sweeps being scheduled, and the compacted copy still holds
+    /// the captured rows; once the plan is consumed the directory is reaped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn captured_plan_pins_retired_snapshot_until_rewrite_completes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = Node::new(&tmp.path().join("writer")).await;
+        let live = create_live_table(&writer).await;
+        let base: Vec<(i64, i64)> = (1..=1000).map(|id| (id, id * 10)).collect();
+        insert(&live, &base).await;
+        insert(&live, &[(1, 100), (2, 200)]).await;
+        let expected = rows(&live).await;
+        let meta = writer.catalog.get_table(DATASET).await.expect("live meta");
+        let captured_dir = writer
+            .data_dir
+            .join(&meta.table_id)
+            .join(&meta.current_snapshot_id);
+        assert!(captured_dir.is_dir());
+
+        let engine = CayenneSnapshotEngine::new(
+            Arc::clone(&writer.catalog),
+            DATASET,
+            writer.data_dir.clone(),
+        )
+        .with_compaction(true);
+        let live_dyn: Arc<dyn TableProvider> = Arc::clone(&live) as Arc<dyn TableProvider>;
+        let plan = engine
+            .prepare_directory_snapshot(&writer.dirs(), DATASET, Some(&live_dyn))
+            .await
+            .expect("prepare");
+        let deferred = plan.deferred.expect("compaction defers the build");
+
+        // Retire the captured snapshot with a whole-table overwrite.
+        {
+            let ctx = SessionContext::new();
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![batch(&[(7, 7), (8, 8)])]], schema(), None)
+                    .expect("memory exec");
+            let overwrite = live
+                .insert_into(&ctx.state(), input, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(overwrite, ctx.task_ctx()).await.expect("overwrite");
+        }
+        let after = writer.catalog.get_table(DATASET).await.expect("live meta");
+        assert_ne!(after.current_snapshot_id, meta.current_snapshot_id);
+
+        // The sweep keeps a retired directory for a 5 s grace regardless of
+        // pins, so the wait is what puts the pin under test; each commit
+        // schedules a sweep.
+        for i in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            insert(&live, &[(100 + i, i)]).await;
+        }
+        live.drain_in_flight_maintenance().await.expect("drain");
+        assert!(
+            captured_dir.is_dir(),
+            "the captured snapshot directory must survive while the plan is alive"
+        );
+
+        let materialized = deferred.await.expect("materialize");
+        let reader = Node::new(&tmp.path().join("reader")).await;
+        let tar = tmp.path().join("snapshot.tar");
+        let skip: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = materialized
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        archive_directories_to_file_with_plan(&materialized.dirs, &tar, &skip, &extras)
+            .await
+            .expect("archive");
+        for dir in &materialized.cleanup_dirs {
+            tokio::fs::remove_dir_all(dir)
+                .await
+                .expect("cleanup scratch");
+        }
+        extract_archive_file_with_options(
+            &tar,
+            &tmp.path().join("reader"),
+            ExtractOptions {
+                prefix_mappings: Some(vec![
+                    ("metadata/".to_string(), reader.metadata_dir.clone()),
+                    ("data/".to_string(), reader.data_dir.clone()),
+                ]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .expect("extract");
+        CayenneSnapshotEngine::new(
+            Arc::clone(&reader.catalog),
+            DATASET,
+            reader.data_dir.clone(),
+        )
+        .finalize_directory_snapshot(&reader.dirs(), DATASET)
+        .await
+        .expect("import slice");
+        let ctx = SessionContext::new();
+        let restored = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&reader.catalog), ctx.runtime_env())
+                .open(DATASET)
+                .await
+                .expect("open reader table"),
+        );
+        assert_eq!(
+            rows(&restored).await,
+            expected,
+            "the compacted copy holds the rows captured before the overwrite"
+        );
+
+        // The plan was consumed by the rewrite, so nothing pins the directory.
+        // A sweep is scheduled by commits that advance the snapshot pointer, so
+        // drive it with overwrites (bounded poll).
+        let mut reaped = false;
+        for i in 0..15 {
+            let ctx = SessionContext::new();
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![batch(&[(200 + i, i)])]], schema(), None)
+                    .expect("memory exec");
+            let overwrite = live
+                .insert_into(&ctx.state(), input, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(overwrite, ctx.task_ctx()).await.expect("overwrite");
+            live.drain_in_flight_maintenance().await.expect("drain");
+            if !captured_dir.is_dir() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(
+            reaped,
+            "retired directory must be swept once no scan pins it"
+        );
+    }
+
     #[test]
     fn scratch_vortex_config_forces_files_and_disables_maintenance() {
         let live = VortexConfig {
