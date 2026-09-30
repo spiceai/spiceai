@@ -216,6 +216,16 @@ pub(crate) fn collect_all_indexes(
         .collect()
 }
 
+/// Whether a successful refresh changed the accelerator's contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The refresh may have written to or reloaded the accelerator.
+    Refreshed,
+    /// The accelerator already matched the source, so nothing was written:
+    /// the source reported unchanged data, or no newer snapshot was available.
+    UpToDate,
+}
+
 pub struct RefreshTaskBuilder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -602,11 +612,15 @@ impl RefreshTask {
 
     /// Runs one refresh to completion.
     ///
+    /// Reports whether the refresh changed the accelerator, so callers can skip
+    /// work (such as results-cache invalidation) after a refresh that found
+    /// nothing new.
+    ///
     /// # Errors
     ///
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
-    pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
+    pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
@@ -633,7 +647,7 @@ impl RefreshTask {
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
             match self.run_once(&refresh).await {
-                Ok(()) => Ok(()),
+                Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
                     if !self.runtime_status.is_shutdown()
                         && let Some(error) = attempt_refresh_error(&retry_err)
@@ -667,7 +681,10 @@ impl RefreshTask {
         result
     }
 
-    async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
+    async fn run_once(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         self.set_refresh_status(
             refresh.display_sql().as_deref(),
             status::ComponentStatus::Refreshing,
@@ -735,7 +752,7 @@ impl RefreshTask {
                             status::ComponentStatus::Ready,
                         )
                         .await;
-                        return Ok(());
+                        return Ok(RefreshOutcome::UpToDate);
                     }
                     Ok(_) => {
                         // Data may have changed or provider does not support skipping; continue with refresh.
@@ -780,7 +797,10 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
-                return self.refresh_stale_cached_rows(refresh).await;
+                return self
+                    .refresh_stale_cached_rows(refresh)
+                    .await
+                    .map(|()| RefreshOutcome::Refreshed);
             }
             RefreshMode::Snapshot => {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
@@ -795,8 +815,9 @@ impl RefreshTask {
             Err(e) => {
                 // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
                 // This is expected and should not be logged as an error.
+                // Report `Refreshed` so a canceled refresh never keeps cached results.
                 if self.runtime_status.is_shutdown() {
-                    return Ok(());
+                    return Ok(RefreshOutcome::Refreshed);
                 }
                 self.log_refresh_error(
                     inner_err_from_retry_ref(&e),
@@ -840,8 +861,9 @@ impl RefreshTask {
         {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
+            // Report `Refreshed` so a canceled refresh never keeps cached results.
             if self.runtime_status.is_shutdown() {
-                return Ok(());
+                return Ok(RefreshOutcome::Refreshed);
             }
             tracing::warn!(
                 "Failed to load data for {} {}: {}",
@@ -860,7 +882,7 @@ impl RefreshTask {
         )
         .await;
 
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 
     fn is_metric_enabled(&self, metric_name: &str) -> bool {
@@ -1263,7 +1285,7 @@ impl RefreshTask {
     async fn refresh_from_snapshot(
         &self,
         refresh: &Refresh,
-    ) -> Result<(), RetryError<super::Error>> {
+    ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
 
         let Some(state) = self.snapshot_refresh_state.clone() else {
@@ -1390,7 +1412,7 @@ impl RefreshTask {
                 }
                 self.set_refresh_status(None, status::ComponentStatus::Ready)
                     .await;
-                return Ok(());
+                return Ok(RefreshOutcome::UpToDate);
             }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
@@ -1587,7 +1609,7 @@ impl RefreshTask {
 
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 
     async fn trace_load_completed(
@@ -2806,7 +2828,7 @@ pub async fn probe_acceleration_contents(
     // the source-federation wiring a refresh needs applies. `accelerator_df`
     // still normalizes the provider chain, and a `FederatedTableProviderAdaptor`
     // left un-federated scans its inner provider directly.
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
     let batches = async {
         accelerator_df(accelerator, &ctx)
             .and_then(|df| df.limit(0, Some(1)))?
@@ -3090,7 +3112,7 @@ fn install_test_meter_provider() {
 /// Used for the user-facing error log. Metric increments use
 /// [`attempt_refresh_error`] and [`terminal_generation_change_refresh_error`].
 #[must_use]
-fn terminal_refresh_error(result: &super::Result<()>, shutdown: bool) -> Option<&super::Error> {
+fn terminal_refresh_error<T>(result: &super::Result<T>, shutdown: bool) -> Option<&super::Error> {
     if shutdown {
         return None;
     }
@@ -3112,8 +3134,8 @@ fn attempt_refresh_error(error: &RetryError<super::Error>) -> Option<&super::Err
 /// An exhausted generation-change after the retry loop. A recovered 412 is
 /// `Ok` and is not counted; a non-generation terminal was already counted
 /// per attempt.
-fn terminal_generation_change_refresh_error(
-    result: &super::Result<()>,
+fn terminal_generation_change_refresh_error<T>(
+    result: &super::Result<T>,
     shutdown: bool,
 ) -> Option<&super::Error> {
     let error = terminal_refresh_error(result, shutdown)?;
@@ -3940,6 +3962,35 @@ mod tests {
             ),
             "RefreshTaskBuilder::build must hand out the shared state, not build its own"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_uses_cpu_budget_partitions() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "accelerated::refresh_task::tests::refresh_session_uses_cpu_budget_partitions",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("cpu_budget_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert_eq!(refresh.state().config().target_partitions(), cores);
     }
 
     #[derive(Debug)]
