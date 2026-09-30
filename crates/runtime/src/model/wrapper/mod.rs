@@ -628,7 +628,7 @@ mod tool_only_defaults {
         )
     }
 
-    fn request(tools: serde_json::Value) -> CreateChatCompletionRequest {
+    fn request(tools: &serde_json::Value) -> CreateChatCompletionRequest {
         serde_json::from_value(json!({"model": "judge", "messages": [], "tools": tools}))
             .expect("chat request")
     }
@@ -638,7 +638,7 @@ mod tool_only_defaults {
     /// cannot be made.
     #[test]
     fn a_request_without_tools_gets_no_tool_defaults() {
-        let prepared = wrapper().with_model_defaults(request(serde_json::Value::Null));
+        let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
 
         assert_eq!(prepared.tool_choice, None);
         assert_eq!(prepared.parallel_tool_calls, None);
@@ -651,7 +651,7 @@ mod tool_only_defaults {
 
     #[test]
     fn a_request_with_tools_gets_the_tool_defaults() {
-        let prepared = wrapper().with_model_defaults(request(json!([{
+        let prepared = wrapper().with_model_defaults(request(&json!([{
             "type": "function",
             "function": {"name": "sql", "parameters": {"type": "object"}}
         }])));
