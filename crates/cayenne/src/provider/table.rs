@@ -12058,25 +12058,6 @@ impl CayenneTableProvider {
         self.pk_warm_probe_done.store(false, Ordering::Release);
     }
 
-    /// Drop the table-wide PK index and leave the per-shard index in place, for a
-    /// writer that commits keys only the per-shard index records: a cached
-    /// table-wide copy would then be missing them, so the next validation that uses
-    /// it must rebuild it from the table.
-    fn drop_table_wide_pk_index(&self) {
-        let dropped = {
-            let mut guard = self.pk_keyset_cache.lock();
-            // A checked-out copy is not in the cell; have its restore drop it too.
-            self.pk_keyset_pending.lock().invalidate();
-            guard.take()
-        };
-        if dropped.is_some() {
-            // The next rebuild floor-stamps every key or returns a Bloom, so no stale
-            // stamp behind a degraded per-key OCC flag survives it.
-            self.pk_keyset_occ_degraded.store(false, Ordering::Release);
-            self.publish_single_keyset_bytes(0);
-        }
-    }
-
     /// Single funnel for (re)setting `cold_pk_existence`: keeps the view's
     /// resident bytes registered with the memory pool alongside the keyset.
     fn store_cold_pk_existence(&self, view: Option<Arc<ColdPkExistence>>) {
@@ -12279,6 +12260,22 @@ impl CayenneTableProvider {
             }
         }
 
+        self.record_table_wide_pk_keys(keys, location, sequence);
+    }
+
+    /// The table-wide half of [`Self::record_pk_keys_with_location`], for a writer
+    /// whose keys are already in the per-shard index: the in-memory sharded apply
+    /// grows that index itself, and records here what the durable path and per-key
+    /// OCC read.
+    pub(crate) fn record_table_wide_pk_keys(
+        &self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
         let max_bytes = self.effective_single_keyset_budget();
         let mut guard = self.pk_keyset_cache.lock();
         // Take ownership so an over-budget Exact keyset can be replaced by a
@@ -15323,14 +15320,15 @@ impl CayenneTableProvider {
         //    account apply back-pressure is the lesser evil; bounding a
         //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
         if !validated_keys.is_empty() {
-            // These keys reach only the per-shard index: this path never passes the
-            // commit mirror in `record_pk_keys_with_location`. The table-wide index
-            // is what the durable path validates against, when a burst the in-memory
-            // tier cannot take (a truncate, an unabsorbable delete, a commit that
-            // cannot defer) or the overload fallback writes durably. A cached copy
-            // missing these keys would read an upsert of one as a new key and leave
-            // two live rows, so drop it and let that validation rebuild it.
-            self.drop_table_wide_pk_index();
+            // The appends above put these keys in the per-shard index. Record them in
+            // the table-wide index too, as the serial mem-tier apply records its keys:
+            // it is what the durable path validates against (a burst the in-memory tier
+            // cannot take, or the overload fallback) and what per-key OCC reads, and a
+            // copy missing a key this apply wrote reads a durable upsert of it as a new
+            // key and leaves two live rows. `MEM_TIER` is a key-based location, so it
+            // still hides the row after a checkpoint moves it into a file.
+            let record_seq = self.sequence_high_water().await;
+            self.record_table_wide_pk_keys(&validated_keys, &RowLocation::MEM_TIER, record_seq);
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             // Gate on the variant, not just the tally: only an `Exact` index grows
             // per recorded key and only it can be degraded, so this fires on the
@@ -69034,6 +69032,53 @@ mod tests {
                 "an earlier abandoned checkout must not force this index to be \
                  discarded (which rebuilds the whole keyset on every later write); \
                  present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// A sharded apply records its keys in the table-wide index as well as the
+    /// per-shard one, as the serial mem-tier apply does, so the durable path and
+    /// per-key OCC read a complete index without rebuilding it from the table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sharded_apply_records_its_keys_in_the_table_wide_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_records_table_wide",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (8, 1)])
+                .await
+                .is_some(),
+            "precondition: the burst takes the in-memory sharded path"
+        );
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => assert!(
+                keyset.location_by_digest(key_7).is_some(),
+                "the table-wide index must hold key 7, which a sharded apply wrote"
+            ),
+            other => panic!(
+                "the warm table-wide index must stay cached, present={}",
                 other.is_some()
             ),
         }
