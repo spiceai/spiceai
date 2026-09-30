@@ -131,11 +131,20 @@ def lint_recipe() -> str:
     """The recipe lines of the Makefile's `lint-rust` target (tab-indented)."""
     after_target = MAKEFILE.read_text(encoding="utf-8").split("\nlint-rust:", 1)[-1]
     # Drop the rest of the target line (its prerequisites) before reading the recipe.
+    # The recipe ends where make ends it, not at the first line without a tab: a
+    # line continuing a `\`-terminated one belongs to it however it is indented,
+    # and blank lines and column-0 comments may sit between recipe lines without
+    # ending the recipe. Stopping early would drop every guard after that point.
     lines = []
+    continued = False
     for line in after_target.split("\n", 1)[-1].splitlines():
-        if not line.startswith("\t"):
+        if continued or line.startswith("\t"):
+            lines.append(line)
+            continued = line.endswith("\\")
+        elif not line.strip() or line.startswith("#"):
+            continue
+        else:
             break
-        lines.append(line)
     return "\n".join(lines)
 
 
@@ -174,15 +183,18 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
         paths.add(f"{conf_dir.rstrip('/')}/clippy.toml")
     # The recipe invokes the guards through $(PYTHON) — the Makefile variable
     # that resolves a Python 3.11+ interpreter. Both make spellings and a literal
-    # `python3` are accepted, with any run of spaces between, so a recipe line
-    # written any of those ways still derives. The two directions are not
-    # symmetric: over-matching only adds a path to the "must be gated" set, which
-    # fails closed, while under-matching silently drops a guard from it and is the
-    # exact failure this script exists to catch. So the accepted spellings are
-    # deliberately broad, and only a spelling that would drop a guard — a
-    # different variable, or a bare `python` — is left unmatched.
+    # `python3` are accepted, and so is every separator make hands the shell as
+    # one: spaces, tabs, and a `\`-continuation onto the next line. The two
+    # directions are not symmetric: over-matching only adds a path to the "must be
+    # gated" set, which fails closed, while under-matching silently drops a guard
+    # from it and is the exact failure this script exists to catch. So the
+    # accepted spellings are deliberately broad, and only a spelling that would
+    # drop a guard — a different variable, or a bare `python` — is left unmatched.
     paths.update(
-        re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
+        re.findall(
+            r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3)(?:\\\n|[ \t])+(scripts/[\w./-]+\.py)",
+            recipe,
+        )
     )
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
