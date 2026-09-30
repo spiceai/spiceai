@@ -85,7 +85,6 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    #[expect(clippy::result_large_err)]
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;

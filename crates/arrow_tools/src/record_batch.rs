@@ -3139,3 +3139,94 @@ pub fn buffers_in_batch(batch: &RecordBatch) -> usize {
 
     batch.columns().iter().map(|c| walk(&c.to_data())).sum()
 }
+
+/// Measure the bytes that a [`RecordBatch`]'s own rows occupy.
+///
+/// [`RecordBatch::get_array_memory_size`] counts whole backing buffers, so a
+/// sliced column — one that shares its buffers with a larger parent batch —
+/// reports the full parent buffer regardless of how many rows the slice covers.
+/// Read paths that hand out zero-copy slices of a large decoded chunk therefore
+/// inflate any byte total that sums `get_array_memory_size` across batches, by
+/// roughly (parent rows / slice rows).
+///
+/// [`ArrayData::get_slice_memory_size`] counts only the part of each buffer that
+/// the slice references, so the total scales with the rows actually present.
+///
+/// The result is an accounting estimate: it saturates instead of overflowing,
+/// and a column whose size cannot be measured falls back to
+/// [`Array::get_array_memory_size`].
+#[must_use]
+pub fn slice_memory_size(batch: &RecordBatch) -> usize {
+    batch.columns().iter().fold(0usize, |total, column| {
+        let data = column.to_data();
+        let bytes = data
+            .get_slice_memory_size()
+            .unwrap_or_else(|_| column.get_array_memory_size());
+        total.saturating_add(bytes)
+    })
+}
+
+#[cfg(test)]
+mod slice_memory_size_tests {
+    use super::slice_memory_size;
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn parent_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids = Int64Array::from(
+            (0..rows)
+                .map(|i| i64::try_from(i).unwrap_or(i64::MAX))
+                .collect::<Vec<_>>(),
+        );
+        let names = StringArray::from((0..rows).map(|i| format!("row-{i:06}")).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names)])
+            .expect("failed to build test batch")
+    }
+
+    /// Slices of one parent batch must sum to about the parent's own size.
+    ///
+    /// `get_array_memory_size` counts the whole shared buffer per slice, so the
+    /// same sum with it is about `slice_count` times too large.
+    #[test]
+    fn slices_sum_to_the_rows_they_cover() {
+        let rows = 4096;
+        let slice_rows = 32;
+        let batch = parent_batch(rows);
+        let parent_size = slice_memory_size(&batch);
+
+        let slices: Vec<RecordBatch> = (0..rows / slice_rows)
+            .map(|i| batch.slice(i * slice_rows, slice_rows))
+            .collect();
+        assert_eq!(slices.len(), rows / slice_rows);
+
+        let sliced_total: usize = slices.iter().map(slice_memory_size).sum();
+        let whole_buffer_total: usize = slices.iter().map(RecordBatch::get_array_memory_size).sum();
+
+        // Allow for per-slice fixed overhead, but no buffer double counting.
+        assert!(
+            sliced_total <= parent_size * 2,
+            "sliced total {sliced_total} must stay near the parent size {parent_size}"
+        );
+
+        // Show the bug that this helper avoids.
+        assert!(
+            whole_buffer_total > parent_size * 10,
+            "get_array_memory_size total {whole_buffer_total} was expected to \
+             inflate far past the parent size {parent_size}"
+        );
+    }
+
+    /// An unsliced batch must keep a sane, non-zero size.
+    #[test]
+    fn unsliced_batch_is_measured() {
+        let batch = parent_batch(1024);
+        let measured = slice_memory_size(&batch);
+        assert!(measured > 0);
+        assert!(measured <= batch.get_array_memory_size());
+    }
+}

@@ -15,14 +15,16 @@ name: 'CodeQL'
 # branch, so a queued PR cannot substitute a clean producer. Do not add
 # `allow-unsafe-pr-checkout`: fork heads stay fail-closed.
 #
-# This workflow is read-only. The Analyze job never writes SARIF: a Cargo
-# build script shares that VM and can replace files under `runner.temp`
-# before `upload-artifact`. It uploads the finalized CodeQL database.
-# `Produce SARIF` runs on a fresh VM, analyzes that database, and publishes
-# the SARIF artifact. It runs the code-scanning suite shipped with its own
-# CLI. The suite stored in the database is written on the Analyze VM, so it
-# is not used. `codeql-upload.yml` (`workflow_run`, default branch) is what
-# calls `upload-sarif`.
+# This workflow is read-only. It publishes the SARIF as an artifact, and
+# `codeql-upload.yml` (`workflow_run`, default branch) is what calls
+# `upload-sarif`.
+#
+# Extraction and query evaluation run in one job. The spiceai-macos runners
+# are persistent (each reuses the CodeQL CLI from its tool cache across
+# jobs), and every one of them runs merge-queue extractions, so no runner in
+# the pool is out of reach of code an earlier queued commit ran. A separate
+# SARIF job there would add a 1 GB database upload and a second wait for a
+# runner without adding isolation.
 on:
   merge_group:
     branches:
@@ -46,16 +48,20 @@ permissions:
 jobs:
   analyze:
     name: Analyze
-    # Rust autobuild runs on the EPYC pool. merge_group checks out the queue
-    # merge commit, which contains the queued pull request, so that event does
-    # not receive MinIO credentials. Produce SARIF stays on a fresh hosted VM
-    # and does not check out that tree.
-    runs-on: spiceai-dev-runners
+    # Rust extraction and the query suite run on the spiceai-macos pool. The
+    # compiler cache is spiceio, as on the other macOS jobs. MinIO credentials
+    # stay on push: merge_group checks out the queue merge commit, which
+    # contains the queued pull request, and a spiceio miss must not fall
+    # through to those credentials.
+    runs-on: spiceai-macos
     env:
       HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
-    # An unbounded autobuild waits out GitHub's six-hour default (#12717).
-    # 150 minutes sits above a cold uncached rust analysis.
-    timeout-minutes: 150
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+    # Extraction takes 10-18 minutes on most runs and up to 75 on a loaded
+    # host. The query suite took 8 minutes with the same 10 threads and
+    # 30 GB outside CI, and runs slower on a loaded host. An unbounded job
+    # waits out GitHub's six-hour default (#12717).
+    timeout-minutes: 180
     permissions:
       actions: read
       contents: read
@@ -77,13 +83,32 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up sccache with local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
+
+      # spiceio is the macOS cache. MinIO is only passed on push, so a missed
+      # spiceio endpoint on merge_group cannot export those credentials.
+      - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ENDPOINT || '' }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          minio_secret_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_SECRET_KEY || '' }}
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
@@ -121,7 +146,7 @@ jobs:
       #   make release
 
       - name: Show sccache stats
-        if: always() && (env.HAS_TEST_MINIO_SECRET == 'true')
+        if: always() && env.SCCACHE_SETUP == 'true'
         # `always()`: this is the one step that reports cache health, and without it
         # it is skipped on exactly the failures it would explain (#12420). The `||`
         # keeps a diagnostic from ever deciding a verdict — when the cache backend is
@@ -129,102 +154,36 @@ jobs:
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
-      # Finalize the database on this VM but do not run queries. Query output
-      # would land under runner.temp on the same user as the Cargo build.
-      - name: Finalize CodeQL database
+      # Extracts the database and runs the code-scanning suite. The action
+      # passes `--threads` and `--ram` from init's CODEQL_THREADS and
+      # CODEQL_RAM, sized to the host. A bare `codeql database analyze`
+      # defaults to one thread and a heap this database runs out of.
+      - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
-          skip-queries: true
           upload: never
           upload-database: false
-          output: ${{ runner.temp }}/codeql-sarif-unused
+          output: ${{ runner.temp }}/codeql-sarif
 
-      - name: Upload CodeQL database
+      - name: Upload SARIF artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: codeql-database-${{ matrix.language }}
-          path: ${{ runner.temp }}/codeql_databases
+          name: codeql-sarif-${{ matrix.language }}
+          path: ${{ runner.temp }}/codeql-sarif
           if-no-files-found: error
-          # Databases are large; only the follow-up SARIF job needs them.
-          retention-days: 1
           # A full-job rerun reaches this step again in the same workflow run.
           # Artifact names are immutable unless overwrite is set, and the
           # default (`false`) fails that retry with HTTP 409.
           overwrite: true
 
-  sarif:
-    name: Produce SARIF
-    needs: analyze
-    runs-on: ubuntu-24.04
-    # Query evaluation against an already-built Rust database, not an
-    # autobuild. Anything past this is wedged, not a cold cache.
-    timeout-minutes: 60
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Download CodeQL database
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: codeql-database-*
-          path: ${{ runner.temp }}/codeql-imported
-          merge-multiple: true
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
-      # Installs the CLI only. This job never checks out the scanned tree
-      # and never runs a Cargo build, so a process left by Analyze cannot
-      # reach the SARIF it produces.
-      - name: Setup CodeQL CLI
-        id: setup-codeql
-        uses: github/codeql-action/setup-codeql@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
-        with:
-          languages: rust
-
-      - name: Analyze imported database
-        env:
-          CODEQL_PATH: ${{ steps.setup-codeql.outputs.codeql-path }}
-          IMPORTED_ROOT: ${{ runner.temp }}/codeql-imported
-          SARIF_DIR: ${{ runner.temp }}/codeql-sarif
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${CODEQL_PATH}" || ! -x "${CODEQL_PATH}" ]]; then
-            echo "::error::CodeQL CLI was not installed, so SARIF was not produced."
-            exit 1
-          fi
-          mkdir -p "${SARIF_DIR}"
-          found=0
-          shopt -s nullglob
-          for db in "${IMPORTED_ROOT}"/*/; do
-            if [[ ! -f "${db}codeql-database.yml" ]]; then
-              continue
-            fi
-            lang="$(basename "${db}")"
-            # The suite inside the database is written on the Analyze VM, after
-            # the merge commit's build. That build can replace the default suite
-            # with one query from the standard pack, and path checks still pass.
-            # This job runs the code-scanning suite shipped with its CLI. Both
-            # jobs pin the same CodeQL action, so the pack matches the database.
-            # Do not pass the suite file stored in the database.
-            suite="codeql/${lang}-queries:codeql-suites/${lang}-code-scanning.qls"
-            found=1
-            echo "Analyzing ${lang} with ${suite}"
-            "${CODEQL_PATH}" database analyze \
-              --format=sarifv2.1.0 \
-              --output="${SARIF_DIR}/${lang}.sarif" \
-              -- \
-              "${db}" \
-              "${suite}"
-          done
-          if [[ "${found}" -eq 0 ]]; then
-            echo "::error::No CodeQL database was found in the imported artifact, so SARIF was not produced."
-            exit 1
-          fi
-
-      - name: Upload SARIF artifact
+      - name: Upload spiceio logs
+        if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: codeql-sarif-rust
-          path: ${{ runner.temp }}/codeql-sarif
-          if-no-files-found: error
-          # A full-job rerun reaches this step again in the same workflow run.
-          overwrite: true
+          name: spiceio-codeql-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore

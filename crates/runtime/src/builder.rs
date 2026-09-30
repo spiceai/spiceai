@@ -851,6 +851,7 @@ impl RuntimeBuilder {
             dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
+            dataset_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
         };
 
@@ -917,6 +918,7 @@ impl Default for RuntimeBuilder {
 // compiled out and the real variant awaits.
 #[expect(
     clippy::unused_async,
+    clippy::unused_async_trait_impl,
     reason = "signature parity with the rate-control variant; caller awaits unconditionally"
 )]
 async fn build_http_rate_control_registry(

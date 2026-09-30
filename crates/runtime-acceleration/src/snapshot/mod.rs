@@ -617,7 +617,10 @@ pub enum SnapshotUploadError {
         source: std::io::Error,
     },
     #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
-    PrepareUpload { source: engine::SnapshotEngineError },
+    PrepareUpload {
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display(
         "Refusing to publish the snapshot of '{dataset}': the archive does not match the \
          metadata captured for it, so restoring it would not reproduce the acceleration. \
@@ -625,7 +628,8 @@ pub enum SnapshotUploadError {
     ))]
     VerifyArchive {
         dataset: String,
-        source: engine::SnapshotEngineError,
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
     },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     AdapterDisabled { dataset: String },
@@ -1798,7 +1802,9 @@ impl SnapshotManager {
             .snapshot_engine
             .prepare_directory_snapshot(dirs, &self.dataset_name)
             .await
-            .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            .map_err(|source| SnapshotUploadError::PrepareUpload {
+                source: Box::new(source),
+            })?;
         let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
         let extras: Vec<(String, Vec<u8>)> = plan
             .extra_entries
@@ -1843,7 +1849,7 @@ impl SnapshotManager {
             let _ = fs::remove_file(&temp_archive_path).await;
             return Err(SnapshotUploadError::VerifyArchive {
                 dataset: self.dataset_name.clone(),
-                source,
+                source: Box::new(source),
             });
         }
 

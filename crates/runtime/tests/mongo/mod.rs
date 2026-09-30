@@ -270,7 +270,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("MongoDB Integration Test Results"),
+                        description => "MongoDB Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {

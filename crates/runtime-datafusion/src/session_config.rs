@@ -52,7 +52,14 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
     RwLock::new(df_config)
 });
 
-/// A clone of the process-wide default [`SessionConfig`].
+/// A clone of the process-wide default [`SessionConfig`] with the CPU budget's
+/// target partition count, which overrides any `target_partitions` written into
+/// [`DEFAULT_DATAFUSION_CONFIG`]. Read per call rather than baked into the
+/// `LazyLock`, so forcing the lock before the budget is installed cannot pin the
+/// host-detected value.
+///
+/// For internal sessions that should keep `DataFusion`'s SQL semantics, use
+/// `util::session_state::session_config()`.
 ///
 /// # Panics
 ///
@@ -61,7 +68,9 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
 #[must_use]
 pub fn get_df_default_config() -> SessionConfig {
     match DEFAULT_DATAFUSION_CONFIG.read() {
-        Ok(config) => config.clone(),
+        Ok(config) => config
+            .clone()
+            .with_target_partitions(cpu_budget::cpu_budget().target_partitions()),
         _ => panic!("Failed to read default DataFusion config. This is a bug."),
     }
 }
