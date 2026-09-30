@@ -35974,8 +35974,9 @@ fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
 ///
 /// A non-negated `BETWEEN` of integer bounds pins an integer column
 /// (`column_type`) to every value in the range, up to the lookup bound: the
-/// planner rewrites an `IN` list of consecutive integers into one. On any other
-/// column type a range holds values no enumeration lists, so it pins nothing.
+/// planner rewrites an `IN` list of consecutive integers into one, which would
+/// otherwise pin nothing. On any other column type a range holds values no
+/// enumeration lists, so it pins nothing.
 fn bare_column_values_for(
     expr: &Expr,
     name: &str,
