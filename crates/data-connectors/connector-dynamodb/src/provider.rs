@@ -52,7 +52,6 @@ use datafusion::datasource::sink::DataSinkExec;
 use datafusion::logical_expr::{
     LogicalPlanBuilder, TableProviderFilterPushDown, dml::InsertOp, ident,
 };
-use datafusion::prelude::SessionContext;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -564,7 +563,7 @@ impl DynamoDBTableProvider {
             .and_then(datafusion::logical_expr::LogicalPlanBuilder::build)
             .context(FailedToBootstrapTableSnafu)?;
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let df = DataFrame::new(ctx.state(), logical_plan);
 
         let record_batch_stream = df

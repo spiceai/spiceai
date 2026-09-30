@@ -306,7 +306,7 @@ fn parse_maintained_aggregate_filter(
                 "Cayenne maintained_aggregates filter '{sql}' could not bind to the table schema: {source}"
             )),
         })?;
-    let context = datafusion::prelude::SessionContext::new();
+    let context = util::session_state::session_context();
     let logical = context
         .parse_sql_expr(sql, &df_schema)
         .map_err(|source| Error::InvalidConfiguration {
