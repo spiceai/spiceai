@@ -386,13 +386,12 @@ pub(crate) fn bigquery_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>)
     }
 }
 
-/// Whether values of `data_type` are text, looking through a dictionary
-/// encoding of them.
+/// Whether values of `data_type` are text — Arrow's own classification,
+/// looking through a dictionary encoding of them.
 fn is_string_type(data_type: &DataType) -> bool {
     match data_type {
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
         DataType::Dictionary(_, value) => is_string_type(value),
-        _ => false,
+        other => other.is_string(),
     }
 }
 
