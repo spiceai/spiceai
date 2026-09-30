@@ -274,11 +274,7 @@ pub(crate) const DEFAULT_GOAL_CONVERGENCE_WINDOW: Duration = Duration::from_mins
 /// How long a per-batch write / publish latency sample stays a live controller
 /// signal: one goal-convergence window (see
 /// [`IngestStats::expire_stale_latencies`]).
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "a minutes-scale convergence window's millis fit i64 with vast headroom"
-)]
-const LATENCY_SIGNAL_TTL_MS: i64 = DEFAULT_GOAL_CONVERGENCE_WINDOW.as_millis() as i64;
+const LATENCY_SIGNAL_TTL_MS: i64 = WindowMax::WINDOW_MS;
 
 /// Number of correction steps the goal controller plans across the convergence
 /// window. Sets BOTH the per-tick step cap (`range / N` — "no big jumps") AND the
@@ -1021,6 +1017,18 @@ struct EwmaInner {
     /// that carried a source-commit ts, so a post-idle batch reports its own small
     /// lag, never the idle duration), unlike the unbounded instantaneous gauges.
     row_freshness_peak: WindowMax,
+    /// Wall-clock times (ms since the Unix epoch) of the newest write / publish
+    /// latency samples, or `None` before the first. See
+    /// [`IngestStats::expire_stale_latencies`].
+    io_latency_at_ms: Option<i64>,
+    publish_latency_at_ms: Option<i64>,
+    /// Live deletion-index size (tombstone count) the most recent committed
+    /// seq-prefix bake left behind, or `None` before the first bake.
+    bake_residual: Option<usize>,
+    /// When the most recent committed bake landed (ms since the Unix epoch), and
+    /// how long after the bake before it; `None` until those bakes happen.
+    last_bake_at_ms: Option<i64>,
+    bake_gap_ms: Option<i64>,
 }
 
 impl Default for EwmaInner {
@@ -1038,6 +1046,11 @@ impl Default for EwmaInner {
             publish_latency_ms: Ewma::new(),
             publish_latency_fast_ms: Ewma::with_alpha(EWMA_ALPHA_FAST),
             row_freshness_peak: WindowMax::new(),
+            io_latency_at_ms: None,
+            publish_latency_at_ms: None,
+            bake_residual: None,
+            last_bake_at_ms: None,
+            bake_gap_ms: None,
         }
     }
 }
@@ -1055,18 +1068,6 @@ pub(crate) struct IngestStats {
     /// Current small-file count in the snapshot (read amplification), set by the
     /// compaction/scan path. Defaults to 0 (healthy) until first observed.
     read_amp: AtomicUsize,
-    /// Live deletion-index size (tombstone count) the most recent committed
-    /// seq-prefix bake left behind; `usize::MAX` until the first bake.
-    bake_residual: AtomicUsize,
-    /// Wall-clock times (ms since the Unix epoch) of the two most recent committed
-    /// bakes; `i64::MIN` until they happen.
-    bake_at_ms: AtomicI64,
-    prev_bake_at_ms: AtomicI64,
-    /// Wall-clock time (ms since the Unix epoch) of the newest per-batch write /
-    /// publish latency sample; `i64::MIN` until the first. See
-    /// [`IngestStats::expire_stale_latencies`].
-    io_latency_at_ms: AtomicI64,
-    publish_latency_at_ms: AtomicI64,
     /// Memory usage as a fraction of the cgroup-aware budget, stored ×1000.
     /// `u64::MAX` is the sentinel for "unknown" (no budget/sample yet).
     mem_pressure_milli: AtomicU64,
@@ -1096,11 +1097,6 @@ impl IngestStats {
             total_bytes: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             read_amp: AtomicUsize::new(0),
-            bake_residual: AtomicUsize::new(usize::MAX),
-            bake_at_ms: AtomicI64::new(i64::MIN),
-            prev_bake_at_ms: AtomicI64::new(i64::MIN),
-            io_latency_at_ms: AtomicI64::new(i64::MIN),
-            publish_latency_at_ms: AtomicI64::new(i64::MIN),
             mem_pressure_milli: AtomicU64::new(u64::MAX),
             newest_source_commit_ts_ms: AtomicI64::new(i64::MIN),
             last_visible_ts_ms: AtomicI64::new(i64::MIN),
@@ -1156,10 +1152,12 @@ impl IngestStats {
     /// this residual is the part of the index it could not remove) and when it
     /// committed.
     pub fn record_bake(&self, deletion_index_len: usize, now_ms: i64) {
-        self.bake_residual
-            .store(deletion_index_len.min(usize::MAX - 1), Ordering::Relaxed);
-        let previous = self.bake_at_ms.swap(now_ms, Ordering::Relaxed);
-        self.prev_bake_at_ms.store(previous, Ordering::Relaxed);
+        let mut inner = self.inner.lock();
+        inner.bake_residual = Some(deletion_index_len);
+        inner.bake_gap_ms = inner
+            .last_bake_at_ms
+            .map(|previous| now_ms.saturating_sub(previous));
+        inner.last_bake_at_ms = Some(now_ms);
     }
 
     /// Update the current memory usage as a fraction of the cgroup-aware budget
@@ -1196,35 +1194,29 @@ impl IngestStats {
     }
 
     /// Fold one CDC batch's object-store/disk write latency (the `vortex_write`
-    /// phase) into the rolling EWMA. Recorded only on batches that spill to Vortex,
-    /// so a pure-inline table leaves `io_latency_ms` unavailable.
-    pub fn record_io_latency(&self, d: Duration) {
+    /// phase), sampled at wall-clock `now_ms`, into the rolling EWMA. Recorded only
+    /// on batches that spill to Vortex, so a pure-inline table leaves
+    /// `io_latency_ms` unavailable.
+    pub fn record_io_latency(&self, d: Duration, now_ms: i64) {
         let mut inner = self.inner.lock();
         let ms = duration_ms(d);
         inner.io_latency_ms.update(ms);
         inner.io_latency_fast_ms.update(ms);
+        inner.io_latency_at_ms = Some(inner.io_latency_at_ms.map_or(now_ms, |at| at.max(now_ms)));
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
-    /// single-writer commit) into the rolling EWMA.
-    pub fn record_publish_latency(&self, d: Duration) {
+    /// single-writer commit), sampled at wall-clock `now_ms`, into the rolling EWMA.
+    pub fn record_publish_latency(&self, d: Duration, now_ms: i64) {
         let mut inner = self.inner.lock();
         let ms = duration_ms(d);
         inner.publish_latency_ms.update(ms);
         inner.publish_latency_fast_ms.update(ms);
-    }
-
-    /// [`Self::record_io_latency`], stamped with the sample's wall-clock time.
-    pub fn record_io_latency_at(&self, d: Duration, now_ms: i64) {
-        self.record_io_latency(d);
-        self.io_latency_at_ms.fetch_max(now_ms, Ordering::Relaxed);
-    }
-
-    /// [`Self::record_publish_latency`], stamped with the sample's wall-clock time.
-    pub fn record_publish_latency_at(&self, d: Duration, now_ms: i64) {
-        self.record_publish_latency(d);
-        self.publish_latency_at_ms
-            .fetch_max(now_ms, Ordering::Relaxed);
+        inner.publish_latency_at_ms = Some(
+            inner
+                .publish_latency_at_ms
+                .map_or(now_ms, |at| at.max(now_ms)),
+        );
     }
 
     /// Drop the write and publish latencies from `snap` when no batch has
@@ -1240,15 +1232,17 @@ impl IngestStats {
     /// crawl step per tick. A latency nobody has refreshed says nothing about the
     /// write path, so the controller reads it as unavailable. Pure in `now_ms`.
     pub fn expire_stale_latencies(&self, snap: &mut IngestSnapshot, now_ms: i64) {
-        let stale = |at: &AtomicI64| {
-            let at = at.load(Ordering::Relaxed);
-            at == i64::MIN || now_ms.saturating_sub(at) > LATENCY_SIGNAL_TTL_MS
+        let (io_at, publish_at) = {
+            let inner = self.inner.lock();
+            (inner.io_latency_at_ms, inner.publish_latency_at_ms)
         };
-        if stale(&self.io_latency_at_ms) {
+        let stale =
+            |at: Option<i64>| at.is_none_or(|at| now_ms.saturating_sub(at) > LATENCY_SIGNAL_TTL_MS);
+        if stale(io_at) {
             snap.io_latency_ms = None;
             snap.io_latency_fast_ms = None;
         }
-        if stale(&self.publish_latency_at_ms) {
+        if stale(publish_at) {
             snap.publish_latency_ms = None;
             snap.publish_latency_fast_ms = None;
         }
@@ -1356,17 +1350,8 @@ impl IngestStats {
             arrival_gap_ms,
             apply_vs_arrival,
             read_amp: self.read_amp.load(Ordering::Relaxed),
-            bake_residual: match self.bake_residual.load(Ordering::Relaxed) {
-                usize::MAX => None,
-                residual => Some(residual),
-            },
-            bake_gap_ms: match (
-                self.bake_at_ms.load(Ordering::Relaxed),
-                self.prev_bake_at_ms.load(Ordering::Relaxed),
-            ) {
-                (i64::MIN, _) | (_, i64::MIN) => None,
-                (at, previous) => Some(at.saturating_sub(previous)),
-            },
+            bake_residual: inner.bake_residual,
+            bake_gap_ms: inner.bake_gap_ms,
             mem_pressure,
             delete_fraction,
             arrival_cv,
@@ -1412,10 +1397,10 @@ pub(crate) struct IngestSnapshot {
     /// high means ingest is producing files that slow scans.
     pub read_amp: usize,
     /// Live deletion-index size the most recent committed seq-prefix bake left
-    /// behind, or `None` before the first bake (see `bake_is_futile`).
+    /// behind, or `None` before the first bake (see `futile_bake_step`).
     pub bake_residual: Option<usize>,
     /// Milliseconds between the two most recent committed bakes, or `None`
-    /// before the second (see `bake_is_futile`).
+    /// before the second (see `futile_bake_step`).
     pub bake_gap_ms: Option<i64>,
     /// Memory usage as a fraction of the cgroup-aware budget (`used / budget`);
     /// `None` when no budget/sample is available. `> 1.0` means over budget.
@@ -2798,24 +2783,11 @@ pub(crate) fn decide_with_goals(
         });
     }
 
-    // (3c) Futile-bake backoff: the last bake could not bring the deletion index
-    // under the trigger, or bakes are running back-to-back (see `bake_is_futile`),
-    // so every tick re-bakes the whole protected prefix to retire only the
-    // tombstones that arrived since. Raise the trigger over the residual. Only
-    // reached with read-amp not high (the unhealthy block above returns first), so
-    // it never fights the read-amp arm that lowers the trigger for query health.
-    if bake_is_futile(s, cur)
-        && let Some(v) = clamp_move_usize(
-            cur.bake_deletion_index_trigger,
-            cur.bake_deletion_index_trigger.max(futile_bake_trigger(s)),
-            b.bake_deletion_index_trigger,
-        )
-    {
-        return Some(Adjustment {
-            actuator: Actuator::BakeDeletionIndexTrigger,
-            new_value: u64::try_from(v).unwrap_or(0),
-            reason: "futile bake: the last bake left the deletion index at or near the trigger → raise it over the residual → stop re-baking the prefix every tick",
-        });
+    // (3c) Futile-bake backoff (see `futile_bake_step`). Only reached with read-amp
+    // not high (the unhealthy block above returns first), so it never fights the
+    // read-amp arm that lowers the trigger for query health.
+    if let Some(adjustment) = futile_bake_step(s, cur, b) {
+        return Some(adjustment);
     }
 
     // (4) Healthy on every axis (ingest caught up, queries not read-amp-bound,
@@ -3297,25 +3269,11 @@ fn decide_goal(
         });
     }
 
-    // (3c) Futile-bake backoff: the last bake could not bring the deletion index
-    // under the trigger, or bakes are running back-to-back (see `bake_is_futile`),
-    // so every tick re-bakes the whole protected prefix to retire only the
-    // tombstones that arrived since. Raise the trigger over the residual. Withheld
-    // while a query goal is violated, so it never fights the query tier's LOWER
-    // move above (queries win).
-    if !query_violated
-        && bake_is_futile(s, cur)
-        && let Some(v) = clamp_move_usize(
-            cur.bake_deletion_index_trigger,
-            cur.bake_deletion_index_trigger.max(futile_bake_trigger(s)),
-            b.bake_deletion_index_trigger,
-        )
-    {
-        return Some(Adjustment {
-            actuator: Actuator::BakeDeletionIndexTrigger,
-            new_value: u64::try_from(v).unwrap_or(0),
-            reason: "futile bake: the last bake left the deletion index at or near the trigger → raise it over the residual → stop re-baking the prefix every tick",
-        });
+    // (3c) Futile-bake backoff (see `futile_bake_step`). Withheld while a query goal
+    // is violated, so it never fights the query tier's LOWER move above (queries
+    // win).
+    if !query_violated && let Some(adjustment) = futile_bake_step(s, cur, b) {
+        return Some(adjustment);
     }
 
     // (4) Healthy-relax: every active goal comfortably met, memory ok, AND the
@@ -3715,9 +3673,14 @@ fn clamp_move_usize(cur: usize, target: usize, (lo, hi): (usize, usize)) -> Opti
 /// far less than the bake's prefix rewrites cost the whole process.
 const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
 
-/// Whether the seq-prefix bake is futile at the current trigger: the most recent
-/// bake could not bring the live deletion index under the trigger, or the last two
-/// bakes ran back-to-back (at most two compaction intervals apart).
+/// The futile-bake backoff shared by both ladders: when the seq-prefix bake is
+/// futile at the current trigger, raise the trigger to
+/// `BAKE_TRIGGER_RESIDUAL_HEADROOM` × the residual the last bake left. The caller
+/// decides when it may run.
+///
+/// A bake is futile when the most recent one could not bring the live deletion
+/// index under the trigger, or the last two ran back-to-back (at most two
+/// compaction intervals apart).
 ///
 /// A bake prunes only tombstones at or below its prefix cutoff — the newest
 /// protected snapshots and the in-memory tier stay out of reach — and it rewrites
@@ -3729,24 +3692,34 @@ const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
 /// (`stock`: ~1.2 GB). A raise that lands just above the residual (`stock` at
 /// 360 K over a ~300 K residual) lets the index regrow past the trigger within a
 /// tick, so bakes running back-to-back count as futile too.
-fn bake_is_futile(s: &IngestSnapshot, cur: &ActuatorValues) -> bool {
-    let Some(residual) = s.bake_residual else {
-        return false;
-    };
+///
+/// Idempotent for one bake outcome: the signal stays set until the next bake, and
+/// a trigger already at the target is not moved again, so a raise spaces the bakes
+/// out and cannot ratchet toward the ceiling.
+fn futile_bake_step(
+    s: &IngestSnapshot,
+    cur: &ActuatorValues,
+    b: &TuningBounds,
+) -> Option<Adjustment> {
+    let residual = s.bake_residual?;
     let back_to_back_ms =
         i64::try_from(cur.compaction_background_interval_ms.saturating_mul(2)).unwrap_or(i64::MAX);
-    residual >= cur.bake_deletion_index_trigger
-        || s.bake_gap_ms.is_some_and(|gap| gap <= back_to_back_ms)
-}
-
-/// The trigger a futile bake moves to: `BAKE_TRIGGER_RESIDUAL_HEADROOM` × the
-/// residual it left. Idempotent for one bake outcome — the signal stays set until
-/// the next bake, and a trigger already there is not moved again — so a raise
-/// spaces the bakes out and cannot ratchet toward the ceiling.
-fn futile_bake_trigger(s: &IngestSnapshot) -> usize {
-    s.bake_residual
-        .unwrap_or(0)
-        .saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM)
+    let futile = residual >= cur.bake_deletion_index_trigger
+        || s.bake_gap_ms.is_some_and(|gap| gap <= back_to_back_ms);
+    if !futile {
+        return None;
+    }
+    let target = residual.saturating_mul(BAKE_TRIGGER_RESIDUAL_HEADROOM);
+    let v = clamp_move_usize(
+        cur.bake_deletion_index_trigger,
+        cur.bake_deletion_index_trigger.max(target),
+        b.bake_deletion_index_trigger,
+    )?;
+    Some(Adjustment {
+        actuator: Actuator::BakeDeletionIndexTrigger,
+        new_value: u64::try_from(v).unwrap_or(0),
+        reason: "futile bake: the last bake left the deletion index at or near the trigger → raise it over the residual → stop re-baking the prefix every tick",
+    })
 }
 
 fn clamp_move_i64(cur: i64, target: i64, (lo, hi): (i64, i64)) -> Option<i64> {
@@ -4933,10 +4906,6 @@ mod tests {
     /// the 50 K default trigger.
     const FUTILE_BAKE_RESIDUAL: usize = 430_000;
 
-    fn query_latency_goal_ms(target_ms: f64) -> Goals {
-        Goals::from_targets(None, None, Some(target_ms), None, Duration::from_mins(1))
-    }
-
     fn raised_bake_trigger(adj: Option<Adjustment>) -> Option<u64> {
         adj.filter(|a| a.actuator == Actuator::BakeDeletionIndexTrigger)
             .map(|a| a.new_value)
@@ -4982,7 +4951,7 @@ mod tests {
                 &met,
                 &actuators(),
                 &bounds(),
-                &query_latency_goal_ms(10_000.0)
+                &latency_goal_for_test(10_000.0)
             )),
             Some(expected),
             "goal mode must raise a futile trigger when no query goal is violated"
@@ -5055,7 +5024,7 @@ mod tests {
         let cur = actuators();
         if let Some(v) = raised_bake_trigger(decide_fresh(&s, &cur, &bounds())) {
             assert!(
-                v < u64::try_from(cur.bake_deletion_index_trigger).expect("fits in u64"),
+                v < current_value(&cur, Actuator::BakeDeletionIndexTrigger),
                 "with read-amp high the trigger may only be lowered, got {v}"
             );
         }
@@ -5073,10 +5042,10 @@ mod tests {
             &s,
             &cur,
             &bounds(),
-            &query_latency_goal_ms(100.0),
+            &latency_goal_for_test(100.0),
         )) {
             assert!(
-                v < u64::try_from(cur.bake_deletion_index_trigger).expect("fits in u64"),
+                v < current_value(&cur, Actuator::BakeDeletionIndexTrigger),
                 "a violated query goal may only lower the bake trigger, got {v}"
             );
         }
@@ -5141,8 +5110,8 @@ mod tests {
         let stats = IngestStats::new();
         let loaded_at_ms = 1_000_000;
         // The bootstrap's durable writes are slow; the table then applies to RAM.
-        stats.record_io_latency_at(Duration::from_millis(800), loaded_at_ms);
-        stats.record_publish_latency_at(Duration::from_millis(400), loaded_at_ms);
+        stats.record_io_latency(Duration::from_millis(800), loaded_at_ms);
+        stats.record_publish_latency(Duration::from_millis(400), loaded_at_ms);
 
         let mut fresh = stats.snapshot();
         stats.expire_stale_latencies(&mut fresh, loaded_at_ms + LATENCY_SIGNAL_TTL_MS);
@@ -5163,7 +5132,7 @@ mod tests {
 
         // A new durable write refreshes the signal.
         let later_ms = loaded_at_ms + 10 * LATENCY_SIGNAL_TTL_MS;
-        stats.record_io_latency_at(Duration::from_millis(50), later_ms);
+        stats.record_io_latency(Duration::from_millis(50), later_ms);
         let mut refreshed = stats.snapshot();
         stats.expire_stale_latencies(&mut refreshed, later_ms + 1);
         assert!(refreshed.io_latency_ms.is_some());
@@ -5181,7 +5150,7 @@ mod tests {
             apply_vs_arrival: 0.01,
             ..snap()
         };
-        let goals = query_latency_goal_ms(10_000.0);
+        let goals = latency_goal_for_test(10_000.0);
         assert!(
             raised_bake_trigger(goal_decide(&io_bound, &actuators(), &bounds(), &goals)).is_some(),
             "precondition: the stale latency reads as write pressure"

@@ -12051,11 +12051,7 @@ impl CayenneTableProvider {
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
         if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            for location in keyset.locations_mut() {
-                if matches!(location, RowLocation::Inlined) {
-                    *location = RowLocation::FileUnlocated;
-                }
-            }
+            keyset.relocate_inlined_to_file_unlocated();
         } else {
             // An index checked out for validation is not in the cell, so its entries
             // keep saying `Inlined` for rows this checkpoint just moved into files.
@@ -12072,16 +12068,10 @@ impl CayenneTableProvider {
         if let Some(index) = sharded.as_mut() {
             index.relocate_inlined_to_file_unlocated();
         } else {
-            // Checked out for validation (or cold, where this is a no-op). The
-            // per-shard index is checked out, built and restored by one apply holding
-            // `write_lock`, so no inline row can be written while it is out and every
-            // `Inlined` entry it holds names a row this flush moved: have the restore
-            // relabel it (see `relocate_inlined_after_flush`) instead of discarding
-            // it. A discard costs the next apply a rebuild from a full-table key scan
-            // under `write_lock`, and the in-memory CDC checkpoint runs this flush
-            // off-lock while an apply validates (every bake after a seal), so on a
-            // large table a discard on every such overlap makes those rebuilds most
-            // of the apply time.
+            // Checked out for validation (or cold, where this is a no-op): have the
+            // restore relabel it instead of discarding it, which would cost the next
+            // apply a full-table keyset rebuild under `write_lock`. Why that is sound
+            // for this index: `PendingPkKeys::relocate_inlined_after_flush`.
             self.sharded_pk_keyset_pending
                 .lock()
                 .relocate_inlined_after_flush();
@@ -12351,10 +12341,8 @@ impl CayenneTableProvider {
         }
         let mut index = index;
         if restored.relocates_inlined() {
-            // A checkpoint moved the inline rows into files while the index was out;
-            // relabel exactly as `flip_inlined_keyset_entries_to_file_unlocated` does
-            // for an index in the cell. `batches()` relabels the held batches that
-            // predate the flush.
+            // A checkpoint moved the inline rows into files while the index was out
+            // (see `PendingPkKeys::relocate_inlined_after_flush`).
             index.relocate_inlined_to_file_unlocated();
         }
         let mut drop_index = false;
@@ -12989,6 +12977,9 @@ impl CayenneTableProvider {
         // together under the WRITE fence, so resolving cold after this block would
         // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
         // snapshot and the post-promotion cold manifest.
+        // Warm the inline cache off the fence, so the fenced read below is a cache
+        // hit in the common case (the shape `capture_raw_scan_input` uses).
+        self.read_inlined_batches_if_present().await?;
         let (
             mem_snapshots,
             staged_keys,
@@ -13606,15 +13597,21 @@ impl CayenneTableProvider {
         // The mem-tier snapshot is taken inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
         // or already durable in the protected/current scan.
-        let (
-            mem_snapshots,
-            staged_keys,
-            inlined_batches,
-            protected_snapshots,
-            current_snapshot_id,
-            _scan_guard,
-        ) = {
+        // Warm the inline cache off the fence (see `load_existing_pk_index`); a stale
+        // sidecar falls back to that full rebuild, which reuses it.
+        self.read_inlined_batches_if_present().await?;
+        let (mem_snapshots, staged_keys, inlined_batches, protected_snapshots, _scan_guard) = {
             let _fence = self.listing_fence.read().await;
+            let current_snapshot_id = self.get_current_snapshot_id();
+            // Gate on the snapshot tag before reading anything else: the bloom covers
+            // the full current snapshot only if nothing rewrote it since the
+            // checkpoint (compaction re-persists). The cold bloom is gated on the
+            // same id for the reason in the doc comment.
+            if checkpoint_snapshot != current_snapshot_id
+                || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
+            {
+                return Ok(None);
+            }
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
                 .shards()
@@ -13627,7 +13624,6 @@ impl CayenneTableProvider {
             let staged_keys = self.snapshot_inflight_staged_pk_keys();
             let inlined_batches = self.read_inlined_batches_if_present().await?;
             let protected_snapshots = self.protected_snapshots.load_full();
-            let current_snapshot_id = self.get_current_snapshot_id();
             // Pin the snapshot dirs this path reads (the protected snapshots folded
             // by `extend_bloom_with_protected_and_inline` below) against the
             // retired-dir sweep for the whole read. The current snapshot is served
@@ -13646,19 +13642,10 @@ impl CayenneTableProvider {
                 staged_keys,
                 inlined_batches,
                 protected_snapshots,
-                current_snapshot_id,
                 scan_guard,
             )
         };
 
-        // Gate on the snapshot tag: the bloom covers the full current snapshot
-        // only if nothing rewrote it since the checkpoint (compaction re-persists).
-        // The cold bloom is gated on the same id for the reason in the doc comment.
-        if checkpoint_snapshot != current_snapshot_id
-            || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
-        {
-            return Ok(None);
-        }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
             return Ok(None);
         };
@@ -25775,7 +25762,16 @@ impl CayenneTableProvider {
                 .await?;
             (plan, epoch)
         };
-        let batches = collect(plan, session_state.task_ctx()).await?;
+        let mut stream = datafusion_physical_plan::execute_stream(plan, session_state.task_ctx())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+            // Stop reading once a write is published: the rebuild is superseded
+            // (below), so the rest of the table would be read for nothing.
+            if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
+                break;
+            }
+        }
         #[cfg(test)]
         self.run_test_post_maintained_aggregate_scan_hook().await;
         // A write that became visible while the scan ran is not in these rows, and
@@ -56453,13 +56449,17 @@ mod tests {
                     let published = provider_in_hook
                         .maintained_aggregate_epoch
                         .load(Ordering::Acquire);
-                    for _ in 0..250 {
-                        if provider_in_hook.maintained_aggregates.epoch_for_test() >= published {
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                    panic!("the applier never took in the delta of the write made during the scan");
+                    let applied = test_framework::utils::wait_until_true(
+                        std::time::Duration::from_secs(5),
+                        || async {
+                            provider_in_hook.maintained_aggregates.epoch_for_test() >= published
+                        },
+                    )
+                    .await;
+                    assert!(
+                        applied,
+                        "the applier never took in the delta of the write made during the scan"
+                    );
                 })
             }));
         }

@@ -400,10 +400,12 @@ impl CachedPkKeyset {
         self.keys.values().map(|entry| &entry.location)
     }
 
-    /// Mutable iterator over every entry's [`RowLocation`] (the
-    /// `Inlined -> FileUnlocated` flip after an inline checkpoint).
-    pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut RowLocation> {
-        self.keys.values_mut().map(|entry| &mut entry.location)
+    /// Relabel every `Inlined` entry `FileUnlocated`: a checkpoint moved the inline
+    /// rows into files, so each now names a file row whose position is unknown.
+    pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) {
+        for entry in self.keys.values_mut() {
+            relocate_inlined(&mut entry.location);
+        }
     }
 
     /// Consume the keyset into `(key, location)` pairs (the shard split).
@@ -1290,12 +1292,11 @@ pub(crate) struct PendingPkKeys {
     /// compaction, a recovery) and must not be cached when it comes back.
     invalidated: bool,
     /// A checkpoint moved the inline rows into files while the index was checked
-    /// out (see [`Self::relocate_inlined_after_flush`]). Holds how many batches the
-    /// log held at the most recent such flush: the index's own `Inlined` entries
-    /// and those batches were all committed before it, so they are relabeled
-    /// `FileUnlocated` at the restore; batches recorded after it keep the location
-    /// they were committed with.
-    inline_flushed_at: Option<usize>,
+    /// out (see [`Self::relocate_inlined_after_flush`]), so the restore relabels
+    /// the index's own `Inlined` entries. The batches held at the flush were
+    /// relabeled then; batches recorded after it keep the location they were
+    /// committed with.
+    inline_flushed: bool,
 }
 
 impl PendingPkKeys {
@@ -1327,7 +1328,7 @@ impl PendingPkKeys {
         }
         self.batches.clear();
         self.approx_bytes = 0;
-        self.inline_flushed_at = None;
+        self.inline_flushed = false;
         self.outstanding = self.outstanding.saturating_add(1);
     }
 
@@ -1342,7 +1343,7 @@ impl PendingPkKeys {
         self.invalidated = true;
         self.batches.clear();
         self.approx_bytes = 0;
-        self.inline_flushed_at = None;
+        self.inline_flushed = false;
     }
 
     /// Report that a checkpoint moved every inline row into files while an index
@@ -1367,7 +1368,10 @@ impl PendingPkKeys {
         if self.outstanding == 0 {
             return;
         }
-        self.inline_flushed_at = Some(self.batches.len());
+        for batch in &mut self.batches {
+            relocate_inlined(&mut batch.location);
+        }
+        self.inline_flushed = true;
     }
 
     /// Hold one committed key batch. A no-op when no index is checked out, or once
@@ -1395,7 +1399,7 @@ impl PendingPkKeys {
             self.overflowed = true;
             self.batches.clear();
             self.approx_bytes = 0;
-            self.inline_flushed_at = None;
+            self.inline_flushed = false;
             return;
         }
         self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
@@ -1415,10 +1419,9 @@ impl PendingPkKeys {
     fn end_checkout(&mut self) -> RestoredPkKeys {
         let restored = RestoredPkKeys {
             batches: std::mem::take(&mut self.batches),
-            discard_index: self.overflowed || self.invalidated,
             overflowed: self.overflowed,
             invalidated: self.invalidated,
-            inline_flushed_at: self.inline_flushed_at.take(),
+            inline_flushed: std::mem::take(&mut self.inline_flushed),
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1445,13 +1448,9 @@ impl PendingPkKeys {
             HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher);
         // Later batches win: a key committed twice during the checkout lives where
         // its most recent commit put it.
-        for (position, batch) in self.batches.iter().enumerate() {
-            let location = relocated_after_inline_flush(
-                &batch.location,
-                self.inline_flushed_at.is_some_and(|at| position < at),
-            );
+        for batch in &self.batches {
             for (digest, _) in batch.keys.iter_with_digest() {
-                locations.insert(digest, location.clone());
+                locations.insert(digest, batch.location.clone());
             }
         }
         Some(PendingPkExistence {
@@ -1584,38 +1583,33 @@ impl CheckedOutShardedPkIndex {
 /// Keys committed while an index was checked out, handed to the restore.
 pub(crate) struct RestoredPkKeys {
     batches: Vec<PendingPkKeyBatch>,
-    discard_index: bool,
     /// The log stopped recording, so keys committed during the checkout are
-    /// unrecoverable. Retained separately from `discard_index` so the discard
-    /// counter can name which condition fired.
+    /// unrecoverable. Either this or `invalidated` discards the index; they are
+    /// kept apart so the discard counter can name which condition fired.
     overflowed: bool,
     /// The cache was invalidated while the index was out.
     invalidated: bool,
-    /// See [`PendingPkKeys::relocate_inlined_after_flush`]: `Some(n)` when a
-    /// checkpoint moved the inline rows into files during the checkout, `n` being
-    /// how many of `batches` were committed before it.
-    inline_flushed_at: Option<usize>,
+    /// See [`PendingPkKeys::relocate_inlined_after_flush`]: a checkpoint moved the
+    /// inline rows into files during the checkout.
+    inline_flushed: bool,
 }
 
-/// The location a key committed before an inline flush lives at after it: the
-/// flush moved every inline row into a file, so an `Inlined` entry that predates it
-/// now names a file row whose position is unknown. Everything else is unchanged.
-fn relocated_after_inline_flush(location: &RowLocation, predates_flush: bool) -> &RowLocation {
-    static FILE_UNLOCATED: RowLocation = RowLocation::FileUnlocated;
-    if predates_flush && matches!(location, RowLocation::Inlined) {
-        &FILE_UNLOCATED
-    } else {
-        location
+/// The location a key lives at after a checkpoint moved every inline row into a
+/// file: an `Inlined` entry now names a file row whose position is unknown.
+/// Everything else is unchanged.
+fn relocate_inlined(location: &mut RowLocation) {
+    if matches!(location, RowLocation::Inlined) {
+        *location = RowLocation::FileUnlocated;
     }
 }
 
 impl RestoredPkKeys {
     /// Whether a checkpoint moved the inline rows into files while the index was
     /// out, so the restore must relabel the index's `Inlined` entries
-    /// (`FileUnlocated`) before caching it. [`Self::batches`] already relabels the
-    /// batches committed before that flush.
+    /// (`FileUnlocated`) before caching it. The batches committed before that flush
+    /// were relabeled when it happened.
     pub(crate) const fn relocates_inlined(&self) -> bool {
-        self.inline_flushed_at.is_some()
+        self.inline_flushed
     }
 
     /// Whether the index that was checked out must be dropped rather than cached:
@@ -1623,7 +1617,7 @@ impl RestoredPkKeys {
     /// cache was invalidated while the index was out. Caching it either way would
     /// answer "absent" for a live key, which reads as a new primary key.
     pub(crate) fn index_must_be_discarded(&self) -> bool {
-        self.discard_index
+        self.overflowed || self.invalidated
     }
 
     /// Which of the two conditions forced the discard, as a metric label.
@@ -1645,20 +1639,12 @@ impl RestoredPkKeys {
 
     /// Replay every held batch, oldest first, so a key committed twice ends on its
     /// most recent location and sequence. A batch committed before an inline flush
-    /// that happened during the checkout comes back relabeled the way the flush
-    /// relabels the cached index (see [`Self::relocates_inlined`]).
+    /// that happened during the checkout was relabeled at the flush, the way the
+    /// flush relabels the cached index (see [`Self::relocates_inlined`]).
     pub(crate) fn batches(&self) -> impl Iterator<Item = (&PkDigestSet, &RowLocation, i64)> {
-        let flushed_at = self.inline_flushed_at;
         self.batches
             .iter()
-            .enumerate()
-            .map(move |(position, batch)| {
-                let location = relocated_after_inline_flush(
-                    &batch.location,
-                    flushed_at.is_some_and(|at| position < at),
-                );
-                (&batch.keys, location, batch.sequence)
-            })
+            .map(|batch| (&batch.keys, &batch.location, batch.sequence))
     }
 }
 
@@ -1874,11 +1860,7 @@ impl ShardedPkIndex {
     pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) {
         if let Self::Exact(keysets) = self {
             for keyset in keysets.iter_mut() {
-                for location in keyset.locations_mut() {
-                    if matches!(location, RowLocation::Inlined) {
-                        *location = RowLocation::FileUnlocated;
-                    }
-                }
+                keyset.relocate_inlined_to_file_unlocated();
             }
         }
     }

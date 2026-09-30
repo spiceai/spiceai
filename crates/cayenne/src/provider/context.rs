@@ -846,14 +846,14 @@ impl CayenneContext {
     /// duration it already measured for telemetry.
     pub(crate) fn record_io_latency(&self, d: std::time::Duration) {
         self.ingest_stats
-            .record_io_latency_at(d, chrono::Utc::now().timestamp_millis());
+            .record_io_latency(d, chrono::Utc::now().timestamp_millis());
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
     /// single-writer commit) into the tuner's rolling EWMA.
     pub(crate) fn record_publish_latency(&self, d: std::time::Duration) {
         self.ingest_stats
-            .record_publish_latency_at(d, chrono::Utc::now().timestamp_millis());
+            .record_publish_latency(d, chrono::Utc::now().timestamp_millis());
     }
 
     /// Record the live deletion-index size a committed seq-prefix bake left
