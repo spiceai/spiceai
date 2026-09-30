@@ -796,13 +796,8 @@ impl Runtime {
             if restored {
                 update_cached_dataset_timestamps(ds.as_ref()).await;
             }
-            self.load_dataset_with_retry(
-                Arc::clone(&ds),
-                bootstrap_status,
-                load_semaphore,
-                &load,
-            )
-            .await;
+            self.load_dataset_with_retry(Arc::clone(&ds), bootstrap_status, load_semaphore, &load)
+                .await;
             if restored {
                 self.df.clear_cached_plans().await;
                 self.invalidate_cached_results_for(&ds.name).await;
@@ -2199,7 +2194,8 @@ impl Runtime {
                     .await;
             });
             let load_future = if pending {
-                self.track_snapshot_bootstrap(&ds.name, load_future, None).await
+                self.track_snapshot_bootstrap(&ds.name, load_future, None)
+                    .await
             } else {
                 load_future
             };
