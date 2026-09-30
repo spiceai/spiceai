@@ -308,7 +308,10 @@ fn build_snapshots_config(
     }
 
     if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
-        param_map.insert("allow_http".to_string(), endpoint.starts_with("http://").to_string());
+        param_map.insert(
+            "allow_http".to_string(),
+            endpoint.starts_with("http://").to_string(),
+        );
         param_map.insert("s3_endpoint".to_string(), endpoint);
     }
 
@@ -2342,11 +2345,25 @@ struct SharedMetastoreFixture {
 
 impl SharedMetastoreFixture {
     async fn new(test_name: &str) -> Result<Self> {
-        let context = SnapshotS3Context::new(test_name).await?;
-        let names = (0..SHARED_METASTORE_DATASETS)
-            .map(|i| format!("taxi_trips_{i}"))
-            .collect::<Vec<_>>();
+        let mut fixture = Self::unpublished(test_name).await?;
+        fixture.publish().await?;
+        Ok(fixture)
+    }
 
+    /// A fixture whose writer has not published yet.
+    async fn unpublished(test_name: &str) -> Result<Self> {
+        Ok(Self {
+            context: SnapshotS3Context::new(test_name).await?,
+            names: (0..SHARED_METASTORE_DATASETS)
+                .map(|i| format!("taxi_trips_{i}"))
+                .collect(),
+            expected_rows: 0,
+        })
+    }
+
+    /// Runs the writer until it has published a snapshot of every dataset.
+    async fn publish(&mut self) -> Result<()> {
+        let (context, names) = (&self.context, &self.names);
         let temp_dir = TempDir::new().context("Creating the writer's Cayenne directory")?;
         let source_path = temp_dir.path().join("taxi_sample.csv");
         fs::write(&source_path, include_str!("../test_data/taxi_sample.csv"))
@@ -2354,12 +2371,11 @@ impl SharedMetastoreFixture {
             .context("Writing sample CSV for the writer's datasets")?;
         let from = format!("file://{}", source_path.display());
 
-        let mut app = AppBuilder::new(format!("{test_name}_writer"))
-            .with_snapshots(build_snapshots_config(
-                &context,
-                BootstrapOnFailureBehavior::Warn,
-            ));
-        for name in &names {
+        let mut app = AppBuilder::new("snapshot_writer").with_snapshots(build_snapshots_config(
+            context,
+            BootstrapOnFailureBehavior::Warn,
+        ));
+        for name in names {
             let mut dataset = shared_metastore_dataset(
                 &from,
                 name,
@@ -2380,21 +2396,28 @@ impl SharedMetastoreFixture {
         let runtime = Arc::new(Runtime::builder().with_app(app.build()).build().await);
         load_runtime(Arc::clone(&runtime)).await?;
         let expected_rows = count_table_rows(&runtime, &names[0]).await?;
-        let wait = context.wait_for_current_snapshots(&names, Duration::from_mins(2)).await;
+        let wait = context
+            .wait_for_current_snapshots(names, Duration::from_mins(2))
+            .await;
         runtime.shutdown().await;
         wait?;
-        assert!(expected_rows > 0, "the writer loaded no rows from the sample CSV");
-
-        Ok(Self {
-            context,
-            names,
-            expected_rows,
-        })
+        assert!(
+            expected_rows > 0,
+            "the writer loaded no rows from the sample CSV"
+        );
+        self.expected_rows = expected_rows;
+        Ok(())
     }
 
     /// A runtime serving only from snapshots: each dataset's source is a placeholder that
     /// is never read, so a dataset that does not bootstrap never loads.
-    fn reader_app(&self, name: &str, root: &Path, datasets: &[String]) -> app::App {
+    fn reader_app(
+        &self,
+        name: &str,
+        root: &Path,
+        datasets: &[String],
+        refresh_check_interval: &str,
+    ) -> app::App {
         let mut app = AppBuilder::new(name).with_snapshots(build_snapshots_config(
             &self.context,
             BootstrapOnFailureBehavior::Warn,
@@ -2408,7 +2431,7 @@ impl SharedMetastoreFixture {
             );
             if let Some(acceleration) = dataset.acceleration.as_mut() {
                 acceleration.refresh_mode = Some(RefreshMode::Snapshot);
-                acceleration.refresh_check_interval = Some("1h".to_string());
+                acceleration.refresh_check_interval = Some(refresh_check_interval.to_string());
             }
             dataset.params = Some(Params::from_string_map(HashMap::from([(
                 "file_format".to_string(),
@@ -2427,22 +2450,44 @@ impl SharedMetastoreFixture {
         root: &Path,
         datasets: &[String],
     ) -> Result<()> {
+        let (runtime, load) = self.start_reader(name, root, datasets, "1h").await;
+        let outcome = self.wait_until_served(&runtime, name, datasets).await;
+        runtime.shutdown().await;
+        load.abort();
+        outcome
+    }
+
+    async fn start_reader(
+        &self,
+        name: &str,
+        root: &Path,
+        datasets: &[String],
+        refresh_check_interval: &str,
+    ) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
         configure_test_datafusion();
         let runtime = Arc::new(
             Runtime::builder()
-                .with_app(self.reader_app(name, root, datasets))
+                .with_app(self.reader_app(name, root, datasets, refresh_check_interval))
                 .build()
                 .await,
         );
         // A dataset that did not bootstrap retries its placeholder source for good, so the
-        // load is not awaited: the per-dataset queries below are the condition.
+        // load is not awaited: the per-dataset queries in `wait_until_served` are the condition.
         let load = tokio::spawn(Arc::clone(&runtime).load_components());
+        (runtime, load)
+    }
 
+    async fn wait_until_served(
+        &self,
+        runtime: &Arc<Runtime>,
+        name: &str,
+        datasets: &[String],
+    ) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(90);
-        let outcome = loop {
+        loop {
             let mut observed = Vec::with_capacity(datasets.len());
             for dataset in datasets {
-                observed.push(match count_table_rows(&runtime, dataset).await {
+                observed.push(match count_table_rows(runtime, dataset).await {
                     Ok(rows) if rows == self.expected_rows => None,
                     Ok(rows) => Some(format!("{dataset}: {rows} rows")),
                     Err(err) => Some(format!("{dataset}: {err:#}")),
@@ -2462,11 +2507,7 @@ impl SharedMetastoreFixture {
                 ));
             }
             sleep(Duration::from_millis(500)).await;
-        };
-
-        runtime.shutdown().await;
-        load.abort();
-        outcome
+        }
     }
 
     async fn cleanup(self) -> Result<()> {
@@ -2529,7 +2570,10 @@ fn shared_metastore_dataset(
             ),
             (
                 "cayenne_metadata_dir".to_string(),
-                root.join("data").join("metadata").to_string_lossy().to_string(),
+                root.join("data")
+                    .join("metadata")
+                    .to_string_lossy()
+                    .to_string(),
             ),
         ]))),
         refresh_on_startup: RefreshOnStartup::Auto,
@@ -2586,6 +2630,56 @@ async fn snapshot_int_test_cayenne_shared_metastore_partial_restart() -> Result<
                     .await
             }
             .await;
+            fixture.cleanup().await?;
+            outcome
+        })
+        .await
+}
+
+/// A reader started before any snapshot exists loads once the writer publishes one,
+/// instead of retrying its placeholder source forever.
+#[tokio::test]
+async fn snapshot_int_test_cayenne_reader_started_before_first_snapshot() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            let mut fixture =
+                SharedMetastoreFixture::unpublished("snapshot_int_cayenne_early_reader").await?;
+            let reader_dir = TempDir::new().context("Creating the reader's Cayenne directory")?;
+            let (runtime, load) = fixture
+                .start_reader("early_reader", reader_dir.path(), &fixture.names, "2s")
+                .await;
+
+            let outcome = async {
+                // Every dataset must have found no snapshot before the writer publishes.
+                let deadline = Instant::now() + Duration::from_mins(1);
+                while !fixture.names.iter().all(|name| {
+                    matches!(
+                        runtime
+                            .status()
+                            .get_dataset_status(&TableReference::parse_str(name)),
+                        Some(ComponentStatus::Error(_))
+                    )
+                }) {
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "the reader's datasets never failed their first load: {:?}",
+                            runtime.status().get_dataset_statuses()
+                        ));
+                    }
+                    sleep(Duration::from_millis(200)).await;
+                }
+
+                fixture.publish().await?;
+                fixture
+                    .wait_until_served(&runtime, "early_reader", &fixture.names)
+                    .await
+            }
+            .await;
+
+            runtime.shutdown().await;
+            load.abort();
             fixture.cleanup().await?;
             outcome
         })

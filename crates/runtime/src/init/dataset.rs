@@ -728,11 +728,8 @@ impl Runtime {
         load_semaphore: Arc<Semaphore>,
         load: DatasetLoad,
     ) {
-        // A `refresh_mode: snapshot` dataset loads only from snapshots. When none existed as
-        // its accelerator initialized (a reader started before its writer published), each
-        // retry re-attempts the bootstrap rather than retrying the source with the empty
-        // status from startup, and the backoff is capped at the refresh interval so a
-        // snapshot published later is picked up about as fast as a newer one would be.
+        // A `refresh_mode: snapshot` dataset that found no snapshot at startup re-attempts
+        // the bootstrap on each retry, at most one refresh interval apart.
         let first_snapshot_poll = waits_for_first_snapshot(&ds, &bootstrap_status);
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(None)
@@ -763,8 +760,8 @@ impl Runtime {
                 ));
             };
 
+            // The first attempt uses the bootstrap from startup.
             let mut status = bootstrap_status.lock().clone();
-            // The first attempt uses the bootstrap startup just ran.
             if first_snapshot_poll.is_some()
                 && !status.is_bootstrapped()
                 && attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
@@ -2749,11 +2746,9 @@ fn with_localpod_dependents(
     reloading
 }
 
-/// The interval at which a `refresh_mode: snapshot` dataset that has not bootstrapped
-/// re-attempts its snapshot bootstrap, or `None` when the dataset is not waiting for one:
-/// it is not accelerated, does not refresh from snapshots, cannot bootstrap from them, or
-/// already bootstrapped. `mode: file_create` is excluded: re-running its accelerator init
-/// recreates the acceleration each time.
+/// How often a `refresh_mode: snapshot` dataset that has not bootstrapped re-attempts
+/// the bootstrap, or `None` if it is not waiting for a first snapshot. `mode: file_create`
+/// is excluded because its init recreates the acceleration.
 fn waits_for_first_snapshot(ds: &Dataset, bootstrap_status: &BootstrapStatus) -> Option<Duration> {
     let acceleration = ds.acceleration.as_ref().filter(|a| a.enabled)?;
     (acceleration.refresh_mode == Some(RefreshMode::Snapshot)
