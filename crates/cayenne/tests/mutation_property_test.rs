@@ -1380,6 +1380,89 @@ async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
 }
 test_with_backends!(prop_sequential_memory_impl);
 
+/// [`assert_converged`] plus a physical row count, which catches a duplicate
+/// row that `read_rows` would fold into the key/value map.
+async fn assert_converged_no_duplicates(
+    ctx: &SessionContext,
+    name: &str,
+    model: &Model,
+    message: &str,
+) -> TestResult<()> {
+    assert_converged(&read_rows(ctx, name).await?, model, message);
+    let count = scalar_i64(ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+    assert_eq!(
+        count,
+        i64::try_from(model.len()).expect("model size fits i64"),
+        "{message}: duplicate physical rows"
+    );
+    Ok(())
+}
+
+// A memory-durable table can receive a durable write when CDC cannot use the
+// mem tier. Walk both write paths against one model after every write.
+async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResult<()> {
+    let name = "mixed_memory_and_durable_upserts";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let mut model = Model::new();
+    let initial: Vec<(i64, i64)> = (0..8).map(|id| (id, 0)).collect();
+    upsert(&table, &initial, Durability::Memory).await?;
+    model.extend(initial);
+
+    let mut rng = Rng::new(14413);
+    for step in 0..24 {
+        let rows = random_rows(&mut rng, 8, 4);
+        let durability = if step % 2 == 0 {
+            Durability::File
+        } else {
+            Durability::Memory
+        };
+        upsert(&table, &rows, durability).await?;
+        model.extend(rows);
+        let message = format!("mixed upsert step {step} ({durability:?})");
+        assert_converged_no_duplicates(&ctx, name, &model, &message).await?;
+    }
+    Ok(())
+}
+test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+
+// A durable upsert of keys first written through the mem tier must hide the
+// old rows whether a checkpoint moves them into a file before the upsert or
+// after it.
+async fn durable_upsert_of_mem_tier_keys(
+    f: TestFixture,
+    name: &str,
+    checkpoint_first: bool,
+) -> TestResult<()> {
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::Memory, None, false).await?;
+    let old: Vec<(i64, i64)> = (1..=100).map(|id| (id, 1)).collect();
+    upsert(&table, &old, Durability::Memory).await?;
+    if checkpoint_first {
+        assert_eq!(
+            table.checkpoint_mem_tier().await?,
+            100,
+            "{name}: the checkpoint must move every key to files"
+        );
+    }
+    let new: Vec<(i64, i64)> = (1..=100).map(|id| (id, 2)).collect();
+    upsert(&table, &new, Durability::File).await?;
+    let model: Model = new.into_iter().collect();
+    assert_converged_no_duplicates(&ctx, name, &model, name).await?;
+    if !checkpoint_first {
+        table.checkpoint_mem_tier().await?;
+        assert_converged_no_duplicates(&ctx, name, &model, &format!("{name} after checkpoint"))
+            .await?;
+    }
+    Ok(())
+}
+async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "durable_upsert_after_mem_tier_checkpoint", true).await
+}
+async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
+    durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
+}
+test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
+test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| {

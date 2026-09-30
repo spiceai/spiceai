@@ -22,6 +22,7 @@ use std::{
 };
 
 use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
+use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
@@ -122,6 +123,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     Extension(evaluate_models): Extension<Arc<RwLock<EvaluateModelStore>>>,
+    Extension(status): Extension<Arc<RuntimeStatus>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
@@ -173,7 +175,10 @@ pub(crate) async fn post(
                 if evaluate_models.read().await.contains_key(&model_id) {
                     evaluate_only_chat_response(&model_id)
                 } else {
-                    (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response()
+                    let message = status
+                        .unavailable_model_reason(&model_id)
+                        .unwrap_or_else(|| format!("model '{model_id}' not found"));
+                    (StatusCode::NOT_FOUND, message).into_response()
                 }
             }
         }
@@ -408,6 +413,7 @@ mod tests {
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
         model::{EvaluateModelStore, LLMChatCompletionsModelStore},
+        status::{ComponentStatus, RuntimeStatus},
     };
     use async_openai::{
         error::OpenAIError,
@@ -490,6 +496,7 @@ mod tests {
         let response = post(
             Extension(llms),
             Extension(evaluate_models),
+            Extension(RuntimeStatus::new()),
             headers,
             Json(req_payload),
         )
@@ -587,6 +594,7 @@ mod tests {
         let response = post(
             Extension(llms),
             Extension(evaluate_models),
+            Extension(RuntimeStatus::new()),
             HeaderMap::new(),
             Json(req_payload),
         )
@@ -612,5 +620,60 @@ mod tests {
             message.contains("/v1/evaluate"),
             "message should direct callers to /v1/evaluate: {message}"
         );
+    }
+
+    async fn post_to_absent_model(status: Arc<RuntimeStatus>) -> (axum::http::StatusCode, String) {
+        let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
+        let evaluate_models = Arc::new(RwLock::new(EvaluateModelStore::new()));
+        let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "deepseek",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(llms),
+            Extension(evaluate_models),
+            Extension(status),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
+        let code = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (code, String::from_utf8(body.to_vec()).expect("utf-8 body"))
+    }
+
+    // regression test for #13303
+    #[tokio::test]
+    async fn chat_names_the_load_failure_of_a_configured_model() {
+        let status = RuntimeStatus::new();
+        status.update_model(
+            "deepseek",
+            ComponentStatus::error_with_message(
+                "Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance",
+            ),
+        );
+
+        let (code, body) = post_to_absent_model(status).await;
+
+        assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            "Model 'deepseek' failed to load, so it cannot serve requests. Cause: Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_reports_an_unconfigured_model_as_not_found() {
+        let (code, body) = post_to_absent_model(RuntimeStatus::new()).await;
+
+        assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body, "model 'deepseek' not found");
     }
 }

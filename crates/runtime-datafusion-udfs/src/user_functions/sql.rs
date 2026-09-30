@@ -197,7 +197,7 @@ pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
     let arrow_schema = Arc::new(Schema::new(fields));
     let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone()).context(BuildSchemaSnafu)?;
 
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::session_context();
 
     let logical_expr = ctx
         .parse_sql_expr(body, &df_schema)
@@ -843,7 +843,7 @@ fn context_with_args(
             })?;
         SessionContext::new_with_state(builder_from_existing(state).build())
     } else {
-        SessionContext::new()
+        util::session_state::session_context()
     };
     let batch = args_record_batch(Arc::clone(&schema), values)?;
     let table = MemTable::try_new(schema, vec![vec![batch]])?;

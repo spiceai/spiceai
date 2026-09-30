@@ -1,5 +1,6 @@
 """Unit tests for check_nextest_config.py."""
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -52,9 +53,58 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 UNDERSIZED_CONFIG = FIXED_CONFIG.replace("terminate-after = 12", "terminate-after = 8")
 
 
-def write(tmp: str, text: str) -> Path:
-    path = Path(tmp) / "nextest.toml"
+# The override that gives `retention_oom` a budget its step can hold: three
+# attempts at the global 360s ceiling, plus startup, inside a 25-minute step.
+RETENTION_OVERRIDE = """\
+
+[[profile.default.overrides]]
+filter = 'binary(=retention_oom)'
+retries = { backoff = "exponential", count = 2, delay = "2s", max-delay = "30s", jitter = true }
+"""
+
+# The config as #12336's fix left it, before #13512: every ceiling right, and
+# `retention_oom` still on the default six attempts.
+PRE_13512_CONFIG = FIXED_CONFIG
+FIXED_CONFIG += RETENTION_OVERRIDE
+UNDERSIZED_CONFIG += RETENTION_OVERRIDE
+
+
+def workflow_with_step_bound(minutes: int | None) -> str:
+    """A cut-down integration.yml whose retention step carries the given bound."""
+    bound = f"        timeout-minutes: {minutes}\n" if minutes is not None else ""
+    return (
+        "jobs:\n"
+        "  test-partitions:\n"
+        "    timeout-minutes: 90\n"
+        "    steps:\n"
+        "      - name: Run integration test\n"
+        "        timeout-minutes: 40\n"
+        "        run: cargo nextest run\n"
+        "      - name: Run retention OOM regression test\n"
+        "        if: matrix.partition == 'count:1/3'\n"
+        f"{bound}"
+        "        run: cargo nextest run -E 'binary_id(=runtime::retention_oom)'\n"
+        "      - name: Upload integration snapshots artifact\n"
+        "        timeout-minutes: 10\n"
+    )
+
+
+def write(tmp: str, text: str, step_bound: int | None = 25, workflow: str | None = None) -> Path:
+    """Write the config, and the workflow STEP_BUDGETS reads, under `tmp`.
+
+    The config goes to `<tmp>/.config/nextest.toml` so the default repo-root
+    derivation in `check_config` finds the workflow beside it.
+    """
+    root = Path(tmp)
+    (root / ".config").mkdir(exist_ok=True)
+    path = root / ".config" / "nextest.toml"
     path.write_text(text, encoding="utf-8")
+    workflow_path = root / ".github" / "workflows" / "integration.yml"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
+    workflow_path.write_text(
+        workflow if workflow is not None else workflow_with_step_bound(step_bound),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -70,6 +120,18 @@ class DurationTest(unittest.TestCase):
         for text in ("120", "s", "", "120 s", "2days"):
             with self.assertRaises(ValueError):
                 check_nextest_config.parse_duration(text)
+
+
+class RetryCountTest(unittest.TestCase):
+    def test_reads_a_table_and_a_bare_count(self):
+        self.assertEqual(check_nextest_config.retry_count({"count": 5, "backoff": "exponential"}), 5)
+        self.assertEqual(check_nextest_config.retry_count(3), 3)
+        self.assertEqual(check_nextest_config.retry_count(None), 0)
+
+    def test_rejects_a_count_it_cannot_read(self):
+        for value in (True, {"backoff": "fixed"}, {"count": "5"}, "5", -1, {"count": -3}):
+            with self.assertRaises(ValueError):
+                check_nextest_config.retry_count(value)
 
 
 class CeilingTest(unittest.TestCase):
@@ -301,6 +363,149 @@ retries = 0
 
 
 class MainTest(unittest.TestCase):
+    def test_the_pre_13512_budget_is_rejected(self):
+        # The default six attempts at 360s inside a 20-minute step: 36 minutes of
+        # budget that the step could never hold, which is what timed the step out
+        # fifteen times in the merge queue.
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(
+                write(tmp, PRE_13512_CONFIG, step_bound=20)
+            )
+        self.assertTrue(any("retention_oom" in p and "no verdict" in p for p in problems), problems)
+        (problem,) = [p for p in problems if "retention_oom" in p]
+        self.assertIn("6 attempt(s) x 360s", problem)
+        self.assertIn("20 min (1200s)", problem)
+
+    def test_the_fixed_budget_fits_its_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, FIXED_CONFIG, step_bound=25)), [])
+
+    def test_the_fixed_budget_does_not_fit_the_old_step_bound(self):
+        # Three attempts x 360s + 240s startup = 1320s, over a 20-minute step: the
+        # override alone is not enough, the step bound has to move with it.
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, FIXED_CONFIG, step_bound=20))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("1320s", problems[0])
+        self.assertIn("3 attempt(s)", problems[0])
+
+    def test_a_bare_retry_count_is_read(self):
+        config = FIXED_CONFIG.replace(
+            'retries = { backoff = "exponential", count = 2, delay = "2s", max-delay = "30s", jitter = true }',
+            "retries = 2",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config, step_bound=25)), [])
+
+    def test_a_step_without_a_bound_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, FIXED_CONFIG, step_bound=None))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("has no timeout-minutes", problems[0])
+
+    def test_a_renamed_step_is_reported_rather_than_skipped(self):
+        workflow = workflow_with_step_bound(25).replace(
+            "Run retention OOM regression test", "Run the retention OOM test"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, FIXED_CONFIG, workflow=workflow))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("not found in the workflow", problems[0])
+
+    def test_a_missing_workflow_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, FIXED_CONFIG)
+            (Path(tmp) / ".github" / "workflows" / "integration.yml").unlink()
+            problems = check_nextest_config.check_config(path)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("integration.yml", problems[0])
+
+    def test_a_budget_binary_without_a_ceiling_is_reported(self):
+        config = FIXED_CONFIG + """\
+
+[[profile.default.overrides]]
+filter = 'binary(=retention_oom)'
+slow-timeout = "120s"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config, step_bound=25))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("no slow-timeout ceiling", problems[0])
+
+    def test_the_step_bound_is_read_from_the_named_step_only(self):
+        # The neighbouring steps carry bounds of their own (40 and 10); the
+        # scan must stop at the next step rather than read past it.
+        self.assertEqual(
+            check_nextest_config.step_timeout_minutes(
+                workflow_with_step_bound(25), "Run retention OOM regression test"
+            ),
+            25,
+        )
+        self.assertIsNone(
+            check_nextest_config.step_timeout_minutes(
+                workflow_with_step_bound(None), "Run retention OOM regression test"
+            )
+        )
+
+    def test_the_step_scan_stops_at_a_step_without_a_name(self):
+        # The step after the target starts with `- uses:` rather than `- name:`,
+        # and carries a bound of its own; the target has none.
+        workflow = (
+            "jobs:\n"
+            "  test:\n"
+            "    steps:\n"
+            "      - name: Run retention OOM regression test\n"
+            "        run: cargo nextest run\n"
+            "      - uses: actions/upload-artifact@v4\n"
+            "        timeout-minutes: 9\n"
+        )
+        self.assertIsNone(
+            check_nextest_config.step_timeout_minutes(workflow, "Run retention OOM regression test")
+        )
+
+    def test_the_step_scan_stops_at_the_end_of_the_job(self):
+        # The target is the last step; the next job's own bound is not its.
+        workflow = (
+            "jobs:\n"
+            "  test:\n"
+            "    steps:\n"
+            "      - name: Run retention OOM regression test\n"
+            "        run: cargo nextest run\n"
+            "  aggregate:\n"
+            "    timeout-minutes: 5\n"
+            "    steps:\n"
+            "      - run: true\n"
+        )
+        self.assertIsNone(
+            check_nextest_config.step_timeout_minutes(workflow, "Run retention OOM regression test")
+        )
+
+    def test_a_nested_timeout_minutes_is_not_the_steps_bound(self):
+        workflow = (
+            "jobs:\n"
+            "  test:\n"
+            "    steps:\n"
+            "      - name: Run retention OOM regression test\n"
+            "        uses: some/action@v1\n"
+            "        with:\n"
+            "          timeout-minutes: 11\n"
+            "        timeout-minutes: 25\n"
+        )
+        self.assertEqual(
+            check_nextest_config.step_timeout_minutes(workflow, "Run retention OOM regression test"),
+            25,
+        )
+
+    def test_a_duplicated_step_name_is_refused(self):
+        workflow = workflow_with_step_bound(25) + (
+            "  other:\n"
+            "    steps:\n"
+            "      - name: Run retention OOM regression test\n"
+            "        timeout-minutes: 5\n"
+        )
+        with self.assertRaises(ValueError):
+            check_nextest_config.step_timeout_minutes(workflow, "Run retention OOM regression test")
+
     def test_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(check_nextest_config.main(["--config", str(write(tmp, FIXED_CONFIG))]), 0)
@@ -310,6 +515,40 @@ class MainTest(unittest.TestCase):
 
 
 class RepositoryTest(unittest.TestCase):
+    def test_the_guard_workflow_triggers_on_every_step_budget_workflow(self):
+        # The guard reads each STEP_BUDGETS workflow, so a change to one of them
+        # alone — a step's timeout-minutes going back down — has to run it. A
+        # budget whose workflow is missing from the trigger paths is a check that
+        # cannot fire when it matters.
+        guard = (
+            Path(__file__).resolve().parents[1] / "workflows" / "nextest_config_check.yml"
+        ).read_text(encoding="utf-8")
+        # Each trigger's own `paths:` list, so a workflow listed twice under one
+        # trigger and not at all under the other cannot pass.
+        triggers = {
+            name: block
+            for name, block in re.findall(
+                r"^  (pull_request|push):\n((?:    .*\n|\n)*)", guard, re.M
+            )
+        }
+        self.assertEqual(set(triggers), {"pull_request", "push"}, guard)
+        # ...and only the `paths:` list inside it, not `paths-ignore:` or
+        # `branches:`, which would carry the same spelling and mean the opposite.
+        path_lists = {}
+        for trigger, block in triggers.items():
+            match = re.search(r"^    paths:\n((?:      .*\n)*)", block, re.M)
+            self.assertIsNotNone(match, f"{trigger} has no paths: list:\n{block}")
+            path_lists[trigger] = match.group(1)
+        for binary, (workflow, _step) in check_nextest_config.STEP_BUDGETS.items():
+            for trigger, paths in sorted(path_lists.items()):
+                with self.subTest(binary=binary, trigger=trigger):
+                    self.assertEqual(
+                        paths.count(f"      - '{workflow}'\n"),
+                        1,
+                        f"{workflow} must be listed exactly once under the {trigger} "
+                        "path filter of nextest_config_check.yml",
+                    )
+
     def test_this_repositorys_nextest_config_holds(self):
         """Regression test for #12336 / #12434 against the real .config/nextest.toml."""
         config_path = Path(__file__).resolve().parents[2] / ".config" / "nextest.toml"
