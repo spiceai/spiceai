@@ -2978,6 +2978,7 @@ mod tests {
                 128 * 1024 * 1024,
             )),
             Handle::current(),
+            Handle::current(),
         )
     }
 
@@ -3229,6 +3230,7 @@ mod tests {
             Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
                 128 * 1024 * 1024,
             )),
+            Handle::current(),
             Handle::current(),
         );
         let drain = writer.drain_task();
@@ -6999,6 +7001,7 @@ mod write_path_tests {
             Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
                 128 * 1024 * 1024,
             )),
+            Handle::current(),
             Handle::current(),
         );
         let drain = writer.drain_task();

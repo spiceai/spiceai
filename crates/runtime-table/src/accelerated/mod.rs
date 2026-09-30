@@ -998,6 +998,10 @@ impl Builder {
                 Arc::clone(&last_updated_at),
                 Arc::clone(&self.runtime_status),
                 Arc::clone(&self.caching_memory_pool),
+                self.cdc_apply_runtime
+                    .clone()
+                    .or_else(|| self.cpu_runtime.clone())
+                    .unwrap_or_else(Handle::current),
                 self.io_runtime.clone(),
             )
         });

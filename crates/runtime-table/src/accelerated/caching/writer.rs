@@ -123,7 +123,8 @@ struct Inner {
     closed: parking_lot::Mutex<bool>,
     /// Refuse successor mutations if durable recovery could not finish.
     recovery_failed: AtomicBool,
-    runtime: Handle,
+    apply_runtime: Handle,
+    io_runtime: Handle,
 }
 
 impl Drop for Inner {
@@ -143,7 +144,8 @@ impl CacheWriter {
         last_updated_at: Arc<AtomicI64>,
         runtime_status: Arc<RuntimeStatus>,
         memory_pool: Arc<dyn MemoryPool>,
-        runtime: Handle,
+        apply_runtime: Handle,
+        io_runtime: Handle,
     ) -> Self {
         let runtime_env = RuntimeEnv {
             memory_pool: Arc::clone(&memory_pool),
@@ -167,7 +169,8 @@ impl CacheWriter {
             stopping: CancellationToken::new(),
             closed: parking_lot::Mutex::new(false),
             recovery_failed: AtomicBool::new(false),
-            runtime,
+            apply_runtime,
+            io_runtime,
         }))
     }
 
@@ -229,6 +232,11 @@ impl CacheWriter {
             self.0.tasks.spawn_on(
                 async move {
                     let _claim = claim;
+                    tracing::trace!(
+                        dataset = %writer.0.dataset,
+                        thread = std::thread::current().name().unwrap_or("unnamed"),
+                        "Applying cache response",
+                    );
                     let propagation = children.map(|children| {
                         (
                             children,
@@ -254,7 +262,7 @@ impl CacheWriter {
                     }
                     Ok(())
                 },
-                &self.0.runtime,
+                &self.0.apply_runtime,
             )
         };
         task.await
@@ -279,7 +287,7 @@ impl CacheWriter {
                     () = refresh => {},
                 }
             },
-            &self.0.runtime,
+            &self.0.io_runtime,
         );
     }
 
@@ -323,6 +331,11 @@ impl CacheWriter {
         if request.batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(());
         }
+        // Preparation cannot mutate storage. Refusal here must neither trigger
+        // recovery nor change the accelerator's write-health state.
+        let request = self.prepare(request, permit).inspect_err(|error| {
+            tracing::debug!(dataset = %self.0.dataset, "Cache response was not prepared: {error}");
+        })?;
         let _guard = self.0.write_mutex.lock().await;
         let result = if self.0.recovery_failed.load(Ordering::Acquire) {
             Err(DataFusionError::Execution(format!(
@@ -330,7 +343,7 @@ impl CacheWriter {
                 self.0.dataset,
             )))
         } else {
-            self.replace(request, permit).await
+            self.replace(request).await
         };
         if let Err(error) = &result {
             #[cfg(not(windows))]
@@ -355,13 +368,20 @@ impl CacheWriter {
         result
     }
 
-    async fn replace(
+    fn prepare(
         &self,
-        request: CacheWriteRequest,
+        mut request: CacheWriteRequest,
         permit: &mut CacheFillPermit,
-    ) -> Result<()> {
+    ) -> Result<CacheWriteRequest> {
+        // A namespace filter alone must never authorize a replacement.
+        if request.replaces_existing && request.filters.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "Cannot replace a cache entry for dataset '{}' without a request predicate",
+                self.0.dataset,
+            )));
+        }
         let schema = self.0.accelerator.schema();
-        let batches = request
+        request.batches = request
             .batches
             .into_iter()
             .map(|batch| {
@@ -372,20 +392,23 @@ impl CacheWriter {
                 Ok(batch)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut filters = request.filters;
-        // No caller predicate must never become a namespace-wide deletion.
-        let can_delete = !filters.is_empty();
         if schema.column_with_name(CACHE_NAMESPACE_COLUMN).is_some() {
-            filters.push(namespace_filter_expr(&request.namespace_id));
+            request
+                .filters
+                .push(namespace_filter_expr(&request.namespace_id));
         }
+        Ok(request)
+    }
+
+    async fn replace(&self, request: CacheWriteRequest) -> Result<()> {
+        let CacheWriteRequest {
+            batches,
+            filters,
+            replaces_existing,
+            ..
+        } = request;
         let state = self.0.context.state();
-        if request.replaces_existing {
-            if !can_delete {
-                return Err(DataFusionError::Execution(format!(
-                    "Cannot replace a cache entry for dataset '{}' without a request predicate",
-                    self.0.dataset,
-                )));
-            }
+        if replaces_existing {
             match self
                 .0
                 .accelerator
@@ -408,7 +431,7 @@ impl CacheWriter {
             }
         }
         let input = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
+            self.0.accelerator.schema(),
             futures::stream::iter(batches.into_iter().map(Ok)),
         ));
         #[cfg(not(windows))]
@@ -457,6 +480,8 @@ mod tests {
         inner: Arc<dyn TableProvider>,
         started: Notify,
         resume: Notify,
+        fail_insert: AtomicBool,
+        insert_thread: parking_lot::Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -482,13 +507,27 @@ mod tests {
             input: Arc<dyn ExecutionPlan>,
             op: InsertOp,
         ) -> Result<Arc<dyn ExecutionPlan>> {
+            *self.insert_thread.lock() = std::thread::current().name().map(str::to_owned);
             self.started.notify_one();
             self.resume.notified().await;
+            if self.fail_insert.load(Ordering::Relaxed) {
+                return Err(DataFusionError::Execution(
+                    "accelerator insert failed".into(),
+                ));
+            }
             self.inner.insert_into(state, input, op).await
         }
     }
 
     fn fixture(pool: Arc<dyn MemoryPool>) -> (CacheWriter, Arc<PausedInsert>, RecordBatch) {
+        fixture_with_runtimes(pool, Handle::current(), Handle::current())
+    }
+
+    fn fixture_with_runtimes(
+        pool: Arc<dyn MemoryPool>,
+        apply_runtime: Handle,
+        io_runtime: Handle,
+    ) -> (CacheWriter, Arc<PausedInsert>, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
@@ -509,6 +548,8 @@ mod tests {
             inner,
             started: Notify::new(),
             resume: Notify::new(),
+            fail_insert: AtomicBool::new(false),
+            insert_thread: parking_lot::Mutex::new(None),
         });
         let writer = CacheWriter::new(
             Arc::clone(&paused) as Arc<dyn TableProvider>,
@@ -517,9 +558,158 @@ mod tests {
             Arc::new(AtomicI64::new(0)),
             RuntimeStatus::new(),
             pool,
-            Handle::current(),
+            apply_runtime,
+            io_runtime,
         );
         (writer, paused, batch)
+    }
+
+    fn request(batch: &RecordBatch) -> CacheWriteRequest {
+        CacheWriteRequest {
+            batches: vec![batch.clone()],
+            filters: vec![col("request_path").eq(lit("/a"))],
+            cache_key: "key".into(),
+            replaces_existing: false,
+            namespace_id: "public".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_refusal_does_not_wait_for_mutation_or_change_write_health() {
+        for prior_failures in [0, 3] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+            let (writer, paused, batch) = fixture(Arc::clone(&pool));
+            let status = Arc::clone(&writer.0.health.lock().runtime_status);
+            status.update_dataset(&writer.0.dataset, runtime_status::ComponentStatus::Ready);
+            for _ in 0..prior_failures {
+                writer
+                    .0
+                    .health
+                    .lock()
+                    .record_failure(&"existing storage failure");
+            }
+            let original_message = status
+                .get_dataset_status(&writer.0.dataset)
+                .and_then(|status| status.error_message().map(str::to_owned));
+            let claims: InFlightRevalidations =
+                Arc::new(parking_lot::Mutex::new(Default::default()));
+            let _write_guard = writer.0.write_mutex.lock().await;
+            for _ in 0..3 {
+                let ClaimOutcome::Leader(claim) =
+                    CacheKeyClaim::acquire(&claims, "key".into(), None)
+                else {
+                    panic!("refused preparation must release its claim");
+                };
+                let permit = writer.admit().await.expect("admission");
+                let error = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    writer.write(request(&batch), claim, permit),
+                )
+                .await
+                .expect("preparation must not wait for the held mutation lock")
+                .expect_err("preparation exceeds the budget");
+                assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+                assert_eq!(writer.0.health.lock().consecutive_failures, prior_failures);
+                assert_eq!(
+                    status
+                        .get_dataset_status(&writer.0.dataset)
+                        .and_then(|status| status.error_message().map(str::to_owned)),
+                    original_message,
+                );
+                assert!(!writer.0.recovery_failed.load(Ordering::Acquire));
+                assert_eq!(writer.0.last_updated_at.load(Ordering::Relaxed), 0);
+                assert!(paused.insert_thread.lock().is_none());
+                assert!(claims.lock().is_empty());
+                assert_eq!(pool.reserved(), 0);
+            }
+            writer.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_failures_still_report_write_health_and_success_clears_them() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let (writer, paused, batch) = fixture(Arc::clone(&pool));
+        let status = Arc::clone(&writer.0.health.lock().runtime_status);
+        status.update_dataset(&writer.0.dataset, runtime_status::ComponentStatus::Ready);
+        paused.fail_insert.store(true, Ordering::Relaxed);
+        for failures in 1..=3 {
+            paused.resume.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(5), writer.send(request(&batch)))
+                .await
+                .expect("write finishes")
+                .expect_err("accelerator refuses the insert");
+            assert!(error.to_string().contains("accelerator insert failed"));
+            assert_eq!(writer.0.health.lock().consecutive_failures, failures);
+            assert_eq!(writer.0.last_updated_at.load(Ordering::Relaxed), 0);
+            assert_eq!(pool.reserved(), 0);
+        }
+        assert!(
+            status
+                .get_dataset_status(&writer.0.dataset)
+                .expect("dataset status")
+                .is_error()
+        );
+        paused.fail_insert.store(false, Ordering::Relaxed);
+        paused.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), writer.send(request(&batch)))
+            .await
+            .expect("write finishes")
+            .expect("accelerator accepts the insert");
+        assert_eq!(writer.0.health.lock().consecutive_failures, 0);
+        assert_eq!(
+            status.get_dataset_status(&writer.0.dataset),
+            Some(runtime_status::ComponentStatus::Ready),
+        );
+        assert!(writer.0.last_updated_at.load(Ordering::Relaxed) > 0);
+        assert_eq!(pool.reserved(), 0);
+        writer.shutdown().await;
+    }
+
+    #[test]
+    fn mutations_and_source_refreshes_use_their_assigned_runtimes() {
+        let io = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("cache-test-io")
+            .enable_all()
+            .build()
+            .expect("I/O runtime");
+        let apply = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("cache-test-apply")
+            .enable_all()
+            .build()
+            .expect("apply runtime");
+        io.block_on(async {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+            let (writer, paused, batch) =
+                fixture_with_runtimes(pool, apply.handle().clone(), io.handle().clone());
+            paused.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), writer.send(request(&batch)))
+                .await
+                .expect("write finishes")
+                .expect("cache write");
+            assert_eq!(
+                paused.insert_thread.lock().as_deref(),
+                Some("cache-test-apply")
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            writer.spawn_refresh(async move {
+                tx.send(std::thread::current().name().map(str::to_owned))
+                    .expect("refresh observer");
+            });
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .expect("refresh runs")
+                    .expect("refresh reports its thread")
+                    .as_deref(),
+                Some("cache-test-io"),
+            );
+            tokio::time::timeout(Duration::from_secs(5), writer.shutdown())
+                .await
+                .expect("both runtimes drained");
+        });
     }
 
     #[tokio::test]
