@@ -2035,11 +2035,12 @@ impl Runtime {
                     let runtime = Arc::clone(&self);
                     let ds_clone = Arc::clone(ds);
                     let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+                    let load = self.dataset_loads.begin(&ds.name);
                     added_futures.insert(
                         resolve_table_reference(ds.name.clone()),
                         Box::pin(async move {
                             runtime
-                                .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                                .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
                                 .await;
                         }),
                     );
