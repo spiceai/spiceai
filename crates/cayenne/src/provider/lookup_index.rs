@@ -3006,6 +3006,95 @@ mod tests {
         }
     }
 
+    /// A write whose rows cannot all be indexed publishes no run, so none of
+    /// its files is covered and a lookup reads them in full. The case that
+    /// matters is a file whose first batch indexed and whose second did not:
+    /// publishing that run would claim the file while missing the second
+    /// batch's rows, and a lookup for them would skip the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_that_fails_to_index_covers_none_of_its_files() {
+        use vortex_datafusion::VortexWriteObserver;
+        // A batch without the `service` key column.
+        let unkeyed = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "tenant",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![Some(7_i64); 3]))],
+        )
+        .expect("batch");
+        for replaces in [false, true] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let state = keyed_state(&pool);
+            let observer = state.write_observer(replaces);
+            observer.batch_written(
+                &path("good.vortex"),
+                0,
+                &keyed_batch(&[Some(1); 3], &[Some("a"), Some("b"), Some("c")]),
+            );
+            observer.batch_written(
+                &path("split.vortex"),
+                0,
+                &keyed_batch(&[Some(7); 3], &[Some("x"), Some("y"), Some("z")]),
+            );
+            observer.batch_written(&path("split.vortex"), 3, &unkeyed);
+            let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
+            state.finish_write(&observer, replaces).await;
+            let covered: Vec<bool> = ["good.vortex", "split.vortex"]
+                .iter()
+                .map(|file| {
+                    state
+                        .published()
+                        .is_some_and(|view| view.covers(&format!("table/snapshot/{file}")))
+                })
+                .collect();
+            assert_eq!(
+                (
+                    covered,
+                    state.counters.builds_unpublished.load(Ordering::Relaxed) - unpublished
+                ),
+                (vec![false, false], 1),
+                "a write with an unindexed batch (replaces: {replaces}) must cover none of its files"
+            );
+            assert_eq!(
+                state.counters().index_bytes,
+                0,
+                "an unpublished run holds nothing"
+            );
+        }
+    }
+
+    /// A batch that arrives after its write's index was finished has no run
+    /// to join: its file stays uncovered while the finished run still covers
+    /// the files it holds in full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_after_the_write_finished_leaves_its_file_uncovered() {
+        use vortex_datafusion::VortexWriteObserver;
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let state = keyed_state(&pool);
+        let observer = state.write_observer(false);
+        observer.batch_written(
+            &path("first.vortex"),
+            0,
+            &keyed_batch(&[Some(1); 2], &[Some("a"), Some("b")]),
+        );
+        state.finish_write(&observer, false).await;
+        observer.batch_written(
+            &path("late.vortex"),
+            0,
+            &keyed_batch(&[Some(2); 2], &[Some("c"), Some("d")]),
+        );
+        let view = state
+            .published()
+            .expect("the finished write published its run");
+        assert!(view.covers("table/snapshot/first.vortex"));
+        assert!(
+            !view.covers("table/snapshot/late.vortex"),
+            "a late batch's file must be read in full"
+        );
+    }
+
     /// An append arrives in a burst far faster than its keys encode, and the
     /// queue absorbs it: an ordinary append of many batches is covered, not
     /// dropped as behind.
