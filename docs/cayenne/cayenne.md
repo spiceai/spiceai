@@ -114,8 +114,10 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
 
 For a table with a primary key, a full refresh resolves or validates key
 conflicts across the entire incoming stream before publishing the replacement,
-in both storage modes. `on_conflict: upsert` rejects a repeated key;
-`upsert_dedup` removes identical rows but rejects conflicting values; and
+in both storage modes. `on_conflict: drop` keeps the first row for each key;
+`upsert` rejects a repeated key. If `on_conflict` is absent, the runtime
+automatically configures `upsert` for a primary key. `upsert_dedup` removes
+identical rows but rejects conflicting values; and
 `upsert_dedup_by_row_id` keeps the last row for each key. A null key fails the
 refresh and leaves the prior table visible. The two deduplication modes buffer
 the incoming overwrite in memory to resolve conflicts across batches, including

@@ -19,6 +19,8 @@ limitations under the License.
 //! carried the null, so the message is built from the batch rather than written out at
 //! each call site.
 
+use arrow::array::BooleanArray;
+use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
@@ -31,7 +33,19 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::provider::pk_index::pk_digest_bytes;
-use crate::row_converter::RowConverter;
+use crate::row_converter::{OwnedRow, RowConverter};
+
+/// How an overwrite handles an incoming key that already appeared in the stream.
+#[derive(Clone, Copy)]
+pub(crate) enum OverwriteConflictAction {
+    Reject,
+    Drop,
+}
+
+enum SeenKeys {
+    Reject(HashSet<u128, PrehashedBuildHasher>),
+    Drop(HashSet<OwnedRow>),
+}
 
 /// Validate primary-key uniqueness over an entire replacement stream before it is published.
 pub(crate) struct OverwritePrimaryKeyValidationStream {
@@ -39,7 +53,7 @@ pub(crate) struct OverwritePrimaryKeyValidationStream {
     schema: SchemaRef,
     pk_indices: Vec<usize>,
     converter: RowConverter,
-    seen: HashSet<u128, PrehashedBuildHasher>,
+    seen: SeenKeys,
     table_name: String,
 }
 
@@ -49,6 +63,7 @@ impl OverwritePrimaryKeyValidationStream {
         pk_indices: Vec<usize>,
         converter: RowConverter,
         table_name: String,
+        action: OverwriteConflictAction,
     ) -> Self {
         let schema = inner.schema();
         Self {
@@ -56,7 +71,12 @@ impl OverwritePrimaryKeyValidationStream {
             schema,
             pk_indices,
             converter,
-            seen: HashSet::with_hasher(PrehashedBuildHasher),
+            seen: match action {
+                OverwriteConflictAction::Reject => {
+                    SeenKeys::Reject(HashSet::with_hasher(PrehashedBuildHasher))
+                }
+                OverwriteConflictAction::Drop => SeenKeys::Drop(HashSet::new()),
+            },
             table_name,
         }
     }
@@ -89,15 +109,34 @@ impl Stream for OverwritePrimaryKeyValidationStream {
                     Ok(rows) => rows,
                     Err(error) => return Poll::Ready(Some(Err(error.into()))),
                 };
-                for row in &rows {
-                    if !this.seen.insert(pk_digest_bytes(row.as_ref())) {
-                        return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                            "Data validation failed for table '{}': Incoming data contains duplicate primary key across batches",
-                            this.table_name
-                        )))));
+                match &mut this.seen {
+                    SeenKeys::Reject(seen) => {
+                        for row in &rows {
+                            if !seen.insert(pk_digest_bytes(row.as_ref())) {
+                                return Poll::Ready(Some(Err(DataFusionError::Execution(
+                                    format!(
+                                        "Data validation failed for table '{}': Incoming data contains duplicate primary key across batches",
+                                        this.table_name
+                                    ),
+                                ))));
+                            }
+                        }
+                        Poll::Ready(Some(Ok(batch)))
+                    }
+                    SeenKeys::Drop(seen) => {
+                        let keep: Vec<bool> =
+                            rows.iter().map(|row| seen.insert(row.owned())).collect();
+                        if keep.iter().all(|&keep| keep) {
+                            Poll::Ready(Some(Ok(batch)))
+                        } else {
+                            Poll::Ready(Some(
+                                filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(
+                                    |error| DataFusionError::ArrowError(Box::new(error), None),
+                                ),
+                            ))
+                        }
                     }
                 }
-                Poll::Ready(Some(Ok(batch)))
             }
             other => other,
         }

@@ -12762,6 +12762,14 @@ impl CayenneTableProvider {
                 pk_indices,
                 converter,
                 self.table_metadata.table_name.clone(),
+                if matches!(
+                    self.table_metadata.on_conflict.as_ref(),
+                    Some(OnConflict::Upsert(_))
+                ) {
+                    super::pk_validation::OverwriteConflictAction::Reject
+                } else {
+                    super::pk_validation::OverwriteConflictAction::Drop
+                },
             ),
         ))
     }
