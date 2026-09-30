@@ -434,6 +434,10 @@ mod tests {
     use datafusion::sql::unparser::Unparser;
     use std::sync::Arc;
 
+    /// One engine's "does it evaluate this node the way `DataFusion` does"
+    /// predicate, named so the engine tables below stay readable.
+    type CanEvaluateExpression = fn(&Expr, Option<&DFSchema>) -> bool;
+
     /// The [`ScalarFunction`] inside a call built by `DataFusion`'s own
     /// `expr_fn` helpers, so these guards run against the real UDFs rather
     /// than a stub that only shares their name.
@@ -711,7 +715,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let engines: [(&str, fn(&Expr, Option<&DFSchema>) -> bool); 4] = [
+        let engines: [(&str, CanEvaluateExpression); 4] = [
             ("DuckDB", duckdb_can_evaluate_expression),
             ("PostgreSQL", postgres_can_evaluate_expression),
             ("MySQL", mysql_can_evaluate_expression),
