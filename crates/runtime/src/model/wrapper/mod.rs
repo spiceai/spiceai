@@ -633,7 +633,7 @@ mod call_dependent_defaults {
     /// refuses ("When stream is true, use Chat::create_stream"); the call decides.
     #[test]
     fn a_stream_default_is_never_applied() {
-        let prepared = wrapper().with_model_defaults(request(serde_json::Value::Null));
+        let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
 
         assert_eq!(prepared.stream, None);
     }
