@@ -546,6 +546,7 @@ pub struct Refresher {
     /// The caching accelerator's claim set, forwarded to the refresh task so
     /// its periodic stale-row refresh claims the keys it replaces.
     in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
+    cache_writer: Option<crate::accelerated::caching::CacheWriteSender>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -617,6 +618,7 @@ impl Refresher {
             accelerator,
             caching: None,
             in_flight_revalidations: None,
+            cache_writer: None,
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
@@ -647,6 +649,14 @@ impl Refresher {
         in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
     ) -> &mut Self {
         self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
+    }
+
+    pub fn cache_writer(
+        &mut self,
+        writer: Option<crate::accelerated::caching::CacheWriteSender>,
+    ) -> &mut Self {
+        self.cache_writer = writer;
         self
     }
 
@@ -960,7 +970,9 @@ impl Refresher {
                 .with_in_flight_revalidations(Arc::clone(in_flight_revalidations));
         }
 
-        let mut refresh_task_runner = refresh_task_runner.build();
+        let mut refresh_task_runner = refresh_task_runner
+            .with_cache_writer(self.cache_writer.clone())
+            .build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
         // Handle for the refresh-completion handler below: cache invalidation

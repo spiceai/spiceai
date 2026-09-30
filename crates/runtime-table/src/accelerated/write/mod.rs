@@ -42,6 +42,7 @@ limitations under the License.
 //!
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
+pub(crate) mod append;
 pub mod dual_write;
 pub(crate) mod lock;
 pub(crate) mod write_back;

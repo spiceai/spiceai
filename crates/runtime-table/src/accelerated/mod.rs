@@ -449,6 +449,7 @@ pub struct Builder {
     caching_stale_if_error: StaleIfError,
     caching_max_size_bytes: Option<u64>,
     caching_max_items: Option<u64>,
+    caching_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
@@ -508,6 +509,9 @@ impl Builder {
             caching_stale_if_error: StaleIfError::default(),
             caching_max_size_bytes: None,
             caching_max_items: None,
+            caching_memory_pool: Arc::new(
+                datafusion::execution::memory_pool::GreedyMemoryPool::new(128 * 1024 * 1024),
+            ),
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
@@ -739,6 +743,15 @@ impl Builder {
         state: Option<snapshots::SnapshotRefreshState>,
     ) -> &mut Self {
         self.snapshot_refresh_state = state;
+        self
+    }
+
+    /// Share the runtime's memory budget with origin fetches and cache applies.
+    pub fn caching_memory_pool(
+        &mut self,
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> &mut Self {
+        self.caching_memory_pool = pool;
         self
     }
 
@@ -977,6 +990,17 @@ impl Builder {
                 .last_updated_at()
                 .map_or(AtomicI64::new(0), AtomicI64::new),
         );
+        let batch_write_tx = (refresh_mode == RefreshMode::Caching).then(|| {
+            caching::CacheWriteSender::new(
+                Arc::clone(&self.accelerator),
+                self.dataset_name.clone(),
+                Arc::clone(&self.accelerator_write_mutex),
+                Arc::clone(&last_updated_at),
+                Arc::clone(&self.runtime_status),
+                Arc::clone(&self.caching_memory_pool),
+                self.io_runtime.clone(),
+            )
+        });
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -992,6 +1016,7 @@ impl Builder {
         refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
+        refresher.cache_writer(batch_write_tx.clone());
         refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
@@ -1104,25 +1129,6 @@ impl Builder {
                 dataset = self.dataset_name,
             );
         }
-
-        // For caching mode, create the batched write channel and spawn consumer task.
-        let batch_write_tx = if refresh_mode == RefreshMode::Caching {
-            let (tx, rx) = caching::create_cache_write_channel();
-            let consumer_handle = caching::spawn_batched_cache_write_task(
-                rx,
-                Arc::clone(&self.accelerator),
-                self.dataset_name.clone(),
-                Arc::clone(&self.accelerator_write_mutex),
-                Arc::clone(&in_flight_revalidations),
-                Arc::clone(&last_updated_at),
-                Arc::clone(&self.runtime_status),
-            );
-            // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
-            handlers.push(consumer_handle);
-            Some(tx)
-        } else {
-            None
-        };
 
         // A caching accelerator is bounded by `caching_eviction` as a computed
         // retention policy rather than by a loop of its own, so the cache is
@@ -1619,6 +1625,20 @@ impl AcceleratedTable {
         Ok(filters_to_reapply)
     }
 
+    /// Fence new cache fills without cancelling accepted mutations.
+    pub fn close_cache_writes(&self) {
+        if let Some(writer) = &self.batch_write_tx {
+            writer.close();
+        }
+    }
+
+    /// Close cache admission and finish accepted mutations before table teardown.
+    pub async fn drain_cache_writes(&self) {
+        if let Some(writer) = &self.batch_write_tx {
+            writer.shutdown().await;
+        }
+    }
+
     fn update_last_updated_at(&self) {
         Self::set_timestamp_to_now(&self.last_updated_at);
     }
@@ -1637,6 +1657,7 @@ impl AcceleratedTable {
 
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
+        self.close_cache_writes();
         for handler in self.handlers.drain(..) {
             handler.abort();
         }

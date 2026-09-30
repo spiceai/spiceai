@@ -259,11 +259,9 @@ pub struct RefreshTaskBuilder {
     /// Per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
-    /// The cache keys a write is pending for, shared with the caching scan and
-    /// its batched writer. `RefreshMode::Caching`'s periodic stale-row refresh
-    /// replaces the entries it refreshes, so it has to claim each key for the
-    /// same reason every other writer does — see [`caching::CacheKeyClaim`].
+    /// Entry ownership shared with the caching scan and direct writer.
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    cache_writer: Option<super::caching::CacheWriteSender>,
 }
 
 impl RefreshTaskBuilder {
@@ -300,7 +298,14 @@ impl RefreshTaskBuilder {
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            cache_writer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_cache_writer(mut self, writer: Option<super::caching::CacheWriteSender>) -> Self {
+        self.cache_writer = writer;
+        self
     }
 
     /// Sets the `disable_federation` flag
@@ -474,9 +479,10 @@ impl RefreshTaskBuilder {
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
-            cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
+            append_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
+            cache_writer: self.cache_writer,
             session_state,
         }
     }
@@ -553,10 +559,11 @@ pub struct RefreshTask {
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
     /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
-    cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
+    append_plan_cache: Arc<Mutex<Option<super::write::append::AppendPlanCache>>>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    cache_writer: Option<super::caching::CacheWriteSender>,
     /// Built once instead of a fresh `SessionContext` per stale entry.
     session_state: Arc<SessionState>,
 }
@@ -1253,6 +1260,13 @@ impl RefreshTask {
             self.dataset_name,
         );
 
+        let writer = self.cache_writer.clone().ok_or_else(|| {
+            RetryError::permanent(super::Error::FailedToRefreshDataset {
+                source: DataFusionError::Execution(
+                    "Caching refresh requires its dataset writer".to_string(),
+                ),
+            })
+        })?;
         // Use the CacheRefreshHelper to identify and refresh all stale rows
         let federated_provider = self.federated.table_provider().await;
         let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
@@ -1261,7 +1275,7 @@ impl RefreshTask {
             Arc::clone(&self.session_state),
             self.dataset_name.to_string().as_str(),
             ttl,
-            Arc::clone(&self.accelerator_write_mutex),
+            writer,
             Arc::clone(&self.in_flight_revalidations),
         )
         .await

@@ -1457,10 +1457,14 @@ impl DataFusion {
                         &dataset.metadata,
                         &dataset.columns,
                     );
-                    self.ctx
+                    let previous = self
+                        .ctx
                         .register_table(dataset_table_ref.clone(), table_provider)
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
+                    if let Some(previous) = previous {
+                        Self::drain_provider_cache_writes(previous.as_ref()).await;
+                    }
                     notifier
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
@@ -2824,10 +2828,21 @@ impl DataFusion {
         self.ctx.catalog(catalog).is_some()
     }
 
+    async fn drain_provider_cache_writes(provider: &dyn TableProvider) {
+        if let Some(table) =
+            spice_table::find_layer::<AcceleratedTable>(provider, spice_table::LayerWalk::Read)
+        {
+            table.drain_cache_writes().await;
+        }
+    }
+
     pub async fn remove_view(&self, view_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(view_name.clone()).unwrap_or(false) {
             return Ok(());
         }
+
+        let provider = self.get_table_provider(view_name).await?;
+        Self::drain_provider_cache_writes(provider.as_ref()).await;
 
         if let Err(e) = self.ctx.deregister_table(view_name.clone()) {
             return UnableToDeleteTableSnafu {
@@ -2847,6 +2862,9 @@ impl DataFusion {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
+
+        let provider = self.get_table_provider(dataset_name).await?;
+        Self::drain_provider_cache_writes(provider.as_ref()).await;
 
         if let Err(e) = self.ctx.deregister_table(dataset_name.clone()) {
             return UnableToDeleteTableSnafu {
@@ -3211,6 +3229,8 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
+        accelerated_table_builder
+            .caching_memory_pool(Arc::clone(&self.ctx.runtime_env().memory_pool));
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
@@ -4910,6 +4930,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
+        builder.caching_memory_pool(Arc::clone(&self.ctx.runtime_env().memory_pool));
         builder.cpu_runtime(self.refresh_runtime().cloned());
         builder.cluster_role(self.cluster_config.effective_role());
         builder.initial_load_complete(initial_load_complete);
@@ -4969,11 +4990,15 @@ impl DataFusion {
             &view.columns,
         );
 
-        self.ctx
+        let previous = self
+            .ctx
             .register_table(table.clone(), Arc::clone(&table_provider))
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to register view: {e}"),
             })?;
+        if let Some(previous) = previous {
+            Self::drain_provider_cache_writes(previous.as_ref()).await;
+        }
 
         // Taken from the provider just registered, rather than re-resolved by
         // name once the caller resumes: by then the name may already answer with
@@ -5089,6 +5114,21 @@ impl DataFusion {
         }
 
         let accelerated_tables = self.accelerated_tables.read().await.clone();
+
+        // Fence every dataset before waiting for any individual drain.
+        for name in &accelerated_tables {
+            match self.get_table_provider(name).await {
+                Ok(provider) => {
+                    if let Some(table) = spice_table::find_layer::<AcceleratedTable>(
+                        provider.as_ref(),
+                        spice_table::LayerWalk::Read,
+                    ) {
+                        table.close_cache_writes();
+                    }
+                }
+                Err(error) => tracing::warn!("Unable to close cache writes for '{name}': {error}"),
+            }
+        }
 
         for table in &accelerated_tables {
             if let Err(err) = self.remove_table(table).await {

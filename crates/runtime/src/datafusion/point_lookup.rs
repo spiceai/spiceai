@@ -49,9 +49,9 @@ use datafusion::physical_plan::ExecutionPlan;
 /// plain columns over a filter of column-against-constant comparisons over one table scan, with
 /// no join, aggregate, subquery, window, sort, union, distinct or limit anywhere.
 ///
-/// `EnforceDistribution` and `EnforceSorting` are here because the shape has no distribution or
-/// ordering requirement; that holds only while `LIMIT` stays excluded (a global limit needs a
-/// single input partition, which `EnforceDistribution` would provide). Rules that act on a scan
+/// `EnforceSorting` is here because the shape has no ordering requirement.
+/// `EnforceDistribution` must run: a provider's scan can contain operators requiring a single
+/// input partition even when the logical query is a point lookup. Rules that act on a scan
 /// of a particular connector (`HttpParamsPushdown`, the `DuckDB` rules) and
 /// `propagate_empty_relation` (which shapes the plan of a contradictory predicate) are not here:
 /// they cost well under a microsecond and are not worth reasoning about per connector.
@@ -88,7 +88,6 @@ pub(crate) const SKIPPABLE_RULES: &[&str] = &[
     "join_selection",
     "eager_aggregation",
     "LimitedDistinctAggregation",
-    "EnforceDistribution",
     "CombinePartialFinalAggregate",
     "EnforceSorting",
     "OptimizeAggregateOrder",
@@ -473,11 +472,12 @@ mod tests {
 
     use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::catalog::MemTable;
+    use datafusion::catalog::{MemTable, Session, TableProvider};
     use datafusion::common::{Constraint, Constraints};
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::physical_plan::displayable;
-    use datafusion::prelude::SessionContext;
+    use datafusion::logical_expr::{Expr, TableType};
+    use datafusion::physical_plan::{ExecutionPlan, displayable, limit::GlobalLimitExec};
+    use datafusion::prelude::{SessionConfig, SessionContext};
 
     use super::{create_physical_plan, is_point_lookup, wrap_skippable_rules};
 
@@ -609,6 +609,102 @@ mod tests {
                 .await
                 .expect("lean rows");
             assert_eq!(full_rows, lean_rows, "{sql}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct SinglePartitionTable(MemTable);
+
+    #[async_trait::async_trait]
+    impl TableProvider for SinglePartitionTable {
+        fn schema(&self) -> Arc<Schema> {
+            self.0.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.0.table_type()
+        }
+
+        fn constraints(&self) -> Option<&Constraints> {
+            self.0.constraints()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            let input = self.0.scan(state, projection, filters, limit).await?;
+            Ok(Arc::new(GlobalLimitExec::new(input, 0, None)))
+        }
+    }
+
+    #[tokio::test]
+    async fn point_lookup_enforces_provider_input_distribution() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let partitions = [vec![1, 3], vec![2, 4]]
+            .into_iter()
+            .map(|values| {
+                vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(values))],
+                    )
+                    .expect("partition"),
+                ]
+            })
+            .collect();
+        let table = MemTable::try_new(schema, partitions)
+            .expect("table")
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
+        let mut builder = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(SessionConfig::new().with_target_partitions(1));
+        wrap_skippable_rules(&mut builder);
+        let ctx = SessionContext::new_with_state(builder.build());
+        ctx.register_table("single_partition", Arc::new(SinglePartitionTable(table)))
+            .expect("register");
+
+        // The logical query has no distribution requirement, but the provider's plan does.
+        for id in [1, 2, 3, 4, 5] {
+            let sql = format!("SELECT id FROM single_partition WHERE id = {id}");
+            let plan = unoptimized(&ctx, &sql).await;
+            assert!(is_point_lookup(&plan), "{sql}");
+            let full = create_physical_plan(&mut ctx.state(), &plan, false)
+                .await
+                .expect("full plan");
+            let lean = create_physical_plan(&mut ctx.state(), &plan, true)
+                .await
+                .expect("point lookup plan");
+            let full_plan = displayable(full.as_ref()).indent(true).to_string();
+            let lean_plan = displayable(lean.as_ref()).indent(true).to_string();
+            assert!(lean_plan.contains("CoalescePartitionsExec"), "{lean_plan}");
+            assert_eq!(full_plan, lean_plan, "{sql}");
+            let full_rows = datafusion::physical_plan::collect(full, ctx.task_ctx())
+                .await
+                .expect("full rows");
+            let lean_rows = datafusion::physical_plan::collect(lean, ctx.task_ctx())
+                .await
+                .expect("point lookup rows");
+            assert_eq!(full_rows, lean_rows, "{sql}");
+            let actual: Vec<i64> = lean_rows
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id")
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(actual, if id <= 4 { vec![id] } else { vec![] }, "{sql}");
         }
     }
 

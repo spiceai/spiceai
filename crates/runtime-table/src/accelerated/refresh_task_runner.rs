@@ -69,6 +69,7 @@ pub struct RefreshTaskRunnerBuilder {
     /// Forwarded to the refresh task so the caching stale-row refresh claims
     /// the keys it replaces.
     in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
+    cache_writer: Option<crate::accelerated::caching::CacheWriteSender>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -104,6 +105,7 @@ impl RefreshTaskRunnerBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             in_flight_revalidations: None,
+            cache_writer: None,
         }
     }
 
@@ -189,6 +191,15 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_cache_writer(
+        mut self,
+        writer: Option<crate::accelerated::caching::CacheWriteSender>,
+    ) -> Self {
+        self.cache_writer = writer;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -199,6 +210,7 @@ impl RefreshTaskRunnerBuilder {
             self.io_runtime,
             self.accelerator_write_mutex,
         )
+        .with_cache_writer(self.cache_writer)
         .with_disable_federation(self.disable_federation)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_metrics(self.metrics);

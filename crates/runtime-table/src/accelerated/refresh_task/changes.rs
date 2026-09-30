@@ -21,6 +21,7 @@ use crate::accelerated::refresh_completion::RefreshCompletion;
 use crate::accelerated::refresh_task::deletion::{
     build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
 };
+use crate::accelerated::write::append::AppendPlanCache;
 #[cfg(not(windows))]
 use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow::array::{
@@ -45,16 +46,12 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 #[cfg(test)]
 use datafusion::logical_expr::Expr;
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use runtime_acceleration::dataupdate::{
-    StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
-};
+use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::OnSchemaChange;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_component::schema_evolution::{
@@ -62,14 +59,13 @@ use runtime_component::schema_evolution::{
     emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
 };
 use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
-use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_metrics::acceleration as metrics;
 use runtime_status as status;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
-use spice_table::{LayerWalk, SpiceTable, find_concrete};
+use spice_table::SpiceTable;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -353,43 +349,6 @@ async fn checkpoint_pending_memory_cdc_commits(
     );
     tracing::error!("{error_message}");
     Some(error_message)
-}
-
-pub(super) struct CdcInsertPlanCache {
-    target_schema: SchemaRef,
-    streaming_plan: Arc<StreamingDataUpdateExecutionPlan>,
-    insert_plan: Arc<dyn ExecutionPlan>,
-}
-
-impl CdcInsertPlanCache {
-    async fn try_new(
-        accelerator: &Arc<dyn TableProvider>,
-        session_state: &SessionState,
-        target_schema: SchemaRef,
-    ) -> Result<Self, DataFusionError> {
-        let streaming_plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
-            &target_schema,
-        )));
-        let streaming_exec: Arc<dyn ExecutionPlan> =
-            Arc::<StreamingDataUpdateExecutionPlan>::clone(&streaming_plan);
-        let cast_plan: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
-            streaming_exec,
-            Arc::clone(&target_schema),
-        ));
-        let insert_plan = accelerator
-            .insert_into(session_state, cast_plan, InsertOp::Append)
-            .await?;
-
-        Ok(Self {
-            target_schema,
-            streaming_plan,
-            insert_plan,
-        })
-    }
-
-    fn matches_schema(&self, schema: &SchemaRef) -> bool {
-        self.target_schema.as_ref() == schema.as_ref()
-    }
 }
 
 struct ApplyContext<'a> {
@@ -2799,51 +2758,16 @@ impl RefreshTask {
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
 
-        let (streaming_plan, insert_plan) = {
-            let mut cache_guard = self.cdc_insert_plan_cache.lock().await;
-            let rebuild_cache = cache_guard
-                .as_ref()
-                .is_none_or(|cache| !cache.matches_schema(&target_schema));
-            if rebuild_cache {
-                *cache_guard = Some(
-                    CdcInsertPlanCache::try_new(
-                        &self.accelerator,
-                        session_state,
-                        Arc::clone(&target_schema),
-                    )
-                    .await
-                    .map_err(find_datafusion_root)
-                    .context(crate::accelerated::FailedToWriteDataSnafu)?,
-                );
-            }
-
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                crate::accelerated::Error::FailedToWriteData {
-                    source: DataFusionError::Execution(
-                        "CDC insert plan cache was not initialized".to_string(),
-                    ),
-                }
-            })?;
-            cache
-                .streaming_plan
-                .set_stream(record_batch_stream)
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated::FailedToWriteDataSnafu)?;
-            (
-                Arc::clone(&cache.streaming_plan),
-                Arc::clone(&cache.insert_plan),
-            )
-        };
-
-        let collect_result = collect(insert_plan, ctx.task_ctx())
-            .await
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu);
-        streaming_plan
-            .clear_stream()
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu)?;
-        collect_result?;
+        AppendPlanCache::append(
+            &mut *self.append_plan_cache.lock().await,
+            &self.accelerator,
+            session_state,
+            ctx.task_ctx(),
+            record_batch_stream,
+        )
+        .await
+        .map_err(find_datafusion_root)
+        .context(crate::accelerated::FailedToWriteDataSnafu)?;
         perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
@@ -3059,7 +2983,7 @@ impl RefreshTask {
     /// loses pipelined finalization (backgrounded publish, no blocking
     /// `apply_on_conflict_deletions`).
     ///
-    /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
+    /// Uses [`spice_table::LayerWalk::Write`], which steps only through wrappers whose
     /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
     /// `IndexLayer`), as each layer's `route` declares.
     ///
@@ -3072,7 +2996,7 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete::<CayenneTableProvider>(self.accelerator.as_ref(), LayerWalk::Write)
+        crate::accelerated::write::append::cayenne_append_target(self.accelerator.as_ref())
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
