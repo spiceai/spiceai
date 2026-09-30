@@ -26,7 +26,7 @@ limitations under the License.
 
 use std::collections::BTreeSet;
 
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{Field, SchemaRef};
 use data_components::inferred_schema::InferredSchema;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
@@ -184,16 +184,9 @@ pub fn apply_inferred_schema(
             // An index the engine would refuse at registration is dropped here
             // instead: the user never declared it, so it must not become a
             // configuration error that keeps the whole dataset from loading.
-            if let Some((column, data_type)) =
-                unindexable_column(engine, effective_schema, &index.columns)
-            {
-                let warning = inferred_index_skip_warning(
-                    dataset_name,
-                    engine,
-                    &index.columns,
-                    column,
-                    data_type,
-                );
+            if let Some(field) = unindexable_column(engine, effective_schema, &index.columns) {
+                let warning =
+                    inferred_index_skip_warning(dataset_name, engine, &index.columns, field);
                 tracing::warn!("{warning}");
                 continue;
             }
@@ -235,52 +228,46 @@ pub fn apply_inferred_schema(
     );
 }
 
-/// The first column of an inferred index that `engine` cannot key, with its type,
-/// or `None` when the engine accepts every column of the index.
+/// The first column of an inferred index that `engine` cannot key, or `None` when
+/// the engine accepts every column of the index.
 ///
-/// Cayenne refuses an index whose key includes a floating-point column at
-/// registration (`KeyColumn::resolve` in `crates/cayenne/src/provider/lookup_index.rs`):
+/// Cayenne refuses a floating-point key column at registration (`KeyColumn::resolve`
+/// in `crates/cayenne/src/provider/lookup_index.rs`, which this rule mirrors), since
 /// float equality admits values such as signed zero that have no single byte
-/// encoding, so the index could miss rows. A *declared* index still reaches Cayenne
-/// and fails with that actionable error; an *inferred* one is skipped by the caller,
-/// because the user never asked for it (#14590). The other engines build secondary
-/// indexes over any column type.
+/// encoding. A *declared* index still reaches Cayenne and fails with that actionable
+/// error; an *inferred* one is skipped by the caller, because the user never asked
+/// for it (#14590). The other engines index any column type.
 ///
 /// Columns absent from `schema` are ignored here; the caller has already skipped
 /// an index naming one.
 fn unindexable_column<'a>(
     engine: Engine,
     schema: &'a SchemaRef,
-    columns: &'a [String],
-) -> Option<(&'a str, &'a DataType)> {
+    columns: &[String],
+) -> Option<&'a Field> {
     if engine != Engine::Cayenne {
         return None;
     }
     columns
         .iter()
         .filter_map(|column| schema.field_with_name(column).ok())
-        .map(|field| (field.name().as_str(), field.data_type()))
-        .find(|(_, data_type)| {
-            matches!(
-                data_type,
-                DataType::Float16 | DataType::Float32 | DataType::Float64
-            )
-        })
+        .find(|field| field.data_type().is_floating())
 }
 
 /// The warning logged when an inferred secondary index is skipped because
-/// `engine` cannot key `column`: names the dataset and the index, says what the
+/// `engine` cannot key `field`: names the dataset and the index, says what the
 /// user will observe, and gives the cause and the fix.
 fn inferred_index_skip_warning(
     dataset_name: &str,
     engine: Engine,
     index_columns: &[String],
-    column: &str,
-    data_type: &DataType,
+    field: &Field,
 ) -> String {
     format!(
-        "Dataset '{dataset_name}' ({engine}): skipped the secondary index on ({}) inferred from the source, so equality lookups on those columns scan the table instead. Cause: column '{column}' has floating-point type {data_type}, which the {engine} accelerator cannot index; to index it, use an integer, decimal, string, or other exact-equality type. See: https://spiceai.org/docs/features/data-acceleration/indexes",
-        index_columns.join(", ")
+        "Dataset '{dataset_name}' ({engine}): skipped the secondary index on ({}) inferred from the source, so equality lookups on those columns scan the table instead. Cause: column '{}' has floating-point type {}, which the {engine} accelerator cannot index; to index it, use an integer, decimal, string, or other exact-equality type. See: https://spiceai.org/docs/features/data-acceleration/indexes",
+        index_columns.join(", "),
+        field.name(),
+        field.data_type()
     )
 }
 
@@ -482,7 +469,7 @@ fn apply_inferred_shard_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Schema};
     use data_components::inferred_schema::{InferredIndex, InferredSortColumn};
     use std::sync::Arc;
 
@@ -955,6 +942,12 @@ mod tests {
         (inferred, schema)
     }
 
+    /// Applies the issue's table to `acc`.
+    fn apply_float_indexed_source(acc: &mut Acceleration, refresh_mode: RefreshMode) {
+        let (inferred, schema) = float_indexed_source();
+        apply_inferred_schema(acc, &inferred, &schema, "t", refresh_mode);
+    }
+
     // regression test for #14590
     #[test]
     fn cayenne_skips_inferred_index_on_float_column_and_keeps_the_rest() {
@@ -963,8 +956,7 @@ mod tests {
         // instead, and the inferred index on `(a, b)` still applies.
         for refresh_mode in [RefreshMode::Full, RefreshMode::Changes] {
             let mut acc = accel(Engine::Cayenne);
-            let (inferred, schema) = float_indexed_source();
-            apply_inferred_schema(&mut acc, &inferred, &schema, "t", refresh_mode);
+            apply_float_indexed_source(&mut acc, refresh_mode);
 
             assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
             assert_eq!(
@@ -1001,8 +993,7 @@ mod tests {
         // receive the inferred index unchanged.
         for engine in [Engine::Sqlite, Engine::PostgreSQL, Engine::Arrow] {
             let mut acc = accel(engine);
-            let (inferred, schema) = float_indexed_source();
-            apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+            apply_float_indexed_source(&mut acc, RefreshMode::Full);
 
             assert_eq!(
                 acc.indexes.len(),
@@ -1020,8 +1011,7 @@ mod tests {
         // reaches Cayenne, which fails registration with its actionable error.
         let mut acc = accel(Engine::Cayenne);
         acc.indexes.insert(col_ref(&["v"]), IndexType::Enabled);
-        let (inferred, schema) = float_indexed_source();
-        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        apply_float_indexed_source(&mut acc, RefreshMode::Full);
 
         assert_eq!(acc.indexes.len(), 1);
         assert!(acc.indexes.contains_key(&col_ref(&["v"])));
@@ -1037,8 +1027,7 @@ mod tests {
             "orders",
             Engine::Cayenne,
             &columns,
-            "v",
-            &DataType::Float64,
+            &Field::new("v", DataType::Float64, true),
         );
 
         assert!(
