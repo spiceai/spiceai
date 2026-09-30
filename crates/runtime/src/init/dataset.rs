@@ -2066,14 +2066,6 @@ impl Runtime {
             .collect();
         let datasets_to_apply = with_localpod_dependents(changed_datasets, &valid_datasets);
 
-        for ds in &existing_datasets {
-            if datasets_to_apply.iter().any(|next| next.name == ds.name)
-                || !valid_datasets.iter().any(|next| next.name == ds.name)
-            {
-                self.cancel_snapshot_bootstrap(&ds.name).await;
-            }
-        }
-
         // A load of a configuration this diff replaces or removes may still be
         // retrying, and its first successful attempt would register that
         // configuration over the one the Spicepod now declares (#1458). Stop it
@@ -2081,6 +2073,12 @@ impl Runtime {
         // or registers it. A dataset whose load was still retrying never
         // registered, so its new configuration is loaded below like an added
         // dataset's, retrying until its source answers, rather than updated once.
+        //
+        // A snapshot reader still waiting for its first publication is such a
+        // load: superseding it drops its bootstrap, so the source table it may
+        // have registered meanwhile is replaced below rather than kept serving
+        // the replaced configuration. Its runtime task has then ended, and only
+        // its registry entry is left to remove.
         let removed_datasets = current_app
             .datasets
             .iter()
@@ -2093,8 +2091,9 @@ impl Runtime {
             .chain(removed_datasets)
         {
             if self.dataset_loads.supersede(&name).await {
-                still_loading.insert(name);
+                still_loading.insert(name.clone());
             }
+            self.cancel_snapshot_bootstrap(&name).await;
         }
 
         let init_results = self
@@ -2179,17 +2178,23 @@ impl Runtime {
                 // restored and its provider can be registered in place.
             }
 
-            // A superseded attempt can be dropped after it registered the table
-            // and before its load completed.
-            if still_loading.contains(&ds.name) && self.df.table_exists(&ds.name) {
-                Arc::clone(&self)
-                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
-                    .await;
-            }
-
+            let serving = if still_loading.contains(&ds.name) {
+                // A superseded attempt can be dropped after it registered the table
+                // and before its load completed.
+                if self.df.table_exists(&ds.name) {
+                    Arc::clone(&self)
+                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .await;
+                }
+                false
+            } else {
+                // A snapshot reader keeps serving its table until the replacement
+                // snapshot has been restored (see above).
+                self.df.table_exists(&ds.name)
+            };
             self.status.update_dataset(
                 &ds.name,
-                if self.df.table_exists(&ds.name) {
+                if serving {
                     status::ComponentStatus::Refreshing
                 } else {
                     status::ComponentStatus::Initializing
