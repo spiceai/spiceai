@@ -2621,6 +2621,16 @@ pub struct CayenneTableProvider {
     pk_constraints: Option<Constraints>,
 }
 
+/// One protected layer an overwrite publishes above its main snapshot; see
+/// [`crate::metadata::OverwriteLayer`].
+pub(crate) struct OverwriteLayerPublish<'a> {
+    pub(crate) snapshot_id: &'a str,
+    pub(crate) threshold: i64,
+    pub(crate) delete_sequence: i64,
+    pub(crate) insert_sequence: i64,
+    pub(crate) tombstones: &'a super::overwrite_layers::LayerTombstones,
+}
+
 /// The inline corpus an overwrite commits alongside its snapshot flip, as the
 /// in-memory visibility state needs to describe it. Both values come from the
 /// single `cayenne_inlined_data` row [`CayenneCatalog::commit_overwrite_in_txn`]
@@ -5707,6 +5717,7 @@ impl CayenneTableProvider {
         &self,
         new_snapshot_id: &str,
         inlined_rows: Option<InlinedOverwritePublish>,
+        layers: &[OverwriteLayerPublish<'_>],
     ) -> Result<Option<u64>> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
@@ -5729,6 +5740,7 @@ impl CayenneTableProvider {
                 new_snapshot_id,
                 new_listing_table,
                 inlined_rows,
+                layers,
             );
             discarded_epoch
         };
@@ -5888,6 +5900,7 @@ impl CayenneTableProvider {
         new_snapshot_id: &str,
         new_listing_table: Arc<ListingTable>,
         inlined_rows: Option<InlinedOverwritePublish>,
+        layers: &[OverwriteLayerPublish<'_>],
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
         // and every step here is synchronous, while a scan-view capture holds
@@ -5903,6 +5916,28 @@ impl CayenneTableProvider {
             lookup_index.promote_staged(new_snapshot_id);
         }
         self.clear_all_deletion_caches();
+        // The overwrite's own protected layers and their tombstones, which its
+        // catalog transaction wrote after clearing the previous ones. Installed in
+        // the same flip as the snapshot pointer, so a scan sees either the old table
+        // or every layer of the new one.
+        if !layers.is_empty() {
+            self.protected_snapshots.store(Arc::new(
+                layers
+                    .iter()
+                    .map(|layer| (layer.snapshot_id.to_string(), layer.threshold))
+                    .collect(),
+            ));
+            for layer in layers {
+                if !layer.tombstones.is_empty() {
+                    self.publish_staged_key_deletion_cache(
+                        &layer.tombstones.pk_i64,
+                        &layer.tombstones.row_keys,
+                        layer.delete_sequence,
+                        layer.insert_sequence,
+                    );
+                }
+            }
+        }
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
         // `inlined_generation`; bump it here, under the fence, so a scan never pairs
@@ -12755,6 +12790,42 @@ impl CayenneTableProvider {
         Ok(Some(indices))
     }
 
+    /// How this table's writes resolve a primary key they repeat, or `None` when
+    /// the table has no primary key or no `on_conflict`; see
+    /// [`super::key_conflicts`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a primary key column is missing or cannot be encoded.
+    pub(crate) fn key_resolver(&self) -> Result<Option<super::key_conflicts::KeyResolver>> {
+        let Some(policy) = super::key_conflicts::ConflictPolicy::new(
+            self.table_metadata.on_conflict.as_ref(),
+            self.upsert_dedup,
+        ) else {
+            return Ok(None);
+        };
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok(None);
+        };
+        Ok(Some(super::key_conflicts::KeyResolver::new(
+            &self.table_metadata.table_name,
+            &self.table_schema(),
+            &pk_indices,
+            policy,
+        )?))
+    }
+
+    /// The primary key column whose values this table's tombstones store
+    /// directly, when its deletion strategy keys tombstones by an `Int64` key.
+    pub(crate) fn int64_tombstone_key(&self) -> Option<usize> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                self.pk_column_indices.first().copied()
+            }
+            _ => None,
+        }
+    }
+
     /// Build a `RowConverter` for the primary key columns.
     fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
         let table_schema = self.table_schema();
@@ -15909,7 +15980,7 @@ impl CayenneTableProvider {
     /// For `Int64Pk` tables, encodes each i64 as big-endian bytes.
     /// For `RowConverterBased` tables, passes through the already-encoded row keys.
     /// Position-based tables don't support upserts and return an empty vec.
-    fn build_pk_deletion_row_keys<'keys>(
+    pub(crate) fn build_pk_deletion_row_keys<'keys>(
         &self,
         deleted_pk_i64: &[i64],
         deleted_row_keys: Cow<'keys, [Box<[u8]>]>,
@@ -15972,7 +16043,7 @@ impl CayenneTableProvider {
         Ok(Some(results))
     }
 
-    async fn write_key_deletion_vectors(
+    pub(crate) async fn write_key_deletion_vectors(
         &self,
         delete_sequence: i64,
         row_keys: Vec<Box<[u8]>>,
@@ -19101,7 +19172,7 @@ impl CayenneTableProvider {
         // only when the new manifest was authored above (publish-before-clear).
         // Best-effort: a prune failure must not fail the compaction.
         if manifest_authored
-            && let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await
+            && let Err(error) = self.prune_snapshot_manifest_to(&[&new_snapshot_id]).await
         {
             tracing::warn!(
                 target: "cayenne::compaction",
@@ -21291,10 +21362,10 @@ impl CayenneTableProvider {
     /// (publish-before-clear).
     pub(crate) async fn prune_snapshot_manifest_to(
         &self,
-        keep_snapshot_id: &str,
+        keep_snapshot_ids: &[&str],
     ) -> CatalogResult<()> {
         self.catalog
-            .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
+            .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_ids)
             .await
     }
 
@@ -22396,7 +22467,7 @@ impl CayenneTableProvider {
         // snapshot's manifest rows are dead. Prune them and assert the live
         // manifest matches the listing we wrote it from (debug builds only).
         if let Some(files) = manifest_listed {
-            if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+            if let Err(error) = self.prune_snapshot_manifest_to(&[&new_snapshot_id]).await {
                 tracing::warn!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -23534,7 +23605,7 @@ impl CayenneTableProvider {
             // Cold graduation's content is the registered cold files; the overwrite
             // clear drops the warm tier's inline corpus with nothing to replace it,
             // so there are no inline rows to republish.
-            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None);
+            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None, &[]);
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -23589,7 +23660,7 @@ impl CayenneTableProvider {
             self.taint_persisted_row_count_exactness().await;
         }
 
-        if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+        if let Err(error) = self.prune_snapshot_manifest_to(&[&new_snapshot_id]).await {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -41422,7 +41493,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id, None)
+                        .publish_overwrite_snapshot(&overwrite_id, None, &[])
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);
@@ -53238,7 +53309,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id, None)
+                        .publish_overwrite_snapshot(&overwrite_id, None, &[])
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);
@@ -68923,4 +68994,7 @@ mod tests {
         );
     }
 
+
+    mod layered_overwrite;
+    mod layered_upsert_state;
 }

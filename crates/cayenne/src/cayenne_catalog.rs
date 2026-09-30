@@ -1049,7 +1049,7 @@ impl CayenneCatalog {
         // cold store. No inline payload: a graduation's content is the cold files
         // registered below, and the overwrite clear correctly drops the warm
         // tier's inline corpus along with everything else keyed on the old snapshot.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
             .await?;
         // One statement per file rather than `execute_many`: each row carries
         // a statistics blob and a primary-key bloom of up to
@@ -1091,6 +1091,7 @@ impl CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        layers: &[crate::metadata::OverwriteLayer],
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -1150,6 +1151,27 @@ impl CayenneCatalog {
                         .to_string(),
                     source: Box::new(e),
                 })?;
+        }
+
+        // The overwrite's protected layers and their tombstones, after the batch
+        // above cleared the previous ones, so the transaction publishes exactly the
+        // state an overwrite followed by one upsert per layer would leave.
+        for layer in layers {
+            let mut payload = crate::provider::on_conflict::PreparedOnConflictDurablePayload {
+                table_id: table_id.to_string(),
+                delete_files: layer.delete_files.clone(),
+                insert_pk_bytes: layer.insert_pk_bytes.clone(),
+                inline_tombstone: None,
+                pending_durable_flips: Vec::new(),
+            };
+            Self::apply_prepared_on_conflict_payload_in_txn(
+                txn,
+                &mut payload,
+                &layer.snapshot_id,
+                layer.threshold,
+                Some(layer.insert_sequence),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -3529,6 +3551,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        layers: &[crate::metadata::OverwriteLayer],
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -3551,7 +3574,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, layers)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -4032,17 +4055,27 @@ impl MetadataCatalog for CayenneCatalog {
     async fn clear_snapshot_files_except(
         &self,
         table_id: &str,
-        snapshot_id: &str,
+        keep_snapshot_ids: &[&str],
     ) -> CatalogResult<()> {
+        if keep_snapshot_ids.is_empty() {
+            return self.clear_snapshot_files(table_id).await;
+        }
+        let placeholders: Vec<String> = (0..keep_snapshot_ids.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect();
+        let sql = format!(
+            "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id NOT IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params = Vec::with_capacity(keep_snapshot_ids.len() + 1);
+        params.push(MetastoreValue::Text(table_id.to_string()));
+        params.extend(
+            keep_snapshot_ids
+                .iter()
+                .map(|id| MetastoreValue::Text((*id).to_string())),
+        );
         self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file \
-                      WHERE table_id = ?1 AND snapshot_id != ?2",
-                params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
-                    MetastoreValue::Text(snapshot_id.to_string()),
-                ],
-            })
+            .execute_helper(ExecuteParams { sql: &sql, params })
             .await
     }
 

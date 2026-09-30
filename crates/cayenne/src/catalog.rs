@@ -701,11 +701,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
+    ///
+    /// `layers` are the protected snapshots the overwrite publishes above its
+    /// main snapshot for keys its incoming data repeats across record batches;
+    /// see [`crate::metadata::OverwriteLayer`].
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        layers: &[crate::metadata::OverwriteLayer],
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -792,11 +797,11 @@ pub trait MetadataCatalog: Send + Sync {
         snapshot_id: &str,
     ) -> CatalogResult<()>;
 
-    /// Drop manifest rows for snapshots other than the given one (snapshot GC).
+    /// Drop manifest rows for snapshots other than the given ones (snapshot GC).
     async fn clear_snapshot_files_except(
         &self,
         table_id: &str,
-        snapshot_id: &str,
+        keep_snapshot_ids: &[&str],
     ) -> CatalogResult<()>;
 
     /// Clear all manifest rows for a table.

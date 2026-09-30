@@ -2078,6 +2078,34 @@ pub struct TableStatistics {
     pub ndv_sketches: Option<Vec<u8>>,
 }
 
+/// A protected snapshot an overwrite publishes above its main snapshot, with
+/// the key tombstones that hide the copies it supersedes in the layers below.
+///
+/// A key an overwrite's incoming data repeats across record batches is a later
+/// upsert of that key. The overwrite resolves it the way a separate upsert would:
+/// the later copy is written to a higher layer, and a tombstone at
+/// `delete_sequence` hides the key in every layer whose threshold is below it.
+/// The thresholds order the layers: `delete_sequence < insert_sequence <
+/// threshold`, and each layer's `delete_sequence` exceeds the previous layer's
+/// `threshold`, so exactly the newest copy of every key stays visible.
+#[derive(Debug, Clone)]
+pub struct OverwriteLayer {
+    /// The protected snapshot holding the layer's rows.
+    pub snapshot_id: String,
+    /// The protected snapshot's threshold: tombstones at or below it do not hide
+    /// the layer's rows.
+    pub threshold: i64,
+    /// The sequence the layer's key tombstones are recorded at.
+    pub delete_sequence: i64,
+    /// The re-insert sequence recorded for every tombstoned key: each one is
+    /// re-inserted by this layer.
+    pub insert_sequence: i64,
+    /// Key-based deletion vectors for the keys this layer supersedes.
+    pub delete_files: Vec<DeleteFile>,
+    /// The encoded primary keys of `delete_files`, re-inserted by this layer.
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+}
+
 /// A small batch of insert data inlined directly in the metastore.
 ///
 /// For streaming workloads that produce many tiny writes, storing data as

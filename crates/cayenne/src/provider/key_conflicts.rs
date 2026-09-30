@@ -284,13 +284,23 @@ impl KeyResolver {
             .collect()
     }
 
-    fn digests(&self, batch: &RecordBatch) -> Result<Vec<u128>> {
+    /// The table's encoding of each row's primary key (the `RowConverter` bytes
+    /// key-based tombstones store).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a primary key column cannot be encoded.
+    pub(crate) fn encode_keys(&self, batch: &RecordBatch) -> Result<crate::row_converter::Rows> {
         let columns: Vec<ArrayRef> = self
             .primary_key
             .iter()
             .map(|&index| Arc::clone(batch.column(index)))
             .collect();
-        let keys = self.keys.convert_columns(&columns)?;
+        Ok(self.keys.convert_columns(&columns)?)
+    }
+
+    fn digests(&self, batch: &RecordBatch) -> Result<Vec<u128>> {
+        let keys = self.encode_keys(batch)?;
         Ok(keys
             .iter()
             .map(|key| pk_digest_bytes(key.as_ref()))
