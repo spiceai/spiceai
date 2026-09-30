@@ -20,6 +20,95 @@ limitations under the License.
 //! each call site.
 
 use arrow::record_batch::RecordBatch;
+use arrow_schema::SchemaRef;
+use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion_common::DataFusionError;
+use futures::Stream;
+use hash_index::PrehashedBuildHasher;
+use std::collections::HashSet;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use crate::provider::pk_index::pk_digest_bytes;
+use crate::row_converter::RowConverter;
+
+/// Validate primary-key uniqueness over an entire replacement stream before it is published.
+pub(crate) struct OverwritePrimaryKeyValidationStream {
+    inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+    pk_indices: Vec<usize>,
+    converter: RowConverter,
+    seen: HashSet<u128, PrehashedBuildHasher>,
+    table_name: String,
+}
+
+impl OverwritePrimaryKeyValidationStream {
+    pub(crate) fn new(
+        inner: SendableRecordBatchStream,
+        pk_indices: Vec<usize>,
+        converter: RowConverter,
+        table_name: String,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            pk_indices,
+            converter,
+            seen: HashSet::with_hasher(PrehashedBuildHasher),
+            table_name,
+        }
+    }
+}
+
+impl Stream for OverwritePrimaryKeyValidationStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if this
+                    .pk_indices
+                    .iter()
+                    .any(|&index| batch.column(index).null_count() > 0)
+                {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "Data validation failed for table '{}': {}",
+                        this.table_name,
+                        null_primary_key_message(&batch, &this.pk_indices)
+                    )))));
+                }
+                let columns = this
+                    .pk_indices
+                    .iter()
+                    .map(|&index| Arc::clone(batch.column(index)))
+                    .collect::<Vec<_>>();
+                let rows = match this.converter.convert_columns(&columns) {
+                    Ok(rows) => rows,
+                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                };
+                for row in &rows {
+                    if !this.seen.insert(pk_digest_bytes(row.as_ref())) {
+                        return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                            "Data validation failed for table '{}': Incoming data contains duplicate primary key across batches",
+                            this.table_name
+                        )))));
+                    }
+                }
+                Poll::Ready(Some(Ok(batch)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl RecordBatchStream for OverwritePrimaryKeyValidationStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
 
 const FIX: &str = "Every primary key column must be non-null: populate it in the source data, or set `primary_key` to columns that are always present. For details, visit https://spiceai.org/docs/features/data-acceleration/constraints";
 

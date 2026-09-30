@@ -112,6 +112,10 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
   until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
 
+For a table with a primary key, a full refresh checks key uniqueness across the
+entire incoming stream before publishing the replacement, in both storage modes.
+A repeated or null key fails the refresh and leaves the prior table visible.
+
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,
 partition reject), `VortexConfig.memory_mode`,

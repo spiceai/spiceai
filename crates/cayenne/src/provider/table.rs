@@ -12747,6 +12747,25 @@ impl CayenneTableProvider {
         Ok(RowConverter::new(sort_fields)?)
     }
 
+    /// Check every replacement row against the other rows in the same overwrite.
+    pub(crate) fn validate_overwrite_primary_keys(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok(stream);
+        };
+        let converter = self.build_pk_converter(&pk_indices)?;
+        Ok(Box::pin(
+            super::pk_validation::OverwritePrimaryKeyValidationStream::new(
+                stream,
+                pk_indices,
+                converter,
+                self.table_metadata.table_name.clone(),
+            ),
+        ))
+    }
+
     /// Partition `batch` into `n` sub-batches by `hash(pk) % n`, where the PK is
     /// the `RowConverter` `OwnedRow` of `pk_indices` (see [`shard_of_pk`]). Row
     /// order within each shard is preserved. Returns exactly `n` batches (some may

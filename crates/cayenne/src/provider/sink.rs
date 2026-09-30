@@ -198,10 +198,15 @@ impl DataSink for CayenneDataSink {
             // rather than a separate delete. Without it a re-INSERT of an existing
             // key left BOTH versions live under a declared primary key.
             //
-            // An OVERWRITE (full refresh) replaces the tier wholesale, so there is
-            // nothing to supersede and no index to consult.
+            // An OVERWRITE replaces the tier wholesale, but its incoming rows
+            // must still have distinct, non-null primary keys.
             let (mut data, post_validation) = if overwrite {
-                (normalized as SendableRecordBatchStream, None)
+                (
+                    self.table
+                        .validate_overwrite_primary_keys(normalized)
+                        .map_err(datafusion_common::DataFusionError::from)?,
+                    None,
+                )
             } else {
                 let prepared = self
                     .table
@@ -698,6 +703,106 @@ mod tests {
             Arc::clone(context),
         );
         sink.write_all(stream, &ctx.task_ctx()).await
+    }
+
+    async fn overwrite_rows(
+        provider: &CayenneTableProvider,
+        context: &Arc<CayenneContext>,
+        schema: &Arc<Schema>,
+        ctx: &SessionContext,
+        batches: Vec<RecordBatch>,
+    ) -> datafusion::error::Result<u64> {
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(schema),
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let sink = CayenneDataSink::new(
+            provider.clone_for_write(),
+            InsertOp::Overwrite,
+            Arc::clone(schema),
+            Arc::clone(context),
+        );
+        sink.write_all(stream, &ctx.task_ctx()).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overwrite_rejects_duplicate_primary_keys_across_batches() {
+        for memory_mode in [false, true] {
+            let ctx = SessionContext::new();
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let metadata_dir = format!("{}/metadata", temp_dir.path().display());
+            let data_dir = format!("{}/data", temp_dir.path().display());
+            std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+            let catalog = Arc::new(
+                CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                    .expect("catalog"),
+            ) as Arc<dyn MetadataCatalog>;
+            catalog.init().await.expect("catalog init");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let vortex_config = VortexConfig {
+                memory_mode,
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            };
+            let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "overwrite_pk");
+            let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+                .with_context(Arc::clone(&context))
+                .create(CreateTableOptions {
+                    table_name: "overwrite_pk".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]))),
+                    base_path: data_dir,
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("table created");
+
+            overwrite_rows(
+                &provider,
+                &context,
+                &schema,
+                &ctx,
+                vec![int64_batch(&schema, vec![7])],
+            )
+            .await
+            .expect("seed overwrite");
+            let error = overwrite_rows(
+                &provider,
+                &context,
+                &schema,
+                &ctx,
+                vec![
+                    int64_batch(&schema, vec![1, 2]),
+                    int64_batch(&schema, vec![1]),
+                ],
+            )
+            .await
+            .expect_err("duplicate primary key must reject overwrite");
+            assert!(
+                error.to_string().contains("duplicate primary key"),
+                "{memory_mode}: {error}"
+            );
+            assert_eq!(visible_rows(&ctx, &provider).await, 1);
+
+            overwrite_rows(
+                &provider,
+                &context,
+                &schema,
+                &ctx,
+                vec![
+                    int64_batch(&schema, vec![1, 2]),
+                    int64_batch(&schema, vec![3]),
+                ],
+            )
+            .await
+            .expect("valid overwrite");
+            assert_eq!(visible_rows(&ctx, &provider).await, 3);
+        }
     }
 
     /// Staged writes keep their write-time footer-cache entries: the Vortex
