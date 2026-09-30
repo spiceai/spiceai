@@ -75,8 +75,8 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::mutation_writer::InlineBatchBuffer;
 use super::key_conflicts::ConflictPolicy;
+use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_layers::{
     FirstCopyFilter, LayerSource, LayerSplitter, LayerTombstones, MAX_LAYER_ROWS,
 };
@@ -705,11 +705,9 @@ impl CayenneTableProvider {
         // policies the last copy wins, so a later copy is written to a higher
         // layer, and the layers after the main snapshot are written below; see
         // `overwrite_layers`.
-        let reservation = MemoryConsumer::new(format!(
-            "CayenneOverwriteKeys[{}]",
-            self.table_name()
-        ))
-        .register(&self.runtime_env().memory_pool);
+        let reservation =
+            MemoryConsumer::new(format!("CayenneOverwriteKeys[{}]", self.table_name()))
+                .register(&self.runtime_env().memory_pool);
         let mut layer_source = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
@@ -864,10 +862,9 @@ impl CayenneTableProvider {
                 Err(error) => {
                     self.discard_lookup_index_build();
                     if !is_s3 {
-                        let _ = tokio::fs::remove_dir_all(
-                            self.snapshot_dir_path_for(&new_snapshot_id),
-                        )
-                        .await;
+                        let _ =
+                            tokio::fs::remove_dir_all(self.snapshot_dir_path_for(&new_snapshot_id))
+                                .await;
                     }
                     return Err(error);
                 }
@@ -937,7 +934,12 @@ impl CayenneTableProvider {
         }
         .await;
 
-        let mut tombstones = source.take_tombstones().into_iter();
+        let mut tombstones = source.take_tombstones();
+        // Tombstones merge by maximum, and a layer tombstones only keys it holds a
+        // copy of, so a key's highest tombstone is in the layer holding its last
+        // copy and hides every lower one: keep only that one.
+        drop_superseded_tombstones(&mut tombstones);
+        let mut tombstones = tombstones.into_iter();
         // Layer 0 is the main snapshot, which supersedes nothing.
         let _main = tombstones.next();
         let mut layers = Vec::with_capacity(written.len());
@@ -996,13 +998,24 @@ impl CayenneTableProvider {
         if let Err(error) = outcome {
             if !is_s3 {
                 for (snapshot_id, _) in &written {
-                    let _ = tokio::fs::remove_dir_all(self.snapshot_dir_path_for(snapshot_id)).await;
+                    let _ =
+                        tokio::fs::remove_dir_all(self.snapshot_dir_path_for(snapshot_id)).await;
                 }
                 remove_layer_deletion_vectors(&layers).await;
             }
             return Err(error);
         }
         Ok((rows, layers, layer_tombstones))
+    }
+}
+
+/// Keep, for each key, only the tombstone of the highest layer that records it.
+fn drop_superseded_tombstones(layers: &mut [LayerTombstones]) {
+    let mut int64_seen = std::collections::HashSet::new();
+    let mut row_seen: std::collections::HashSet<Box<[u8]>> = std::collections::HashSet::new();
+    for layer in layers.iter_mut().rev() {
+        layer.pk_i64.retain(|pk| int64_seen.insert(*pk));
+        layer.row_keys.retain(|key| row_seen.insert(key.clone()));
     }
 }
 

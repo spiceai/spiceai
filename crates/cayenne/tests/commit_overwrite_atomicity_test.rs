@@ -479,7 +479,13 @@ async fn commit_overwrite_in_txn_rejects_invalid_uuid() {
         .expect("begin_transaction");
 
     let bad_table_id = catalog
-        .commit_overwrite_in_txn(&mut *txn, "'; DROP TABLE cayenne_table; --", "1234", None, &[])
+        .commit_overwrite_in_txn(
+            &mut *txn,
+            "'; DROP TABLE cayenne_table; --",
+            "1234",
+            None,
+            &[],
+        )
         .await;
     assert!(
         bad_table_id.is_err(),

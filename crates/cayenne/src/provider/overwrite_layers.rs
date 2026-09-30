@@ -32,9 +32,10 @@ limitations under the License.
 //!    below. A false positive tombstones a key no earlier layer holds, which hides
 //!    nothing: the layer's own copy sits above the tombstone.
 //!
-//! Both questions are answered by bloom filters, so the memory a write holds
-//! does not grow with the size of each copy, and a false positive costs a layer
-//! or a tombstone, never a row.
+//! The first question is answered by a set of 64-bit key hashes for the current
+//! layer, bounded by its row cap; the second by a bloom filter over the whole
+//! write. Neither holds a row, and a false positive costs a layer or a
+//! tombstone, never a row.
 //!
 //! Under `drop` the first copy of a key wins, so a later copy must be dropped
 //! outright; that needs an exact answer, which [`FirstCopyFilter`] keeps.
@@ -93,20 +94,15 @@ impl ChainedBloom {
     fn insert(&mut self, hash: u64) {
         if self.newest_keys >= self.newest_capacity {
             self.newest_capacity = (self.newest_capacity * FILTER_GROWTH).max(FIRST_FILTER_KEYS);
-            self.filters
-                .push(SplitBlockBloomFilter::new(self.newest_capacity * self.density));
+            self.filters.push(SplitBlockBloomFilter::new(
+                self.newest_capacity * self.density,
+            ));
             self.newest_keys = 0;
         }
         if let Some(filter) = self.filters.last() {
             filter.insert(hash);
         }
         self.newest_keys += 1;
-    }
-
-    fn clear(&mut self) {
-        self.filters.clear();
-        self.newest_keys = 0;
-        self.newest_capacity = 0;
     }
 
     fn memory_bytes(&self) -> usize {
@@ -148,9 +144,11 @@ pub(crate) struct LayerSplitter {
     /// Index of the `Int64` primary key column, when the table stores its
     /// tombstones as `Int64` keys.
     int64_key: Option<usize>,
-    /// Keys of the current layer. 48 bits per key: a false positive here starts
-    /// a layer, so it is kept rare.
-    layer_keys: ChainedBloom,
+    /// 64-bit hashes of the current layer's keys. Exact up to a hash collision,
+    /// which only starts a layer early, and it grows with the layer instead of
+    /// being sized in advance; a chain of bloom filters would sum its filters'
+    /// false-positive rates and split refreshes that repeat no key.
+    layer_keys: HashSet<u64, PrehashedBuildHasher>,
     /// Keys of every layer written so far. 16 bits per key: a false positive
     /// here costs one tombstone.
     written_keys: ChainedBloom,
@@ -191,7 +189,7 @@ impl LayerSplitter {
         Self {
             resolver,
             int64_key,
-            layer_keys: ChainedBloom::new(3),
+            layer_keys: HashSet::with_hasher(PrehashedBuildHasher),
             written_keys: ChainedBloom::new(1),
             collect_tombstones,
             layer: 0,
@@ -220,7 +218,7 @@ impl LayerSplitter {
                 || resolved
                     .digests
                     .iter()
-                    .any(|&digest| self.layer_keys.might_contain(layer_hash(digest))));
+                    .any(|&digest| self.layer_keys.contains(&layer_hash(digest))));
         if starts_layer {
             self.layer += 1;
             self.layer_keys.clear();
@@ -246,8 +244,10 @@ impl LayerSplitter {
             }
         }
         self.layer_rows += rows;
-        self.reservation
-            .try_resize(self.layer_keys.memory_bytes() + self.written_keys.memory_bytes())?;
+        self.reservation.try_resize(
+            // hashbrown: one control byte per bucket beside each 8-byte hash.
+            self.layer_keys.capacity() * (size_of::<u64>() + 1) + self.written_keys.memory_bytes(),
+        )?;
         let tombstones = if self.collect_tombstones {
             self.tombstones(&resolved.batch, &superseding)?
         } else {
@@ -596,8 +596,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_row_cap_opens_a_layer_without_tombstones() {
-        let (layers, tombstones) =
-            layers(vec![batch(&[(1, "a")]), batch(&[(2, "b")]), batch(&[(3, "c")])], 2).await;
+        let (layers, tombstones) = layers(
+            vec![batch(&[(1, "a")]), batch(&[(2, "b")]), batch(&[(3, "c")])],
+            2,
+        )
+        .await;
         assert_eq!(
             layers,
             vec![owned(&[(1, "a"), (2, "b")]), owned(&[(3, "c")])]

@@ -65,7 +65,9 @@ async fn visible(provider: &CayenneTableProvider) -> (Vec<(i64, String)>, i64) {
         .expect("collect");
     let mut rows = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_primitive::<arrow::datatypes::Int64Type>();
+        let ids = batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>();
         let values = batch.column(1).as_string::<i32>();
         for row in 0..batch.num_rows() {
             rows.push((ids.value(row), values.value(row).to_string()));
@@ -91,7 +93,12 @@ fn owned(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
 async fn table(
     mode: DeletionMode,
     dedup: UpsertDedup,
-) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, Arc<RuntimeEnv>, TempDir) {
+) -> (
+    CayenneTableProvider,
+    Arc<dyn MetadataCatalog>,
+    Arc<RuntimeEnv>,
+    TempDir,
+) {
     let runtime_env = SessionContext::new().runtime_env();
     let (mut provider, catalog, dir) = create_cdc_table_with_schema(
         "t",
@@ -289,7 +296,11 @@ fn last_copies() -> Vec<(i64, String)> {
 async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
     let mut failures = Vec::new();
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        for dedup in [UpsertDedup::None, UpsertDedup::DropIdentical, UpsertDedup::KeepLast] {
+        for dedup in [
+            UpsertDedup::None,
+            UpsertDedup::DropIdentical,
+            UpsertDedup::KeepLast,
+        ] {
             let label = format!("{mode:?}/{dedup:?}");
             let (provider, catalog, runtime_env, _dir) = table(mode, dedup).await;
             write(&provider, InsertOp::Overwrite, vec![batch(&[(9, "old")])])
@@ -299,32 +310,53 @@ async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
                 .await
                 .expect("layered overwrite");
             let expected = last_copies();
-            let mut check = |stage: &str, (rows, count): (Vec<(i64, String)>, i64), layers: usize| {
-                let ok = rows == expected && count == 6;
-                eprintln!(
-                    "{label} {stage}: protected layers {layers}, rows {}, COUNT(*) {count}: {}",
-                    rows.len(),
-                    if ok { "ok" } else { "WRONG" }
-                );
-                if !ok {
-                    failures.push(format!("{label} {stage}: {rows:?} COUNT(*) {count}"));
-                }
-            };
-            check("after overwrite", visible(&provider).await, provider.protected_snapshot_ids().len());
+            let mut check =
+                |stage: &str, (rows, count): (Vec<(i64, String)>, i64), layers: usize| {
+                    let ok = rows == expected && count == 6;
+                    eprintln!(
+                        "{label} {stage}: protected layers {layers}, rows {}, COUNT(*) {count}: {}",
+                        rows.len(),
+                        if ok { "ok" } else { "WRONG" }
+                    );
+                    if !ok {
+                        failures.push(format!("{label} {stage}: {rows:?} COUNT(*) {count}"));
+                    }
+                };
+            check(
+                "after overwrite",
+                visible(&provider).await,
+                provider.protected_snapshot_ids().len(),
+            );
             let provider = reopen(&catalog, &runtime_env, dedup).await;
-            check("after reopen", visible(&provider).await, provider.protected_snapshot_ids().len());
+            check(
+                "after reopen",
+                visible(&provider).await,
+                provider.protected_snapshot_ids().len(),
+            );
             let merged = provider
                 .compact_protected_snapshots_subset(8)
                 .await
                 .expect("merge");
-            check(&format!("after protected merge ({merged})"), visible(&provider).await, provider.protected_snapshot_ids().len());
+            check(
+                &format!("after protected merge ({merged})"),
+                visible(&provider).await,
+                provider.protected_snapshot_ids().len(),
+            );
             provider
                 .sort_and_rewrite_data(64 * 1024 * 1024)
                 .await
                 .expect("full rewrite");
-            check("after full rewrite", visible(&provider).await, provider.protected_snapshot_ids().len());
+            check(
+                "after full rewrite",
+                visible(&provider).await,
+                provider.protected_snapshot_ids().len(),
+            );
             let provider = reopen(&catalog, &runtime_env, dedup).await;
-            check("after second reopen", visible(&provider).await, provider.protected_snapshot_ids().len());
+            check(
+                "after second reopen",
+                visible(&provider).await,
+                provider.protected_snapshot_ids().len(),
+            );
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -337,14 +369,29 @@ async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwri
         write(&provider, InsertOp::Overwrite, repeated_across_batches())
             .await
             .expect("layered overwrite");
-        assert!(provider.protected_snapshot_ids().len() >= 2, "{mode:?}: layers");
-        write(&provider, InsertOp::Append, vec![batch(&[(2, "e"), (7, "e")])])
-            .await
-            .expect("upsert");
+        assert!(
+            provider.protected_snapshot_ids().len() >= 2,
+            "{mode:?}: layers"
+        );
+        write(
+            &provider,
+            InsertOp::Append,
+            vec![batch(&[(2, "e"), (7, "e")])],
+        )
+        .await
+        .expect("upsert");
         let (rows, count) = visible(&provider).await;
         assert_eq!(
             rows,
-            owned(&[(1, "c"), (2, "e"), (3, "a"), (4, "b"), (5, "c"), (6, "d"), (7, "e")]),
+            owned(&[
+                (1, "c"),
+                (2, "e"),
+                (3, "a"),
+                (4, "b"),
+                (5, "c"),
+                (6, "d"),
+                (7, "e")
+            ]),
             "{mode:?}: after upsert"
         );
         assert_eq!(count, 7, "{mode:?}: COUNT(*) after upsert");
@@ -352,10 +399,21 @@ async fn a_layered_overwrite_is_superseded_by_a_later_upsert_and_a_later_overwri
         write(&provider, InsertOp::Overwrite, vec![batch(&[(1, "z")])])
             .await
             .expect("plain overwrite");
-        assert_eq!(visible(&provider).await, (owned(&[(1, "z")]), 1), "{mode:?}: replaced");
-        assert!(provider.protected_snapshot_ids().is_empty(), "{mode:?}: layers cleared");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(1, "z")]), 1),
+            "{mode:?}: replaced"
+        );
+        assert!(
+            provider.protected_snapshot_ids().is_empty(),
+            "{mode:?}: layers cleared"
+        );
         let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
-        assert_eq!(visible(&provider).await, (owned(&[(1, "z")]), 1), "{mode:?}: reopened");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(1, "z")]), 1),
+            "{mode:?}: reopened"
+        );
     }
 }
 
@@ -380,13 +438,26 @@ async fn a_failed_layered_overwrite_leaves_the_previous_table() {
         .await
         .expect_err("a repeat within one batch fails plain upsert");
         assert!(
-            error.to_string().contains("uniqueness constraint on column(s): 'id'"),
+            error
+                .to_string()
+                .contains("uniqueness constraint on column(s): 'id'"),
             "{mode:?}: {error}"
         );
-        assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1), "{mode:?}");
-        assert!(provider.protected_snapshot_ids().is_empty(), "{mode:?}: no layers");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(9, "old")]), 1),
+            "{mode:?}"
+        );
+        assert!(
+            provider.protected_snapshot_ids().is_empty(),
+            "{mode:?}: no layers"
+        );
         let provider = reopen(&catalog, &runtime_env, UpsertDedup::None).await;
-        assert_eq!(visible(&provider).await, (owned(&[(9, "old")]), 1), "{mode:?}: reopened");
+        assert_eq!(
+            visible(&provider).await,
+            (owned(&[(9, "old")]), 1),
+            "{mode:?}: reopened"
+        );
     }
 }
 

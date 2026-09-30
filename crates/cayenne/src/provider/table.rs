@@ -2631,6 +2631,12 @@ pub(crate) struct OverwriteLayerPublish<'a> {
     pub(crate) tombstones: &'a super::overwrite_layers::LayerTombstones,
 }
 
+/// The tombstone index an overwrite's layers publish, built before its fence.
+pub(crate) enum OverwriteLayerDeletions {
+    Int64(DeletionIndex),
+    Rows(KeyDeletionIndex),
+}
+
 /// The inline corpus an overwrite commits alongside its snapshot flip, as the
 /// in-memory visibility state needs to describe it. Both values come from the
 /// single `cayenne_inlined_data` row [`CayenneCatalog::commit_overwrite_in_txn`]
@@ -5722,6 +5728,7 @@ impl CayenneTableProvider {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
+        let layer_deletions = self.build_overwrite_layer_deletions(layers);
         let discarded_epoch = {
             let _fence = self.listing_fence.write().await;
             // An overwrite replaces every row, including the rows still in the
@@ -5741,6 +5748,7 @@ impl CayenneTableProvider {
                 new_listing_table,
                 inlined_rows,
                 layers,
+                layer_deletions,
             );
             discarded_epoch
         };
@@ -5901,6 +5909,7 @@ impl CayenneTableProvider {
         new_listing_table: Arc<ListingTable>,
         inlined_rows: Option<InlinedOverwritePublish>,
         layers: &[OverwriteLayerPublish<'_>],
+        layer_deletions: Option<OverwriteLayerDeletions>,
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
         // and every step here is synchronous, while a scan-view capture holds
@@ -5927,16 +5936,27 @@ impl CayenneTableProvider {
                     .map(|layer| (layer.snapshot_id.to_string(), layer.threshold))
                     .collect(),
             ));
-            for layer in layers {
-                if !layer.tombstones.is_empty() {
-                    self.publish_staged_key_deletion_cache(
-                        &layer.tombstones.pk_i64,
-                        &layer.tombstones.row_keys,
-                        layer.delete_sequence,
-                        layer.insert_sequence,
-                    );
-                }
+        }
+        match (layer_deletions, &self.pk_deletion_strategy) {
+            (
+                Some(OverwriteLayerDeletions::Int64(index)),
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                },
+            ) => {
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(index)));
+                self.refresh_deletion_memory_accounting();
             }
+            (
+                Some(OverwriteLayerDeletions::Rows(index)),
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                },
+            ) => {
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(index)));
+                self.refresh_deletion_memory_accounting();
+            }
+            _ => {}
         }
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
         // catalog atomically with the snapshot flip, but didn't bump
@@ -12853,10 +12873,53 @@ impl CayenneTableProvider {
     /// directly, when its deletion strategy keys tombstones by an `Int64` key.
     pub(crate) fn int64_tombstone_key(&self) -> Option<usize> {
         match self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                self.pk_column_indices.first().copied()
-            }
+            PkDeletionStrategyWithCache::Int64Pk { .. } => self.pk_column_indices.first().copied(),
             _ => None,
+        }
+    }
+
+    /// The tombstone index an overwrite's layers leave: the overwrite clears
+    /// every earlier tombstone, so it is built outright from the layers rather
+    /// than folded into the live index, and before the publish takes the fence.
+    fn build_overwrite_layer_deletions(
+        &self,
+        layers: &[OverwriteLayerPublish<'_>],
+    ) -> Option<OverwriteLayerDeletions> {
+        if layers.iter().all(|layer| layer.tombstones.is_empty()) {
+            return None;
+        }
+        match self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                let mut deleted = HashMap::new();
+                let mut inserted = HashMap::new();
+                for layer in layers {
+                    for &pk in &layer.tombstones.pk_i64 {
+                        let delete = deleted.entry(pk).or_insert(layer.delete_sequence);
+                        *delete = (*delete).max(layer.delete_sequence);
+                        let insert = inserted.entry(pk).or_insert(layer.insert_sequence);
+                        *insert = (*insert).max(layer.insert_sequence);
+                    }
+                }
+                Some(OverwriteLayerDeletions::Int64(DeletionIndex::from_maps(
+                    deleted, inserted,
+                )))
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let mut deleted: HashMap<Box<[u8]>, i64> = HashMap::new();
+                let mut inserted: HashMap<Box<[u8]>, i64> = HashMap::new();
+                for layer in layers {
+                    for key in &layer.tombstones.row_keys {
+                        let delete = deleted.entry(key.clone()).or_insert(layer.delete_sequence);
+                        *delete = (*delete).max(layer.delete_sequence);
+                        let insert = inserted.entry(key.clone()).or_insert(layer.insert_sequence);
+                        *insert = (*insert).max(layer.insert_sequence);
+                    }
+                }
+                Some(OverwriteLayerDeletions::Rows(KeyDeletionIndex::from_maps(
+                    deleted, inserted,
+                )))
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => None,
         }
     }
 
@@ -23639,7 +23702,13 @@ impl CayenneTableProvider {
             // Cold graduation's content is the registered cold files; the overwrite
             // clear drops the warm tier's inline corpus with nothing to replace it,
             // so there are no inline rows to republish.
-            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None, &[]);
+            self.publish_overwrite_snapshot_fenced(
+                &new_snapshot_id,
+                new_listing_table,
+                None,
+                &[],
+                None,
+            );
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -46485,7 +46554,7 @@ mod tests {
         shards: usize,
         max_bytes: i64,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-        let (mut provider, catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+        let (provider, catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
             table_name,
             runtime_env,
             VortexConfig {
@@ -46668,10 +46737,14 @@ mod tests {
                             .map(Ok),
                         ),
                     ));
-                    provider
+                    let write = provider
                         .write_cdc_append_stream(changes, &ctx.task_ctx())
                         .await
                         .expect("a change stream never rejects a repeated key");
+                    assert!(
+                        write.in_memory_epoch().is_some(),
+                        "write used the memory tier"
+                    );
                     assert_eq!(
                         collect_id_value_pairs(&ctx, &provider, "buffered_cdc_keys").await,
                         vec![(1, 70), (2, 20), (9, 90)]

@@ -131,6 +131,7 @@ pub use compaction::{
     set_compaction_runtime_env, set_compaction_runtime_handle,
 };
 pub use context::CayenneContext;
+pub use key_conflicts::UpsertDedup;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
     clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,
@@ -139,7 +140,6 @@ pub use mem_tier_budget::{
     try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use on_conflict::PreparedOnConflictDeletionPublish;
-pub use key_conflicts::UpsertDedup;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use pk_keyset_budget::{

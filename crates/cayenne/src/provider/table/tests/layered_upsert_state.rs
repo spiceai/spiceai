@@ -43,8 +43,7 @@ fn rows(ids: std::ops::Range<i64>, value: i64) -> RecordBatch {
 
 async fn write(provider: &CayenneTableProvider, op: InsertOp, batch: RecordBatch) {
     let ctx = SessionContext::new();
-    let source =
-        MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("source");
+    let source = MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("source");
     let plan = provider
         .insert_into(&ctx.state(), source, op)
         .await
@@ -65,8 +64,12 @@ async fn visible(provider: &CayenneTableProvider) -> (Vec<(i64, i64)>, i64) {
         .expect("collect");
     let mut out = Vec::new();
     for batch in &batches {
-        let ids = batch.column(0).as_primitive::<arrow::datatypes::Int64Type>();
-        let values = batch.column(1).as_primitive::<arrow::datatypes::Int64Type>();
+        let ids = batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+        let values = batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int64Type>();
         for row in 0..batch.num_rows() {
             out.push((ids.value(row), values.value(row)));
         }
@@ -126,44 +129,76 @@ async fn overwrite_then_upsert_layers_keep_the_last_copy_through_its_lifecycle()
 
         let mut check = |stage: &str, (rows, count): (Vec<(i64, i64)>, i64), layers: usize| {
             let ok = rows == expected && count == expected_count;
-            eprintln!("{mode:?} {stage}: protected layers {layers}, {} rows, COUNT(*) {count}: {}", rows.len(), if ok { "ok" } else { "WRONG" });
+            eprintln!(
+                "{mode:?} {stage}: protected layers {layers}, {} rows, COUNT(*) {count}: {}",
+                rows.len(),
+                if ok { "ok" } else { "WRONG" }
+            );
             if !ok {
                 failures.push(format!("{mode:?} {stage}: {rows:?} count {count}"));
             }
         };
-        check("after writes", visible(&provider).await, provider.protected_snapshot_ids().len());
+        check(
+            "after writes",
+            visible(&provider).await,
+            provider.protected_snapshot_ids().len(),
+        );
         let reopened =
             CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
                 .open("t")
                 .await
                 .expect("reopen");
-        check("after reopen", visible(&reopened).await, reopened.protected_snapshot_ids().len());
+        check(
+            "after reopen",
+            visible(&reopened).await,
+            reopened.protected_snapshot_ids().len(),
+        );
         let merged = reopened
             .compact_protected_snapshots_subset(8)
             .await
             .expect("protected merge");
-        check(&format!("after protected merge ({merged})"), visible(&reopened).await, reopened.protected_snapshot_ids().len());
+        check(
+            &format!("after protected merge ({merged})"),
+            visible(&reopened).await,
+            reopened.protected_snapshot_ids().len(),
+        );
         let baked = reopened
             .bake_seq_prefix_protected_snapshots()
             .await
             .expect("bake");
-        check(&format!("after seq-prefix bake ({baked})"), visible(&reopened).await, reopened.protected_snapshot_ids().len());
+        check(
+            &format!("after seq-prefix bake ({baked})"),
+            visible(&reopened).await,
+            reopened.protected_snapshot_ids().len(),
+        );
         let small = reopened
             .compact_current_snapshot_small_files()
             .await
             .expect("small files");
-        check(&format!("after small-file compaction ({small})"), visible(&reopened).await, reopened.protected_snapshot_ids().len());
+        check(
+            &format!("after small-file compaction ({small})"),
+            visible(&reopened).await,
+            reopened.protected_snapshot_ids().len(),
+        );
         reopened
             .sort_and_rewrite_data(64 * 1024 * 1024)
             .await
             .expect("full rewrite");
-        check("after full rewrite", visible(&reopened).await, reopened.protected_snapshot_ids().len());
+        check(
+            "after full rewrite",
+            visible(&reopened).await,
+            reopened.protected_snapshot_ids().len(),
+        );
         let reopened =
             CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
                 .open("t")
                 .await
                 .expect("reopen");
-        check("after second reopen", visible(&reopened).await, reopened.protected_snapshot_ids().len());
+        check(
+            "after second reopen",
+            visible(&reopened).await,
+            reopened.protected_snapshot_ids().len(),
+        );
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

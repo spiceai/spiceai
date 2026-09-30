@@ -46,7 +46,10 @@ const POLICIES: [(&str, OnConflictBehavior); 4] = [
     ("drop", OnConflictBehavior::Drop),
     ("upsert", OnConflictBehavior::Upsert),
     ("upsert_dedup", OnConflictBehavior::UpsertDedup),
-    ("upsert_dedup_by_row_id", OnConflictBehavior::UpsertDedupByRowId),
+    (
+        "upsert_dedup_by_row_id",
+        OnConflictBehavior::UpsertDedupByRowId,
+    ),
 ];
 
 struct Case {
@@ -89,7 +92,11 @@ async fn load(
             dir.path().join("meta").display().to_string(),
         );
     }
-    let key = if case.partitioned { "(id, region)" } else { "id" };
+    let key = if case.partitioned {
+        "(id, region)"
+    } else {
+        "id"
+    };
     let mut dataset = Dataset::new(format!("file://{}", file.display()), "t");
     dataset.acceleration = Some(Acceleration {
         enabled: true,
@@ -195,7 +202,8 @@ async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
             for case in cases() {
                 for (name, behavior) in POLICIES {
                     let label = format!("{}/{name}", case.label());
-                    let (rt, _dir) = load(&repeated_across_batches(), &case, behavior, &label).await;
+                    let (rt, _dir) =
+                        load(&repeated_across_batches(), &case, behavior, &label).await;
                     let Some(rt) = rt else {
                         failures.push(format!("{label}: did not load"));
                         continue;
@@ -207,7 +215,10 @@ async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
                     };
                     let (values, count) = (value_of(&rt, 0).await, count(&rt).await);
                     let ok = values == [expected] && count == 8_192;
-                    eprintln!("{label}: key 0 = {values:?}, COUNT(*) = {count}: {}", if ok { "ok" } else { "WRONG" });
+                    eprintln!(
+                        "{label}: key 0 = {values:?}, COUNT(*) = {count}: {}",
+                        if ok { "ok" } else { "WRONG" }
+                    );
                     if !ok {
                         failures.push(format!("{label}: key 0 = {values:?}, COUNT(*) = {count}"));
                     }
@@ -246,15 +257,22 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
                             let values = value_of(rt, 1).await;
                             let count = count(rt).await;
                             if count != 2 || values.len() != 1 {
-                                failures.push(format!("{label}: key 1 = {values:?}, COUNT(*) = {count}"));
+                                failures.push(format!(
+                                    "{label}: key 1 = {values:?}, COUNT(*) = {count}"
+                                ));
                             }
                             values.into_iter().next()
                         }
                     };
                     let ok = observed.as_deref() == *expected;
-                    eprintln!("{label}: expected {expected:?}, observed {observed:?}: {}", if ok { "ok" } else { "WRONG" });
+                    eprintln!(
+                        "{label}: expected {expected:?}, observed {observed:?}: {}",
+                        if ok { "ok" } else { "WRONG" }
+                    );
                     if !ok {
-                        failures.push(format!("{label}: expected {expected:?}, observed {observed:?}"));
+                        failures.push(format!(
+                            "{label}: expected {expected:?}, observed {observed:?}"
+                        ));
                     }
                 }
             }
