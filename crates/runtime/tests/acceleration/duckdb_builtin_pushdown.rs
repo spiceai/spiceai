@@ -105,9 +105,9 @@ fn write_regexp_source(path: &Path) -> Result<(), anyhow::Error> {
 /// a start offset to drop matches, and a row holding an Arabic-Indic digit
 /// (`U+0661`) that the kernel's `\d` matches and RE2's does not.
 ///
-/// The NULL cases are the point (issue #13870): `regexp_count` counts zero
-/// matches in a NULL input or against a NULL pattern and answers `0`, where
-/// `DuckDB`'s `regexp_extract_all` answers NULL for either.
+/// The NULL cases are the point (issue #13870): `regexp_count` answers NULL
+/// for a NULL input or a NULL pattern, and the pushed-down rendering must
+/// answer NULL there too rather than a count.
 fn write_regexp_count_source(path: &Path) -> Result<(), anyhow::Error> {
     std::fs::write(
         path,
@@ -700,8 +700,8 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
 
             // All three remaining regexp built-ins agree with local evaluation over
             // every row, the NULL one included, and all three are pushed down —
-            // `regexp_count` at a rendering that coalesces DuckDB's NULL count of a
-            // NULL input to the kernel's 0 (#13870).
+            // `regexp_count` as `len(regexp_extract_all(..))`, which is NULL for a
+            // NULL input exactly as the kernel is (#13870).
             let siblings = "SELECT id, regexp_like(s, '(a)(b)') AS l, \
                             regexp_replace(s, '(a)(b)', 'X') AS r, \
                             regexp_count(s, 'a') AS c FROM {table} ORDER BY id";
@@ -713,16 +713,14 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
                 "regexp_like/replace/count must agree with local evaluation on every row"
             );
 
-            // The NULL row is where `regexp_count` used to part company: the dialect
-            // rendered it `len(regexp_extract_all(..))`, and `regexp_extract_all(NULL,
-            // p)` is NULL in DuckDB, so the federated answer was NULL where
-            // DataFusion counts zero matches and answers 0 (#13870). Both sides must
-            // answer 0 with the call pushed down.
+            // The NULL row is where the two engines can part company (#13870): a
+            // rendering that answered a count there would disagree with the
+            // kernel's NULL. Both sides must answer NULL with the call pushed down.
             let null_row = "SELECT regexp_count(s, 'a') AS c FROM {table} WHERE s IS NULL";
             let accelerated = run_query(&rt, &null_row.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &null_row.replace("{table}", "local")).await?;
             for batches in [&accelerated, &local] {
-                assert_batches_eq!(["+---+", "| c |", "+---+", "| 0 |", "+---+",], batches);
+                assert_batches_eq!(["+---+", "| c |", "+---+", "|   |", "+---+",], batches);
             }
 
             let plan = to_pretty_display(
@@ -730,8 +728,9 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
             )?
             .to_string();
             assert!(
-                pushed_down_sql(&plan).contains("coalesce(len(regexp_extract_all("),
-                "regexp_count must be pushed down as coalesce(len(regexp_extract_all(..)), 0); \
+                pushed_down_sql(&plan).contains("len(regexp_extract_all(")
+                    && !pushed_down_sql(&plan).contains("coalesce("),
+                "regexp_count must be pushed down as len(regexp_extract_all(..)); \
                  plan was:\n{plan}"
             );
 
@@ -821,14 +820,15 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 .to_string();
                 let remote_sql = pushed_down_sql(&plan);
                 assert!(
-                    remote_sql.contains("coalesce(len(regexp_extract_all("),
-                    "{what} ({call}) must be pushed down as coalesce(len(regexp_extract_all(..)), 0); \
+                    remote_sql.contains("len(regexp_extract_all(")
+                        && !remote_sql.contains("coalesce("),
+                    "{what} ({call}) must be pushed down as len(regexp_extract_all(..)); \
                      plan was:\n{plan}"
                 );
             }
 
             // The values themselves, so the agreement above is not two engines
-            // agreeing on a wrong answer: a NULL input counts 0, and the start
+            // agreeing on a wrong answer: a NULL input or pattern counts NULL, and the start
             // offset drops the match before it (a `start - 1` offset into
             // DuckDB's 1-based SUBSTRING would keep it).
             let pinned = "SELECT id, regexp_count(s, 'a') AS plain, regexp_count(s, 'a', 2) AS from_2 \
@@ -841,9 +841,9 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                     "| 1  | 1     | 0      |",
                     "| 2  | 0     | 0      |",
                     "| 3  | 1     | 0      |",
-                    "| 4  | 0     | 0      |",
+                    "| 4  |       |        |",
                     "| 5  | 1     | 0      |",
-                    "| 6  | 0     | 0      |",
+                    "| 6  |       |        |",
                     "| 7  | 3     | 2      |",
                     "| 8  | 0     | 0      |",
                     "| 9  | 0     | 0      |",
@@ -855,14 +855,13 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
 
             // A count that is NULL rather than 0 changes which rows a predicate
             // keeps, which is why the divergence mattered: the NULL rows must
-            // survive `= 0` accelerated exactly as they do locally.
+            // drop out of `= 0` accelerated exactly as they do locally.
             let filtered = "SELECT id FROM {table} WHERE regexp_count(s, 'a') = 0 ORDER BY id";
             let accelerated = run_query(&rt, &filtered.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &filtered.replace("{table}", "local")).await?;
             assert_batches_eq!(
                 [
-                    "+----+", "| id |", "+----+", "| 2  |", "| 4  |", "| 6  |", "| 8  |", "| 9  |",
-                    "| 10 |", "+----+",
+                    "+----+", "| id |", "+----+", "| 2  |", "| 8  |", "| 9  |", "| 10 |", "+----+",
                 ],
                 &accelerated
             );
