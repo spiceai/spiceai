@@ -13868,11 +13868,14 @@ dependencies = [
  "futures",
  "object_store 0.13.2",
  "parking_lot",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "tracing",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -17418,6 +17421,7 @@ dependencies = [
  "futures",
  "hex",
  "object_store 0.13.2",
+ "object_store_occ",
  "opentelemetry",
  "runtime-checkpoint-api",
  "runtime-datafusion",
@@ -17426,6 +17430,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-secrets",
  "rusqlite",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",

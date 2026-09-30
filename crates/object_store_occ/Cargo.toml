@@ -11,10 +11,13 @@ bytes.workspace = true
 futures.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 tempfile.workspace = true
