@@ -103,14 +103,13 @@ fn parse_default<T: serde::de::DeserializeOwned>(
     value: &serde_json::Value,
     model: &str,
 ) -> Option<T> {
-    match T::deserialize(value) {
-        Ok(parsed) => Some(parsed),
-        Err(_) => {
-            tracing::warn!(
-                "Failed to parse `{field}` model parameter override for model='{model}'. Ensure {value:?} is of the correct format."
-            );
-            None
-        }
+    if let Ok(parsed) = T::deserialize(value) {
+        Some(parsed)
+    } else {
+        tracing::warn!(
+            "Failed to parse `{field}` model parameter override for model='{model}'. Ensure {value:?} is of the correct format."
+        );
+        None
     }
 }
 
