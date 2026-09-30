@@ -1667,6 +1667,8 @@ All of these are cheap reads (atomic loads, a non-blocking `try_lock`, and one s
 
 The PK existence index is what an upsert-heavy apply leans on hardest, and its failures are silent: a discarded index is rebuilt from the table, which is correct but costs a full keyset scan.
 
+**The in-memory sharded apply does not keep the table-wide index current.** It records its keys only in the per-shard index (it never reaches the commit mirror in `record_pk_keys_with_location`), so it drops a cached table-wide index once it commits keys (`drop_table_wide_pk_index`). The table-wide index is what the durable path validates against when a burst the in-memory tier cannot take (a truncate, a delete it cannot absorb, a commit that cannot defer) or the overload fallback writes durably, and that validation rebuilds it from the table. A stale copy would read an upsert of a key the sharded apply wrote as a new key and leave two live rows for it.
+
 **Reported per cache, not per table.** A sharded (N>1) table keeps **two** indexes at once — the table-wide keyset and the per-shard index — each bounded by *half* the configured budget, and they transition independently. One can be an exact keyset still growing while the other has already degraded to a bloom, so every per-cache metric here carries `site` ∈ `table_keyset`, `sharded_keyset`. A per-table aggregate cannot express that mixed state, and the cache nearing its transition is the one worth knowing about.
 
 Two aggregation rules follow, and getting either wrong is easy:

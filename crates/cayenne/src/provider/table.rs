@@ -12058,6 +12058,25 @@ impl CayenneTableProvider {
         self.pk_warm_probe_done.store(false, Ordering::Release);
     }
 
+    /// Drop the table-wide PK index and leave the per-shard index in place, for a
+    /// writer that commits keys only the per-shard index records: a cached
+    /// table-wide copy would then be missing them, so the next validation that uses
+    /// it must rebuild it from the table.
+    fn drop_table_wide_pk_index(&self) {
+        let dropped = {
+            let mut guard = self.pk_keyset_cache.lock();
+            // A checked-out copy is not in the cell; have its restore drop it too.
+            self.pk_keyset_pending.lock().invalidate();
+            guard.take()
+        };
+        if dropped.is_some() {
+            // The next rebuild floor-stamps every key or returns a Bloom, so no stale
+            // stamp behind a degraded per-key OCC flag survives it.
+            self.pk_keyset_occ_degraded.store(false, Ordering::Release);
+            self.publish_single_keyset_bytes(0);
+        }
+    }
+
     /// Single funnel for (re)setting `cold_pk_existence`: keeps the view's
     /// resident bytes registered with the memory pool alongside the keyset.
     fn store_cold_pk_existence(&self, view: Option<Arc<ColdPkExistence>>) {
@@ -15304,6 +15323,14 @@ impl CayenneTableProvider {
         //    account apply back-pressure is the lesser evil; bounding a
         //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
         if !validated_keys.is_empty() {
+            // These keys reach only the per-shard index: this path never passes the
+            // commit mirror in `record_pk_keys_with_location`. The table-wide index
+            // is what the durable path validates against, when a burst the in-memory
+            // tier cannot take (a truncate, an unabsorbable delete, a commit that
+            // cannot defer) or the overload fallback writes durably. A cached copy
+            // missing these keys would read an upsert of one as a new key and leave
+            // two live rows, so drop it and let that validation rebuild it.
+            self.drop_table_wide_pk_index();
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             // Gate on the variant, not just the tally: only an `Exact` index grows
             // per recorded key and only it can be degraded, so this fires on the
@@ -69010,6 +69037,52 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// A burst the in-memory tier cannot take is written durably: the runtime
+    /// checkpoints the tier, clears the slot advancer, and the durable path validates
+    /// against the table-wide index. The keys earlier sharded applies wrote must be in
+    /// that index, or an upsert of one reads as a new key and leaves two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_durable_upsert_after_sharded_applies_replaces_their_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_durable_after_sharded",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.maybe_install_warm_pk_caches().await;
+
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (8, 1)])
+                .await
+                .is_some(),
+            "precondition: the first burst takes the in-memory sharded path"
+        );
+
+        // The runtime's sequence for a burst that must be durable
+        // (`checkpoint_pending_memory_cdc_commits`, then `clear_slot_advancer`).
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint the in-memory tier");
+        provider.clear_slot_advancer();
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)])
+                .await
+                .is_none(),
+            "precondition: the second burst writes durably"
+        );
+
+        let rows = collect_id_value_pairs(&ctx, &provider, "pk_durable_after_sharded").await;
+        assert_eq!(
+            rows,
+            vec![(7, 2), (8, 1)],
+            "one live row per key, key 7 upserted"
+        );
     }
 
     /// An abandoned checkout must release the resident-byte accounting its window
