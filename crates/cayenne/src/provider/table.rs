@@ -7170,6 +7170,29 @@ impl CayenneTableProvider {
             .join(snapshot_id)
     }
 
+    /// The listing URL of a snapshot directory.
+    ///
+    /// `ListingTableUrl::parse` stats a local path, twice, to learn whether it names a directory,
+    /// and a scan builds this URL on every query. A snapshot directory is always a directory, so
+    /// an absolute local one is converted directly; anything else — an object-store URL, a
+    /// relative path, a path `parse` would read as a glob — still goes through `parse`.
+    fn snapshot_listing_url(
+        table_path: &str,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<ListingTableUrl> {
+        let dir = Self::snapshot_dir_path(table_path, table_id, snapshot_id);
+        if !table_path.starts_with("s3://")
+            && dir.is_absolute()
+            && !dir.to_string_lossy().contains(['*', '?', '['])
+            && let Ok(url) = url::Url::from_directory_path(&dir)
+            && let Ok(url) = url::Url::parse(url.as_str())
+        {
+            return ListingTableUrl::try_new(url, None);
+        }
+        ListingTableUrl::parse(Self::snapshot_dir_url(table_path, table_id, snapshot_id))
+    }
+
     /// Convert a directory path to a `DataFusion`-compatible URL string with trailing slash.
     ///
     /// `DataFusion` requires directory URLs to end with a trailing slash.
@@ -7505,7 +7528,7 @@ impl CayenneTableProvider {
             schema,
             vortex_format,
             strategy,
-            &SessionConfig::default(),
+            &util::session_state::session_config(),
         )
     }
 
@@ -10991,9 +11014,22 @@ impl CayenneTableProvider {
     /// an ordinary write inherits it from whatever session is executing
     /// (`runtime.query.target_partitions`, or a cluster's executor-slot count),
     /// and a configured `cayenne_write_concurrency` must survive that.
+    ///
+    /// A configured value is still capped at the CPU budget's ceiling. The
+    /// writer session is sized from the same budget, so the Vortex sink builds
+    /// no more shards than that (`VortexFormat::build_shard_spec`); capping here
+    /// keeps every count derived from this one — range split points, the shard
+    /// config, encode permits — equal to the shards actually written. Split
+    /// points computed for more shards would be cut down to their first few,
+    /// leaving the last shard nearly all of the rows.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
-        self.context.write_concurrency().unwrap_or(default).max(1)
+        let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
+        self.context
+            .write_concurrency()
+            .unwrap_or(default)
+            .min(ceiling)
+            .max(1)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -23319,7 +23355,7 @@ impl CayenneTableProvider {
         // would be dropped from the rewrite while the commit below still
         // retires it — silent row loss (#12708).
         let ctx = self.create_compaction_session_context_with_config(
-            SessionConfig::default().with_extension(Arc::new(
+            util::session_state::session_config().with_extension(Arc::new(
                 super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
@@ -25249,9 +25285,9 @@ impl CayenneTableProvider {
     /// Session context for Cayenne-internal writes and maintenance (snapshot
     /// writes, compaction, keyset/deletion scans).
     ///
-    /// Deliberately built from `SessionConfig::default()` rather than the
-    /// operator's query session, so `target_partitions` resolves to the host's
-    /// available parallelism (≈ logical CPU count). On the write path this value
+    /// Deliberately built from `util::session_state::session_config()` rather
+    /// than the operator's query session, so `target_partitions` is the CPU
+    /// budget's core count. On the write path this value
     /// is the **parallel-encode shard ceiling**: `VortexFormat::build_shard_spec`
     /// clamps the requested `cayenne_write_concurrency` to it. Encoding a snapshot
     /// is CPU-bound, so allowing more shards than cores buys no encode throughput
@@ -25264,7 +25300,7 @@ impl CayenneTableProvider {
     /// `cayenne_upload_concurrency`.
     fn create_session_context(&self) -> SessionContext {
         SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(self.context.runtime_env()),
         )
     }
@@ -25321,7 +25357,7 @@ impl CayenneTableProvider {
             })?;
 
         Ok(SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             runtime_env,
         ))
     }
@@ -25871,7 +25907,7 @@ impl CayenneTableProvider {
     /// snapshot rewrite cannot starve concurrent queries. Falls back to the
     /// shared query environment when no dedicated compaction env is set.
     fn create_compaction_session_context(&self) -> SessionContext {
-        self.create_compaction_session_context_with_config(SessionConfig::default())
+        self.create_compaction_session_context_with_config(util::session_state::session_config())
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
@@ -26176,7 +26212,7 @@ impl CayenneTableProvider {
         let sink = self.taint_row_count_exactness(Arc::new(sink));
 
         let deleted = sink
-            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
+            .delete_from(Arc::new(util::session_state::task_context()))
             .await;
         drop(write_guard);
         let deleted_count = match deleted {
@@ -33915,12 +33951,11 @@ impl CayenneTableProvider {
         // view-typed read schema so the scan output matches the advertised
         // `TableProvider::schema()` and downstream joins plan on view arrays.
         let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
-        let snapshot_dir_url = Self::snapshot_dir_url(
+        let table_url = Self::snapshot_listing_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
-        );
-        let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
+        )?;
         let mut options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
@@ -34096,6 +34131,20 @@ impl CayenneTableProvider {
         let mut file_source = options
             .format
             .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+
+        // A primary-key equality reads only the key blocks that can hold the key
+        // (`VortexSource::with_key_column`). Their bounds are cached by file path,
+        // which is sound because a data file's uuid7 path is never reused.
+        if let [pk_index] = self.pk_column_indices.as_slice() {
+            let key_column: Arc<str> =
+                Arc::from(self.table_schema().field(*pk_index).name().as_str());
+            let keyed: Option<Arc<dyn FileSource>> = file_source
+                .downcast_ref::<VortexSource>()
+                .map(|vs| Arc::new(vs.clone().with_key_column(key_column)) as Arc<dyn FileSource>);
+            if let Some(keyed) = keyed {
+                file_source = keyed;
+            }
+        }
 
         // Small groups gain no decode parallelism worth having from being
         // byte-range-split into `target_partitions` scan units, but pay a Vortex
@@ -36669,7 +36718,7 @@ impl TableProvider for CayenneTableProvider {
         let options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
-            &SessionConfig::default(),
+            &util::session_state::session_config(),
         );
         let partition_column_names = options
             .table_partition_cols
@@ -37272,7 +37321,7 @@ impl CayenneTableProvider {
             filters: filters.to_vec(),
         };
         let deleted = sink
-            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
+            .delete_from(Arc::new(util::session_state::task_context()))
             .await
             .map_err(datafusion_common::DataFusionError::External)?;
         Ok(Some(deleted))
@@ -38120,6 +38169,36 @@ mod tests {
 
     fn url(s: &str) -> String {
         s.to_string()
+    }
+
+    /// A scan converts an absolute local snapshot directory to its listing URL
+    /// without `ListingTableUrl::parse`; the result must be exactly what `parse`
+    /// returns, for the paths converted directly and for those that still parse.
+    #[test]
+    fn snapshot_listing_url_is_what_parse_returns() {
+        // `parse` stats the path, so cover a snapshot directory that exists too.
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(temp.path().join("table-id").join("snapshot-id"))
+            .expect("snapshot dir");
+        let existing = temp.path().to_string_lossy().to_string();
+        for table_path in [
+            existing.as_str(),
+            "/does/not/exist/spice data",
+            "relative/spice/data",
+            "s3://bucket/prefix",
+            "/data/[glob]",
+        ] {
+            let direct =
+                CayenneTableProvider::snapshot_listing_url(table_path, "table-id", "snapshot-id")
+                    .expect("listing URL");
+            let parsed = ListingTableUrl::parse(CayenneTableProvider::snapshot_dir_url(
+                table_path,
+                "table-id",
+                "snapshot-id",
+            ))
+            .expect("parsed listing URL");
+            assert_eq!(direct, parsed, "table path {table_path}");
+        }
     }
 
     /// The per-file row cap must keep a full file's right-sized PK bloom
@@ -49696,15 +49775,28 @@ mod tests {
     /// Without that, a globally sorted stream is split across shard files and
     /// every file's zone maps span the whole range, silently forfeiting the
     /// pruning the sort exists for.
+    /// A configured write concurrency above 1 that the CPU budget does not cap,
+    /// so a test of how the configured value interacts with the partition hint
+    /// does not depend on the host's core count.
+    fn configured_write_concurrency_within_budget() -> usize {
+        let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
+        assert!(
+            ceiling >= 2,
+            "these tests need a CPU budget of at least 2 cores"
+        );
+        ceiling.min(8)
+    }
+
     #[tokio::test]
     async fn test_sorted_rewrite_stays_serial_under_write_concurrency_override() {
+        let configured = configured_write_concurrency_within_budget();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_cayenne_table_with_config(
             "sorted_rewrite_concurrency_override",
             Arc::clone(&schema),
             VortexConfig {
-                write_concurrency: Some(8),
+                write_concurrency: Some(configured),
                 sort_columns: vec!["id".to_string()],
                 ..VortexConfig::default()
             },
@@ -49733,7 +49825,7 @@ mod tests {
         // not hold, so a sorted rewrite that only passed `1` would fan out.
         assert_eq!(
             provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
-            8,
+            configured,
             "the partition hint alone does not bound a configured concurrency"
         );
     }
@@ -49744,18 +49836,19 @@ mod tests {
     /// `runtime.query.target_partitions`, or a cluster's executor-slot count — so
     /// treating it as a hard ceiling would silently disable a configured
     /// `cayenne_write_concurrency` on the CDC, DML, staged and overwrite paths.
-    /// `write_to_snapshot` builds its own `SessionConfig::default()` session for
-    /// the sink, so the sink would still have encoded at the configured width;
-    /// only the accelerator's request would have collapsed.
+    /// `write_to_snapshot` builds its own CPU-budget-sized session for the sink,
+    /// so the sink would still have encoded at the configured width; only the
+    /// accelerator's request would have collapsed.
     #[tokio::test]
     async fn test_low_partition_hint_does_not_serialize_a_sized_write() {
+        let configured = configured_write_concurrency_within_budget();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_cayenne_table_with_config(
             "low_partition_hint",
             Arc::clone(&schema),
             VortexConfig {
-                write_concurrency: Some(8),
+                write_concurrency: Some(configured),
                 ..VortexConfig::default()
             },
             vec![],
@@ -49766,7 +49859,7 @@ mod tests {
         let tsb = provider.context.target_file_size_bytes();
         assert_eq!(
             provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
-            8,
+            configured,
             "a configured write concurrency must survive a low partition hint"
         );
         assert_eq!(
@@ -49775,8 +49868,95 @@ mod tests {
                 .write_shard()
                 .expect("a sized write keeps its shard config")
                 .write_concurrency,
-            8
+            configured
         );
+    }
+
+    /// A configured write concurrency above the CPU budget is capped at it, the
+    /// same count the writer session lets the Vortex sink build. Range split
+    /// points are computed for this count; computed for the uncapped one, the
+    /// sink would keep only the first few and route nearly every row to its
+    /// last shard.
+    #[tokio::test]
+    async fn test_write_concurrency_above_cpu_budget_is_capped_at_it() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "provider::table::tests::test_write_concurrency_above_cpu_budget_is_capped_at_it",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "write_concurrency_above_budget",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(16),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        assert_eq!(
+            provider.snapshot_shard_count(16, tsb, None, EncodeFanOut::Sized),
+            cores
+        );
+        let session_partitions = provider
+            .create_session_context()
+            .state()
+            .config()
+            .target_partitions();
+        assert_eq!(
+            session_partitions, cores,
+            "the writer session bounds the shards the sink builds"
+        );
+    }
+
+    #[tokio::test]
+    async fn cayenne_maintenance_sessions_use_cpu_budget_partitions() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "provider::table::tests::cayenne_maintenance_sessions_use_cpu_budget_partitions",
+        )
+        .expect("isolated CPU budget run should pass") else {
+            return;
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "cpu_budget_maintenance",
+            schema,
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        let internal = provider
+            .create_session_context()
+            .state()
+            .config()
+            .target_partitions();
+        let compaction = provider
+            .create_compaction_session_context()
+            .state()
+            .config()
+            .target_partitions();
+        let custom_writer = provider
+            .compaction_session_context(
+                crate::provider::compaction_writer::CompactionWriterConfig::for_ebs_tier(),
+                256 * 1024 * 1024,
+            )
+            .expect("custom compaction writer session should be created")
+            .state()
+            .config()
+            .target_partitions();
+        assert_eq!(internal, cores, "internal session");
+        assert_eq!(compaction, cores, "compaction session");
+        assert_eq!(custom_writer, cores, "compaction-writer session");
     }
 
     #[tokio::test]
