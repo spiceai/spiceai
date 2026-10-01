@@ -194,7 +194,7 @@ def check_admission_ratio(
     the load generator does, the admission ratio only moves when the controller
     does.
     """
-    if scenario.fault_admission_ratio_below is None:
+    if scenario.fault_admission_ratio_below is None and scenario.fault_admission_ratio_above is None:
         return
     values = [
         sample.value
@@ -204,14 +204,25 @@ def check_admission_ratio(
         and fault.start_ms <= sample.scrape_epoch_ms < fault.end_ms
     ]
     lowest = min(values) if values else None
-    assertions.add(
-        f"metrics: the admission coefficient falls below"
-        f" {scenario.fault_admission_ratio_below:g} while the origin fails",
-        lowest is not None and lowest < scenario.fault_admission_ratio_below,
+    detail = (
         f"lowest published ratio {lowest:.3f} over {len(values)} scrapes"
         if lowest is not None
-        else "the metric was never scraped in the fault phase",
+        else "the metric was never scraped in the fault phase"
     )
+    if scenario.fault_admission_ratio_below is not None:
+        assertions.add(
+            f"metrics: the admission coefficient falls below"
+            f" {scenario.fault_admission_ratio_below:g} while the origin fails",
+            lowest is not None and lowest < scenario.fault_admission_ratio_below,
+            detail,
+        )
+    if scenario.fault_admission_ratio_above is not None:
+        assertions.add(
+            f"metrics: the admission coefficient never falls below"
+            f" {scenario.fault_admission_ratio_above:g}",
+            lowest is not None and lowest >= scenario.fault_admission_ratio_above,
+            detail,
+        )
 
 
 def check_metrics_agreement(

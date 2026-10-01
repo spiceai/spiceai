@@ -60,6 +60,17 @@ failures" is not what happens; B is admitted through a budget A's failures
 shrank, which is still more than a per-dataset limiter would do, but a failing
 tenant on a busy origin barely moves the origin's load.
 
+`sameorigin-minority-failure`: the sharp edge of that. d1 is given 2 of 18
+workers and fails **every** request for 65s. It is 10.3% of the origin's
+traffic, so the origin-wide error rate is 0.103 against a 0.20 threshold, and
+the admission coefficient stays at **1.000 across all 120 scrapes** — the
+controller never reacts, and the origin keeps taking its full 20 rps.
+
+The relationship is exact: the observed coefficient equals
+`(1 - f) / (1 - threshold)` where `f` is the origin-wide error rate (0.306 →
+0.867 observed 0.867; 0.443 → 0.696 observed 0.716). A tenant with share `s`
+failing everything contributes `f = s`, so it is invisible while `s < threshold`.
+
 `sameorigin-conflicting-config`: two datasets on one origin asking for
 different limits is refused at start-up — *"Multiple HTTP-based components
 target http://127.0.0.1:9001 with different rate-control settings."*

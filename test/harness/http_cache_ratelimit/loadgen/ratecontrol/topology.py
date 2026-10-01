@@ -97,6 +97,11 @@ class DatasetSpec:
     name: str
     origin: str
     path: str = "/data"
+    #: Concurrent queries for this dataset, overriding the scenario's default.
+    #: Sets how large a share of its origin's traffic this dataset asks for,
+    #: which is what decides how much of the origin's overall error rate a
+    #: failure here accounts for.
+    workers: int | None = None
     # Only for the configuration that is supposed to be refused: parameters that
     # disagree with the origin's own `RateControl`.
     override: Mapping[str, str] = field(default_factory=dict)

@@ -136,6 +136,9 @@ class Scenario:
     #: fault phase. Read from the runtime's own telemetry, so it decides
     #: "the controller reacted" independently of what reached the origin.
     fault_admission_ratio_below: float | None = None
+    #: The published `adaptive_admission_ratio` must stay at or above this for
+    #: the whole fault phase -- the claim that the controller did NOT react.
+    fault_admission_ratio_above: float | None = None
     #: A configuration the runtime is expected to refuse. When set, the run
     #: starts the replicas, greps their logs for this text, and stops.
     expect_startup_error: str | None = None
@@ -472,6 +475,43 @@ C_SCENARIOS = (
             ),
             _saturated("recovery"),
         ),
+        **SINGLE_ADAPTIVE_SHAPE,
+    ),
+    Scenario(
+        name="sameorigin-minority-failure",
+        claim=(
+            "a dataset small enough can fail EVERY request without the origin's "
+            "controller throttling at all"
+        ),
+        # The controller keys on the origin's overall error rate `f`, and
+        # throttling starts exactly when `f` passes the failure threshold. A
+        # dataset that is a share `s` of the origin's traffic and fails every
+        # request contributes `f = s`, so with `s` under the threshold it is
+        # invisible however hard it fails. d1 gets 2 of the 18 workers here, so
+        # it asks for roughly a ninth of the origin's traffic against a 20%
+        # threshold.
+        topology=Topology(
+            origins=(OriginSpec("p1", P1_PORT, _adaptive(threshold="20%")),),
+            datasets=(
+                DatasetSpec("d1", "p1", "/data", workers=2),
+                DatasetSpec("d2", "p1", "/data.json", workers=16),
+            ),
+        ),
+        faults=(Fault("p1", dict(FAIL_503, fault_paths=["/data"])),),
+        bounds=(
+            _saturated("warmup"),
+            Bound(
+                claim="the minority dataset really is failing every request",
+                phase="fault",
+                where=Slice(dataset="d1"),
+                only_statuses=("503",),
+                min_total=20,
+            ),
+            _unchanged(
+                "fault", "and the origin keeps running at its full configured rate"
+            ),
+        ),
+        fault_admission_ratio_above=0.999,
         **SINGLE_ADAPTIVE_SHAPE,
     ),
     Scenario(

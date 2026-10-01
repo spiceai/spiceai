@@ -343,14 +343,38 @@ Written as `"1"` it behaves as intended and throttles in 15s. Every other
 duration parameter in the same `params:` block — `rate_control_acquire_timeout`,
 `retry_max_duration` — does take a unit.
 
-**2. A failing dataset's errors are diluted by its healthy co-tenants.** The
-adaptive controller keys on the **origin's** overall error rate, not any one
-dataset's. In `sameorigin-coupled-throttle` the fault is scoped to d1's path, so
-roughly half the origin's requests fail, and with a 20% failure threshold the
-published admission coefficient settles near **0.82** rather than at the floor.
-That is the formula working as designed on the mix it is given, but it means a
-noisy minority tenant on a busy origin moves the rate far less than the same
-origin failing outright.
+**2. A failing tenant's errors are diluted by its healthy co-tenants, and a
+small enough tenant is invisible.** The adaptive controller keys on the
+**origin's** overall error rate `f`, not any one dataset's or replica's. The
+implementation is exact — the measured coefficient matches `(1 - f) / (1 -
+threshold)` to the third decimal:
+
+| scenario | `f` | `(1-f)/(1-t)` | observed |
+|---|---|---|---|
+| one of two datasets failing | 0.306 | 0.867 | **0.867** |
+| one of two replicas failing | 0.443 | 0.696 | **0.716** |
+
+What that means in practice: a tenant that is a share `s` of an origin's traffic
+and fails every request contributes `f = s`, and throttling starts only once `f`
+passes the threshold. So **a tenant below the threshold is invisible however
+hard it fails.** `sameorigin-minority-failure` gives d1 two of eighteen workers
+and fails every one of its requests for 65 seconds:
+
+```
+fault phase: 1301 arrivals at the origin
+  d1 (failing dataset): 134 = 10.3% of the origin's traffic, every one a 503
+  origin-wide error rate f = 0.103   (threshold 0.20)
+  admission coefficient: min 1.000, max 1.000, over 120 scrapes
+```
+
+The controller never moved. This is the formula working as documented
+("throttling starts exactly when the error rate passes the threshold") applied
+to an origin-wide rate; whether that is the right rate to key on is a design
+question, not a defect. It is worth knowing because the usual overload
+signature is partial — one expensive endpoint starts failing while the cheap
+ones still return 200 — so the controller is least sensitive in the case you
+most want it to catch, and adding datasets to an origin desensitises it
+further.
 
 **3. The co-tenant is barely affected at all.** Across five runs of the same
 scenario, the failing dataset loses about half its rate every time while its

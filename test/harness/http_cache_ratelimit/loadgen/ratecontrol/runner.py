@@ -377,7 +377,7 @@ def drive(
         threading.Thread(target=worker, args=(replica, index, dataset.name), daemon=True)
         for index, replica in enumerate(scenario.topology.replica_names())
         for dataset in scenario.topology.datasets
-        for _ in range(scenario.workers)
+        for _ in range(dataset.workers or scenario.workers)
     ]
     for thread in threads:
         thread.start()
