@@ -41,6 +41,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_status::{RuntimeStatus, unavailable_model_message};
 use tracing::{Instrument, Level};
 
 use async_trait::async_trait;
@@ -95,6 +96,10 @@ pub type RateControllerStore = HashMap<String, Arc<RateController>>;
 pub struct Ai {
     model_store: Arc<RwLock<ChatModelStore>>,
     rate_controllers: Arc<RwLock<RateControllerStore>>,
+    /// Explains a configured model that is missing from `model_store`. A model that failed to
+    /// load, or has not finished loading, is never inserted there, so without its status a lookup
+    /// miss reads as "no such model".
+    model_status: Option<Arc<RuntimeStatus>>,
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `RwLock<ChatModelStore>` implement them.
     ptr: u64,
 }
@@ -131,8 +136,38 @@ impl Ai {
         Self {
             model_store,
             rate_controllers,
+            model_status: None,
             ptr,
         }
+    }
+
+    /// Reads each configured model's load status from `status`, so a model that is configured
+    /// but cannot serve is reported as such rather than as missing.
+    #[must_use]
+    pub fn with_model_status(mut self, status: Arc<RuntimeStatus>) -> Self {
+        self.model_status = Some(status);
+        self
+    }
+
+    /// Why the configured model `model_name` is absent from the model store, if its status says.
+    fn unavailable_model_reason(&self, model_name: &str) -> Option<String> {
+        self.model_status
+            .as_ref()?
+            .unavailable_model_reason(model_name)
+    }
+
+    /// Why each configured model that cannot serve is absent from the model store, ordered by
+    /// model name.
+    fn unavailable_model_reasons(&self) -> Vec<String> {
+        let Some(status) = &self.model_status else {
+            return Vec::new();
+        };
+        let mut statuses: Vec<_> = status.get_model_statuses().into_iter().collect();
+        statuses.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        statuses
+            .into_iter()
+            .filter_map(|(name, model_status)| unavailable_model_message(&name, Some(model_status)))
+            .collect()
     }
 
     #[must_use]
@@ -145,7 +180,14 @@ impl Ai {
         let models: Vec<String> = model_store.keys().cloned().collect();
 
         match models.len() {
-            0 => exec_err!("{AI_UDF_NAME}: No chat models configured in Spicepod"),
+            0 => {
+                let reasons = self.unavailable_model_reasons();
+                if reasons.is_empty() {
+                    exec_err!("{AI_UDF_NAME}: No chat models configured in Spicepod")
+                } else {
+                    exec_err!("{AI_UDF_NAME}: {}", reasons.join("; "))
+                }
+            }
             1 => Ok(models[0].clone()),
             _ => exec_err!(
                 "{AI_UDF_NAME}: Multiple chat models configured. Please specify model name as second argument"
@@ -221,6 +263,9 @@ impl AsyncScalarUDFImpl for Ai {
 
         let model_store = self.model_store.read().await;
         let Some(model) = model_store.get(&model_name) else {
+            if let Some(reason) = self.unavailable_model_reason(&model_name) {
+                return exec_err!("{AI_UDF_NAME}: {reason}");
+            }
             return exec_err!(
                 "{AI_UDF_NAME} cannot find model '{}'. Available models: {}",
                 model_name,
@@ -556,6 +601,7 @@ mod tests {
     };
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
+    use runtime_status::ComponentStatus;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -764,6 +810,137 @@ mod tests {
                 .expect_err("should error with no models")
                 .to_string()
                 .contains("No chat models configured")
+        );
+    }
+
+    fn status_with(models: &[(&str, ComponentStatus)]) -> Arc<RuntimeStatus> {
+        let status = RuntimeStatus::new();
+        for (name, model_status) in models {
+            status.update_model(name, model_status.clone());
+        }
+        status
+    }
+
+    fn scalar_args(message: &str, model: Option<&str>) -> ScalarFunctionArgs {
+        let mut args = vec![ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            message.to_string(),
+        )))];
+        if let Some(model) = model {
+            args.push(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                model.to_string(),
+            ))));
+        }
+        ScalarFunctionArgs {
+            args,
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
+        }
+    }
+
+    // regression test for #14394
+    #[tokio::test]
+    async fn named_model_that_failed_to_load_reports_its_load_failure() {
+        let udf = Ai::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            empty_rate_controllers(),
+        )
+        .with_model_status(status_with(&[(
+            "deepseek",
+            ComponentStatus::error_with_message("Insufficient Balance"),
+        )]));
+
+        let err = udf
+            .invoke_async_with_args(scalar_args("hi", Some("deepseek")))
+            .await
+            .expect_err("a model that failed to load cannot serve the call");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai: Model 'deepseek' failed to load, so it cannot serve requests. Cause: Insufficient Balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_model_without_a_status_is_still_not_found() {
+        let udf = Ai::new(create_test_model_store(), empty_rate_controllers())
+            .with_model_status(status_with(&[("test-model", ComponentStatus::Ready)]));
+
+        let err = udf
+            .invoke_async_with_args(scalar_args("hi", Some("unknown")))
+            .await
+            .expect_err("an unconfigured model cannot serve the call");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai cannot find model 'unknown'. Available models: test-model"
+        );
+    }
+
+    // regression test for #14394
+    #[tokio::test]
+    async fn default_model_that_failed_to_load_reports_its_load_failure() {
+        let udf = Ai::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            empty_rate_controllers(),
+        )
+        .with_model_status(status_with(&[(
+            "deepseek",
+            ComponentStatus::error_with_message("Insufficient Balance"),
+        )]));
+
+        let err = udf
+            .invoke_async_with_args(scalar_args("hi", None))
+            .await
+            .expect_err("no loaded chat model can serve the call");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai: Model 'deepseek' failed to load, so it cannot serve requests. Cause: Insufficient Balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_reports_every_configured_model_that_cannot_serve() {
+        let udf = Ai::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            empty_rate_controllers(),
+        )
+        .with_model_status(status_with(&[
+            ("zeta", ComponentStatus::Initializing),
+            ("alpha", ComponentStatus::error_with_message("boom")),
+            ("removed", ComponentStatus::Disabled),
+        ]));
+
+        let err = udf
+            .get_default_model_name()
+            .await
+            .expect_err("no loaded chat model can serve the call");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai: Model 'alpha' failed to load, so it cannot serve requests. Cause: boom; Model 'zeta' is still loading. Retry once it is ready."
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_with_no_unavailable_model_keeps_the_not_configured_error() {
+        // A loaded evaluate-only model reports `Ready` but never enters the chat model store.
+        let udf = Ai::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            empty_rate_controllers(),
+        )
+        .with_model_status(status_with(&[("evaluator", ComponentStatus::Ready)]));
+
+        let err = udf
+            .get_default_model_name()
+            .await
+            .expect_err("no chat model is configured");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai: No chat models configured in Spicepod"
         );
     }
 

@@ -153,6 +153,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
         ctx.register_udf(
             Ai::new(runtime.completion_llms(), runtime.model_rate_controllers())
+                .with_model_status(runtime.status())
                 .into_async_udf()
                 .into_scalar_udf(),
         );
