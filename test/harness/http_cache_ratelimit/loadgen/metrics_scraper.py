@@ -100,7 +100,7 @@ class MetricsScraper:
         self.interval_s = interval_s
         # Flat set of base names to match by prefix.
         self.base_names: list[str] = []
-        for group in ("adaptive", "cooldown", "static_limiter"):
+        for group in ("adaptive", "cluster", "cooldown", "static_limiter"):
             self.base_names.extend(config.get(group, {}).values())
         self.samples: list[MetricSample] = []
         self.discovered_names: set[str] = set()

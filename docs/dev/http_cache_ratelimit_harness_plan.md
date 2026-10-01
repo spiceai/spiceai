@@ -42,9 +42,29 @@ If a scenario also puts the SQL results cache in front (not the default plan), t
 
 Rate control is fully observable through `runtime.metrics` (Prometheus/OpenTelemetry). The metrics are registered as OTel observable instruments in `crates/data-http-rate-control/src/lib.rs:363-472` and are labeled per origin by an `origin` attribute (`callback_to_observe_metric`, `lib.rs:522-532`; the label value is `rate_control_key(base_url)`).
 
-Adaptive metrics (per origin) — only these two gauges are registered; #14143 exposes no separate throttled-request counter, so "was this request throttled" is read off the admission coefficient dropping below 1000:
-- `adaptive_rate_control_effective_limit` (gauge; `0` when disabled)
-- `adaptive_rate_control_admission_coefficient_permille` (gauge, `0..=1000`; `1000` = admit all)
+Adaptive metrics (per origin), **verified against a live scrape** of `spiced`
+v2.4.0-unstable-build.41116b5ae9 built with `--features rate-control`
+(2026-10-01). The names in an earlier draft of this plan
+(`adaptive_rate_control_effective_limit`,
+`adaptive_rate_control_admission_coefficient_permille`) do not exist in the
+runtime; what ships is one f64 gauge in `[0, 1]`, so the permille conversion is
+gone too. Every series below carries the `dataset_http_` exporter prefix:
+- `dataset_http_rate_control_adaptive_admission_ratio` (gauge, `0..=1`; `1` = admit all; absent in static mode)
+- `dataset_http_rate_control_adaptive_throttled_total` (counter; absent in static mode)
+
+Cluster rate-control metrics (per origin **and** per limiter), present only
+when `runtime.source_rate_control.state_location` is set:
+- `dataset_http_rate_control_cluster_effective_burst` (gauge; the budget for the current window after adaptive throttling)
+- `dataset_http_rate_control_cluster_budget_remaining` (gauge; tokens of the current window not yet leased by any instance)
+- `dataset_http_rate_control_lease_granted` (gauge; tokens this instance holds)
+- `dataset_http_rate_control_lease_acquire_duration_ms` (gauge)
+- `dataset_http_rate_control_lease_acquire_conflicts_total` (counter; optimistic-concurrency retries)
+- `dataset_http_rate_control_lease_refresh_errors_total` (counter)
+- `dataset_http_rate_control_fail_closed_total` (counter; requests refused because the shared store was unreachable and the lease had expired)
+
+These carry a `limiter` label as well as `origin`, so a dataset that configures
+both a per-second and a per-minute limit emits two rows per scrape that a
+scraper keyed only on `origin` cannot tell apart.
 
 Cooldown/Retry-After metrics (per origin):
 - `rate_limit_retry_after_updates_total`, `rate_limit_retry_after_waits_total`, `rate_limit_retry_after_wait_duration_ms`, `rate_limit_retry_after_remaining_ms`
@@ -60,6 +80,36 @@ Confirmed in `crates/data_components/src/http/provider.rs:1608-1628`:
 - A response with a retryable status (408 / 429 / 5xx) records `Failure`; any other status records `Success` (lines 1624-1628). `status_is_retryable` lives in `crates/data_components/src/resilient_http.rs:310-316`; connect/timeout detection uses `error.is_connect() || error.is_timeout()` (`resilient_http.rs:295`).
 
 This is why the timeout fault mode is mandatory: a hang past `client_timeout` is the same failure signal to the controller as a 503, and it is the trigger for SIE on the caching side.
+
+### 2.5 The three dimensions rate control varies in
+
+`rate_control_key(base_url)` is `scheme://host:port` -- path-independent -- and
+the registry caches one limiter per key ("One origin gets one limiter" is a
+literal comment in `data-http-rate-control/src/lib.rs`). Three things therefore
+change what is under test, and the scenario catalog
+(`loadgen/ratecontrol/scenarios.py`, run by `run_ratecontrol.sh`) crosses them:
+
+1. **How many origins.** Each is an independent limiter and an independent
+   adaptive controller. A failing origin must not move a healthy one's rate.
+2. **How many datasets share an origin.** They share its limiter, so N
+   saturated datasets on one origin stay inside ONE budget, and a fault scoped
+   to one dataset's path throttles its co-tenants. Two datasets on one origin
+   that ask for *different* limits are refused at start-up
+   (`resolve_existing_controller` -> `conflicting_config_error`), so the limit
+   belongs to the origin, not the dataset.
+3. **How many spiced replicas.** With `runtime.source_rate_control.state_location`
+   set, the budget is leased from a shared object instead of held in process
+   memory, and the adaptive coefficient is derived from counts every replica
+   publishes (spiceai/spiceai#14575). A per-node controller and a cluster one
+   are told apart by failing *one replica's* traffic: only the cluster throttles
+   the replica that saw no failure.
+
+**A single node and a cluster react at completely different speeds.** A single
+node decays over `rate_control_window` (default 10s), so it glides down over
+~40s; a cluster's half-life is one window (`refresh_interval`), because one
+window is the shortest half-life the shared state can express, so it steps. Any
+assertion about a steady state has to settle for the right one of those, and
+the reaction time itself is worth asserting separately.
 
 ## 3. Architecture
 
@@ -356,6 +406,7 @@ Each run creates `runs/<UTC-timestamp>-<scenario>/` containing: the resolved spi
 3. Phase 2 — metrics scraper + rate-control assertions. Add the scraper and the per-origin adaptive/cooldown checks. Deliverable: `ratecontrol-admission`, `ratecontrol-cooldown`, `ratecontrol-ietf-headers`.
 4. Phase 3 — topology + composition. Second origin, two p2 datasets, isolation/sharing checks, and the composition scenario.
 5. Phase 4 — hygiene, compose, slow run, correlation plot. One-command bring-up, run directories, the guardrail warning, and scenario 12.
+6. Phase 5 — the rate-control scenario catalog (`run_ratecontrol.sh`). Crosses the three dimensions of Section 2.5: several origins, several datasets on one origin, and several spiced replicas leasing one budget from object storage, with the fault modes of Section 4.4 scoped per path and per replica. The shared state object is read back as its own evidence (budget never oversold; published `ok`/`failed` equal to the origin's own outcomes per window, which is how a permit-acquire timeout is shown never to count as an upstream failure; `effective_burst` re-derived from the published formula).
 
 Each phase is independently useful: Phase 0 already validates the single most load-bearing assumption (the payload oracle).
 

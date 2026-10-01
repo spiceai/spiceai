@@ -6,6 +6,10 @@ a HTTP server and asserts various properties of the cache. Tiers of testing.
  of caching TTL, and reduces load on origin (i.e. acts like a cache). 
  - Phase 1: Satisfies RFC 5861 stale-if-error mechanisms. 
  - Phase 2: Measures effectiveness of adaptive rate controls, both additive increase, multplicative decrease, and sucess-based throttling.
+ - Rate-control catalog (`run_ratecontrol.sh`): the breadth pass over HTTP rate
+   control — several origins, several datasets on one origin, and several spiced
+   replicas sharing one budget through object storage. See "The rate-control
+   scenario catalog" below.
  
 ```ascii
   [ load gen ] ---> [ spiced :8090 ] ---> [ HTTP origin 1 :9001 ]
@@ -30,6 +34,11 @@ a HTTP server and asserts various properties of the cache. Tiers of testing.
   entries against one origin.
 - `run_phase0.sh`, `run_phase1.sh`, `run_phase2.sh`: one-command
   orchestration per phase.
+- `run_ratecontrol.sh` + `loadgen/run_ratecontrol.py` + `loadgen/ratecontrol/`:
+  the rate-control scenario catalog. `scenarios.py` is the catalog itself,
+  `topology.py` renders the spicepod for a given origin/dataset/replica shape,
+  `rates.py` turns the origins' arrival logs into per-second statistics, and
+  `state.py` reads the shared cluster state object back as evidence.
 - `loadgen/report.py`: renders any run directory (any phase) into one static
   HTML report — QPS at the HTTP origin(s) and at spiced (each also broken
   down per status), latency, staleness/freshness, and (Phase 2) admission
@@ -194,6 +203,126 @@ Evidence for finding 3 (`caching-sie-timeout`, origin hang-fetch arrivals):
 hang fetches re-arrive ~1.0s apart (client_timeout) though each hang would
 only respond at +3000ms — the connector abandoned each attempt at the
 timeout, it did not wait the full hang.
+
+## The rate-control scenario catalog (`run_ratecontrol.sh`)
+
+`run_phase2.sh` asks one deep question of one spiced: does the admission
+coefficient follow the formula? `run_ratecontrol.sh` asks a broad one, from the
+origins' arrival logs, across the three dimensions rate control actually varies
+in:
+
+```
+            one origin, one dataset         several origins          several datasets, one origin
+                    |                              |                              |
+   one spiced   does it react, and to     is a failing origin      do they share one limiter,
+                what?  503 / 429 /        isolated from a          or get one each?
+                timeout / refuse /        healthy one?
+                latency-only / below
+                the threshold
+                    |                              |                              |
+   N spiced     is the budget the         does each origin get      does one budget cover the
+   sharing      cluster's, and does a     its own shared budget     whole replica x dataset
+   state        peer's failure throttle   and its own throttle?     cross-product?
+                a replica that saw none?
+```
+
+```bash
+./run_ratecontrol.sh --list                   # the catalog, one line per claim
+./run_ratecontrol.sh all                      # ~45 min
+./run_ratecontrol.sh cluster                  # one group
+./run_ratecontrol.sh multi-origin-isolation   # one scenario
+```
+
+Exit code is the verdict (0 PASS, 1 FAIL, 2 BLOCKED). Artifacts land in
+`/tmp/http_ratecontrol_run/<scenario>/`: `verdict.json`, `arrival_curve.txt`
+(the per-second shape of the reaction), `queries.csv`, `metrics.csv`,
+`origin_*.jsonl`, `state_timeline_*.txt`, `spiced_*.log`, and the rendered
+`spicepod.yaml` per replica.
+
+Cluster scenarios need the **`rate-control`** cargo feature, same as Phase 2.
+Without it `state_location` is ignored, the runtime warns once, and every
+cluster scenario silently measures a process-local limiter instead.
+`cluster-adaptive-s3` additionally needs `rustfs` and the `aws` CLI.
+
+### What a scenario is
+
+`loadgen/ratecontrol/scenarios.py` is the catalog, and it is meant to be read:
+each entry is a claim plus the smallest topology that can decide it.
+
+- `topology` — origins (each one `rate_control_key` = one limiter), datasets
+  (several may share an origin), replicas, and whether they lease from shared
+  state. `RateControl` hangs off the **origin**, not the dataset, because the
+  runtime refuses to start when two datasets on one origin ask for different
+  limits — a per-dataset limit is not something a working config can express.
+- `faults` — a `/control` profile applied to one origin for the fault phase.
+  `fault_paths` scopes it to one dataset's URL and `fault_headers` to one
+  replica's `X-Spice-Replica` tag, so a single origin can fail one tenant's
+  traffic and serve everybody else's. That is what tells a per-dataset or
+  per-node controller apart from a shared one.
+- `bounds` — p99/peak claims per phase, over a slice of the traffic
+  (`Slice(origin=…, dataset=…, replica=…)`).
+- `timing` — how fast the rate must fall, and how fast it must come back.
+
+### Measuring a rate
+
+Buckets are **whole unix seconds**, because the rate-control window is
+`epoch_ms // window_ms`; a bucket counted from the start of a phase would
+straddle two windows and report a peak that was never spent. The statistic is
+**p99 and peak, never the mean** — a limit is a claim about the worst second.
+Empty seconds inside the range are counted, so a throttled phase is not
+flattered by dropping its idle seconds.
+
+A whole second may legitimately carry **one request more** than the budget: a
+permit is spent when its window grants it and the request lands milliseconds
+later. The exact check is per rate-control window, in
+`loadgen/ratecontrol/state.py`, which reads the leased budget out of the shared
+state object rather than trusting wall-clock arrivals.
+
+### A single node and a cluster move at completely different speeds
+
+This is the one thing that will mislead you if you skip it. A single node's
+adaptive controller decays over `rate_control_window`, which **defaults to
+10s**, so it walks a saturated origin down over ~40s and back up over ~15s. A
+cluster's half-life is one window (`refresh_interval`, 1s in this harness),
+because one window is the shortest half-life the shared state can express, so
+it steps rather than glides:
+
+```
+single node (default 10s window)          cluster (1s window)
+20 ####################                   20 ####################
+20 ####################                   19 ###################
+17 #################                       5 #####
+15 ###############                         2 ##
+13 #############                           6 ######
+11 ###########                             6 ######
+ 9 #########                               6 ######
+ 7 #######                                 6 ######
+ 5 #####                                   6 ######
+ 4 ####                                    6 ######
+```
+
+A steady-state bound measured 6s into the fault therefore says nothing about a
+single node. `Settle` skips a long transient in a single-node fault phase and a
+short one in a cluster's, and `Timing` asserts the transient itself — so the
+reaction time is measured rather than smeared into a steady-state bound.
+
+### What the cluster scenarios check beyond the rate
+
+The shared state object is read back as evidence
+(`loadgen/ratecontrol/state.py`):
+
+| check | why the arrival log cannot settle it |
+|---|---|
+| `sum(granted) <= effective_burst` per window | the lease split is invisible from outside |
+| arrivals within the leased budget over adjacent windows | distinguishes a real oversell from a boundary-crossing request |
+| published `ok`/`failed` == the origin's own 200/non-200 per window | proves a permit-acquire timeout, which never reaches the origin, is never counted as an upstream failure |
+| `effective_burst` matches the published formula | re-derives it from `ok`/`failed` with `K = 1/(1 - failure_threshold)` |
+| static mode publishes no outcome counts | the state object stays byte-compatible with pre-cluster-adaptive runtimes |
+
+And from each replica's own `/metrics`: every replica must publish the same
+`cluster_effective_burst` and `adaptive_admission_ratio`, having exchanged no
+traffic with its peers — plus zero lease-refresh errors and zero fail-closed
+requests.
 
 ## Phase 2 — adaptive rate control
 

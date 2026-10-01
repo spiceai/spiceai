@@ -46,6 +46,11 @@ faulted, except ``refuse``) also carries the ``latency_ms`` slowdown.
   latency - a non-failing slowdown only; ``latency_ms`` on every response
             and no errors regardless of ``error_rate``.
 
+A fault can be scoped by ``fault_paths`` (one dataset's URL path) and by
+``fault_headers`` (one spiced instance's ``X-Spice-Replica`` tag), so a
+single origin can fail one dataset's or one replica's traffic while serving
+everybody else's.
+
 The fault draw uses a seeded RNG (``seed`` in the profile) so a run
 replays deterministically.
 
@@ -84,6 +89,8 @@ ORIGIN_NAME = os.environ.get("ORIGIN_NAME", "p1")
 BUMP_INTERVAL_S = float(os.environ.get("ORIGIN_BUMP_INTERVAL", "1.0"))
 PAYLOAD_FORMAT = os.environ.get("ORIGIN_PAYLOAD_FORMAT", "ndjson").lower()
 REQUEST_LOG_PATH = os.environ.get("ORIGIN_REQUEST_LOG", "origin_requests.jsonl")
+# Lower-case: Starlette's header mapping is case-insensitive but keyed lower.
+REPLICA_HEADER = os.environ.get("ORIGIN_REPLICA_HEADER", "x-spice-replica").lower()
 T0 = float(os.environ.get("HARNESS_T0", str(time.time())))
 SEED_VERSION = int(os.environ.get("ORIGIN_SEED_VERSION", "1"))
 
@@ -100,6 +107,7 @@ _CONTROL_KEYS = (
     "headers",
     "seed",
     "fault_paths",
+    "fault_headers",
 )
 
 _lock = threading.Lock()
@@ -125,6 +133,14 @@ _state: dict[str, Any] = {
     # rate controller's per-origin state (keyed on host:port, not path --
     # see rate_control_key in data-http-rate-control) couples the two.
     "fault_paths": [],
+    # Request headers this fault applies to, as {name: value} (name matched
+    # case-insensitively). Empty = every request on this origin. A dataset
+    # carries a fixed header per spiced instance via the connector's
+    # `http_headers` parameter, so scoping a fault this way fails one
+    # replica's traffic and serves another's -- which is how a per-node
+    # controller is told apart from a cluster one, where the replica that saw
+    # no failure throttles anyway.
+    "fault_headers": {},
     # Counters.
     "data_requests": 0,
     "total_requests": 0,
@@ -183,6 +199,7 @@ def _log_request(
     applied_delay_ms: Any = None,
     fault_profile_id: Optional[str] = None,
     request_seq: Optional[int] = None,
+    replica: str = "",
 ) -> None:
     row = {
         "recv_epoch_ms": recv_ms,
@@ -190,6 +207,9 @@ def _log_request(
         "origin": ORIGIN_NAME,
         "method": method,
         "path": path,
+        # Which spiced instance sent this, from the REPLICA_HEADER the dataset
+        # attaches. Empty when the dataset carries no tag.
+        "replica": replica,
         # Raw query string of the request; the per-key cache/version key.
         "query": query,
         "applied_status": applied_status,
@@ -308,8 +328,15 @@ async def _serve_data(request: Request, path: str) -> Any:
 
         fault_paths = _state.get("fault_paths") or []
         path_faultable = not fault_paths or path in fault_paths
+        fault_headers = _state.get("fault_headers") or {}
+        headers_faultable = all(
+            request.headers.get(name.lower()) == value for name, value in fault_headers.items()
+        )
         faulted = (
-            path_faultable and mode in ("status", "refuse", "hang") and _rng.random() < error_rate
+            path_faultable
+            and headers_faultable
+            and mode in ("status", "refuse", "hang")
+            and _rng.random() < error_rate
         )
         if faulted:
             _state["faulted_requests"] += 1
@@ -338,6 +365,7 @@ async def _serve_data(request: Request, path: str) -> Any:
         applied_delay_ms=round(applied_delay_ms, 2),
         fault_profile_id=profile_id,
         request_seq=seq,
+        replica=request.headers.get(REPLICA_HEADER, ""),
     )
 
     if applied_status == "refuse":
