@@ -44,10 +44,24 @@ impl<M> ManagedRecordBatchStream<M> {
     }
 }
 
+/// When the managed runtime starts pulling batches from the stream the future produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamStart {
+    /// As soon as the future has produced the stream, so the first batches are ready by the
+    /// time the caller asks for them.
+    Immediately,
+    /// Only once the caller first polls the returned stream. For a consumer that has to finish
+    /// preparing before any batch is produced: a refresh's source stream computes the dataset's
+    /// indexes as it is read, so it must not run ahead of the sink opening the index write
+    /// window (#14619).
+    OnFirstPoll,
+}
+
 /// Executes a future that produces a [`SendableRecordBatchStream`] on the provided Tokio runtime.
 ///
 /// The future and the resulting stream are both driven by the supplied runtime handle. The resulting
-/// stream can be consumed from the caller's runtime without blocking the managed runtime.
+/// stream can be consumed from the caller's runtime without blocking the managed runtime. `start`
+/// decides whether the stream is pulled ahead of the caller's first poll.
 ///
 /// # Errors
 ///
@@ -57,6 +71,7 @@ pub async fn run_record_batch_stream_on_runtime<Fut, M, E>(
     runtime_handle: Handle,
     request_context: Arc<RequestContext>,
     span: Span,
+    start: StreamStart,
     future: Fut,
 ) -> Result<ManagedRecordBatchStream<M>, ManagedRuntimeError<E>>
 where
@@ -66,6 +81,11 @@ where
 {
     let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
     let (meta_tx, meta_rx) = oneshot::channel::<Result<(M, SchemaRef), E>>();
+    let (demand_tx, demand_rx) = oneshot::channel::<()>();
+    let demand_tx = match start {
+        StreamStart::Immediately => None,
+        StreamStart::OnFirstPoll => Some(demand_tx),
+    };
 
     let driver_request_context = Arc::clone(&request_context);
     let driver_span = span.clone();
@@ -87,6 +107,11 @@ where
                 let schema = stream.schema();
 
                 if meta_tx.send(Ok((metadata, schema))).is_err() {
+                    return;
+                }
+
+                // An error means the caller dropped the stream without polling it.
+                if start == StreamStart::OnFirstPoll && demand_rx.await.is_err() {
                     return;
                 }
 
@@ -114,7 +139,7 @@ where
         Err(_) => return Err(ManagedRuntimeError::DriverTaskEnded),
     };
 
-    let driver_stream = RuntimeDriverStream::new(batch_rx, driver_handle);
+    let driver_stream = RuntimeDriverStream::new(batch_rx, driver_handle).with_demand(demand_tx);
     let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(driver_stream));
     let stream: SendableRecordBatchStream = Box::pin(adapter);
 
@@ -130,6 +155,8 @@ where
 struct RuntimeDriverStream {
     receiver: ReceiverStream<Result<RecordBatch, DataFusionError>>,
     driver_handle: Option<JoinHandle<()>>,
+    /// Released on the first poll, for a driver started with [`StreamStart::OnFirstPoll`].
+    demand: Option<oneshot::Sender<()>>,
 }
 
 impl RuntimeDriverStream {
@@ -140,7 +167,13 @@ impl RuntimeDriverStream {
         Self {
             receiver: ReceiverStream::new(receiver),
             driver_handle: Some(driver_handle),
+            demand: None,
         }
+    }
+
+    fn with_demand(mut self, demand: Option<oneshot::Sender<()>>) -> Self {
+        self.demand = demand;
+        self
     }
 }
 
@@ -149,6 +182,12 @@ impl Stream for RuntimeDriverStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        if let Some(demand) = this.demand.take() {
+            // The driver only stops waiting once this send lands or the stream is dropped, so
+            // a failed send means the driver has already ended and the handle reports why.
+            let _ = demand.send(());
+        }
 
         // Drain already-produced batches first, so a driver failure surfaces only
         // after the caller has received everything the driver actually sent.
@@ -236,6 +275,7 @@ mod tests {
             handle,
             Arc::clone(&request_context),
             Span::current(),
+            StreamStart::Immediately,
             async move {
                 let schema = Arc::new(Schema::new(vec![Field::new(
                     "value",
@@ -288,6 +328,7 @@ mod tests {
             handle,
             Arc::clone(&request_context),
             Span::current(),
+            StreamStart::Immediately,
             async move { Err::<(u8, SendableRecordBatchStream), &'static str>("boom") },
         )
         .await;
@@ -312,6 +353,7 @@ mod tests {
             handle,
             request_context,
             Span::current(),
+            StreamStart::Immediately,
             async move {
                 panic!("driver task panic");
             },
@@ -477,6 +519,106 @@ mod tests {
             panic!("expected exactly one batch and no error, got {results:?}");
         };
         assert_eq!(batch.num_rows(), 1);
+        runtime.shutdown_background();
+    }
+
+    /// Starts a managed stream over one batch, reporting on `polled` each time the managed
+    /// runtime polls the source.
+    async fn managed_stream_reporting_polls(
+        runtime: &tokio::runtime::Runtime,
+        start: StreamStart,
+    ) -> (
+        SendableRecordBatchStream,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let (polled_tx, polled_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let managed = run_record_batch_stream_on_runtime(
+            runtime.handle().clone(),
+            test_request_context(),
+            Span::current(),
+            start,
+            async move {
+                let batch = test_batch(vec![1, 2, 3]);
+                let schema = batch.schema();
+                let mut batches = vec![Ok::<_, DataFusionError>(batch)].into_iter();
+                let source = futures::stream::poll_fn(move |_| {
+                    let _ = polled_tx.send(());
+                    Poll::Ready(batches.next())
+                });
+                let stream: SendableRecordBatchStream =
+                    Box::pin(RecordBatchStreamAdapter::new(schema, source.boxed()));
+                Ok::<_, DataFusionError>(((), stream))
+            },
+        )
+        .await
+        .expect("managed stream");
+        (managed.into_parts().1, polled_rx)
+    }
+
+    /// A driver started with `OnFirstPoll` reads nothing from the source until the caller asks
+    /// for a batch — the guarantee a refresh relies on so its source cannot index rows before
+    /// the sink opens the index write window (#14619).
+    #[tokio::test]
+    async fn on_first_poll_driver_does_not_read_the_source_before_the_caller_polls() {
+        let runtime = test_runtime();
+        let (stream, mut polled) =
+            managed_stream_reporting_polls(&runtime, StreamStart::OnFirstPoll).await;
+
+        // Asserting an absence needs a bounded wait: an eager driver polls the source within
+        // microseconds of handing back the stream, far inside this window.
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(200), polled.recv()).await;
+        assert!(
+            early.is_err(),
+            "the driver read the source before the caller polled the stream"
+        );
+
+        let results: Vec<_> = stream.collect().await;
+        let [Ok(batch)] = results.as_slice() else {
+            panic!("expected exactly one batch and no error, got {results:?}");
+        };
+        assert_eq!(batch.num_rows(), 3);
+        assert!(
+            polled.try_recv().is_ok(),
+            "the source was never polled, yet the stream yielded its batch"
+        );
+        runtime.shutdown_background();
+    }
+
+    /// The `Immediately` driver keeps pulling ahead of the caller, as queries expect.
+    #[tokio::test]
+    async fn immediate_driver_reads_the_source_before_the_caller_polls() {
+        let runtime = test_runtime();
+        let (stream, mut polled) =
+            managed_stream_reporting_polls(&runtime, StreamStart::Immediately).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), polled.recv())
+            .await
+            .expect("the driver reads the source without waiting for the caller")
+            .expect("the source reports its poll");
+
+        let results: Vec<_> = stream.collect().await;
+        assert_eq!(results.len(), 1, "unexpected results: {results:?}");
+        runtime.shutdown_background();
+    }
+
+    /// Dropping an `OnFirstPoll` stream that was never polled ends the waiting driver rather
+    /// than leaving it parked on the managed runtime.
+    #[tokio::test]
+    async fn on_first_poll_driver_ends_when_the_stream_is_dropped_unpolled() {
+        let runtime = test_runtime();
+        let (stream, mut polled) =
+            managed_stream_reporting_polls(&runtime, StreamStart::OnFirstPoll).await;
+        drop(stream);
+
+        // The driver owns the source, so its channel closes once the driver task ends.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), polled.recv())
+            .await
+            .expect("the driver ended after the stream was dropped");
+        assert!(
+            closed.is_none(),
+            "the dropped stream's source was still read"
+        );
         runtime.shutdown_background();
     }
 }
