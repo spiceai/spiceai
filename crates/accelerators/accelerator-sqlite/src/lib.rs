@@ -49,7 +49,8 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, keep_first,
+    upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
@@ -589,6 +590,15 @@ impl DataAccelerator for SqliteAccelerator {
             &cmd.options,
             cmd.constraints.clone(),
         );
+        // The per-batch uniqueness check refuses a key repeated within one
+        // write before `ON CONFLICT DO NOTHING` can drop it, so `drop` keeps
+        // the first copy here.
+        let write_provider = keep_first::wrap_with_keep_first_if_needed(
+            write_provider,
+            &cmd.options,
+            cmd.schema.as_arrow(),
+            &cmd.constraints,
+        );
 
         let table_provider =
             Arc::new(PolyTableProvider::new(write_provider, read_provider)).into_table();
@@ -793,7 +803,7 @@ mod tests {
     };
     use data_accelerator_api::DataAccelerator;
     use datafusion::{
-        common::{Constraints, TableReference, ToDFSchema},
+        common::{Constraint, Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
@@ -868,6 +878,98 @@ mod tests {
             .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
+    }
+
+    /// Regression test for #14629: under `on_conflict: drop`, a write that
+    /// repeats a key keeps its first copy, whether the repeat is within one
+    /// record batch (which the per-batch uniqueness check used to refuse) or
+    /// in a later one.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_a_write_repeats() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("v", DataType::Utf8, false),
+        ]));
+        let batch = |rows: &[(i64, &str)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("batch should be created")
+        };
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema"),
+            name: TableReference::bare("drop_repeats"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: [("on_conflict".to_string(), "do_nothing:id".to_string())]
+                .into_iter()
+                .collect(),
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        let exec = MockExec::new(
+            vec![
+                Ok(batch(&[(1, "a"), (2, "b"), (1, "c")])),
+                Ok(batch(&[(2, "d"), (3, "e")])),
+            ],
+            Arc::clone(&schema),
+        );
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Overwrite)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("a repeated key must not fail a drop write");
+
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be planned");
+        let mut rows = Vec::new();
+        for batch in collect(scan, ctx.task_ctx()).await.expect("scan") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("v is Utf8");
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), vals.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "e".to_string())
+            ]
+        );
     }
 
     /// Regression test for the DF53 / table-providers v0.11 `SQLite` Decimal

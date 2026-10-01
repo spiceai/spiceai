@@ -119,7 +119,7 @@ pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
-use data_accelerator_api::upsert_dedup;
+use data_accelerator_api::{keep_first, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -1723,6 +1723,16 @@ pub(crate) async fn create_table_provider(
         &cmd.options,
         cmd.constraints.clone(),
     );
+    // DuckDB writes a whole stream as one `INSERT … ON CONFLICT DO NOTHING`,
+    // which refuses a key repeated within one batch and resolves one repeated
+    // across batches in parallel-insert order, so `drop` keeps the first copy
+    // here, before the write reaches DuckDB.
+    let write_provider = keep_first::wrap_with_keep_first_if_needed(
+        write_provider,
+        &cmd.options,
+        cmd.schema.as_arrow(),
+        &cmd.constraints,
+    );
     let write_provider = guard_unique_index_overwrites(write_provider, cmd);
 
     let mut schema_metadata = HashMap::new();
@@ -2330,6 +2340,7 @@ mod tests {
         },
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
+    use datafusion::datasource::TableProvider;
     use datafusion::{
         common::{Constraint, Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -2663,6 +2674,164 @@ mod tests {
             ids,
             vec![1, 2, 3],
             "rows must be ordered by descending timestamp"
+        );
+    }
+
+    async fn drop_on_conflict_table(name: &str) -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let mut options = HashMap::new();
+        options.insert("on_conflict".to_string(), "do_nothing:id".to_string());
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(schema)
+                .expect("to convert Arrow schema to DataFusion schema"),
+            name: TableReference::bare(name),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table, None)
+            .await
+            .expect("table should be created")
+    }
+
+    fn id_v_batch(rows: &[(i64, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("to create RecordBatch")
+    }
+
+    async fn write_batches(
+        table: &Arc<dyn TableProvider>,
+        batches: Vec<RecordBatch>,
+        op: InsertOp,
+    ) -> datafusion::common::Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        let schema = batches[0].schema();
+        let exec = Arc::new(MockExec::new(batches.into_iter().map(Ok).collect(), schema));
+        let plan = table.insert_into(&ctx.state(), exec, op).await?;
+        collect(plan, ctx.task_ctx()).await
+    }
+
+    /// `(id, v)` rows the table holds, ordered by `id`.
+    async fn id_v_rows(table: &Arc<dyn TableProvider>) -> Vec<(i64, String)> {
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan");
+        let mut rows = Vec::new();
+        for batch in collect(plan, ctx.task_ctx()).await.expect("to scan") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("v is Utf8");
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), vals.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Regression test for #14629: under `on_conflict: drop`, a full refresh
+    /// that repeats a key within one record batch keeps its first copy instead
+    /// of failing the refresh on the uniqueness check.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_an_overwrite_repeats_within_a_batch() {
+        let table = drop_on_conflict_table("drop_within_batch").await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("a repeated key must not fail a drop overwrite");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// Regression test for #14629: a key repeated in a later record batch
+    /// keeps its first copy. `DuckDB` inserts the whole write as one statement
+    /// over a parallel scan, so before the fix the copy that survived varied
+    /// run to run; repeating the write catches that.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_an_overwrite_repeats_across_batches() {
+        let first: Vec<(i64, &str)> = (0..8192).map(|id| (id, "first")).collect();
+        for attempt in 0..20 {
+            let table = drop_on_conflict_table(&format!("drop_across_batches_{attempt}")).await;
+            write_batches(
+                &table,
+                vec![id_v_batch(&first), id_v_batch(&[(0, "last")])],
+                InsertOp::Overwrite,
+            )
+            .await
+            .expect("overwrite succeeds");
+
+            let rows = id_v_rows(&table).await;
+            assert_eq!(rows.len(), 8192, "attempt {attempt}");
+            assert_eq!(rows[0], (0, "first".to_string()), "attempt {attempt}");
+        }
+    }
+
+    /// An append under `drop` keeps a stored row over an incoming copy of its
+    /// key, and the first of the copies the append itself repeats.
+    #[tokio::test]
+    async fn drop_append_keeps_stored_rows_and_the_first_new_copy() {
+        let table = drop_on_conflict_table("drop_append").await;
+        write_batches(&table, vec![id_v_batch(&[(5, "old")])], InsertOp::Overwrite)
+            .await
+            .expect("initial overwrite succeeds");
+        write_batches(
+            &table,
+            vec![
+                id_v_batch(&[(5, "new"), (7, "a")]),
+                id_v_batch(&[(7, "b"), (8, "c")]),
+            ],
+            InsertOp::Append,
+        )
+        .await
+        .expect("append succeeds");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![
+                (5, "old".to_string()),
+                (7, "a".to_string()),
+                (8, "c".to_string())
+            ]
         );
     }
 
