@@ -5614,7 +5614,8 @@ impl CayenneTableProvider {
         result
     }
 
-    /// Prepares and publishes an atomic complete-set replacement.
+    /// Prepares an atomic complete-set replacement. Finish the returned write
+    /// before reporting publication to the producer.
     ///
     /// # Errors
     ///
@@ -5626,9 +5627,37 @@ impl CayenneTableProvider {
         recovery: data_components::cdc::mutation::Recovery,
         session: &datafusion::execution::context::SessionContext,
     ) -> datafusion_common::Result<CayenneCdcWrite> {
+        self.write_replace_sets(vec![replacement], recovery, session)
+            .await
+    }
+
+    /// Whether two complete sets may share a backend publication without
+    /// overlapping scope or cross-group primary-key validation dependencies.
+    #[must_use]
+    pub fn can_coalesce_replace_sets(
+        &self,
+        left: &data_components::cdc::mutation::ReplaceSet,
+        right: &data_components::cdc::mutation::ReplaceSet,
+    ) -> bool {
+        super::replace_set::can_coalesce(self, left, right)
+    }
+
+    /// Prepares disjoint complete sets through one mutation lifecycle.
+    /// Finish the returned write before reporting publication to producers.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty batches, incompatible schemas, unsupported targets and
+    /// overlapping or primary-key-dependent scopes before publication.
+    pub async fn write_replace_sets(
+        &self,
+        replacements: Vec<data_components::cdc::mutation::ReplaceSet>,
+        recovery: data_components::cdc::mutation::Recovery,
+        session: &datafusion::execution::context::SessionContext,
+    ) -> datafusion_common::Result<CayenneCdcWrite> {
         MutationWriter::new(self, &self.context, &session.task_ctx())
             .with_recovery(recovery)
-            .write_replace_set(replacement, session)
+            .write_replace_sets(replacements, session)
             .await
     }
 

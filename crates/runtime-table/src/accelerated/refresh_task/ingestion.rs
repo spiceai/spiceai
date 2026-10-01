@@ -83,6 +83,18 @@ impl Drop for PublicationCompletion {
     }
 }
 
+/// These variants denote refusal before storage publication, including a
+/// shared batch error delivered to multiple publication receipts.
+pub(crate) fn is_prepublication_refusal(mut error: &DataFusionError) -> bool {
+    while let DataFusionError::Shared(inner) = error {
+        error = inner.as_ref();
+    }
+    matches!(
+        error,
+        DataFusionError::Plan(_) | DataFusionError::NotImplemented(_)
+    )
+}
+
 pub(crate) type IngestItem = std::result::Result<Mutation, cdc::StreamError>;
 
 pub(crate) struct IngestInput {
@@ -262,6 +274,17 @@ mod tests {
             panic!("expected a finite replacement");
         };
         published
+    }
+
+    #[test]
+    fn shared_refusal_keeps_its_completion_classification() {
+        let refusal =
+            DataFusionError::Shared(Arc::new(DataFusionError::Plan("invalid scope".into())));
+        let failure = DataFusionError::Shared(Arc::new(DataFusionError::Execution(
+            "uncertain write".into(),
+        )));
+        assert!(is_prepublication_refusal(&refusal));
+        assert!(!is_prepublication_refusal(&failure));
     }
 
     #[tokio::test]

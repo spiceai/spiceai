@@ -36,7 +36,10 @@ use super::{
     CACHE_NAMESPACE_COLUMN, CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth, CacheWriteRequest,
     MAX_CONCURRENT_REFRESHES, namespace_filter_expr, stamp_namespace_column,
 };
-use crate::accelerated::refresh_task::{RefreshTask, ingestion::IngestSender};
+use crate::accelerated::refresh_task::{
+    RefreshTask,
+    ingestion::{self, IngestSender},
+};
 use crate::accelerated::write::append::AppendPlanCache;
 #[cfg(not(windows))]
 use crate::accelerated::write::append::cayenne_append_target;
@@ -195,7 +198,7 @@ impl CacheWriter {
             };
             match result {
                 Ok(()) => owner.health.lock().record_success(),
-                Err(DataFusionError::Plan(_) | DataFusionError::NotImplemented(_)) => {
+                Err(error) if ingestion::is_prepublication_refusal(error) => {
                     tracing::debug!(dataset = %owner.dataset, ?result, "Complete-set replacement refused before publication");
                 }
                 Err(error) => {

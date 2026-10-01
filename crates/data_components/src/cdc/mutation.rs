@@ -149,6 +149,24 @@ impl SetKey {
         &self.values
     }
 
+    /// Proves disjointness using the same null-aware equality as membership.
+    /// Different schemas or keys without a conflicting shared column may overlap.
+    pub fn is_disjoint_from(&self, other: &Self) -> Result<bool> {
+        if self.schema.fields() != other.schema.fields() {
+            return Ok(false);
+        }
+        for (name, value) in &self.values {
+            if let Some((_, other_value)) = other.values.iter().find(|(column, _)| column == name) {
+                let left = value.to_scalar()?;
+                let right = other_value.to_scalar()?;
+                if !arrow::compute::kernels::cmp::not_distinct(&left, &right)?.value(0) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Null-aware membership in this group, including view/storage string layouts.
     pub fn matching_rows(&self, batch: &RecordBatch) -> Result<arrow::array::BooleanArray> {
         use arrow::array::BooleanArray;
@@ -238,5 +256,55 @@ impl ReplaceSet {
     #[must_use]
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(self.key.schema())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn disjointness_preserves_null_and_scope_semantics() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("group", DataType::Utf8, true),
+        ]));
+        let key = |values: Vec<(&str, Option<&str>)>| {
+            SetKey::try_new(
+                Arc::clone(&schema),
+                values
+                    .into_iter()
+                    .map(|(name, value)| (name.into(), ScalarValue::Utf8(value.map(str::to_owned))))
+                    .collect(),
+            )
+        };
+        let broad = key(vec![("tenant", Some("a"))])?;
+        let null = key(vec![("tenant", Some("a")), ("group", None)])?;
+        let empty = key(vec![("tenant", Some("a")), ("group", Some(""))])?;
+        let other = key(vec![("tenant", Some("b")), ("group", None)])?;
+        let unbound_tenant = key(vec![("group", Some(""))])?;
+        assert!(!null.is_disjoint_from(&null)?);
+        assert!(null.is_disjoint_from(&empty)?);
+        assert!(empty.is_disjoint_from(&null)?);
+        assert!(null.is_disjoint_from(&other)?);
+        assert!(!broad.is_disjoint_from(&null)?);
+        assert!(!null.is_disjoint_from(&broad)?);
+        assert!(!broad.is_disjoint_from(&unbound_tenant)?);
+        Ok(())
+    }
+
+    #[test]
+    fn disjointness_requires_the_same_row_layout() -> Result<()> {
+        let left = SetKey::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![("id".into(), ScalarValue::Int64(Some(1)))],
+        )?;
+        let right = SetKey::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![("id".into(), ScalarValue::Int32(Some(2)))],
+        )?;
+        assert!(!left.is_disjoint_from(&right)?);
+        Ok(())
     }
 }

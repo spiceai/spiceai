@@ -1793,17 +1793,47 @@ impl RefreshTask {
                     recovery,
                     published,
                 }) => {
+                    let mut replacements = vec![replacement];
+                    let mut completions = vec![published];
+                    'coalesce: while let Some(Ok(Mutation::ReplaceSet {
+                        replacement: next,
+                        recovery: next_recovery,
+                        ..
+                    })) = iter.peek()
+                    {
+                        if recovery != *next_recovery {
+                            break;
+                        }
+                        for previous in replacements.chunks(8) {
+                            if !previous
+                                .iter()
+                                .all(|previous| self.can_coalesce_set_replacements(previous, next))
+                            {
+                                break 'coalesce;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        let Some(Ok(Mutation::ReplaceSet {
+                            replacement,
+                            published,
+                            ..
+                        })) = iter.next()
+                        else {
+                            unreachable!("peeked replacement above");
+                        };
+                        replacements.push(replacement);
+                        completions.push(published);
+                    }
                     let result = self
-                        .apply_set_replacement(context, replacement, recovery)
-                        .await;
-                    let failed = result.as_ref().is_err_and(|error| {
-                        !matches!(
-                            error,
-                            DataFusionError::NotImplemented(_) | DataFusionError::Plan(_)
-                        )
-                    });
-
-                    published.complete(result);
+                        .apply_set_replacements(context, replacements, recovery)
+                        .await
+                        .map_err(Arc::new);
+                    let failed = result
+                        .as_ref()
+                        .is_err_and(|error| !ingestion::is_prepublication_refusal(error));
+                    for completion in completions {
+                        completion.complete(result.clone().map_err(DataFusionError::Shared));
+                    }
                     if failed {
                         return false;
                     }
@@ -1885,10 +1915,27 @@ impl RefreshTask {
         (sender, task)
     }
 
-    async fn apply_set_replacement(
+    fn can_coalesce_set_replacements(
+        &self,
+        left: &data_components::cdc::mutation::ReplaceSet,
+        right: &data_components::cdc::mutation::ReplaceSet,
+    ) -> bool {
+        #[cfg(not(windows))]
+        {
+            self.cayenne_accelerator()
+                .is_some_and(|table| table.can_coalesce_replace_sets(left, right))
+        }
+        #[cfg(windows)]
+        {
+            let _ = (left, right);
+            false
+        }
+    }
+
+    async fn apply_set_replacements(
         &self,
         context: &mut ApplyContext<'_>,
-        replacement: data_components::cdc::mutation::ReplaceSet,
+        replacements: Vec<data_components::cdc::mutation::ReplaceSet>,
         recovery: data_components::cdc::mutation::Recovery,
     ) -> datafusion::error::Result<()> {
         // A complete-set operation is an ordering barrier for a preceding
@@ -1925,15 +1972,22 @@ impl RefreshTask {
                 },
             )
         {
-            let rows = replacement
-                .batches()
+            let row_counts: Vec<_> = replacements
                 .iter()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>();
+                .map(|replacement| {
+                    replacement
+                        .batches()
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>()
+                })
+                .collect();
+            let rows = row_counts.iter().sum::<usize>();
+            let replacement_count = replacements.len();
             let _guard = self.accelerator_write_mutex.lock().await;
             let result: datafusion::error::Result<bool> = async {
                 let write = cayenne
-                    .write_replace_set(replacement, recovery, &context.write_ctx)
+                    .write_replace_sets(replacements, recovery, &context.write_ctx)
                     .await?;
                 let in_memory = write.in_memory_epoch().is_some();
                 write.finish().await?;
@@ -1943,10 +1997,8 @@ impl RefreshTask {
             let in_memory = match result {
                 Ok(in_memory) => in_memory,
                 Err(error) => {
-                    if !matches!(
-                        error,
-                        DataFusionError::Plan(_) | DataFusionError::NotImplemented(_)
-                    ) && let Err(recovery_error) = cayenne.recover_incomplete_writes().await
+                    if !ingestion::is_prepublication_refusal(&error)
+                        && let Err(recovery_error) = cayenne.recover_incomplete_writes().await
                     {
                         tracing::error!(dataset = %self.dataset_name, %recovery_error, "Ingestion recovery failed; the driver is stopping");
                     }
@@ -1956,7 +2008,10 @@ impl RefreshTask {
             };
             self.update_last_updated_at();
             metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(rows as u64, context.metric_labels.dataset());
-            tracing::trace!(dataset = %self.dataset_name, rows, in_memory, "Published complete replacement through change ingestion");
+            tracing::trace!(dataset = %self.dataset_name, replacements = replacement_count, rows, in_memory, "Published replacement batch through change ingestion");
+            for rows in row_counts {
+                tracing::trace!(dataset = %self.dataset_name, rows, in_memory, "Published complete replacement through change ingestion");
+            }
             return Ok(());
         }
         Err(DataFusionError::NotImplemented(

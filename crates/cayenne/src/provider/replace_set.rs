@@ -16,9 +16,10 @@ limitations under the License.
 
 //! Complete-set preparation for atomic snapshot replacement.
 //!
-//! The input preserves rows outside the group and includes every replacement
-//! member. The overwrite sink takes its write/checkpoint guards before polling
-//! this stream; its scan must remain lazy so a preceding write cannot be lost.
+//! The input preserves rows outside the replaced groups and includes every
+//! replacement member. The overwrite sink takes its write/checkpoint guards
+//! before polling this stream; its scan must remain lazy so a preceding write
+//! cannot be lost.
 //! Staging and publication use the ordinary overwrite lifecycle, including its
 //! memory limit, file spilling, snapshot visibility and checkpoint fences.
 
@@ -28,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow::array::RecordBatch;
-use arrow::compute::{filter_record_batch, not};
+use arrow::compute::{filter_record_batch, not, or};
 use arrow_schema::SchemaRef;
 use data_components::cdc::mutation::ReplaceSet;
 use datafusion::datasource::{TableProvider, sink::DataSink};
@@ -124,23 +125,64 @@ impl PrimaryKeys {
     }
 }
 
+pub(super) fn is_primary_key_singleton(
+    table: &CayenneTableProvider,
+    replacement: &ReplaceSet,
+) -> bool {
+    let pk_columns = table.pk_column_names();
+    let key = replacement.key().values();
+    table.supports_rebuildable_ingestion()
+        && key.len() == pk_columns.len()
+        && pk_columns.iter().all(|name| {
+            key.iter()
+                .any(|(column, value)| column == name && !value.is_null())
+        })
+        && replacement
+            .batches()
+            .iter()
+            .try_fold(0_usize, |rows, batch| rows.checked_add(batch.num_rows()))
+            == Some(1)
+}
+
+pub(super) fn can_coalesce(
+    table: &CayenneTableProvider,
+    left: &ReplaceSet,
+    right: &ReplaceSet,
+) -> bool {
+    // Disjoint groups can still collide on a separate row primary key. Keep
+    // those requests independent so a rejected member cannot reject its peers.
+    let compatible = table.pk_column_names().is_empty()
+        || (is_primary_key_singleton(table, left) && is_primary_key_singleton(table, right));
+    compatible
+        && table.metadata().partition_column.is_none()
+        && table.mem_tier_shard_count() == 1
+        && (left.schema().fields() == table.table_schema().fields()
+            || left.schema().fields() == table.read_schema().fields())
+        && left.key().is_disjoint_from(right.key()).unwrap_or(false)
+}
+
 pub(super) async fn write_snapshot(
     table: &CayenneTableProvider,
-    replacement: ReplaceSet,
+    replacements: Vec<ReplaceSet>,
     session: &SessionContext,
     task: &Arc<TaskContext>,
 ) -> Result<CayenneCdcWrite> {
     let start = Instant::now();
-    let rows = replacement
-        .batches()
+    let rows = replacements
         .iter()
+        .flat_map(|replacement| replacement.batches())
         .try_fold(0_u64, |rows, batch| {
             rows.checked_add(batch.num_rows() as u64).ok_or_else(|| {
                 DataFusionError::Plan("Complete-set replacement row count exceeds u64".into())
             })
         })?;
-    let bytes = replacement.retained_bytes() as u64;
-    let (key, batches) = replacement.into_parts();
+    let bytes = replacements
+        .iter()
+        .map(|replacement| replacement.retained_bytes() as u64)
+        .fold(0_u64, u64::saturating_add);
+    let (keys, batches): (Vec<_>, Vec<_>) =
+        replacements.into_iter().map(ReplaceSet::into_parts).unzip();
+    let keys = Arc::new(keys);
     let schema = table.table_schema();
     let primary_keys = PrimaryKeys::new(table, &schema, task)?;
     let state = session.state();
@@ -161,12 +203,24 @@ pub(super) async fn write_snapshot(
         execute_stream(scan, scan_task)
     })
     .try_flatten()
-    .map(move |batch| -> Result<RecordBatch> {
-        let batch = batch?;
-        let matching = key.matching_rows(&batch)?;
-        let retained = filter_record_batch(&batch, &not(&matching)?)?;
-        deleted_rows.fetch_add(matching.true_count() as u64, Ordering::Relaxed);
-        Ok(retained)
+    .and_then(move |batch| {
+        let keys = Arc::clone(&keys);
+        let deleted_rows = Arc::clone(&deleted_rows);
+        async move {
+            let (first, rest) = keys
+                .split_first()
+                .ok_or_else(|| DataFusionError::Internal("Missing replacement scope".into()))?;
+            let mut matching = first.matching_rows(&batch)?;
+            for keys in rest.chunks(8) {
+                for key in keys {
+                    matching = or(&matching, &key.matching_rows(&batch)?)?;
+                }
+                tokio::task::yield_now().await;
+            }
+            let retained = filter_record_batch(&batch, &not(&matching)?)?;
+            deleted_rows.fetch_add(matching.true_count() as u64, Ordering::Relaxed);
+            Ok::<RecordBatch, DataFusionError>(retained)
+        }
     });
 
     // Validation failures occur before the overwrite can commit. Preserve the
@@ -175,7 +229,7 @@ pub(super) async fn write_snapshot(
     let validation_error = Arc::new(Mutex::new(None));
     let validation_failure = Arc::clone(&validation_error);
     let target_schema = Arc::clone(&schema);
-    let input = futures::stream::iter(batches.into_iter().map(Ok))
+    let input = futures::stream::iter(batches.into_iter().flatten().map(Ok))
         .chain(retained)
         .map(move |batch| {
             arrow_tools::record_batch::try_cast_to(batch?, Arc::clone(&target_schema))

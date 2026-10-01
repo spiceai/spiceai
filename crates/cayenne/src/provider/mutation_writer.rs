@@ -19,7 +19,7 @@ limitations under the License.
 //! `MutationWriter` prepares row mutations and complete-set replacements and
 //! selects their inline, memory-tier or staged snapshot publication.
 //!
-//! - [`MutationWriter::write_replace_set`] preserves the incoming multiset and
+//! - [`MutationWriter::write_replace_sets`] preserves the incoming multiset and
 //!   rows outside its group. A complete primary-key singleton uses atomic upsert;
 //!   other shapes stream a complete snapshot through the overwrite lifecycle.
 //! - [`MutationWriter::write`] — the synchronous append path used by
@@ -324,21 +324,39 @@ impl<'a> MutationWriter<'a> {
         self
     }
 
-    pub(super) async fn write_replace_set(
+    pub(super) async fn write_replace_sets(
         &self,
-        replacement: data_components::cdc::mutation::ReplaceSet,
+        replacements: Vec<data_components::cdc::mutation::ReplaceSet>,
         session: &datafusion::execution::context::SessionContext,
     ) -> datafusion_common::Result<CayenneCdcWrite> {
         use data_components::cdc::mutation::Recovery;
         use datafusion_common::DataFusionError;
 
-        // Schema-level provider tags are not part of the row layout.
-        if replacement.schema().fields() != self.table.table_schema().fields()
-            && replacement.schema().fields() != self.table.read_schema().fields()
-        {
+        let Some(first) = replacements.first() else {
             return Err(DataFusionError::Plan(
-                "Replacement schema does not match the target table".into(),
+                "A replacement batch must not be empty".into(),
             ));
+        };
+        // Schema-level provider tags are not part of the row layout.
+        for (index, replacement) in replacements.iter().enumerate() {
+            if replacement.schema().fields() != self.table.table_schema().fields()
+                && replacement.schema().fields() != self.table.read_schema().fields()
+            {
+                return Err(DataFusionError::Plan(
+                    "Replacement schema does not match the target table".into(),
+                ));
+            }
+            for previous in replacements[..index].chunks(8) {
+                if !previous
+                    .iter()
+                    .all(|previous| self.table.can_coalesce_replace_sets(previous, replacement))
+                {
+                    return Err(DataFusionError::NotImplemented(
+                        "Combined replacement requires disjoint keyless groups or disjoint primary-key singletons".into(),
+                    ));
+                }
+                tokio::task::yield_now().await;
+            }
         }
         if self.recovery == Recovery::Replayable {
             return Err(DataFusionError::NotImplemented(
@@ -358,24 +376,14 @@ impl<'a> MutationWriter<'a> {
                 "Durable complete-set replacement requires file-backed storage".into(),
             ));
         }
-        let pk_columns = self.table.pk_column_names();
-        let key = replacement.key().values();
-        let exact_primary_key = key.len() == pk_columns.len()
-            && pk_columns.iter().all(|name| {
-                key.iter()
-                    .any(|(column, value)| column == name && !value.is_null())
-            });
-        let singleton = replacement
-            .batches()
-            .iter()
-            .try_fold(0_usize, |rows, batch| rows.checked_add(batch.num_rows()))
-            == Some(1);
-        if self.table.supports_rebuildable_ingestion() && exact_primary_key && singleton {
-            let schema = replacement.schema();
-            let (_, batches) = replacement.into_parts();
+        if super::replace_set::is_primary_key_singleton(self.table, first) {
+            let schema = first.schema();
+            let batches = replacements
+                .into_iter()
+                .flat_map(|replacement| replacement.into_parts().1);
             let input = Box::pin(RecordBatchStreamAdapter::new(
                 schema,
-                futures::stream::iter(batches.into_iter().map(Ok)),
+                futures::stream::iter(batches.map(Ok)),
             ));
             return self
                 .table
@@ -383,7 +391,7 @@ impl<'a> MutationWriter<'a> {
                 .await
                 .map_err(Into::into);
         }
-        super::replace_set::write_snapshot(self.table, replacement, session, self.task_context)
+        super::replace_set::write_snapshot(self.table, replacements, session, self.task_context)
             .await
     }
 
