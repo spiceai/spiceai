@@ -1413,6 +1413,149 @@ mod tests {
         out
     }
 
+    /// Rows held in the inline tier — small batches stored as Arrow IPC blobs in
+    /// `cayenne_inlined_data`, not yet flushed to a Vortex file — are part of the
+    /// captured view too, and the compacted snapshot carries them as files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compaction_includes_rows_held_in_the_inline_tier() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = Node::new(&tmp.path().join("writer")).await;
+        let ctx = SessionContext::new();
+        // Default inline caps (small writes land in `cayenne_inlined_data`), no
+        // flush trigger so they stay there.
+        let vortex_config = VortexConfig {
+            cdc_durability: cayenne::metadata::CdcDurability::File,
+            inline_flush_max_rows: i64::MAX,
+            inline_flush_max_segments: i64::MAX,
+            inline_flush_max_bytes: i64::MAX,
+            ..VortexConfig::default()
+        };
+        let live = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&writer.catalog), ctx.runtime_env())
+                .create(CreateTableOptions {
+                    table_name: DATASET.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]))),
+                    base_path: writer.data_dir.to_string_lossy().into_owned(),
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("create table"),
+        );
+        // A base load large enough to go to a file, then small writes that stay
+        // inline: an upsert of base rows and new rows.
+        let base: Vec<(i64, i64)> = (1..=5000).map(|id| (id, id * 10)).collect();
+        insert(&live, &base).await;
+        let meta = writer.catalog.get_table(DATASET).await.expect("live meta");
+        let files_before = walk_files(&writer.data_dir.join(&meta.table_id)).len();
+        assert!(files_before > 0, "the base load must have produced files");
+
+        insert(
+            &live,
+            &(1..=20).map(|id| (id, id * 1000)).collect::<Vec<_>>(),
+        )
+        .await;
+        insert(&live, &(9000..=9020).map(|id| (id, id)).collect::<Vec<_>>()).await;
+        let inlined = writer
+            .catalog
+            .get_inlined_data_count(&meta.table_id)
+            .await
+            .expect("inlined count");
+        assert!(inlined > 0, "the small writes must be in the inline tier");
+        assert_eq!(
+            walk_files(&writer.data_dir.join(&meta.table_id)).len(),
+            files_before,
+            "the small writes must not have produced files"
+        );
+        let expected = rows(&live).await;
+        assert_eq!(expected.get(&1), Some(&1000));
+        assert_eq!(expected.get(&9020), Some(&9020));
+
+        let engine = CayenneSnapshotEngine::new(
+            Arc::clone(&writer.catalog),
+            DATASET,
+            writer.data_dir.clone(),
+        )
+        .with_compaction(true);
+        let live_dyn: Arc<dyn TableProvider> = Arc::clone(&live) as Arc<dyn TableProvider>;
+        let plan = engine
+            .prepare_directory_snapshot(&writer.dirs(), DATASET, Some(&live_dyn))
+            .await
+            .expect("prepare");
+        let materialized = plan
+            .deferred
+            .expect("compaction defers the build")
+            .await
+            .expect("materialize");
+
+        let reader = Node::new(&tmp.path().join("reader")).await;
+        let tar = tmp.path().join("snapshot.tar");
+        let skip: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = materialized
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        archive_directories_to_file_with_plan(&materialized.dirs, &tar, &skip, &extras)
+            .await
+            .expect("archive");
+        for dir in &materialized.cleanup_dirs {
+            tokio::fs::remove_dir_all(dir)
+                .await
+                .expect("cleanup scratch");
+        }
+        extract_archive_file_with_options(
+            &tar,
+            &tmp.path().join("reader"),
+            ExtractOptions {
+                prefix_mappings: Some(vec![
+                    ("metadata/".to_string(), reader.metadata_dir.clone()),
+                    ("data/".to_string(), reader.data_dir.clone()),
+                ]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .expect("extract");
+        CayenneSnapshotEngine::new(
+            Arc::clone(&reader.catalog),
+            DATASET,
+            reader.data_dir.clone(),
+        )
+        .finalize_directory_snapshot(&reader.dirs(), DATASET)
+        .await
+        .expect("import slice");
+        let restored_meta = reader
+            .catalog
+            .get_table(DATASET)
+            .await
+            .expect("reader meta");
+        assert_eq!(
+            reader
+                .catalog
+                .get_inlined_data_count(&restored_meta.table_id)
+                .await
+                .expect("reader inlined"),
+            0,
+            "the compacted snapshot holds the inline rows as files, not inline"
+        );
+        let restored = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&reader.catalog), ctx.runtime_env())
+                .open(DATASET)
+                .await
+                .expect("open reader table"),
+        );
+        assert_eq!(
+            rows(&restored).await,
+            expected,
+            "the compacted snapshot must carry the inline-tier rows"
+        );
+    }
+
     #[test]
     fn scratch_vortex_config_forces_files_and_disables_maintenance() {
         let live = VortexConfig {
