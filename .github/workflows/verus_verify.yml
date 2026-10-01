@@ -88,10 +88,10 @@ env:
   # `crates/cache`, `crates/key-index` and `crates/sharded-cache` today), and
   # VERUS_SHA256 pins the exact bytes of the archive: a release tag names an asset, it does not fix
   # its contents, and this job executes what it downloads.
-  VERUS_RELEASE: release/0.2026.08.30.b432e82
-  VERUS_ASSET: verus-0.2026.08.30.b432e82-x86-linux.zip
-  VERUS_SHA256: 067f5f72a457fe66b77c0c10b180f2a919a9c7481a8baa024ffc716aa931a41b
-  VERUS_VSTD_VERSION: 0.0.0-2026-08-30-0159
+  VERUS_RELEASE: release/0.2026.09.27.3cf1832
+  VERUS_ASSET: verus-0.2026.09.27.3cf1832-x86-linux.zip
+  VERUS_SHA256: 43814031e10df043221d83c7fa842e3ebd662cb7b0090fc1eb4d7a8673226978
+  VERUS_VSTD_VERSION: 0.0.0-2026-09-20-0158
 
 jobs:
   verus-verify:
