@@ -35,6 +35,7 @@ use data_connector_api::accelerated::{
 };
 use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::catalog::Session;
+use datafusion::common::{Constraint, Constraints};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
@@ -323,6 +324,7 @@ pub struct AcceleratedTable {
     /// mode, where the storage schema is augmented with a hidden
     /// [`caching::CACHE_NAMESPACE_COLUMN`] for per-principal isolation.
     user_facing_schema: Option<SchemaRef>,
+    user_facing_constraints: Option<Constraints>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -1313,6 +1315,34 @@ impl Builder {
             handlers.push(worker.start());
         }
 
+        let user_facing_constraints = self.user_facing_schema.as_ref().and_then(|schema| {
+            let storage_schema = self.accelerator.schema();
+            self.accelerator.constraints().map(|constraints| {
+                Constraints::new_unverified(constraints.iter().filter_map(|constraint| {
+                    let (Constraint::PrimaryKey(indices) | Constraint::Unique(indices)) = constraint;
+                    let mut projected = Vec::with_capacity(indices.len());
+                    for &index in indices {
+                        let field = storage_schema.fields().get(index)?;
+                        // Every caching scan is restricted to one namespace, so
+                        // namespace-scoped uniqueness holds on its visible key.
+                        if refresh_mode == RefreshMode::Caching
+                            && field.name() == caching::CACHE_NAMESPACE_COLUMN
+                        {
+                            continue;
+                        }
+                        projected.push(schema.index_of(field.name()).ok()?);
+                    }
+                    if projected.is_empty() {
+                        return None;
+                    }
+                    Some(match constraint {
+                        Constraint::PrimaryKey(_) => Constraint::PrimaryKey(projected),
+                        Constraint::Unique(_) => Constraint::Unique(projected),
+                    })
+                }).collect())
+            })
+        });
+
         Ok(AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
@@ -1338,6 +1368,7 @@ impl Builder {
             batch_write_tx,
             cluster_role: self.cluster_role,
             user_facing_schema: self.user_facing_schema,
+            user_facing_constraints,
         })
     }
 }
@@ -2087,6 +2118,14 @@ impl TableLayer for AcceleratedTable {
 
     fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
         AcceleratedTable::schema(self)
+    }
+
+    fn constraints<'a>(&'a self, below: &'a Arc<dyn TableProvider>) -> Option<&'a Constraints> {
+        if self.user_facing_schema.is_some() {
+            self.user_facing_constraints.as_ref()
+        } else {
+            below.constraints()
+        }
     }
 
     fn supports_filters_pushdown(
