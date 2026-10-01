@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::provider::table::{CayenneTableProvider, CayenneTableProviderBuilder};
+use cayenne::provider::{CayenneTableProvider, CayenneTableProviderBuilder};
 use cayenne::{CayenneCatalog, MetadataCatalog};
 use data_components::cdc::mutation::{Recovery, ReplaceSet, SetKey};
 use datafusion::datasource::TableProvider;
