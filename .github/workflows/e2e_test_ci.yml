@@ -1749,10 +1749,7 @@ jobs:
         run: |
           output=$(spice refresh customer 2>&1)
           echo "$output"
-          if [[ $output == *"Dataset refresh triggered"* ]]; then
-            # time to refresh dataset
-            sleep 3
-          else
+          if [[ $output != *"Dataset refresh triggered"* ]]; then
             echo "Failed to trigger dataset refresh."
             exit 1
           fi
@@ -1760,14 +1757,26 @@ jobs:
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
         run: |
-          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-          echo "$response"
-          if echo "$response" | grep -q "results-cache-status: MISS"; then
-            echo "Cache miss detected as expected"
-          else
-            echo "Cache miss not detected" >&2
-            exit 1
-          fi
+          # `spice refresh` only triggers the refresh; cached results are invalidated when it
+          # completes, which is an S3 round trip of unbounded latency. Poll for the miss
+          # rather than sleeping a fixed interval. The item_ttl set in "Spice configure" (300s)
+          # is well above this bound, so a miss here can only come from the refresh's invalidation.
+          deadline=$((SECONDS + 60))
+          while :; do
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+            if echo "$response" | grep -q "results-cache-status: MISS"; then
+              echo "$response"
+              echo "Cache miss detected as expected"
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "$response"
+              echo "::error::Cached results for customer were not invalidated within 60s of 'spice refresh customer'."
+              grep -E "for dataset customer" spice.log || true
+              exit 1
+            fi
+            sleep 1
+          done
 
       - name: Run SQL query with custom cache key and check for miss header
         working-directory: test_app
