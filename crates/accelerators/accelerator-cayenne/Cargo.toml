@@ -81,6 +81,7 @@ tokio = { workspace = true, features = ["sync", "rt", "fs"] }
 runtime-table = { path = "../../runtime-table" }
 spice-table = { path = "../../spice-table" }
 insta.workspace = true
+tar = "0.4"
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
