@@ -324,6 +324,45 @@ And from each replica's own `/metrics`: every replica must publish the same
 traffic with its peers — plus zero lease-refresh errors and zero fail-closed
 requests.
 
+### Four findings from building the catalog
+
+Each one changed a scenario, and each is reproducible from the artifacts named.
+
+**1. `client_timeout` and `connect_timeout` silently ignore a unit.** The
+https connector parses both with `t.parse::<u64>()` as bare seconds
+(`https.rs:869`, `:881`) and falls back to the default on a parse failure, with
+nothing logged. `client_timeout: "1s"` therefore means 30s. The
+`adaptive-timeout` scenario was configured that way and every hung request
+completed successfully after 3s instead of timing out at 1s, so the controller
+correctly saw successes and did not throttle; the scenario was testing nothing.
+Written as `"1"` it behaves as intended and throttles in 15s. Every other
+duration parameter in the same `params:` block — `rate_control_acquire_timeout`,
+`retry_max_duration` — does take a unit.
+
+**2. A failing dataset's errors are diluted by its healthy co-tenants.** The
+adaptive controller keys on the **origin's** overall error rate, not any one
+dataset's. In `sameorigin-coupled-throttle` the fault is scoped to d1's path, so
+roughly half the origin's requests fail, and with a 20% failure threshold the
+published admission coefficient settles near **0.82** rather than at the floor.
+That is the formula working as designed on the mix it is given, but it means a
+noisy minority tenant on a busy origin moves the rate far less than the same
+origin failing outright.
+
+**3. The co-tenant does not slow down — it speeds up.** In the same scenario,
+while d1 fell from a p99 of 18 to 10, **d2 rose from 16 to 18**, and the
+origin's total fell only 20 → 18. The budget d1 stops claiming is reallocated to
+whoever is still asking. "Dataset B is throttled by dataset A's failures" is the
+wrong claim; the true one is that B is admitted through the budget A's failures
+shrank, so the two together never exceed one budget and the coefficient moves on
+failures B never saw. A per-dataset limiter would have let B keep its own full
+budget beside A's.
+
+**4. The same dilution applies across replicas.** `cluster-asymmetric` fails
+only r0's requests, so about half the cluster's traffic fails and the shared
+coefficient settles near 0.4 rather than at the floor. r1, which was served
+nothing but 200s, still falls from a p99 of 11 to 8 — the cross-replica signal
+is real, but its depth is set by the fleet's overall error rate.
+
 ## Phase 2 — adaptive rate control
 
 Puts a real `spiced` in front of both origins, breaks p2 on a schedule, and
