@@ -140,7 +140,7 @@ fn word_hash(word: u64) -> u64 {
 /// with its rows' postings.
 #[derive(Debug)]
 pub struct IndexRun {
-    files: Box<[String]>,
+    files: Box<[Arc<str>]>,
     words: Box<[u64]>,
     /// Per word: its only posting, when it has one below [`MULTI`] (a unique
     /// key's row, the common case); otherwise [`MULTI`] and the offset in
@@ -160,7 +160,7 @@ pub struct IndexRun {
 
 impl IndexRun {
     fn from_parts(
-        files: Box<[String]>,
+        files: Box<[Arc<str>]>,
         words: Box<[u64]>,
         slots: Box<[u32]>,
         postings: Box<[u8]>,
@@ -169,10 +169,8 @@ impl IndexRun {
         let directory = words.iter().step_by(DIRECTORY_STRIDE).copied().collect();
         // Built from the words, never stored: a filter read back from disk
         // could disagree with them, and a word it lacked would be missed.
-        let filter = SplitBlockBloomFilter::new(words.len());
-        for &word in &words {
-            filter.insert(word_hash(word));
-        }
+        let mut filter = SplitBlockBloomFilter::new(words.len());
+        filter.extend(words.iter().map(|&word| word_hash(word)));
         Self {
             files,
             words,
@@ -192,7 +190,7 @@ impl IndexRun {
 
     /// The files this run covers, in the order their ids were assigned.
     #[must_use]
-    pub fn files(&self) -> &[String] {
+    pub fn files(&self) -> &[Arc<str>] {
         &self.files
     }
 
@@ -386,7 +384,7 @@ impl IndexRun {
         for _ in 0..count {
             let len = reader.u32()? as usize;
             let name = std::str::from_utf8(reader.bytes(len)?).map_err(|_| Error::Corrupt)?;
-            files.push(name.to_string());
+            files.push(Arc::from(name));
         }
         let rows = reader.len()?;
         let word_count = reader.len()?;
@@ -455,7 +453,7 @@ impl RunWriter {
         Ok(())
     }
 
-    fn finish(self, files: Box<[String]>) -> IndexRun {
+    fn finish(self, files: Box<[Arc<str>]>) -> IndexRun {
         IndexRun::from_parts(
             files,
             self.words.into(),
@@ -687,7 +685,7 @@ impl RunBuilder {
             group.dedup();
             writer.push(word, &group)?;
         }
-        Ok(writer.finish(self.files.into_boxed_slice()))
+        Ok(writer.finish(self.files.into_iter().map(Arc::from).collect()))
     }
 }
 
@@ -754,11 +752,21 @@ impl TableFilter {
 
     /// A filter over the keys of `runs`.
     fn over(runs: &[RunEntry]) -> Self {
-        let filter = Self::sized(runs.iter().map(|entry| entry.run.keys()).sum());
-        for entry in runs {
-            filter.insert_run(&entry.run);
+        Self::of_runs(runs.iter().map(|entry| &*entry.run))
+    }
+
+    /// A filter sized for, and holding, the keys of `runs`, filled before any
+    /// reader can see it.
+    fn of_runs<'a>(runs: impl Iterator<Item = &'a IndexRun> + Clone) -> Self {
+        let keys = runs.clone().map(IndexRun::keys).sum();
+        let mut filter = SplitBlockBloomFilter::new(keys);
+        let distinct =
+            filter.extend(runs.flat_map(|run| run.words.iter().map(|&word| word_hash(word))));
+        Self {
+            filter,
+            capacity: keys,
+            distinct: AtomicUsize::new(distinct),
         }
-        filter
     }
 
     fn insert(&self, hash: u64) {
@@ -794,7 +802,7 @@ struct Layers {
     /// Holds every key of every run in `runs`.
     filter: Arc<TableFilter>,
     /// Every file some run covers and has not retired.
-    covered: HashSet<String>,
+    covered: HashSet<Arc<str>>,
 }
 
 impl Layers {
@@ -814,7 +822,7 @@ impl Layers {
                     .iter()
                     .zip(entry.live.iter())
                     .filter(|&(_, &live)| live)
-                    .map(|(file, _)| file.clone())
+                    .map(|(file, _)| Arc::clone(file))
             })
             .collect();
         Self {
@@ -837,11 +845,7 @@ impl Layers {
         add: &[IndexRun],
     ) -> Arc<TableFilter> {
         if kept.is_empty() {
-            let filter = TableFilter::sized(add.iter().map(IndexRun::keys).sum());
-            for run in add {
-                filter.insert_run(run);
-            }
-            return Arc::new(filter);
+            return Arc::new(TableFilter::of_runs(add.iter()));
         }
         for run in add {
             current.insert_run(run);
@@ -883,7 +887,7 @@ fn pick_merge(runs: &[RunEntry]) -> Option<Vec<usize>> {
 fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<Arc<str>> = Vec::new();
     let mut offsets: Vec<u64> = Vec::with_capacity(sources.len());
     for source in sources {
         offsets.push(files.len() as u64);
@@ -1145,6 +1149,7 @@ impl TieredIndex {
     pub fn publish(&self, add: Vec<IndexRun>, retired: &[&str]) {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
+        let retired: HashSet<&str> = retired.iter().copied().collect();
         let mut runs: Vec<RunEntry> = Vec::with_capacity(current.runs.len() + add.len());
         for entry in &current.runs {
             let touched = entry
@@ -1152,7 +1157,7 @@ impl TieredIndex {
                 .files
                 .iter()
                 .zip(entry.live.iter())
-                .any(|(file, &live)| live && retired.contains(&file.as_str()));
+                .any(|(file, &live)| live && retired.contains(&**file));
             if !touched {
                 runs.push(entry.clone());
                 continue;
@@ -1162,7 +1167,7 @@ impl TieredIndex {
                 .files
                 .iter()
                 .zip(entry.live.iter())
-                .map(|(file, &live)| live && !retired.contains(&file.as_str()))
+                .map(|(file, &live)| live && !retired.contains(&**file))
                 .collect();
             // Dropped once none of its files is live.
             if live.iter().any(|&live| live) {
@@ -1194,7 +1199,7 @@ impl TieredIndex {
             let live: Arc<[bool]> = run
                 .files
                 .iter()
-                .map(|file| live.contains(file.as_str()))
+                .map(|file| live.contains(&**file))
                 .collect();
             if live.iter().any(|&live| live) {
                 admitted.push((run, live));
@@ -1358,7 +1363,7 @@ impl TieredIndex {
                 .run
                 .files
                 .iter()
-                .map(|file| live.contains(file.as_str()))
+                .map(|file| live.contains(&**file))
                 .collect();
             let next_seen: Vec<u8> = entry
                 .seen
@@ -2207,7 +2212,7 @@ mod persist_tests {
     /// with a valid checksum, as a writer bug or a crafted file could leave.
     fn sealed_with_postings(postings: Vec<u8>, rows: usize) -> Vec<u8> {
         IndexRun::from_parts(
-            vec!["a".to_string()].into(),
+            vec![Arc::from("a")].into(),
             vec![7].into(),
             vec![word_proof::offset_slot(0)].into(),
             postings.into(),
