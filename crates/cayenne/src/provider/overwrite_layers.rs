@@ -375,24 +375,33 @@ impl CollapseWindow {
         }
         self.bytes += resolved.batch.get_array_memory_size();
         self.batches.push(resolved);
-        // hashbrown: one control byte per bucket beside each digest and position.
-        self.reservation.try_resize(
-            self.bytes
-                + self.survivor.capacity() * (size_of::<u128>() + size_of::<(usize, usize)>() + 1),
-        )?;
+        self.reservation.try_resize(self.held_bytes())?;
         Ok(())
     }
 
+    /// Everything the window holds: its rows and the map of their keys.
+    fn held_bytes(&self) -> usize {
+        // hashbrown: one control byte per bucket beside each digest and position.
+        self.bytes
+            + self.survivor.capacity() * (size_of::<u128>() + size_of::<(usize, usize)>() + 1)
+    }
+
     fn is_full(&self) -> bool {
-        self.bytes >= self.max_bytes
+        self.held_bytes() >= self.max_bytes
+    }
+
+    /// Release the window's rows and its map, capacity included, so a window
+    /// holds at most its bound and nothing between windows.
+    fn reset(&mut self) {
+        self.survivor = HashMap::with_hasher(PrehashedBuildHasher);
+        self.bytes = 0;
+        self.reservation.free();
     }
 
     fn drain(&mut self) -> super::Result<VecDeque<ResolvedBatch>> {
         if !std::mem::take(&mut self.repeats) {
             let out = std::mem::take(&mut self.batches).into();
-            self.survivor.clear();
-            self.bytes = 0;
-            self.reservation.free();
+            self.reset();
             return Ok(out);
         }
         let mut out = VecDeque::with_capacity(self.batches.len());
@@ -422,9 +431,7 @@ impl CollapseWindow {
                 digests,
             });
         }
-        self.survivor.clear();
-        self.bytes = 0;
-        self.reservation.free();
+        self.reset();
         Ok(out)
     }
 }
@@ -878,6 +885,44 @@ mod tests {
         .await;
         assert_eq!(layers, vec![owned(&[(1, "a"), (2, "b"), (3, "c")])]);
         assert!(superseded.is_empty());
+    }
+
+    /// The window's bound covers everything it holds — its rows and the map of
+    /// their keys — and holds no more than one window's worth after a drain.
+    #[test]
+    fn a_window_stays_within_its_bound() {
+        const BOUND: usize = 8 * 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("window").register(&pool);
+        let mut window = CollapseWindow::new(BOUND, reservation);
+        let resolver = resolver(ConflictPolicy::UpsertKeepLast);
+        let mut peak = 0;
+        let mut next_id = 0_i64;
+        let mut push = |window: &mut CollapseWindow, rows: i64| {
+            let ids: Vec<(i64, String)> = (next_id..next_id + rows)
+                .map(|id| (id, format!("value-{id:012}")))
+                .collect();
+            next_id += rows;
+            let rows: Vec<(i64, &str)> = ids.iter().map(|(id, v)| (*id, v.as_str())).collect();
+            window
+                .push(resolver.resolve_batch(&batch(&rows)).expect("resolve"))
+                .expect("push");
+        };
+        while !window.is_full() {
+            push(&mut window, 8192);
+            peak = peak.max(pool.reserved());
+        }
+        assert!(
+            peak <= BOUND + BOUND / 4,
+            "peak reservation {peak} exceeds the {BOUND}-byte bound"
+        );
+        window.drain().expect("drain");
+        push(&mut window, 1);
+        assert!(
+            pool.reserved() <= BOUND / 4,
+            "after a drain a one-row window reserves {}",
+            pool.reserved()
+        );
     }
 
     #[tokio::test]
