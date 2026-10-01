@@ -465,15 +465,12 @@ async fn test_megascience_permutations(
     let _es_container;
     let es_endpoint: String;
     if matches!(text_engine, TextEngineOptions::Elasticsearch) {
-        // Pick a random high port to avoid collisions with other parallel test runs.
-        let port = {
-            use rand::RngExt;
-            let mut rng = rand::rng();
-            rng.random_range(19200_u16..19300_u16)
-        };
         let container = elasticsearch::start_elasticsearch_docker_container()
             .await
             .expect("failed to start Elasticsearch Docker container");
+        let port = container
+            .host_port(9200)
+            .expect("Elasticsearch container must publish TCP port 9200");
         es_endpoint = elasticsearch::elasticsearch_endpoint(port);
         _es_container = Some(container);
     } else {
@@ -642,7 +639,6 @@ async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
 
     let response_str = http_post(&format!("{base_url}/v1/sql").to_string(), sql, headers).await?;
-    let port = container.host_port(9200)?;
     serde_json::from_str(&response_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse 'v1/sql' HTTP response: {e}"))
 }
