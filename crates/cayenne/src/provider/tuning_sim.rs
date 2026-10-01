@@ -1648,6 +1648,10 @@ fn sim_property_sweep_no_panic_in_bounds_coherent() {
             arrival_gap_ms,
             apply_vs_arrival: apply_ms / arrival_gap_ms,
             read_amp: rng.range_u64(0, 64) as usize,
+            bake_residual: rng
+                .chance(0.5)
+                .then(|| rng.range_u64(0, 10_000_000) as usize),
+            bake_gap_ms: rng.chance(0.5).then(|| rng.range_u64(0, 600_000) as i64),
             mem_pressure: opt(&mut rng, 0.0, 1.3),
             delete_fraction: rng.range_f64(0.0, 1.0),
             arrival_cv: rng.range_f64(0.0, 3.0),
