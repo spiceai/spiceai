@@ -140,7 +140,7 @@ fn word_hash(word: u64) -> u64 {
 /// with its rows' postings.
 #[derive(Debug)]
 pub struct IndexRun {
-    files: Box<[String]>,
+    files: Box<[Arc<str>]>,
     words: Box<[u64]>,
     /// Per word: its only posting, when it has one below [`MULTI`] (a unique
     /// key's row, the common case); otherwise [`MULTI`] and the offset in
@@ -160,14 +160,17 @@ pub struct IndexRun {
 
 impl IndexRun {
     fn from_parts(
-        files: Box<[String]>,
+        files: Box<[Arc<str>]>,
         words: Box<[u64]>,
         slots: Box<[u32]>,
         postings: Box<[u8]>,
         rows: usize,
-        filter: SplitBlockBloomFilter,
     ) -> Self {
         let directory = words.iter().step_by(DIRECTORY_STRIDE).copied().collect();
+        // Built from the words, never stored: a filter read back from disk
+        // could disagree with them, and a word it lacked would be missed.
+        let mut filter = SplitBlockBloomFilter::new(words.len());
+        filter.extend(words.iter().map(|&word| word_hash(word)));
         Self {
             files,
             words,
@@ -187,7 +190,7 @@ impl IndexRun {
 
     /// The files this run covers, in the order their ids were assigned.
     #[must_use]
-    pub fn files(&self) -> &[String] {
+    pub fn files(&self) -> &[Arc<str>] {
         &self.files
     }
 
@@ -245,14 +248,66 @@ impl IndexRun {
         let Some(count) = varint::get(&self.postings, &mut from) else {
             return;
         };
-        let mut posting = 0;
+        let mut posting = 0_u64;
         for _ in 0..count {
-            let Some(delta) = varint::get(&self.postings, &mut from) else {
+            // `from_bytes` checks that every stream decodes in full, and a
+            // built run is written by `finish`, so neither ends early here.
+            let Some(next) =
+                varint::get(&self.postings, &mut from).and_then(|delta| posting.checked_add(delta))
+            else {
                 return;
             };
-            posting += delta;
+            posting = next;
             f(posting);
         }
+    }
+
+    /// Whether every word's postings decode in full, ascending, with
+    /// positions in range, and add up to the run's row count. A stream that
+    /// ended early would make a lookup skip the rows after it.
+    fn postings_intact(&self) -> bool {
+        let files = self.files.len().max(1) as u64;
+        let in_range = |posting: u64| posting / files <= POSITION_MASK;
+        let mut rows = 0_usize;
+        for &slot in &self.slots {
+            if word_proof::slot_is_lone(slot) {
+                if !in_range(u64::from(slot)) {
+                    return false;
+                }
+                rows += 1;
+                continue;
+            }
+            let mut from = word_proof::slot_offset(slot) as usize;
+            let Some(count) = varint::get(&self.postings, &mut from) else {
+                return false;
+            };
+            // Every posting takes at least one byte.
+            if count == 0 || count > (self.postings.len() - from) as u64 {
+                return false;
+            }
+            let mut posting = 0_u64;
+            for i in 0..count {
+                let next = varint::get(&self.postings, &mut from)
+                    .filter(|&delta| i == 0 || delta > 0)
+                    .and_then(|delta| posting.checked_add(delta));
+                let Some(next) = next else {
+                    return false;
+                };
+                posting = next;
+            }
+            // Postings ascend, so the last holds the largest position.
+            let Some(total) = usize::try_from(count)
+                .ok()
+                .and_then(|count| rows.checked_add(count))
+            else {
+                return false;
+            };
+            if !in_range(posting) {
+                return false;
+            }
+            rows = total;
+        }
+        rows == self.rows
     }
 
     /// Call `f(word, file, position)` for every row the run indexes, in word
@@ -269,8 +324,10 @@ impl IndexRun {
     }
 
     /// Call `f(file, position)` for every row of these files whose key has
-    /// the word `word`, ascending by position then file.
-    pub fn lookup(&self, word: u64, mut f: impl FnMut(&str, u64)) {
+    /// the word `word`, ascending by position then file. Tests probe one run
+    /// with it; a reader goes through [`IndexView::candidates`].
+    #[cfg(test)]
+    pub(crate) fn lookup(&self, word: u64, mut f: impl FnMut(&str, u64)) {
         if !self.filter.might_contain(word_hash(word)) {
             return;
         }
@@ -307,9 +364,6 @@ impl IndexRun {
         crate::persist::put_u32s(&mut out, &self.slots);
         out.extend_from_slice(&(self.postings.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.postings);
-        let words = self.filter.to_words();
-        out.extend_from_slice(&(words.len() as u64).to_le_bytes());
-        crate::persist::put_u32s(&mut out, &words);
         crate::persist::seal(&mut out);
         out
     }
@@ -330,7 +384,7 @@ impl IndexRun {
         for _ in 0..count {
             let len = reader.u32()? as usize;
             let name = std::str::from_utf8(reader.bytes(len)?).map_err(|_| Error::Corrupt)?;
-            files.push(name.to_string());
+            files.push(Arc::from(name));
         }
         let rows = reader.len()?;
         let word_count = reader.len()?;
@@ -338,9 +392,6 @@ impl IndexRun {
         let slots = reader.u32s(word_count)?;
         let postings_len = reader.len()?;
         let postings = reader.bytes(postings_len)?.to_vec();
-        let filter_words = reader.len()?;
-        let filter =
-            SplitBlockBloomFilter::from_words(&reader.u32s(filter_words)?).ok_or(Error::Corrupt)?;
         let ordered = words.windows(2).all(|pair| pair[0] < pair[1])
             && slots.iter().all(|&slot| {
                 word_proof::slot_is_lone(slot)
@@ -349,14 +400,17 @@ impl IndexRun {
         if !ordered || !reader.is_empty() {
             return Err(Error::Corrupt);
         }
-        Ok(Self::from_parts(
+        let run = Self::from_parts(
             files.into(),
             words.into(),
             slots.into(),
             postings.into(),
             rows,
-            filter,
-        ))
+        );
+        if !run.postings_intact() {
+            return Err(Error::Corrupt);
+        }
+        Ok(run)
     }
 }
 
@@ -389,11 +443,7 @@ impl RunWriter {
                     .filter(|&offset| offset < MULTI)
                     .ok_or(Error::TooLarge)?;
                 varint::put(&mut self.postings, postings.len() as u64);
-                let mut previous = 0;
-                for &posting in postings {
-                    varint::put(&mut self.postings, posting - previous);
-                    previous = posting;
-                }
+                varint::put_postings(&mut self.postings, postings);
                 word_proof::offset_slot(offset)
             }
         };
@@ -403,18 +453,13 @@ impl RunWriter {
         Ok(())
     }
 
-    fn finish(self, files: Box<[String]>) -> IndexRun {
-        let filter = SplitBlockBloomFilter::new(self.words.len());
-        for &word in &self.words {
-            filter.insert(word_hash(word));
-        }
+    fn finish(self, files: Box<[Arc<str>]>) -> IndexRun {
         IndexRun::from_parts(
             files,
             self.words.into(),
             self.slots.into(),
             self.postings.into(),
             self.rows,
-            filter,
         )
     }
 }
@@ -476,14 +521,16 @@ impl RunBuilder {
         let bound = self.encoder.bind(columns).context(KeySnafu)?;
         let file_id = self.file_id(file)?;
         let rows = bound.num_rows();
-        let last = first_position + rows as u64;
-        ensure!(
-            rows == 0 || last - 1 <= POSITION_MASK,
-            PositionSnafu {
-                file: file.to_string(),
-                position: last - 1,
-            }
-        );
+        if let Some(offset) = (rows as u64).checked_sub(1) {
+            let last = first_position.saturating_add(offset);
+            ensure!(
+                last <= POSITION_MASK,
+                PositionSnafu {
+                    file: file.to_string(),
+                    position: last,
+                }
+            );
+        }
         self.ingest(&bound, file_id, |row| first_position + row as u64);
         Ok(())
     }
@@ -638,7 +685,7 @@ impl RunBuilder {
             group.dedup();
             writer.push(word, &group)?;
         }
-        Ok(writer.finish(self.files.into_boxed_slice()))
+        Ok(writer.finish(self.files.into_iter().map(Arc::from).collect()))
     }
 }
 
@@ -705,11 +752,21 @@ impl TableFilter {
 
     /// A filter over the keys of `runs`.
     fn over(runs: &[RunEntry]) -> Self {
-        let filter = Self::sized(runs.iter().map(|entry| entry.run.keys()).sum());
-        for entry in runs {
-            filter.insert_run(&entry.run);
+        Self::of_runs(runs.iter().map(|entry| &*entry.run))
+    }
+
+    /// A filter sized for, and holding, the keys of `runs`, filled before any
+    /// reader can see it.
+    fn of_runs<'a>(runs: impl Iterator<Item = &'a IndexRun> + Clone) -> Self {
+        let keys = runs.clone().map(IndexRun::keys).sum();
+        let mut filter = SplitBlockBloomFilter::new(keys);
+        let distinct =
+            filter.extend(runs.flat_map(|run| run.words.iter().map(|&word| word_hash(word))));
+        Self {
+            filter,
+            capacity: keys,
+            distinct: AtomicUsize::new(distinct),
         }
-        filter
     }
 
     fn insert(&self, hash: u64) {
@@ -745,7 +802,7 @@ struct Layers {
     /// Holds every key of every run in `runs`.
     filter: Arc<TableFilter>,
     /// Every file some run covers and has not retired.
-    covered: HashSet<String>,
+    covered: HashSet<Arc<str>>,
 }
 
 impl Layers {
@@ -765,7 +822,7 @@ impl Layers {
                     .iter()
                     .zip(entry.live.iter())
                     .filter(|&(_, &live)| live)
-                    .map(|(file, _)| file.clone())
+                    .map(|(file, _)| Arc::clone(file))
             })
             .collect();
         Self {
@@ -788,11 +845,7 @@ impl Layers {
         add: &[IndexRun],
     ) -> Arc<TableFilter> {
         if kept.is_empty() {
-            let filter = TableFilter::sized(add.iter().map(IndexRun::keys).sum());
-            for run in add {
-                filter.insert_run(run);
-            }
-            return Arc::new(filter);
+            return Arc::new(TableFilter::of_runs(add.iter()));
         }
         for run in add {
             current.insert_run(run);
@@ -834,7 +887,7 @@ fn pick_merge(runs: &[RunEntry]) -> Option<Vec<usize>> {
 fn merge_runs(sources: &[&RunEntry]) -> Result<IndexRun> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<Arc<str>> = Vec::new();
     let mut offsets: Vec<u64> = Vec::with_capacity(sources.len());
     for source in sources {
         offsets.push(files.len() as u64);
@@ -1096,6 +1149,7 @@ impl TieredIndex {
     pub fn publish(&self, add: Vec<IndexRun>, retired: &[&str]) {
         let _swap = self.swap.lock();
         let current = self.layers.load_full();
+        let retired: HashSet<&str> = retired.iter().copied().collect();
         let mut runs: Vec<RunEntry> = Vec::with_capacity(current.runs.len() + add.len());
         for entry in &current.runs {
             let touched = entry
@@ -1103,7 +1157,7 @@ impl TieredIndex {
                 .files
                 .iter()
                 .zip(entry.live.iter())
-                .any(|(file, &live)| live && retired.contains(&file.as_str()));
+                .any(|(file, &live)| live && retired.contains(&**file));
             if !touched {
                 runs.push(entry.clone());
                 continue;
@@ -1113,7 +1167,7 @@ impl TieredIndex {
                 .files
                 .iter()
                 .zip(entry.live.iter())
-                .map(|(file, &live)| live && !retired.contains(&file.as_str()))
+                .map(|(file, &live)| live && !retired.contains(&**file))
                 .collect();
             // Dropped once none of its files is live.
             if live.iter().any(|&live| live) {
@@ -1145,7 +1199,7 @@ impl TieredIndex {
             let live: Arc<[bool]> = run
                 .files
                 .iter()
-                .map(|file| live.contains(file.as_str()))
+                .map(|file| live.contains(&**file))
                 .collect();
             if live.iter().any(|&live| live) {
                 admitted.push((run, live));
@@ -1309,7 +1363,7 @@ impl TieredIndex {
                 .run
                 .files
                 .iter()
-                .map(|file| live.contains(file.as_str()))
+                .map(|file| live.contains(&**file))
                 .collect();
             let next_seen: Vec<u8> = entry
                 .seen
@@ -1931,6 +1985,15 @@ mod tests {
         builder
             .add_batch("a", POSITION_MASK, &column(&[1]))
             .expect("the largest position is accepted");
+        // A first position so large that adding the row count overflows is
+        // refused, not wrapped into range.
+        assert!(matches!(
+            builder.add_batch("a", u64::MAX, &column(&[1, 2])),
+            Err(Error::Position {
+                position: u64::MAX,
+                ..
+            })
+        ));
     }
 }
 
@@ -2143,6 +2206,54 @@ mod persist_tests {
                 kind: crate::persist::KIND_RUN
             })
         );
+    }
+
+    /// A run whose only word has `postings` as its posting stream, sealed
+    /// with a valid checksum, as a writer bug or a crafted file could leave.
+    fn sealed_with_postings(postings: Vec<u8>, rows: usize) -> Vec<u8> {
+        IndexRun::from_parts(
+            vec![Arc::from("a")].into(),
+            vec![7].into(),
+            vec![word_proof::offset_slot(0)].into(),
+            postings.into(),
+            rows,
+        )
+        .to_bytes()
+    }
+
+    fn varints(values: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &value in values {
+            varint::put(&mut out, value);
+        }
+        out
+    }
+
+    /// A posting stream that passes the checksum but would overflow, end
+    /// early, repeat a posting or disagree with the row count is rejected: a
+    /// lookup over it would panic, or skip rows after the damage.
+    #[test]
+    fn a_run_whose_postings_do_not_decode_in_full_is_rejected() {
+        let intact = sealed_with_postings(varints(&[2, 0, 5]), 2);
+        let run = IndexRun::from_bytes(&intact).expect("an intact stream loads");
+        let mut got = Vec::new();
+        run.lookup(7, |file, position| got.push((file.to_string(), position)));
+        assert_eq!(got, vec![("a".to_string(), 0), ("a".to_string(), 5)]);
+
+        for (what, postings, rows) in [
+            ("overflowing deltas", varints(&[2, u64::MAX, 5]), 2),
+            ("a count past the bytes", varints(&[3, 0, 5]), 3),
+            ("a repeated posting", varints(&[2, 4, 0]), 2),
+            ("a zero count", varints(&[0]), 0),
+            ("a wrong row count", varints(&[2, 0, 5]), 3),
+            ("a position past 40 bits", varints(&[2, 0, 1 << 41]), 2),
+        ] {
+            assert_eq!(
+                IndexRun::from_bytes(&sealed_with_postings(postings, rows)).err(),
+                Some(Error::Corrupt),
+                "{what} accepted"
+            );
+        }
     }
 
     /// Words out of order, or offsets that do not span the postings, are

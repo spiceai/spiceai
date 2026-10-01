@@ -128,7 +128,14 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let local_snapshot_file = temp_root.join("acceleration.db");
 
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    tokio::fs::write(&local_snapshot_file, b"snapshot-data").await?;
+    // A real DuckDB database: the snapshot opens the acceleration file to
+    // checkpoint its write-ahead log before copying it, and refuses a file it
+    // cannot open.
+    let db_path = local_snapshot_file.clone();
+    tokio::task::spawn_blocking(move || {
+        duckdb::Connection::open(&db_path)?.execute_batch("CREATE TABLE t(id INTEGER)")
+    })
+    .await??;
 
     let snapshots = Snapshots {
         enabled: true,
