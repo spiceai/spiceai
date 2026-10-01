@@ -77,7 +77,7 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::key_conflicts::ConflictPolicy;
 use super::mutation_writer::InlineBatchBuffer;
-use super::overwrite_layers::{CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter};
+use super::overwrite_layers::{CollapseWindow, LayerSource, LayerSplitter, Survivor};
 use super::table::{
     CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
     RangePartitioning, serialize_batches_to_ipc,
@@ -672,37 +672,45 @@ impl CayenneTableProvider {
         // `warm_inlined_cache_for_overwrite`.
         self.warm_inlined_cache_for_overwrite().await;
 
-        // Resolve the keys the incoming data repeats. Under `drop` the first copy
-        // wins, so later copies are filtered out as they arrive. Under the upsert
-        // policies the last copy wins, so a later copy is written to a higher
-        // layer, and the layers after the main snapshot are written below; see
-        // `overwrite_layers`.
+        // Resolve the keys the incoming data repeats: the last copy wins under the
+        // upsert policies, the first under `drop`. A later copy is written to a
+        // higher layer, and the layers after the main snapshot are written below;
+        // see `overwrite_layers`. The map of admitted keys is bounded by the
+        // memory pool and spills to the runtime's spill directory.
         let reservation =
             MemoryConsumer::new(format!("CayenneOverwriteKeys[{}]", self.table_name()))
                 .register(&self.runtime_env().memory_pool);
         let mut layer_source = None;
         let data: SendableRecordBatchStream = match self.key_resolver()? {
             None => data,
-            Some(resolver) if resolver.policy() == ConflictPolicy::KeepFirst => {
-                Box::pin(FirstCopyFilter::new(data, resolver, reservation))
-            }
             Some(resolver) => {
                 let window_reservation = reservation.new_empty();
-                // A refresh usually holds about the keys of the table it replaces.
+                let (survivor, window) = if resolver.policy() == ConflictPolicy::KeepFirst {
+                    (
+                        Survivor::Earliest,
+                        CollapseWindow::new(self.collapse_window_bytes, window_reservation)
+                            .keeping_first(),
+                    )
+                } else {
+                    (
+                        Survivor::Latest,
+                        CollapseWindow::new(self.collapse_window_bytes, window_reservation),
+                    )
+                };
+                // A refresh usually holds about the keys of the table it replaces;
+                // the pool caps the size.
                 let expected_keys = self
                     .optimizer_table_statistics()
                     .and_then(|stats| stats.num_rows.get_value().copied())
                     .unwrap_or(0);
-                let splitter = LayerSplitter::new(Arc::new(resolver), reservation)
-                    .with_expected_keys(expected_keys);
-                let mut source = LayerSource::new(
-                    data,
-                    splitter,
-                    Some(CollapseWindow::new(
-                        self.collapse_window_bytes,
-                        window_reservation,
-                    )),
-                );
+                let splitter = LayerSplitter::new(
+                    Arc::new(resolver),
+                    reservation,
+                    survivor,
+                    Some(Arc::clone(&self.runtime_env().disk_manager)),
+                )
+                .with_expected_keys(expected_keys);
+                let mut source = LayerSource::new(data, splitter, Some(window));
                 let main = self.first_layer(&mut source)?;
                 layer_source = Some(source);
                 main
@@ -1084,7 +1092,12 @@ impl CayenneTableProvider {
         write_stats_acc: &ColumnStatsAccumulator,
     ) -> Result<(u64, HashMap<String, Vec<u32>>)> {
         let mut rows: u64 = 0;
-        while let Some(stream) = source.next_layer() {
+        loop {
+            // Between layers every admitted key is located, so the map can spill.
+            source.spill_if_pending().await?;
+            let Some(stream) = source.next_layer() else {
+                break;
+            };
             let (layer_rows, _files, layer_stats) = self
                 .write_to_snapshot_range_partitioned(
                     stream,
@@ -1103,7 +1116,7 @@ impl CayenneTableProvider {
         self.sync_local_snapshot_dir(snapshot_id)
             .await
             .map_err(|source| super::Error::Catalog { source })?;
-        let superseded = source.take_superseded(self.table_name())?;
+        let superseded = source.take_superseded(self.table_name()).await?;
         Ok((rows, superseded))
     }
 

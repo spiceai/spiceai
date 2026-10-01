@@ -782,3 +782,68 @@ async fn a_statement_repeating_a_key_across_batches_still_fails() {
         );
     }
 }
+
+/// A refresh whose map of keys outgrows a bounded memory pool spills it and
+/// still keeps the last copy of every key, rather than failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_in_a_small_memory_pool_spills_and_keeps_the_last_copy() {
+    const KEYS: i64 = 200_000;
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let runtime_env = datafusion_execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(
+                datafusion_execution::memory_pool::GreedyMemoryPool::new(8 * 1024 * 1024),
+            ))
+            .build_arc()
+            .expect("runtime env");
+        let (provider, _catalog, _dir) = create_cdc_table_with_schema(
+            "t",
+            Arc::clone(&runtime_env),
+            schema(),
+            vec!["id".to_string()],
+            VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        let rows: Vec<(i64, &str)> = ["first", "last"]
+            .iter()
+            .flat_map(|value| (0..KEYS).map(move |id| (id, *value)))
+            .collect();
+        write(
+            &provider,
+            InsertOp::Overwrite,
+            rows.chunks(8192).map(batch).collect(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{mode:?}: refresh in a bounded pool failed: {error}"));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        let counts = ctx
+            .sql("SELECT COUNT(*), COUNT(DISTINCT id), SUM(CASE WHEN value = 'last' THEN 1 ELSE 0 END) FROM t")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("collect");
+        let column = |index: usize| {
+            counts[0]
+                .column(index)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(0)
+        };
+        assert_eq!(
+            (column(0), column(1), column(2)),
+            (KEYS, KEYS, KEYS),
+            "{mode:?}: (rows, keys, last copies)"
+        );
+    }
+}

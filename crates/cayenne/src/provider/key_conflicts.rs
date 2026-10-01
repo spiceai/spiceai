@@ -174,6 +174,10 @@ impl KeyResolver {
         }
     }
 
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
     pub(crate) fn policy(&self) -> ConflictPolicy {
         self.policy
     }
