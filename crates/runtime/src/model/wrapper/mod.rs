@@ -241,10 +241,19 @@ impl ChatWrapper {
                 // These defaults are only checked, so a malformed one is still reported at
                 // startup. Whether to stream is decided by the call, `chat_request` or
                 // `chat_stream`, and `chat_request` fails on a request marked as streaming.
-                // A tool choice or parallel-call setting means nothing to a request that
-                // offers no tools, and providers reject one sent alone.
+                // `stream_options` is only valid when `stream` is true; applying it after
+                // the `stream` default is ignored would send a non-streaming request that
+                // providers reject. A tool choice or parallel-call setting means nothing
+                // to a request that offers no tools, and providers reject one sent alone.
                 "stream" => {
                     parse_default::<bool>("stream", value, &self.public_name);
+                }
+                "stream_options" if !req.stream.is_some_and(|s| s) => {
+                    parse_default::<ChatCompletionStreamOptions>(
+                        "stream_options",
+                        value,
+                        &self.public_name,
+                    );
                 }
                 "tool_choice" if !offers_tools => {
                     parse_default::<ChatCompletionToolChoiceOption>(
@@ -616,6 +625,7 @@ mod call_dependent_defaults {
             None,
             vec![
                 ("stream".to_string(), json!(true)),
+                ("stream_options".to_string(), json!({"include_usage": true})),
                 ("tool_choice".to_string(), json!("auto")),
                 ("parallel_tool_calls".to_string(), json!(false)),
                 ("temperature".to_string(), json!(0.5)),
@@ -635,6 +645,37 @@ mod call_dependent_defaults {
         let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
 
         assert_eq!(prepared.stream, None);
+    }
+
+    /// `stream_options` is only valid when `stream` is true. A companion default
+    /// must not ride onto a non-streaming call after the `stream` default is ignored
+    /// (evaluation and other `chat_request` paths).
+    #[test]
+    fn a_stream_options_default_is_not_applied_unless_streaming() {
+        let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
+
+        assert_eq!(prepared.stream, None);
+        assert_eq!(
+            prepared.stream_options, None,
+            "stream_options on a non-streaming request is rejected by providers"
+        );
+
+        let streaming = serde_json::from_value(json!({
+            "model": "judge",
+            "messages": [],
+            "stream": true
+        }))
+        .expect("streaming chat request");
+        let prepared = wrapper().with_model_defaults(streaming);
+
+        assert_eq!(prepared.stream, Some(true));
+        assert_eq!(
+            prepared.stream_options,
+            Some(async_openai::types::chat::ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            })
+        );
     }
 
     /// A request with no tools, such as an evaluation's, must not be sent a tool choice
