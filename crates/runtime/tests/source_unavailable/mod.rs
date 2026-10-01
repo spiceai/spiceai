@@ -47,12 +47,15 @@ use crate::{
     utils::{run_query, wait_until_true},
 };
 
-/// A source whose connector cannot be built while it is down, failing the way the
-/// `PostgreSQL` and `MySQL` connectors do when their database refuses the
-/// connection: with `UnableToConnectInvalidHostOrPort`, raised from `create()`.
+/// A source that fails while it is down the way the `PostgreSQL` and `MySQL`
+/// connectors do when their database refuses the connection: with
+/// `UnableToConnectInvalidHostOrPort`. By default the connector cannot be built
+/// (`create()` fails); with [`Self::refuse_reads_instead_of_connecting`] it builds,
+/// and `read_provider` fails instead.
 struct UnreachableSource {
     prefix: &'static str,
     up: AtomicBool,
+    refuse_reads: AtomicBool,
     connect_attempts: AtomicUsize,
     value: AtomicUsize,
 }
@@ -62,8 +65,27 @@ impl UnreachableSource {
         Arc::new(Self {
             prefix,
             up: AtomicBool::new(false),
+            refuse_reads: AtomicBool::new(false),
             connect_attempts: AtomicUsize::new(0),
             value: AtomicUsize::new(value),
+        })
+    }
+
+    fn refuse_reads_instead_of_connecting(&self) {
+        self.refuse_reads.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts an attempt to reach the source, and fails it while the source is down.
+    fn attempt(&self, connector_component: ConnectorComponent) -> Result<(), DataConnectorError> {
+        self.connect_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.up.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+            dataconnector: self.prefix.to_string(),
+            connector_component,
+            host: "127.0.0.1".to_string(),
+            port: "5432".to_string(),
         })
     }
 
@@ -122,6 +144,9 @@ impl DataConnector for UnreachableSourceConnector {
         _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
+        if self.source.refuse_reads.load(Ordering::SeqCst) {
+            self.source.attempt(ConnectorComponent::from(dataset))?;
+        }
         let table =
             self.source
                 .table()
@@ -158,15 +183,8 @@ impl DataConnectorFactory for UnreachableSourceFactory {
         _context: &'a dyn ConnectorContext,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            self.source.connect_attempts.fetch_add(1, Ordering::SeqCst);
-            if !self.source.up.load(Ordering::SeqCst) {
-                return Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
-                    dataconnector: self.source.prefix.to_string(),
-                    connector_component: params.component.clone(),
-                    host: "127.0.0.1".to_string(),
-                    port: "5432".to_string(),
-                }
-                .into());
+            if !self.source.refuse_reads.load(Ordering::SeqCst) {
+                self.source.attempt(params.component.clone())?;
             }
             Ok(Arc::new(UnreachableSourceConnector {
                 source: Arc::clone(&self.source),
@@ -187,19 +205,17 @@ fn dataset_status(rt: &Runtime, name: &str) -> Option<ComponentStatus> {
     rt.status().get_component_status(&format!("dataset:{name}"))
 }
 
-/// Regression test for #14609: a source that is down when the runtime starts used
-/// to fail the dataset permanently, so it never loaded even after the source came
-/// back. It must keep retrying, and load once the source is reachable.
-#[tokio::test]
-async fn a_dataset_whose_source_is_down_at_startup_loads_once_the_source_is_reachable()
--> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    let source = UnreachableSource::new("unreachable-at-startup", 7);
+/// Starts a runtime with one dataset on `source` while it is down, and asserts the
+/// dataset reports the failure, then loads once the source is reachable.
+async fn assert_loads_once_reachable(
+    source: &Arc<UnreachableSource>,
+    snapshot: &str,
+) -> Result<(), anyhow::Error> {
     source.register().await;
 
     let app = AppBuilder::new("source_unavailable")
         .with_dataset(SpicepodDataset::new(
-            "unreachable-at-startup://orders",
+            format!("{}://orders", source.prefix),
             "orders",
         ))
         .build();
@@ -250,10 +266,36 @@ async fn a_dataset_whose_source_is_down_at_startup_loads_once_the_source_is_reac
 
     let batches = run_query(&rt, "SELECT SUM(v) AS s, COUNT(*) AS n FROM orders").await?;
     insta::assert_snapshot!(
-        "source_down_at_startup_loads_once_reachable",
+        snapshot,
         arrow::util::pretty::pretty_format_batches(&batches)?
     );
 
     loader.abort();
     Ok(())
+}
+
+/// Regression test for #14609: a source that is down when the runtime starts used
+/// to fail the dataset permanently, so it never loaded even after the source came
+/// back. It must keep retrying, and load once the source is reachable.
+#[tokio::test]
+async fn a_dataset_whose_source_is_down_at_startup_loads_once_the_source_is_reachable()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("unreachable-at-startup", 7);
+    assert_loads_once_reachable(&source, "source_down_at_startup_loads_once_reachable").await
+}
+
+/// The same failure surfacing from `read_provider` instead: a connector that builds
+/// without contacting the source, and is refused when it reads the schema.
+#[tokio::test]
+async fn a_dataset_whose_source_refuses_reads_at_startup_loads_once_the_source_is_reachable()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("refuses-reads-at-startup", 5);
+    source.refuse_reads_instead_of_connecting();
+    assert_loads_once_reachable(
+        &source,
+        "source_refuses_reads_at_startup_loads_once_reachable",
+    )
+    .await
 }

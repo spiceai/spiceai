@@ -1076,7 +1076,7 @@ impl Runtime {
                         status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    if connector_error_is_permanent(&err) {
+                    if !err.is_retriable() {
                         error_spaced!(spaced_tracer, "{}{err}", "");
                         return PermanentDatasetFailureSnafu {
                             dataset: ds.name.clone(),
@@ -2367,22 +2367,6 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
     }
 }
 
-/// Whether a connector error is a configuration problem that no retry can clear.
-///
-/// A source that could not be reached is not, even though
-/// [`DataConnectorError::is_retriable`](dataconnector::DataConnectorError::is_retriable)
-/// reports `UnableToConnectInvalidHostOrPort` as unretriable: connectors report a
-/// database that is down or still starting (connection refused, timed out) that way,
-/// and it must recover the dataset on its own once it is reachable. Rejected
-/// credentials and TLS failures stay permanent — they are configuration errors.
-fn connector_error_is_permanent(err: &dataconnector::DataConnectorError) -> bool {
-    !err.is_retriable()
-        && !matches!(
-            err,
-            dataconnector::DataConnectorError::UnableToConnectInvalidHostOrPort { .. }
-        )
-}
-
 /// Returns `true` when a boxed connector-construction error is a configuration
 /// error that no retry can clear.
 ///
@@ -2399,7 +2383,7 @@ fn connector_error_is_permanent(err: &dataconnector::DataConnectorError) -> bool
 /// inherit "permanent" from this arm.
 fn is_permanent_dataset_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     if let Some(err) = source.downcast_ref::<dataconnector::DataConnectorError>() {
-        return connector_error_is_permanent(err);
+        return !err.is_retriable();
     }
     matches!(
         source.downcast_ref::<runtime_parameters::Error>(),
