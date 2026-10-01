@@ -9048,6 +9048,261 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
+    /// The write a conflicting transaction holds open on a table's control row,
+    /// which every snapshot-pointer swap also writes.
+    #[cfg(feature = "turso")]
+    const CONTROL_ROW_WRITE: &str = "UPDATE cayenne_table \
+        SET current_sequence_number = current_sequence_number + 1 WHERE table_id = ?1";
+
+    /// Open a metastore transaction that writes the rows `sql` selects for
+    /// `table_id`, and leave it open: until it ends, any other transaction that
+    /// writes those rows conflicts with it.
+    #[cfg(feature = "turso")]
+    async fn hold_conflicting_write(
+        catalog: &CayenneCatalog,
+        sql: &str,
+        table_id: &str,
+    ) -> Box<dyn MetastoreTransaction> {
+        let tx = catalog
+            .begin_transaction()
+            .await
+            .expect("begin the conflicting transaction");
+        tx.execute(ExecuteParams {
+            sql,
+            params: vec![MetastoreValue::Text(table_id.to_string())],
+        })
+        .await
+        .expect("write the rows the operation under test also writes");
+        tx
+    }
+
+    /// `None` when a commit envelope that ran while [`hold_conflicting_write`]
+    /// held its rows spent every attempt and failed with an error a caller still
+    /// recognises as a retryable write conflict. Otherwise, what it did instead.
+    #[cfg(feature = "turso")]
+    fn statement_conflict_violation<T: std::fmt::Debug>(
+        operation: &str,
+        attempts: u64,
+        result: &CatalogResult<T>,
+    ) -> Option<String> {
+        let expected = u64::from(DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS);
+        match result {
+            Err(error) if attempts == expected && is_retryable_write_conflict(error) => None,
+            Err(error) => Some(format!(
+                "{operation}: made {attempts} of {expected} attempts, then returned {error:?} \
+                 (retryable: {})",
+                is_retryable_write_conflict(error)
+            )),
+            Ok(value) => Some(format!(
+                "{operation}: returned {value:?} while a conflicting transaction was open"
+            )),
+        }
+    }
+
+    /// Under Turso's `BEGIN CONCURRENT`, writing a row that another open
+    /// transaction has changed fails the statement itself with a write-write
+    /// conflict, not only the `COMMIT`. Every commit envelope has to treat that
+    /// the way it treats a conflicted `COMMIT` — roll the attempt back and retry
+    /// it — and, once it gives up, return the conflict in a form a coordinator
+    /// above it still recognises as retryable. With the conflicting transaction
+    /// held open, each envelope therefore spends all its attempts, one `BEGIN`
+    /// each; once that transaction ends, the same write succeeds.
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_statement_write_conflicts_are_retried_by_every_commit_envelope() {
+        let (_table_root, base_path) = test_table_root();
+        let metastore_dir = tempfile::tempdir().expect("create a temporary metastore directory");
+        let catalog = CayenneCatalog::new(format!(
+            "libsql://{}",
+            metastore_dir.path().join("cayenne.db").display()
+        ))
+        .expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "statement_conflicts".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path,
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+        let mut violations = Vec::new();
+
+        // Every envelope that swaps the snapshot pointer writes the control row.
+        let blocker = hold_conflicting_write(&catalog, CONTROL_ROW_WRITE, &table_id).await;
+        let current = current_snapshot_id(&catalog, &table_id).await;
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .set_current_snapshot(&table_id, &current, &uuid::Uuid::now_v7().to_string())
+            .await;
+        violations.extend(statement_conflict_violation(
+            "set_current_snapshot",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_compaction(&table_id, &current, &uuid::Uuid::now_v7().to_string())
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_compaction",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_compaction_fenced(
+                &table_id,
+                &current,
+                &uuid::Uuid::now_v7().to_string(),
+                i64::MAX,
+                &[],
+            )
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_compaction_fenced",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None)
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_overwrite",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_overwrite_to_cold(&table_id, &uuid::Uuid::now_v7().to_string(), &[])
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_overwrite_to_cold",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        blocker
+            .rollback()
+            .await
+            .expect("end the transaction holding the control row");
+        let compacted_to = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_compaction(&table_id, &current, &compacted_to)
+            .await
+            .expect("commit_compaction succeeds once the conflicting transaction ends");
+        assert_eq!(
+            current_snapshot_id(&catalog, &table_id).await,
+            compacted_to,
+            "the compaction moved the snapshot pointer"
+        );
+
+        // A protected-snapshot swap writes the protected snapshots' roster rows.
+        let merged_away_first = uuid::Uuid::now_v7().to_string();
+        let merged_away_second = uuid::Uuid::now_v7().to_string();
+        for (snapshot_id, sequence_number) in [(&merged_away_first, 1), (&merged_away_second, 2)] {
+            catalog
+                .set_snapshot_sequence(&table_id, snapshot_id, sequence_number)
+                .await
+                .expect("protect a snapshot");
+        }
+        let merged_away = [merged_away_first, merged_away_second];
+        let merged_into = uuid::Uuid::now_v7().to_string();
+        let blocker = hold_conflicting_write(
+            &catalog,
+            "UPDATE cayenne_snapshot_sequence SET sequence_number = sequence_number + 1 \
+             WHERE table_id = ?1",
+            &table_id,
+        )
+        .await;
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .swap_protected_snapshots(&table_id, &merged_away, &merged_into, 3)
+            .await;
+        violations.extend(statement_conflict_violation(
+            "swap_protected_snapshots",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        blocker
+            .rollback()
+            .await
+            .expect("end the transaction holding the roster rows");
+        assert!(
+            catalog
+                .swap_protected_snapshots(&table_id, &merged_away, &merged_into, 3)
+                .await
+                .expect("swap_protected_snapshots succeeds once the conflicting transaction ends"),
+            "both merged-away snapshots are still protected, so the swap commits"
+        );
+
+        // An inline mutation writes the inline rows it rewrites.
+        let inlined = InlinedData {
+            inlined_id: uuid::Uuid::now_v7().to_string(),
+            table_id: table_id.clone(),
+            partition_key: None,
+            data_ipc: vec![1, 2, 3],
+            record_count: 1,
+            sequence_number: 1,
+            created_at: "2026-10-01T00:00:00Z".to_string(),
+        };
+        catalog
+            .commit_inlined_mutation(&table_id, vec![], vec![], vec![inlined.clone()], 1)
+            .await
+            .expect("inline a row");
+        let rewritten = InlinedData {
+            data_ipc: vec![4, 5, 6],
+            ..inlined
+        };
+        let blocker = hold_conflicting_write(
+            &catalog,
+            "UPDATE cayenne_inlined_data SET record_count = record_count + 1 WHERE table_id = ?1",
+            &table_id,
+        )
+        .await;
+
+        let before = catalog.metastore_query_count();
+        let result = catalog
+            .commit_inlined_mutation(&table_id, vec![rewritten.clone()], vec![], vec![], 2)
+            .await;
+        violations.extend(statement_conflict_violation(
+            "commit_inlined_mutation",
+            catalog.metastore_query_count() - before,
+            &result,
+        ));
+
+        blocker
+            .rollback()
+            .await
+            .expect("end the transaction holding the inline rows");
+        catalog
+            .commit_inlined_mutation(&table_id, vec![rewritten], vec![], vec![], 2)
+            .await
+            .expect("commit_inlined_mutation succeeds once the conflicting transaction ends");
+
+        assert!(
+            violations.is_empty(),
+            "a write conflict raised by a statement was not retried like a conflicted COMMIT: \
+             {violations:#?}"
+        );
+    }
+
     /// Test that `commit_compaction` rejects non-UUID identifiers.
     #[tokio::test]
     async fn test_commit_compaction_rejects_invalid_uuid() {
