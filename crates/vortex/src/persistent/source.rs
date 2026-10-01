@@ -4,6 +4,7 @@
 use std::fmt::Formatter;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 
 use datafusion_common::Result as DFResult;
@@ -69,6 +70,10 @@ pub struct VortexSource {
     layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by path.
     natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    /// Per-path lock guarding the natural-split-range computation for that file,
+    /// so a cache miss for one path never blocks behind another path's
+    /// computation in the same `natural_split_ranges` shard.
+    natural_split_range_locks: Arc<DashMap<Path, Arc<Mutex<()>>>>,
     expression_convertor: Arc<dyn ExpressionConvertor>,
     pub(crate) vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
@@ -111,6 +116,7 @@ impl VortexSource {
             df_metrics: ExecutionPlanMetricsSet::default(),
             layout_readers: Arc::new(DashMap::default()),
             natural_split_ranges: Arc::new(DashMap::default()),
+            natural_split_range_locks: Arc::new(DashMap::default()),
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             vortex_reader_factory: None,
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
@@ -315,6 +321,7 @@ impl FileSource for VortexSource {
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
             layout_readers: Arc::clone(&self.layout_readers),
             natural_split_ranges: Arc::clone(&self.natural_split_ranges),
+            natural_split_range_locks: Arc::clone(&self.natural_split_range_locks),
             has_output_ordering: !base_config.output_ordering.is_empty(),
             expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
