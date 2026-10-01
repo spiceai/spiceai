@@ -29,6 +29,7 @@ pub(crate) mod model;
 pub(crate) mod pods_watcher;
 pub(crate) mod rerank;
 pub(crate) mod scheduler;
+pub(crate) mod snapshot_source;
 pub(crate) mod task_history;
 pub(crate) mod tool;
 pub(crate) mod view;
