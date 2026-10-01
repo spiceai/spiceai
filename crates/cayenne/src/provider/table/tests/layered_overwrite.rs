@@ -46,7 +46,7 @@ async fn write(
     op: InsertOp,
     batches: Vec<RecordBatch>,
 ) -> datafusion_common::Result<()> {
-    let ctx = SessionContext::new();
+    let ctx = util::session_state::refresh_session_context();
     let source = MemorySourceConfig::try_new_exec(&[batches], schema(), None)?;
     let plan = provider.insert_into(&ctx.state(), source, op).await?;
     collect(plan, ctx.task_ctx()).await.map(|_| ())
@@ -464,7 +464,7 @@ async fn a_layered_overwrite_resolves_a_string_key_in_both_modes() {
         )
         .await;
         provider.collapse_window_bytes = 1;
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::refresh_session_context();
         let source = MemorySourceConfig::try_new_exec(
             &[vec![
                 rows_of(&[("a", 1), ("b", 1)]),
@@ -732,71 +732,52 @@ async fn aggregates_after_a_layered_overwrite_ignore_superseded_copies() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// A transaction's staged upsert keeps the last copy of a key it repeats across
-/// record batches, and supersedes the stored copy exactly once.
+/// A user's statement keeps its own semantics: `on_conflict` resolves only the
+/// keys a refresh repeats, so a key a plain `INSERT` or a transaction's write
+/// repeats across record batches still fails the statement.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_staged_upsert_keeps_the_last_copy_across_batches() {
-    let mut failures = Vec::new();
+async fn a_statement_repeating_a_key_across_batches_still_fails() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
-        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
-        write(
-            &provider,
-            InsertOp::Overwrite,
-            vec![batch(&[(1, "old"), (9, "old")])],
-        )
-        .await
-        .expect("seed");
-        let token = provider.transaction_write_token().await;
+        let (provider, _catalog, _runtime_env, _dir) = table(mode, UpsertDedup::KeepLast).await;
+        let repeated = || {
+            MemorySourceConfig::try_new_exec(
+                &[vec![batch(&[(1, "a"), (2, "a")]), batch(&[(1, "b")])]],
+                schema(),
+                None,
+            )
+            .expect("source")
+        };
         let ctx = SessionContext::new();
-        let source = MemorySourceConfig::try_new_exec(
-            &[vec![
-                batch(&[(1, "a"), (2, "zzz")]),
-                batch(&[(2, "b"), (3, "b")]),
-                batch(&[(1, "c")]),
-            ]],
-            schema(),
-            None,
-        )
-        .expect("source");
-        let stream = source.execute(0, ctx.task_ctx()).expect("stream");
-        let staged = provider
+        let plan = provider
+            .insert_into(&ctx.state(), repeated(), InsertOp::Append)
+            .await
+            .expect("plan");
+        let error = collect(plan, ctx.task_ctx())
+            .await
+            .expect_err("a statement repeating a key across batches must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate primary key across batches"),
+            "{mode:?} INSERT: {error}"
+        );
+
+        let token = provider.transaction_write_token().await;
+        let stream = repeated().execute(0, ctx.task_ctx()).expect("stream");
+        let error = provider
             .begin_staged_upsert_occ(token, stream, 4)
             .await
-            .expect("stage");
-        staged
-            .commit(std::collections::HashSet::new(), true)
-            .await
-            .expect("commit");
-        let expected = owned(&[(1, "c"), (2, "b"), (3, "b"), (9, "old")]);
-        for (stage, provider) in [
-            ("after commit", provider.clone_for_write()),
-            (
-                "after reopen",
-                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
-            ),
-        ] {
-            let (rows, count) = visible(&provider).await;
-            let ctx = SessionContext::new();
-            ctx.register_table("t", Arc::new(provider))
-                .expect("register");
-            let max = ctx
-                .sql("SELECT MAX(value) FROM t")
-                .await
-                .expect("query")
-                .collect()
-                .await
-                .expect("collect")[0]
-                .column(0)
-                .as_string::<i32>()
-                .value(0)
-                .to_string();
-            eprintln!("{mode:?} {stage}: {rows:?} COUNT(*) {count} MAX {max}");
-            if rows != expected || count != 4 || max != "old" {
-                failures.push(format!(
-                    "{mode:?} {stage}: {rows:?} COUNT(*) {count} MAX {max}"
-                ));
-            }
-        }
+            .expect_err("a transaction repeating a key across batches must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate primary key across batches"),
+            "{mode:?} transaction: {error}"
+        );
+        assert_eq!(
+            visible(&provider).await,
+            (Vec::new(), 0),
+            "{mode:?}: nothing written"
+        );
     }
-    assert!(failures.is_empty(), "{failures:#?}");
 }

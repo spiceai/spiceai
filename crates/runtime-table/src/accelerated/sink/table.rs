@@ -245,7 +245,9 @@ impl TableSink {
             overwrite
         );
 
-        let ctx = util::session_state::session_context();
+        // A refresh's write: the accelerator resolves the keys its data repeats
+        // per the dataset's `on_conflict`.
+        let ctx = util::session_state::refresh_session_context();
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(
             &self.dataset_name,

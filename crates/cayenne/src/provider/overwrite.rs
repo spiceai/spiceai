@@ -920,47 +920,6 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Write every layer of `source` into the unpublished snapshot `snapshot_id`,
-    /// one after another, and fold the copies later layers supersede out of its
-    /// files; see [`Self::fold_superseded_copies`]. Returns the rows the snapshot
-    /// holds and their statistics.
-    pub(super) async fn write_layers_folded(
-        &self,
-        mut source: LayerSource,
-        snapshot_id: &str,
-        write: LayerWrite,
-    ) -> Result<(u64, Arc<ColumnStatsAccumulator>)> {
-        let file_stats = Arc::new(FileStatsObserver::new(self.table_schema(), None));
-        let observer = Some(source.observer(Some(
-            Arc::clone(&file_stats) as Arc<dyn vortex_datafusion::VortexWriteObserver>
-        )));
-        let first = self.first_layer(&mut source)?;
-        let (_rows, _files, stats) = self
-            .write_to_snapshot_range_partitioned(
-                first,
-                write.target_size_bytes,
-                snapshot_id,
-                write.target_partitions,
-                None,
-                write.write_policy,
-                None,
-                observer.as_ref().map(Arc::clone),
-            )
-            .await?;
-        let later = self
-            .write_later_layers(
-                &mut source,
-                snapshot_id,
-                write,
-                observer,
-                stats,
-                Some(&file_stats),
-            )
-            .await?;
-        let live_rows = u64::try_from(later.stats.row_count()).unwrap_or(0);
-        Ok((live_rows, later.stats))
-    }
-
     /// Write every layer of `source` after the first into `snapshot_id`, which
     /// already holds the first, and locate the copies they supersede. With
     /// `fold` — the statistics of every file written so far — the copies are
@@ -999,7 +958,7 @@ impl CayenneTableProvider {
     /// Remove an unpublished snapshot's local directory, best-effort: a
     /// directory left behind is pruned by the next snapshot cleanup, and object
     /// stores are left to it entirely.
-    pub(super) async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
+    async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
         if self.table_path().starts_with("s3://") {
             return;
         }
@@ -1177,10 +1136,10 @@ impl CayenneTableProvider {
 
 /// How a layered write writes each layer after the first.
 #[derive(Clone, Copy)]
-pub(super) struct LayerWrite {
-    pub(super) target_size_bytes: usize,
-    pub(super) target_partitions: usize,
-    pub(super) write_policy: super::delta_encoding::WritePolicy,
+struct LayerWrite {
+    target_size_bytes: usize,
+    target_partitions: usize,
+    write_policy: super::delta_encoding::WritePolicy,
 }
 
 /// What [`CayenneTableProvider::write_later_layers`] wrote.
@@ -1198,14 +1157,14 @@ struct LaterLayers {
 /// Records the statistics of each file a write produces, by file name, and
 /// forwards every batch to `inner`.
 #[derive(Debug)]
-pub(super) struct FileStatsObserver {
+struct FileStatsObserver {
     schema: arrow_schema::SchemaRef,
     inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
     files: parking_lot::Mutex<HashMap<String, Arc<ColumnStatsAccumulator>>>,
 }
 
 impl FileStatsObserver {
-    pub(super) fn new(
+    fn new(
         schema: arrow_schema::SchemaRef,
         inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
     ) -> Self {

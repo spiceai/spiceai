@@ -1850,6 +1850,11 @@ pub struct CayenneTableProvider {
     /// The `upsert` refinement of the dataset's `on_conflict`, which decides how a
     /// write resolves a key it repeats; see [`super::key_conflicts`].
     upsert_dedup: super::key_conflicts::UpsertDedup,
+    /// Whether this provider's writes resolve the keys their data repeats per
+    /// `on_conflict` ([`Self::key_resolver`]). True for the accelerator's own
+    /// writes — refreshes and change streams; [`TableProvider::insert_into`]
+    /// clears it for a user's statement, which keeps its own semantics.
+    resolves_repeated_keys: bool,
     /// Bytes of input a streaming upsert write collapses in memory before it
     /// splits the rest into layers; see [`super::overwrite_layers::CollapseWindow`].
     pub(crate) collapse_window_bytes: usize,
@@ -9105,6 +9110,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             upsert_dedup,
+            resolves_repeated_keys: true,
             collapse_window_bytes: super::overwrite_layers::COLLAPSE_WINDOW_BYTES,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -11141,6 +11147,7 @@ impl CayenneTableProvider {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             upsert_dedup: self.upsert_dedup,
+            resolves_repeated_keys: self.resolves_repeated_keys,
             collapse_window_bytes: self.collapse_window_bytes,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
@@ -12932,6 +12939,9 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if a primary key column is missing or cannot be encoded.
     pub(crate) fn key_resolver(&self) -> Result<Option<super::key_conflicts::KeyResolver>> {
+        if !self.resolves_repeated_keys {
+            return Ok(None);
+        }
         let Some(policy) = super::key_conflicts::ConflictPolicy::new(
             self.table_metadata.on_conflict.as_ref(),
             self.upsert_dedup,
@@ -14100,12 +14110,7 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(
-            stream,
-            false,
-            super::on_conflict::CrossBatchRepeats::Reject,
-        )
-        .await
+        self.prepare_stream_for_insert_inner(stream, false).await
     }
 
     /// Off-lock variant for conditional-commit staging: validates against a
@@ -14114,24 +14119,17 @@ impl CayenneTableProvider {
     /// ordinary writers concurrently update the shared cache. Optimistic
     /// concurrency is re-checked at commit; a private keyset that is stale by
     /// commit is caught there (the transaction's sequence gate aborts).
-    ///
-    /// `repeats` says what to do with a key an earlier batch already holds;
-    /// [`super::on_conflict::CrossBatchRepeats::KeepLaterCopy`] is only for a
-    /// writer that folds the earlier copies out of its snapshot itself.
     pub(crate) async fn prepare_stream_for_insert_offlock(
         &self,
         stream: SendableRecordBatchStream,
-        repeats: super::on_conflict::CrossBatchRepeats,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(stream, true, repeats)
-            .await
+        self.prepare_stream_for_insert_inner(stream, true).await
     }
 
     async fn prepare_stream_for_insert_inner(
         &self,
         stream: SendableRecordBatchStream,
         offlock: bool,
-        repeats: super::on_conflict::CrossBatchRepeats,
     ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(PreparedInsertStream::immediate(stream));
@@ -14201,8 +14199,7 @@ impl CayenneTableProvider {
             on_conflict,
             Arc::clone(&post_validation),
             pk_checkout,
-        )
-        .with_cross_batch_repeats(repeats);
+        );
 
         Ok(PreparedInsertStream::deferred(
             Box::pin(validation_stream) as SendableRecordBatchStream,
@@ -14712,10 +14709,6 @@ impl CayenneTableProvider {
             }
 
             if ctx.incoming_keys.contains(&digest) {
-                if ctx.cross_batch_repeats == super::on_conflict::CrossBatchRepeats::KeepLaterCopy {
-                    keep_mask.push(true);
-                    continue;
-                }
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -15163,7 +15156,6 @@ impl CayenneTableProvider {
                 existing: index.existence_ref(s),
                 pending: pending_existence.as_ref(),
                 incoming_keys: &incoming_keys,
-                cross_batch_repeats: super::on_conflict::CrossBatchRepeats::Reject,
             };
             let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
             for (file_path, rows) in result.delete_specs {
@@ -37142,8 +37134,13 @@ impl TableProvider for CayenneTableProvider {
         // - Overwrite: new snapshot creation, catalog commit, state updates, cleanup
         // - Append: write lock, PK validation, on-conflict deletions, new snapshot
         //   when needed, retention filters, sort-and-rewrite, listing table refresh
+        // Only a refresh resolves the keys its data repeats per `on_conflict`; a
+        // user's statement keeps its own semantics.
+        let mut table = self.clone_for_write();
+        table.resolves_repeated_keys =
+            self.resolves_repeated_keys && util::session_state::is_refresh_write(state.config());
         let sink = Arc::new(CayenneDataSink::new(
-            self.clone_for_write(),
+            table,
             overwrite,
             self.table_schema(),
             Arc::clone(&self.context),
@@ -68953,7 +68950,6 @@ mod tests {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &incoming_keys,
-            cross_batch_repeats: crate::provider::on_conflict::CrossBatchRepeats::Reject,
         };
 
         let result = provider

@@ -1628,7 +1628,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = util::session_state::session_context();
+        let ctx = util::session_state::refresh_session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches
@@ -1864,7 +1864,7 @@ impl CacheRefreshHelper {
             return Ok(());
         }
 
-        let ctx = util::session_state::session_context();
+        let ctx = util::session_state::refresh_session_context();
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
