@@ -1227,6 +1227,189 @@ mod tests {
         );
     }
 
+    /// Rows that live only in the RAM CDC tier (`cdc_durability: memory`, not
+    /// yet checkpointed to a file) are part of the captured view and reach the
+    /// compacted snapshot: the capture clones the mem-tier segments into the
+    /// plan, so the scratch rewrite reads them like any other input.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compaction_includes_rows_held_only_in_the_memory_tier() {
+        use cayenne::metadata::CdcDurability;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = Node::new(&tmp.path().join("writer")).await;
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            cdc_durability: CdcDurability::Memory,
+            // No periodic checkpoint: the rows stay in RAM until this test ends.
+            cdc_mem_tier_checkpoint_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let live = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&writer.catalog), ctx.runtime_env())
+                .create(CreateTableOptions {
+                    table_name: DATASET.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]))),
+                    base_path: writer.data_dir.to_string_lossy().into_owned(),
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("create table"),
+        );
+        // The RAM tier engages only once the runtime installs a slot advancer
+        // (the replayable-source gate); stand in for the runtime here.
+        struct NoopSlotAdvancer;
+        #[async_trait::async_trait]
+        impl cayenne::SlotAdvancer for NoopSlotAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        live.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Durable base rows, then CDC rows that go to the RAM tier only.
+        let base: Vec<(i64, i64)> = (1..=500).map(|id| (id, id * 10)).collect();
+        insert(&live, &base).await;
+        let meta = writer.catalog.get_table(DATASET).await.expect("live meta");
+        let files_before = walk_files(&writer.data_dir.join(&meta.table_id)).len();
+
+        let cdc_rows: Vec<(i64, i64)> = (1..=50)
+            .map(|id| (id, id * 1000))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain((900..=950).map(|id| (id, id)))
+            .collect();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema(),
+            futures::stream::iter([Ok(batch(&cdc_rows))]),
+        ));
+        let write = live
+            .write_cdc_append_stream(stream, &ctx.task_ctx())
+            .await
+            .expect("cdc write");
+        assert!(
+            write.in_memory_epoch().is_some() && !write.has_pending_finalize(),
+            "the CDC write must have taken the in-memory tier path"
+        );
+        write.finish().await.expect("finish");
+
+        let files_after = walk_files(&writer.data_dir.join(&meta.table_id)).len();
+        assert_eq!(
+            files_before, files_after,
+            "the CDC rows must not have reached a file yet"
+        );
+        assert_eq!(
+            writer
+                .catalog
+                .get_inlined_data_count(&meta.table_id)
+                .await
+                .expect("inlined"),
+            0,
+            "the CDC rows must not be in the inline tier either"
+        );
+        let expected = rows(&live).await;
+        assert_eq!(
+            expected.get(&1),
+            Some(&1000),
+            "RAM-tier upsert visible on the writer"
+        );
+        assert_eq!(
+            expected.get(&950),
+            Some(&950),
+            "RAM-tier insert visible on the writer"
+        );
+
+        let engine = CayenneSnapshotEngine::new(
+            Arc::clone(&writer.catalog),
+            DATASET,
+            writer.data_dir.clone(),
+        )
+        .with_compaction(true);
+        let live_dyn: Arc<dyn TableProvider> = Arc::clone(&live) as Arc<dyn TableProvider>;
+        let plan = engine
+            .prepare_directory_snapshot(&writer.dirs(), DATASET, Some(&live_dyn))
+            .await
+            .expect("prepare");
+        let materialized = plan
+            .deferred
+            .expect("compaction defers the build")
+            .await
+            .expect("materialize");
+
+        let reader = Node::new(&tmp.path().join("reader")).await;
+        let tar = tmp.path().join("snapshot.tar");
+        let skip: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = materialized
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        archive_directories_to_file_with_plan(&materialized.dirs, &tar, &skip, &extras)
+            .await
+            .expect("archive");
+        for dir in &materialized.cleanup_dirs {
+            tokio::fs::remove_dir_all(dir)
+                .await
+                .expect("cleanup scratch");
+        }
+        extract_archive_file_with_options(
+            &tar,
+            &tmp.path().join("reader"),
+            ExtractOptions {
+                prefix_mappings: Some(vec![
+                    ("metadata/".to_string(), reader.metadata_dir.clone()),
+                    ("data/".to_string(), reader.data_dir.clone()),
+                ]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .expect("extract");
+        CayenneSnapshotEngine::new(
+            Arc::clone(&reader.catalog),
+            DATASET,
+            reader.data_dir.clone(),
+        )
+        .finalize_directory_snapshot(&reader.dirs(), DATASET)
+        .await
+        .expect("import slice");
+        let restored = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&reader.catalog), ctx.runtime_env())
+                .open(DATASET)
+                .await
+                .expect("open reader table"),
+        );
+        assert_eq!(
+            rows(&restored).await,
+            expected,
+            "the compacted snapshot must carry the RAM-tier rows"
+        );
+    }
+
+    fn walk_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "vortex") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn scratch_vortex_config_forces_files_and_disables_maintenance() {
         let live = VortexConfig {
