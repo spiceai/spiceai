@@ -21,9 +21,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group or non-trunk
+  # branch. Trunk pushes share one group and never cancel: each runs on `spiceai-macos-large`, the
+  # pool the merge queue builds on, so a newer push replaces only the run still waiting. The trunk
+  # commit is the merge-group commit that already passed this workflow.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' }}
 
 env:
   CARGO_TERM_COLOR: always
