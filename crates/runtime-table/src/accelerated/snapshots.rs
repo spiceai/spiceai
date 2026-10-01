@@ -550,7 +550,7 @@ pub async fn create_checkpoint_and_snapshot(
             if !e.is_retriable() || is_shutdown_cancellation(&e) {
                 return RetryError::permanent(e);
             }
-            tracing::warn!(dataset = %dataset_name, error = %e, "Snapshot attempt failed, retrying");
+            tracing::debug!(dataset = %dataset_name, error = %e, "Snapshot attempt failed, retrying");
             RetryError::transient(e)
         })
     })
@@ -722,27 +722,40 @@ mod tests {
         });
         let checkpointer: Arc<dyn DatasetCheckpointer> = Arc::clone(&flaky) as _;
         let mutex = Arc::new(Mutex::new(()));
-        create_checkpoint_and_snapshot(
-            &checkpointer,
-            None,
-            &Arc::new(Schema::empty()),
-            &mutex,
-            &TableReference::bare("t"),
-            &Arc::new(AtomicI64::new(0)),
-            ForceCreate(false),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let task = tokio::spawn({
+            let mutex = Arc::clone(&mutex);
+            async move {
+                create_checkpoint_and_snapshot(
+                    &checkpointer,
+                    None,
+                    &Arc::new(Schema::empty()),
+                    &mutex,
+                    &TableReference::bare("t"),
+                    &Arc::new(AtomicI64::new(0)),
+                    ForceCreate(false),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+        });
+
+        // Runs once the task parks in the backoff after its first failure.
+        while flaky.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "the retry is still pending");
+        assert!(
+            mutex.try_lock().is_ok(),
+            "the write lock is free during the backoff"
+        );
+
+        task.await.expect("snapshot task completes");
         assert_eq!(
             flaky.calls.load(Ordering::SeqCst),
             3,
             "two failures, then the attempt that succeeded"
-        );
-        assert!(
-            mutex.try_lock().is_ok(),
-            "the write lock is released after the retries"
         );
     }
 

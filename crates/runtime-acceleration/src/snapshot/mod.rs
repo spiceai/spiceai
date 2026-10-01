@@ -5616,6 +5616,50 @@ mod tests {
     }
 
     #[test]
+    fn upload_error_retriability() {
+        let store_err = |source| SnapshotUploadError::UploadWriteMetadata {
+            path: "metadata.json".to_string(),
+            source,
+        };
+        let transient = store_err(object_store::Error::Generic {
+            store: "S3",
+            source: "connection reset".into(),
+        });
+        let precondition = store_err(object_store::Error::Precondition {
+            path: "metadata.json".to_string(),
+            source: "etag changed".into(),
+        });
+        let archive = SnapshotUploadError::ArchiveCreate {
+            path: PathBuf::from("/tmp/snapshot.tar"),
+            source: directory_archive::ArchiveError::CreateArchive {
+                path: PathBuf::from("/data/t"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        };
+        let mismatch = SnapshotUploadError::UploadSchemaMismatch {
+            dataset: "t".to_string(),
+            details: "column dropped".to_string(),
+        };
+
+        assert!(
+            transient.is_retriable(),
+            "a network error may pass on retry"
+        );
+        assert!(
+            archive.is_retriable(),
+            "an archive walk may race maintenance"
+        );
+        assert!(
+            !precondition.is_retriable(),
+            "a precondition failure is handled by the metadata update loop"
+        );
+        assert!(
+            !mismatch.is_retriable(),
+            "a schema mismatch needs user action"
+        );
+    }
+
+    #[test]
     fn snapshot_uri_to_object_path_handles_relative_uris() {
         let store = Arc::new(InMemory::new());
         let schema = sample_schema();
