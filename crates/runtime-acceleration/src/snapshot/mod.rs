@@ -21,9 +21,9 @@ use aws_sdk_credential_bridge::object_store_builder::{
 };
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, stream::BoxStream};
 use object_store::{
-    GetOptions, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
     path::Path as ObjectPath,
 };
 use opentelemetry::KeyValue;
@@ -68,6 +68,13 @@ pub mod metrics;
 pub use crate::layout::AccelerationLayout;
 pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled};
 use engine::{SnapshotEngine, create_snapshot_engine};
+
+/// Size of each ranged GET used to download a snapshot.
+const SNAPSHOT_DOWNLOAD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// Ranged GETs in flight per snapshot download (up to 32 MiB buffered).
+const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
+
+type SnapshotChunks<'a> = BoxStream<'a, object_store::Result<bytes::Bytes>>;
 
 /// Public API types for snapshot information exposed via HTTP endpoints.
 pub mod api {
@@ -2275,6 +2282,44 @@ impl SnapshotManager {
         }
     }
 
+    /// Streams the snapshot at `object_path` as ranged GETs, yielding bytes in order.
+    ///
+    /// A single GET shares one retry budget (180s by default) across all body resumes, so
+    /// on a slow link a large snapshot fails at the same point on every attempt. Each range
+    /// is a separate request with its own budget.
+    fn snapshot_chunks<'a>(&'a self, object_path: &'a ObjectPath, size: u64) -> SnapshotChunks<'a> {
+        let ranges = (0..size.div_ceil(SNAPSHOT_DOWNLOAD_CHUNK_BYTES)).map(move |i| {
+            let start = i * SNAPSHOT_DOWNLOAD_CHUNK_BYTES;
+            start
+                ..start
+                    .saturating_add(SNAPSHOT_DOWNLOAD_CHUNK_BYTES)
+                    .min(size)
+        });
+        futures::stream::iter(ranges)
+            .map(move |range| async move {
+                retry(self.network_retry_strategy.clone(), || async {
+                    self.object_store
+                        .get_range(object_path, range.clone())
+                        .await
+                        .map_err(|err| {
+                            if !is_retriable_object_store_error(&err) {
+                                return RetryError::permanent(err);
+                            }
+                            tracing::warn!(
+                                "Transient error downloading snapshot, retrying. dataset={} path={object_path} range={}..{} error={err}",
+                                self.dataset_name,
+                                range.start,
+                                range.end,
+                            );
+                            RetryError::transient(err)
+                        })
+                })
+                .await
+            })
+            .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY)
+            .boxed()
+    }
+
     /// Returns the URI a snapshot entry is read from, for logs.
     ///
     /// An entry's recorded URI can name another bucket than the one read, e.g. the writer's
@@ -2338,14 +2383,16 @@ impl SnapshotManager {
         // bucket), so a log still ties the restore back to the writer's metadata entry.
         let recorded_as = (snapshot_uri != entry.snapshot).then_some(entry.snapshot.as_str());
 
-        let get_result = self
+        let object_size = self
             .object_store
-            .get(&object_path)
+            .head(&object_path)
             .await
             .map_err(|source| SnapshotDownloadError::Download {
                 path: path_display.clone(),
                 source,
-            })?;
+            })?
+            .size;
+        let chunks = self.snapshot_chunks(&object_path, object_size);
 
         tracing::debug!(
             dataset = %self.dataset_name,
@@ -2362,11 +2409,11 @@ impl SnapshotManager {
                 });
             }
             AccelerationLayout::File { path } => {
-                self.download_to_file(path, get_result, entry, &path_display)
+                self.download_to_file(path, chunks, entry, &path_display)
                     .await?
             }
             AccelerationLayout::Directories { dirs } => {
-                self.download_to_directories(dirs, get_result, entry, &path_display)
+                self.download_to_directories(dirs, chunks, entry, &path_display)
                     .await?
             }
         };
@@ -2499,7 +2546,7 @@ impl SnapshotManager {
     async fn download_to_file(
         &self,
         local_path: &PathBuf,
-        get_result: GetResult,
+        mut stream: SnapshotChunks<'_>,
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
@@ -2511,8 +2558,6 @@ impl SnapshotManager {
                 }
             })?;
         }
-
-        let mut stream = get_result.into_stream();
 
         // Write to a sibling temp file then atomically rename into the primary
         // path. This guarantees concurrent readers (e.g. an active accelerator
@@ -2674,7 +2719,7 @@ impl SnapshotManager {
     async fn download_to_directories(
         &self,
         dirs: &[(PathBuf, String)],
-        get_result: GetResult,
+        mut stream: SnapshotChunks<'_>,
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
@@ -2700,7 +2745,6 @@ impl SnapshotManager {
             })?;
         }
 
-        let mut stream = get_result.into_stream();
         let mut file = fs::File::create(&temp_archive_path)
             .await
             .map_err(|source| SnapshotDownloadError::WriteLocal {
@@ -3947,6 +3991,17 @@ mod tests {
             .await
             .expect("read downloaded snapshot");
         assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    /// A snapshot spanning several ranged GETs is reassembled byte-for-byte.
+    #[tokio::test]
+    async fn download_latest_snapshot_reassembles_a_multi_range_snapshot() {
+        // 2.5 ranges; the byte pattern varies so a reordered range changes the checksum.
+        let len = usize::try_from(SNAPSHOT_DOWNLOAD_CHUNK_BYTES * 5 / 2).expect("fits usize");
+        let contents: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i / 4096) % 251).expect("< 251"))
+            .collect();
+        download_and_verify_snapshot(&AccelerationEngine::Cayenne, contents.into()).await;
     }
 
     #[tokio::test]
@@ -6113,6 +6168,15 @@ mod tests {
 
     /// Generic test: Download snapshot succeeds with valid metadata (for any engine).
     async fn generic_download_snapshot_with_valid_metadata(engine: &AccelerationEngine) {
+        download_and_verify_snapshot(
+            engine,
+            Bytes::from_static(b"engine-agnostic-snapshot-bytes"),
+        )
+        .await;
+    }
+
+    /// Publishes `contents` as the current snapshot, downloads it, and checks the result.
+    async fn download_and_verify_snapshot(engine: &AccelerationEngine, contents: Bytes) {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
@@ -6122,7 +6186,6 @@ mod tests {
             .expect("valid time");
         let location = layout.build_location(&base, instant);
 
-        let contents = Bytes::from_static(b"engine-agnostic-snapshot-bytes");
         store
             .put(&location, contents.clone().into())
             .await
@@ -6179,7 +6242,10 @@ mod tests {
         let downloaded = fs::read(&local_path)
             .await
             .expect("read downloaded snapshot");
-        assert_eq!(downloaded.as_slice(), contents.as_ref());
+        assert!(
+            downloaded.as_slice() == contents.as_ref(),
+            "downloaded bytes differ"
+        );
     }
 
     /// Generic test: `SnapshotEngine` reports correct compaction support.
