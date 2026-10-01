@@ -328,7 +328,7 @@ And from each replica's own `/metrics`: every replica must publish the same
 traffic with its peers — plus zero lease-refresh errors and zero fail-closed
 requests.
 
-### Four findings from building the catalog
+### Five findings from building the catalog
 
 Each one changed a scenario, and each is reproducible from the artifacts named.
 
@@ -361,7 +361,21 @@ shrank, so the two together never exceed one budget and the coefficient moves on
 failures B never saw. A per-dataset limiter would have let B keep its own full
 budget beside A's.
 
-**4. The same dilution applies across replicas.** `cluster-asymmetric` fails
+**4. A connection per query exhausts the host, slowly and silently.** This one
+is about the harness, not the runtime, and it is the trap most likely to be
+repeated. The generator originally opened a TCP connection per query. Each
+leaves a TIME_WAIT behind for 2*MSL — 30s on macOS, against an ephemeral range
+of 16,384 ports — and a worker driving a throttled origin loops as fast as
+spiced can refuse it. Eleven scenarios into a catalog run, every worker was
+blocking on `connect`: scenarios that take two minutes took seventeen, the ones
+in the middle recorded a rate of **zero**, and an hour later it fixed itself.
+It reads exactly like a product regression. What gave it away was a per-query
+p99 latency of 1,035,731 ms against a 30s client timeout, and a verdict
+timeline whose degradation started and ended on wall-clock rather than on any
+property of the scenarios. `harness.http.SqlSession` holds one connection per
+worker; use it for anything saturating.
+
+**5. The same dilution applies across replicas.** `cluster-asymmetric` fails
 only r0's requests, so about half the cluster's traffic fails and the shared
 coefficient settles near 0.4 rather than at the floor. r1, which was served
 nothing but 200s, still falls from a p99 of 11 to 8 — the cross-replica signal
