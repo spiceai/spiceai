@@ -51,6 +51,7 @@ use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
+use vortex::expr::BoundExpression;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
@@ -222,7 +223,7 @@ impl FileOpener for VortexOpener {
             // cannot rule out a key the blocks hold, and a predicate that is not
             // dynamic gives it nothing to re-check while the file is read.
             let early_key_ranges = match (key_column.as_ref(), filter.as_ref(), &file.range) {
-                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                (Some(column), Some(predicate), None) if !contains_dynamic_filter(predicate) => {
                     match key_equality(predicate, column, &unified_file_schema) {
                         Some(key) => key_blocks::cached_key_blocks(
                             &object_store_url,
@@ -344,10 +345,12 @@ impl FileOpener for VortexOpener {
 
             // The schema of the stream returned from the vortex scan.
             // We use a reference schema for types that don't roundtrip (Dictionary, Utf8, etc.).
-            let scan_projection = scan_projection.bind(vxf.dtype()).map_err(|e| {
+            // The scan takes the projection bound to the file's type; a point read
+            // optimizes the unbound projection against that type before binding it.
+            let bound_scan_projection = scan_projection.bind(vxf.dtype()).map_err(|e| {
                 exec_datafusion_err!("Couldn't get the dtype for the underlying Vortex scan: {e}")
             })?;
-            let scan_dtype = scan_projection.dtype().clone();
+            let scan_dtype = bound_scan_projection.dtype().clone();
 
             // When projection pushdown is enabled, the scan outputs the projected columns.
             // When disabled, the scan outputs raw columns and the projection is applied after.
@@ -435,7 +438,7 @@ impl FileOpener for VortexOpener {
             // changes after the file opens, so it keeps the scan.
             let key_ranges = match (key_column.as_ref(), filter.as_ref(), &row_range) {
                 _ if early_key_ranges.is_some() => early_key_ranges,
-                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                (Some(column), Some(predicate), None) if !contains_dynamic_filter(predicate) => {
                     match key_equality(predicate, column, &this_file_schema) {
                         Some(key) => key_blocks::key_blocks(
                             &layout_reader,
@@ -505,7 +508,11 @@ impl FileOpener for VortexOpener {
                         Err(err) => Some(Err(err)),
                     }
                 })
-                .transpose()?
+                .transpose()?;
+            // The scan takes the filter bound to the file's type; a point read splits
+            // and optimizes the unbound filter before binding each conjunct.
+            let bound_filter = filter
+                .as_ref()
                 .map(|predicate| predicate.bind(vxf.dtype()))
                 .transpose()
                 .map_err(|e| exec_datafusion_err!("Failed to bind the Vortex filter to the file's type: {e}"))?;
@@ -538,6 +545,7 @@ impl FileOpener for VortexOpener {
                 )
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex point read: {e}"))?
             } else {
+                let filter = bound_filter;
                 // Drop a split whose zones cannot satisfy the filter before the scan is
                 // built. Vortex prunes these same zones inside the scan, but only after
                 // `ScanBuilder::build` has optimized the projection and the filter
@@ -625,7 +633,7 @@ impl FileOpener for VortexOpener {
 
                 scan_builder
                     .with_metrics_registry(metrics_registry)
-                    .with_projection(scan_projection)
+                    .with_projection(bound_scan_projection)
                     .with_some_filter(filter)
                     .with_ordered(has_output_ordering)
                     .map(move |chunk| {
@@ -740,17 +748,21 @@ fn point_read_stream(
     projection: &Expression,
     target: Field,
 ) -> VortexResult<BoxStream<'static, VortexResult<RecordBatch>>> {
-    let conjuncts: Arc<[Expression]> =
-        conjuncts(&filter.optimize_recursive(reader.dtype())?).into();
+    let dtype = reader.dtype();
+    let conjuncts: Arc<[BoundExpression]> = conjuncts(&filter.optimize_recursive(dtype)?)
+        .iter()
+        .map(|conjunct| conjunct.bind(dtype))
+        .collect::<VortexResult<Vec<_>>>()?
+        .into();
     // A projection of every field in file order is the root itself. The struct
     // reader rewrites a projection against its own expansion of the root before
-    // partitioning it by field, and for that `pack` the rewrite nests the
-    // expansion once per field; handed `root()`, it has nothing to rewrite.
-    let projection = if is_identity_projection(projection, reader.dtype()) {
+    // partitioning it by field; handed `root()`, it has nothing to rewrite.
+    let projection = if is_identity_projection(projection, dtype) {
         root()
     } else {
-        projection.optimize_recursive(reader.dtype())?
-    };
+        projection.optimize_recursive(dtype)?
+    }
+    .bind(dtype)?;
     let reads = ranges.into_iter().map(move |range| {
         read_range(
             Arc::clone(&reader),
@@ -781,8 +793,8 @@ async fn read_range(
     reader: Arc<dyn LayoutReader>,
     session: VortexSession,
     range: Range<u64>,
-    conjuncts: Arc<[Expression]>,
-    projection: Expression,
+    conjuncts: Arc<[BoundExpression]>,
+    projection: BoundExpression,
     target: Field,
 ) -> VortexResult<Option<RecordBatch>> {
     let rows = usize::try_from(range.end - range.start)
@@ -1422,7 +1434,7 @@ mod tests {
         use datafusion::arrow::array::AsArray;
         use datafusion::arrow::datatypes::Int64Type;
 
-        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let table_schema = TableSchema::from(Arc::clone(schema));
         let filter = logical2physical(predicate, table_schema.table_schema());
         let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
         opener.projection = ProjectionExprs::from_indices(&[0, 1], schema);
@@ -1469,7 +1481,7 @@ mod tests {
     ) -> anyhow::Result<Vec<String>> {
         use datafusion::arrow::util::display::ArrayFormatter;
 
-        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let table_schema = TableSchema::from(Arc::clone(schema));
         let filter = logical2physical(predicate, table_schema.table_schema());
         let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
         opener.projection = ProjectionExprs::from_indices(&[1], schema);
@@ -1622,7 +1634,6 @@ mod tests {
     #[tokio::test]
     async fn key_lookups_leave_selections_and_wide_keys_to_the_scan() -> anyhow::Result<()> {
         use vortex::buffer::Buffer;
-        use vortex::scan::selection::Selection;
 
         const BLOCK: i64 = 8_192;
 
@@ -1656,7 +1667,7 @@ mod tests {
         let keep: Vec<u64> = (0..9 * 8_192_u64).filter(|row| *row != 8_197).collect();
         selected.extensions.insert(
             VortexAccessPlan::default()
-                .with_selection(Selection::IncludeByIndex(Buffer::from_iter(keep))),
+                .with_selection(crate::include_by_index(&Buffer::from_iter(keep))),
         );
         let scanned = read_keyed(&object_store, &schema, &selected, &predicate, None).await?;
         take_scans_built();
