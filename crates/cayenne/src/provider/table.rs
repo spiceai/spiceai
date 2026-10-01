@@ -49,7 +49,7 @@ use super::maintenance_metrics::{
     self, CompactionKind, CompactionOutcome, CompactionTrigger, MaintenanceOp, MaintenanceOutcome,
 };
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
-use super::mutation_writer::AppendMutationWriter;
+use super::mutation_writer::MutationWriter;
 use super::on_conflict::{
     BatchValidationResult, CheckpointCorpusKeys, DeletionSinkSource, ExtractedPrimaryKeys,
     InlineAwareDeletionSink, InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
@@ -615,7 +615,7 @@ impl CayenneCdcWrite {
             if retention_requested {
                 // Match the non-pipelined path: retention's delete outcome is
                 // not yet known, so clear conservatively. See the comment in
-                // `AppendMutationWriter::write_prepared_stream`.
+                // `MutationWriter::write_prepared_stream`.
                 self.table.clear_cached_pk_keyset();
             } else {
                 let record_seq = self.table.sequence_high_water().await;
@@ -2432,7 +2432,7 @@ pub struct CayenneTableProvider {
     /// is empty, so the same WALs are treated as crash-recovery input.
     ///
     /// The value carries the primary keys that append validated while its rows
-    /// were still private. `AppendMutationWriter`'s pipelined staged append is
+    /// were still private. `MutationWriter`'s pipelined staged append is
     /// the one path that records BEFORE publishing, and it does so on BOTH of
     /// its arms: `stage_on_conflict`, and the `!stage_on_conflict` arm that
     /// takes purely-new keys into a table holding no tombstones (#13642). Those
@@ -5549,7 +5549,7 @@ impl CayenneTableProvider {
             .await
     }
 
-    async fn write_ingestion_append_stream(
+    pub(super) async fn write_ingestion_append_stream(
         &self,
         data: SendableRecordBatchStream,
         source_commit_ts_ms: Option<i64>,
@@ -5592,7 +5592,7 @@ impl CayenneTableProvider {
         {
             self.checkpoint_mem_tier().await?;
         }
-        let result = AppendMutationWriter::new(self, &self.context, task_context)
+        let result = MutationWriter::new(self, &self.context, task_context)
             .with_recovery(recovery)
             .write_cdc_pipelined(normalized, write_guard)
             .await;
@@ -5614,53 +5614,22 @@ impl CayenneTableProvider {
         result
     }
 
-    /// Prepares an atomic complete-set replacement through the mutation writer.
-    /// Unsupported grouping shapes are rejected before changing storage.
+    /// Prepares and publishes an atomic complete-set replacement.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incompatible schemas, unsupported targets and constraint violations.
+    /// Storage failures require reconciliation before a conflicting successor.
     pub async fn write_replace_set(
         &self,
         replacement: data_components::cdc::mutation::ReplaceSet,
         recovery: data_components::cdc::mutation::Recovery,
-        task_context: &Arc<datafusion_execution::TaskContext>,
+        session: &datafusion::execution::context::SessionContext,
     ) -> datafusion_common::Result<CayenneCdcWrite> {
-        // Provider-level schema metadata does not change the row layout.
-        // Field equality retains names, types, nullability and field metadata.
-        if replacement.key().schema().fields() != self.table_schema().fields()
-            && replacement.key().schema().fields() != self.read_schema().fields()
-        {
-            return Err(DataFusionError::Plan(
-                "Replacement schema does not match the target table".into(),
-            ));
-        }
-        let pk_columns = self.pk_column_names();
-        let key = replacement.key().values();
-        let exact_primary_key = key.len() == pk_columns.len()
-            && pk_columns.iter().all(|name| {
-                key.iter()
-                    .any(|(column, value)| column == name && !value.is_null())
-            });
-        if !self.supports_rebuildable_ingestion()
-            || !exact_primary_key
-            || replacement
-                .batches()
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>()
-                != 1
-        {
-            return Err(DataFusionError::NotImplemented(
-                "Atomic replacement requires a complete primary-key singleton on this target"
-                    .into(),
-            ));
-        }
-        let schema = replacement.schema();
-        let (_, batches) = replacement.into_parts();
-        let input = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(batches.into_iter().map(Ok)),
-        ));
-        self.write_ingestion_append_stream(input, None, recovery, task_context)
+        MutationWriter::new(self, &self.context, &session.task_ctx())
+            .with_recovery(recovery)
+            .write_replace_set(replacement, session)
             .await
-            .map_err(Into::into)
     }
 
     /// Returns whether retention filters are configured for this table.
@@ -31607,7 +31576,7 @@ impl CayenneTableProvider {
         // Seed the persisted live `num_rows` from the mem-tier rows that just
         // became durable. Unlike the inline/staged path — which persists
         // `Delta(live_rows_delta)` at write time (`try_inline_or_restream` /
-        // `AppendMutationWriter`) — the RAM-append path (`append_to_shard`) only
+        // `MutationWriter`) — the RAM-append path (`append_to_shard`) only
         // nets these rows into the in-memory `inlined_row_count`; it never feeds
         // the persisted aggregate. So the checkpoint is where they enter the
         // maintained count, or a `cdc_durability: memory` table reports
@@ -46428,7 +46397,7 @@ mod tests {
     //
     // All drive the REAL end-to-end sharded apply path: a table built with
     // `cdc_mem_tier_shards: N` + an installed slot advancer engages the
-    // `write_cdc_in_memory_sharded` branch in `AppendMutationWriter`
+    // `write_cdc_in_memory_sharded` branch in `MutationWriter`
     // (PK-fan-out validate→append across N shards), while N=1 takes the
     // byte-identical serial path. The headline property is row-for-row
     // equivalence to the serial path at N ∈ {1, 4, 8}.
@@ -57930,7 +57899,7 @@ mod tests {
 
     /// The same claim-before-publish contract on the DML path.
     ///
-    /// `INSERT INTO` reaches `AppendMutationWriter::write_prepared_stream`,
+    /// `INSERT INTO` reaches `MutationWriter::write_prepared_stream`,
     /// which is a separate commit from the staged CDC one in
     /// `a_staged_publish_claims_its_delta_before_the_rows_become_visible` and
     /// stakes its own claim. That path holds the table write lock for the whole

@@ -46,7 +46,7 @@ limitations under the License.
 //!   deletion vectors and to gate decimal→float predicate pushdown.
 //! - [`sink`]: `CayenneDataSink` — `DataFusion` `DataSink` adapter that the
 //!   regular (non-CDC) write path uses for both append and overwrite modes.
-//! - [`mutation_writer`]: `AppendMutationWriter` — append-side write logic,
+//! - [`mutation_writer`]: `MutationWriter` — row and complete-set write logic,
 //!   inline-memtable admission, and `write_cdc_pipelined` for the Stage A /
 //!   Stage B CDC path consumed by `runtime/src/accelerated_table/refresh_task`.
 //! - [`staging_wal`]: Staging WAL for crash-safe staged appends. Three-phase
@@ -105,6 +105,7 @@ pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
 pub(crate) mod protected_merge_claims;
 pub(crate) mod query_admission;
+mod replace_set;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;

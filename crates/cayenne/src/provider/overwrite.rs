@@ -308,7 +308,7 @@ impl PreparedOverwrite {
             .await?;
 
         // Arm retention the moment the flip commits, the same way an append does (see
-        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
+        // `MutationWriter::write_prepared_stream`). An overwrite reloads every
         // source row, so a `retention_sql` predicate has to run again over the new
         // snapshot — otherwise the rows it deletes come straight back on each full
         // refresh and the acceleration keeps data the user asked to be deleted.

@@ -1931,7 +1931,7 @@ impl RefreshTask {
                 .map(RecordBatch::num_rows)
                 .sum::<usize>();
             let write = cayenne
-                .write_replace_set(replacement, recovery, &context.write_ctx.task_ctx())
+                .write_replace_set(replacement, recovery, &context.write_ctx)
                 .await?;
             let in_memory = write.in_memory_epoch().is_some();
             write.finish().await?;

@@ -33,7 +33,7 @@ use futures::StreamExt;
 use runtime_datafusion::extension::request_context::resolve_request_context;
 
 use super::context::CayenneContext;
-use super::mutation_writer::AppendMutationWriter;
+use super::mutation_writer::MutationWriter;
 use super::table::CayenneTableProvider;
 use super::transaction::CayenneTransaction;
 
@@ -489,7 +489,7 @@ impl CayenneDataSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> super::Result<u64> {
-        AppendMutationWriter::new(&self.table, &self.context, context)
+        MutationWriter::new(&self.table, &self.context, context)
             .write(data)
             .await
     }

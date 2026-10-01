@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Append-side mutation writer for [`CayenneTableProvider`].
+//! Mutation writer for [`CayenneTableProvider`].
 //!
-//! `AppendMutationWriter` owns the logic that turns a `SendableRecordBatchStream`
-//! into either an inline-memtable update (small writes, no blocking config) or a
-//! staged Vortex write. Two entry points:
+//! `MutationWriter` prepares row mutations and complete-set replacements and
+//! selects their inline, memory-tier or staged snapshot publication.
 //!
-//! - [`AppendMutationWriter::write`] — the synchronous append path used by
+//! - [`MutationWriter::write_replace_set`] preserves the incoming multiset and
+//!   rows outside its group. A complete primary-key singleton uses atomic upsert;
+//!   other shapes stream a complete snapshot through the overwrite lifecycle.
+//! - [`MutationWriter::write`] — the synchronous append path used by
 //!   `DataFusion`'s `INSERT INTO` and by CDC fallback. Runs prepare →
 //!   try-inline-or-stage → optional on-conflict deletion vectors → optional
 //!   retention/sort → schedule post-write maintenance (debounced refresh +
 //!   stats + compaction).
-//! - [`AppendMutationWriter::write_cdc_pipelined`] — the CDC fast path. Stage A
+//! - [`MutationWriter::write_cdc_pipelined`] — the CDC fast path. Stage A
 //!   writes Vortex files into the staging dir and returns a [`super::table::CayenneCdcWrite`]
 //!   that owns the staging-WAL receipt and the still-held per-table write
 //!   guard. The runtime spawns Stage B on a background task so the next CDC
@@ -292,14 +294,14 @@ fn restore_post_validation(
     *post_validation.lock() = Some(state);
 }
 
-pub(super) struct AppendMutationWriter<'a> {
+pub(super) struct MutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
     task_context: &'a Arc<TaskContext>,
     recovery: data_components::cdc::mutation::Recovery,
 }
 
-impl<'a> AppendMutationWriter<'a> {
+impl<'a> MutationWriter<'a> {
     #[must_use]
     pub(super) fn new(
         table: &'a CayenneTableProvider,
@@ -320,6 +322,69 @@ impl<'a> AppendMutationWriter<'a> {
     ) -> Self {
         self.recovery = recovery;
         self
+    }
+
+    pub(super) async fn write_replace_set(
+        &self,
+        replacement: data_components::cdc::mutation::ReplaceSet,
+        session: &datafusion::execution::context::SessionContext,
+    ) -> datafusion_common::Result<CayenneCdcWrite> {
+        use data_components::cdc::mutation::Recovery;
+        use datafusion_common::DataFusionError;
+
+        // Schema-level provider tags are not part of the row layout.
+        if replacement.schema().fields() != self.table.table_schema().fields()
+            && replacement.schema().fields() != self.table.read_schema().fields()
+        {
+            return Err(DataFusionError::Plan(
+                "Replacement schema does not match the target table".into(),
+            ));
+        }
+        if self.recovery == Recovery::Replayable {
+            return Err(DataFusionError::NotImplemented(
+                "Replayable replacement requires a source acknowledgement contract".into(),
+            ));
+        }
+        if self.table.metadata().partition_column.is_some()
+            || self.table.mem_tier_shard_count() != 1
+        {
+            return Err(DataFusionError::NotImplemented(
+                "Atomic complete-set replacement requires a nonpartitioned, single-shard target"
+                    .into(),
+            ));
+        }
+        if self.recovery == Recovery::Durable && self.table.is_memory_resident_mode() {
+            return Err(DataFusionError::NotImplemented(
+                "Durable complete-set replacement requires file-backed storage".into(),
+            ));
+        }
+        let pk_columns = self.table.pk_column_names();
+        let key = replacement.key().values();
+        let exact_primary_key = key.len() == pk_columns.len()
+            && pk_columns.iter().all(|name| {
+                key.iter()
+                    .any(|(column, value)| column == name && !value.is_null())
+            });
+        let singleton = replacement
+            .batches()
+            .iter()
+            .try_fold(0_usize, |rows, batch| rows.checked_add(batch.num_rows()))
+            == Some(1);
+        if self.table.supports_rebuildable_ingestion() && exact_primary_key && singleton {
+            let schema = replacement.schema();
+            let (_, batches) = replacement.into_parts();
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            ));
+            return self
+                .table
+                .write_ingestion_append_stream(input, None, self.recovery, self.task_context)
+                .await
+                .map_err(Into::into);
+        }
+        super::replace_set::write_snapshot(self.table, replacement, session, self.task_context)
+            .await
     }
 
     pub(super) async fn write_cdc_pipelined(

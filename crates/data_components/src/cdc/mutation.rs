@@ -149,6 +149,21 @@ impl SetKey {
         &self.values
     }
 
+    /// Null-aware membership in this group, including view/storage string layouts.
+    pub fn matching_rows(&self, batch: &RecordBatch) -> Result<arrow::array::BooleanArray> {
+        use arrow::array::BooleanArray;
+        use arrow::buffer::BooleanBuffer;
+        use arrow::compute::{and, kernels::cmp::not_distinct};
+
+        let mut mask = BooleanArray::new(BooleanBuffer::new_set(batch.num_rows()), None);
+        for (name, value) in &self.values {
+            let column = batch.column(batch.schema().index_of(name)?);
+            let expected = value.cast_to(column.data_type())?.to_scalar()?;
+            mask = and(&mask, &not_distinct(&column.as_ref(), &expected)?)?;
+        }
+        Ok(mask)
+    }
+
     #[must_use]
     pub fn filters(&self) -> Vec<Expr> {
         self.values
