@@ -427,6 +427,16 @@ impl FileSource for VortexSource {
             None => Some(conjunction(filters.iter().map(Arc::clone))),
         };
 
+        // `file_prune_verdicts` is keyed by file path alone, with nothing in the
+        // key that ties a cached verdict to the predicate it was decided for. The
+        // derived `Clone` above still points at `self`'s map, but `self` and
+        // `source` are about to answer `should_prune` for two different
+        // predicates — so a clone that changes `full_predicate` must start from
+        // its own empty map rather than risk serving a sibling's verdict for a
+        // predicate it never agreed with. A scan's own splits still share one
+        // verdict: they all read through this same clone's map, untouched here.
+        source.file_prune_verdicts = Arc::new(DashMap::default());
+
         // A filter is row-evaluated inside the Vortex scan only if the convertor can
         // translate it. Hash-join *dynamic* filters appear here as a `lit(true)`
         // placeholder and are accepted; the per-conjunct decision of what actually
@@ -523,6 +533,26 @@ fn resolve_scan_concurrency(
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::array::RecordBatch;
+    use datafusion::common::record_batch;
+    use datafusion::logical_expr::col;
+    use datafusion::logical_expr::lit;
+    use datafusion::physical_expr::planner::logical2physical;
+    use datafusion::scalar::ScalarValue;
+    use datafusion_common::ColumnStatistics;
+    use datafusion_common::Statistics;
+    use datafusion_common::stats::Precision;
+    use datafusion_datasource::PartitionedFile;
+    use futures::TryStreamExt;
+    use object_store::memory::InMemory;
+    use vortex::VortexSessionDefault;
+    use vortex::array::ArrayRef;
+    use vortex::arrow::FromArrowArray;
+    use vortex::file::WriteOptionsSessionExt;
+    use vortex::io::VortexWrite;
+    use vortex::io::object_store::ObjectStoreWrite;
+    use vortex::metrics::DefaultMetricsRegistry;
+
     use super::*;
 
     /// A ceiling high enough not to bind, for the cases under test.
@@ -593,5 +623,167 @@ mod tests {
             resolve_scan_concurrency(ScanConcurrency::Auto, 64, 1, false, 0),
             1
         );
+    }
+
+    async fn write_arrow_to_vortex(
+        session: &VortexSession,
+        object_store: Arc<dyn ObjectStore>,
+        path: &str,
+        rb: RecordBatch,
+    ) -> anyhow::Result<u64> {
+        let array = ArrayRef::from_arrow(rb, false)?;
+        let path = Path::parse(path)?;
+
+        let mut write = ObjectStoreWrite::new(object_store, &path).await?;
+        let summary = session
+            .write_options()
+            .write(&mut write, array.to_array_stream())
+            .await?;
+        write.shutdown().await?;
+
+        Ok(summary.size())
+    }
+
+    /// Builds a file-level `min`/`max` statistics pair for a single-column,
+    /// all-non-null `Int32` file.
+    fn int32_column_stats(num_rows: usize, min: i32, max: i32) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(num_rows),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(min))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(max))),
+                ..ColumnStatistics::default()
+            }],
+        }
+    }
+
+    /// Builds a `VortexOpener` for `source` directly, bypassing
+    /// `create_file_opener`/`FileScanConfig`: all this needs is the fields
+    /// `try_pushdown_filters` can make diverge (`full_predicate`) and the ones
+    /// it shares via the derived `Clone` (`file_prune_verdicts`).
+    fn opener_for(source: &VortexSource, object_store: Arc<dyn ObjectStore>) -> VortexOpener {
+        VortexOpener {
+            partition: 0,
+            session: source.session.clone(),
+            vortex_reader_factory: Arc::new(DefaultVortexReaderFactory::new(object_store)),
+            projection: source.projection.clone(),
+            filter: None,
+            file_pruning_predicate: source.full_predicate.as_ref().map(Arc::clone),
+            expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
+            table_schema: source.table_schema.clone(),
+            batch_size: 100,
+            limit: None,
+            metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
+            layout_readers: Default::default(),
+            natural_split_ranges: Default::default(),
+            file_prune_verdicts: Arc::clone(&source.file_prune_verdicts),
+            has_output_ordering: false,
+            expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
+            file_metadata_cache: None,
+            segment_cache: None,
+            object_store_url: Arc::from("memory:///"),
+            projection_pushdown: false,
+            scan_concurrency: None,
+            runtime_access_plan_provider: None,
+            key_column: None,
+        }
+    }
+
+    /// `try_pushdown_filters` clones `self` and gives the clone its own
+    /// `full_predicate`. `file_prune_verdicts` is keyed by file path alone, with
+    /// nothing in the key that ties a cached verdict to the predicate it was
+    /// decided for — so a clone that changes `full_predicate` must also start
+    /// from its own empty verdict map, or it risks answering from a sibling
+    /// clone's verdict for a predicate it never agreed with.
+    ///
+    /// Two descendants of the same base source diverge on `full_predicate`:
+    /// `a > 1000` (correctly prunable for a file whose statistics are `1..=3`)
+    /// and `a < 1000` (never prunable for that same file). The first
+    /// descendant's cached "prune" verdict must not leak into the second, which
+    /// would otherwise drop all three rows a correct read returns.
+    #[tokio::test]
+    async fn pushdown_clones_do_not_share_prune_verdicts() -> anyhow::Result<()> {
+        let session = VortexSession::default();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "shared_source.vortex";
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("test record batch should build");
+        let data_size =
+            write_arrow_to_vortex(&session, object_store.clone(), file_path, batch.clone()).await?;
+
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let base = VortexSource::new(table_schema.clone(), session);
+        let config_options = ConfigOptions::default();
+
+        let gt_filter = logical2physical(&col("a").gt(lit(1000)), table_schema.table_schema());
+        let source_prunes = base
+            .try_pushdown_filters(vec![gt_filter], &config_options)?
+            .updated_node
+            .expect("pushdown should produce an updated source")
+            .downcast_ref::<VortexSource>()
+            .cloned()
+            .expect("updated source should downcast to VortexSource");
+
+        let lt_filter = logical2physical(&col("a").lt(lit(1000)), table_schema.table_schema());
+        let source_keeps = base
+            .try_pushdown_filters(vec![lt_filter], &config_options)?
+            .updated_node
+            .expect("pushdown should produce an updated source")
+            .downcast_ref::<VortexSource>()
+            .cloned()
+            .expect("updated source should downcast to VortexSource");
+
+        assert!(
+            !Arc::ptr_eq(
+                &source_prunes.file_prune_verdicts,
+                &source_keeps.file_prune_verdicts
+            ),
+            "a clone that changes full_predicate must not keep sharing its \
+             sibling's verdict map"
+        );
+
+        let opener_prunes = opener_for(&source_prunes, object_store.clone());
+        let opener_keeps = opener_for(&source_keeps, object_store.clone());
+
+        let stats = Arc::new(int32_column_stats(3, 1, 3));
+
+        let file_for_prunes = PartitionedFile::new(file_path.to_string(), data_size)
+            .with_statistics(Arc::clone(&stats));
+        let rows_pruned: usize = opener_prunes
+            .open(file_for_prunes)
+            .expect("opener should open the file")
+            .await
+            .expect("opening should produce a stream")
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows_pruned, 0,
+            "`a > 1000` is correctly pruned for a file whose statistics are 1..=3"
+        );
+
+        let file_for_keeps =
+            PartitionedFile::new(file_path.to_string(), data_size).with_statistics(stats);
+        let rows_kept: usize = opener_keeps
+            .open(file_for_keeps)
+            .expect("opener should open the file")
+            .await
+            .expect("opening should produce a stream")
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows_kept, 3,
+            "`a < 1000` can never be pruned for this file; a different descendant's cached \
+             verdict must not make this read return zero rows"
+        );
+
+        Ok(())
     }
 }
