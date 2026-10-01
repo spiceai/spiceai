@@ -5622,8 +5622,10 @@ impl CayenneTableProvider {
         recovery: data_components::cdc::mutation::Recovery,
         task_context: &Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<CayenneCdcWrite> {
-        if replacement.key().schema().as_ref() != self.table_schema().as_ref()
-            && replacement.key().schema().as_ref() != self.read_schema().as_ref()
+        // Provider-level schema metadata does not change the row layout.
+        // Field equality retains names, types, nullability and field metadata.
+        if replacement.key().schema().fields() != self.table_schema().fields()
+            && replacement.key().schema().fields() != self.read_schema().fields()
         {
             return Err(DataFusionError::Plan(
                 "Replacement schema does not match the target table".into(),
