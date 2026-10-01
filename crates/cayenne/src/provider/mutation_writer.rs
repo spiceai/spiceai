@@ -296,7 +296,7 @@ pub(super) struct AppendMutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
     task_context: &'a Arc<TaskContext>,
-    cache_loss_allowed: bool,
+    recovery: data_components::cdc::mutation::Recovery,
 }
 
 impl<'a> AppendMutationWriter<'a> {
@@ -310,12 +310,15 @@ impl<'a> AppendMutationWriter<'a> {
             table,
             context,
             task_context,
-            cache_loss_allowed: false,
+            recovery: data_components::cdc::mutation::Recovery::Durable,
         }
     }
 
-    pub(super) fn with_cache_loss_allowed(mut self) -> Self {
-        self.cache_loss_allowed = true;
+    pub(super) fn with_recovery(
+        mut self,
+        recovery: data_components::cdc::mutation::Recovery,
+    ) -> Self {
+        self.recovery = recovery;
         self
     }
 
@@ -325,6 +328,11 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<CayenneCdcWrite> {
         self.table.ensure_no_incomplete_write().await?;
+        let rebuildable = self.recovery == data_components::cdc::mutation::Recovery::Rebuildable
+            && self.table.supports_rebuildable_ingestion();
+        if rebuildable {
+            self.table.enable_rebuildable_ingestion();
+        }
         // Empty-table probe: on the very first write of a freshly-created
         // table, install warm empty PK caches so the initial load maintains
         // them and the first upsert never pays the full cold index scan.
@@ -356,6 +364,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
+            && self.recovery == data_components::cdc::mutation::Recovery::Replayable
             && self.table.is_cdc_mem_tier_armed()
             && self.table.metadata().partition_column.is_none()
         {
@@ -502,11 +511,12 @@ impl<'a> AppendMutationWriter<'a> {
         // source (`has_slot_advancer`). The two differ in how the runtime acks the
         // source slot: `mode: memory` never checkpoints, so the slot is committed
         // immediately (nothing to defer behind); `cdc_durability: memory` defers the
-        // ack behind the covering durable checkpoint. Cache writes explicitly
-        // permit loss before checkpoint and carry no source acknowledgement.
+        // ack behind the covering durable checkpoint. Rebuildable ingestion
+        // permits loss before checkpoint and carries no source acknowledgement.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
-            || self.table.is_cdc_mem_tier_armed()
-            || (self.cache_loss_allowed && self.table.supports_cache_mem_tier())
+            || (self.recovery == data_components::cdc::mutation::Recovery::Replayable
+                && self.table.is_cdc_mem_tier_armed())
+            || rebuildable
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)

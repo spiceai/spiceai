@@ -1007,6 +1007,26 @@ impl Builder {
                 self.io_runtime.clone(),
             )
         });
+        #[cfg(not(windows))]
+        if let Some(writer) = batch_write_tx.as_ref()
+            && write::append::cayenne_append_target(self.accelerator.as_ref()).is_some()
+        {
+            let task = refresh_task::RefreshTask::builder(
+                Arc::clone(&self.runtime_status),
+                self.dataset_name.clone(),
+                Arc::clone(&self.federated),
+                Some(self.federated_source.clone()),
+                Arc::clone(&self.accelerator),
+                self.io_runtime.clone(),
+                Arc::clone(&self.accelerator_write_mutex),
+            )
+            .with_last_updated_at(Arc::clone(&last_updated_at))
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_engine_type_rewrites(self.engine_type_rewrites)
+            .with_cdc_param_overrides(self.cdc_param_overrides.clone())
+            .build();
+            writer.start_ingestion(task, Arc::clone(&refresh_params));
+        }
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -1318,28 +1338,34 @@ impl Builder {
         let user_facing_constraints = self.user_facing_schema.as_ref().and_then(|schema| {
             let storage_schema = self.accelerator.schema();
             self.accelerator.constraints().map(|constraints| {
-                Constraints::new_unverified(constraints.iter().filter_map(|constraint| {
-                    let (Constraint::PrimaryKey(indices) | Constraint::Unique(indices)) = constraint;
-                    let mut projected = Vec::with_capacity(indices.len());
-                    for &index in indices {
-                        let field = storage_schema.fields().get(index)?;
-                        // Every caching scan is restricted to one namespace, so
-                        // namespace-scoped uniqueness holds on its visible key.
-                        if refresh_mode == RefreshMode::Caching
-                            && field.name() == caching::CACHE_NAMESPACE_COLUMN
-                        {
-                            continue;
-                        }
-                        projected.push(schema.index_of(field.name()).ok()?);
-                    }
-                    if projected.is_empty() {
-                        return None;
-                    }
-                    Some(match constraint {
-                        Constraint::PrimaryKey(_) => Constraint::PrimaryKey(projected),
-                        Constraint::Unique(_) => Constraint::Unique(projected),
-                    })
-                }).collect())
+                Constraints::new_unverified(
+                    constraints
+                        .iter()
+                        .filter_map(|constraint| {
+                            let (Constraint::PrimaryKey(indices) | Constraint::Unique(indices)) =
+                                constraint;
+                            let mut projected = Vec::with_capacity(indices.len());
+                            for &index in indices {
+                                let field = storage_schema.fields().get(index)?;
+                                // Every caching scan is restricted to one namespace, so
+                                // namespace-scoped uniqueness holds on its visible key.
+                                if refresh_mode == RefreshMode::Caching
+                                    && field.name() == caching::CACHE_NAMESPACE_COLUMN
+                                {
+                                    continue;
+                                }
+                                projected.push(schema.index_of(field.name()).ok()?);
+                            }
+                            if projected.is_empty() {
+                                return None;
+                            }
+                            Some(match constraint {
+                                Constraint::PrimaryKey(_) => Constraint::PrimaryKey(projected),
+                                Constraint::Unique(_) => Constraint::Unique(projected),
+                            })
+                        })
+                        .collect(),
+                )
             })
         });
 

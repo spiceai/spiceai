@@ -2603,7 +2603,7 @@ impl CayenneAccelerator {
         let acceleration = source.acceleration();
         let mut primary_keys = primary_keys;
         let mut on_conflict = on_conflict;
-        let cache_mem_tier = source.is_file_accelerated()
+        let namespace_scoped_key = source.is_file_accelerated()
             && acceleration.is_some_and(|a| {
                 a.refresh_mode == Some(RefreshMode::Caching) && a.partition_by.is_empty()
             })
@@ -2613,10 +2613,13 @@ impl CayenneAccelerator {
                 on_conflict,
                 Some(datafusion_table_providers::util::on_conflict::OnConflict::Upsert(_))
             );
-        if cache_mem_tier {
+        if namespace_scoped_key {
             // Physical uniqueness must not make one principal's upsert replace
             // another principal's cached response.
-            if !primary_keys.iter().any(|key| key == "__spice_cache_namespace") {
+            if !primary_keys
+                .iter()
+                .any(|key| key == "__spice_cache_namespace")
+            {
                 primary_keys.push("__spice_cache_namespace".to_string());
             }
             primary_keys.sort();
@@ -2672,8 +2675,7 @@ impl CayenneAccelerator {
         )
         .await?;
 
-        vortex_config.cache_mem_tier = cache_mem_tier;
-        if cache_mem_tier {
+        if namespace_scoped_key {
             // A complete cache entry must publish through one shard's atomic swap.
             vortex_config.cdc_mem_tier_shards = 1;
             if vortex_config.deletion_mode == cayenne::metadata::DeletionMode::Auto {

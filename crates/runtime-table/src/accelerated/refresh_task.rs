@@ -107,6 +107,7 @@ use util::{RetryError, retry};
 
 pub mod changes;
 mod deletion;
+pub(crate) mod ingestion;
 
 // Reuse the single shared schema-evolution instrument rather than registering a
 // same-named counter under a second meter.

@@ -23,6 +23,7 @@ use std::{
 use parking_lot::Mutex;
 
 pub mod config;
+pub mod mutation;
 pub use config::{
     DEFAULT_READY_LAG, InitialSnapshotMode, InvalidCheckpointBehavior, heartbeat_interval,
 };

@@ -15,6 +15,7 @@ limitations under the License.
 */
 use super::DatasetMetricLabels;
 use super::RefreshTask;
+use super::ingestion::{self, IngestInput, IngestItem, Mutation, ReaderTask};
 use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::RefreshCompletion;
@@ -1132,34 +1133,7 @@ impl RefreshTask {
         // produces, which at a large scale factor can be a substantial and
         // otherwise unmeasured share of the process. `cdc_prefetch_buffer_bytes`
         // estimates it.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<
-            Result<cdc::ChangeEnvelope, cdc::StreamError>,
-        >(cdc_cfg.prefetch_buffer);
-        // Weak handle so the apply loop can read the channel's live occupancy
-        // (`max_capacity - capacity`) for the backpressure gauge without keeping a
-        // strong `Sender` alive — an extra strong sender would stop `rx.recv()`
-        // ever returning `None`, hanging end-of-stream. `upgrade()` only succeeds
-        // while the reader's real sender lives, so it can never resurrect a closed
-        // channel.
-        let tx_probe = tx.downgrade();
-        // Estimated size of what is queued in the channel above. The capacity
-        // bound counts envelopes, so this is not derivable from occupancy: a
-        // mid-range envelope count can hold anything from kilobytes to gigabytes
-        // depending on how wide the source's batches are. The reader adds an
-        // envelope's encoded size as it hands it over and the apply loop
-        // subtracts it on receipt, so the value tracks what is queued ahead of
-        // apply. `encoded_len` is a decode-free estimate, not measured resident
-        // bytes — see `CDC_PREFETCH_BUFFER_BYTES` for what it does and does not
-        // claim.
-        let prefetch_bytes = Arc::new(AtomicU64::new(0));
-        let reader_prefetch_bytes = Arc::clone(&prefetch_bytes);
-        // Zeroes the gauge once this stream is gone, however it goes (see
-        // `PrefetchBytesGaugeReset`). Held for the whole function so the reset
-        // also covers the finalize/commit drain below, not just the apply loop.
-        let _prefetch_gauge_reset = PrefetchBytesGaugeReset {
-            labels: metric_labels.clone(),
-        };
-
+        let (tx, input) = ingestion::channel(cdc_cfg.prefetch_buffer);
         let reader_dataset = dataset_name.clone();
         let reader_metric_labels = metric_labels.clone();
         let reader_handle = tokio::spawn(async move {
@@ -1184,24 +1158,8 @@ impl RefreshTask {
                     }
                     item = stream.next() => {
                         let Some(item) = item else { return; };
-                        // Charge the envelope before handing it over: once `send`
-                        // returns the apply loop may already have taken it and
-                        // subtracted, and crediting afterwards could then drive
-                        // the counter negative. `encoded_len` does not force a
-                        // deferred envelope to build.
-                        let queued_bytes = match &item {
-                            Ok(envelope) => envelope.encoded_len() as u64,
-                            Err(_) => 0,
-                        };
-                        reader_prefetch_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
-                        // Time blocked on send: non-zero => the prefetch channel is
-                        // full and the apply loop can't drain fast enough (apply-bound).
                         let send_start = Instant::now();
-                        let send_res = tx.send(item).await;
-                        if send_res.is_err() {
-                            // Nobody will receive it, so nobody will subtract it.
-                            discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
-                        }
+                        let send_res = tx.send_source(item).await;
                         metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
                         if send_res.is_err() {
                             tracing::debug!(
@@ -1213,6 +1171,43 @@ impl RefreshTask {
                 }
             }
         });
+        self.start_ingestion(
+            cdc_cfg,
+            refresh,
+            input,
+            ReaderTask::new(Some(reader_handle)),
+            caching,
+            refresh_completion,
+            initial_load_completed,
+        )
+        .await
+    }
+
+    /// Runs the common mutation driver. Source readers and finite producers
+    /// submit through the same admission channel and ordered publication loop.
+    pub(crate) async fn start_ingestion(
+        &self,
+        cdc_cfg: CdcConfig,
+        refresh: Arc<RwLock<Refresh>>,
+        input: IngestInput,
+        reader_handle: ReaderTask,
+        caching: Option<Weak<Caching>>,
+        refresh_completion: Option<RefreshCompletion>,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> crate::accelerated::Result<()> {
+        let IngestInput {
+            receiver: mut rx,
+            probe: tx_probe,
+            queued_bytes: prefetch_bytes,
+            write_context,
+        } = input;
+        let dataset_name = self.dataset_name.clone();
+        let metric_labels = self.dataset_metric_labels.clone();
+        let sql = refresh.read().await.display_sql();
+        let _prefetch_gauge_reset = PrefetchBytesGaugeReset {
+            labels: metric_labels.clone(),
+        };
+        let has_source_reader = reader_handle.is_source();
 
         // The previous burst's source-side commit task. Commits are network
         // round-trips to the source (PG `Standby Status Update`, Kafka offset
@@ -1228,7 +1223,7 @@ impl RefreshTask {
         // Previous iteration's recv-start, for the apply-cadence metric
         // (`cdc_apply_cycle_ms`): the period between successive burst applies.
         let mut prev_recv_start: Option<Instant> = None;
-        let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        let mut carried_item: Option<IngestItem> = None;
         // Receipt time of `carried_item`, captured when it is carried so the next
         // iteration attributes its wait from true receipt rather than after it sat
         // through this burst's apply. `_ms` (wall clock) feeds the arrival-lag gauge;
@@ -1237,7 +1232,7 @@ impl RefreshTask {
         let mut carried_received_ms: Option<i64> = None;
         let mut carried_received_at: Option<Instant> = None;
         let mut last_cycle_start = Instant::now();
-        let write_ctx = util::session_state::session_context();
+        let write_ctx = write_context.unwrap_or_else(util::session_state::session_context);
         let write_session_state = write_ctx.state();
         let recv_wait_labels = metric_labels.dataset();
 
@@ -1455,8 +1450,7 @@ impl RefreshTask {
             // awaiting more envelopes until the envelope cap, the byte budget, or
             // a deadline anchored at the START of the previous apply
             // (`last_cycle_start`) is reached.
-            let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
-                Vec::with_capacity(8);
+            let mut burst: Vec<IngestItem> = Vec::with_capacity(8);
             let mut burst_bytes = cdc_item_budget_bytes(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
@@ -1694,7 +1688,7 @@ impl RefreshTask {
         // joins are expected during shutdown and do not need to escalate.
         match reader_handle.await {
             Ok(()) => {
-                if !self.runtime_status.is_shutdown() {
+                if has_source_reader && !self.runtime_status.is_shutdown() {
                     tracing::warn!("Changes stream ended for dataset {dataset_name}");
                 }
             }
@@ -1734,7 +1728,7 @@ impl RefreshTask {
     async fn apply_burst(
         &self,
         context: &mut ApplyContext<'_>,
-        burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+        burst: Vec<IngestItem>,
         close_reason: &'static str,
     ) -> bool {
         let burst_start = Instant::now();
@@ -1766,7 +1760,7 @@ impl RefreshTask {
             // the server clock, which would inflate the applied frontier + lag gauge
             // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
             .filter(|env| !env.is_heartbeat())
-            .filter_map(cdc::ChangeEnvelope::source_commit_ts_ms)
+            .filter_map(Mutation::source_commit_ts_ms)
             .max();
         if let Some(ts) = max_commit_ts_ms {
             metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);
@@ -1778,11 +1772,11 @@ impl RefreshTask {
         let mut iter = burst.into_iter().peekable();
         while let Some(item) = iter.next() {
             match item {
-                Ok(first_env) => {
+                Ok(Mutation::Rows(first_env)) => {
                     let mut envelopes = Vec::with_capacity(8);
                     envelopes.push(first_env);
-                    while let Some(Ok(_)) = iter.peek() {
-                        let Some(Ok(next)) = iter.next() else {
+                    while let Some(Ok(Mutation::Rows(_))) = iter.peek() {
+                        let Some(Ok(Mutation::Rows(next))) = iter.next() else {
                             unreachable!("peeked Ok above");
                         };
                         envelopes.push(next);
@@ -1791,6 +1785,26 @@ impl RefreshTask {
                     if !self.apply_envelope_run(context, envelopes).await {
                         metrics::CDC_APPLY_BURST_DURATION_MS
                             .record(elapsed_ms(burst_start), labels);
+                        return false;
+                    }
+                }
+                Ok(Mutation::ReplaceSet {
+                    replacement,
+                    recovery,
+                    published,
+                }) => {
+                    let result = self
+                        .apply_set_replacement(context, replacement, recovery)
+                        .await;
+                    let failed = result.as_ref().is_err_and(|error| {
+                        !matches!(
+                            error,
+                            DataFusionError::NotImplemented(_) | DataFusionError::Plan(_)
+                        )
+                    });
+
+                    let _ = published.send(result);
+                    if failed {
                         return false;
                     }
                 }
@@ -1839,6 +1853,96 @@ impl RefreshTask {
             }
         }
         true
+    }
+
+    pub(crate) fn open_ingestion(
+        self: Arc<Self>,
+        refresh: Arc<RwLock<Refresh>>,
+        runtime: &tokio::runtime::Handle,
+        write_context: SessionContext,
+    ) -> (
+        ingestion::IngestSender,
+        tokio::task::JoinHandle<crate::accelerated::Result<()>>,
+    ) {
+        let mut config = cdc_config();
+        if let Some(overrides) = self.cdc_param_overrides.as_ref() {
+            config = cdc_config_overlay(config, overrides);
+        }
+        let (sender, mut input) = ingestion::channel(config.prefetch_buffer);
+        input.write_context = Some(write_context);
+        let task = runtime.spawn(async move {
+            self.start_ingestion(
+                config,
+                refresh,
+                input,
+                ReaderTask::new(None),
+                None,
+                None,
+                Arc::new(AtomicBool::new(true)),
+            )
+            .await
+        });
+        (sender, task)
+    }
+
+    async fn apply_set_replacement(
+        &self,
+        context: &mut ApplyContext<'_>,
+        replacement: data_components::cdc::mutation::ReplaceSet,
+        recovery: data_components::cdc::mutation::Recovery,
+    ) -> datafusion::error::Result<()> {
+        // A complete-set operation is an ordering barrier for a preceding
+        // pipelined publication, including its source acknowledgement effects.
+        if let Some(pending) = context.pending_finalize.take() {
+            if let Some(error) = join_pending_finalize(
+                pending.finalize,
+                context.dataset_name,
+                self.runtime_status.is_shutdown(),
+            )
+            .await
+            {
+                return Err(DataFusionError::Execution(error));
+            }
+            if !self
+                .run_finalize_side_effects(
+                    context,
+                    pending.committers,
+                    pending.ready_after_finalize,
+                )
+                .await
+            {
+                return Err(DataFusionError::Execution(
+                    "Prior ingestion finalization failed".into(),
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        if let Some(cayenne) = self.cayenne_accelerator()
+            && spice_table::nodes(self.accelerator.as_ref(), spice_table::LayerWalk::Write).all(
+                |node| {
+                    node.layer_as::<data_components::poly::PolyTableProvider>()
+                        .is_some()
+                },
+            )
+        {
+            let rows = replacement
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            let write = cayenne
+                .write_replace_set(replacement, recovery, &context.write_ctx.task_ctx())
+                .await?;
+            let in_memory = write.in_memory_epoch().is_some();
+            write.finish().await?;
+            self.update_last_updated_at();
+            metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(rows as u64, context.metric_labels.dataset());
+            tracing::trace!(dataset = %self.dataset_name, rows, in_memory, "Published complete replacement through change ingestion");
+            return Ok(());
+        }
+        Err(DataFusionError::NotImplemented(
+            "Atomic complete-set replacement is not supported by this write target".into(),
+        ))
     }
 
     /// Run the post-finalize side effects for a deferred Stage-B finalize that
@@ -3412,14 +3516,14 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
         })
 }
 
-fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+fn cdc_item_budget_bytes(item: &IngestItem) -> usize {
     // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
     // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
     // envelope from a schema-aware estimate of its buffered wire size, a built
     // one from its actual Arrow size. Used only to bound how much a single burst
     // accumulates before applying; the real Arrow build is deferred to apply
     // time (`into_parts_offloaded_burst`), off the source's shared read path.
-    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
+    item.as_ref().map_or(0, Mutation::encoded_len)
 }
 
 /// Zeroes `cdc_prefetch_buffer_bytes` for one dataset when the CDC stream that

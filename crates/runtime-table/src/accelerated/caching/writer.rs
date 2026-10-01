@@ -36,9 +36,11 @@ use super::{
     CACHE_NAMESPACE_COLUMN, CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth, CacheWriteRequest,
     MAX_CONCURRENT_REFRESHES, namespace_filter_expr, stamp_namespace_column,
 };
+use crate::accelerated::refresh_task::{RefreshTask, ingestion::IngestSender};
 use crate::accelerated::write::append::AppendPlanCache;
 #[cfg(not(windows))]
 use crate::accelerated::write::append::cayenne_append_target;
+use data_components::cdc::mutation::{Recovery, ReplaceSet, SetKey};
 
 /// Admission held from before the source fetch through mutation completion.
 pub(crate) struct CacheFillPermit {
@@ -125,6 +127,9 @@ struct Inner {
     recovery_failed: AtomicBool,
     apply_runtime: Handle,
     io_runtime: Handle,
+    ingestion: parking_lot::Mutex<Option<IngestSender>>,
+    ingestion_task:
+        parking_lot::Mutex<Option<tokio::task::JoinHandle<crate::accelerated::Result<()>>>>,
 }
 
 impl Drop for Inner {
@@ -171,7 +176,20 @@ impl CacheWriter {
             recovery_failed: AtomicBool::new(false),
             apply_runtime,
             io_runtime,
+            ingestion: parking_lot::Mutex::new(None),
+            ingestion_task: parking_lot::Mutex::new(None),
         }))
+    }
+
+    pub(crate) fn start_ingestion(
+        &self,
+        task: RefreshTask,
+        refresh: Arc<tokio::sync::RwLock<crate::accelerated::refresh::Refresh>>,
+    ) {
+        let (sender, driver) =
+            Arc::new(task).open_ingestion(refresh, &self.0.apply_runtime, self.0.context.clone());
+        *self.0.ingestion.lock() = Some(sender);
+        *self.0.ingestion_task.lock() = Some(driver);
     }
 
     pub(crate) async fn admit(&self) -> Result<CacheFillPermit> {
@@ -302,6 +320,16 @@ impl CacheWriter {
     pub(crate) async fn shutdown(&self) {
         self.close();
         self.0.tasks.wait().await;
+        self.0.ingestion.lock().take();
+        let driver = self.0.ingestion_task.lock().take();
+        if let Some(driver) = driver {
+            match driver.await {
+                Ok(Ok(())) => {}
+                result => {
+                    tracing::debug!(dataset = %self.0.dataset, ?result, "Change ingestion drain failed")
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -407,23 +435,19 @@ impl CacheWriter {
             replaces_existing,
             ..
         } = request;
-        let state = self.0.context.state();
-        #[cfg(not(windows))]
-        if let Some(cayenne) = cayenne_append_target(self.0.accelerator.as_ref())
-            // A native upsert must not bypass a wrapper's delete/index effects.
-            && spice_table::nodes(self.0.accelerator.as_ref(), spice_table::LayerWalk::Write)
-                .all(|node| node.layer_as::<data_components::poly::PolyTableProvider>().is_some())
-            && cayenne
-                .try_write_cache_entry(
-                    &batches,
-                    &filters,
-                    CACHE_NAMESPACE_COLUMN,
-                    &self.0.context.task_ctx(),
-                )
-                .await?
-        {
-            return Ok(());
+        let ingestion = self.0.ingestion.lock().clone();
+        if let Some(ingestion) = ingestion {
+            let key = SetKey::from_filters(self.0.accelerator.schema(), &filters)?;
+            let replacement = ReplaceSet::try_new(key, batches)?;
+            let admission = ingestion
+                .admit(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+                .await?;
+            return admission
+                .submit(replacement, Recovery::Rebuildable)
+                .published()
+                .await;
         }
+        let state = self.0.context.state();
         if replaces_existing {
             match self
                 .0
