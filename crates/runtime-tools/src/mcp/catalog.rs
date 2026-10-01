@@ -399,7 +399,7 @@ impl McpToolCatalog {
                     )
                     .await;
                 }
-                immediate_already_refreshed = tool_cache_clone.read().ok().is_some_and(|cache| {
+                immediate_already_refreshed = tool_cache_clone.read().is_ok_and(|cache| {
                     matches!(cache.expires_at, ListCacheExpiry::ImmediatelyStale)
                 });
             }
@@ -451,8 +451,7 @@ impl McpToolCatalog {
     fn cache_is_fresh(&self) -> bool {
         self.tool_cache
             .read()
-            .ok()
-            .is_some_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
+            .is_ok_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
     }
 
     fn cached_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -718,8 +717,7 @@ fn ttl_wait(
 fn listed_cache_is_stale(cache: &StdRwLock<ToolListCache>) -> bool {
     !cache
         .read()
-        .ok()
-        .is_some_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
+        .is_ok_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
 }
 
 /// `try_get` must not return a listed spec after `ttlMs` expires.
