@@ -421,9 +421,8 @@ C_SCENARIOS = (
     Scenario(
         name="sameorigin-coupled-throttle",
         claim=(
-            "one dataset's failures throttle the origin its healthy co-tenant is "
-            "admitted through -- the co-tenant is not itself slowed down, it "
-            "inherits the share the failing one stops using"
+            "one dataset's failures shrink the budget its healthy co-tenant is "
+            "admitted through, without the co-tenant itself being slowed down"
         ),
         topology=_one_origin(_adaptive(), datasets=2),
         # Scoped to d1's path only, so d2's own responses stay 200 throughout.
@@ -435,10 +434,11 @@ C_SCENARIOS = (
         #    only part of that origin's traffic, so d2's successes dilute d1's
         #    errors. With a 20% threshold and roughly half the traffic failing,
         #    the coefficient settles near 0.8, not at the floor.
-        # 2. d2 does not slow down. It speeds up. The budget d1 stops claiming
-        #    is reallocated to whoever is asking, so the co-tenant's own rate can
-        #    RISE while the origin's total falls. Asserting that d2 slows down
-        #    would be asserting something untrue.
+        # 2. d2 does not slow down. Over five runs d1 loses about half its rate
+        #    every time while d2 stays flat within +/-3 rps and the origin's
+        #    total falls by only 1-2. Asserting that d2 slows down would be
+        #    asserting something that does not happen; asserting that it speeds
+        #    up (an earlier draft did, on two runs) is no better supported.
         #
         # What is true, and is what a per-dataset limiter would fail: d2 is
         # admitted through the budget d1's failures shrank, so the two of them

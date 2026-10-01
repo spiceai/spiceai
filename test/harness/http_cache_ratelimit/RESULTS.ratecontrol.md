@@ -49,12 +49,16 @@ outage, and two origins hold two different budgets at the same time.
 | | fault | **18** | **11** | **17** |
 | | recovery | 20/20 | 17 | 16 |
 
-Two saturated datasets on one origin stay inside **one** budget, not two. When
-only d1's path fails, the origin's published admission coefficient falls to
-**0.82** — on failures d2 never saw — and the origin's total falls, but **d2
-itself speeds up**: it inherits the share d1 stops claiming. "Dataset B is
-throttled by dataset A's failures" is the wrong claim; B is admitted through
-the budget A's failures shrank.
+Two saturated datasets on one origin stay inside **one** budget, not two.
+
+When only d1's path fails, the origin's published admission coefficient falls to
+**0.82** — on failures d2 never saw — but the effect on the co-tenant is small.
+Over five runs d1 loses about half its rate every time (14→10, 19→9, 17→9,
+21→9, 17→11) while d2 stays flat (18→16, 16→16, 14→16, 18→17, 20→17) and the
+origin's total falls by only 1–2 rps. "Dataset B is throttled by dataset A's
+failures" is not what happens; B is admitted through a budget A's failures
+shrank, which is still more than a per-dataset limiter would do, but a failing
+tenant on a busy origin barely moves the origin's load.
 
 `sameorigin-conflicting-config`: two datasets on one origin asking for
 different limits is refused at start-up — *"Multiple HTTP-based components

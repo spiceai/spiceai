@@ -352,14 +352,30 @@ That is the formula working as designed on the mix it is given, but it means a
 noisy minority tenant on a busy origin moves the rate far less than the same
 origin failing outright.
 
-**3. The co-tenant does not slow down — it speeds up.** In the same scenario,
-while d1 fell from a p99 of 18 to 10, **d2 rose from 16 to 18**, and the
-origin's total fell only 20 → 18. The budget d1 stops claiming is reallocated to
-whoever is still asking. "Dataset B is throttled by dataset A's failures" is the
-wrong claim; the true one is that B is admitted through the budget A's failures
-shrank, so the two together never exceed one budget and the coefficient moves on
-failures B never saw. A per-dataset limiter would have let B keep its own full
-budget beside A's.
+**3. The co-tenant is barely affected at all.** Across five runs of the same
+scenario, the failing dataset loses about half its rate every time while its
+healthy co-tenant stays flat:
+
+| run | d1 (fails) | d2 (healthy) | origin total |
+|---|---|---|---|
+| 1 | 14 → 10 | 18 → 16 | 20 → 19 |
+| 2 | 19 → 9 | 16 → 16 | 20 → 18 |
+| 3 | 17 → 9 | 14 → 16 | 20 → 18 |
+| 4 | 21 → 9 | 18 → 17 | 20 → 18 |
+| 5 | 17 → 11 | 20 → 17 | 20 → 18 |
+
+d2 moves by −3 to +2 on a 20 rps budget — noise. An earlier draft of this
+section claimed d2 *rises*, on the strength of two runs where it did; five runs
+do not support that either. What is consistent is that the origin's total falls
+by only 1–2 rps while half of its traffic is failing, because of finding 2.
+
+So "dataset B is throttled by dataset A's failures" is not what happens. What
+does: B is admitted through a budget that A's failures shrank — the coefficient
+drops to 0.82 on failures B never saw, and the two together never exceed one
+budget, which a per-dataset limiter would not do. The practical consequence is
+the uncomfortable one: a dataset hammering a failing endpoint is throttled
+mostly at its own expense, and the origin keeps receiving ~90% of its configured
+load.
 
 **4. A connection per query exhausts the host, slowly and silently.** This one
 is about the harness, not the runtime, and it is the trap most likely to be
