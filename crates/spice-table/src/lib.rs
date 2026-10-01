@@ -326,6 +326,26 @@ pub trait Index: Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether this index holds none of its table's rows, so the rows an accelerator already
+    /// holds at startup must be replayed through [`Index::compute_index`] before the index can
+    /// answer for them.
+    ///
+    /// An index whose entries live outside the accelerated table is filled only by the
+    /// acceleration write path. An accelerator that keeps its rows across a restart is refreshed
+    /// with only what it is missing — or not at all — so without a replay such an index would
+    /// answer every query from nothing. An in-memory full-text index starts every process
+    /// empty; a file-backed one is empty when its directory did not survive (a snapshot
+    /// bootstrap restores the accelerator, not the index).
+    ///
+    /// Defaults to `false`: correct for an index whose entries live in the accelerated table row
+    /// itself, or in a store that outlives the process.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently leaves an empty inner index empty.
+    fn requires_rebuild(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
 

@@ -293,6 +293,13 @@ impl Index for FullTextDatabaseIndex {
         true
     }
 
+    fn requires_rebuild(&self) -> bool {
+        // An in-memory index starts every process empty, and a file-backed one is empty when
+        // its directory was not carried over. Either way it holds none of the accelerator's
+        // rows until they are replayed through `compute_index` (#14618).
+        self.reader.searcher().num_docs() == 0
+    }
+
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         // A stream-attached index never defers: its change/append stream calls
         // `compute_index` outside this lifecycle, and the shared writer cannot commit one
@@ -1121,6 +1128,59 @@ mod tests {
             false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
+    }
+
+    /// Regression test for #14618: an index holding no documents asks to be rebuilt from its
+    /// accelerator, and stops asking once it holds them.
+    #[tokio::test]
+    async fn an_index_requires_a_rebuild_only_while_it_holds_no_documents() {
+        let index = new_test_index();
+        assert!(
+            index.requires_rebuild(),
+            "a new in-memory index holds none of the accelerator's rows"
+        );
+
+        index
+            .compute_index(vec![batch(&[1, 2], &["alpha", "beta"])])
+            .await
+            .expect("failed to compute_index");
+        index.reader.reload().expect("failed to reload the reader");
+
+        assert!(
+            !index.requires_rebuild(),
+            "an index that holds documents must not be replayed into again"
+        );
+    }
+
+    /// A file-backed index reopened from a surviving directory already holds its documents,
+    /// so a warm restart must not replay the accelerator into it.
+    #[tokio::test]
+    async fn a_reopened_file_index_does_not_require_a_rebuild() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let open = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                Some(dir.path().to_path_buf()),
+                &["content".to_string()],
+                false,
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        let first = open();
+        assert!(first.requires_rebuild(), "a new index directory is empty");
+        first
+            .compute_index(vec![batch(&[1], &["alpha"])])
+            .await
+            .expect("failed to compute_index");
+        drop(first);
+
+        assert!(
+            !open().requires_rebuild(),
+            "the reopened index already holds the committed document"
+        );
     }
 
     const EXPUNGE_FIXTURE_IDS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
