@@ -902,12 +902,11 @@ async fn replaced_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     if let Err(err) = wait_for_ready(&reader, &table).await {
         failures.push(err.to_string());
     }
-    if tokio::time::timeout(Duration::from_secs(30), &mut reader_load)
-        .await
-        .is_err()
-    {
-        failures
-            .push("the reader was still loading its components 30 s after the reload".to_string());
+    match tokio::time::timeout(Duration::from_secs(30), &mut reader_load).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => failures.push(format!("the reader's load failed: {err}")),
+        Err(_) => failures
+            .push("the reader was still loading its components 30 s after the reload".to_string()),
     }
     // Over several of the 1 s intervals on which a waiting dataset checks for a snapshot.
     for status in other_statuses_than_ready(&reader, &table, Duration::from_secs(5)).await {

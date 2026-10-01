@@ -95,8 +95,9 @@ impl Runtime {
         // A superseded load stops waiting at once, dropping the read it is running, rather
         // than at its next attempt.
         let resolved = tokio::select! {
-            resolved = wait_for_snapshot => resolved.ok()?,
+            biased;
             () = load.superseded() => return None,
+            resolved = wait_for_snapshot => resolved.ok()?,
         };
 
         // Held until the snapshot is restored, so a reload that supersedes the load
@@ -127,12 +128,16 @@ impl Runtime {
         // `dataset_loads`).
         let bootstrap_status = {
             let permit = tokio::select! {
-                permit = load_semaphore.acquire() => permit,
+                biased;
                 () = load.superseded() => return None,
+                permit = load_semaphore.acquire() => permit,
             };
             let Ok(_permit) = permit else {
                 return None;
             };
+            if stopped() {
+                return None;
+            }
             self.initialize_datasets_accelerators(std::slice::from_ref(&resolved))
                 .await
                 .remove(&resolved.name)?
