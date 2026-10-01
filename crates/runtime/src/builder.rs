@@ -853,6 +853,7 @@ impl RuntimeBuilder {
             )),
             dataset_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
+            snapshot_sources: Arc::default(),
         };
 
         // Executors: register cluster status before any concurrent

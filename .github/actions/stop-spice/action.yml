@@ -23,9 +23,13 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # Neither step sets `working-directory:`. The runner refuses to start a step
+    # whose working directory does not exist, so when the job failed before
+    # creating it (a failed install, say) this cleanup used to fail as well, and
+    # its "No such file or directory" error sat beside the real cause.
+    # stop_spice.sh scopes by RUNNER_WORKSPACE and never reads its cwd.
     - name: Stop spice
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
       env:
         SPICE_STOP_PORTS: ${{ inputs.ports }}
       # Invoked through `bash` so the step does not depend on the script's
@@ -35,10 +39,13 @@ runs:
     - name: Print spice.log
       if: ${{ inputs.print-log == 'true' }}
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
+      env:
+        SPICE_LOG_DIR: ${{ inputs.working-directory }}
       run: |
-        if [ -f spice.log ]; then
-          cat spice.log
+        if [ ! -d "$SPICE_LOG_DIR" ]; then
+          echo "no spice.log: $SPICE_LOG_DIR does not exist, so the runtime was never started from it"
+        elif [ -f "$SPICE_LOG_DIR/spice.log" ]; then
+          cat "$SPICE_LOG_DIR/spice.log"
         else
-          echo "no spice.log in $(pwd)"
+          echo "no spice.log in $SPICE_LOG_DIR"
         fi

@@ -1730,6 +1730,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.supports_column_alias_in_table_alias()
     }
 
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        self.inner.derived_table_evaluates_volatile_outputs_once()
+    }
+
     fn requires_derived_table_alias(&self) -> bool {
         self.inner.requires_derived_table_alias()
     }

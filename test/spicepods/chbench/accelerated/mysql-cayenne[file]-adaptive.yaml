@@ -112,7 +112,13 @@ datasets:
         cdc_prefetch_buffer: '16384'
         cdc_max_coalesced_envelopes: '16384'
         cdc_max_coalesced_bytes: '536870912'
-        cdc_max_coalesce_age_ms: '2000'
+        # A 500 ms linger is the knee of the freshness/query trade-off once per-shard PK-index rebuilds are
+        # off the apply path (#14555). Measured on MySQL SF-100 at 3 000 txn/s, 600 s, two runs per setting:
+        #   2000 ms: worst-table freshness P99 2 826 ms, query geomean 903 ms
+        #    500 ms: 1 416 ms, 934 ms (+3.4 %, within run spread)
+        #    250 ms: 1 190 ms, 973 ms (+7.7 %)
+        #      0 ms: one apply per transaction, half the query throughput
+        cdc_max_coalesce_age_ms: '500'
         # Goal-driven SLOs are set globally under `runtime.params` (above) and
         # inherited by every dataset, so they are intentionally not repeated here.
         # (A dataset that needed a sharper target would override the relevant
