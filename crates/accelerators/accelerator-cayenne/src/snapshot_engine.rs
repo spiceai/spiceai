@@ -727,22 +727,6 @@ mod tests {
         archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras)
             .await
             .expect("archive");
-        let names: Vec<String> = tar::Archive::new(std::fs::File::open(&tar).expect("open tar"))
-            .entries()
-            .expect("entries")
-            .map(|e| {
-                e.expect("entry")
-                    .path()
-                    .expect("path")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert!(
-            !names.iter().any(|n| n.contains(&first)),
-            "the retired snapshot must not be archived: {names:?}"
-        );
-        assert!(names.iter().any(|n| n.contains(&second)));
 
         let reader_root = tmp.path().join("reader");
         let reader_metadata = reader_root.join("metadata");
@@ -763,6 +747,11 @@ mod tests {
         )
         .await
         .expect("extract");
+        assert!(
+            !reader_data.join(&table_id).join(&first).exists(),
+            "the retired snapshot must not be in the archive"
+        );
+        assert!(reader_data.join(&table_id).join(&second).is_dir());
         CayenneSnapshotEngine::new(
             Arc::clone(&reader_catalog) as Arc<dyn MetadataCatalog>,
             "trips",
