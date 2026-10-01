@@ -2,8 +2,11 @@ name: testoperator dispatch
 
 on:
   schedule:
-    # daily-main, 0900 UTC / 0200 PDT  — full bench suite
+    # daily, 0900 UTC / 0200 PDT — the bench suites, except the configs on the weekly schedule
     - cron: '0 9 * * *'
+    # weekly, Sunday 0000 UTC / Saturday 1700 PDT — the configs whose source is a hosted service
+    # billed per use, marked `schedule: weekly` in their dispatch config
+    - cron: '0 0 * * 0'
 
   workflow_dispatch:
     inputs:
@@ -32,28 +35,88 @@ on:
         required: false
         type: boolean
         default: false
-      scheduled:
-        description: 'Run schedule?'
+      schedule:
+        description: 'Run a scheduled dispatch (daily or weekly) instead of the workflow_type dispatch'
         required: false
-        type: boolean
-        default: false
+        type: choice
+        default: 'none'
+        options:
+          - 'none'
+          - 'daily'
+          - 'weekly'
 
 jobs:
+  # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
+  # input) and for which branches. trunk dispatches the configs on that schedule. A release
+  # branch changes only when a fix is cherry-picked onto it, so its whole suite, weekly configs
+  # included, is dispatched once per commit on the daily schedule, and a commit an earlier
+  # scheduled run already benchmarked is skipped.
+  plan-scheduled:
+    name: Plan scheduled dispatch
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'none') }}
+    outputs:
+      schedule: ${{ steps.plan.outputs.schedule }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRON: ${{ github.event.schedule }}
+          INPUT_SCHEDULE: ${{ github.event.inputs.schedule }}
+          RELEASE_BRANCH: 'release/2.3'
+        run: |
+          set -euo pipefail
+          case "$CRON" in
+            '0 9 * * *') schedule=daily ;;
+            '0 0 * * 0') schedule=weekly ;;
+            '')          schedule="$INPUT_SCHEDULE" ;;   # manual dispatch
+            *)           schedule= ;;                      # unrecognized cron — dispatch nothing
+          esac
+          echo "Resolved schedule: ${schedule:-<none>}"
+          echo "schedule=$schedule" >> "$GITHUB_OUTPUT"
+
+          matrix='[]'
+          if [ -n "$schedule" ]; then
+            matrix=$(jq -cn --arg schedule "$schedule" '[{branch: "trunk", schedule: $schedule}]')
+          fi
+          if [ "$schedule" = daily ]; then
+            # Each scheduled release run uploads a `scheduled-bench-<branch>-<commit>` artifact for the
+            # spiced commit it benchmarked. A failed lookup dispatches the suite rather than skip it.
+            found=0
+            if sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" --jq .object.sha); then
+              marker="scheduled-bench-${RELEASE_BRANCH//\//-}-${sha}"
+              found=$(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/artifacts" -f name="$marker" \
+                --jq '[.artifacts[] | select(.expired | not)] | length') || found=0
+            fi
+            if [ "$found" -gt 0 ]; then
+              echo "${RELEASE_BRANCH} is still at ${sha}, which an earlier scheduled run benchmarked; skipping it."
+            else
+              matrix=$(jq -c --arg branch "$RELEASE_BRANCH" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
+            fi
+          fi
+          echo "Dispatching for: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   dispatch-scheduled:
-    name: Dispatch tests - Scheduled
+    name: Dispatch tests - Scheduled (${{ matrix.branch }})
+    needs: plan-scheduled
+    if: ${{ needs.plan-scheduled.outputs.matrix != '[]' }}
     runs-on: spiceai-dev-runners
-    # daily-main dispatches the bench suite (including the chbench bench run) and returns once all child workflows are dispatched
+    # dispatches the bench suite (including the chbench bench run) and returns once all child workflows are dispatched
     timeout-minutes: 720
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
       matrix:
-        branch:
-          - 'trunk'
-          - 'release/2.3'
+        include: ${{ fromJSON(needs.plan-scheduled.outputs.matrix) }}
     concurrency:
-      group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
+      group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ needs.plan-scheduled.outputs.schedule }}
       cancel-in-progress: false
+    env:
+      # `daily` or `weekly` on trunk, passed to every `testoperator dispatch` as `--schedule`. Empty on
+      # a release branch, which dispatches its whole suite.
+      SCHEDULE: ${{ matrix.schedule }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,20 +157,7 @@ jobs:
       - name: Set spicepod validator path
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
 
-      # Map the cron that fired to a human-readable schedule name. 
-      # Every gated step reads steps.sched.outputs.name.
-      - name: Resolve schedule name
-        id: sched
-        run: |
-          case "${{ github.event.schedule }}" in
-            '0 9 * * *')               NAME=daily-main ;;
-            *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
-          esac
-          echo "Resolved schedule name: $NAME"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
-
       - name: Validate spicepods - TPCH - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
@@ -116,7 +166,6 @@ jobs:
           done
 
       - name: Validate spicepods - TPCDS - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
@@ -125,7 +174,6 @@ jobs:
           done
 
       - name: Validate spicepods - ClickBench - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
@@ -134,7 +182,6 @@ jobs:
           done
 
       - name: Validate spicepods - TPCH - SF100
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
@@ -143,7 +190,6 @@ jobs:
           done
 
       - name: Validate spicepods - TPCDS - SF100
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
@@ -160,7 +206,6 @@ jobs:
           done
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
           failed=0
@@ -171,7 +216,7 @@ jobs:
               # skip covers one that gets re-added.
               ./tools/testoperator/dispatch/tpch/sf1/federated/scylladb.yaml) continue ;;
             esac
-            if ! testoperator dispatch "$file" --workflow bench; then
+            if ! testoperator dispatch "$file" --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}; then
               failed=1
             fi
           done
@@ -182,18 +227,16 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -202,36 +245,32 @@ jobs:
       # Catalog-connector discovery tests. Only the dispatch configs that declare a
       # `schema` block are dispatched, so this is the catalog spicepods.
       - name: Dispatch Testoperator - Scheduled Schema - TPCH - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow schema
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow schema ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS - SF100
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -256,20 +295,40 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       # CH-benCHmark explain-plan bench (no OLTP load) runs with the daily bench suite. The scheduled
-      # HTAP runs (SF1/SF100/SF1000) are part of testoperator_dispatch_htap.yml.
+      # HTAP runs (SF1/SF1000) are part of testoperator_dispatch_htap.yml.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark Bench - SF100
-        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
+        if: ${{ matrix.branch == 'trunk' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      # A release branch dispatches its suite once per commit: record the commit this run benchmarked
+      # so the next scheduled run's plan job skips the branch until it moves.
+      - name: Record the benchmarked release commit
+        id: benchmarked
+        if: ${{ matrix.schedule == '' }}
+        env:
+          BRANCH: ${{ matrix.branch }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: |
+          echo "$SPICED_COMMIT" > benchmarked-commit.txt
+          echo "name=scheduled-bench-${BRANCH//\//-}-${SPICED_COMMIT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the benchmarked release commit
+        if: ${{ matrix.schedule == '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.benchmarked.outputs.name }}
+          path: benchmarked-commit.txt
+          retention-days: 90
+
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule == 'none' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
