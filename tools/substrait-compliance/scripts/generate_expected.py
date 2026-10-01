@@ -147,9 +147,12 @@ def load_tables(con: duckdb.DuckDBPyConnection, data_dir: pathlib.Path) -> dict[
         if not path.is_file():
             raise SystemExit(f"missing {path}: write the tables with `--write-data {data_dir}` first")
         con.execute(f"CREATE TABLE {table} ({columns})")
-        # Explicit quoting matches the harness's writer; no field is trimmed.
+        # Bind the path: a `--data-dir` may contain `'`, which would break a
+        # quoted SQL literal. Explicit CSV quoting matches the harness writer;
+        # no field is trimmed.
         con.execute(
-            f"COPY {table} FROM '{path}' (DELIMITER '|', HEADER false, QUOTE '\"', ESCAPE '\"')"
+            f"COPY {table} FROM ? (DELIMITER '|', HEADER false, QUOTE '\"', ESCAPE '\"')",
+            [str(path)],
         )
         rows = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         lines = sum(1 for _ in path.open("rb"))
