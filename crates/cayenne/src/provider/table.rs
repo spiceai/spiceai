@@ -10110,11 +10110,15 @@ impl CayenneTableProvider {
             let snapshot_id = snapshot_id.to_string();
             let schema = Arc::clone(schema);
             handles.push(tokio::spawn(async move {
-                // The shard is fully materialized, so its size is the resident
-                // memory of its batches with each Arrow allocation counted once —
-                // the same figure `MemSegment::bytes` charged the tier for them. A
-                // per-reference sum would bill one allocation once per buffer and
-                // fan a Flight-fed shard out into ~its buffer count in files.
+                // The unit is fully materialized, so its size is the resident
+                // memory of its batches with each Arrow allocation counted once.
+                // A PK-shard unit was rebuilt by the shard split
+                // (`filter_record_batch` allocates), so it shares nothing and the
+                // count matches its per-reference sum. The inline-corpus unit comes
+                // straight out of the metastore's IPC blobs, where every buffer of an
+                // entry points into one body allocation: a per-reference sum bills
+                // that allocation once per buffer and fans the unit out into ~its
+                // buffer count in files.
                 let unit_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&unit);
                 let estimated_bytes = Some(unit_bytes);
                 let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(

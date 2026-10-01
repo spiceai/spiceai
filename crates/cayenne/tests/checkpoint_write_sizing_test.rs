@@ -456,7 +456,8 @@ fn a_sharded_mem_tier_checkpoint_writes_one_file_per_encoded_unit() -> Result<()
         let table = memory_cdc_table(&fixture, "sharded", &base_path, SHARDS, true).await?;
 
         // Ordinary appends inline into the metastore; CDC applies land in the
-        // RAM tier. A checkpoint flushes both, as `WRITES + 1` units.
+        // RAM tier. A checkpoint flushes both, as one unit per PK shard plus one
+        // for the inline corpus.
         let mut inlined = Vec::with_capacity(WRITES);
         for write in 0..WRITES {
             let batch = rows(&schema, i64::try_from(write * ROWS_PER_WRITE)?);
