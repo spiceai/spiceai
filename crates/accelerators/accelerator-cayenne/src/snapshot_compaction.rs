@@ -109,6 +109,11 @@ pub enum CompactionError {
     PartitionedTable { dataset: String },
 
     #[snafu(display(
+        "Cannot compact the snapshot of dataset '{dataset}': it has a cold tier (`cayenne_datalake_location`), and a compacted snapshot would re-encode every cold row into local files on each snapshot. Set `snapshots_compaction: disabled` for this dataset"
+    ))]
+    ColdTierTable { dataset: String },
+
+    #[snafu(display(
         "Failed to prepare the scratch directory for compacting the snapshot of dataset '{dataset}': {source}"
     ))]
     Scratch {
@@ -185,8 +190,8 @@ impl CompactionCapture {
     ///
     /// Fails when the live table cannot be scanned, when its metadata cannot be
     /// exported, or when the dataset is one compaction does not support (a data
-    /// directory outside the dataset's acceleration directory, or a partitioned
-    /// table).
+    /// directory outside the dataset's acceleration directory, a partitioned
+    /// table, or a table with a cold tier).
     pub async fn capture(
         catalog: &Arc<dyn MetadataCatalog>,
         dataset_name: &str,
@@ -243,6 +248,21 @@ impl CompactionCapture {
                 dataset: dataset_name
             }
         );
+        // The scan would read the cold branch too, pulling the whole cold tier
+        // into warm files on every snapshot.
+        let vortex_config_column = table_column(dataset_name, "vortex_config_json")?;
+        if let Some(SliceValue::Text(json)) = table_row.get(vortex_config_column) {
+            let config: VortexConfig =
+                serde_json::from_str(json).context(VortexConfigJsonSnafu {
+                    dataset: dataset_name,
+                })?;
+            ensure!(
+                config.cold_tier_location.is_none(),
+                ColdTierTableSnafu {
+                    dataset: dataset_name
+                }
+            );
+        }
 
         Ok(Self {
             dataset_name: dataset_name.to_string(),
