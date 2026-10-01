@@ -3604,12 +3604,15 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
-    use crate::snapshot::engine::create_snapshot_engine;
+    use crate::snapshot::engine::{
+        DirectorySnapshotPlan, SnapshotEngineError, create_snapshot_engine,
+    };
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
     use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
     use object_store::{memory::InMemory, path::Path};
+    use std::collections::HashSet;
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
@@ -6525,6 +6528,167 @@ mod tests {
 
     /// Builds a `SnapshotManager` for metadata-only API tests.
     /// Uses `AccelerationLayout::None` since API tests only read/write metadata.
+    /// Engine whose deferred build hands back a scratch directory, as the
+    /// compacting Cayenne engine does.
+    struct ScratchDirEngine {
+        scratch: PathBuf,
+    }
+
+    #[async_trait]
+    impl SnapshotEngine for ScratchDirEngine {
+        async fn prepare_for_upload(
+            &self,
+            source_path: &std::path::Path,
+            _dataset_name: &str,
+        ) -> Result<PathBuf, SnapshotEngineError> {
+            Ok(source_path.to_path_buf())
+        }
+
+        fn supports_compaction(&self) -> bool {
+            true
+        }
+
+        async fn prepare_directory_snapshot(
+            &self,
+            _dirs: &[(PathBuf, String)],
+            _dataset_name: &str,
+            _live_table: Option<&Arc<dyn TableProvider>>,
+        ) -> Result<DirectorySnapshotPlan, SnapshotEngineError> {
+            let scratch = self.scratch.clone();
+            Ok(DirectorySnapshotPlan {
+                deferred: Some(Box::pin(async move {
+                    Ok(engine::MaterializedDirectorySnapshot {
+                        dirs: vec![(scratch.clone(), "data/".to_string())],
+                        skip_relative_paths: HashSet::new(),
+                        extra_entries: Vec::new(),
+                        cleanup_dirs: vec![scratch],
+                    })
+                })),
+                ..DirectorySnapshotPlan::default()
+            })
+        }
+    }
+
+    fn build_directory_manager(
+        store: Arc<InMemory>,
+        live_dir: PathBuf,
+        engine: Arc<dyn SnapshotEngine>,
+    ) -> SnapshotManager {
+        SnapshotManager {
+            dataset_name: DATASET_NAME.to_string(),
+            snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
+            snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
+            layout: AccelerationLayout::directories(vec![(live_dir, "data/".to_string())]),
+            engine: AccelerationEngine::Cayenne,
+            snapshot_engine: engine,
+            compaction_enabled: true,
+            object_store: store,
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
+            checkpointer_factory: None,
+            snapshots_creation_policy: SnapshotsCreationPolicy::Always,
+            network_retry_strategy: RetryBackoffBuilder::new()
+                .max_retries(Some(NETWORK_RETRY_MAX))
+                .build(),
+        }
+    }
+
+    /// A deferred build's scratch directory is removed after archiving, and
+    /// the archive is cut from it rather than from the live directory.
+    #[tokio::test]
+    async fn deferred_build_scratch_dir_is_archived_then_removed() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let live_dir = temp_dir.path().join("live");
+        let scratch = temp_dir.path().join("scratch");
+        std::fs::create_dir_all(&live_dir).expect("live dir");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(live_dir.join("live.bin"), b"live").expect("live file");
+        std::fs::write(scratch.join("compacted.bin"), b"compacted").expect("scratch file");
+
+        let manager = build_directory_manager(
+            Arc::clone(&store),
+            live_dir,
+            Arc::new(ScratchDirEngine {
+                scratch: scratch.clone(),
+            }),
+        );
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let uploaded = manager
+            .create_snapshot(&sample_schema(), lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot path");
+
+        assert!(
+            !scratch.exists(),
+            "scratch directory must be removed after archiving"
+        );
+        let archive = store
+            .get(&uploaded)
+            .await
+            .expect("get archive")
+            .bytes()
+            .await
+            .expect("archive bytes");
+        let names: Vec<String> = tar::Archive::new(archive.as_ref())
+            .entries()
+            .expect("entries")
+            .map(|e| {
+                e.expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("compacted.bin")),
+            "archive must come from the scratch directory: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("live.bin")),
+            "live directory must not be archived: {names:?}"
+        );
+    }
+
+    /// The scratch directory is removed even when archiving it fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_build_scratch_dir_is_removed_when_archiving_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let live_dir = temp_dir.path().join("live");
+        let scratch = temp_dir.path().join("scratch");
+        std::fs::create_dir_all(&live_dir).expect("live dir");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let unreadable = scratch.join("unreadable.bin");
+        std::fs::write(&unreadable, b"x").expect("scratch file");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        let manager = build_directory_manager(
+            Arc::clone(&store),
+            live_dir,
+            Arc::new(ScratchDirEngine {
+                scratch: scratch.clone(),
+            }),
+        );
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let result = manager
+            .create_snapshot(&sample_schema(), lock_guard, None, None, ForceCreate(true))
+            .await;
+
+        assert!(result.is_err(), "archiving an unreadable file must fail");
+        assert!(
+            !scratch.exists(),
+            "scratch directory must be removed after a failed archive"
+        );
+    }
+
     fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
         let object_store: Arc<dyn ObjectStore> = store;
         let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
