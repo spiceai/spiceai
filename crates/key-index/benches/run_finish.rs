@@ -41,9 +41,8 @@ limitations under the License.
 //! - `merge`: one run per file, merged to one run by repeated `merge_step`.
 //! - `restore`: one write's run over all the files, read back from its
 //!   persisted bytes (`IndexRun::from_bytes`), as a reopened table does.
-//! - `encode`: the cost per row of encoding each key, of hashing the encoded
-//!   key to its word, and of a length-prefixed encoding instead of the
-//!   escaped one, measured apart.
+//! - `encode`: the cost per row of encoding each key and of hashing the
+//!   encoded key to its word, measured apart.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -134,17 +133,6 @@ fn add(builder: &mut RunBuilder, file: &str, ids: &[i64]) {
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
-}
-
-/// Min / max over the reps, and ns per row at the min.
-fn stat(samples: &mut [Duration], rows: usize) -> String {
-    samples.sort_unstable();
-    format!(
-        "{:>8.1} / {:>8.1} ms ({:>5.0} ns/row)",
-        ms(samples[0]),
-        ms(samples[samples.len() - 1]),
-        samples[0].as_nanos() as f64 / rows as f64
-    )
 }
 
 fn finish(ids: &[i64], file_rows: usize, reps: usize) {
@@ -283,15 +271,15 @@ fn merge(ids: &[i64], file_rows: usize, reps: usize) {
     );
     println!(
         "  per-file runs, add + finish   {}",
-        stat(&mut per_file, rows)
+        per_row(&mut per_file, rows)
     );
     println!(
         "  merge_step policy             {}  {steps} steps, stops at {left} runs",
-        stat(&mut merge_total, rows)
+        per_row(&mut merge_total, rows)
     );
     println!(
         "  merge_all (one pass)          {}",
-        stat(&mut merge_all, rows)
+        per_row(&mut merge_all, rows)
     );
 }
 
@@ -347,49 +335,30 @@ fn load(file_rows: usize) {
 
 /// The `p50 / p99 / max` of `samples` as ns per row of `rows`.
 fn per_row(samples: &mut [Duration], rows: usize) -> String {
-    samples.sort_unstable();
     let ns = |d: Duration| d.as_nanos() as f64 / rows as f64;
-    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+    let (p50, p99, max) = quantiles(samples);
     format!(
         "{:>6.1} / {:>6.1} / {:>6.1} ns/row",
-        ns(at(0.5)),
-        ns(at(0.99)),
-        ns(samples[samples.len() - 1])
+        ns(p50),
+        ns(p99),
+        ns(max)
     )
 }
 
-/// Appends a length-prefixed encoding of `row`: per column, a NULL marker
-/// when nullable, then a `u32` length and the bytes for a variable-length
-/// value, or the fixed-width big-endian bytes otherwise.
-fn length_prefixed(columns: &[ArrayRef], row: usize, out: &mut Vec<u8>) {
-    use arrow_array::Array;
-    use arrow_array::cast::AsArray;
-    for column in columns {
-        match column.data_type() {
-            DataType::Utf8 => {
-                let value = column.as_string::<i32>().value(row).as_bytes();
-                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                out.extend_from_slice(value);
-            }
-            DataType::Int64 => {
-                let value = column
-                    .as_primitive::<arrow_array::types::Int64Type>()
-                    .value(row);
-                out.extend_from_slice(&(value.cast_unsigned() ^ (1 << 63)).to_be_bytes());
-            }
-            other => panic!("no prototype encoding for {other}"),
-        }
-    }
+/// The p50, p99 and max of `samples`.
+fn quantiles(samples: &mut [Duration]) -> (Duration, Duration, Duration) {
+    samples.sort_unstable();
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+    (at(0.5), at(0.99), samples[samples.len() - 1])
 }
 
-/// Times, apart, encoding every key, hashing the encoded keys to words, and
-/// a length-prefixed encoding plus its hash, `reps` times each.
+/// Times, apart, encoding every key and hashing the encoded keys to words,
+/// `reps` times each.
 fn encode(ids: &[i64], reps: usize) {
-    use arrow_array::Array;
     let encoder = encoder();
     let batches: Vec<Vec<ArrayRef>> = ids.chunks(8192).map(columns).collect();
     let rows = ids.len();
-    let (mut escaped, mut hashed, mut prefixed) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut escaped, mut hashed) = (Vec::new(), Vec::new());
     let mut scratch = Vec::new();
     let mut sink = 0_u64;
     // The escaped keys, kept so the hash pass times hashing alone.
@@ -416,17 +385,6 @@ fn encode(ids: &[i64], reps: usize) {
         }
         hashed.push(started.elapsed());
     }
-    for _ in 0..reps {
-        let started = Instant::now();
-        for batch in &batches {
-            for row in 0..batch[0].len() {
-                scratch.clear();
-                length_prefixed(batch, row, &mut scratch);
-                sink ^= encoder.key_word(&scratch);
-            }
-        }
-        prefixed.push(started.elapsed());
-    }
     std::hint::black_box(sink);
     println!("encode {rows:>9} rows (p50 / p99 / max over {reps} reps):");
     println!(
@@ -436,10 +394,6 @@ fn encode(ids: &[i64], reps: usize) {
     println!(
         "  hash of the escaped key    {}",
         per_row(&mut hashed, rows)
-    );
-    println!(
-        "  length-prefixed + its hash {}",
-        per_row(&mut prefixed, rows)
     );
 }
 
@@ -457,16 +411,15 @@ fn restore(ids: &[i64], file_rows: usize, reps: usize) {
         samples.push(started.elapsed());
         assert_eq!(run.len(), ids.len());
     }
-    samples.sort_unstable();
-    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+    let (p50, p99, max) = quantiles(&mut samples);
     println!(
         "restore {:>9} rows, {:>6.1} MB: p50 {:>7.2} ms, p99 {:>7.2} ms, max {:>7.2} ms ({:.1} ns/row at p99)",
         ids.len(),
         bytes.len() as f64 / 1e6,
-        ms(at(0.5)),
-        ms(at(0.99)),
-        ms(samples[samples.len() - 1]),
-        at(0.99).as_nanos() as f64 / ids.len() as f64
+        ms(p50),
+        ms(p99),
+        ms(max),
+        p99.as_nanos() as f64 / ids.len() as f64
     );
 }
 

@@ -135,6 +135,56 @@ fn word_hash(word: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Whether a run's `slots` and `postings` are laid out as `RunWriter` writes
+/// them, so every lookup reads exactly its own word's rows: each
+/// multi-posting word's stream starts where the previous one ended, in word
+/// order, and the streams fill `postings` exactly; every stream decodes in
+/// full, ascending, with positions in range; and the postings add up to
+/// `rows`. A stream that ended early would skip rows after the damage, and two
+/// words sharing one would give the second the first's rows.
+fn postings_intact(files: usize, slots: &[u32], postings: &[u8], rows: usize) -> bool {
+    let files = files.max(1) as u64;
+    // Where the next word's stream has to start.
+    let mut end = 0_usize;
+    let mut total = 0_usize;
+    for &slot in slots {
+        // A lone posting is below `MULTI`, so its position is in range.
+        if word_proof::slot_is_lone(slot) {
+            total += 1;
+            continue;
+        }
+        let mut at = word_proof::slot_offset(slot) as usize;
+        if at != end {
+            return false;
+        }
+        let Some(count) = varint::get(postings, &mut at).filter(|&count| count > 0) else {
+            return false;
+        };
+        let mut posting = 0_u64;
+        for i in 0..count {
+            let next = varint::get(postings, &mut at)
+                .filter(|&delta| i == 0 || delta > 0)
+                .and_then(|delta| posting.checked_add(delta));
+            let Some(next) = next else {
+                return false;
+            };
+            posting = next;
+        }
+        // Postings ascend, so the last holds the largest position. Each took
+        // at least one byte, so the count fits a `usize` and the total cannot
+        // overflow.
+        let Ok(count) = usize::try_from(count) else {
+            return false;
+        };
+        if posting / files > POSITION_MASK {
+            return false;
+        }
+        total += count;
+        end = at;
+    }
+    end == postings.len() && total == rows
+}
+
 /// An immutable index over exactly the files one write produced: every
 /// distinct key word ([`KeyEncoder::key_word`]) of their rows, ascending, each
 /// with its rows' postings.
@@ -222,7 +272,9 @@ impl IndexRun {
             + self
                 .files
                 .iter()
-                .map(|f| f.len() + std::mem::size_of::<String>())
+                // The `Arc<str>` itself, and its allocation: the two reference
+                // counts, then the name.
+                .map(|f| size_of::<Arc<str>>() + 2 * size_of::<usize>() + f.len())
                 .sum::<usize>()
     }
 
@@ -260,54 +312,6 @@ impl IndexRun {
             posting = next;
             f(posting);
         }
-    }
-
-    /// Whether every word's postings decode in full, ascending, with
-    /// positions in range, and add up to the run's row count. A stream that
-    /// ended early would make a lookup skip the rows after it.
-    fn postings_intact(&self) -> bool {
-        let files = self.files.len().max(1) as u64;
-        let in_range = |posting: u64| posting / files <= POSITION_MASK;
-        let mut rows = 0_usize;
-        for &slot in &self.slots {
-            if word_proof::slot_is_lone(slot) {
-                if !in_range(u64::from(slot)) {
-                    return false;
-                }
-                rows += 1;
-                continue;
-            }
-            let mut from = word_proof::slot_offset(slot) as usize;
-            let Some(count) = varint::get(&self.postings, &mut from) else {
-                return false;
-            };
-            // Every posting takes at least one byte.
-            if count == 0 || count > (self.postings.len() - from) as u64 {
-                return false;
-            }
-            let mut posting = 0_u64;
-            for i in 0..count {
-                let next = varint::get(&self.postings, &mut from)
-                    .filter(|&delta| i == 0 || delta > 0)
-                    .and_then(|delta| posting.checked_add(delta));
-                let Some(next) = next else {
-                    return false;
-                };
-                posting = next;
-            }
-            // Postings ascend, so the last holds the largest position.
-            let Some(total) = usize::try_from(count)
-                .ok()
-                .and_then(|count| rows.checked_add(count))
-            else {
-                return false;
-            };
-            if !in_range(posting) {
-                return false;
-            }
-            rows = total;
-        }
-        rows == self.rows
     }
 
     /// Call `f(word, file, position)` for every row the run indexes, in word
@@ -392,25 +396,18 @@ impl IndexRun {
         let slots = reader.u32s(word_count)?;
         let postings_len = reader.len()?;
         let postings = reader.bytes(postings_len)?.to_vec();
-        let ordered = words.windows(2).all(|pair| pair[0] < pair[1])
-            && slots.iter().all(|&slot| {
-                word_proof::slot_is_lone(slot)
-                    || (word_proof::slot_offset(slot) as usize) < postings.len()
-            });
-        if !ordered || !reader.is_empty() {
+        let ordered = words.windows(2).all(|pair| pair[0] < pair[1]);
+        if !ordered || !reader.is_empty() || !postings_intact(files.len(), &slots, &postings, rows)
+        {
             return Err(Error::Corrupt);
         }
-        let run = Self::from_parts(
+        Ok(Self::from_parts(
             files.into(),
             words.into(),
             slots.into(),
             postings.into(),
             rows,
-        );
-        if !run.postings_intact() {
-            return Err(Error::Corrupt);
-        }
-        Ok(run)
+        ))
     }
 }
 
@@ -742,17 +739,13 @@ struct TableFilter {
 }
 
 impl TableFilter {
-    fn sized(keys: usize) -> Self {
+    /// A filter over no keys, for an index with no run.
+    fn empty() -> Self {
         Self {
-            filter: SplitBlockBloomFilter::new(keys),
-            capacity: keys,
+            filter: SplitBlockBloomFilter::new(0),
+            capacity: 0,
             distinct: AtomicUsize::new(0),
         }
-    }
-
-    /// A filter over the keys of `runs`.
-    fn over(runs: &[RunEntry]) -> Self {
-        Self::of_runs(runs.iter().map(|entry| &*entry.run))
     }
 
     /// A filter sized for, and holding, the keys of `runs`, filled before any
@@ -809,7 +802,7 @@ impl Layers {
     fn new(runs: Vec<RunEntry>, filter: Arc<TableFilter>) -> Self {
         // No run left: the filter holds only retired keys, so let it go.
         let filter = if runs.is_empty() && filter.capacity > 0 {
-            Arc::new(TableFilter::sized(0))
+            Arc::new(TableFilter::empty())
         } else {
             filter
         };
@@ -1113,7 +1106,7 @@ impl TieredIndex {
     pub fn new(encoder: KeyEncoder) -> Self {
         Self {
             encoder: Arc::new(encoder),
-            layers: ArcSwap::from_pointee(Layers::new(Vec::new(), Arc::new(TableFilter::sized(0)))),
+            layers: ArcSwap::from_pointee(Layers::new(Vec::new(), Arc::new(TableFilter::empty()))),
             swap: Mutex::new(()),
             merging: Mutex::new(()),
         }
@@ -1246,7 +1239,7 @@ impl TieredIndex {
         if !snapshot.filter.needs_rebuild(&snapshot.runs) {
             return false;
         }
-        let rebuilt = TableFilter::over(&snapshot.runs);
+        let rebuilt = TableFilter::of_runs(snapshot.runs.iter().map(|entry| &*entry.run));
         let _swap = self.swap.lock();
         let now = self.layers.load_full();
         for entry in &now.runs {
@@ -2254,6 +2247,41 @@ mod persist_tests {
                 "{what} accepted"
             );
         }
+    }
+
+    /// Two words whose slots share one posting stream, leaving the stream of
+    /// the second unreferenced, are rejected even when the row count adds
+    /// up: the second word's lookups would read the first's rows and miss
+    /// its own.
+    #[test]
+    fn a_run_whose_words_share_a_posting_stream_is_rejected() {
+        let mut postings = varints(&[2, 0, 5]);
+        let second = u32::try_from(postings.len()).expect("small");
+        postings.extend(varints(&[2, 1, 2]));
+        let sealed = |slots: Vec<u32>, rows: usize| {
+            IndexRun::from_parts(
+                vec![Arc::from("a")].into(),
+                vec![7, 9].into(),
+                slots.into(),
+                postings.clone().into(),
+                rows,
+            )
+            .to_bytes()
+        };
+        let intact = IndexRun::from_bytes(&sealed(
+            vec![word_proof::offset_slot(0), word_proof::offset_slot(second)],
+            4,
+        ))
+        .expect("streams laid out in word order load");
+        let mut got = Vec::new();
+        intact.lookup(9, |file, position| got.push((file.to_string(), position)));
+        assert_eq!(got, vec![("a".to_string(), 1), ("a".to_string(), 3)]);
+
+        let shared = sealed(
+            vec![word_proof::offset_slot(0), word_proof::offset_slot(0)],
+            4,
+        );
+        assert_eq!(IndexRun::from_bytes(&shared).err(), Some(Error::Corrupt));
     }
 
     /// Words out of order, or offsets that do not span the postings, are
