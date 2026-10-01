@@ -389,29 +389,3 @@ pub enum SharedAccelerationSnapshotError {
     ))]
     DuckDbSharedFile { datasets: String, path: String },
 }
-
-#[derive(Debug, Snafu)]
-pub enum CayenneSnapshotValidationError {
-    #[snafu(display(
-        "Cayenne datasets sharing metadata directory '{metadata_dir}' have inconsistent snapshot settings. \
-        Datasets with snapshots enabled: [{enabled_datasets}]. Datasets with snapshots disabled: [{disabled_datasets}]. \
-        All Cayenne datasets sharing the same metadata directory must have the same snapshot \
-        configuration (either all enabled or all disabled). \
-        See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
-    ))]
-    InconsistentSnapshotSettings {
-        metadata_dir: String,
-        enabled_datasets: String,
-        disabled_datasets: String,
-    },
-
-    #[snafu(display(
-        "Cayenne doesn't support snapshots for shared acceleration. \
-        Datasets [{datasets}] share metadata directory '{metadata_dir}'. \
-        Only single dataset per spicepod is supported when snapshots are enabled"
-    ))]
-    SharedAcceleration {
-        metadata_dir: String,
-        datasets: String,
-    },
-}
