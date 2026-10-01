@@ -32,7 +32,7 @@ use async_openai::types::chat::{
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails, ToolChoiceOptions,
+    FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -480,19 +480,7 @@ fn create_new_recursive_req(
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
-
-    // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
-    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
-    if matches!(
-        new_req.tool_choice,
-        Some(ChatCompletionToolChoiceOption::Function(_)) | None
-    ) {
-        // Auto is default when tools exist.
-        tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
-        new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Mode(
-            ToolChoiceOptions::Auto,
-        ));
-    }
+    new_req.tool_choice = next_round_tool_choice(new_req.tool_choice.take());
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_completion_tokens) = new_req.max_completion_tokens
@@ -503,6 +491,49 @@ fn create_new_recursive_req(
     }
 
     new_req
+}
+
+/// The `tool_choice` for the round after one that called tools.
+///
+/// A choice that forces a tool call applies to the round it was sent with, as it
+/// does for a single completion: once that round has called a tool, a named
+/// function, `required` and `allowed_tools` in `required` mode are satisfied, and
+/// the next round may answer (issue #14459). Re-sending one would force a tool call
+/// on every round until `tool_recursion_limit` runs out, so the turn could never
+/// end in an answer. `allowed_tools` keeps its tool list, in `auto` mode.
+///
+/// An unset choice becomes `auto` as well: one configured as a default in the
+/// Spicepod (`openai_tool_choice`) arrives here unset, and must not force a call on
+/// every round either.
+fn next_round_tool_choice(
+    choice: Option<ChatCompletionToolChoiceOption>,
+) -> Option<ChatCompletionToolChoiceOption> {
+    match choice {
+        None
+        | Some(
+            ChatCompletionToolChoiceOption::Function(_)
+            | ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
+        ) => {
+            tracing::debug!("Not forcing a tool call again after a round that made one.");
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            ))
+        }
+        Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
+            for entry in &mut allowed.allowed_tools {
+                entry.mode = ToolChoiceAllowedMode::Auto;
+            }
+            Some(ChatCompletionToolChoiceOption::AllowedTools(allowed))
+        }
+        // A custom tool is the client's to call, so a round that called a runtime
+        // tool never ran under one; `auto` and `none` force nothing.
+        Some(
+            choice @ (ChatCompletionToolChoiceOption::Custom(_)
+            | ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto | ToolChoiceOptions::None,
+            )),
+        ) => Some(choice),
+    }
 }
 
 pub fn combine_usage(
@@ -869,6 +900,64 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::chat::{
+        ChatCompletionAllowedTools, ChatCompletionAllowedToolsChoice,
+        ChatCompletionNamedToolChoice, FunctionName,
+    };
+
+    fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
+        ChatCompletionToolChoiceOption::AllowedTools(ChatCompletionAllowedToolsChoice {
+            allowed_tools: vec![ChatCompletionAllowedTools {
+                mode,
+                tools: vec![serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "list_datasets" }
+                })],
+            }],
+        })
+    }
+
+    // regression test for #14459
+    #[test]
+    fn a_choice_that_forces_a_tool_call_is_not_sent_again_after_a_round_that_made_one() {
+        let auto = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
+        for forced in [
+            None,
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Required,
+            )),
+            Some(ChatCompletionToolChoiceOption::Function(
+                ChatCompletionNamedToolChoice {
+                    function: FunctionName {
+                        name: "list_datasets".to_string(),
+                    },
+                },
+            )),
+        ] {
+            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+        }
+
+        // `allowed_tools` keeps its tool list, no longer requiring a call from it.
+        assert_eq!(
+            next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto))
+        );
+
+        // Choices that force nothing pass through unchanged.
+        for unforced in [
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
+            allowed_tools(ToolChoiceAllowedMode::Auto),
+        ] {
+            assert_eq!(
+                next_round_tool_choice(Some(unforced.clone())),
+                Some(unforced)
+            );
+        }
+    }
+
     use async_openai::types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
