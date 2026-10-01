@@ -266,8 +266,10 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             if let Some(live_table) = live_table {
                 return self.compacted_plan(dirs, live_table).await;
             }
-            tracing::warn!(
-                "Snapshot of dataset '{dataset_name}' is being published without compaction: this snapshot is taken from the on-disk layout, not the running table, so `snapshots_compaction: enabled` cannot apply to it. The dataset's regular snapshots are compacted."
+            // Only the pre-recreation snapshot has no live table; its
+            // uncompacted archive is still correct.
+            tracing::debug!(
+                "Snapshot of dataset '{dataset_name}' archived without compaction: no live table to read"
             );
         }
 
