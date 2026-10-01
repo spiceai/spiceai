@@ -345,7 +345,7 @@ impl CacheWriter {
             match driver.await {
                 Ok(Ok(())) => {}
                 result => {
-                    tracing::debug!(dataset = %self.0.dataset, ?result, "Change ingestion drain failed")
+                    tracing::debug!(dataset = %self.0.dataset, ?result, "Change ingestion drain failed");
                 }
             }
         }

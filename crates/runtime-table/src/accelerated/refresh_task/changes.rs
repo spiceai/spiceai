@@ -1987,7 +1987,7 @@ impl RefreshTask {
             let _guard = self.accelerator_write_mutex.lock().await;
             let result: datafusion::error::Result<bool> = async {
                 let write = cayenne
-                    .write_replace_sets(replacements, recovery, &context.write_ctx)
+                    .write_replace_sets(replacements, recovery, context.write_ctx)
                     .await?;
                 let in_memory = write.in_memory_epoch().is_some();
                 write.finish().await?;

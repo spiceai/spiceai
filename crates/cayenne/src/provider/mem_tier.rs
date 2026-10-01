@@ -1176,7 +1176,7 @@ mod tests {
             },
             |_| None,
         );
-        assert!(result.is_err());
+        result.unwrap_err();
         assert_eq!(visited, 2);
         assert!(Arc::ptr_eq(&before, &tier.segments));
         assert_eq!(tier.rows, 4);

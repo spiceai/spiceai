@@ -107,7 +107,7 @@ impl PrimaryKeys {
                 .map(|array| array.slice(offset, length))
                 .collect();
             let rows = converter.convert_columns(&chunk)?;
-            for row in rows.iter() {
+            for row in &rows {
                 let key = row.as_ref();
                 if self.seen.contains(key) {
                     return Err(DataFusionError::Plan(
@@ -170,7 +170,7 @@ pub(super) async fn write_snapshot(
     let start = Instant::now();
     let rows = replacements
         .iter()
-        .flat_map(|replacement| replacement.batches())
+        .flat_map(data_components::cdc::mutation::ReplaceSet::batches)
         .try_fold(0_u64, |rows, batch| {
             rows.checked_add(batch.num_rows() as u64).ok_or_else(|| {
                 DataFusionError::Plan("Complete-set replacement row count exceeds u64".into())
