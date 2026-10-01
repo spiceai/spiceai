@@ -243,15 +243,16 @@ assert_silent_about 'no longer running'
 
 # A stand-in for the `spice` CLI that emulates just enough of the `chat` and
 # `search` REPLs for the scripts to run, and that can be told to exit part-way
-# through so the crash paths are exercised.
-mkdir -p "$work_dir/bin"
-cat >"$work_dir/bin/spice" <<'STAND_IN'
-#!/usr/bin/env bash
+# through so the crash paths are exercised. It is input to the installed shell,
+# not an executable: first exec of a freshly written script can stall before
+# its interpreter starts on macOS (#13761).
+cat >"$work_dir/spice.sh" <<'STAND_IN'
 set -u
 mode=$1
 exit_before=${SPICE_FAKE_EXIT_BEFORE_TURN:-0}
 exit_after=${SPICE_FAKE_EXIT_AFTER_TURN:-0}
 sleep_secs=${SPICE_FAKE_SLEEP_SECONDS:-0}
+initial_sleep_secs=${SPICE_FAKE_INITIAL_SLEEP_SECONDS:-0}
 
 # Records how the script invoked us, so a test can check that the runtime
 # endpoint was passed through rather than left at the CLI default.
@@ -265,6 +266,9 @@ if [ "$mode" = 'search' ]; then
 fi
 
 turn=0
+if [ "$initial_sleep_secs" -gt 0 ]; then
+  sleep "$initial_sleep_secs"
+fi
 printf '%s' "$prompt"
 
 while IFS= read -r line; do
@@ -299,7 +303,19 @@ while IFS= read -r line; do
   fi
 done
 STAND_IN
-chmod +x "$work_dir/bin/spice"
+
+# Source the real E2E script and adapt only its spawn command. Keep spawn_id in
+# the caller's scope so all prompt, crash and timeout checks use the real pty.
+cat >"$work_dir/script_case.exp" <<'DRIVER'
+rename spawn stand_in_spawn
+proc spawn {command args} {
+    if {$command ne "spice"} {
+        error "Expected the E2E script to spawn spice, got $command"
+    }
+    uplevel 1 [list stand_in_spawn /bin/sh $::env(SPICE_FAKE_SCRIPT) {*}$args]
+}
+source $::env(SPICE_EXPECT_SCRIPT)
+DRIVER
 
 # script_case <name> <script> [env assignments...] — runs one of the E2E scripts
 # against the stand-in `spice`.
@@ -309,7 +325,10 @@ script_case() {
   shift 2
 
   printf 'case: %s\n' "$name"
-  case_output=$(PATH="$work_dir/bin:$PATH" env "$@" "$script_dir/$script" 2>&1)
+  case_output=$(env "$@" \
+    SPICE_FAKE_SCRIPT="$work_dir/spice.sh" \
+    SPICE_EXPECT_SCRIPT="$script_dir/$script" \
+    /usr/bin/expect -f "$work_dir/script_case.exp" 2>&1)
   case_status=$?
 }
 
@@ -332,6 +351,14 @@ script_case 'chat_01_simple.exp when the REPL exits before answering' chat_01_si
 assert_status 1
 assert_reports 'Waiting for the response to'
 assert_reports 'exited with status 44'
+assert_silent_about 'Model returned expected response'
+
+# A stand-in that starts but never reaches its prompt must still time out.
+script_case 'chat_01_simple.exp times out waiting for the initial prompt' chat_01_simple.exp \
+  SPICE_CHAT_EXPECT_TIMEOUT=1 \
+  SPICE_FAKE_INITIAL_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'Timeout waiting for initial chat prompt'
 assert_silent_about 'Model returned expected response'
 
 # A generation that outlives the chat expect budget must fail as a timeout, not
