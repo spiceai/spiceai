@@ -150,6 +150,29 @@ pub trait Index: Debug + Send + Sync + 'static {
         )))
     }
 
+    /// Builds a fresh, empty instance of this index that persists into `staging_dir`, bound to
+    /// `base` as its new-generation data source and sharing this index's identity and schema.
+    ///
+    /// The returned index is populated by the caller through the ordinary write primitives
+    /// ([`Index::on_write_start`] with [`WriteWindow::ReplaceAll`], [`Index::compute_index`],
+    /// [`Index::on_write_complete`]) and then installed into this (live) index via
+    /// [`Index::restore_from`] pointed at `staging_dir` — the same atomic install the artifact
+    /// path uses. This lets a configured index with no snapshot artifact be reconstructed from
+    /// the restored acceleration data at the same generation.
+    ///
+    /// Default errors: an index with no durable snapshot state cannot be rebuilt this way.
+    async fn new_staging_from_source(
+        &self,
+        base: Arc<dyn TableProvider>,
+        staging_dir: &Path,
+    ) -> Result<Arc<dyn Index + Send + Sync>> {
+        let _ = (base, staging_dir);
+        Err(datafusion::error::DataFusionError::NotImplemented(format!(
+            "Index {} does not support snapshot rebuild",
+            self.name()
+        )))
+    }
+
     /// Compute the index - if the index data is represented in the batch itself (i.e. a vector
     /// "*_embedding" column) then modify the provided batches to include the computed column.
     async fn compute_index(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {

@@ -1586,7 +1586,11 @@ impl RefreshTask {
         // later failure (accelerator reload, schema check) would leave the live index pointing at
         // a newer generation than the still-live (old) database, which could return rows that
         // don't correspond to the visible data.
-        if let Err(error) = state.manager.restore_indexes_from_snapshot(&info).await {
+        if let Err(error) = state
+            .manager
+            .restore_indexes_from_snapshot(&info, &new_provider)
+            .await
+        {
             tracing::error!(
                 dataset = %self.dataset_name,
                 snapshot_id = info.snapshot_id,

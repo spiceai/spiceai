@@ -108,6 +108,18 @@ impl Index for CompoundSearchIndex {
         self.primary.restore_from(extracted_dir).await
     }
 
+    async fn new_staging_from_source(
+        &self,
+        base: Arc<dyn TableProvider>,
+        staging_dir: &Path,
+    ) -> DataFusionResult<Arc<dyn Index + Send + Sync>> {
+        // Only the primary carries snapshotable state; the compound routes source rows to it
+        // unchanged, so the fresh primary reproduces the same on-disk content.
+        self.primary
+            .new_staging_from_source(base, staging_dir)
+            .await
+    }
+
     async fn compute_index(
         &self,
         batches: Vec<RecordBatch>,
