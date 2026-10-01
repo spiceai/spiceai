@@ -3667,7 +3667,7 @@ mod tests {
 #[cfg(target_os = "macos")]
 mod real_launchd {
     use std::cell::RefCell;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::net::TcpListener;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::Path;

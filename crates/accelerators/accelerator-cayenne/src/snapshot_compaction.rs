@@ -45,8 +45,9 @@ use cayenne::metastore::EXPECTED_TABLES;
 use cayenne::metastore::snapshot::{
     DatasetMetastoreSlice, SLICE_ENGINE, SLICE_FORMAT_VERSION, SliceRow, SliceValue,
 };
-use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
@@ -57,6 +58,10 @@ use runtime_acceleration::snapshot::engine::{
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 const CAYENNE_TABLE: &str = "cayenne_table";
+/// Rows that mark committed-but-undelivered federated write-backs. They are
+/// not part of the table's data, so the rewrite does not produce them; they
+/// are carried over from the live table as-is.
+const PENDING_WRITE_BACK: &str = "cayenne_pending_write_back";
 
 const DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
 
@@ -82,6 +87,11 @@ pub enum CompactionError {
         "Dataset '{dataset}' has no Cayenne table, so its snapshot cannot be compacted"
     ))]
     MissingTableRow { dataset: String },
+
+    #[snafu(display(
+        "Dataset '{dataset}' is not served by a Cayenne table, so its snapshot cannot be compacted"
+    ))]
+    NotCayenneTable { dataset: String },
 
     #[snafu(display(
         "Dataset '{dataset}' uses a Cayenne table layout this version cannot compact ('{column}' is missing). Set `snapshots_compaction: disabled` for this dataset. See: {DOCS}"
@@ -163,6 +173,8 @@ pub struct CompactionCapture {
     dataset_name: String,
     /// The live `cayenne_table` row, paths relative to the live data directory.
     table_row: SliceRow,
+    /// The live `cayenne_pending_write_back` rows, carried into the slice as-is.
+    pending_write_back: Vec<SliceRow>,
     /// Scan of the live table, bound to the view captured at plan build.
     scan: Arc<dyn ExecutionPlan>,
     /// Session the scan was planned in; the rewrite runs in it too.
@@ -183,7 +195,23 @@ impl CompactionCapture {
         live_data_dir: &Path,
         live_table: &Arc<dyn TableProvider>,
     ) -> Result<Self> {
-        let session = SessionContext::new();
+        // The runtime's `RuntimeEnv` carries the query memory pool and object
+        // stores; a fresh default one would put the rewrite outside
+        // `runtime.query.memory_limit`.
+        let runtime_env = spice_table::find_concrete::<CayenneTableProvider>(
+            live_table.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .map(CayenneTableProvider::runtime_env)
+        .context(NotCayenneTableSnafu {
+            dataset: dataset_name,
+        })?;
+        let session = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_runtime_env(runtime_env)
+                .build(),
+        );
         let scan = live_table
             .scan(&session.state(), None, &[], None)
             .await
@@ -205,6 +233,11 @@ impl CompactionCapture {
             .context(MissingTableRowSnafu {
                 dataset: dataset_name,
             })?;
+        let pending_write_back = slice
+            .tables
+            .get(PENDING_WRITE_BACK)
+            .cloned()
+            .unwrap_or_default();
 
         // The path is re-anchored at the scratch directory and again on the
         // reader, which needs it to be relative.
@@ -251,6 +284,7 @@ impl CompactionCapture {
         Ok(Self {
             dataset_name: dataset_name.to_string(),
             table_row,
+            pending_write_back,
             scan,
             session,
         })
@@ -316,7 +350,13 @@ impl CompactionCapture {
             engine: SLICE_ENGINE.to_string(),
             dataset_name: dataset.to_string(),
             exported_at_ms,
-            tables: BTreeMap::from([(CAYENNE_TABLE.to_string(), vec![row])]),
+            tables: BTreeMap::from([
+                (CAYENNE_TABLE.to_string(), vec![row]),
+                (
+                    PENDING_WRITE_BACK.to_string(),
+                    self.pending_write_back.clone(),
+                ),
+            ]),
         };
         scratch_catalog
             .import_dataset_slice(&seed, &scratch_data_dir)
@@ -1551,6 +1591,98 @@ mod tests {
             expected,
             "the compacted snapshot must carry the inline-tier rows"
         );
+    }
+
+    /// The capture plans and rewrites in the live table's `RuntimeEnv`, so the
+    /// rewrite is accounted against the runtime's query memory pool.
+    #[tokio::test]
+    async fn capture_uses_the_live_tables_runtime_env() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = Node::new(&tmp.path().join("writer")).await;
+        let live = create_live_table(&writer).await;
+        insert(&live, &[(1, 10)]).await;
+        let live_dyn: Arc<dyn TableProvider> = Arc::clone(&live) as Arc<dyn TableProvider>;
+        let capture =
+            CompactionCapture::capture(&writer.catalog, DATASET, &writer.data_dir, &live_dyn)
+                .await
+                .expect("capture");
+        assert!(
+            Arc::ptr_eq(&capture.session.runtime_env(), &live.runtime_env()),
+            "the rewrite must run in the live table's RuntimeEnv"
+        );
+    }
+
+    /// Undelivered federated write-back markers are not table data, so the
+    /// rewrite does not produce them; they are carried over from the live
+    /// table so a restored snapshot still knows what is owed to the source.
+    #[tokio::test]
+    async fn compaction_carries_pending_write_back_markers() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = Node::new(&tmp.path().join("writer")).await;
+        let live = create_live_table(&writer).await;
+        insert(&live, &[(1, 10), (2, 20)]).await;
+        let meta = writer.catalog.get_table(DATASET).await.expect("live meta");
+        let table_key = cayenne::metastore::table_id_to_key_bytes(&meta.table_id);
+        {
+            let conn = rusqlite::Connection::open(writer.metadata_dir.join("cayenne.db"))
+                .expect("open live metastore");
+            conn.execute(
+                "INSERT INTO cayenne_pending_write_back (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
+                rusqlite::params![table_key, vec![0u8, 0, 0, 1], 7_i64],
+            )
+            .expect("mark a pending write-back");
+        }
+
+        let engine = CayenneSnapshotEngine::new(
+            Arc::clone(&writer.catalog),
+            DATASET,
+            writer.data_dir.clone(),
+        )
+        .with_compaction(true);
+        let live_dyn: Arc<dyn TableProvider> = Arc::clone(&live) as Arc<dyn TableProvider>;
+        let plan = engine
+            .prepare_directory_snapshot(&writer.dirs(), DATASET, Some(&live_dyn))
+            .await
+            .expect("prepare");
+        let materialized = plan
+            .deferred
+            .expect("compaction defers the build")
+            .await
+            .expect("materialize");
+        let slice_bytes = materialized
+            .extra_entries
+            .iter()
+            .find(|e| e.archive_path.ends_with(".slice.json"))
+            .map(|e| e.bytes.clone())
+            .expect("slice in archive");
+        for dir in &materialized.cleanup_dirs {
+            tokio::fs::remove_dir_all(dir)
+                .await
+                .expect("cleanup scratch");
+        }
+        let slice = DatasetMetastoreSlice::from_json_bytes(&slice_bytes).expect("parse slice");
+        assert_eq!(
+            slice.tables.get(PENDING_WRITE_BACK).map(Vec::len),
+            Some(1),
+            "the compacted slice must carry the pending write-back marker"
+        );
+
+        let reader = Node::new(&tmp.path().join("reader")).await;
+        reader
+            .catalog
+            .import_dataset_slice(&slice, &reader.data_dir)
+            .await
+            .expect("import slice");
+        let conn = rusqlite::Connection::open(reader.metadata_dir.join("cayenne.db"))
+            .expect("open reader metastore");
+        let restored: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM cayenne_pending_write_back WHERE table_id = ?1",
+                rusqlite::params![table_key],
+                |row| row.get(0),
+            )
+            .expect("count markers");
+        assert_eq!(restored, 1, "the restored metastore must keep the marker");
     }
 
     #[test]

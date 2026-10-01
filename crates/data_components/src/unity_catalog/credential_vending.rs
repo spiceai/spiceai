@@ -400,7 +400,6 @@ mod delta {
     use datafusion::datasource::TableProvider;
     use datafusion::sql::TableReference;
     use secrecy::{ExposeSecret, SecretString};
-    use snafu::prelude::*;
     use tokio::runtime::Handle;
 
     use super::*;

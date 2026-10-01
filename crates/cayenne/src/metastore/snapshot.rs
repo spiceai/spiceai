@@ -237,6 +237,15 @@ fn make_absolute(rel_or_abs: &str, anchor: &Path) -> String {
     }
 }
 
+/// Tables whose `table_id` column holds the raw-UUID-bytes BLOB rather than
+/// text, and which have no foreign key to `cayenne_table`.
+fn blob_table_id(table_name: &str) -> bool {
+    matches!(
+        table_name,
+        "cayenne_insert_record" | "cayenne_pending_write_back"
+    )
+}
+
 /// Lookup `table_id` for the given dataset, returning `None` if not found.
 async fn lookup_table_id(
     metastore: &impl MetastoreBackend,
@@ -291,11 +300,12 @@ pub async fn export_dataset(
                 vec![MetastoreValue::Text(dataset_name.to_string())],
             )
         } else {
-            // `cayenne_insert_record.table_id` is stored as the raw-UUID-bytes
-            // BLOB (see `metastore::table_id_to_key_bytes`), so its filter must
-            // bind a BLOB — a TEXT bind never matches a BLOB column in SQLite.
-            // Every other child table keeps `table_id` as TEXT.
-            let table_id_param = if expected.name == "cayenne_insert_record" {
+            // `cayenne_insert_record` and `cayenne_pending_write_back` store
+            // `table_id` as the raw-UUID-bytes BLOB (see
+            // `metastore::table_id_to_key_bytes`), so their filter must bind a
+            // BLOB — a TEXT bind never matches a BLOB column in SQLite. Every
+            // other child table keeps `table_id` as TEXT.
+            let table_id_param = if blob_table_id(expected.name) {
                 MetastoreValue::Blob(super::table_id_to_key_bytes(&table_id))
             } else {
                 MetastoreValue::Text(table_id.clone())
@@ -392,11 +402,11 @@ pub async fn import_dataset(
 
     // Wholesale-replace any existing rows for this dataset. `cayenne_table`'s
     // `ON DELETE CASCADE` clears the dependent rows of every child table whose
-    // foreign key still references it — but `cayenne_insert_record` no longer
-    // has that foreign key (its `table_id` is a raw-bytes BLOB; see
-    // `metastore::table_id_to_key_bytes`), so resolve the existing `table_id`
-    // and clear its insert-records explicitly first, inside the same
-    // transaction, before the parent row is removed.
+    // foreign key still references it — but `cayenne_insert_record` and
+    // `cayenne_pending_write_back` have no such foreign key (their `table_id`
+    // is a raw-bytes BLOB; see `metastore::table_id_to_key_bytes`), so resolve
+    // the existing `table_id` and clear their rows explicitly first, inside the
+    // same transaction, before the parent row is removed.
     if let Ok(values) = txn
         .query_row_values(QueryRowParams {
             sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
@@ -405,13 +415,15 @@ pub async fn import_dataset(
         .await
         && let Some(MetastoreValue::Text(existing_table_id)) = values.into_iter().next()
     {
-        txn.execute(ExecuteParams {
-            sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?",
-            params: vec![MetastoreValue::Blob(super::table_id_to_key_bytes(
-                &existing_table_id,
-            ))],
-        })
-        .await?;
+        for table in ["cayenne_insert_record", "cayenne_pending_write_back"] {
+            txn.execute(ExecuteParams {
+                sql: &format!("DELETE FROM {table} WHERE table_id = ?"),
+                params: vec![MetastoreValue::Blob(super::table_id_to_key_bytes(
+                    &existing_table_id,
+                ))],
+            })
+            .await?;
+        }
     }
 
     txn.execute(ExecuteParams {

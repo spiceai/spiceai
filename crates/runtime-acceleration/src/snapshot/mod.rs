@@ -566,7 +566,10 @@ pub enum SnapshotUploadError {
         source: std::io::Error,
     },
     #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
-    PrepareUpload { source: engine::SnapshotEngineError },
+    PrepareUpload {
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     AdapterDisabled { dataset: String },
     #[snafu(display("Failed to create snapshot archive at {}: {source}", path.display()))]
@@ -755,6 +758,48 @@ struct SnapshotPhases {
     upload: Duration,
     archive_bytes: u64,
     deferred: bool,
+}
+
+/// Removes a deferred build's scratch directories when dropped, so a snapshot
+/// cancelled while archiving does not leak a copy of the table under the
+/// temporary directory. The normal path removes them explicitly first.
+struct ScratchCleanup {
+    dirs: Vec<PathBuf>,
+}
+
+impl ScratchCleanup {
+    async fn remove_all(mut self, dataset_name: &str) {
+        for dir in std::mem::take(&mut self.dirs) {
+            if let Err(err) = fs::remove_dir_all(&dir).await
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    "Failed to remove the scratch directory left by building the snapshot of dataset {dataset_name}; remove {} by hand to reclaim its disk space. Cause: {err}",
+                    dir.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for ScratchCleanup {
+    fn drop(&mut self) {
+        let dirs = std::mem::take(&mut self.dirs);
+        if dirs.is_empty() {
+            return;
+        }
+        let remove = move || {
+            for dir in dirs {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        };
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(remove);
+            }
+            Err(_) => remove(),
+        }
+    }
 }
 
 pub struct ForceCreate(pub bool);
@@ -1630,7 +1675,9 @@ impl SnapshotManager {
             .snapshot_engine
             .prepare_directory_snapshot(dirs, &self.dataset_name, live_table)
             .await
-            .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            .map_err(|source| SnapshotUploadError::PrepareUpload {
+                source: Box::new(source),
+            })?;
         phases.prepare = prepare_started.elapsed();
 
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -1651,9 +1698,12 @@ impl SnapshotManager {
             );
 
             let build_started = Instant::now();
-            let materialized = deferred
-                .await
-                .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            let materialized =
+                deferred
+                    .await
+                    .map_err(|source| SnapshotUploadError::PrepareUpload {
+                        source: Box::new(source),
+                    })?;
             phases.build = build_started.elapsed();
             let skip_paths: Vec<PathBuf> = materialized.skip_relative_paths.into_iter().collect();
             let extras: Vec<(String, Vec<u8>)> = materialized
@@ -1662,6 +1712,11 @@ impl SnapshotManager {
                 .map(|e| (e.archive_path, e.bytes))
                 .collect();
 
+            // Held across the archive so a cancelled snapshot still removes
+            // the scratch directories.
+            let cleanup = ScratchCleanup {
+                dirs: materialized.cleanup_dirs,
+            };
             let archive_started = Instant::now();
             let result = archive_directories_to_file_with_plan(
                 &materialized.dirs,
@@ -1671,18 +1726,7 @@ impl SnapshotManager {
             )
             .await;
             phases.archive = archive_started.elapsed();
-
-            for dir in &materialized.cleanup_dirs {
-                if let Err(err) = fs::remove_dir_all(dir).await
-                    && err.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(
-                        "Failed to remove the scratch directory left by building the snapshot of dataset {}; remove {} by hand to reclaim its disk space. Cause: {err}",
-                        self.dataset_name,
-                        dir.display()
-                    );
-                }
-            }
+            cleanup.remove_all(&self.dataset_name).await;
 
             result
         } else {
@@ -6649,6 +6693,123 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.ends_with("live.bin")),
             "live directory must not be archived: {names:?}"
+        );
+    }
+
+    /// Engine whose deferred build waits for a signal, so the test can check
+    /// what the manager does while the build is pending.
+    struct BlockingDeferredEngine {
+        scratch: PathBuf,
+        release: Arc<tokio::sync::Notify>,
+        building: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl SnapshotEngine for BlockingDeferredEngine {
+        async fn prepare_for_upload(
+            &self,
+            source_path: &std::path::Path,
+            _dataset_name: &str,
+        ) -> Result<PathBuf, SnapshotEngineError> {
+            Ok(source_path.to_path_buf())
+        }
+
+        fn supports_compaction(&self) -> bool {
+            true
+        }
+
+        async fn prepare_directory_snapshot(
+            &self,
+            _dirs: &[(PathBuf, String)],
+            _dataset_name: &str,
+            _live_table: Option<&Arc<dyn TableProvider>>,
+        ) -> Result<DirectorySnapshotPlan, SnapshotEngineError> {
+            let scratch = self.scratch.clone();
+            let release = Arc::clone(&self.release);
+            let building = Arc::clone(&self.building);
+            Ok(DirectorySnapshotPlan {
+                deferred: Some(Box::pin(async move {
+                    building.notify_one();
+                    release.notified().await;
+                    Ok(engine::MaterializedDirectorySnapshot {
+                        dirs: vec![(scratch.clone(), "data/".to_string())],
+                        skip_relative_paths: HashSet::new(),
+                        extra_entries: Vec::new(),
+                        cleanup_dirs: vec![scratch],
+                    })
+                })),
+                ..DirectorySnapshotPlan::default()
+            })
+        }
+    }
+
+    /// The accelerator write lock is released before a deferred build runs:
+    /// while the build is blocked, the lock can be taken again.
+    #[tokio::test]
+    async fn deferred_build_runs_after_the_write_lock_is_released() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let live_dir = temp_dir.path().join("live");
+        let scratch = temp_dir.path().join("scratch");
+        std::fs::create_dir_all(&live_dir).expect("live dir");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("compacted.bin"), b"compacted").expect("scratch file");
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let building = Arc::new(tokio::sync::Notify::new());
+        let manager = Arc::new(build_directory_manager(
+            Arc::clone(&store),
+            live_dir,
+            Arc::new(BlockingDeferredEngine {
+                scratch,
+                release: Arc::clone(&release),
+                building: Arc::clone(&building),
+            }),
+        ));
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = Arc::clone(&mutex).lock_owned().await;
+        let building_signal = building.notified();
+        let snapshot = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .create_snapshot(&sample_schema(), lock_guard, None, None, ForceCreate(true))
+                    .await
+            })
+        };
+
+        building_signal.await;
+        assert!(
+            mutex.try_lock().is_ok(),
+            "the write lock must be free while the deferred build is pending"
+        );
+        release.notify_one();
+        snapshot
+            .await
+            .expect("snapshot task")
+            .expect("create snapshot")
+            .expect("snapshot path");
+    }
+
+    /// Dropping the cleanup guard removes the scratch directories, which is
+    /// what a snapshot cancelled mid-archive relies on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scratch_cleanup_guard_removes_directories_on_drop() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let scratch = temp_dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("compacted.bin"), b"compacted").expect("scratch file");
+
+        drop(ScratchCleanup {
+            dirs: vec![scratch.clone()],
+        });
+        let started = Instant::now();
+        while scratch.exists() && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !scratch.exists(),
+            "the guard must remove the scratch directory"
         );
     }
 
