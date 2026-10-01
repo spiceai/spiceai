@@ -185,13 +185,23 @@ pub enum Error {
     UnknownDataSource { data_source: String },
 
     #[snafu(display("Failed to initialize the query engine: {source}"))]
-    UnableToCreateBackend { source: datafusion::Error },
+    UnableToCreateBackend {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to attach view: {source}"))]
-    UnableToAttachView { source: datafusion::Error },
+    UnableToAttachView {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to attach dataset index: {source}"))]
-    UnableToAttachIndex { source: datafusion::Error },
+    UnableToAttachIndex {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
@@ -284,7 +294,8 @@ pub enum Error {
 
     #[snafu(display("Failed to setup the {connector_component} ({data_connector}). {source}"))]
     UnableToAttachDataConnector {
-        source: datafusion::Error,
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
         connector_component: ConnectorComponent,
         data_connector: String,
     },
@@ -442,7 +453,8 @@ pub enum Error {
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
         dataset: TableReference,
-        source: datafusion::Error,
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
     },
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
@@ -469,7 +481,10 @@ pub enum Error {
     UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to register metrics table: {source}"))]
-    UnableToRegisterMetricsTable { source: datafusion::Error },
+    UnableToRegisterMetricsTable {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
     InvalidSpicepodDataset {
@@ -713,6 +728,10 @@ pub struct Runtime {
     /// fetched from the scheduler; for all other modes it is set before
     /// the runtime starts.
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+
+    /// The engines found to have created the snapshots of datasets that read snapshots
+    /// (`file_format: snapshot`), which building those datasets needs.
+    snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
 }
 
 impl Debug for Runtime {
@@ -847,6 +866,13 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The engines of the snapshot sources this runtime has resolved.
+    pub(crate) fn snapshot_sources(
+        &self,
+    ) -> &Arc<component::dataset::snapshot_source::SnapshotSourceRegistry> {
+        &self.snapshot_sources
     }
 
     #[must_use]
@@ -2273,7 +2299,6 @@ impl Runtime {
 // below `runtime` can resolve it; re-exported here for path compatibility.
 pub use data_accelerator_api::spice_data_base_path;
 
-#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);

@@ -82,6 +82,53 @@ async fn scan_statistics(
     Ok((stats.total_byte_size, per_column))
 }
 
+/// The manifest rows a settle produces, waited for rather than read once.
+///
+/// `flush_pending_maintenance` does not guarantee the checkpoint/maintenance passes
+/// have committed their manifest rows by the time it returns, so on a loaded runner
+/// the first read comes back empty — a readiness race in the test, not a missing
+/// file. #13904 observed exactly that here (`TRY 1 FAIL` / `TRY 2 PASS` at the
+/// `!files.is_empty()` premise), and spiceai/spiceai#13906 is the same shape in a
+/// neighbouring suite. Poll the condition with a bound rather than sleeping a fixed
+/// amount, and name the last observed state on failure.
+async fn await_manifest_rows(
+    fixture: &common::TestFixture,
+    table_id: &str,
+) -> TestResult<Vec<cayenne::metadata::SnapshotFile>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let files = fixture.catalog.get_all_snapshot_files(table_id).await?;
+        if !files.is_empty() {
+            return Ok(files);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the settle must have produced a data file within 30s; \
+             `get_all_snapshot_files` still returns no manifest row for table {table_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The key a per-file statistics row is stored under: the object-store location,
+/// which is the store-relative path. The manifest carries only the bare filename.
+fn statistics_row_key(
+    data_path: &std::path::Path,
+    table_id: &str,
+    file: &cayenne::metadata::SnapshotFile,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        data_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .trim_end_matches('/'),
+        table_id,
+        file.snapshot_id,
+        file.file_path
+    )
+}
+
 async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -217,40 +264,10 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     // Overwrite every per-file row with a pre-change blob, which is the state an
     // installation that upgrades into this change is already in.
     let table_id = table.table_id().to_string();
-    // The manifest rows are published by the checkpoint/maintenance passes above, and
-    // `flush_pending_maintenance` does not guarantee they are committed by the time it
-    // returns. Poll for them rather than asserting once: on a loaded runner the first
-    // read comes back empty, which is a readiness race in this test and not a missing
-    // file (spiceai/spiceai#13906 is the same shape in a neighbouring suite).
-    let mut files = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline {
-        files = fixture.catalog.get_all_snapshot_files(&table_id).await?;
-        if !files.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(
-        !files.is_empty(),
-        "the settle must have produced a data file within 30s; \
-         `get_all_snapshot_files` still returns no manifest row for table {table_id}"
-    );
+    let files = await_manifest_rows(&fixture, &table_id).await?;
     let scan_snapshot_id = files[0].snapshot_id.clone();
-    // Per-file statistics rows are keyed by the object-store location, which is the
-    // store-relative path; the manifest carries only the bare filename.
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        format!(
-            "{}/{}/{}/{}",
-            fixture
-                .data_path
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .trim_end_matches('/'),
-            table_id,
-            file.snapshot_id,
-            file.file_path
-        )
+        statistics_row_key(&fixture.data_path, &table_id, file)
     };
     for file in &files {
         fixture
@@ -325,6 +342,143 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
         rewritten_rows > 0,
         "re-inference must persist the size back for the file it read, or every process re-reads the footer (seeded {} rows, none rewritten)",
         files.len()
+    );
+
+    Ok(())
+}
+
+test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
+
+const EVOLVED_TABLE: &str = "file_stats_source_evolved";
+
+/// A per-column size no Vortex footer would produce, so a scan reporting it was
+/// served from the persisted blob rather than from the file.
+const POISON_BYTES: usize = 1_234_567;
+
+fn evolved_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("extra", DataType::Int64, true),
+    ]))
+}
+
+/// Widening a table leaves every file written before the widening without the new
+/// column. The per-file blob those files persist can then never restore a
+/// `total_byte_size` — `file_statistics_to_df` sums the per-column sizes and the
+/// missing column has none — so a freshness check that reads that total rejects
+/// the blob on every cold scan, for the life of the file. The scan still answers
+/// correctly, from the footer, but the persisted row it exists to avoid re-reading
+/// is re-read and rewritten every time (regression test for #13829).
+async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            catalog,
+            CreateTableOptions {
+                table_name: EVOLVED_TABLE.to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    insert_rows(&table, 0..512).await?;
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+    table.flush_pending_maintenance().await?;
+
+    let evolution_ctx = arrow_tools::schema_evolution::EvolutionContext {
+        constraint_columns: &[],
+    };
+    let plan =
+        match arrow_tools::schema_evolution::classify(&schema(), &evolved_schema(), &evolution_ctx)
+        {
+            arrow_tools::schema_evolution::SchemaEvolution::Widening(plan) => plan,
+            other => panic!("expected a widening classification, got {other:?}"),
+        };
+    table.evolve_schema_live(&plan).await?;
+
+    // This scan takes the footer path (the widening cleared the per-file rows) and
+    // writes the blob every later process is meant to be served from.
+    let (footer_total, _) = scan_statistics(&table, &ctx).await?;
+    assert!(
+        matches!(footer_total, Precision::Exact(_) | Precision::Inexact(_)),
+        "the footer path must report a total for this test to mean anything, got {footer_total:?}"
+    );
+
+    // Poison every per-file row with a size no footer would produce. A later scan
+    // that reports it was served from the blob; one that reports the footer value
+    // rejected the blob and re-read the file.
+    let table_id = table.table_id().to_string();
+    let stored_schema = table.schema();
+    let files = await_manifest_rows(&fixture, &table_id).await?;
+    let stats_key = |file: &cayenne::metadata::SnapshotFile| {
+        statistics_row_key(&fixture.data_path, &table_id, file)
+    };
+    let mut poisoned = 0;
+    for file in &files {
+        let Some(row) = fixture
+            .catalog
+            .get_snapshot_file_statistics(&table_id, &file.snapshot_id, &stats_key(file))
+            .await?
+        else {
+            continue;
+        };
+        let mut restored = cayenne::stats::file_statistics_to_df(
+            &cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &stored_schema)?,
+            &stored_schema,
+            row.num_rows,
+        );
+        restored.column_statistics[0].byte_size = Precision::Exact(POISON_BYTES);
+        let blob = cayenne::stats::statistics_to_persisted_blob(&restored, &stored_schema)
+            .expect("poisoned blob serializes");
+        fixture
+            .catalog
+            .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
+                table_id: table_id.clone(),
+                snapshot_id: file.snapshot_id.clone(),
+                file_path: stats_key(file),
+                file_size_bytes: row.file_size_bytes,
+                num_rows: row.num_rows,
+                statistics_blob: blob,
+            })
+            .await?;
+        poisoned += 1;
+    }
+    assert!(
+        poisoned > 0,
+        "the footer scan must have persisted a row to poison, or this test proves nothing"
+    );
+
+    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog.init().await?;
+    let ctx = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .open(EVOLVED_TABLE)
+        .await?,
+    );
+    let (_, blob_columns) = scan_statistics(&reopened, &ctx).await?;
+
+    assert_eq!(
+        blob_columns[0],
+        Precision::Exact(POISON_BYTES),
+        "a widened table's file must still be served from its persisted blob; \
+         reporting the footer's size instead means the blob was rejected and the \
+         file re-read, which repeats on every cold scan for the life of the file"
     );
 
     Ok(())

@@ -17,14 +17,15 @@ limitations under the License.
 //! The byte format of a persisted [`IndexRun`](crate::tiered::IndexRun).
 //!
 //! A run is already flat — its key words, one slot per word (its only
-//! posting, or an offset into the postings), the postings, and its filter —
-//! so it persists as those arrays, framed:
+//! posting, or an offset into the postings), and the postings — so it
+//! persists as those arrays, framed. Its Bloom filter is rebuilt from the
+//! words on load rather than stored, so it can never disagree with them:
 //!
 //! ```text
 //! magic "CIDX" | version | kind | body | checksum
 //! body (run): files u32 | (len u32 | name)* | rows u64
 //!             | words u64 | u64 * words | u32 * words (slots)
-//!             | postings u64 | postings bytes | bloom words u64 | u32 * bloom words
+//!             | postings u64 | postings bytes
 //! ```
 //!
 //! All integers are little-endian. The trailing checksum is
@@ -126,8 +127,10 @@ impl<'a> Reader<'a> {
     pub(crate) fn u32s(&mut self, count: usize) -> Result<Vec<u32>> {
         let bytes = self.bytes(count.checked_mul(4).ok_or(Error::Corrupt)?)?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect())
     }
 
@@ -135,8 +138,10 @@ impl<'a> Reader<'a> {
     pub(crate) fn u64s(&mut self, count: usize) -> Result<Vec<u64>> {
         let bytes = self.bytes(count.checked_mul(8).ok_or(Error::Corrupt)?)?;
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| u64::from_le_bytes(c))
             .collect())
     }
 
