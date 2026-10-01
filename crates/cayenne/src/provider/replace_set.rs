@@ -161,7 +161,7 @@ pub(super) async fn write_snapshot(
         execute_stream(scan, scan_task)
     })
     .try_flatten()
-    .map(move |batch| {
+    .map(move |batch| -> Result<RecordBatch> {
         let batch = batch?;
         let matching = key.matching_rows(&batch)?;
         let retained = filter_record_batch(&batch, &not(&matching)?)?;
