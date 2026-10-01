@@ -84,6 +84,20 @@ fn cases(base: u64) -> u64 {
     (base * scale).max(1)
 }
 
+/// Runs `case` for each of `cases(base)` seeds with an RNG seeded from it,
+/// naming the seed of a case that panics so it replays exactly.
+fn for_seeds(base: u64, mut case: impl FnMut(u64, &mut StdRng)) {
+    for seed in 0..cases(base) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            case(seed, &mut StdRng::seed_from_u64(seed));
+        }));
+        if let Err(panic) = outcome {
+            eprintln!("failing seed: {seed}");
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
 /// `len` in `lengths` values drawn by `value`.
 fn vec_of<T>(
     rng: &mut StdRng,
@@ -281,24 +295,24 @@ fn run_ops(ops: &[Op], encoder: &KeyEncoder, exact: bool) -> Result<(), String> 
 /// rebuilds.
 #[test]
 fn candidates_match_a_model() {
-    for seed in 0..cases(256) {
-        let ops = ops(&mut StdRng::seed_from_u64(seed));
+    for_seeds(256, |seed, rng| {
+        let ops = ops(rng);
         if let Err(failure) = run_ops(&ops, &encoder(), true) {
             panic!("seed {seed}: {failure}\nops: {ops:?}");
         }
-    }
+    });
 }
 
 /// With 2-bit words, keys share words: candidates are then a superset of
 /// every key's live rows, never missing one.
 #[test]
 fn colliding_candidates_never_miss_a_row() {
-    for seed in 0..cases(256) {
-        let ops = ops(&mut StdRng::seed_from_u64(seed));
+    for_seeds(256, |seed, rng| {
+        let ops = ops(rng);
         if let Err(failure) = run_ops(&ops, &encoder().with_word_bits(2), false) {
             panic!("seed {seed}: {failure}\nops: {ops:?}");
         }
-    }
+    });
 }
 
 /// A run holds exactly the rows added to it, in word order, whatever the
@@ -306,9 +320,8 @@ fn colliding_candidates_never_miss_a_row() {
 #[test]
 fn a_run_holds_exactly_its_rows() {
     let encoder = encoder();
-    for seed in 0..cases(256) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let files = vec_of(&mut rng, 1..4, |rng| {
+    for_seeds(256, |seed, rng| {
+        let files = vec_of(rng, 1..4, |rng| {
             vec_of(rng, 0..60, |rng| {
                 (
                     rng.random_range(0_i64..40),
@@ -349,17 +362,16 @@ fn a_run_holds_exactly_its_rows() {
         );
         let got: BTreeSet<(u64, String, u64)> = got.into_iter().collect();
         assert_eq!(got, expected, "seed {seed}");
-    }
+    });
 }
 
 /// Arbitrary bytes are rejected or read, never a panic.
 #[test]
 fn arbitrary_bytes_never_panic() {
-    for seed in 0..cases(256) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let bytes = vec_of(&mut rng, 0..512, RngExt::random::<u8>);
+    for_seeds(256, |_seed, rng| {
+        let bytes = vec_of(rng, 0..512, RngExt::random::<u8>);
         let _ = IndexRun::from_bytes(&bytes);
-    }
+    });
 }
 
 /// A run's bytes changed anywhere and then given a valid checksum (so the
@@ -367,9 +379,8 @@ fn arbitrary_bytes_never_panic() {
 /// read into a run whose lookups do not panic.
 #[test]
 fn resealed_corruptions_never_panic() {
-    for seed in 0..cases(256) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let keys = vec_of(&mut rng, 1..80, |rng| rng.random_range(0_i64..40));
+    for_seeds(256, |_seed, rng| {
+        let keys = vec_of(rng, 1..80, |rng| rng.random_range(0_i64..40));
         let mut builder = RunBuilder::new(encoder());
         builder.add_batch("f", 0, &column(&keys)).expect("batch");
         let bytes = builder.finish().expect("finish").to_bytes();
@@ -383,15 +394,14 @@ fn resealed_corruptions_never_panic() {
             }
             run.for_each_row(|_, _, _| {});
         }
-    }
+    });
 }
 
 /// Every `u64` round-trips through a varint, at every width.
 #[test]
 fn varints_round_trip() {
-    for seed in 0..cases(256) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let values = vec_of(&mut rng, 0..64, |rng| {
+    for_seeds(256, |seed, rng| {
+        let values = vec_of(rng, 0..64, |rng| {
             rng.random::<u64>() >> rng.random_range(0..64)
         });
         let mut bytes = Vec::new();
@@ -403,5 +413,5 @@ fn varints_round_trip() {
             assert_eq!(varint::get(&bytes, &mut at), Some(value), "seed {seed}");
         }
         assert_eq!(at, bytes.len(), "seed {seed}");
-    }
+    });
 }
