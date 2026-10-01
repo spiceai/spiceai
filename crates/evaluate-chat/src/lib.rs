@@ -321,23 +321,38 @@ impl Evaluate for ChatEvaluator {
 /// rejected request, key or rate limit keeps its kind, and a provider that cannot be
 /// reached is unavailable (as a System One provider's transport failure is). Anything
 /// else is a failed call.
+///
+/// Discriminators live in `code` (OpenAI-shaped) or `type` (Anthropic type-only
+/// `ApiError`s such as `authentication_error` / `permission_error` /
+/// `rate_limit_error`). Both are matched so `/v1/evaluate` can return 401/403/429
+/// instead of 500.
 fn chat_error(model: &str, error: OpenAIError) -> Error {
     let model = model.to_string();
     match error {
         OpenAIError::InvalidArgument(message) => Error::InvalidRequest { model, message },
-        OpenAIError::ApiError(api) => match api.code.as_deref() {
-            Some("invalid_request_error") => Error::InvalidRequest {
+        OpenAIError::ApiError(api) => match (api.code.as_deref(), api.r#type.as_deref()) {
+            (Some("invalid_request_error"), _) | (_, Some("invalid_request_error")) => {
+                Error::InvalidRequest {
+                    model,
+                    message: api.message,
+                }
+            }
+            (Some("invalid_api_key"), _) | (_, Some("authentication_error")) => {
+                Error::AuthenticationFailed {
+                    model,
+                    message: api.message,
+                }
+            }
+            (_, Some("permission_error")) => Error::PermissionDenied {
                 model,
                 message: api.message,
             },
-            Some("invalid_api_key") => Error::AuthenticationFailed {
-                model,
-                message: api.message,
-            },
-            Some("rate_limit_exceeded") => Error::RateLimited {
-                model,
-                message: api.message,
-            },
+            (Some("rate_limit_exceeded"), _) | (_, Some("rate_limit_error")) => {
+                Error::RateLimited {
+                    model,
+                    message: api.message,
+                }
+            }
             _ => Error::ModelCallFailed {
                 model,
                 source: Box::new(OpenAIError::ApiError(api)),
@@ -749,11 +764,24 @@ mod tests {
                 code: Some(code.to_string()),
             }))
         };
+        // Anthropic (and some gateways) send the discriminator in `type` and leave
+        // `code` unset. Those must not become `ModelCallFailed` / HTTP 500.
+        let type_only = |kind: &str| {
+            Err(OpenAIError::ApiError(ApiError {
+                message: format!("upstream {kind}"),
+                r#type: Some(kind.to_string()),
+                param: None,
+                code: None,
+            }))
+        };
         for (failure, expected) in [
             (api_error("rate_limit_exceeded"), "RateLimited"),
             (api_error("invalid_api_key"), "AuthenticationFailed"),
             (api_error("invalid_request_error"), "InvalidRequest"),
             (api_error("server_error"), "ModelCallFailed"),
+            (type_only("authentication_error"), "AuthenticationFailed"),
+            (type_only("permission_error"), "PermissionDenied"),
+            (type_only("rate_limit_error"), "RateLimited"),
             (
                 Err(OpenAIError::InvalidArgument("bad".to_string())),
                 "InvalidRequest",
