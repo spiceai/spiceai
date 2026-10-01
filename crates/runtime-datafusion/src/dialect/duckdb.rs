@@ -417,18 +417,21 @@ pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSc
 /// [`concat_arguments_are_renderable`], no rendering closes that, so the cast
 /// stays local.
 ///
-/// Only text targets are refused for a binary operand: casting binary into a
-/// number, a date or a boolean is unsupported on both engines, so both refuse
-/// the query.
+/// Casting a binary operand into a number, a date or a boolean federates: it is
+/// unsupported on both engines, so both refuse the query.
 ///
-/// A cast *into* binary is refused whatever its operand. The unparser renders
-/// no binary type, so a federated one fails the query at planning with
-/// `Unsupported DataType: conversion: Binary` where `DataFusion` answers it
-/// (issue #14397). Rendering `BLOB` would not close it either: `DuckDB`'s
-/// `CAST(VARCHAR AS BLOB)` reads `\xFF` as one escaped byte and refuses
-/// non-ASCII text, where `DataFusion` keeps the string's UTF-8 bytes — the
+/// A cast *into* binary is refused whatever its operand, because no rendering
+/// of one answers what `DataFusion` does (issue #14397). The unparser renders
+/// no binary type, so a cast of a column fails the query at planning with
+/// `Unsupported DataType: conversion: Binary`. A cast of a string literal it
+/// sends as the bare string, which `DuckDB` converts to `BLOB` itself — and
+/// `DuckDB`'s conversion reads `\xFF` as one escaped byte and refuses
+/// non-ASCII text, where `DataFusion` keeps the string's UTF-8 bytes. The
 /// strings `\xFF` and `é` are `5c784646` and `c3a9` locally, while `DuckDB`
-/// answers `FF` for the first and raises a conversion error for the second.
+/// answers `FF` for the first and raises a conversion error for the second,
+/// so a federated `a = CAST('\xFF' AS BYTEA)` selects the row holding `FF`
+/// instead of the one holding `5c784646`. Rendering `BLOB` would carry the same
+/// conversion.
 pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     let (Expr::Cast(Cast {
         expr: operand,
@@ -442,7 +445,10 @@ pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool 
         return true;
     };
     let target = field.data_type();
-    !target.is_binary() && (!target.is_string() || !operand_reaches_binary(operand, scope))
+    if target.is_binary() {
+        return false;
+    }
+    !target.is_string() || !operand_reaches_binary(operand, scope)
 }
 
 /// Whether any node of this operand's expression tree is, or carries, a binary
