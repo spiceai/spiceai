@@ -3132,7 +3132,9 @@ mod tests {
             )
             .expect("create events");
             let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |row| row.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |row| {
+                    row.get(0)
+                })
                 .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
             assert_eq!(
                 count, 3,
