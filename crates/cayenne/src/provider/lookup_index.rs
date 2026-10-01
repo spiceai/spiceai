@@ -1504,7 +1504,6 @@ impl LookupIndexState {
             return;
         }
         let (runs, bytes) = persisted_runs.load().await;
-        persisted_runs.report_bytes(bytes);
         let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
         *self.live_files.lock() = Some(Arc::new(
             live.iter().map(|&name| name.to_string()).collect(),
@@ -1525,12 +1524,14 @@ impl LookupIndexState {
             persisted_runs.loaded.store(true, Ordering::Release);
             self.repin();
             drop(publishing);
+            // Coverage is known from here, so publish it even when the pool
+            // refused the loaded runs: every file then reads as uncovered.
+            self.report_coverage();
             if !fits {
                 self.report_refusal();
                 return;
             }
         }
-        self.report_coverage();
         if loaded > 0 {
             // A file counts as covered once every key's runs hold it.
             let covered = self
@@ -1540,14 +1541,15 @@ impl LookupIndexState {
             tracing::info!(
                 table = %self.table_name,
                 "{}",
-                persisted_runs_loaded_message(&self.table_name, loaded, bytes, covered, live.len())
+                persisted_runs_loaded_message(&self.table_name, bytes, covered, live.len())
             );
         }
     }
 
     /// Reports, per key, how many of the table's current data files its runs
     /// cover and how many they do not yet, on `cayenne_lookup_index_files`.
-    /// Nothing is reported until a scan has listed the table's files.
+    /// Nothing is reported until the table's files are known: at open, when
+    /// it loads persisted runs, or else at the first scan.
     fn report_coverage(&self) {
         for (label, covered, uncovered) in self.coverage().unwrap_or_default() {
             for (coverage, files) in [("covered", covered), ("uncovered", uncovered)] {
@@ -2456,17 +2458,14 @@ impl PersistedRuns {
             .list_index_runs(&self.table_id)
             .await
             .map_err(|e| format!("list persisted runs: {e}"))?;
-        let mut existing: HashMap<(String, String), u64> = registered
+        let mut existing: HashSet<(String, String)> = registered
             .into_iter()
-            .map(|record| ((record.index_key, record.run_name), record.size_bytes))
+            .map(|record| (record.index_key, record.run_name))
             .collect();
-        // The bytes of every run this sync leaves persisted.
-        let mut persisted = 0_u64;
         for (view, key) in views.iter().zip(&self.keys) {
             for run in view.run_list() {
                 let name = run_file_name(&run);
-                if let Some(size) = existing.remove(&(key.clone(), name.clone())) {
-                    persisted = persisted.saturating_add(size);
+                if existing.remove(&(key.clone(), name.clone())) {
                     continue;
                 }
                 let row_count = run.len() as u64;
@@ -2489,15 +2488,13 @@ impl PersistedRuns {
                     .register_index_run(&record)
                     .await
                     .map_err(|e| format!("register {path}: {e}"))?;
-                persisted = persisted.saturating_add(record.size_bytes);
             }
         }
         // What is left is registered but no longer wanted: runs merged or
         // retired since, and runs of a key the table no longer has.
-        for (key, name) in existing.into_keys() {
+        for (key, name) in existing {
             self.remove(&key, &name).await?;
         }
-        self.report_bytes(persisted);
         Ok(())
     }
 
@@ -2555,13 +2552,6 @@ impl PersistedRuns {
         (all, bytes)
     }
 
-    fn report_bytes(&self, bytes: u64) {
-        telemetry::cayenne::track_lookup_index_persisted_bytes(
-            bytes,
-            &[telemetry::KeyValue::new("table", self.table_name.clone())],
-        );
-    }
-
     async fn read(&self, path: &object_store::path::Path) -> Result<IndexRun, String> {
         let bytes = self
             .store
@@ -2598,10 +2588,9 @@ impl PersistedRuns {
     }
 }
 
-/// The line a reopened table logs once it has loaded its persisted runs.
+/// The line a reopened table logs once it has loaded its persisted index.
 fn persisted_runs_loaded_message(
     table_name: &str,
-    runs: usize,
     bytes: u64,
     covered: usize,
     files: usize,
@@ -2619,9 +2608,8 @@ fn persisted_runs_loaded_message(
             files - covered
         )
     };
-    let plural = if runs == 1 { "" } else { "s" };
     format!(
-        "Dataset '{table_name}' (cayenne): loaded {runs} persisted secondary index run{plural} ({mib:.1} MiB on disk), {coverage}"
+        "Dataset '{table_name}' (cayenne): loaded its secondary index from disk ({mib:.1} MiB), {coverage}"
     )
 }
 
@@ -3600,16 +3588,16 @@ mod tests {
     #[test]
     fn the_loaded_runs_message_names_the_table_its_size_and_its_coverage() {
         assert_eq!(
-            persisted_runs_loaded_message("orders", 3, 5 << 20, 20, 20),
-            "Dataset 'orders' (cayenne): loaded 3 persisted secondary index runs (5.0 MiB on disk), covering all 20 of its files"
+            persisted_runs_loaded_message("orders", 5 << 20, 20, 20),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 20 of its files"
         );
         assert_eq!(
-            persisted_runs_loaded_message("orders", 3, 3 << 19, 18, 20),
-            "Dataset 'orders' (cayenne): loaded 3 persisted secondary index runs (1.5 MiB on disk), covering 18 of its 20 files; the other 2 are indexed in the background"
+            persisted_runs_loaded_message("orders", 3 << 19, 18, 20),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (1.5 MiB), covering 18 of its 20 files; the other 2 are indexed in the background"
         );
         assert_eq!(
-            persisted_runs_loaded_message("orders", 1, 5 << 20, 4, 4),
-            "Dataset 'orders' (cayenne): loaded 1 persisted secondary index run (5.0 MiB on disk), covering all 4 of its files"
+            persisted_runs_loaded_message("orders", 5 << 20, 4, 4),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 4 of its files"
         );
     }
 

@@ -3640,6 +3640,8 @@ enum DataDirRole {
     DeletionVector,
     /// Residue under `_staging/` from an interrupted write.
     Staging,
+    /// A persisted secondary index file (under `_lookup_index/`).
+    LookupIndex,
     /// Write-ahead logs, temporaries, anything else.
     Other,
 }
@@ -10860,6 +10862,9 @@ impl CayenneTableProvider {
                         &mut usage.deletion_vector_files,
                         &mut usage.deletion_vector_bytes,
                     ),
+                    DataDirRole::LookupIndex => {
+                        (&mut usage.lookup_index_files, &mut usage.lookup_index_bytes)
+                    }
                     DataDirRole::Data => (&mut usage.data_files, &mut usage.data_bytes),
                     DataDirRole::Other => (&mut usage.other_files, &mut usage.other_bytes),
                 };
@@ -10881,17 +10886,22 @@ impl CayenneTableProvider {
     fn data_dir_role(path: &std::path::Path, root: &std::path::Path) -> DataDirRole {
         let relative = path.strip_prefix(root).unwrap_or(path);
         let mut in_staging = false;
+        let mut in_lookup_index = false;
         let mut in_deletions = false;
         for component in relative.components() {
             let component = component.as_os_str();
             if component == STAGING_DIR_NAME {
                 in_staging = true;
+            } else if component == LOOKUP_INDEX_DIR_NAME {
+                in_lookup_index = true;
             } else if component == super::delete::vector_io::DELETION_DIR_NAME {
                 in_deletions = true;
             }
         }
         if in_staging {
             DataDirRole::Staging
+        } else if in_lookup_index {
+            DataDirRole::LookupIndex
         } else if in_deletions {
             DataDirRole::DeletionVector
         } else if path
@@ -39800,7 +39810,8 @@ mod tests {
         let retired = root.join("snapshot-retired");
         let deletions = live.join("deletions");
         let staging = root.join(STAGING_DIR_NAME);
-        for dir in [&live, &retired, &deletions, &staging] {
+        let lookup_index = root.join(LOOKUP_INDEX_DIR_NAME).join("0123456789abcdef");
+        for dir in [&live, &retired, &deletions, &staging, &lookup_index] {
             tokio::fs::create_dir_all(dir).await.expect("create dir");
         }
 
@@ -39819,6 +39830,8 @@ mod tests {
         write(staging.join("pending.vortex"), 800).await;
         write(staging.join(STAGING_WAL_FILENAME), 10).await;
         write(root.join("stray.log"), 5).await;
+        write(lookup_index.join("fedcba9876543210.run"), 30).await;
+        write(lookup_index.join("0011223344556677.run"), 12).await;
 
         let usage = CayenneTableProvider::measure_data_dir(root)
             .await
@@ -39833,11 +39846,13 @@ mod tests {
             "a .vortex under _staging is staging residue, not data"
         );
         assert_eq!(usage.staging_bytes, 810);
+        assert_eq!(usage.lookup_index_files, 2, "the secondary index's files");
+        assert_eq!(usage.lookup_index_bytes, 42);
         assert_eq!(usage.other_files, 1, "the stray log");
         assert_eq!(usage.other_bytes, 5);
         assert_eq!(
             usage.snapshot_dirs, 2,
-            "_staging is not a snapshot directory"
+            "neither _staging nor _lookup_index is a snapshot directory"
         );
     }
 
