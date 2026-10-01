@@ -20,8 +20,8 @@ use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
 
 use super::{
-    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_gateway_error, is_retriable_error,
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RefusalKind,
+    ReqwestInternalSnafu, Result, is_gateway_error, is_retriable_error, should_shrink_page_size,
 };
 use arrow::{
     array::RecordBatch,
@@ -1761,12 +1761,15 @@ impl GraphQLClient {
     /// Note: Rate limit handling (waiting until reset time) is done proactively by the
     /// `RateLimiter` trait via `check_rate_limit()` before each request.
     ///
-    /// On gateway errors (HTTP 502/504) the next retry is sent with a smaller
+    /// On an upstream backend error the next retry is sent with a smaller
     /// per-page size, shrinking along a reverse-Fibonacci sequence. A 502 from
     /// an upstream proxy commonly means the GitHub GraphQL backend timed out
     /// while resolving an oversized query; requesting a smaller page gives the
     /// backend a chance to complete within its per-request deadline instead of
-    /// replaying the exact same failing query.
+    /// replaying the exact same failing query. GitHub reports the same timeout
+    /// as HTTP 200 with an "internal error" message, which reaches this path as
+    /// an inferred `InvalidCredentialsOrPermissions`; see
+    /// `should_shrink_page_size`.
     async fn execute_with_retry(
         client: &Arc<Self>,
         query: &GraphQLQuery,
@@ -1829,6 +1832,8 @@ impl GraphQLClient {
                             }
                             if is_gateway_error(&e) {
                                 close_conn.store(true, Ordering::Relaxed);
+                            }
+                            if should_shrink_page_size(&e) {
                                 // Shrink the per-page size for the next retry.
                                 // Seed from the query's declared page size on
                                 // the first gateway error, then reverse-Fib.
@@ -1845,7 +1850,7 @@ impl GraphQLClient {
                                 });
                                 let next = reverse_fibonacci_shrink(current);
                                 tracing::warn!(
-                                    "Gateway error; shrinking GraphQL page size for retry: {current} -> {next}"
+                                    "Upstream backend error; shrinking GraphQL page size for retry: {current} -> {next}"
                                 );
                                 *guard = Some(next);
                             }
@@ -1971,11 +1976,13 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials are correct."
                 ),
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials have the necessary permissions."
                 ),
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => {
                 Err(Error::InvalidReqwestStatus {
@@ -2013,21 +2020,24 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                 return Ok(());
             }
 
-            // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
-            // returns "Something went wrong while executing your query" instead of a proper
-            // permission error. This appears to be a GitHub API bug where lack of permissions
-            // triggers an internal error rather than returning a proper authorization error.
-            // Check for this before processing other GraphQL errors.
+            // GitHub sends "Something went wrong while executing your query" for
+            // two different causes, and the message alone cannot tell them apart:
+            // a backend timeout on a query that is too expensive, and a GitHub
+            // defect where missing Projects v2 access gives an internal error
+            // instead of an authorization error. The timeout is the common case,
+            // so the error is not an explicit deny: the caller retries it with a
+            // smaller page. Check for this before processing other GraphQL errors.
             for error in errors_array {
                 if let Some(message) = error.get("message").and_then(|m| m.as_str())
                     && message.contains("Something went wrong while executing your query")
                 {
                     tracing::debug!(
-                        "Detected GitHub 'Something went wrong' error, likely a permissions issue: {}",
+                        "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
                         message
                     );
                     return Err(Error::InvalidCredentialsOrPermissions {
-                        message: "GitHub returned an internal error. This may indicate the GitHub App does not have permission to access the requested resource. Verify the app has the required permissions.".to_string(),
+                        message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
+                        kind: RefusalKind::Inferred,
                     });
                 }
             }
@@ -2084,6 +2094,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     message: format!(
                         "The API returned a 'FORBIDDEN' error. Verify the credentials have the necessary permissions. {message}"
                     ),
+                    kind: RefusalKind::Explicit,
                 });
             }
             if error_type.to_lowercase() == "not_found" {
