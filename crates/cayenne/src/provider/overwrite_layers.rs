@@ -350,6 +350,9 @@ pub(crate) struct CollapseWindow {
     bytes: usize,
     /// The window position of each key's last copy.
     survivor: HashMap<u128, (usize, usize), PrehashedBuildHasher>,
+    /// Whether the window holds a key more than once; when it does not, every
+    /// row survives and the drain filters nothing.
+    repeats: bool,
     reservation: MemoryReservation,
 }
 
@@ -360,6 +363,7 @@ impl CollapseWindow {
             batches: Vec::new(),
             bytes: 0,
             survivor: HashMap::with_hasher(PrehashedBuildHasher),
+            repeats: false,
             reservation,
         }
     }
@@ -367,7 +371,7 @@ impl CollapseWindow {
     fn push(&mut self, resolved: ResolvedBatch) -> super::Result<()> {
         let index = self.batches.len();
         for (row, &digest) in resolved.digests.iter().enumerate() {
-            self.survivor.insert(digest, (index, row));
+            self.repeats |= self.survivor.insert(digest, (index, row)).is_some();
         }
         self.bytes += resolved.batch.get_array_memory_size();
         self.batches.push(resolved);
@@ -384,6 +388,13 @@ impl CollapseWindow {
     }
 
     fn drain(&mut self) -> super::Result<VecDeque<ResolvedBatch>> {
+        if !std::mem::take(&mut self.repeats) {
+            let out = std::mem::take(&mut self.batches).into();
+            self.survivor.clear();
+            self.bytes = 0;
+            self.reservation.free();
+            return Ok(out);
+        }
         let mut out = VecDeque::with_capacity(self.batches.len());
         for (index, resolved) in std::mem::take(&mut self.batches).into_iter().enumerate() {
             let keep: BooleanArray = resolved
@@ -855,6 +866,17 @@ mod tests {
         )
         .await;
         assert_eq!(layers, vec![owned(&[(1, "c"), (3, "d"), (2, "e")])]);
+        assert!(superseded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_window_without_repeats_passes_every_row_through() {
+        let (layers, superseded) = overwrite_layers(
+            vec![batch(&[(1, "a"), (2, "b")]), batch(&[(3, "c")])],
+            Some(CollapseWindow::new(COLLAPSE_WINDOW_BYTES, reservation())),
+        )
+        .await;
+        assert_eq!(layers, vec![owned(&[(1, "a"), (2, "b"), (3, "c")])]);
         assert!(superseded.is_empty());
     }
 
