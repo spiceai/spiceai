@@ -880,33 +880,36 @@ mod tests {
             .expect("deletion should be successful");
     }
 
-    /// Regression test for #14629: under `on_conflict: drop`, a write that
-    /// repeats a key keeps its first copy, whether the repeat is within one
-    /// record batch (which the per-batch uniqueness check used to refuse) or
-    /// in a later one.
-    #[tokio::test]
-    async fn drop_keeps_the_first_copy_of_a_key_a_write_repeats() {
-        let schema = Arc::new(Schema::new(vec![
+    fn id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
             arrow::datatypes::Field::new("v", DataType::Utf8, false),
-        ]));
-        let batch = |rows: &[(i64, &str)]| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(
-                        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                    )),
-                    Arc::new(StringArray::from(
-                        rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
-                    )),
-                ],
-            )
-            .expect("batch should be created")
-        };
+        ]))
+    }
+
+    fn id_v_batch(rows: &[(i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch should be created")
+    }
+
+    async fn id_v_table(
+        name: &str,
+        on_conflict: &str,
+        constraints: Vec<Constraint>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
         let external_table = CreateExternalTable {
-            schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema"),
-            name: TableReference::bare("drop_repeats"),
+            schema: ToDFSchema::to_dfschema_ref(id_v_schema()).expect("df schema"),
+            name: TableReference::bare(name),
             location: String::new(),
             file_type: String::new(),
             table_partition_cols: vec![],
@@ -915,34 +918,40 @@ mod tests {
             definition: None,
             order_exprs: vec![],
             unbounded: false,
-            options: [("on_conflict".to_string(), "do_nothing:id".to_string())]
+            options: [("on_conflict".to_string(), on_conflict.to_string())]
                 .into_iter()
                 .collect(),
-            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            constraints: Constraints::new_unverified(constraints),
             column_defaults: HashMap::default(),
             temporary: false,
         };
-        let ctx = SessionContext::new();
-        let table = SqliteAccelerator::new()
+        SqliteAccelerator::new()
             .create_external_table(external_table, None, vec![], None)
             .await
-            .expect("table should be created");
+            .expect("table should be created")
+    }
 
-        let exec = MockExec::new(
-            vec![
-                Ok(batch(&[(1, "a"), (2, "b"), (1, "c")])),
-                Ok(batch(&[(2, "d"), (3, "e")])),
-            ],
-            Arc::clone(&schema),
-        );
+    async fn write_id_v(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+        batches: Vec<RecordBatch>,
+        op: InsertOp,
+    ) {
+        let ctx = SessionContext::new();
+        let exec = MockExec::new(batches.into_iter().map(Ok).collect(), id_v_schema());
         let insertion = table
-            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Overwrite)
+            .insert_into(&ctx.state(), Arc::new(exec), op)
             .await
             .expect("insertion should be planned");
         collect(insertion, ctx.task_ctx())
             .await
             .expect("a repeated key must not fail a drop write");
+    }
 
+    /// `(id, v)` rows the table holds, ordered by `id`.
+    async fn id_v_rows(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Vec<(i64, String)> {
+        let ctx = SessionContext::new();
         let scan = table
             .scan(&ctx.state(), None, &[], None)
             .await
@@ -962,13 +971,64 @@ mod tests {
             rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), vals.value(i).to_string())));
         }
         rows.sort_unstable();
+        rows
+    }
+
+    /// Regression test for #14629: under `on_conflict: drop`, a write that
+    /// repeats a key keeps its first copy, whether the repeat is within one
+    /// record batch (which the per-batch uniqueness check used to refuse) or
+    /// in a later one.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_a_write_repeats() {
+        let table = id_v_table(
+            "drop_repeats",
+            "do_nothing:id",
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![
+                id_v_batch(&[(1, "a"), (2, "b"), (1, "c")]),
+                id_v_batch(&[(2, "d"), (3, "e")]),
+            ],
+            InsertOp::Overwrite,
+        )
+        .await;
+
         assert_eq!(
-            rows,
+            id_v_rows(&table).await,
             vec![
                 (1, "a".to_string()),
                 (2, "b".to_string()),
                 (3, "e".to_string())
             ]
+        );
+    }
+
+    /// With `drop` on two constraints, an append must not drop a row because of
+    /// a key carried by an earlier incoming row that the table itself rejects:
+    /// `(1, 'b')` conflicts with the stored `(1, 'a')`, so it is never written,
+    /// and `(2, 'b')` then conflicts with nothing.
+    #[tokio::test]
+    async fn drop_on_every_constraint_appends_rows_only_a_rejected_row_conflicted_with() {
+        let table = id_v_table(
+            "drop_all_append",
+            "do_nothing_all",
+            vec![Constraint::PrimaryKey(vec![0]), Constraint::Unique(vec![1])],
+        )
+        .await;
+        write_id_v(&table, vec![id_v_batch(&[(1, "a")])], InsertOp::Overwrite).await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "b")]), id_v_batch(&[(2, "b")])],
+            InsertOp::Append,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
         );
     }
 

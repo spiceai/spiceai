@@ -182,6 +182,15 @@ impl TableProvider for KeepFirstTableProvider {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // A row the table rejects against a stored row is never written, but
+        // this filter cannot see stored rows, so it would still hold that
+        // row's keys against later rows. With one key that is harmless — a
+        // later copy conflicts with the same stored row — but with several it
+        // drops a row whose only conflict was with a row never written. An
+        // overwrite starts from an empty table, so it has no stored rows.
+        if self.key_sets.len() > 1 && op != InsertOp::Overwrite {
+            return self.inner.insert_into(state, input, op).await;
+        }
         let exec = KeepFirstExec::try_new(input, &self.key_sets)?;
         self.inner.insert_into(state, Arc::new(exec), op).await
     }
@@ -470,7 +479,7 @@ impl SeenKeys {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeepFirstTableProvider, wrap_with_keep_first_if_needed};
+    use super::{KeepFirstExec, KeepFirstTableProvider, wrap_with_keep_first_if_needed};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -624,13 +633,73 @@ mod tests {
         assert_eq!(rows.len(), 3, "{rows:?}");
     }
 
+    /// Each key is held separately, and a row repeating any one of them is
+    /// dropped without admitting its other keys.
     #[tokio::test]
-    async fn drop_on_every_target_keeps_the_first_copy_per_constraint() {
-        let input = source(&[vec![batch(&[(Some(1), "a"), (Some(1), "b")])]]);
-        let rows = write_and_read("do_nothing_all", input, &SessionContext::new())
+    async fn the_filter_drops_a_row_repeating_any_of_several_keys() {
+        let input = source(&[vec![batch(&[
+            (Some(1), "a"),
+            (Some(1), "b"),
+            (Some(2), "a"),
+            (Some(3), "b"),
+        ])]]);
+        let key_sets: Arc<[Vec<String>]> =
+            Arc::from(vec![vec!["id".to_string()], vec!["v".to_string()]]);
+        let exec = KeepFirstExec::try_new(input, &key_sets).expect("plan");
+        let batches = collect(Arc::new(exec), Arc::new(TaskContext::default()))
             .await
-            .expect("write succeeds");
-        assert_eq!(rows, vec![(Some(1), "a".to_string())]);
+            .expect("filter runs");
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>()
+            })
+            .collect();
+        // (1, b) repeats id 1; (2, a) repeats v 'a'; (3, b) is new on both,
+        // because the dropped (1, b) admitted neither of its keys.
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    /// An append under several `drop` targets is passed through untouched: the
+    /// filter cannot tell which incoming rows the table will reject against a
+    /// stored row, and holding a rejected row's other keys would drop rows
+    /// that conflict with nothing.
+    #[tokio::test]
+    async fn drop_on_every_target_leaves_an_append_to_the_table() {
+        let constraints = Constraints::new_unverified(vec![
+            Constraint::PrimaryKey(vec![0]),
+            Constraint::Unique(vec![1]),
+        ]);
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let table = wrap_with_keep_first_if_needed(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            &options("do_nothing_all"),
+            &schema(),
+            &constraints,
+        );
+        let ctx = SessionContext::new();
+        let input = source(&[vec![batch(&[(Some(1), "a"), (Some(1), "b")])]]);
+        let plan = table
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx()).await.expect("write succeeds");
+        let scan = inner
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        let stored: usize = collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan runs")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(stored, 2, "both rows reach the table, which resolves them");
     }
 
     #[tokio::test]
