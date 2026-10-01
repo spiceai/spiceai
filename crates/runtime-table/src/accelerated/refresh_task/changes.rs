@@ -352,6 +352,14 @@ async fn checkpoint_pending_memory_cdc_commits(
     Some(error_message)
 }
 
+/// Refresh configuration, cache invalidation and initial-load progress for a driver.
+struct IngestionState {
+    refresh: Arc<RwLock<Refresh>>,
+    caching: Option<Weak<Caching>>,
+    refresh_completion: Option<RefreshCompletion>,
+    initial_load_completed: Arc<AtomicBool>,
+}
+
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
     dataset_name: &'a TableReference,
@@ -1173,28 +1181,33 @@ impl RefreshTask {
         });
         self.start_ingestion(
             cdc_cfg,
-            refresh,
+            IngestionState {
+                refresh,
+                caching,
+                refresh_completion,
+                initial_load_completed,
+            },
             input,
             ReaderTask::new(Some(reader_handle)),
-            caching,
-            refresh_completion,
-            initial_load_completed,
         )
         .await
     }
 
     /// Runs the common mutation driver. Source readers and finite producers
     /// submit through the same admission channel and ordered publication loop.
-    pub(crate) async fn start_ingestion(
+    async fn start_ingestion(
         &self,
         cdc_cfg: CdcConfig,
-        refresh: Arc<RwLock<Refresh>>,
+        state: IngestionState,
         input: IngestInput,
         reader_handle: ReaderTask,
-        caching: Option<Weak<Caching>>,
-        refresh_completion: Option<RefreshCompletion>,
-        initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
+        let IngestionState {
+            refresh,
+            caching,
+            refresh_completion,
+            initial_load_completed,
+        } = state;
         let IngestInput {
             receiver: mut rx,
             probe: tx_probe,
@@ -1903,12 +1916,14 @@ impl RefreshTask {
         let task = runtime.spawn(async move {
             self.start_ingestion(
                 config,
-                refresh,
+                IngestionState {
+                    refresh,
+                    caching: None,
+                    refresh_completion: None,
+                    initial_load_completed: Arc::new(AtomicBool::new(true)),
+                },
                 input,
                 ReaderTask::new(None),
-                None,
-                None,
-                Arc::new(AtomicBool::new(true)),
             )
             .await
         });

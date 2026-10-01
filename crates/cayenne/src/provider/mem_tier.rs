@@ -1176,7 +1176,7 @@ mod tests {
             },
             |_| None,
         );
-        result.unwrap_err();
+        result.expect_err("injected preparation refusal must leave the input unchanged");
         assert_eq!(visited, 2);
         assert!(Arc::ptr_eq(&before, &tier.segments));
         assert_eq!(tier.rows, 4);

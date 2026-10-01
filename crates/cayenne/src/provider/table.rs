@@ -21757,7 +21757,6 @@ impl CayenneTableProvider {
     #[inline]
     #[expect(
         clippy::unused_async,
-        clippy::unused_async_trait_impl,
         reason = "release no-op stub mirrors the async debug-build signature so \
                   call sites `.await` it unconditionally"
     )]
