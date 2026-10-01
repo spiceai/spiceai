@@ -935,6 +935,57 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Write every layer of `source` into the unpublished snapshot `snapshot_id`,
+    /// one after another, and fold the copies later layers supersede out of its
+    /// files; see [`Self::fold_superseded_copies`]. Returns the rows the snapshot
+    /// holds and their statistics.
+    pub(super) async fn write_layers_folded(
+        &self,
+        mut source: LayerSource,
+        snapshot_id: &str,
+        write: LayerWrite,
+    ) -> Result<(u64, Arc<ColumnStatsAccumulator>)> {
+        let file_stats = Arc::new(FileStatsObserver::new(self.table_schema(), None));
+        let observer =
+            || Some(Arc::clone(&file_stats) as Arc<dyn vortex_datafusion::VortexWriteObserver>);
+        let first = source.next_layer().ok_or_else(|| super::Error::Internal {
+            table: self.table_name().to_string(),
+            message: "a layered write's input yielded no first layer".to_string(),
+        })?;
+        let (first_rows, _files, stats) = self
+            .write_to_snapshot_range_partitioned(
+                first,
+                write.target_size_bytes,
+                snapshot_id,
+                write.target_partitions,
+                None,
+                write.write_policy,
+                None,
+                observer(),
+            )
+            .await?;
+        let mut later = self
+            .write_overwrite_layers_in_place(&mut source, snapshot_id, write, observer(), &stats)
+            .await?;
+        let live_rows = first_rows
+            .saturating_add(later.rows)
+            .saturating_sub(later.deleted_rows);
+        if later.position_deletions.is_empty() {
+            return Ok((live_rows, stats));
+        }
+        let folded = self
+            .fold_superseded_copies(
+                snapshot_id,
+                &std::mem::take(&mut later.position_deletions),
+                write,
+                &file_stats,
+                &stats,
+                live_rows,
+            )
+            .await?;
+        Ok((live_rows, folded))
+    }
+
     /// Drop an overwrite's unpublished snapshot after a failure before it is
     /// prepared, which never reaches `rollback`.
     async fn abandon_overwrite_snapshot(&self, snapshot_id: &str) {
@@ -1119,12 +1170,12 @@ impl CayenneTableProvider {
     }
 }
 
-/// How a layered overwrite writes each layer after the main snapshot.
+/// How a layered write writes each layer after the first.
 #[derive(Clone, Copy)]
-struct LayerWrite {
-    target_size_bytes: usize,
-    target_partitions: usize,
-    write_policy: super::delta_encoding::WritePolicy,
+pub(super) struct LayerWrite {
+    pub(super) target_size_bytes: usize,
+    pub(super) target_partitions: usize,
+    pub(super) write_policy: super::delta_encoding::WritePolicy,
 }
 
 /// What [`CayenneTableProvider::write_overwrite_layers_in_place`] wrote.

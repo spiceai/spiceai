@@ -48,12 +48,20 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::memory_pool::MemoryConsumer;
+use futures::StreamExt;
 
 use super::Error;
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::delta_encoding::WritePolicy;
+use super::key_conflicts::ConflictPolicy;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
+use super::overwrite::LayerWrite;
+use super::overwrite_layers::{
+    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS,
+};
 use super::pk_index::PkDigestSet;
 use super::table::CayenneTableProvider;
 
@@ -545,25 +553,84 @@ impl CayenneTableProvider {
             });
         }
 
+        // Resolve the keys the incoming data repeats, per the documented
+        // `on_conflict` semantics in which each batch is one upsert statement.
+        // Under `drop` the first copy wins, so later copies are filtered out before
+        // validation. Under the upsert policies a repeat within a batch is resolved
+        // here, and one across batches is validated as a later copy (see
+        // `prepare_stream_for_insert_offlock`) and folded out of the staged
+        // snapshot below, after the layers order the copies.
+        let reservation =
+            MemoryConsumer::new(format!("CayenneStagedUpsertKeys[{}]", self.table_name()))
+                .register(&self.runtime_env().memory_pool);
+        let mut layered = None;
+        let data: SendableRecordBatchStream = match self.key_resolver()? {
+            None => data,
+            Some(resolver) if resolver.policy() == ConflictPolicy::KeepFirst => {
+                Box::pin(FirstCopyFilter::new(data, resolver, reservation))
+            }
+            Some(resolver) => {
+                layered = Some(reservation);
+                let schema = data.schema();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    data.map(move |batch| {
+                        batch.and_then(|batch| {
+                            resolver
+                                .resolve_batch(&batch)
+                                .map(|resolved| resolved.batch)
+                                .map_err(Into::into)
+                        })
+                    }),
+                ))
+            }
+        };
+
         let prepared = self.prepare_stream_for_insert_offlock(data).await?;
         let post_validation = prepared.post_validation();
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.target_file_size_bytes();
 
-        let (row_count, _writer_ops, stats) = match self
-            .write_to_snapshot(
-                prepared.stream,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                // Unknown size (the validation stream is consumed lazily); shard
-                // across the full write concurrency, matching `begin_staged_append`.
-                None,
-                WritePolicy::DELTA,
-            )
-            .await
-        {
+        let written = match layered {
+            None => self
+                .write_to_snapshot(
+                    prepared.stream,
+                    target_size_bytes,
+                    &new_snapshot_id,
+                    target_partitions,
+                    // Unknown size (the validation stream is consumed lazily); shard
+                    // across the full write concurrency, matching `begin_staged_append`.
+                    None,
+                    WritePolicy::DELTA,
+                )
+                .await
+                .map(|(rows, _writer_ops, stats)| (rows, stats)),
+            Some(reservation) => {
+                let resolver = self.key_resolver()?.ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "a staged upsert lost its primary key".to_string(),
+                })?;
+                let window =
+                    CollapseWindow::new(self.collapse_window_bytes, reservation.new_empty());
+                let source = LayerSource::new(
+                    prepared.stream,
+                    LayerSplitter::new(resolver, MAX_LAYER_ROWS, reservation),
+                    Some(window),
+                );
+                self.write_layers_folded(
+                    source,
+                    &new_snapshot_id,
+                    LayerWrite {
+                        target_size_bytes,
+                        target_partitions,
+                        write_policy: WritePolicy::DELTA,
+                    },
+                )
+                .await
+            }
+        };
+        let (row_count, stats) = match written {
             Ok(result) => result,
             Err(e) => {
                 cleanup_orphan_snapshot_dir(self, &new_snapshot_id).await;

@@ -14207,6 +14207,9 @@ impl CayenneTableProvider {
     /// ordinary writers concurrently update the shared cache. Optimistic
     /// concurrency is re-checked at commit; a private keyset that is stale by
     /// commit is caught there (the transaction's sequence gate aborts).
+    ///
+    /// A key an earlier batch already holds is kept as a later copy rather than
+    /// rejected: the staging writer folds the earlier copies out of its snapshot.
     pub(crate) async fn prepare_stream_for_insert_offlock(
         &self,
         stream: SendableRecordBatchStream,
@@ -14288,6 +14291,11 @@ impl CayenneTableProvider {
             Arc::clone(&post_validation),
             pk_checkout,
         );
+        let validation_stream = if offlock {
+            validation_stream.superseding_repeats()
+        } else {
+            validation_stream
+        };
 
         Ok(PreparedInsertStream::deferred(
             Box::pin(validation_stream) as SendableRecordBatchStream,
@@ -14797,6 +14805,10 @@ impl CayenneTableProvider {
             }
 
             if ctx.incoming_keys.contains(&digest) {
+                if ctx.supersede_repeats {
+                    keep_mask.push(true);
+                    continue;
+                }
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -15244,6 +15256,7 @@ impl CayenneTableProvider {
                 existing: index.existence_ref(s),
                 pending: pending_existence.as_ref(),
                 incoming_keys: &incoming_keys,
+                supersede_repeats: false,
             };
             let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
             for (file_path, rows) in result.delete_specs {
@@ -69033,6 +69046,7 @@ mod tests {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &incoming_keys,
+            supersede_repeats: false,
         };
 
         let result = provider
