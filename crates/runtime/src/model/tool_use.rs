@@ -657,6 +657,37 @@ impl Stream for CustomStream {
     }
 }
 
+/// What [`make_a_stream`] does with one choice of an upstream chunk.
+#[derive(Debug, PartialEq, Eq)]
+enum ChoiceDisposition {
+    /// Pass the choice to the caller.
+    Forward,
+    /// The model finished a tool call: run the Spice tools it named and stream the
+    /// follow-up answer in place of this choice.
+    RunTools,
+    /// Nothing in the choice is for the caller: no finish and no content.
+    Drop,
+}
+
+/// Decides each choice exactly once, so a choice is never forwarded twice and a
+/// `tool_calls` finish that Spice acts on is never forwarded at all. Every other
+/// finish is forwarded whether or not the provider sent `content` beside it.
+///
+/// Some providers (`DeepSeek`, for one) put `"content": ""` on every chunk, the
+/// tool-call chunks and the final `tool_calls` finish included. Deciding on
+/// `content.is_some()` alone forwarded that finish after the follow-up answer, so
+/// the stream ended on `finish_reason: tool_calls` although the tool had run and
+/// the answer was complete, and a chunk carrying both content and `stop` was
+/// forwarded twice.
+fn choice_disposition(choice: &ChatChoiceStream) -> ChoiceDisposition {
+    match choice.finish_reason {
+        Some(FinishReason::ToolCalls) => ChoiceDisposition::RunTools,
+        Some(_) => ChoiceDisposition::Forward,
+        None if choice.delta.content.is_some() => ChoiceDisposition::Forward,
+        None => ChoiceDisposition::Drop,
+    }
+}
+
 fn make_a_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -738,85 +769,95 @@ fn make_a_stream(
                                 }
                             }
                         }
-                        if chat_choice.delta.content.is_some() {
-                            finished_choices.push(chat_choice.clone());
+                        match choice_disposition(&chat_choice) {
+                            ChoiceDisposition::Forward => {
+                                finished_choices.push(chat_choice);
+                                continue;
+                            }
+                            ChoiceDisposition::Drop => continue,
+                            ChoiceDisposition::RunTools => {}
                         }
 
-                        // If a tool has finished (i.e. we have all chunks), process them.
-                        if let Some(finish_reason) = &chat_choice.finish_reason {
-                            if matches!(finish_reason, FinishReason::ToolCalls) {
-                                let tool_call_states_clone = Arc::clone(&tool_call_states);
+                        // A tool call has finished (i.e. we have all chunks), process it.
+                        let tool_calls_to_process = match tool_call_states.lock() {
+                            Ok(states_lock) => states_lock.values().cloned().collect(),
+                            Err(e) => {
+                                tracing::error!("Failed to lock tool_call_states: {}", e);
+                                return;
+                            }
+                        };
 
-                                let tool_calls_to_process = {
-                                    match tool_call_states_clone.lock() {
-                                        Ok(states_lock) => states_lock
-                                            .values()
-                                            .cloned()
-                                            .collect(),
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to lock tool_call_states: {}",
-                                                e
-                                            );
-                                            return;
+                        let new_messages = match model
+                            .process_tool_calls_and_run_spice_tools(
+                                req.messages.clone(),
+                                tool_calls_to_process,
+                            )
+                            .await
+                        {
+                            Ok(Some(messages)) => messages,
+                            Ok(None) => {
+                                // No spice tools within returned tools, so return as message in stream.
+                                finished_choices.push(chat_choice);
+                                continue;
+                            }
+                            Err(e) => {
+                                if let Err(e) = sender_clone.send(Err(e)).await
+                                    && !sender_clone.is_closed() {
+                                        tracing::error!("Error sending error: {}", e);
+                                    }
+                                return;
+                            }
+                        };
+
+                        // Text the model wrote alongside the tool call belongs before the answer
+                        // the tool results produce, not after it.
+                        if chat_choice
+                            .delta
+                            .content
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                        {
+                            let mut text_only = chat_choice;
+                            text_only.delta.tool_calls = None;
+                            text_only.finish_reason = None;
+                            if let Some(text) = &text_only.delta.content {
+                                chat_output.push_str(text);
+                            }
+                            let mut resp = response.clone();
+                            resp.choices = vec![text_only];
+                            if let Err(e) = sender_clone.send(Ok(resp)).await {
+                                if !sender_clone.is_closed() {
+                                    tracing::error!("Error sending error: {}", e);
+                                }
+                                return;
+                            }
+                        }
+
+                        match model
+                            .chat_stream_inner(create_new_recursive_req(
+                                &req,
+                                new_messages,
+                                response.usage.as_ref(),
+                            ))
+                            .await
+                        {
+                            Ok(mut s) => {
+                                while let Some(resp) = s.next().await {
+                                    // TODO check if this works for choices > 1.
+                                    if let Err(e) = sender_clone.send(resp).await {
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending error: {}", e);
                                         }
-                                    }
-                                };
-
-                                let new_messages = match model
-                                    .process_tool_calls_and_run_spice_tools(
-                                        req.messages.clone(),
-                                        tool_calls_to_process,
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(messages)) => messages,
-                                    Ok(None) => {
-                                        // No spice tools within returned tools, so return as message in stream.
-                                        finished_choices.push(chat_choice);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await
-                                            && !sender_clone.is_closed() {
-                                                tracing::error!("Error sending error: {}", e);
-                                            }
-                                        return;
-                                    }
-                                };
-
-                                match model
-                                    .chat_stream_inner(create_new_recursive_req(
-                                        &req,
-                                        new_messages,
-                                        response.usage.as_ref(),
-                                    ))
-                                    .await
-                                {
-                                    Ok(mut s) => {
-                                        while let Some(resp) = s.next().await {
-                                            // TODO check if this works for choices > 1.
-                                            if let Err(e) = sender_clone.send(resp).await {
-                                                if !sender_clone.is_closed() {
-                                                    tracing::error!("Error sending error: {}", e);
-                                                }
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await
-                                            && !sender_clone.is_closed() {
-                                                tracing::error!("Error sending error: {}", e);
-                                            }
                                         return;
                                     }
                                 }
-                            } else if matches!(finish_reason, FinishReason::Stop)
-                                || matches!(finish_reason, FinishReason::Length)
-                            {
-                                // If complete, return to stream original.
-                                finished_choices.push(chat_choice.clone());
+                            }
+                            Err(e) => {
+                                if let Err(e) = sender_clone.send(Err(e)).await
+                                    && !sender_clone.is_closed() {
+                                        tracing::error!("Error sending error: {}", e);
+                                    }
+                                return;
                             }
                         }
                     }
@@ -900,6 +941,59 @@ mod tests {
         ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, CustomName,
         FunctionCall,
     };
+
+    fn stream_choice(json: &str) -> ChatChoiceStream {
+        serde_json::from_str(json).expect("valid stream choice")
+    }
+
+    #[test]
+    fn a_tool_calls_finish_runs_tools_whatever_its_content() {
+        // DeepSeek shape: an empty `content` beside the finish. Regression test for #13309.
+        for choice in [
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"tool_calls"}"#,
+            r#"{"index":0,"delta":{"content":"Let me check."},"finish_reason":"tool_calls"}"#,
+        ] {
+            assert_eq!(
+                choice_disposition(&stream_choice(choice)),
+                ChoiceDisposition::RunTools,
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_finish_is_forwarded_once_whatever_its_content() {
+        for choice in [
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"stop"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"stop"}"#,
+            r#"{"index":0,"delta":{"content":"done"},"finish_reason":"length"}"#,
+            r#"{"index":0,"delta":{},"finish_reason":"content_filter"}"#,
+            r#"{"index":0,"delta":{"content":""},"finish_reason":"content_filter"}"#,
+        ] {
+            assert_eq!(
+                choice_disposition(&stream_choice(choice)),
+                ChoiceDisposition::Forward,
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_choice_without_a_finish_is_forwarded_only_when_it_carries_content() {
+        assert_eq!(
+            choice_disposition(&stream_choice(
+                r#"{"index":0,"delta":{"content":"The table has "}}"#
+            )),
+            ChoiceDisposition::Forward
+        );
+        assert_eq!(
+            choice_disposition(&stream_choice(
+                r#"{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}"#
+            )),
+            ChoiceDisposition::Drop
+        );
+    }
 
     fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
         ChatCompletionRequestSystemMessageArgs::default()
