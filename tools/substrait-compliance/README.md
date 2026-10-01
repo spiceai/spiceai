@@ -34,7 +34,7 @@ time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
 | Suite | Measured | PASS | FAIL | SKIP | ERROR | Total |
 |-------|----------|------|------|------|-------|-------|
-| TPC-H SF 1 (generated tables, `expected/sf1`; what CI runs) | 2026-09-28 | 22 | 0 | 0 | 0 | 22 |
+| TPC-H SF 1 (generated tables, `expected/sf1`; what CI runs) | 2026-10-01 | 22 | 0 | 0 | 0 | 22 |
 | TPC-H SF 0.01 (the suite's CSVs and goldens) | 2026-09-09 | 22 | 0 | 0 | 0 | 22 |
 
 At SF 0.01, each step measured with the same command: IBM-strict compare on the first
