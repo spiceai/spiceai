@@ -698,9 +698,12 @@ impl SnapshotUploadError {
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
-            Self::UploadReadMetadata { source, .. } | Self::UploadWriteMetadata { source, .. } => {
-                is_retriable_object_store_error(source)
-            }
+            Self::StartUpload { source, .. }
+            | Self::UploadPart { source, .. }
+            | Self::CompleteUpload { source, .. }
+            | Self::AbortUpload { source, .. }
+            | Self::UploadReadMetadata { source, .. }
+            | Self::UploadWriteMetadata { source, .. } => is_retriable_object_store_error(source),
             Self::UploadSchemaSerialize { .. }
             | Self::UploadParseMetadata { .. }
             | Self::UploadUnsupportedMetadataVersion { .. }
@@ -5629,6 +5632,13 @@ mod tests {
             path: "metadata.json".to_string(),
             source: "etag changed".into(),
         });
+        let missing_bucket = SnapshotUploadError::StartUpload {
+            path: "t.cayenne".to_string(),
+            source: object_store::Error::NotFound {
+                path: "t.cayenne".to_string(),
+                source: "no such bucket".into(),
+            },
+        };
         let archive = SnapshotUploadError::ArchiveCreate {
             path: PathBuf::from("/tmp/snapshot.tar"),
             source: directory_archive::ArchiveError::CreateArchive {
@@ -5652,6 +5662,10 @@ mod tests {
         assert!(
             !precondition.is_retriable(),
             "a precondition failure is handled by the metadata update loop"
+        );
+        assert!(
+            !missing_bucket.is_retriable(),
+            "a missing bucket needs user action"
         );
         assert!(
             !mismatch.is_retriable(),
