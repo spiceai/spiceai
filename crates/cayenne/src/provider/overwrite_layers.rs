@@ -14,28 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Splitting a streaming overwrite into layers, so a key its incoming data
-//! repeats across record batches resolves as the later upsert it is.
+//! Splitting a streaming write into layers, so a key its incoming data repeats
+//! across record batches resolves as the later upsert it is.
 //!
-//! Cayenne orders rows by sequence only between layers — the main snapshot and
-//! the protected snapshots above it — never within one. So the later copy of a key
-//! must land in a higher layer than the earlier one, with a tombstone between
-//! them; the published state is then exactly what the overwrite followed by one
-//! upsert per layer would leave, which every reader and compaction already
-//! handles. [`LayerSplitter`] decides where each batch goes:
+//! Cayenne orders rows by sequence only between snapshots, never within one, so
+//! the later copy of a key must be written after the earlier one has been
+//! closed off. [`LayerSplitter`] decides where each batch goes:
 //!
 //! 1. A batch holding a key the current layer may already hold starts a new
 //!    layer, as does one that would take the layer past its row cap. A false
 //!    positive only starts a layer early.
-//! 2. In any layer above the first, a key an earlier layer may hold is
-//!    tombstoned at the layer's delete sequence, which hides it in every layer
-//!    below. A false positive tombstones a key no earlier layer holds, which hides
-//!    nothing: the layer's own copy sits above the tombstone.
+//! 2. In any layer above the first, a key an earlier layer may hold is recorded
+//!    as possibly superseding an earlier copy. A false positive records a key no
+//!    earlier layer holds, which a later read-back finds nothing for.
+//!
+//! An overwrite writes every layer into its one snapshot and, once all are
+//! written, reads back the lower layers' keys to find the copies the recorded
+//! keys supersede: a table that deletes by position hides them with position
+//! deletes, and one that deletes by key rewrites the files that hold them
+//! without them. A streaming append publishes each layer as its own protected
+//! snapshot, which supersedes the copies below it the way any later write does.
 //!
 //! The first question is answered by a set of 64-bit key hashes for the current
 //! layer, bounded by its row cap; the second by a bloom filter over the whole
 //! write. Neither holds a row, and a false positive costs a layer or a
-//! tombstone, never a row.
+//! read-back of a key, never a row.
 //!
 //! Under `drop` the first copy of a key wins, so a later copy must be dropped
 //! outright; that needs an exact answer, which [`FirstCopyFilter`] keeps.
@@ -45,9 +48,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{AsArray, BooleanArray, RecordBatch};
+use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{Int64Type, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_execution::memory_pool::MemoryReservation;
 use futures::Stream;
@@ -117,49 +120,30 @@ impl ChainedBloom {
     }
 }
 
-/// The primary keys a layer tombstones, in the encoding its strategy stores.
-#[derive(Debug, Default)]
-pub(crate) struct LayerTombstones {
-    /// `Int64` primary keys.
-    pub(crate) pk_i64: Vec<i64>,
-    /// Encoded primary keys, for every other key shape.
-    pub(crate) row_keys: Vec<Box<[u8]>>,
-    /// The key digest of every tombstoned key, in the same order.
-    pub(crate) digests: Vec<u128>,
-}
-
-impl LayerTombstones {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.pk_i64.is_empty() && self.row_keys.is_empty()
-    }
-}
-
 /// Where a routed batch goes; see the module documentation.
 #[derive(Debug)]
 struct Routed {
     batch: RecordBatch,
     /// The batch opens a new layer.
     starts_layer: bool,
-    /// Keys of the batch an earlier layer may hold.
-    tombstones: LayerTombstones,
+    /// Digests of the batch's keys an earlier layer may hold.
+    superseding: Vec<u128>,
 }
 
 /// Assigns each batch of an overwrite to a layer; see the module documentation.
 pub(crate) struct LayerSplitter {
     resolver: KeyResolver,
-    /// Index of the `Int64` primary key column, when the table stores its
-    /// tombstones as `Int64` keys.
-    int64_key: Option<usize>,
     /// 64-bit hashes of the current layer's keys. Exact up to a hash collision,
     /// which only starts a layer early, and it grows with the layer instead of
     /// being sized in advance; a chain of bloom filters would sum its filters'
     /// false-positive rates and split refreshes that repeat no key.
     layer_keys: HashSet<u64, PrehashedBuildHasher>,
     /// Keys of every layer written so far. 16 bits per key: a false positive
-    /// here costs one tombstone.
+    /// here costs one key's read-back.
     written_keys: ChainedBloom,
-    /// Append validation supplies its own cross-layer key deletions.
-    collect_tombstones: bool,
+    /// Whether to record the keys that may supersede an earlier layer's; an
+    /// append's layers supersede by snapshot instead.
+    track_superseding: bool,
     layer: usize,
     layer_rows: usize,
     max_layer_rows: usize,
@@ -169,35 +153,33 @@ pub(crate) struct LayerSplitter {
 impl LayerSplitter {
     pub(crate) fn new(
         resolver: KeyResolver,
-        int64_key: Option<usize>,
         max_layer_rows: usize,
         reservation: MemoryReservation,
     ) -> Self {
-        Self::with_tombstones(resolver, int64_key, max_layer_rows, reservation, true)
+        Self::with_superseding(resolver, max_layer_rows, reservation, true)
     }
 
-    /// Split an append without building overwrite-specific tombstones.
+    /// Split an append, whose layers supersede by snapshot, without recording
+    /// the keys that may supersede an earlier layer's.
     pub(crate) fn for_append(
         resolver: KeyResolver,
         max_layer_rows: usize,
         reservation: MemoryReservation,
     ) -> Self {
-        Self::with_tombstones(resolver, None, max_layer_rows, reservation, false)
+        Self::with_superseding(resolver, max_layer_rows, reservation, false)
     }
 
-    fn with_tombstones(
+    fn with_superseding(
         resolver: KeyResolver,
-        int64_key: Option<usize>,
         max_layer_rows: usize,
         reservation: MemoryReservation,
-        collect_tombstones: bool,
+        track_superseding: bool,
     ) -> Self {
         Self {
             resolver,
-            int64_key,
             layer_keys: HashSet::with_hasher(PrehashedBuildHasher),
             written_keys: ChainedBloom::new(1),
-            collect_tombstones,
+            track_superseding,
             layer: 0,
             layer_rows: 0,
             max_layer_rows: max_layer_rows.max(1),
@@ -235,20 +217,19 @@ impl LayerSplitter {
         }
         // In the first layer every key written so far is in the current layer,
         // which rule 1 has just ruled out, so a hit there is a false positive.
-        let superseding: Vec<usize> = if !self.collect_tombstones || self.layer == 0 {
+        let superseding: Vec<u128> = if !self.track_superseding || self.layer == 0 {
             Vec::new()
         } else {
             resolved
                 .digests
                 .iter()
-                .enumerate()
-                .filter(|&(_, &digest)| self.written_keys.might_contain(written_hash(digest)))
-                .map(|(row, _)| row)
+                .copied()
+                .filter(|&digest| self.written_keys.might_contain(written_hash(digest)))
                 .collect()
         };
         for &digest in &resolved.digests {
             self.layer_keys.insert(layer_hash(digest));
-            if self.collect_tombstones {
+            if self.track_superseding {
                 self.written_keys.insert(written_hash(digest));
             }
         }
@@ -257,44 +238,11 @@ impl LayerSplitter {
             // hashbrown: one control byte per bucket beside each 8-byte hash.
             self.layer_keys.capacity() * (size_of::<u64>() + 1) + self.written_keys.memory_bytes(),
         )?;
-        let tombstones = if self.collect_tombstones {
-            self.tombstones(&resolved, &superseding)?
-        } else {
-            LayerTombstones::default()
-        };
         Ok(Some(Routed {
             batch: resolved.batch,
             starts_layer,
-            tombstones,
+            superseding,
         }))
-    }
-
-    fn tombstones(
-        &self,
-        resolved: &ResolvedBatch,
-        rows: &[usize],
-    ) -> super::Result<LayerTombstones> {
-        if rows.is_empty() {
-            return Ok(LayerTombstones::default());
-        }
-        let digests = rows.iter().map(|&row| resolved.digests[row]).collect();
-        if let Some(index) = self.int64_key {
-            let keys = resolved.batch.column(index).as_primitive::<Int64Type>();
-            return Ok(LayerTombstones {
-                pk_i64: rows.iter().map(|&row| keys.value(row)).collect(),
-                row_keys: Vec::new(),
-                digests,
-            });
-        }
-        let encoded = self.resolver.encode_keys(&resolved.batch)?;
-        Ok(LayerTombstones {
-            pk_i64: Vec::new(),
-            row_keys: rows
-                .iter()
-                .map(|&row| Box::<[u8]>::from(encoded.row(row).as_ref()))
-                .collect(),
-            digests,
-        })
     }
 }
 
@@ -384,8 +332,8 @@ struct LayerSourceState {
     ready: VecDeque<ResolvedBatch>,
     /// The batch that opened the next layer, held until that layer's stream starts.
     carry: Option<Routed>,
-    /// Tombstones of each layer, indexed by layer.
-    tombstones: Vec<LayerTombstones>,
+    /// Digests of the keys each layer may supersede, indexed by layer.
+    superseding: Vec<Vec<u128>>,
     exhausted: bool,
 }
 
@@ -413,7 +361,7 @@ impl LayerSource {
                 window,
                 ready: VecDeque::new(),
                 carry: None,
-                tombstones: Vec::new(),
+                superseding: Vec::new(),
                 exhausted: false,
             })),
             schema,
@@ -441,9 +389,10 @@ impl LayerSource {
         }))
     }
 
-    /// The tombstones of every layer so far, taken once all layers are written.
-    pub(crate) fn take_tombstones(&self) -> Vec<LayerTombstones> {
-        std::mem::take(&mut self.state.lock().tombstones)
+    /// Digests of the keys each layer so far may supersede, indexed by layer,
+    /// taken once all layers are written.
+    pub(crate) fn take_superseding(&self) -> Vec<Vec<u128>> {
+        std::mem::take(&mut self.state.lock().superseding)
     }
 }
 
@@ -457,15 +406,10 @@ struct LayerStream {
 
 impl LayerStream {
     fn accept(state: &mut LayerSourceState, layer: usize, routed: Routed) -> RecordBatch {
-        if state.tombstones.len() <= layer {
-            state
-                .tombstones
-                .resize_with(layer + 1, LayerTombstones::default);
+        if state.superseding.len() <= layer {
+            state.superseding.resize_with(layer + 1, Vec::new);
         }
-        let tombstones = &mut state.tombstones[layer];
-        tombstones.pk_i64.extend(routed.tombstones.pk_i64);
-        tombstones.row_keys.extend(routed.tombstones.row_keys);
-        tombstones.digests.extend(routed.tombstones.digests);
+        state.superseding[layer].extend(routed.superseding);
         routed.batch
     }
 }
@@ -616,8 +560,8 @@ impl RecordBatchStream for FirstCopyFilter {
 mod tests {
     use super::*;
     use crate::provider::key_conflicts::ConflictPolicy;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{AsArray, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
     use futures::StreamExt;
@@ -659,7 +603,7 @@ mod tests {
     async fn layers(
         batches: Vec<RecordBatch>,
         max_layer_rows: usize,
-    ) -> (Vec<Vec<(i64, String)>>, Vec<LayerTombstones>) {
+    ) -> (Vec<Vec<(i64, String)>>, Vec<Vec<u128>>) {
         windowed_layers(batches, max_layer_rows, None).await
     }
 
@@ -667,10 +611,9 @@ mod tests {
         batches: Vec<RecordBatch>,
         max_layer_rows: usize,
         window: Option<CollapseWindow>,
-    ) -> (Vec<Vec<(i64, String)>>, Vec<LayerTombstones>) {
+    ) -> (Vec<Vec<(i64, String)>>, Vec<Vec<u128>>) {
         let splitter = LayerSplitter::new(
             resolver(ConflictPolicy::UpsertKeepLast),
-            Some(0),
             max_layer_rows,
             reservation(),
         );
@@ -688,7 +631,14 @@ mod tests {
             }
             out.push(rows);
         }
-        (out, source.take_tombstones())
+        (out, source.take_superseding())
+    }
+
+    fn digest(id: i64) -> u128 {
+        resolver(ConflictPolicy::UpsertKeepLast)
+            .resolve_batch(&batch(&[(id, "")]))
+            .expect("resolve")
+            .digests[0]
     }
 
     fn owned(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
@@ -697,18 +647,18 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_keys_stay_in_one_layer() {
-        let (layers, tombstones) = layers(
+        let (layers, superseding) = layers(
             vec![batch(&[(1, "a"), (2, "b")]), batch(&[(3, "c")])],
             MAX_LAYER_ROWS,
         )
         .await;
         assert_eq!(layers, vec![owned(&[(1, "a"), (2, "b"), (3, "c")])]);
-        assert!(tombstones.iter().all(LayerTombstones::is_empty));
+        assert!(superseding.iter().all(Vec::is_empty));
     }
 
     #[tokio::test]
-    async fn a_key_repeated_in_a_later_batch_opens_a_layer_that_tombstones_it() {
-        let (layers, tombstones) = layers(
+    async fn a_key_repeated_in_a_later_batch_opens_a_layer_that_supersedes_it() {
+        let (layers, superseding) = layers(
             vec![
                 batch(&[(1, "a"), (2, "b")]),
                 batch(&[(3, "c")]),
@@ -726,14 +676,15 @@ mod tests {
                 owned(&[(4, "f")]),
             ]
         );
-        assert_eq!(tombstones.len(), 3);
-        assert_eq!(tombstones[1].pk_i64, vec![1]);
-        assert_eq!(tombstones[2].pk_i64, vec![4]);
+        assert_eq!(
+            superseding,
+            vec![Vec::new(), vec![digest(1)], vec![digest(4)]]
+        );
     }
 
     #[tokio::test]
-    async fn the_row_cap_opens_a_layer_without_tombstones() {
-        let (layers, tombstones) = layers(
+    async fn the_row_cap_opens_a_layer_that_supersedes_nothing() {
+        let (layers, superseding) = layers(
             vec![batch(&[(1, "a")]), batch(&[(2, "b")]), batch(&[(3, "c")])],
             2,
         )
@@ -742,7 +693,7 @@ mod tests {
             layers,
             vec![owned(&[(1, "a"), (2, "b")]), owned(&[(3, "c")])]
         );
-        assert!(tombstones.iter().all(LayerTombstones::is_empty));
+        assert!(superseding.iter().all(Vec::is_empty));
     }
 
     #[tokio::test]
@@ -752,20 +703,20 @@ mod tests {
             batch(&[(1, "c"), (3, "d")]),
             batch(&[(2, "e")]),
         ];
-        let (layers, tombstones) = windowed_layers(
+        let (layers, superseding) = windowed_layers(
             batches,
             MAX_LAYER_ROWS,
             Some(CollapseWindow::new(COLLAPSE_WINDOW_BYTES, reservation())),
         )
         .await;
         assert_eq!(layers, vec![owned(&[(1, "c"), (3, "d"), (2, "e")])]);
-        assert!(tombstones.iter().all(LayerTombstones::is_empty));
+        assert!(superseding.iter().all(Vec::is_empty));
     }
 
     #[tokio::test]
     async fn a_repeat_across_windows_still_opens_a_layer() {
         // A one-byte window flushes after every batch.
-        let (layers, tombstones) = windowed_layers(
+        let (layers, superseding) = windowed_layers(
             vec![batch(&[(1, "a"), (2, "b")]), batch(&[(1, "c")])],
             MAX_LAYER_ROWS,
             Some(CollapseWindow::new(1, reservation())),
@@ -775,7 +726,7 @@ mod tests {
             layers,
             vec![owned(&[(1, "a"), (2, "b")]), owned(&[(1, "c")])]
         );
-        assert_eq!(tombstones[1].pk_i64, vec![1]);
+        assert_eq!(superseding[1], vec![digest(1)]);
     }
 
     #[tokio::test]

@@ -365,9 +365,9 @@ async fn overwrite_keeps_the_last_copy_across_batches_through_its_lifecycle() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// A key-deletion table publishes the later copies as protected layers; a
-/// position-deletion table publishes one snapshot whose superseded copies are
-/// hidden by position.
+/// A layered overwrite publishes one snapshot: a position-deletion table hides
+/// the superseded copies by position, and a key-deletion table drops them from
+/// its files, leaving no deletes at all.
 fn assert_layered_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
     let position_deleted: u64 = provider
         .pk_deletion_strategy
@@ -376,23 +376,16 @@ fn assert_layered_shape(provider: &CayenneTableProvider, mode: DeletionMode) {
         .values()
         .map(|deletes| deletes.len())
         .sum();
-    if mode == DeletionMode::Position {
-        assert!(
-            provider.protected_snapshot_ids().is_empty(),
-            "{mode:?}: layers"
-        );
-        assert_eq!(position_deleted, 3, "{mode:?}: superseded copies");
-        assert!(
-            !provider.has_pending_deletions(),
-            "{mode:?}: key tombstones"
-        );
-    } else {
-        assert!(
-            provider.protected_snapshot_ids().len() >= 2,
-            "{mode:?}: layers"
-        );
-        assert_eq!(position_deleted, 0, "{mode:?}: position deletes");
-    }
+    assert!(
+        provider.protected_snapshot_ids().is_empty(),
+        "{mode:?}: layers"
+    );
+    assert!(
+        !provider.has_pending_deletions(),
+        "{mode:?}: key tombstones"
+    );
+    let expected = if mode == DeletionMode::Position { 3 } else { 0 };
+    assert_eq!(position_deleted, expected, "{mode:?}: position deletes");
 }
 
 /// After a layered overwrite on a position-deletion table, position capture and
@@ -665,4 +658,76 @@ async fn repeats_within_the_collapse_window_publish_one_snapshot() {
         );
         assert!(!provider.has_pending_deletions(), "{mode:?}: no tombstones");
     }
+}
+
+/// A superseded copy's values never reach an aggregate, whether it reads the
+/// rows or the table's statistics. A key-deletion table keeps its statistics
+/// exact, since its superseded copies leave its files.
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregates_after_a_layered_overwrite_ignore_superseded_copies() {
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode, UpsertDedup::None).await;
+        write(
+            &provider,
+            InsertOp::Overwrite,
+            vec![
+                batch(&[(1, "m"), (2, "zzz"), (3, "m")]),
+                batch(&[(2, "aaa"), (4, "m")]),
+            ],
+        )
+        .await
+        .expect("layered overwrite");
+        for (stage, provider) in [
+            ("after overwrite", provider.clone_for_write()),
+            (
+                "after reopen",
+                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
+            ),
+        ] {
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            let df = ctx
+                .sql("SELECT MIN(value), MAX(value), COUNT(*), COUNT(value) FROM t")
+                .await
+                .expect("query");
+            let plan = arrow::util::pretty::pretty_format_batches(
+                &df.clone()
+                    .explain(false, false)
+                    .expect("explain")
+                    .collect()
+                    .await
+                    .expect("plan"),
+            )
+            .expect("format")
+            .to_string();
+            let from_statistics = plan.contains("PlaceholderRowExec");
+            if mode == DeletionMode::Key && !from_statistics {
+                failures.push(format!(
+                    "{mode:?} {stage}: scanned instead of using statistics"
+                ));
+            }
+            let batches = df.collect().await.expect("collect");
+            let row = &batches[0];
+            let observed = (
+                row.column(0).as_string::<i32>().value(0).to_string(),
+                row.column(1).as_string::<i32>().value(0).to_string(),
+                row.column(2)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0),
+                row.column(3)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0),
+            );
+            let expected = ("aaa".to_string(), "m".to_string(), 4, 4);
+            eprintln!("{mode:?} {stage}: {observed:?}, from statistics: {from_statistics}");
+            if observed != expected {
+                failures.push(format!(
+                    "{mode:?} {stage}: {observed:?}, expected {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

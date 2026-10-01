@@ -302,11 +302,7 @@ impl KeyResolver {
 
     /// The table's encoding of each row's primary key (the `RowConverter` bytes
     /// key-based tombstones store).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a primary key column cannot be encoded.
-    pub(crate) fn encode_keys(&self, batch: &RecordBatch) -> Result<crate::row_converter::Rows> {
+    fn encode_keys(&self, batch: &RecordBatch) -> Result<crate::row_converter::Rows> {
         let columns: Vec<ArrayRef> = self
             .primary_key
             .iter()

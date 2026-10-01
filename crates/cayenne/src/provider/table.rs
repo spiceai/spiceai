@@ -2624,22 +2624,6 @@ pub struct CayenneTableProvider {
     pk_constraints: Option<Constraints>,
 }
 
-/// One protected layer an overwrite publishes above its main snapshot; see
-/// [`crate::metadata::OverwriteLayer`].
-pub(crate) struct OverwriteLayerPublish<'a> {
-    pub(crate) snapshot_id: &'a str,
-    pub(crate) threshold: i64,
-    pub(crate) delete_sequence: i64,
-    pub(crate) insert_sequence: i64,
-    pub(crate) tombstones: &'a super::overwrite_layers::LayerTombstones,
-}
-
-/// The tombstone index an overwrite's layers publish, built before its fence.
-pub(crate) enum OverwriteLayerDeletions {
-    Int64(DeletionIndex),
-    Rows(KeyDeletionIndex),
-}
-
 /// The inline corpus an overwrite commits alongside its snapshot flip, as the
 /// in-memory visibility state needs to describe it. Both values come from the
 /// single `cayenne_inlined_data` row [`CayenneCatalog::commit_overwrite_in_txn`]
@@ -5726,13 +5710,11 @@ impl CayenneTableProvider {
         &self,
         new_snapshot_id: &str,
         inlined_rows: Option<InlinedOverwritePublish>,
-        layers: &[OverwriteLayerPublish<'_>],
         position_deletions: &HashMap<String, Vec<u32>>,
     ) -> Result<Option<u64>> {
         // Build the new listing table BEFORE acquiring the fence (synchronous, no
         // I/O), then flip every visibility-affecting pointer atomically below.
         let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
-        let layer_deletions = self.build_overwrite_layer_deletions(layers);
         let position_deletions: Option<PositionBitmap> =
             (!position_deletions.is_empty()).then(|| {
                 position_deletions
@@ -5763,8 +5745,6 @@ impl CayenneTableProvider {
                 new_snapshot_id,
                 new_listing_table,
                 inlined_rows,
-                layers,
-                layer_deletions,
                 position_deletions,
             );
             discarded_epoch
@@ -5925,8 +5905,6 @@ impl CayenneTableProvider {
         new_snapshot_id: &str,
         new_listing_table: Arc<ListingTable>,
         inlined_rows: Option<InlinedOverwritePublish>,
-        layers: &[OverwriteLayerPublish<'_>],
-        layer_deletions: Option<OverwriteLayerDeletions>,
         position_deletions: Option<PositionBitmap>,
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
@@ -5943,41 +5921,9 @@ impl CayenneTableProvider {
             lookup_index.promote_staged(new_snapshot_id);
         }
         self.clear_all_deletion_caches();
-        // The overwrite's own protected layers and their tombstones, which its
-        // catalog transaction wrote after clearing the previous ones. Installed in
-        // the same flip as the snapshot pointer, so a scan sees either the old table
-        // or every layer of the new one.
-        if !layers.is_empty() {
-            self.protected_snapshots.store(Arc::new(
-                layers
-                    .iter()
-                    .map(|layer| (layer.snapshot_id.to_string(), layer.threshold))
-                    .collect(),
-            ));
-        }
-        match (layer_deletions, &self.pk_deletion_strategy) {
-            (
-                Some(OverwriteLayerDeletions::Int64(index)),
-                PkDeletionStrategyWithCache::Int64Pk {
-                    deletion_snapshot, ..
-                },
-            ) => {
-                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(index)));
-                self.refresh_deletion_memory_accounting();
-            }
-            (
-                Some(OverwriteLayerDeletions::Rows(index)),
-                PkDeletionStrategyWithCache::RowConverterBased {
-                    deletion_snapshot, ..
-                },
-            ) => {
-                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(index)));
-                self.refresh_deletion_memory_accounting();
-            }
-            _ => {}
-        }
-        // The position deletes that hide the copies an overwrite written in place
-        // superseded; see `write_overwrite_layers_in_place`.
+        // The position deletes that hide the copies of keys the overwrite's
+        // incoming data repeated, which its catalog transaction wrote after
+        // clearing the previous ones; see `write_overwrite_layers_in_place`.
         if let Some(position_deletions) = position_deletions {
             self.pk_deletion_strategy
                 .position_cache()
@@ -11483,7 +11429,7 @@ impl CayenneTableProvider {
         // a commit whose `live_rows_delta` is still queued survives every proxy
         // and would be served `Exact`-and-short. The fourth term reads that
         // queue directly, which no checkpoint can clear out from under it.
-        let has_pending_visibility_changes = self.has_pending_deletions()
+        let has_pending_visibility_changes = self.has_rows_hidden_from_file_statistics()
             || self.inlined_row_count.load(Ordering::Relaxed) > 0
             || self.mem_tier.any_tombstones()
             || self.post_write_maintenance.has_unapplied_live_rows_delta();
@@ -12963,6 +12909,98 @@ impl CayenneTableProvider {
         Ok(located)
     }
 
+    /// Stream the rows of the unpublished snapshot's files named in `excluded`,
+    /// less the file-local positions it lists for each.
+    pub(crate) async fn scan_snapshot_files_excluding(
+        &self,
+        snapshot_id: &str,
+        excluded: &HashMap<String, Vec<u32>>,
+    ) -> Result<SendableRecordBatchStream> {
+        let invalid = |message: String| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message,
+        };
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        );
+        let mut urls = Vec::with_capacity(excluded.len());
+        let mut deletions = PositionBitmap::with_capacity(excluded.len());
+        for (location, positions) in excluded {
+            let name = object_store::path::Path::from(location.as_str())
+                .filename()
+                .map(str::to_string)
+                .ok_or_else(|| invalid(format!("file {location} has no name")))?;
+            urls.push(
+                ListingTableUrl::parse(format!("{snapshot_dir_url}{name}"))
+                    .map_err(|err| invalid(format!("invalid file URL for {location}: {err}")))?,
+            );
+            deletions.insert(
+                location.clone(),
+                Arc::new(PositionDeletionVector::new(
+                    positions.iter().copied().collect(),
+                )),
+            );
+        }
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let format: Arc<dyn FileFormat> = Arc::new(
+            self.context
+                .file_format()
+                .with_access_plan_provider(Arc::new(PositionDeletionAccessPlanProvider::new(
+                    Arc::new(ArcSwap::from_pointee(deletions)),
+                ))),
+        );
+        let options = ListingOptions::new(format)
+            .with_session_config_options(state.config())
+            .with_collect_stat(false);
+        let config = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(options)
+            .with_schema(self.table_schema());
+        let listing = ListingTable::try_new(config)
+            .map_err(|err| invalid(format!("failed to read superseded files: {err}")))?;
+        ctx.read_table(Arc::new(listing))
+            .map_err(|err| invalid(format!("failed to read superseded files: {err}")))?
+            .execute_stream()
+            .await
+            .map_err(|err| invalid(format!("failed to read superseded files: {err}")))
+    }
+
+    /// Delete the files at `locations` from an unpublished snapshot.
+    pub(crate) async fn remove_snapshot_files(
+        &self,
+        snapshot_id: &str,
+        locations: impl IntoIterator<Item = &String>,
+    ) -> Result<()> {
+        let invalid = |message: String| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message,
+        };
+        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        ))
+        .map_err(|err| invalid(format!("invalid snapshot URL: {err}")))?;
+        let store = self
+            .context
+            .runtime_env()
+            .object_store(&table_url)
+            .map_err(|err| invalid(format!("failed to resolve object store: {err}")))?;
+        for location in locations {
+            store
+                .delete(&object_store::path::Path::from(location.as_str()))
+                .await
+                .map_err(|err| {
+                    invalid(format!(
+                        "failed to delete superseded file {location}: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Returns the column indices for the configured primary key, if any.
     fn primary_key_indices(&self) -> Result<Option<Vec<usize>>> {
         if self.table_metadata.primary_key.is_empty() {
@@ -13040,60 +13078,6 @@ impl CayenneTableProvider {
         match self.key_resolver()? {
             Some(resolver) => resolver.for_change_stream().collapse_write(batches),
             None => Ok(batches),
-        }
-    }
-
-    /// The primary key column whose values this table's tombstones store
-    /// directly, when its deletion strategy keys tombstones by an `Int64` key.
-    pub(crate) fn int64_tombstone_key(&self) -> Option<usize> {
-        match self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => self.pk_column_indices.first().copied(),
-            _ => None,
-        }
-    }
-
-    /// The tombstone index an overwrite's layers leave: the overwrite clears
-    /// every earlier tombstone, so it is built outright from the layers rather
-    /// than folded into the live index, and before the publish takes the fence.
-    fn build_overwrite_layer_deletions(
-        &self,
-        layers: &[OverwriteLayerPublish<'_>],
-    ) -> Option<OverwriteLayerDeletions> {
-        if layers.iter().all(|layer| layer.tombstones.is_empty()) {
-            return None;
-        }
-        match self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                let mut deleted = HashMap::new();
-                let mut inserted = HashMap::new();
-                for layer in layers {
-                    for &pk in &layer.tombstones.pk_i64 {
-                        let delete = deleted.entry(pk).or_insert(layer.delete_sequence);
-                        *delete = (*delete).max(layer.delete_sequence);
-                        let insert = inserted.entry(pk).or_insert(layer.insert_sequence);
-                        *insert = (*insert).max(layer.insert_sequence);
-                    }
-                }
-                Some(OverwriteLayerDeletions::Int64(DeletionIndex::from_maps(
-                    deleted, inserted,
-                )))
-            }
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                let mut deleted: HashMap<Box<[u8]>, i64> = HashMap::new();
-                let mut inserted: HashMap<Box<[u8]>, i64> = HashMap::new();
-                for layer in layers {
-                    for key in &layer.tombstones.row_keys {
-                        let delete = deleted.entry(key.clone()).or_insert(layer.delete_sequence);
-                        *delete = (*delete).max(layer.delete_sequence);
-                        let insert = inserted.entry(key.clone()).or_insert(layer.insert_sequence);
-                        *insert = (*insert).max(layer.insert_sequence);
-                    }
-                }
-                Some(OverwriteLayerDeletions::Rows(KeyDeletionIndex::from_maps(
-                    deleted, inserted,
-                )))
-            }
-            PkDeletionStrategyWithCache::PositionBased { .. } => None,
         }
     }
 
@@ -16251,7 +16235,7 @@ impl CayenneTableProvider {
     /// For `Int64Pk` tables, encodes each i64 as big-endian bytes.
     /// For `RowConverterBased` tables, passes through the already-encoded row keys.
     /// Position-based tables don't support upserts and return an empty vec.
-    pub(crate) fn build_pk_deletion_row_keys<'keys>(
+    fn build_pk_deletion_row_keys<'keys>(
         &self,
         deleted_pk_i64: &[i64],
         deleted_row_keys: Cow<'keys, [Box<[u8]>]>,
@@ -16314,7 +16298,7 @@ impl CayenneTableProvider {
         Ok(Some(results))
     }
 
-    pub(crate) async fn write_key_deletion_vectors(
+    async fn write_key_deletion_vectors(
         &self,
         delete_sequence: i64,
         row_keys: Vec<Box<[u8]>>,
@@ -19443,7 +19427,7 @@ impl CayenneTableProvider {
         // only when the new manifest was authored above (publish-before-clear).
         // Best-effort: a prune failure must not fail the compaction.
         if manifest_authored
-            && let Err(error) = self.prune_snapshot_manifest_to(&[&new_snapshot_id]).await
+            && let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await
         {
             tracing::warn!(
                 target: "cayenne::compaction",
@@ -21633,10 +21617,10 @@ impl CayenneTableProvider {
     /// (publish-before-clear).
     pub(crate) async fn prune_snapshot_manifest_to(
         &self,
-        keep_snapshot_ids: &[&str],
+        keep_snapshot_id: &str,
     ) -> CatalogResult<()> {
         self.catalog
-            .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_ids)
+            .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
             .await
     }
 
@@ -22738,7 +22722,7 @@ impl CayenneTableProvider {
         // snapshot's manifest rows are dead. Prune them and assert the live
         // manifest matches the listing we wrote it from (debug builds only).
         if let Some(files) = manifest_listed {
-            if let Err(error) = self.prune_snapshot_manifest_to(&[&new_snapshot_id]).await {
+            if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
                 tracing::warn!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -23876,14 +23860,7 @@ impl CayenneTableProvider {
             // Cold graduation's content is the registered cold files; the overwrite
             // clear drops the warm tier's inline corpus with nothing to replace it,
             // so there are no inline rows to republish.
-            self.publish_overwrite_snapshot_fenced(
-                &new_snapshot_id,
-                new_listing_table,
-                None,
-                &[],
-                None,
-                None,
-            );
+            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None, None);
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -23938,7 +23915,7 @@ impl CayenneTableProvider {
             self.taint_persisted_row_count_exactness().await;
         }
 
-        if let Err(error) = self.prune_snapshot_manifest_to(&[&new_snapshot_id]).await {
+        if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -26718,6 +26695,15 @@ impl CayenneTableProvider {
                 deletion_snapshot, ..
             } => deletion_snapshot.load().tombstones.has_deletions(),
         }
+    }
+
+    /// Whether a deletion hides rows that the files' own statistics still
+    /// describe: a key tombstone, or a position delete. A table with a primary
+    /// key can hold position deletes with no tombstone, which
+    /// [`Self::has_pending_deletions`] does not report.
+    pub(crate) fn has_rows_hidden_from_file_statistics(&self) -> bool {
+        self.has_pending_deletions()
+            || !self.pk_deletion_strategy.position_cache().load().is_empty()
     }
 
     /// Returns a reference to the primary key deletion strategy and its caches.
@@ -34938,7 +34924,7 @@ impl CayenneTableProvider {
         // footer row counts are not live-row counts, however, so pending
         // deletions separately disable LIMIT early-stop and exact aggregates.
         let collect_stats = request.options.collect_stat;
-        let has_pending_deletions = self.has_pending_deletions();
+        let has_pending_deletions = self.has_rows_hidden_from_file_statistics();
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
         let dir_generation = request.captured_files.map_or_else(
             || self.current_dir_generation.load(Ordering::Acquire),
@@ -37173,7 +37159,7 @@ impl TableProvider for CayenneTableProvider {
         // mis-sizes joins / enables unsafe count pushdown). The narrow
         // position-only guard left key-based pending deletes leaking the
         // over-count in the pre-first-maintenance window.
-        if self.has_pending_deletions() {
+        if self.has_rows_hidden_from_file_statistics() {
             return None;
         }
 
@@ -41777,7 +41763,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id, None, &[], &HashMap::new())
+                        .publish_overwrite_snapshot(&overwrite_id, None, &HashMap::new())
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);
@@ -53737,7 +53723,7 @@ mod tests {
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
                     provider_in_hook
-                        .publish_overwrite_snapshot(&overwrite_id, None, &[], &HashMap::new())
+                        .publish_overwrite_snapshot(&overwrite_id, None, &HashMap::new())
                         .await
                         .expect("mid-pass overwrite publish");
                     fired.store(true, Ordering::SeqCst);

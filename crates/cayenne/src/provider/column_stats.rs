@@ -666,6 +666,33 @@ impl ColumnStatsAccumulator {
         }
     }
 
+    /// Merge only `other`'s NDV sketches, leaving the row count and min/max/null
+    /// statistics as they are.
+    pub(crate) fn merge_ndv_from(&self, other: &Self) {
+        let other_ndv = {
+            let Ok(other_state) = other.state.lock() else {
+                tracing::warn!(
+                    "ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping"
+                );
+                return;
+            };
+            other_state.ndv.clone()
+        };
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping");
+            return;
+        };
+        for (idx, other_hll) in other_ndv.into_iter().enumerate() {
+            let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
+                continue;
+            };
+            match slot {
+                Some(hll) => hll.merge(&other_hll),
+                None => *slot = Some(other_hll),
+            }
+        }
+    }
+
     /// Snapshot the accumulated per-column NDV sketches as an [`NdvSketches`]
     /// container (column index -> sketch), for serialization/merge on persist.
     pub(crate) fn to_ndv_sketches(&self) -> crate::hll::NdvSketches {

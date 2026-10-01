@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The state a layered write publishes — a main snapshot, protected snapshots
+//! The state a layered streaming append publishes — a main snapshot, protected snapshots
 //! above it, and key tombstones between them — is exactly what an overwrite
 //! followed by upsert appends produces. This checks that state keeps the last
 //! copy of every key through a reopen and every compaction, in both deletion modes.
