@@ -2438,9 +2438,16 @@ impl HttpExec {
             "request_headers" => {
                 Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
             }
-            "content" => Ok(Arc::new(StringArray::from_iter_values(
-                content_rows.iter().map(String::as_str),
-            )) as ArrayRef),
+            "content" => {
+                // Consumers can retain these buffers after the request finishes.
+                // Size them for the complete response before sharing the array.
+                let content_bytes = content_rows.iter().map(String::len).sum();
+                let mut builder = StringBuilder::with_capacity(content_rows.len(), content_bytes);
+                for row in content_rows {
+                    builder.append_value(row);
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
             "response_status" => Ok(Arc::new(UInt16Array::from(vec![
                 fetch_result.response_status;
                 num_rows
@@ -6383,6 +6390,78 @@ mod tests {
         assert!(!schema.field(5).is_nullable()); // response_status is not nullable
         assert!(schema.field(6).is_nullable()); // response_headers is nullable
         assert!(schema.field(7).is_nullable()); // _fetched_at is nullable
+    }
+
+    #[test]
+    fn content_buffers_are_sized_before_sharing() {
+        let rows = vec![
+            "a".repeat(131_156),
+            "b".repeat(131_156),
+            "a".repeat(131_156),
+        ];
+        let array = HttpExec::build_metadata_array(
+            "content",
+            "",
+            "",
+            "",
+            "",
+            &rows,
+            &empty_fetch_result(),
+            0,
+            rows.len(),
+        )
+        .expect("content array");
+        let content = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string content");
+        assert_eq!(content.len(), rows.len());
+        assert_eq!(content.null_count(), 0);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(content.value(index), row);
+        }
+        let content_bytes: usize = rows.iter().map(String::len).sum();
+        assert!(
+            content.get_array_memory_size() <= content_bytes + 1024,
+            "complete response retains unused buffer capacity: {} bytes for {content_bytes} content bytes",
+            content.get_array_memory_size(),
+        );
+    }
+
+    #[test]
+    fn content_buffers_preserve_empty_and_multibyte_rows() {
+        for rows in [
+            Vec::new(),
+            vec![
+                String::new(),
+                "東京".to_string(),
+                "🍛".to_string(),
+                "\0".to_string(),
+                "null".to_string(),
+            ],
+        ] {
+            let array = HttpExec::build_metadata_array(
+                "content",
+                "",
+                "",
+                "",
+                "",
+                &rows,
+                &empty_fetch_result(),
+                0,
+                rows.len(),
+            )
+            .expect("content array");
+            let content = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string content");
+            assert_eq!(content.len(), rows.len());
+            assert_eq!(content.null_count(), 0);
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(content.value(index), row);
+            }
+        }
     }
 
     #[tokio::test]
