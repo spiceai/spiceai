@@ -1910,7 +1910,9 @@ jobs:
 
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
-    runs-on: ${{ matrix.target.runner }}
+    # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
+    # moves on its own, so this Linux-only job stays on ubuntu-24.04.
+    runs-on: ubuntu-24.04
     needs:
       - build
       - setup-matrix
