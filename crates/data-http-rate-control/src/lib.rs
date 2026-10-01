@@ -592,25 +592,6 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     .description("Tokens of the current cluster rate-control window not yet leased by any instance, per limiter")
     .auto_register(),
     MetricSpec::new(
-        "rate_control_cluster_effective_burst",
-        MetricType::ObservableGaugeU64,
-    )
-    .description("This instance's rate-control budget for the current window after adaptive throttling, per limiter; equal to the configured budget while the origin is healthy. Derived from the shared outcome counts, so replicas reading settled counts report the same value")
-    .auto_register(),
-    MetricSpec::new(
-        "rate_control_lease_acquire_duration_ms",
-        MetricType::ObservableGaugeU64,
-    )
-    .description("Time the most recent cluster rate-control lease refresh took, per limiter")
-    .unit("ms")
-    .auto_register(),
-    MetricSpec::new(
-        "rate_control_lease_acquire_conflicts_total",
-        MetricType::ObservableCounterU64,
-    )
-    .description("Total optimistic-concurrency conflicts hit while refreshing a cluster rate-control lease, per limiter")
-    .auto_register(),
-    MetricSpec::new(
         "rate_control_lease_refresh_errors_total",
         MetricType::ObservableCounterU64,
     )
@@ -808,17 +789,6 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             }
             "rate_control_cluster_budget_remaining" => {
                 observe_per_limiter_metric!(LeasedBucketMetrics::cluster_budget_remaining)
-            }
-            "rate_control_cluster_effective_burst" => {
-                observe_per_limiter_metric!(LeasedBucketMetrics::cluster_effective_burst)
-            }
-            "rate_control_lease_acquire_duration_ms" => {
-                observe_per_limiter_metric!(|metrics: &LeasedBucketMetrics| {
-                    metrics.last_lease_acquire_micros() / 1_000
-                })
-            }
-            "rate_control_lease_acquire_conflicts_total" => {
-                observe_per_limiter_metric!(LeasedBucketMetrics::lease_acquire_conflicts_total)
             }
             "rate_control_lease_refresh_errors_total" => {
                 observe_per_limiter_metric!(LeasedBucketMetrics::lease_refresh_errors_total)
