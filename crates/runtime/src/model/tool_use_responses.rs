@@ -680,9 +680,9 @@ fn create_new_recursive_req(
 ) -> CreateResponse {
     let mut new_req = req.clone();
     new_req.input = InputParam::Items(new_msg);
-    new_req.tool_choice = next_round_tool_choice(new_req.tool_choice.take());
+    new_req.tool_choice = Some(next_round_tool_choice(new_req.tool_choice.take()));
 
-    // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
+    // Adjust input `max_output_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_output_tokens) = new_req.max_output_tokens
         && let Some(usage) = marginal_usage
     {
@@ -693,31 +693,31 @@ fn create_new_recursive_req(
 }
 
 /// The `tool_choice` for the round after one that called tools — the Responses
-/// counterpart of `tool_use::next_round_tool_choice`, which explains why a choice
-/// that forces a tool call is not sent again (issue #14459).
-fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> Option<ToolChoiceParam> {
+/// counterpart of `tool_use::next_round_tool_choice`: a choice that forces a call
+/// applies to one round (issue #14459), and `allowed_tools` keeps its tool list in
+/// `auto` mode. An unset choice is sent as `auto` as well.
+fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> ToolChoiceParam {
     match choice {
-        None
-        | Some(ToolChoiceParam::Function(_) | ToolChoiceParam::Mode(ToolChoiceOptions::Required)) =>
-        {
-            tracing::debug!("Not forcing a tool call again after a round that made one.");
-            Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto))
-        }
-        Some(ToolChoiceParam::AllowedTools(mut allowed)) => {
-            allowed.mode = ToolChoiceAllowedMode::Auto;
-            Some(ToolChoiceParam::AllowedTools(allowed))
-        }
-        // These force a tool the runtime does not run — the provider's own, or the
-        // client's — so a round that called a runtime tool never ran under one;
-        // `auto` and `none` force nothing.
+        None => ToolChoiceParam::Mode(ToolChoiceOptions::Auto),
         Some(
-            choice @ (ToolChoiceParam::Mcp(_)
+            ToolChoiceParam::Function(_)
+            | ToolChoiceParam::Mcp(_)
             | ToolChoiceParam::Custom(_)
             | ToolChoiceParam::ApplyPatch
             | ToolChoiceParam::Shell
             | ToolChoiceParam::Hosted(_)
-            | ToolChoiceParam::Mode(ToolChoiceOptions::Auto | ToolChoiceOptions::None)),
-        ) => Some(choice),
+            | ToolChoiceParam::Mode(ToolChoiceOptions::Required),
+        ) => {
+            tracing::debug!("Not forcing a tool call again after a round that made one.");
+            ToolChoiceParam::Mode(ToolChoiceOptions::Auto)
+        }
+        Some(ToolChoiceParam::AllowedTools(mut allowed)) => {
+            allowed.mode = ToolChoiceAllowedMode::Auto;
+            ToolChoiceParam::AllowedTools(allowed)
+        }
+        Some(choice @ ToolChoiceParam::Mode(ToolChoiceOptions::Auto | ToolChoiceOptions::None)) => {
+            choice
+        }
     }
 }
 
@@ -753,5 +753,56 @@ pub fn combine_usage(
         (Some(u1), None) => Some(u1),
         (None, Some(u2)) => Some(u2),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::{
+        ToolChoiceAllowed, ToolChoiceCustom, ToolChoiceFunction, ToolChoiceTypes,
+    };
+
+    fn allowed_tools(mode: ToolChoiceAllowedMode) -> ToolChoiceParam {
+        ToolChoiceParam::AllowedTools(ToolChoiceAllowed {
+            mode,
+            tools: vec![json!({ "type": "function", "name": "list_datasets" })],
+        })
+    }
+
+    // regression test for #14459
+    #[test]
+    fn test_next_round_tool_choice() {
+        let auto = ToolChoiceParam::Mode(ToolChoiceOptions::Auto);
+        for forced in [
+            None,
+            Some(ToolChoiceParam::Mode(ToolChoiceOptions::Required)),
+            Some(ToolChoiceParam::Function(ToolChoiceFunction {
+                name: "list_datasets".to_string(),
+            })),
+            Some(ToolChoiceParam::Custom(ToolChoiceCustom {
+                name: "client_tool".to_string(),
+            })),
+            Some(ToolChoiceParam::ApplyPatch),
+            Some(ToolChoiceParam::Shell),
+            Some(ToolChoiceParam::Hosted(ToolChoiceTypes::WebSearchPreview)),
+        ] {
+            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+        }
+
+        // `allowed_tools` keeps its tool list, in `auto` mode.
+        assert_eq!(
+            next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
+            allowed_tools(ToolChoiceAllowedMode::Auto)
+        );
+
+        // Choices that force nothing pass through unchanged.
+        for unforced in [
+            ToolChoiceParam::Mode(ToolChoiceOptions::Auto),
+            ToolChoiceParam::Mode(ToolChoiceOptions::None),
+            allowed_tools(ToolChoiceAllowedMode::Auto),
+        ] {
+            assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+        }
     }
 }
