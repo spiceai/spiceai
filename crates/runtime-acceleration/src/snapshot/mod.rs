@@ -140,15 +140,15 @@ pub const SOURCE_SELECTION_FINGERPRINT_PROPERTY: &str = "spice.source-selection-
 const SNAPSHOT_READ_CONSISTENCY_DOCS: &str =
     "https://spiceai.org/docs/components/data-accelerators/snapshots";
 
-fn accept_skew_snapshot_bootstrap_reason() -> String {
+fn independent_reads_snapshot_bootstrap_reason() -> String {
     format!(
-        "it was published under `snapshots_consistency: accept_skew`, so its rows may span several source positions. Set `snapshots_consistency: accept_skew` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+        "it was published under `snapshots_consistency: independent_reads`, so its rows may span several source positions. Set `snapshots_consistency: independent_reads` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
     )
 }
 
 fn missing_read_consistency_bootstrap_reason() -> String {
     format!(
-        "it records no `snapshot-read-consistency`, so it cannot be shown to have come from a single consistent read. Set `snapshots_consistency: accept_skew` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+        "it records no `snapshot-read-consistency`, so it cannot be shown to have come from a single consistent read. Set `snapshots_consistency: independent_reads` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
     )
 }
 
@@ -366,7 +366,7 @@ struct SnapshotEntry {
     /// How the producing materialization was allowed to read its sources.
     ///
     /// Recorded per entry so a `consistent_read` bootstrap can refuse an archive
-    /// published under `accept_skew` even when the consumer's current plan happens
+    /// published under `independent_reads` even when the consumer's current plan happens
     /// to read once — catalog state and pushdown can change that plan without
     /// changing the SQL. Absent for an entry written before this was recorded, or
     /// by a source that is not a query (a dataset always reads once).
@@ -885,7 +885,7 @@ pub struct SnapshotManager {
     ///
     /// `None` for a source that is not a query (a dataset): no stamp, no check. `Some`
     /// for a view: every published entry records the value, and a `consistent_read`
-    /// bootstrap refuses an `accept_skew` or unstamped entry.
+    /// bootstrap refuses an `independent_reads` or unstamped entry.
     snapshots_consistency: Option<SnapshotsConsistency>,
 }
 
@@ -1299,7 +1299,7 @@ impl SnapshotManager {
 
     /// Records how this series' producing materialization was allowed to read its
     /// sources, so a `consistent_read` bootstrap can refuse an archive published
-    /// under `accept_skew`.
+    /// under `independent_reads`.
     ///
     /// Call only for a planned-query source (a view). A dataset always reads once
     /// and does not stamp or check this field.
@@ -1394,17 +1394,17 @@ impl SnapshotManager {
     /// Whether one snapshot entry's producing-read stamp is admissible for this manager.
     ///
     /// A manager with no consistency policy (a dataset) accepts anything. An
-    /// `accept_skew` consumer accepts any stamp, including none: it opted out. A
+    /// `independent_reads` consumer accepts any stamp, including none: it opted out. A
     /// `consistent_read` consumer accepts only an entry stamped `consistent_read` —
-    /// an `accept_skew` marker means the rows may already be torn, and a missing
+    /// an `independent_reads` marker means the rows may already be torn, and a missing
     /// stamp cannot be shown to have come from a single read.
     fn entry_read_consistency_permits(&self, entry: &SnapshotEntry) -> Result<(), String> {
         match self.snapshots_consistency {
-            None | Some(SnapshotsConsistency::AcceptSkew) => Ok(()),
+            None | Some(SnapshotsConsistency::IndependentReads) => Ok(()),
             Some(SnapshotsConsistency::ConsistentRead) => match entry.snapshot_read_consistency {
                 Some(SnapshotsConsistency::ConsistentRead) => Ok(()),
-                Some(SnapshotsConsistency::AcceptSkew) => {
-                    Err(accept_skew_snapshot_bootstrap_reason())
+                Some(SnapshotsConsistency::IndependentReads) => {
+                    Err(independent_reads_snapshot_bootstrap_reason())
                 }
                 None => Err(missing_read_consistency_bootstrap_reason()),
             },
@@ -4253,7 +4253,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]
-    async fn download_latest_snapshot_refuses_an_accept_skew_archive_under_consistent_read() {
+    async fn download_latest_snapshot_refuses_an_independent_reads_archive_under_consistent_read() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
@@ -4282,7 +4282,7 @@ mod tests {
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
             snapshot_source_selection_fingerprint: None,
-            snapshot_read_consistency: Some(SnapshotsConsistency::AcceptSkew),
+            snapshot_read_consistency: Some(SnapshotsConsistency::IndependentReads),
         };
 
         let schema = sample_schema();
@@ -4317,7 +4317,7 @@ mod tests {
             .expect("a refused bootstrap is not a download error");
         assert!(
             result.is_none(),
-            "a consistent_read consumer must not restore an accept_skew archive"
+            "a consistent_read consumer must not restore an independent_reads archive"
         );
         assert!(
             !local_path.exists(),
@@ -4399,7 +4399,8 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]
-    async fn download_latest_snapshot_accepts_an_accept_skew_archive_under_accept_skew() {
+    async fn download_latest_snapshot_accepts_an_independent_reads_archive_under_independent_reads()
+    {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
@@ -4409,7 +4410,7 @@ mod tests {
             .expect("valid time");
         let location = layout.build_location(&base, instant);
 
-        let contents = Bytes::from_static(b"accept-skew-snapshot-bytes");
+        let contents = Bytes::from_static(b"independent-reads-snapshot-bytes");
         store
             .put(&location, contents.clone().into())
             .await
@@ -4428,7 +4429,7 @@ mod tests {
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
             snapshot_source_selection_fingerprint: None,
-            snapshot_read_consistency: Some(SnapshotsConsistency::AcceptSkew),
+            snapshot_read_consistency: Some(SnapshotsConsistency::IndependentReads),
         };
 
         let schema = sample_schema();
@@ -4455,13 +4456,13 @@ mod tests {
             &schema,
             false,
         )
-        .with_snapshots_consistency(SnapshotsConsistency::AcceptSkew);
+        .with_snapshots_consistency(SnapshotsConsistency::IndependentReads);
 
         let info = manager
             .download_latest_snapshot()
             .await
             .expect("download should succeed")
-            .expect("an accept_skew consumer must restore an accept_skew archive");
+            .expect("an independent_reads consumer must restore an independent_reads archive");
         assert_eq!(info.checksum, checksum);
         let downloaded = fs::read(&local_path)
             .await
@@ -5533,7 +5534,7 @@ mod tests {
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             }),
-            SnapshotsConsistency::AcceptSkew,
+            SnapshotsConsistency::IndependentReads,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -5559,12 +5560,12 @@ mod tests {
             .expect("a published archive must be current");
         assert_eq!(
             entry.snapshot_read_consistency,
-            Some(SnapshotsConsistency::AcceptSkew),
-            "an accept_skew view must stamp the archive so a consistent_read bootstrap can refuse it"
+            Some(SnapshotsConsistency::IndependentReads),
+            "an independent_reads view must stamp the archive so a consistent_read bootstrap can refuse it"
         );
         let json = serde_json::to_value(&handle.metadata).expect("serialize metadata");
         assert_eq!(
-            json[DATASET_NAME]["snapshots"][0]["snapshot-read-consistency"], "accept_skew",
+            json[DATASET_NAME]["snapshots"][0]["snapshot-read-consistency"], "independent_reads",
             "the archive field must serialize under its kebab-case name"
         );
     }
@@ -5627,7 +5628,7 @@ mod tests {
                 accept_unstamped: false,
                 materialization: crate::acceleration_source::MaterializationSource::SourceTable,
             }),
-            SnapshotsConsistency::AcceptSkew,
+            SnapshotsConsistency::IndependentReads,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -5903,18 +5904,18 @@ mod tests {
     /// same SQL can replan from multi-read to single-read. The producing-read stamp
     /// on the entry is the proof.
     #[test]
-    fn consistent_read_bootstrap_refuses_an_accept_skew_or_unstamped_archive() {
+    fn consistent_read_bootstrap_refuses_an_independent_reads_or_unstamped_archive() {
         let store = Arc::new(InMemory::new());
         let consistent = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
             .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
 
         let refused = consistent
             .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             )))
-            .expect_err("an accept_skew archive must not bootstrap under consistent_read");
+            .expect_err("an independent_reads archive must not bootstrap under consistent_read");
         assert!(
-            refused.contains("`snapshots_consistency: accept_skew`"),
+            refused.contains("`snapshots_consistency: independent_reads`"),
             "{refused}"
         );
         assert!(
@@ -5946,24 +5947,25 @@ mod tests {
     }
 
     #[test]
-    fn accept_skew_bootstrap_admits_any_producing_read_stamp() {
+    fn independent_reads_bootstrap_admits_any_producing_read_stamp() {
         let store = Arc::new(InMemory::new());
-        let accept_skew = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
-            .with_snapshots_consistency(SnapshotsConsistency::AcceptSkew);
+        let independent_reads =
+            manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+                .with_snapshots_consistency(SnapshotsConsistency::IndependentReads);
 
-        accept_skew
+        independent_reads
             .entry_read_consistency_permits(&dummy_snapshot_entry(None))
-            .expect("accept_skew must admit an unstamped archive");
-        accept_skew
+            .expect("independent_reads must admit an unstamped archive");
+        independent_reads
             .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             )))
-            .expect("accept_skew must admit an accept_skew archive");
-        accept_skew
+            .expect("independent_reads must admit an independent_reads archive");
+        independent_reads
             .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
                 SnapshotsConsistency::ConsistentRead,
             )))
-            .expect("accept_skew must admit a consistent_read archive");
+            .expect("independent_reads must admit a consistent_read archive");
     }
 
     #[test]
@@ -5972,7 +5974,7 @@ mod tests {
         let dataset = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"));
         dataset
             .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             )))
             .expect("a dataset has no read-consistency policy");
         dataset
@@ -5993,11 +5995,11 @@ mod tests {
                     materialization:
                         crate::acceleration_source::MaterializationSource::PlannedQuery,
                 }),
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             );
         assert_eq!(
             view.snapshots_consistency,
-            Some(SnapshotsConsistency::AcceptSkew),
+            Some(SnapshotsConsistency::IndependentReads),
             "a view must stamp the producing-read policy it publishes under"
         );
 
@@ -6010,7 +6012,7 @@ mod tests {
                     accept_unstamped: false,
                     materialization: crate::acceleration_source::MaterializationSource::SourceTable,
                 }),
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             );
         assert!(
             dataset.snapshots_consistency.is_none(),
@@ -6021,14 +6023,14 @@ mod tests {
     #[test]
     fn producing_read_consistency_refusal_messages_name_the_setting_and_a_way_out() {
         for expected in [
-            "`snapshots_consistency: accept_skew`",
+            "`snapshots_consistency: independent_reads`",
             "span several source positions",
             SNAPSHOT_READ_CONSISTENCY_DOCS,
         ] {
-            let reason = accept_skew_snapshot_bootstrap_reason();
+            let reason = independent_reads_snapshot_bootstrap_reason();
             assert!(
                 reason.contains(expected),
-                "the accept_skew bootstrap reason must contain {expected:?}: {reason}"
+                "the independent_reads bootstrap reason must contain {expected:?}: {reason}"
             );
         }
         for expected in [

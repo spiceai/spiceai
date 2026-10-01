@@ -313,7 +313,7 @@ impl Runtime {
             // `bootstrap_only` / `consistent_read` view whose query is multi-read today
             // would otherwise restore an archive, checkpoint it, then be refused —
             // leaving those rows on disk for a later same-schema start. The archive's
-            // producing-read stamp additionally refuses `accept_skew` entries, but that
+            // producing-read stamp additionally refuses `independent_reads` entries, but that
             // check runs inside `init`; skipping bootstrap here still keeps a currently
             // multi-read view from restoring a `consistent_read` archive before the
             // load-time refusal. `create_accelerated_view` inits after that decision.

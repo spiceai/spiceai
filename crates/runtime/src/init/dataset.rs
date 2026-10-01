@@ -3059,15 +3059,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_dataset_refuses_accept_skew_snapshots_consistency() {
+    async fn validate_dataset_refuses_independent_reads_snapshots_consistency() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
 
-        let accept_skew = spicepod::acceleration::Acceleration {
-            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::AcceptSkew,
+        let independent_reads = spicepod::acceleration::Acceleration {
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::IndependentReads,
             ..spicepod::acceleration::Acceleration::default()
         };
-        let err = validate_dataset(&dataset_with_acceleration(&runtime, accept_skew))
-            .expect_err("accept_skew on a dataset is a no-op and must be refused");
+        let err = validate_dataset(&dataset_with_acceleration(&runtime, independent_reads))
+            .expect_err("independent_reads on a dataset is a no-op and must be refused");
         assert!(
             matches!(err, Error::SnapshotsConsistencyNotForDataset { .. }),
             "expected a snapshots_consistency refusal, got: {err}"
@@ -3075,7 +3075,7 @@ mod tests {
         for expected in [
             "orders",
             "postgres",
-            "snapshots_consistency: accept_skew",
+            "snapshots_consistency: independent_reads",
             "only valid for accelerated views",
             "https://spiceai.org/docs/components/data-accelerators/snapshots",
         ] {
@@ -3169,12 +3169,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_dataset_ignores_accept_skew_on_a_disabled_acceleration() {
+    async fn validate_dataset_ignores_independent_reads_on_a_disabled_acceleration() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
 
         let acceleration = spicepod::acceleration::Acceleration {
             enabled: false,
-            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::AcceptSkew,
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::IndependentReads,
             ..spicepod::acceleration::Acceleration::default()
         };
 
@@ -3243,7 +3243,7 @@ mod tests {
         for expected in [
             "'orders'",
             "postgres",
-            "`snapshots_consistency: accept_skew`",
+            "`snapshots_consistency: independent_reads`",
             "only valid for accelerated views",
             "Remove `snapshots_consistency`",
             "https://spiceai.org/docs/components/data-accelerators/snapshots",

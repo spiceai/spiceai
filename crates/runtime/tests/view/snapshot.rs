@@ -429,7 +429,7 @@ async fn multi_read_view_refuses_snapshots() -> anyhow::Result<()> {
 
 /// `bootstrap_only` does not create snapshots, but it still restores them. A default
 /// `consistent_read` consumer must refuse a multi-read view rather than silently
-/// serving an archive an `accept_skew` writer could have published.
+/// serving an archive an `independent_reads` writer could have published.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn multi_read_view_refuses_bootstrap_only_snapshots() -> anyhow::Result<()> {
@@ -468,11 +468,11 @@ async fn multi_read_view_refuses_bootstrap_only_snapshots() -> anyhow::Result<()
         .await
 }
 
-/// `accept_skew` is the explicit opt-out: a bootstrap-only multi-read view still
+/// `independent_reads` is the explicit opt-out: a bootstrap-only multi-read view still
 /// loads, and still creates nothing.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn multi_read_view_bootstrap_only_accept_skew_loads() -> anyhow::Result<()> {
+async fn multi_read_view_bootstrap_only_independent_reads_loads() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -484,14 +484,14 @@ async fn multi_read_view_bootstrap_only_accept_skew_loads() -> anyhow::Result<()
             let snapshot_dir = temp.path().join("snapshots");
             std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshots");
 
-            let app = AppBuilder::new("view_snapshot_bootstrap_only_accept_skew")
+            let app = AppBuilder::new("view_snapshot_bootstrap_only_independent_reads")
                 .with_dataset(csv_dataset(&csv_path))
                 .with_view(accelerated_view_with(
                     "orders_self_join",
                     MULTI_READ_SQL,
-                    &temp.path().join("accept_skew.db"),
+                    &temp.path().join("independent_reads.db"),
                     spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
-                    SnapshotsConsistency::AcceptSkew,
+                    SnapshotsConsistency::IndependentReads,
                 ))
                 .with_snapshots(snapshots_config(&snapshot_dir))
                 .build();
@@ -503,11 +503,11 @@ async fn multi_read_view_bootstrap_only_accept_skew_loads() -> anyhow::Result<()
                 .build()
                 .run()
                 .await
-                .expect("a bootstrap-only multi-read view with accept_skew must load")
+                .expect("a bootstrap-only multi-read view with independent_reads must load")
                 .data
                 .try_collect::<Vec<_>>()
                 .await
-                .expect("collecting accepted-skew rows");
+                .expect("collecting independent-reads rows");
             let rows: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -518,7 +518,7 @@ async fn multi_read_view_bootstrap_only_accept_skew_loads() -> anyhow::Result<()
             );
             assert!(
                 published_snapshots(&snapshot_dir).is_empty(),
-                "bootstrap_only must not publish, even when accept_skew admits the view"
+                "bootstrap_only must not publish, even when independent_reads admits the view"
             );
 
             Ok(())
@@ -542,14 +542,14 @@ async fn query_view_row_count(rt: &Runtime, sql: &str) -> anyhow::Result<usize> 
         .sum())
 }
 
-/// An archive published under `accept_skew` must not bootstrap into a default
+/// An archive published under `independent_reads` must not bootstrap into a default
 /// `consistent_read` consumer of the same SQL: catalog/pushdown can replan that
 /// SQL as single-read later, which is exactly when the load-time check would
 /// pass and torn rows would be served. The producing stamp is the gate.
-/// An `accept_skew` consumer still restores those archives — that is the opt-in.
+/// An `independent_reads` consumer still restores those archives — that is the opt-in.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn accept_skew_archive_is_refused_by_consistent_read_and_allowed_by_accept_skew()
+async fn independent_reads_archive_is_refused_by_consistent_read_and_allowed_by_independent_reads()
 -> anyhow::Result<()> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -563,14 +563,14 @@ async fn accept_skew_archive_is_refused_by_consistent_read_and_allowed_by_accept
             std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshots");
 
             let publisher_db = temp.path().join("publisher.db");
-            let app = AppBuilder::new("view_snapshot_accept_skew_publish")
+            let app = AppBuilder::new("view_snapshot_independent_reads_publish")
                 .with_dataset(csv_dataset(&csv_path))
                 .with_view(accelerated_view_with(
                     "orders_us",
                     "SELECT id FROM orders WHERE region = 'us'",
                     &publisher_db,
                     spicepod::acceleration::SnapshotBehavior::Enabled,
-                    SnapshotsConsistency::AcceptSkew,
+                    SnapshotsConsistency::IndependentReads,
                 ))
                 .with_snapshots(snapshots_config(&snapshot_dir))
                 .build();
@@ -578,15 +578,15 @@ async fn accept_skew_archive_is_refused_by_consistent_read_and_allowed_by_accept
 
             let snapshot_dir_for_wait = snapshot_dir.clone();
             wait_until(
-                "the accept_skew view to publish a snapshot and its metadata pointer",
+                "the independent_reads view to publish a snapshot and its metadata pointer",
                 Duration::from_secs(90),
                 || snapshot_is_published(&snapshot_dir_for_wait),
             )
             .await?;
             assert_eq!(
                 published_read_consistencies(&snapshot_dir),
-                vec!["accept_skew".to_string()],
-                "an accept_skew publisher must stamp accept_skew on the archive"
+                vec!["independent_reads".to_string()],
+                "an independent_reads publisher must stamp independent_reads on the archive"
             );
             drop(publisher);
 
@@ -608,19 +608,19 @@ async fn accept_skew_archive_is_refused_by_consistent_read_and_allowed_by_accept
                     .await?;
             assert_eq!(
                 refused_rows, 3,
-                "consistent_read must refuse an accept_skew archive and rebuild from the diverged source (3 rows); 2 would mean the torn-capable archive was restored"
+                "consistent_read must refuse an independent_reads archive and rebuild from the diverged source (3 rows); 2 would mean the torn-capable archive was restored"
             );
             drop(refused);
 
-            let allowed_db = temp.path().join("accept_skew_consumer.db");
-            let app = AppBuilder::new("view_snapshot_accept_skew_consumer")
+            let allowed_db = temp.path().join("independent_reads_consumer.db");
+            let app = AppBuilder::new("view_snapshot_independent_reads_consumer")
                 .with_dataset(csv_dataset(&csv_path))
                 .with_view(accelerated_view_with(
                     "orders_us",
                     "SELECT id FROM orders WHERE region = 'us'",
                     &allowed_db,
                     spicepod::acceleration::SnapshotBehavior::Enabled,
-                    SnapshotsConsistency::AcceptSkew,
+                    SnapshotsConsistency::IndependentReads,
                 ))
                 .with_snapshots(snapshots_config(&snapshot_dir))
                 .build();
@@ -630,7 +630,7 @@ async fn accept_skew_archive_is_refused_by_consistent_read_and_allowed_by_accept
                     .await?;
             assert_eq!(
                 allowed_rows, 2,
-                "accept_skew must still bootstrap the archive it opted into; 3 would mean it rebuilt from the diverged source instead"
+                "independent_reads must still bootstrap the archive it opted into; 3 would mean it rebuilt from the diverged source instead"
             );
 
             Ok(())

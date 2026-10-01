@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dataset_parses_snapshots_consistency_accept_skew() {
+    fn a_dataset_parses_snapshots_consistency_independent_reads() {
         // Configuration-level coverage for the public Spicepod field: a dataset
         // YAML may name `snapshots_consistency`. The runtime refuses a non-default
         // value at load; parse must still accept the documented tokens.
@@ -654,7 +654,7 @@ mod tests {
             acceleration:
               engine: duckdb
               snapshots: enabled
-              snapshots_consistency: accept_skew
+              snapshots_consistency: independent_reads
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("dataset should deserialize");
         let acceleration = dataset
@@ -663,7 +663,7 @@ mod tests {
             .expect("acceleration block should parse");
         assert_eq!(
             acceleration.snapshots_consistency,
-            crate::acceleration::SnapshotsConsistency::AcceptSkew
+            crate::acceleration::SnapshotsConsistency::IndependentReads
         );
         assert_eq!(
             acceleration.snapshots,

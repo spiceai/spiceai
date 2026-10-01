@@ -53,9 +53,9 @@ use tokio::sync::RwLock as TokioRwLock;
 /// operator can act on — including a `bootstrap_only` consumer whose query is multi-read
 /// today. It cannot speak for an archive already on disk: catalog state and pushdown can
 /// change the compiled plan without changing the SQL, so a view that reads once at
-/// restore may be restoring rows published under `accept_skew` while the plan was
+/// restore may be restoring rows published under `independent_reads` while the plan was
 /// multi-read. Each archive carries a producing-read stamp, and a `consistent_read`
-/// bootstrap refuses an `accept_skew` (or unstamped) entry.
+/// bootstrap refuses an `independent_reads` (or unstamped) entry.
 ///
 /// This gate consumes the read-shape recorded from the plan that *executed* the
 /// refresh that produced the rows now on disk. It does not re-plan at publish time:
@@ -78,7 +78,7 @@ use tokio::sync::RwLock as TokioRwLock;
 /// table stays correct and keeps serving — it just does not add a snapshot this cycle,
 /// and a cold start bootstraps whatever was last published.
 ///
-/// `accept_skew` waives the read-shape check and nothing else. The operator accepted
+/// `independent_reads` waives the read-shape check and nothing else. The operator accepted
 /// rows captured at several source positions; they did not accept rows derived from a
 /// dependency definition the archive's fingerprint does not describe, so the stamp, its
 /// epoch, and every dependency check still apply.
@@ -94,7 +94,7 @@ pub(crate) struct ViewSnapshotPublishGate {
     /// Publication is withheld while any of them is not proven configured.
     dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
     /// Whether a multi-read stamp refuses the publish (`consistent_read`) or is
-    /// accepted (`accept_skew`).
+    /// accepted (`independent_reads`).
     consistency: SnapshotsConsistency,
 }
 
@@ -122,7 +122,7 @@ fn unconfirmed_rows_clause(consistency: SnapshotsConsistency) -> &'static str {
         SnapshotsConsistency::ConsistentRead => {
             "Spice cannot confirm these rows came from a single consistent read of its sources"
         }
-        SnapshotsConsistency::AcceptSkew => {
+        SnapshotsConsistency::IndependentReads => {
             "Spice cannot confirm these rows came from the configured definitions of its sources"
         }
     }
@@ -225,7 +225,7 @@ impl SnapshotPublishGate for ViewSnapshotPublishGate {
                     SnapshotsConsistency::ConsistentRead => {
                         stamp.shape.refusal_reason().map_or(Ok(()), Err)
                     }
-                    SnapshotsConsistency::AcceptSkew => Ok(()),
+                    SnapshotsConsistency::IndependentReads => Ok(()),
                 }
             }
         }
@@ -2351,12 +2351,12 @@ mod tests {
             );
         }
 
-        /// `accept_skew` waives the read-shape check and nothing else. A multi-read
+        /// `independent_reads` waives the read-shape check and nothing else. A multi-read
         /// stamp publishes, but rows refreshed while a dependency was not at its
         /// configured definition are refused exactly as under `consistent_read`:
         /// the archive would carry a fingerprint that does not describe them.
         #[tokio::test]
-        async fn accept_skew_gate_waives_only_the_read_shape_check() {
+        async fn independent_reads_gate_waives_only_the_read_shape_check() {
             use runtime_component::dataset::acceleration::RefreshMode;
             use runtime_table::accelerated::refresh::Refresh;
             use tokio::sync::RwLock;
@@ -2382,13 +2382,13 @@ mod tests {
                 TableReference::bare("orders_us"),
                 attestation.clone(),
                 vec![(dep_name.clone(), Arc::clone(&dep_refresh))],
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             );
 
             let missing = gate
                 .check_publish()
                 .await
-                .expect_err("accept_skew must still refuse a publish no refresh attested");
+                .expect_err("independent_reads must still refuse a publish no refresh attested");
             assert!(missing.contains("configured definitions"), "{missing}");
 
             let view_epoch = view_identity.begin_refresh();
@@ -2403,10 +2403,9 @@ mod tests {
                 )],
             );
             gate.bind_materialization_epoch(view_epoch);
-            let refused = gate
-                .check_publish()
-                .await
-                .expect_err("accept_skew must not publish rows read from an overridden dependency");
+            let refused = gate.check_publish().await.expect_err(
+                "independent_reads must not publish rows read from an overridden dependency",
+            );
             assert!(refused.contains("dependency 'orders'"), "{refused}");
 
             // The dependency refreshes from its configured definition, then the view does.
@@ -2424,9 +2423,9 @@ mod tests {
                 )],
             );
             gate.bind_materialization_epoch(view_epoch);
-            gate.check_publish()
-                .await
-                .expect("accept_skew must publish a multi-read stamp over configured dependencies");
+            gate.check_publish().await.expect(
+                "independent_reads must publish a multi-read stamp over configured dependencies",
+            );
         }
 
         #[tokio::test]

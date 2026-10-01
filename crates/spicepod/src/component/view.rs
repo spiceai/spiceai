@@ -171,14 +171,14 @@ params:
     }
 
     #[test]
-    fn a_view_parses_snapshots_consistency_accept_skew() {
+    fn a_view_parses_snapshots_consistency_independent_reads() {
         let yaml = r"
             name: orders_by_region
             sql: SELECT region, COUNT(*) FROM orders GROUP BY region
             acceleration:
               engine: duckdb
               snapshots: enabled
-              snapshots_consistency: accept_skew
+              snapshots_consistency: independent_reads
         ";
         let view: View = yaml::from_str(yaml).expect("view should deserialize");
         let acceleration = view
@@ -187,7 +187,7 @@ params:
             .expect("acceleration block should parse");
         assert_eq!(
             acceleration.snapshots_consistency,
-            crate::acceleration::SnapshotsConsistency::AcceptSkew
+            crate::acceleration::SnapshotsConsistency::IndependentReads
         );
         assert_eq!(
             acceleration.snapshots,

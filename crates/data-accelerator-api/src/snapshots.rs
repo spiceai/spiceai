@@ -158,7 +158,7 @@ pub async fn download_snapshot(
         // bootstrap an archive materialized from a different one: the rows would be
         // wrong rather than merely old, and no schema check would catch it. A view
         // also stamps producing-read consistency so a `consistent_read` bootstrap
-        // refuses an archive published under `accept_skew`.
+        // refuses an archive published under `independent_reads`.
         //
         // Views share the same live-refresh identity publish uses (see
         // `View::definition_fingerprint`); datasets keep the Spicepod identity.

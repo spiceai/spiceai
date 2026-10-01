@@ -572,7 +572,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to enable acceleration snapshots for view '{view_name}': {reason}. \
          Set `snapshots: disabled` on the view, reduce its query to a single table scan, \
-         or set `snapshots_consistency: accept_skew` to use the snapshots anyway and accept \
+         or set `snapshots_consistency: independent_reads` to use the snapshots anyway and accept \
          that the stored rows may span several source positions. \
          See: https://spiceai.org/docs/components/data-accelerators/snapshots"
     ))]
@@ -655,15 +655,15 @@ impl Error {
 /// plan check fails fast when this view's query is multi-read today. It cannot speak
 /// for an archive already on disk: that archive carries a producing-read stamp
 /// (`snapshot-read-consistency`), and a `consistent_read` bootstrap refuses an
-/// `accept_skew` or unstamped entry even if today's plan happens to read once.
+/// `independent_reads` or unstamped entry even if today's plan happens to read once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 enum ViewSnapshotConsistencyDecision {
-    /// The operator set `accept_skew`. No single-read gate. A create-enabled view
+    /// The operator set `independent_reads`. No single-read gate. A create-enabled view
     /// still installs the publish gate, which waives only the read-shape check and
     /// keeps requiring that every dependency was at its configured definition when
-    /// the view refreshed. Each archive is stamped `accept_skew`.
-    AcceptSkew,
+    /// the view refreshed. Each archive is stamped `independent_reads`.
+    IndependentReads,
     /// The compiled plan reads once today. A create-enabled view still installs a
     /// publish-time re-check because the compiled plan can change. Archives it
     /// publishes are stamped `consistent_read`.
@@ -674,22 +674,22 @@ impl ViewSnapshotConsistencyDecision {
     /// The consistency the publish gate enforces for this decision.
     fn consistency(self) -> SnapshotsConsistency {
         match self {
-            Self::AcceptSkew => SnapshotsConsistency::AcceptSkew,
+            Self::IndependentReads => SnapshotsConsistency::IndependentReads,
             Self::ConsistentSingleRead => SnapshotsConsistency::ConsistentRead,
         }
     }
 }
 
 #[must_use]
-fn view_snapshot_accept_skew_warning(table: &TableReference) -> String {
+fn view_snapshot_independent_reads_warning(table: &TableReference) -> String {
     format!(
-        "View '{table}' uses snapshots with `snapshots_consistency: accept_skew`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to require a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+        "View '{table}' uses snapshots with `snapshots_consistency: independent_reads`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to require a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
     )
 }
 
 /// Load-time read-shape policy for any snapshot-enabled view.
 ///
-/// Refuses a multi-read view unless the operator set `accept_skew`. Does not
+/// Refuses a multi-read view unless the operator set `independent_reads`. Does not
 /// install a publish gate — that is the caller's job when this instance creates.
 async fn view_snapshot_consistency_decision(
     ctx: &SessionContext,
@@ -697,9 +697,9 @@ async fn view_snapshot_consistency_decision(
     sql: &str,
     consistency: SnapshotsConsistency,
 ) -> Result<ViewSnapshotConsistencyDecision> {
-    if matches!(consistency, SnapshotsConsistency::AcceptSkew) {
-        tracing::warn!("{}", view_snapshot_accept_skew_warning(table));
-        return Ok(ViewSnapshotConsistencyDecision::AcceptSkew);
+    if matches!(consistency, SnapshotsConsistency::IndependentReads) {
+        tracing::warn!("{}", view_snapshot_independent_reads_warning(table));
+        return Ok(ViewSnapshotConsistencyDecision::IndependentReads);
     }
 
     let shape = crate::view::analyzed_view_read_shape(ctx, sql)
@@ -5074,7 +5074,7 @@ impl DataFusion {
     /// attested from the plan that executed the refresh — it does not re-plan at
     /// publish time — and withholds while any accelerated dataset dependency was
     /// not at its configured definition when the view refreshed. Under
-    /// `accept_skew` the gate skips only the read-shape check.
+    /// `independent_reads` the gate skips only the read-shape check.
     async fn view_snapshot_publish_gate(
         &self,
         table: &TableReference,
@@ -5168,7 +5168,7 @@ impl DataFusion {
                 acceleration.snapshots_consistency,
             )
             .await?;
-            // Attested under `accept_skew` too. It waives the single-read requirement
+            // Attested under `independent_reads` too. It waives the single-read requirement
             // only: rows read from a dependency that was not at its configured
             // definition are still refused, because the archive would carry a
             // fingerprint that does not describe them.
@@ -5302,7 +5302,7 @@ impl DataFusion {
         // view; `ViewSnapshotPublishGate` then requires the attestation recorded from
         // the plan that executed the refresh, not a fresh re-plan at publish time.
         // Each published archive also records producing-read consistency so a
-        // `consistent_read` bootstrap can refuse an `accept_skew` entry.
+        // `consistent_read` bootstrap can refuse an `independent_reads` entry.
         match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
             Ok(layout) if layout.is_enabled() => {
                 ensure!(
@@ -6543,7 +6543,7 @@ mod tests {
     mod view_snapshot_consistency {
         use super::super::{
             AcceleratedViewSnapshotsNotSingleReadSnafu, ViewSnapshotConsistencyDecision,
-            view_snapshot_accept_skew_warning, view_snapshot_consistency_decision,
+            view_snapshot_consistency_decision, view_snapshot_independent_reads_warning,
         };
         use super::*;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -6559,18 +6559,19 @@ mod tests {
         }
 
         #[test]
-        fn accept_skew_warning_names_the_setting_and_a_way_out() {
-            let message = view_snapshot_accept_skew_warning(&TableReference::bare("orders_us"));
+        fn independent_reads_warning_names_the_setting_and_a_way_out() {
+            let message =
+                view_snapshot_independent_reads_warning(&TableReference::bare("orders_us"));
             for expected in [
                 "'orders_us'",
-                "`snapshots_consistency: accept_skew`",
+                "`snapshots_consistency: independent_reads`",
                 "cold start will serve them",
                 "Remove `snapshots_consistency`",
                 "https://spiceai.org/docs/components/data-accelerators/snapshots",
             ] {
                 assert!(
                     message.contains(expected),
-                    "the accept_skew warning must contain {expected:?}: {message}"
+                    "the independent_reads warning must contain {expected:?}: {message}"
                 );
             }
         }
@@ -6587,7 +6588,7 @@ mod tests {
                 "'orders_self_join'",
                 "reads its sources 2 times",
                 "`snapshots: disabled`",
-                "`snapshots_consistency: accept_skew`",
+                "`snapshots_consistency: independent_reads`",
                 "https://spiceai.org/docs/components/data-accelerators/snapshots",
             ] {
                 assert!(
@@ -6617,18 +6618,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn accept_skew_admits_a_multi_read_view() {
+        async fn independent_reads_admits_a_multi_read_view() {
             let ctx = ctx_with_orders();
             let table = TableReference::bare("orders_self_join");
             let decision = view_snapshot_consistency_decision(
                 &ctx,
                 &table,
                 "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id",
-                SnapshotsConsistency::AcceptSkew,
+                SnapshotsConsistency::IndependentReads,
             )
             .await
-            .expect("accept_skew must admit a multi-read view");
-            assert_eq!(decision, ViewSnapshotConsistencyDecision::AcceptSkew);
+            .expect("independent_reads must admit a multi-read view");
+            assert_eq!(decision, ViewSnapshotConsistencyDecision::IndependentReads);
         }
 
         #[tokio::test]
@@ -8137,7 +8138,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_read_view_snapshot_refusal_names_accept_skew_and_a_way_out() {
+    fn a_multi_read_view_snapshot_refusal_names_independent_reads_and_a_way_out() {
         let message = AcceleratedViewSnapshotsNotSingleReadSnafu {
             view_name: "sales".to_string(),
             reason: "the plan joins two tables".to_string(),
@@ -8148,7 +8149,7 @@ mod tests {
             "'sales'",
             "the plan joins two tables",
             "`snapshots: disabled`",
-            "`snapshots_consistency: accept_skew`",
+            "`snapshots_consistency: independent_reads`",
             "use the snapshots anyway",
             "https://spiceai.org/docs/components/data-accelerators/snapshots",
         ] {

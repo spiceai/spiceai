@@ -398,7 +398,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset '{dataset_name}' ({connector}): `snapshots_consistency: accept_skew` is only valid for accelerated views, so it has no effect on a dataset. A dataset always materializes a single source read. Remove `snapshots_consistency` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+        "Failed to register dataset '{dataset_name}' ({connector}): `snapshots_consistency: independent_reads` is only valid for accelerated views, so it has no effect on a dataset. A dataset always materializes a single source read. Remove `snapshots_consistency` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
     ))]
     SnapshotsConsistencyNotForDataset {
         dataset_name: String,

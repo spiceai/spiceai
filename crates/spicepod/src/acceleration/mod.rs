@@ -249,7 +249,7 @@ pub enum SnapshotsCreationPolicy {
 /// `bootstrap_only` consumer with the default `consistent_read` is refused rather
 /// than serving that archive without opting in. Each published view archive
 /// records this setting, so a later single-read replan of the same SQL cannot
-/// restore an `accept_skew` archive either.
+/// restore an `independent_reads` archive either.
 ///
 /// Only meaningful for views. A dataset that sets a non-default value is refused at
 /// load: a dataset materializes a single source and always reads it once, so the
@@ -265,18 +265,19 @@ pub enum SnapshotsConsistency {
     /// materialization's epoch — not a fresh re-plan after the fact. An ordinary
     /// query does not record, and a later refresh's attestation cannot approve the
     /// previous generation. Each published archive records this setting so a later
-    /// `consistent_read` bootstrap can refuse an archive published under `accept_skew`
+    /// `consistent_read` bootstrap can refuse an archive published under `independent_reads`
     /// even if the consumer's current plan happens to read once. A missing stamp is
     /// refused the same way: it cannot be shown to have come from a single read.
     #[default]
     ConsistentRead,
-    /// Publish or restore a materialization that reads its sources more than once,
-    /// accepting that the stored rows may span several source positions. Choose this
-    /// only when the view's consumers tolerate that. Only the single-read requirement
-    /// is waived: a publish is still withheld while a dependency the view read was not
-    /// at its configured definition. Archives published under this setting are stamped
-    /// `accept_skew` and a default `consistent_read` consumer will not restore them.
-    AcceptSkew,
+    /// Publish or restore a materialization whose query reads its sources independently,
+    /// each at its own point in time, so the stored rows may span several source
+    /// positions. Choose this only when the view's consumers tolerate that. Only the
+    /// single-read requirement is waived: a publish is still withheld while a dependency
+    /// the view read was not at its configured definition. Archives published under this
+    /// setting are stamped `independent_reads` and a default `consistent_read` consumer
+    /// will not restore them.
+    IndependentReads,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -681,14 +682,14 @@ pub struct Acceleration {
     /// For an accelerated view: whether a snapshot may be published or restored
     /// from a materialization that spans more than one read of the view's sources.
     ///
-    /// Options: `consistent_read` (default) / `accept_skew`.
+    /// Options: `consistent_read` (default) / `independent_reads`.
     ///
     /// Each published view archive records the producing setting. The default
     /// `consistent_read` restores only archives stamped as a single read, so a
     /// later single-read replan of the same SQL cannot serve rows captured under
-    /// `accept_skew`.
+    /// `independent_reads`.
     ///
-    /// Only meaningful for views. A dataset that sets `accept_skew` is refused at
+    /// Only meaningful for views. A dataset that sets `independent_reads` is refused at
     /// load — a dataset always materializes a single source read, so the option
     /// cannot apply. Omit the field, or set `consistent_read`, on datasets.
     ///
@@ -700,7 +701,7 @@ pub struct Acceleration {
     ///       enabled: true
     ///       engine: duckdb
     ///       snapshots: enabled
-    ///       snapshots_consistency: accept_skew
+    ///       snapshots_consistency: independent_reads
     /// ```
     #[serde(default, skip_serializing_if = "is_default_snapshots_consistency")]
     pub snapshots_consistency: SnapshotsConsistency,
@@ -1240,7 +1241,7 @@ mod tests {
     fn snapshots_consistency_deserializes_each_accepted_value() {
         for (yaml_value, expected) in [
             ("consistent_read", SnapshotsConsistency::ConsistentRead),
-            ("accept_skew", SnapshotsConsistency::AcceptSkew),
+            ("independent_reads", SnapshotsConsistency::IndependentReads),
         ] {
             let acceleration =
                 acceleration_from_yaml(&format!("snapshots_consistency: {yaml_value}"));
@@ -1257,17 +1258,17 @@ mod tests {
             .expect_err("an unknown snapshots_consistency value must not parse");
         let message = err.to_string();
         assert!(
-            message.contains("accept_skew") || message.contains("consistent_read"),
+            message.contains("independent_reads") || message.contains("consistent_read"),
             "the parse error should name the accepted values: {message}"
         );
     }
 
     #[test]
-    fn a_disabled_block_reports_accept_skew_as_discarded() {
+    fn a_disabled_block_reports_independent_reads_as_discarded() {
         let acceleration = acceleration_from_yaml(
             r"
                 enabled: false
-                snapshots_consistency: accept_skew
+                snapshots_consistency: independent_reads
             ",
         );
         assert_eq!(
