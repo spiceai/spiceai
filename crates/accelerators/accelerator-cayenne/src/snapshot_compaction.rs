@@ -1227,6 +1227,14 @@ mod tests {
         );
     }
 
+    /// Stands in for the runtime's slot advancer, which arms the RAM CDC tier.
+    struct NoopSlotAdvancer;
+
+    #[async_trait::async_trait]
+    impl cayenne::SlotAdvancer for NoopSlotAdvancer {
+        async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+    }
+
     /// Rows that live only in the RAM CDC tier (`cdc_durability: memory`, not
     /// yet checkpointed to a file) are part of the captured view and reach the
     /// compacted snapshot: the capture clones the mem-tier segments into the
@@ -1265,11 +1273,6 @@ mod tests {
         );
         // The RAM tier engages only once the runtime installs a slot advancer
         // (the replayable-source gate); stand in for the runtime here.
-        struct NoopSlotAdvancer;
-        #[async_trait::async_trait]
-        impl cayenne::SlotAdvancer for NoopSlotAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
         live.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
         // Durable base rows, then CDC rows that go to the RAM tier only.
