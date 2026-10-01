@@ -429,6 +429,35 @@ pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool 
     !field.data_type().is_string() || !operand_reaches_binary(operand, scope)
 }
 
+/// Whether `DuckDB` reads this literal as the value it carries.
+///
+/// The unparser spells a non-NULL binary literal as a hex string literal,
+/// `X'ff'`, and `DuckDB` does not read that as a `BLOB`: v1.4.4 parses `X'ff'`
+/// as the *text* `'xff'`. Compared against a `BLOB` column it then matches the
+/// row holding the three bytes `xff` instead of the one byte `0xFF`, and
+/// `X''` matches nothing where the empty blob is a row — a wrong answer with no
+/// error. The dialect has no hook for rendering a literal, so the literal, and
+/// with it the expression around it, stays local; a NULL renders as `NULL` and
+/// is read correctly.
+pub(crate) fn literal_is_renderable(expr: &Expr) -> bool {
+    let Expr::Literal(value, _) = expr else {
+        return true;
+    };
+    !is_rendered_as_hex_string(value)
+}
+
+/// Whether the unparser renders this scalar as an `X'..'` hex string literal.
+fn is_rendered_as_hex_string(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Binary(Some(_))
+        | ScalarValue::LargeBinary(Some(_))
+        | ScalarValue::BinaryView(Some(_))
+        | ScalarValue::FixedSizeBinary(_, Some(_)) => true,
+        ScalarValue::Dictionary(_, inner) => is_rendered_as_hex_string(inner),
+        _ => false,
+    }
+}
+
 /// Whether any node of this operand's expression tree is, or carries, a binary
 /// value — including one a cast has since retyped as text.
 ///
