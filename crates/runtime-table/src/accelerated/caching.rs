@@ -32,7 +32,8 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
-use datafusion::physical_plan::execution_plan::EmissionType;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     stream::RecordBatchStreamAdapter,
@@ -48,6 +49,7 @@ use tokio::task::JoinHandle;
 
 use runtime_acceleration::acceleration::StaleIfError;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
+use runtime_datafusion::execution_plan::TableScanParams;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
@@ -1210,13 +1212,11 @@ impl RevalidationOutcome {
     }
 }
 
-/// Helper functions for cache refresh operations
 /// An expired response is read only when a failing origin needs a fallback.
-/// The deferred form avoids executing the accelerator scan on a backend-first read.
 enum CacheFallback {
     Loaded(Vec<RecordBatch>),
     Deferred {
-        input: Arc<dyn ExecutionPlan>,
+        input: CachingScanInput,
         partition: usize,
         context: Arc<TaskContext>,
     },
@@ -1231,10 +1231,16 @@ impl CacheFallback {
                 partition,
                 context,
             } => input
+                .into_plan()
+                .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
+                .ok()?
                 .execute(partition, context)
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
                 .ok()?
                 .try_collect()
                 .await
+                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
                 .ok()?,
         };
         let batches: Vec<RecordBatch> = batches
@@ -2682,9 +2688,79 @@ pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> = LazyLock::
     )
 });
 
+/// Whether a filtered cache read must ask the origin before it may serve stored rows.
+pub(super) fn uses_source_first(
+    filters: &[Expr],
+    max_age: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    stale_if_error: StaleIfError,
+) -> bool {
+    !filters.is_empty()
+        && effective_max_age(max_age).is_zero()
+        && stale_while_revalidate.unwrap_or_default().is_zero()
+        && stale_if_error.serves_stale_on_error()
+}
+
+/// The accelerator read input. A deferred input owns query-specific scan arguments,
+/// not a storage snapshot; its read view is selected only if the origin fails.
+#[derive(Clone)]
+pub(super) enum CachingScanInput {
+    Planned(Arc<dyn ExecutionPlan>),
+    Deferred {
+        accelerator: Arc<dyn TableProvider>,
+        scan_params: TableScanParams,
+        filters_to_reapply: Vec<Expr>,
+        schema: SchemaRef,
+    },
+}
+
+impl From<Arc<dyn ExecutionPlan>> for CachingScanInput {
+    fn from(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self::Planned(input)
+    }
+}
+
+impl CachingScanInput {
+    fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Planned(input) => input.schema(),
+            Self::Deferred { schema, .. } => Arc::clone(schema),
+        }
+    }
+
+    async fn into_plan(self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        match self {
+            Self::Planned(input) => Ok(input),
+            Self::Deferred {
+                accelerator,
+                scan_params,
+                filters_to_reapply,
+                schema,
+            } => {
+                let input = scan_params
+                    .scan_and_optimize(accelerator.as_ref(), &filters_to_reapply)
+                    .await?;
+                if input.schema().fields() != schema.fields() {
+                    tracing::debug!(expected = ?schema, actual = ?input.schema(), "Cache fallback schema mismatch");
+                    return Err(DataFusionError::Execution(
+                        "The cached response schema changed while fetching the origin".to_string(),
+                    ));
+                }
+                // Physical scans may omit schema-level table metadata. Keep the
+                // deferred node's output schema without accepting changed fields.
+                if input.schema() == schema {
+                    Ok(input)
+                } else {
+                    Ok(Arc::new(SchemaCastScanExec::new(input, schema)))
+                }
+            }
+        }
+    }
+}
+
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
-    input: Arc<dyn ExecutionPlan>,
+    input: CachingScanInput,
     plan_properties: Arc<PlanProperties>,
     /// Maximum time data is considered "fresh" - can be served without refresh
     max_age: Option<Duration>,
@@ -2714,8 +2790,8 @@ pub struct CachingAccelerationScanExec {
 
 impl CachingAccelerationScanExec {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
+    pub(super) fn new(
+        input: impl Into<CachingScanInput>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
         stale_if_error: StaleIfError,
@@ -2732,15 +2808,22 @@ impl CachingAccelerationScanExec {
         batch_write_tx: CacheWriteSender,
     ) -> Self {
         let max_age = Some(effective_max_age(max_age));
+        let input = input.into();
 
-        let plan_properties = Arc::new(
-            input
+        let plan_properties = Arc::new(match &input {
+            CachingScanInput::Planned(input) => input
                 .properties()
                 .as_ref()
                 .clone()
                 .with_emission_type(EmissionType::Final)
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
-        );
+            CachingScanInput::Deferred { schema, .. } => PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        });
 
         let session_state = Arc::clone(&SHARED_SESSION_STATE);
 
@@ -2774,7 +2857,12 @@ impl std::fmt::Debug for CachingAccelerationScanExec {
 
 impl DisplayAs for CachingAccelerationScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CachingAccelerationScanExec")
+        match &self.input {
+            CachingScanInput::Planned(_) => write!(f, "CachingAccelerationScanExec"),
+            CachingScanInput::Deferred { .. } => {
+                write!(f, "CachingAccelerationScanExec: cache_scan=deferred")
+            }
+        }
     }
 }
 
@@ -2792,19 +2880,32 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition; 1]
+        vec![Distribution::SinglePartition; self.children().len()]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
+        match &self.input {
+            CachingScanInput::Planned(input) => vec![input],
+            CachingScanInput::Deferred { .. } => vec![],
+        }
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let input = match (&self.input, children.as_slice()) {
+            (CachingScanInput::Planned(_), [input]) => Arc::clone(input),
+            (CachingScanInput::Deferred { .. }, []) => return Ok(self),
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "CachingAccelerationScanExec received an invalid number of children"
+                        .to_string(),
+                ));
+            }
+        };
         Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
+            input,
             self.max_age,
             self.stale_while_revalidate,
             self.stale_if_error,
@@ -2832,6 +2933,12 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.dataset_name
         );
 
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "CachingAccelerationScanExec only supports partition 0, got {partition}"
+            )));
+        }
+
         // The originating request context is attached to the session as
         // an extension by `Query::run_internal`. We read it from the
         // `TaskContext` here and NOT from `RequestContext::current()`,
@@ -2847,14 +2954,15 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         // With neither a fresh nor an SWR window, a stale-if-error entry can
         // only be served after a failing fetch. Do not execute its scan until
         // that failure; successful fetches replace any stored response for the key.
-        if !self.filters.is_empty()
-            && self.max_age == Some(Duration::ZERO)
-            && self.stale_while_revalidate.unwrap_or_default().is_zero()
-            && self.stale_if_error.serves_stale_on_error()
-        {
+        if uses_source_first(
+            &self.filters,
+            self.max_age,
+            self.stale_while_revalidate,
+            self.stale_if_error,
+        ) {
             let schema = self.input.schema();
             let stream_schema = Arc::clone(&schema);
-            let input = Arc::clone(&self.input);
+            let input = self.input.clone();
             let federated = Arc::clone(&self.federated);
             let session_state = Arc::clone(&self.session_state);
             let dataset_name = self.dataset_name.clone();
@@ -2897,8 +3005,12 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
         }
 
-        // Execute the accelerator scan
-        let accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
+        let CachingScanInput::Planned(input) = &self.input else {
+            return Err(DataFusionError::Internal(
+                "A cache-first read requires a planned accelerator input".to_string(),
+            ));
+        };
+        let accelerator_stream = input.execute(partition, Arc::clone(&context))?;
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
         // without triggering HTTP requests to the federated source or staleness checks.
@@ -5012,6 +5124,7 @@ mod tests {
         let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
             MemorySourceConfig::try_new(&[vec![stale]], stale_schema, None).expect("cache input"),
         )));
+        let input = input.into();
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
@@ -5181,6 +5294,7 @@ mod tests {
             MemorySourceConfig::try_new(&[vec![stale]], Arc::clone(&schema), None)
                 .expect("cache input"),
         )));
+        let input = input.into();
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
@@ -6595,7 +6709,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
-                    input,
+                    input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
                 }),
@@ -6656,7 +6770,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
-                    input,
+                    input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
                 }),
