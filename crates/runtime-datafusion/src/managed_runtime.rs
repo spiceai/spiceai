@@ -45,7 +45,7 @@ impl<M> ManagedRecordBatchStream<M> {
 }
 
 /// When the managed runtime starts pulling batches from the stream the future produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum StreamStart {
     /// As soon as the future has produced the stream, so the first batches are ready by the
     /// time the caller asks for them.
@@ -81,10 +81,12 @@ where
 {
     let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
     let (meta_tx, meta_rx) = oneshot::channel::<Result<(M, SchemaRef), E>>();
-    let (demand_tx, demand_rx) = oneshot::channel::<()>();
-    let demand_tx = match start {
-        StreamStart::Immediately => None,
-        StreamStart::OnFirstPoll => Some(demand_tx),
+    let (demand_tx, demand_rx) = match start {
+        StreamStart::Immediately => (None, None),
+        StreamStart::OnFirstPoll => {
+            let (tx, rx) = oneshot::channel::<()>();
+            (Some(tx), Some(rx))
+        }
     };
 
     let driver_request_context = Arc::clone(&request_context);
@@ -111,7 +113,9 @@ where
                 }
 
                 // An error means the caller dropped the stream without polling it.
-                if start == StreamStart::OnFirstPoll && demand_rx.await.is_err() {
+                if let Some(demand_rx) = demand_rx
+                    && demand_rx.await.is_err()
+                {
                     return;
                 }
 
@@ -139,7 +143,7 @@ where
         Err(_) => return Err(ManagedRuntimeError::DriverTaskEnded),
     };
 
-    let driver_stream = RuntimeDriverStream::new(batch_rx, driver_handle).with_demand(demand_tx);
+    let driver_stream = RuntimeDriverStream::new(batch_rx, driver_handle, demand_tx);
     let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(driver_stream));
     let stream: SendableRecordBatchStream = Box::pin(adapter);
 
@@ -163,17 +167,13 @@ impl RuntimeDriverStream {
     fn new(
         receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch, DataFusionError>>,
         driver_handle: JoinHandle<()>,
+        demand: Option<oneshot::Sender<()>>,
     ) -> Self {
         Self {
             receiver: ReceiverStream::new(receiver),
             driver_handle: Some(driver_handle),
-            demand: None,
+            demand,
         }
-    }
-
-    fn with_demand(mut self, demand: Option<oneshot::Sender<()>>) -> Self {
-        self.demand = demand;
-        self
     }
 }
 
@@ -397,7 +397,7 @@ mod tests {
 
         closed_rx.await.expect("driver signalled the channel close");
 
-        let mut stream = RuntimeDriverStream::new(batch_rx, driver_handle);
+        let mut stream = RuntimeDriverStream::new(batch_rx, driver_handle, None);
         assert!(
             matches!(futures::poll!(stream.next()), Poll::Pending),
             "the stream ended while the driver's outcome was still unknown — \
@@ -442,7 +442,7 @@ mod tests {
 
         closed_rx.await.expect("driver signalled the channel close");
 
-        let mut stream = RuntimeDriverStream::new(batch_rx, driver_handle);
+        let mut stream = RuntimeDriverStream::new(batch_rx, driver_handle, None);
         let first = futures::poll!(stream.next());
         assert!(
             matches!(first, Poll::Ready(Some(Ok(_)))),
@@ -482,7 +482,7 @@ mod tests {
         });
         driver_handle.abort();
 
-        let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle)
+        let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle, None)
             .collect()
             .await;
 
@@ -511,7 +511,7 @@ mod tests {
                 .expect("send batch");
         });
 
-        let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle)
+        let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle, None)
             .collect()
             .await;
 

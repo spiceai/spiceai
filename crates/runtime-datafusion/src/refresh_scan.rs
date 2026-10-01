@@ -177,118 +177,42 @@ fn include_computed_columns(
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use async_trait::async_trait;
-    use datafusion::catalog::Session;
-    use datafusion::datasource::TableType;
-    use datafusion::physical_expr::EquivalenceProperties;
-    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::catalog::streaming::StreamingTable;
     use datafusion::physical_plan::memory::MemoryStream;
-    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Partitioning, PlanProperties};
+    use datafusion::physical_plan::streaming::PartitionStream;
 
     use super::*;
 
     const PARTITIONS: usize = 2;
 
-    /// A source scan with [`PARTITIONS`] partitions that counts how many it has executed.
+    /// One partition of a source scan, counting how many partitions have been executed.
     #[derive(Debug)]
-    struct CountingExec {
+    struct CountingPartition {
         schema: SchemaRef,
+        id: i64,
         executed: Arc<AtomicUsize>,
-        properties: Arc<PlanProperties>,
     }
 
-    impl DisplayAs for CountingExec {
-        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "CountingExec")
-        }
-    }
-
-    impl ExecutionPlan for CountingExec {
-        fn name(&self) -> &'static str {
-            "CountingExec"
+    impl PartitionStream for CountingPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.properties
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            _children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            Ok(self)
-        }
-
-        fn execute(
-            &self,
-            partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> DataFusionResult<SendableRecordBatchStream> {
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
             self.executed.fetch_add(1, Ordering::SeqCst);
-            let id = i64::try_from(partition).expect("partition fits in i64");
             let batch = RecordBatch::try_new(
                 Arc::clone(&self.schema),
-                vec![Arc::new(Int64Array::from(vec![id]))],
-            )?;
-            Ok(Box::pin(MemoryStream::try_new(
-                vec![batch],
-                Arc::clone(&self.schema),
-                None,
-            )?))
-        }
-    }
-
-    #[derive(Debug)]
-    struct CountingTable {
-        schema: SchemaRef,
-        executed: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl TableProvider for CountingTable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-
-        async fn scan(
-            &self,
-            _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(CountingExec {
-                schema: Arc::clone(&self.schema),
-                executed: Arc::clone(&self.executed),
-                properties: Arc::new(PlanProperties::new(
-                    EquivalenceProperties::new(Arc::clone(&self.schema)),
-                    Partitioning::UnknownPartitioning(PARTITIONS),
-                    EmissionType::Incremental,
-                    Boundedness::Bounded,
-                )),
-            }))
+                vec![Arc::new(Int64Array::from(vec![self.id]))],
+            )
+            .expect("build the partition's batch");
+            Box::pin(
+                MemoryStream::try_new(vec![batch], Arc::clone(&self.schema), None)
+                    .expect("build the partition's stream"),
+            )
         }
     }
 
@@ -300,16 +224,32 @@ mod tests {
     /// Regression test for #14619.
     #[tokio::test]
     async fn get_data_executes_the_source_scan_only_when_first_polled() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let executed = Arc::new(AtomicUsize::new(0));
-        let table: Arc<dyn TableProvider> = Arc::new(CountingTable {
-            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-            executed: Arc::clone(&executed),
-        });
+        let partitions = (0..PARTITIONS)
+            .map(|id| {
+                Arc::new(CountingPartition {
+                    schema: Arc::clone(&schema),
+                    id: i64::try_from(id).expect("partition id fits in i64"),
+                    executed: Arc::clone(&executed),
+                }) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let table: Arc<dyn TableProvider> = Arc::new(
+            StreamingTable::try_new(Arc::clone(&schema), partitions).expect("build the source"),
+        );
         let mut ctx = SessionContext::new();
 
         let stream = get_data(&mut ctx, TableReference::bare("docs"), table, None, vec![])
             .await
             .expect("plan the refresh scan");
+        // Executing a multi-partition plan spawns one task per partition. On this
+        // single-threaded test runtime they run only once the test yields, so yield before
+        // looking: an eagerly executed scan has executed its partitions by then.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             executed.load(Ordering::SeqCst),
             0,
