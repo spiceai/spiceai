@@ -595,7 +595,7 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
         "rate_control_cluster_effective_burst",
         MetricType::ObservableGaugeU64,
     )
-    .description("Cluster rate-control budget for the current window after adaptive throttling, per limiter; equal to the configured budget while the origin is healthy")
+    .description("This instance's rate-control budget for the current window after adaptive throttling, per limiter; equal to the configured budget while the origin is healthy. Derived from the shared outcome counts, so replicas reading settled counts report the same value")
     .auto_register(),
     MetricSpec::new(
         "rate_control_lease_acquire_duration_ms",

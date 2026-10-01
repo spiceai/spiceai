@@ -78,6 +78,10 @@ limitations under the License.
 //! `t·W`, giving `age = t - s - 1` whole windows of separation. Every replica
 //! leasing window `t` therefore applies the same weights to the same source
 //! windows, whatever its local clock reads.
+//!
+//! The budget itself is never written back. Only the counts are shared; each
+//! replica derives `effective_burst` from them and holds it for the life of
+//! the window, so a tick cannot move the budget under a grant already issued.
 
 use std::{
     collections::HashMap,
@@ -96,8 +100,8 @@ use tokio::sync::{Mutex, Notify};
 use crate::adaptive::{RequestOutcome, ThrottleState};
 use crate::phase_change_log::{Damping, PhaseChangeLog};
 
-/// Bumped to 4 for the `ok` / `failed` / `effective_burst` fields of cluster
-/// adaptive throttling. [`PersistedRateControlState::is_current_schema`] tests
+/// Bumped to 4 for the `ok` / `failed` fields of cluster adaptive throttling.
+/// [`PersistedRateControlState::is_current_schema`] tests
 /// for an exact match and a reader discards a mismatch, so a fleet spanning two
 /// schema versions erases the shared state on every tick, in both directions.
 /// The `rate-control` feature is absent from the release build, so the bump is
@@ -160,14 +164,6 @@ pub(crate) struct PersistedLimiter {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct PersistedWindow {
-    /// Cluster budget for this window after the adaptive coefficient. The first
-    /// replica to write the window fixes this value; later replicas read it and
-    /// do not calculate their own, so two replicas reading the file at
-    /// different moments cannot size their grants against different budgets.
-    /// `None` on a window written before cluster adaptive throttling, which
-    /// reads as the configured `burst_per_window`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_burst: Option<u64>,
     pub budget_remaining: u64,
     pub leases: HashMap<String, PersistedLease>, // instance_id -> lease
 }
@@ -291,11 +287,6 @@ impl PersistedLimiter {
         demand
     }
 
-    /// The budget a peer already fixed for `window_id`, if any.
-    fn effective_burst_of(&self, window_id: u64) -> Option<u64> {
-        self.windows.get(&window_id.to_string())?.effective_burst
-    }
-
     /// Weighted upstream request and success counts over the completed windows
     /// before `target_window`.
     ///
@@ -337,9 +328,6 @@ impl PersistedLimiter {
 impl PersistedWindow {
     fn new(burst: u64) -> Self {
         Self {
-            // Left unset so the caller can tell a window it just created from
-            // one a peer created, and fix the budget exactly once.
-            effective_burst: None,
             budget_remaining: burst,
             leases: HashMap::new(),
         }
@@ -1042,6 +1030,36 @@ pub(crate) struct LeasedBucket {
     /// not oscillate. Separate from `inner` and synchronous: it is touched once
     /// per refresh tick, never on the acquire path.
     throttle_log: SyncMutex<PhaseChangeLog<ThrottleState>>,
+    /// The budget this replica has already fixed for the windows it is
+    /// currently leasing. Touched once per refresh tick, like `throttle_log`.
+    budget_memo: SyncMutex<BudgetMemo>,
+}
+
+/// Holds this replica's derived budget for the life of each window it leases.
+///
+/// Two slots: a tick leases the current window and pre-leases the next, so a
+/// third window is never live at once.
+#[derive(Debug, Default)]
+struct BudgetMemo {
+    slots: [Option<(u64, u64)>; 2],
+}
+
+impl BudgetMemo {
+    /// The budget already fixed for `window_id`, else `derive()`'s value,
+    /// stored against it. Evicts the older window when both slots are taken.
+    fn get_or_derive(&mut self, window_id: u64, derive: impl FnOnce() -> u64) -> u64 {
+        if let Some((_, burst)) = self.slots.iter().flatten().find(|(id, _)| *id == window_id) {
+            return *burst;
+        }
+        let burst = derive();
+        let victim = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| usize::from(self.slots[1] < self.slots[0]));
+        self.slots[victim] = Some((window_id, burst));
+        burst
+    }
 }
 
 impl LeasedBucket {
@@ -1064,6 +1082,7 @@ impl LeasedBucket {
             notify: Notify::new(),
             metrics: Arc::new(LeasedBucketMetrics::default()),
             throttle_log: SyncMutex::new(PhaseChangeLog::new(ThrottleState::Healthy, hold)),
+            budget_memo: SyncMutex::new(BudgetMemo::default()),
             config,
         })
     }
@@ -1295,18 +1314,10 @@ impl LeasedBucket {
 
         let limiter = state.limiter_entry(&self.config.limiter_key, burst);
 
-        // The budget this window is leased against. First write wins, one level
-        // above the grant: the replica that creates a window fixes the budget
-        // every replica then leases against. Two replicas can read the file at
-        // different moments — before and after a late tail publish, say — and
-        // would otherwise derive different budgets from the same window and
-        // break `Σ granted <= budget`.
-        let peer_burst = limiter.effective_burst_of(window_id);
-        // This replica's own reading of the shared counts: `Some` exactly in
-        // adaptive mode. Taken even when a peer already fixed the budget, since
-        // it costs a few map lookups and is what tells this replica's log line
-        // how firm the state is — so every replica reports for itself, not only
-        // the one that happened to create the window.
+        // This replica's reading of the shared counts: `Some` exactly in
+        // adaptive mode. Every replica reads the same published outcomes, so
+        // they converge on the same coefficient without any of it being
+        // written back — the counts are the shared state, the budget is not.
         let reading = self.config.adaptive.map(|adaptive| {
             let outcomes = limiter.ewma_outcomes(
                 window_id,
@@ -1315,7 +1326,13 @@ impl LeasedBucket {
             );
             (adaptive, outcomes)
         });
-        let effective_burst = peer_burst.unwrap_or_else(|| {
+        // The budget this window is leased against, derived once and then held
+        // for the life of the window. A later tick must not move it: this
+        // replica's grant is already in the file, and a budget recomputed from
+        // fresher counts would republish a `budget_remaining` that contradicts
+        // the leases already written. Same reason the grant itself is
+        // first-write-wins.
+        let effective_burst = self.budget_memo.lock().get_or_derive(window_id, || {
             reading.map_or(burst, |(adaptive, outcomes)| {
                 scale_burst(burst, outcomes.coefficient(adaptive.k))
             })
@@ -1336,10 +1353,6 @@ impl LeasedBucket {
             .min(max_lease_per_replica(effective_burst));
 
         let window = limiter.window_entry(window_id, effective_burst);
-        // `replace` rather than `get_or_insert`: the value is already this
-        // window's own, so this only reports whether *we* fixed it, which the
-        // write-back decision below needs.
-        let budget_newly_fixed = window.effective_burst.replace(effective_burst).is_none();
 
         // Only the current window can hold expired leases; a future window's
         // lease cannot have expired yet.
@@ -1388,22 +1401,18 @@ impl LeasedBucket {
             budget_remaining_after: window.budget_remaining,
             throttle: reading.map(|(adaptive, outcomes)| ClusterThrottle {
                 effective_burst,
-                // Reported from the budget actually in force, not from this
-                // replica's own arithmetic, so every replica leasing a window
-                // reports the same ratio.
                 admission_ratio: admission_ratio(effective_burst, burst),
                 near_boundary: outcomes.is_near_boundary(adaptive.k, effective_burst < burst),
             }),
-            dirty: published || budget_newly_fixed,
+            dirty: published,
         }
     }
 
     /// Publish the adaptive state of the window just leased, and log a change
     /// of state.
     ///
-    /// Every replica reports for itself. They share one budget, so their lines
-    /// agree — and a replica that adopted a peer's budget still reports, rather
-    /// than only the replica that happened to create the window.
+    /// Every replica reports for itself. They read the same published counts,
+    /// so their lines agree once those counts have settled.
     fn report_throttle(&self, throttle: Option<ClusterThrottle>) {
         let Some(throttle) = throttle else {
             return; // Static mode: nothing to report, and no series to emit.
@@ -1651,7 +1660,6 @@ mod tests {
         windows.insert(
             "1700000000".to_string(),
             PersistedWindow {
-                effective_burst: Some(9),
                 budget_remaining: 1,
                 leases,
             },
@@ -1713,7 +1721,6 @@ mod tests {
               "windows": {
                 "1700000000": {
                   "budget_remaining": 1,
-                  "effective_burst": 9,
                   "leases": {
                     "replica-a": {
                       "attempted": 12,
@@ -1752,8 +1759,7 @@ mod tests {
         assert_eq!(state, decoded);
     }
 
-    /// `consumed`, `attempted`, `ok`, `failed` and `effective_burst` are all
-    /// optional on the wire. A file written by a replica that omits them must
+    /// `consumed`, `attempted`, `ok` and `failed` are all optional on the wire. A file written by a replica that omits them must
     /// still load: the counts at zero, and the two `Option`s absent rather than
     /// `Some(0)` — "did not report" is not "reported none".
     #[test]
@@ -1807,10 +1813,6 @@ mod tests {
         assert_eq!(lease.attempted, 0, "missing `attempted` defaults to zero");
         assert_eq!(lease.ok, None, "missing `ok` is absent, not zero");
         assert_eq!(lease.failed, None, "missing `failed` is absent, not zero");
-        assert_eq!(
-            window.effective_burst, None,
-            "a window written before cluster adaptive throttling fixes no budget"
-        );
     }
 
     /// A file written under schema 3 is discarded, not read field by field. The
@@ -1864,7 +1866,6 @@ mod tests {
             updated_at_unix_ms: 0,
         };
         let window = |attempted| PersistedWindow {
-            effective_burst: None,
             budget_remaining: 0,
             leases: HashMap::from([("a".to_string(), lease(0, attempted))]),
         };
@@ -1912,7 +1913,6 @@ mod tests {
 
     fn outcome_window(leases: Vec<(&str, PersistedLease)>) -> PersistedWindow {
         PersistedWindow {
-            effective_burst: None,
             budget_remaining: 0,
             leases: leases
                 .into_iter()
@@ -2200,55 +2200,37 @@ mod tests {
         assert_eq!(scale_burst(10, 0.5), 5);
     }
 
-    /// The budget of a window is fixed by whoever writes it first. Two replicas
-    /// reading the file at different moments would otherwise derive different
-    /// budgets from the same counts and break `sum(granted) <= budget`.
+    /// The budget is derived per replica and never written back, so it must
+    /// not move under grants this replica has already issued: a second tick
+    /// inside the same window leases against the budget of the first.
     #[tokio::test]
-    async fn second_replica_adopts_the_effective_burst_of_the_first() {
+    async fn the_budget_of_a_window_is_held_for_the_life_of_the_window() {
         let store = Arc::new(InMemory::new());
-        let window = Duration::from_millis(200);
-        let mut cfg_a = config_for(10, "a", window);
-        cfg_a.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
-        cfg_a.adaptive = Some(adaptive_config(1.0));
-        let mut cfg_b = cfg_a.clone();
-        cfg_b.instance_id = "b".to_string();
+        let window = Duration::from_millis(400);
+        let mut cfg = config_for(10, "a", window);
+        cfg.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        cfg.adaptive = Some(adaptive_config(1.0));
 
-        let a = LeasedBucket::new(cfg_a);
-        let b = LeasedBucket::new(cfg_b);
+        let bucket = LeasedBucket::new(cfg);
+        bucket.refresh_lease().await.expect("first tick leases");
+        let first = bucket.metrics.cluster_effective_burst();
+        let granted = bucket.metrics.lease_granted();
 
-        a.refresh_lease().await.expect("a leases");
-        // Overwrite the budget A fixed, to a value B could not have calculated.
-        let window_id = window_id_for(SystemTime::now(), window);
-        let mut state = a.read_state().await.expect("read").expect("state exists");
-        let limiter = state
-            .limiter_mut(&a.config.limiter_key)
-            .expect("limiter present");
-        limiter
-            .window_mut(window_id)
-            .expect("current window present")
-            .effective_burst = Some(3);
-        a.write_state(state).await.expect("write");
+        // Enough failures to shrink the budget, were it recomputed now.
+        for _ in 0..40 {
+            bucket.record_outcome(RequestOutcome::Failure);
+        }
+        bucket.refresh_lease().await.expect("second tick leases");
 
-        b.refresh_lease().await.expect("b leases");
-
-        let adopted = b
-            .read_state()
-            .await
-            .expect("read")
-            .expect("state exists")
-            .limiters
-            .get(&b.config.limiter_key)
-            .and_then(|limiter| limiter.windows.get(&window_id.to_string()))
-            .and_then(|window| window.effective_burst);
         assert_eq!(
-            adopted,
-            Some(3),
-            "B must lease against the budget A fixed, not recalculate one"
+            bucket.metrics.cluster_effective_burst(),
+            first,
+            "the budget of a live window must not move under a grant already issued"
         );
-        assert!(
-            b.metrics.lease_granted() <= 3,
-            "B leased {} against a budget of 3",
-            b.metrics.lease_granted()
+        assert_eq!(
+            bucket.metrics.lease_granted(),
+            granted,
+            "and the grant leased against it must not change either"
         );
     }
 
@@ -2287,15 +2269,21 @@ mod tests {
             bucket.refresh_lease().await.expect("lease");
         }
         tokio::time::sleep(window + Duration::from_millis(20)).await;
-        for bucket in [&a, &b] {
-            bucket.refresh_lease().await.expect("lease");
+        // Two passes: the first settles the tail counts in the file, the second
+        // has both replicas read that same settled state. Nothing pins the
+        // budget any more, so they agree by reading the same counts, not by
+        // adopting one another's value.
+        for _ in 0..2 {
+            for bucket in [&a, &b] {
+                bucket.refresh_lease().await.expect("lease");
+            }
         }
 
         let burst_a = a.metrics.cluster_effective_burst();
         let burst_b = b.metrics.cluster_effective_burst();
         assert_eq!(
             burst_a, burst_b,
-            "replicas must agree on the cluster budget"
+            "replicas reading the same settled counts must derive the same budget"
         );
         assert!(
             burst_a < 20,
