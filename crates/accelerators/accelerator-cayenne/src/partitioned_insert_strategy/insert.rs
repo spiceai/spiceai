@@ -315,7 +315,8 @@ impl CayennePartitionedOverwriteSink {
     /// cross-partition case.
     ///
     /// Retries on `SQLITE_BUSY` / `SQLITE_LOCKED` (and the equivalent Turso
-    /// `BEGIN CONCURRENT` write-conflict at commit time). Each retry opens a
+    /// `BEGIN CONCURRENT` write-write conflict, which a partition's statement can
+    /// raise as well as the commit). Each retry opens a
     /// fresh transaction and re-runs every `PreparedOverwrite::apply_in_txn`
     /// — the prepared receipts are immutable (data already on disk in their
     /// new snapshot directories), so re-applying their catalog mutations is
