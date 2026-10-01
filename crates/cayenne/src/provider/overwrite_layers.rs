@@ -945,6 +945,81 @@ impl RecordBatchStream for LayerStream {
     }
 }
 
+/// Resolves the keys its input repeats within bounded windows ([`CollapseWindow`])
+/// and passes the result through unsplit: a write that cannot take layers
+/// resolves repeats this close together, and leaves a key repeated across
+/// windows for its conflict validation to reject, as it would without it.
+pub(crate) struct CollapseStream {
+    input: SendableRecordBatchStream,
+    resolver: KeyResolver,
+    window: CollapseWindow,
+    ready: VecDeque<ResolvedBatch>,
+    exhausted: bool,
+}
+
+impl CollapseStream {
+    pub(crate) fn new(
+        input: SendableRecordBatchStream,
+        resolver: KeyResolver,
+        window: CollapseWindow,
+    ) -> Self {
+        Self {
+            input,
+            resolver,
+            window,
+            ready: VecDeque::new(),
+            exhausted: false,
+        }
+    }
+}
+
+impl Stream for CollapseStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(resolved) = this.ready.pop_front() {
+                if resolved.batch.num_rows() == 0 {
+                    continue;
+                }
+                return Poll::Ready(Some(Ok(resolved.batch)));
+            }
+            if this.exhausted {
+                return Poll::Ready(None);
+            }
+            let step: super::Result<()> = match this.input.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    this.resolver.resolve_batch(&batch).and_then(|resolved| {
+                        this.window.push(resolved)?;
+                        if this.window.is_full() {
+                            this.ready = this.window.drain()?;
+                        }
+                        Ok(())
+                    })
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => {
+                    this.exhausted = true;
+                    this.window.drain().map(|ready| this.ready = ready)
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Err(error) = step {
+                this.exhausted = true;
+                this.ready.clear();
+                return Poll::Ready(Some(Err(error.into())));
+            }
+        }
+    }
+}
+
+impl RecordBatchStream for CollapseStream {
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+}
+
 /// Keeps the first copy of every key of an overwrite (`drop`), within and across
 /// record batches. Exact: a later copy is dropped only when its key was written.
 pub(crate) struct FirstCopyFilter {

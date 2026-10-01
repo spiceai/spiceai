@@ -98,6 +98,10 @@ async fn load(
         "id"
     };
     let mut dataset = Dataset::new(format!("file://{}", file.display()), "t");
+    // An append refresh of a partitioned table needs a time column to load.
+    if case.partitioned && case.refresh == RefreshMode::Append {
+        dataset.time_column = Some("ts".to_string());
+    }
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
@@ -175,22 +179,24 @@ fn cases() -> Vec<Case> {
             });
         }
     }
-    cases.push(Case {
-        mode: Mode::File,
-        refresh: RefreshMode::Full,
-        partitioned: true,
-    });
+    for refresh in [RefreshMode::Full, RefreshMode::Append] {
+        cases.push(Case {
+            mode: Mode::File,
+            refresh,
+            partitioned: true,
+        });
+    }
     cases
 }
 
 /// 8,192 distinct keys fill the first record batch; key 0 repeats with a
 /// different value in the second.
 fn repeated_across_batches() -> String {
-    let mut csv = String::from("id,region,v\n");
+    let mut csv = String::from("id,region,ts,v\n");
     for id in 0..8_192 {
-        csv.push_str(&format!("{id},us,first\n"));
+        csv.push_str(&format!("{id},us,2026-01-01T00:00:00,first\n"));
     }
-    csv.push_str("0,us,last\n");
+    csv.push_str("0,us,2026-01-01T00:00:00,last\n");
     csv
 }
 
@@ -233,8 +239,8 @@ async fn a_key_repeated_across_batches_resolves_per_on_conflict() {
 async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
     test_request_context()
         .scope(async {
-            let identical = "id,region,v\n1,us,a\n2,us,b\n1,us,a\n";
-            let differing = "id,region,v\n1,us,a\n2,us,b\n1,us,c\n";
+            let identical = "id,region,ts,v\n1,us,2026-01-01T00:00:00,a\n2,us,2026-01-01T00:00:00,b\n1,us,2026-01-01T00:00:00,a\n";
+            let differing = "id,region,ts,v\n1,us,2026-01-01T00:00:00,a\n2,us,2026-01-01T00:00:00,b\n1,us,2026-01-01T00:00:00,c\n";
             // (csv, policy, expected value of key 1, or None when the load must fail)
             let expectations: [(&str, OnConflictBehavior, Option<&str>); 8] = [
                 (identical, OnConflictBehavior::Drop, Some("a")),
@@ -277,6 +283,86 @@ async fn a_key_repeated_within_a_batch_resolves_per_on_conflict() {
                 }
             }
             assert!(failures.is_empty(), "{failures:#?}");
+        })
+        .await;
+}
+
+/// A parent with a `localpod` child refreshes through the child-syncing sink, and
+/// still resolves a key its data repeats across batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_localpod_parents_refresh_resolves_repeated_keys() {
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let file = dir.path().join("rows.csv");
+            let distinct: String = std::iter::once("id,region,v\n".to_string())
+                .chain((0..8_192).map(|id| format!("{id},us,first\n")))
+                .collect();
+            std::fs::write(&file, &distinct).expect("csv");
+            let params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.path().join("data").display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    dir.path().join("meta").display().to_string(),
+                ),
+            ]);
+            let mut parent = Dataset::new(format!("file://{}", file.display()), "t");
+            parent.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                params: Some(Params::from_string_map(params)),
+                primary_key: Some("id".to_string()),
+                on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+                ..Acceleration::default()
+            });
+            let mut child = Dataset::new("localpod:t", "t_child");
+            child.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+            configure_test_datafusion();
+            let app = AppBuilder::new("cayenne_on_conflict_localpod")
+                .with_dataset(parent)
+                .with_dataset(child)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(120)) => panic!("load timed out"),
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check_with_timeout_err(&rt, Duration::from_secs(30))
+                .await
+                .expect("ready");
+            assert_eq!(count(&rt).await, 8_192, "initial load");
+
+            std::fs::write(&file, format!("{distinct}0,us,last\n")).expect("csv");
+            crate::acceleration::trigger_refresh(&rt, "t")
+                .await
+                .expect("refresh");
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let values = value_of(&rt, 0).await;
+                if values.contains(&"last".to_string()) {
+                    let count = count(&rt).await;
+                    assert_eq!(
+                        (values, count),
+                        (vec!["last".to_string()], 8_192),
+                        "the parent's refresh must keep one copy of key 0"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the refresh did not land; key 0 = {values:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         })
         .await;
 }

@@ -1314,6 +1314,33 @@ impl CayenneTableProvider {
         setup_cleanup.snapshots.push(staging_snapshot_id.clone());
         self.clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
+        // A partition's append is one staged snapshot, so it cannot take the
+        // layers a streaming append splits a repeated key into. It resolves the
+        // repeats a bounded window holds instead; a key repeated further apart
+        // is rejected by validation below, as it would be without the window.
+        let data: SendableRecordBatchStream = match self.key_resolver()? {
+            None => data,
+            Some(resolver) => {
+                let reservation = datafusion_execution::memory_pool::MemoryConsumer::new(format!(
+                    "CayenneAppendKeys[{}]",
+                    self.table_name()
+                ))
+                .register(&self.runtime_env().memory_pool);
+                let window = super::overwrite_layers::CollapseWindow::new(
+                    self.collapse_window_bytes,
+                    reservation,
+                );
+                let window = if resolver.policy() == super::key_conflicts::ConflictPolicy::KeepFirst
+                {
+                    window.keeping_first()
+                } else {
+                    window
+                };
+                Box::pin(super::overwrite_layers::CollapseStream::new(
+                    data, resolver, window,
+                ))
+            }
+        };
         let prepared_insert = match self.prepare_stream_for_insert(data).await {
             Ok(prepared) => prepared,
             Err(error) => {
