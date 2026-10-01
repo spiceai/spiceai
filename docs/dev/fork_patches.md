@@ -114,7 +114,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `f22d1a746c3d22d041e75b985ce693c993a0e948` | `spiceai-55-patches-2` (TEMPORARY: the spiceai/datafusion pull request into `spiceai-55-patches-2`) |
+| [datafusion](#datafusion) | `ae719330b178520ecb8c9cabf579b114f7941a79` | `spiceai-55-patches-2` (TEMPORARY: the spiceai/datafusion pull request into `spiceai-55-patches-2`) |
 | [datafusion-ballista](#datafusion-ballista) | `7c4d54c2cefe27336fb9f70c67b2301ea7773920` | `spiceai-55-patches-2` (TEMPORARY: the spiceai/datafusion-ballista pull request into `spiceai-55-patches-2`) |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `9ca84a39760d7728bdeb5eac8480a3f9ee8422be` | `spiceai-55-patches-2` (TEMPORARY: the spiceai/datafusion-federation pull request into `spiceai-55-patches-2`) |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `3045960a3affcc12661539ba0327eaac770508ff` | `spiceai-55-patches-2` (TEMPORARY: the spiceai/datafusion-table-providers pull request into `spiceai-55-patches-2`) |
