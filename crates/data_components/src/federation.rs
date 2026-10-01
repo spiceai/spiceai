@@ -3094,6 +3094,53 @@ mod tests {
         conn.prepare(sql).map(|_| ())
     }
 
+    /// Regression test for the `spiceai/datafusion` fork's Date32 literal fix
+    /// (spiceai/datafusion#237, refs spiceai/spiceai#14491): the unparser spelled
+    /// every date literal `CAST('…' AS DATE)`, which `SQLite` reads as the number
+    /// `1994`, so a date range pushed to `SQLite` compared text against a number and
+    /// matched no row. The literal's cast must use the dialect's date type, as a
+    /// plain cast already did.
+    #[test]
+    fn a_date_range_unparsed_for_sqlite_keeps_the_rows_it_selects() {
+        let date = |days: i32| lit(ScalarValue::Date32(Some(days)));
+        // 1994-01-01 and 1995-01-01 as days since the Unix epoch.
+        let (from, to) = (8766, 9131);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new("d", DataType::Date32, false)]),
+            None,
+        )
+        .expect("scan events")
+        .filter(col("d").gt_eq(date(from)).and(col("d").lt(date(to))))
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("sqlite", &SqliteDialect {}, &plan);
+        assert!(
+            !sql.contains("AS DATE"),
+            "a date literal must not be cast to DATE for SQLite, which reads it as a number: {sql}"
+        );
+
+        #[cfg(feature = "sqlite")]
+        {
+            let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+            conn.execute_batch(
+                "CREATE TABLE events (d TEXT NOT NULL); \
+                 INSERT INTO events VALUES ('1993-12-31'), ('1994-01-01'), ('1994-06-30'), \
+                 ('1994-12-31'), ('1995-01-01');",
+            )
+            .expect("create events");
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+            assert_eq!(
+                count, 3,
+                "SQLite must keep the three 1994 rows the filter selects: {sql}"
+            );
+        }
+    }
+
     /// Regression test for the unparser's `rescope_projection_over_projection`,
     /// carried by the `spiceai/datafusion` fork (upstream's
     /// apache/datafusion#22961): common subexpression elimination leaves a
