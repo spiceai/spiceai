@@ -687,8 +687,31 @@ pub enum SnapshotUploadError {
     #[snafu(display("Failed to create snapshot archive at {}: {source}", path.display()))]
     ArchiveCreate {
         path: PathBuf,
-        source: std::io::Error,
+        source: directory_archive::ArchiveError,
     },
+}
+
+impl SnapshotUploadError {
+    /// Whether a fresh attempt may succeed. Schema and format errors need a change
+    /// outside the runtime; everything else (network, local I/O, an archive walk that
+    /// raced engine maintenance) may pass on retry.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::UploadReadMetadata { source, .. } | Self::UploadWriteMetadata { source, .. } => {
+                is_retriable_object_store_error(source)
+            }
+            Self::UploadSchemaSerialize { .. }
+            | Self::UploadParseMetadata { .. }
+            | Self::UploadUnsupportedMetadataVersion { .. }
+            | Self::UploadSerializeMetadata { .. }
+            | Self::UploadMetadataSchemaDeserialize { .. }
+            | Self::UploadMetadataSchemaMissing { .. }
+            | Self::UploadSchemaMismatch { .. }
+            | Self::AdapterDisabled { .. } => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -816,6 +839,7 @@ impl std::fmt::Debug for SnapshotManager {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ForceCreate(pub bool);
 
 impl Not for ForceCreate {
@@ -1714,7 +1738,7 @@ impl SnapshotManager {
                 .await
                 .map_err(|source| SnapshotUploadError::ArchiveCreate {
                     path: temp_archive_path.clone(),
-                    source: std::io::Error::other(source.to_string()),
+                    source,
                 })?;
 
         tracing::debug!(
