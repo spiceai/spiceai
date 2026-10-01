@@ -47,8 +47,12 @@ pub use turso::TursoSnapshotEngine;
 #[derive(Debug, Snafu)]
 pub enum SnapshotEngineError {
     #[snafu(display("DuckDB snapshot error: {source}"))]
+    /// Boxed: the checkpoint variants carry a dataset, a path and a `duckdb::Error`,
+    /// which would otherwise make every `Result<_, SnapshotEngineError>` carry them too.
     #[cfg(feature = "duckdb")]
-    DuckDB { source: duckdb::DuckDBSnapshotError },
+    DuckDB {
+        source: Box<duckdb::DuckDBSnapshotError>,
+    },
 
     #[snafu(display("SQLite snapshot error: {source}"))]
     #[cfg(feature = "sqlite")]

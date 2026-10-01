@@ -6713,9 +6713,18 @@ mod tests {
             !local_path.exists(),
             "no engine hook may bring the accelerator file into existence"
         );
+        // The writer lease this attempt took, then released, is not a snapshot.
+        let published: Vec<_> = store
+            .list(None)
+            .map(|meta| meta.expect("list the store").location)
+            .filter(|location| {
+                std::future::ready(!location.as_ref().starts_with("snapshots/leases/"))
+            })
+            .collect()
+            .await;
         assert!(
-            store.list(None).next().await.is_none(),
-            "nothing may be published when there is no accelerator file to snapshot"
+            published.is_empty(),
+            "nothing may be published when there is no accelerator file to snapshot: {published:?}"
         );
     }
 
