@@ -40,9 +40,11 @@ const SINK_NAME: &str = "IndexRebuild";
 /// [`Index::requires_rebuild`], returning how many rows were replayed (`None` when no index
 /// needed it).
 ///
-/// The replay runs in a [`WriteWindow::Append`] window rather than a replacing one: an index
+/// The replay runs in a [`WriteWindow::Rebuild`] window rather than a replacing one: an index
 /// that needs a rebuild holds nothing to clear, and an index composed with a durable store
 /// (a compound over Elasticsearch) must not have that store wiped to rebuild its other half.
+/// The window also tells a stream-attached index it may defer its commit, so a replay that
+/// fails part-way leaves nothing committed and the next startup replays it again.
 ///
 /// # Errors
 ///
@@ -68,7 +70,7 @@ pub(crate) async fn rebuild_indexes_from_accelerator(
         indexes.len()
     );
 
-    prepare_indexes(SINK_NAME, indexes.iter(), WriteWindow::Append).await?;
+    prepare_indexes(SINK_NAME, indexes.iter(), WriteWindow::Rebuild).await?;
 
     match replay(accelerator, &indexes).await {
         Ok(rows) => {
@@ -211,7 +213,7 @@ mod tests {
     }
 
     /// Regression test for #14618: an index that starts empty over an accelerator that kept
-    /// its rows is given every one of them, in one append window that is then committed.
+    /// its rows is given every one of them, in one rebuild window that is then committed.
     #[tokio::test]
     async fn an_empty_index_is_given_every_row_the_accelerator_holds() {
         let empty = RecordingIndex::new(true);
@@ -225,7 +227,7 @@ mod tests {
 
         assert_eq!(rows, Some(5));
         assert_eq!(empty.rows.load(Ordering::SeqCst), 5);
-        assert_eq!(*empty.started.lock(), vec![WriteWindow::Append]);
+        assert_eq!(*empty.started.lock(), vec![WriteWindow::Rebuild]);
         assert!(empty.completed.load(Ordering::SeqCst));
         assert!(!empty.failed.load(Ordering::SeqCst));
     }

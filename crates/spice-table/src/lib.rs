@@ -55,6 +55,13 @@ pub enum WriteWindow {
     /// live inside the accelerated table row must clear itself for this window, or it keeps
     /// entries for rows the source dropped.
     ReplaceAll,
+    /// The index is being filled from the rows the accelerator already holds, before any
+    /// change or append stream attaches. As with [`WriteWindow::Append`], existing entries are
+    /// preserved. Nothing else writes to the index while this window is open, so an index that
+    /// otherwise commits every write as it arrives (because a stream shares its writer) can
+    /// stage the whole window and commit it once — a replay that fails part-way then leaves the
+    /// index as empty as it started, and the next startup replays it again.
+    Rebuild,
 }
 
 impl From<InsertOp> for WriteWindow {

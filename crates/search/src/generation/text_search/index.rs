@@ -310,7 +310,12 @@ impl Index for FullTextDatabaseIndex {
         // length of the refresh, and would discard stream documents staged alongside it.
         // A stream-attached index is told about deletions explicitly by its stream, so it does
         // not depend on the replace-window clear to drop rows the source removed.
-        if self.stream_attached.load(Ordering::Acquire) {
+        //
+        // A `Rebuild` window is the exception: it runs before any stream attaches, so nothing
+        // else stages into the writer while it is open. Deferring it is what keeps a replay
+        // that fails part-way from committing a partial index that `requires_rebuild` would
+        // then report as complete.
+        if self.stream_attached.load(Ordering::Acquire) && window != WriteWindow::Rebuild {
             return Ok(());
         }
 
@@ -1180,6 +1185,64 @@ mod tests {
         assert!(
             !open().requires_rebuild(),
             "the reopened index already holds the committed document"
+        );
+    }
+
+    /// A stream-attached index commits every write as it arrives, except inside a rebuild
+    /// window: a startup replay that fails part-way must leave a file-backed index empty, so
+    /// the next startup still sees it needs a rebuild instead of trusting a partial one.
+    #[tokio::test]
+    async fn a_failed_rebuild_of_a_stream_attached_index_commits_nothing() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let open = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                Some(dir.path().to_path_buf()),
+                &["content".to_string()],
+                true,
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        let first = open();
+        first
+            .on_write_start(WriteWindow::Rebuild)
+            .await
+            .expect("on_write_start failed");
+        first
+            .compute_index(vec![batch(&[1], &["alpha"])])
+            .await
+            .expect("failed to compute_index");
+        // A later batch of the replay fails, so the window is rolled back.
+        first
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+        drop(first);
+
+        let reopened = open();
+        assert!(
+            reopened.requires_rebuild(),
+            "the batch staged before the failure must not have been committed"
+        );
+
+        reopened
+            .on_write_start(WriteWindow::Rebuild)
+            .await
+            .expect("on_write_start failed");
+        reopened
+            .compute_index(vec![batch(&[1, 2], &["alpha", "beta"])])
+            .await
+            .expect("failed to compute_index");
+        reopened
+            .on_write_complete()
+            .await
+            .expect("on_write_complete failed");
+        assert!(
+            !reopened.requires_rebuild(),
+            "a completed rebuild window commits the replayed documents"
         );
     }
 
