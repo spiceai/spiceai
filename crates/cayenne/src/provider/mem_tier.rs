@@ -563,6 +563,18 @@ impl MemTier {
     /// bumped so every scan-view cache keyed on it re-keys.
     pub(crate) fn retain_rows(
         &self,
+        keep_batch: impl FnMut(&RecordBatch, i64) -> datafusion_common::Result<RecordBatch>,
+        reindex: impl FnMut(&RecordBatch) -> Option<Arc<crate::provider::mem_tier_index::BatchIndex>>,
+    ) -> datafusion_common::Result<(Self, u64)> {
+        self.retain_rows_matching(|_| true, keep_batch, reindex)
+    }
+
+    /// Rebuild only candidate segments. A false `may_match` result must prove
+    /// that the segment cannot contain a removed row; unknown statistics must
+    /// retain the candidate. Skipped segments keep their batches and indexes.
+    pub(crate) fn retain_rows_matching(
+        &self,
+        mut may_match: impl FnMut(usize) -> bool,
         mut keep_batch: impl FnMut(&RecordBatch, i64) -> datafusion_common::Result<RecordBatch>,
         mut reindex: impl FnMut(
             &RecordBatch,
@@ -573,7 +585,13 @@ impl MemTier {
         let mut bytes = 0u64;
         let mut rows = 0u64;
 
-        for segment in self.segments.iter() {
+        for (index, segment) in self.segments.iter().enumerate() {
+            if !may_match(index) {
+                bytes = bytes.saturating_add(segment.bytes);
+                rows = rows.saturating_add(segment.rows);
+                segments.push(segment.clone());
+                continue;
+            }
             let mut kept: Vec<RecordBatch> = Vec::with_capacity(segment.batches.len());
             let mut kept_indexes = Vec::with_capacity(segment.batches.len());
             let mut segment_removed = 0u64;
@@ -1072,6 +1090,97 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))])
             .expect("batch")
+    }
+
+    #[test]
+    fn retain_rows_matching_shares_skipped_segments() {
+        let tier = MemTier::empty()
+            .append_segment(
+                Arc::new(vec![batch(&[1, 2])]),
+                1,
+                SegmentTombstones::default(),
+                64,
+                2,
+                0,
+            )
+            .append_segment(
+                Arc::new(vec![batch(&[10, 11])]),
+                2,
+                SegmentTombstones::default(),
+                64,
+                2,
+                0,
+            );
+        let mut visited = 0;
+        let (next, removed) = tier
+            .retain_rows_matching(
+                |index| index == 0,
+                |batch, _| {
+                    visited += 1;
+                    Ok(batch.slice(1, 1))
+                },
+                |_| None,
+            )
+            .expect("prepare scoped retention");
+        assert_eq!(visited, 1);
+        assert_eq!(removed, 1);
+        assert_eq!(next.rows, 3);
+        assert_eq!(tier.rows, 4);
+        assert!(Arc::ptr_eq(
+            &tier.segments[1].batches,
+            &next.segments[1].batches
+        ));
+        assert!(Arc::ptr_eq(
+            &tier.segments[1].statistics,
+            &next.segments[1].statistics
+        ));
+        assert!(!Arc::ptr_eq(
+            &tier.segments[0].statistics,
+            &next.segments[0].statistics
+        ));
+        assert_eq!(next.epoch, tier.epoch);
+        assert_eq!(next.version, tier.version + 1);
+    }
+
+    #[test]
+    fn retain_rows_matching_failure_preserves_input() {
+        let tier = MemTier::empty()
+            .append_segment(
+                Arc::new(vec![batch(&[1, 2])]),
+                1,
+                SegmentTombstones::default(),
+                64,
+                2,
+                0,
+            )
+            .append_segment(
+                Arc::new(vec![batch(&[10, 11])]),
+                2,
+                SegmentTombstones::default(),
+                64,
+                2,
+                0,
+            );
+        let before = Arc::clone(&tier.segments);
+        let mut visited = 0;
+        let result = tier.retain_rows_matching(
+            |_| true,
+            |batch, _| {
+                visited += 1;
+                if visited == 2 {
+                    return Err(datafusion_common::DataFusionError::ResourcesExhausted(
+                        "injected preparation refusal".into(),
+                    ));
+                }
+                Ok(batch.slice(1, 1))
+            },
+            |_| None,
+        );
+        assert!(result.is_err());
+        assert_eq!(visited, 2);
+        assert!(Arc::ptr_eq(&before, &tier.segments));
+        assert_eq!(tier.rows, 4);
+        assert_eq!(tier.segments[0].batches[0].num_rows(), 2);
     }
 
     /// Appending shares the underlying `RecordBatch` `Arc` rather than deep

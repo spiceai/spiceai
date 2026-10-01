@@ -31,6 +31,8 @@ limitations under the License.
 //! - the **seq-prefix bake** planner and the in-process compaction runner;
 //! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
+mod memory_replacement;
+
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{

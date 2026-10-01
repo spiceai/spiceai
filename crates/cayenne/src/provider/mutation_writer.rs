@@ -391,6 +391,12 @@ impl<'a> MutationWriter<'a> {
                 .await
                 .map_err(Into::into);
         }
+        if self.table.is_memory_resident_mode() && self.table.pk_column_names().is_empty() {
+            return self
+                .table
+                .write_keyless_memory_replacements(replacements)
+                .await;
+        }
         super::replace_set::write_snapshot(self.table, replacements, session, self.task_context)
             .await
     }

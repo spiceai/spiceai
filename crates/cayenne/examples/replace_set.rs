@@ -109,6 +109,9 @@ async fn replace(
             ctx,
         )
         .await?;
+    if table.is_memory_resident_mode() && write.in_memory_epoch().is_none() {
+        return Err("resident replacement did not publish through the shared RAM tier".into());
+    }
     if write.rows() != ids.len() as u64 || write.finish().await? != ids.len() as u64 {
         return Err("replacement receipt row count differs from input".into());
     }
@@ -221,8 +224,8 @@ async fn exercise_coalescing(
     let write = table
         .write_replace_sets(next, Recovery::Rebuildable, ctx)
         .await?;
-    if keyed && write.in_memory_epoch().is_none() {
-        return Err("primary-key batch did not use native memory publication".into());
+    if (keyed || table.is_memory_resident_mode()) && write.in_memory_epoch().is_none() {
+        return Err("replacement batch did not use native memory publication".into());
     }
     write.finish().await?;
     check(
@@ -520,7 +523,7 @@ async fn exercise(root: &Path, name: &str, memory: bool, inline: bool, keyed: bo
         read(&ctx, &table).await?,
         expected,
     )?;
-    if keyed {
+    if keyed || memory {
         let input = Box::pin(RecordBatchStreamAdapter::new(
             schema(),
             futures::stream::iter(vec![Ok(batch(&members("a", Some("g"), &[8]))?)]),
