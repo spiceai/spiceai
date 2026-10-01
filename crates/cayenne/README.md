@@ -218,8 +218,11 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_all_snapshot_sequences(&self, table_id: &str) -> CatalogResult<HashMap<String, i64>>;
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 
-    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic)
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    // Atomic snapshot pointer flips (compaction and overwrite share retry-on-conflict logic).
+    // A compaction commits only while the table still points at the snapshot it
+    // was built from (`SnapshotReplaced` otherwise).
+    async fn commit_compaction(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    async fn set_current_snapshot(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     // Partitions
@@ -375,7 +378,8 @@ pub struct CayenneTableProvider {
 
     // Per-table locks
     write_lock: Arc<tokio::sync::Mutex<()>>,
-    compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
 
     // Object store
     object_store_config: Option<ObjectStoreConfig>,
@@ -903,9 +907,9 @@ The `cayenne_unsupported_type_action` parameter controls handling:
 
 #### Indexes
 
-Cayenne honors dataset `indexes` as in-memory point-lookup accelerators in both file and memory modes. A lookup uses an index only when equality predicates on bare columns pin every column in one index entry; all predicates still run on the candidate rows. `unique` builds the same lookup index and emits a warning because it does not constrain writes—use `primary_key` plus `on_conflict` for write-time uniqueness.
+Cayenne honors dataset `indexes` as in-memory point-lookup accelerators in both file and memory modes. A planned lookup uses an index when equality predicates on bare columns pin every column in one index entry. File mode can also batch-probe a published index from a completed collect-left hash join's exact scalar or correlated composite key set. Partitioned or oversized runtime key sets scan normally. Every predicate and join still runs on the candidate rows. `unique` builds the same lookup index and emits a warning because it does not constrain writes—use `primary_key` plus `on_conflict` for write-time uniqueness.
 
-Floating-point columns (`Float16`, `Float32`, and `Float64`) are rejected as index columns because equal values such as signed zero do not have a unique byte representation. `EXPLAIN` surfaces the selected shape, outcome, and candidate counts on `CayenneAccelerationExec`; unsupported predicate shapes report `lookup_index_outcome=not_applicable` and scan normally. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
+Floating-point columns (`Float16`, `Float32`, and `Float64`) are rejected as index columns because equal values such as signed zero do not have a unique byte representation. `EXPLAIN` surfaces planning-time shape, outcome, and candidate counts on `CayenneAccelerationExec`; unsupported predicate shapes and runtime-only lookups report `lookup_index_outcome=not_applicable`. Actual runtime index probes are reported by the lookup-index probe metrics. See [Secondary indexes](../../docs/cayenne/cayenne.md#secondary-indexes-indexes) for the design and lifecycle details.
 
 #### Concurrency / MVCC
 

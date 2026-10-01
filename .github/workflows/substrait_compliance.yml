@@ -1,42 +1,25 @@
 name: Substrait compliance
 
-# Mode A TPC-H on pull_request, merge_group, nightly, and manual dispatch.
+# Mode A TPC-H on merge_group, push to trunk/release/feature branches,
+# nightly schedule, and manual dispatch. Not triggered on pull_request.
 # Per-query FAIL/ERROR still exit 0 (report-only pass rate). Do not fail
 # the repository on pass rate until a threshold is set. A harness/build
 # crash must still fail the job.
 #
-# Not a required check (`scripts/signoff` REQUIRED_CHECKS): the job is
-# visible on PRs that touch the paths below and runs in the merge queue,
-# but a low pass rate does not block merge. `merge_group` cannot honour
-# `paths`, so that event is gated with check-code-changes instead.
+# Not a required check (`scripts/signoff` REQUIRED_CHECKS): the job runs
+# in the merge queue (path-gated below), on push to trunk/release/feature,
+# and on schedule/dispatch, but a low pass rate does not block merge.
+# `merge_group` cannot honour `paths`, so that event is gated with
+# check-code-changes instead. Docs-only / harness Markdown edits are
+# excluded from those globs so they do not pay for a 90m compile.
 
 on:
-  pull_request:
+  push:
     branches:
       - trunk
       - release-*
       - release/*
       - feature-*
-    # Docs-only PRs (repo docs and harness Markdown) must not pay for a
-    # 90m compile. Harness globs omit `*.md` so README/RESULTS edits do
-    # not start this workflow. Keep this list in lockstep with the
-    # check_changes filter below.
-    paths:
-      - 'tools/substrait-compliance/src/**'
-      - 'tools/substrait-compliance/scripts/**'
-      - 'tools/substrait-compliance/Cargo.toml'
-      - 'tools/substrait-compliance/.gitignore'
-      - 'tools/substrait-compliance/NOTICE'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'rust-toolchain'
-      - '.cargo/**'
-      - '.github/workflows/substrait_compliance.yml'
-      - '.github/actions/setup-rust/**'
-      - '.github/actions/install-protoc/**'
-      - '.github/actions/check-code-changes/**'
-      - 'crates/yaml/**'
   merge_group:
     branches:
       - trunk
@@ -52,7 +35,8 @@ concurrency:
   cancel-in-progress: true
 
 # check-code-changes only runs on merge_group here, where dorny/paths-filter
-# diffs the checkout (`git diff <base>..<head>`). No pull-request REST API.
+# diffs the checkout (`git diff <base>..<head>`). push/schedule/dispatch
+# skip path filtering and always run Mode A.
 permissions:
   contents: read
 
@@ -64,8 +48,8 @@ env:
 
 jobs:
   # merge_group cannot path-filter, so decide here whether Mode A should
-  # run. Path-filtered pull_request, schedule, and workflow_dispatch
-  # always run — dispatch has no useful base to diff (see verus_verify.yml).
+  # run. push, schedule, and workflow_dispatch always run Mode A —
+  # dispatch has no useful base to diff (see verus_verify.yml).
   check_changes:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -74,7 +58,7 @@ jobs:
     steps:
       - name: Non-merge-group events always run Mode A
         if: ${{ github.event_name != 'merge_group' }}
-        run: echo "Mode A TPC-H runs on pull_request, schedule, and workflow_dispatch"
+        run: echo "Mode A TPC-H runs on push, schedule, and workflow_dispatch"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ github.event_name == 'merge_group' }}
@@ -87,8 +71,9 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
         with:
-          # Same globs as on.pull_request.paths — a path missing here
-          # reports the merge-queue job green without running Mode A.
+          # Path gate for merge_group only. Harness globs omit `*.md` so
+          # README/RESULTS edits report green without running Mode A.
+          # Keep this list in lockstep with any future path documentation.
           filters: |
             code_changes:
               - 'tools/substrait-compliance/src/**'

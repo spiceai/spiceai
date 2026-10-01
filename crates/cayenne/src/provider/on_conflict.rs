@@ -27,6 +27,7 @@ use super::pk_index::{
     PkExistenceRef,
 };
 use super::pk_validation::null_primary_key_message;
+use super::table::DeletionRequestSource;
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -383,9 +384,42 @@ impl InlinedDataRewrite {
     }
 }
 
+/// Where [`InlineAwareDeletionSink`] gets the deletion-vector sink it publishes
+/// through. Not itself a sink — see [`super::delete::sink::file_based`] for the
+/// file-based delete route, which is a different delete strategy entirely.
+///
+/// A [`CayenneDeletionSink`] captures the tiers it will scan when it is BUILT and
+/// re-reads only the main listing at execution, so every other source — the
+/// protected snapshots a mem-tier checkpoint publishes into, the cold tier — is
+/// frozen at build time. How far that freeze can drift from the delete depends on
+/// who builds the sink and when.
+pub(crate) enum DeletionSinkSource {
+    /// Built by the caller immediately before it drives the sink itself
+    /// (`delete_from_cdc_fast`, the CDC apply loop's own delete path). Its window
+    /// is whatever separates those two statements; this is its pre-existing shape,
+    /// neither widened nor narrowed here.
+    Prebuilt(Box<CayenneDeletionSink>),
+    /// Built inside the execution-time `write_lock` hold, after the in-memory CDC
+    /// tier is checkpointed in that same hold.
+    ///
+    /// `TableProvider::delete_from` builds a plan and executes it as two separate
+    /// steps, so building here left the delete judging the table by a capture taken
+    /// before any apply that landed in between: a row that arrived after it is in no
+    /// scan source, so a predicate naming it deletes nothing, and — worse — an upsert
+    /// that superseded a durable row leaves the scan matching the SUPERSEDED version,
+    /// so the key tombstone hides the KEY and takes the live replacement with it
+    /// (#13828, the lost-update shape #13574 closed one tier over).
+    ///
+    /// This closes that gap, not every drift: a mem-tier checkpoint publishes its
+    /// snapshot under `listing_fence` rather than `write_lock`, so one can still
+    /// appear mid-delete — the residual race `CayenneDeletionSink::live_main_insert_records`
+    /// documents and downgrades for.
+    BuildAtExecution(DeletionRequestSource),
+}
+
 pub(crate) struct InlineAwareDeletionSink {
     pub(crate) table: CayenneTableProvider,
-    pub(crate) file_sink: CayenneDeletionSink,
+    pub(crate) file_sink: DeletionSinkSource,
     pub(crate) filters: Vec<Expr>,
 }
 
@@ -594,11 +628,32 @@ impl DeletionSink for InlineAwareDeletionSink {
         let _write_guard = self.table.write_lock.lock().await;
         self.table.mark_maintained_aggregates_stale();
 
+        // Make the in-memory CDC tier durable and capture the scan sources inside
+        // THIS hold, so no apply lands between the capture and the delete it is
+        // judged by (#13828). The two are not separable: a checkpoint publishes its
+        // rows as a protected snapshot, and the sink freezes the protected set it
+        // will scan. See [`DeletionSinkSource`].
+        let built_at_execution;
+        let file_sink = match &self.file_sink {
+            DeletionSinkSource::Prebuilt(sink) => sink.as_ref(),
+            DeletionSinkSource::BuildAtExecution(source) => {
+                // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
+                // into — there the tier is reconciled below by
+                // `apply_mem_tier_delete`.
+                self.table.checkpoint_mem_tier_for_delete().await?;
+                built_at_execution = self
+                    .table
+                    .build_deletion_vector_sink(&self.filters, None, *source)
+                    .await?;
+                &built_at_execution
+            }
+        };
+
         let (inline_rewrite, inlined_deleted) = self
             .table
             .prepare_inlined_rows_matching_filters(&self.filters)
             .await?;
-        let mut prepared_file_delete = self.file_sink.prepare_delete().await?;
+        let mut prepared_file_delete = file_sink.prepare_delete().await?;
         let file_deleted = prepared_file_delete
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);

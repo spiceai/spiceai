@@ -24,6 +24,7 @@ use arrow_flight::{
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
+use arrow_tools::ipc::{declares_ipc_data, declares_record_batch};
 use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::schema::verify_schema;
 use datafusion::{
@@ -453,46 +454,6 @@ impl MapEntriesGuard {
             Status::invalid_argument(message)
         })
     }
-}
-
-/// What an IPC message's header declares, or `None` when the message carries no header bytes.
-///
-/// The header is the discriminator, not the body length: a batch of zero rows — and a batch
-/// whose columns need no buffers — is sent with an empty body, so treating an empty body as
-/// "no data" both drops rows the writer sent and under-counts the ones a failed write discarded.
-///
-/// A message with no header bytes at all declares nothing — Flight allows a metadata-only
-/// message, and there is nothing there to misread. A header that has bytes but will not parse is
-/// neither a declaration nor the absence of one: it is a malformed stream, and the `Err` is what
-/// lets a caller report that parse failure instead of the "carries no batch" diagnosis a `false`
-/// would produce, which names the wrong problem and hides the reason the IPC was rejected.
-fn declared_message_header(data_header: &[u8]) -> Result<Option<arrow_ipc::MessageHeader>, String> {
-    if data_header.is_empty() {
-        return Ok(None);
-    }
-
-    arrow_ipc::root_as_message(data_header)
-        .map(|message| Some(message.header_type()))
-        .map_err(|e| e.to_string())
-}
-
-/// Whether an IPC message's header declares a record batch — the messages the write decodes.
-fn declares_record_batch(data_header: &[u8]) -> Result<bool, String> {
-    Ok(declared_message_header(data_header)? == Some(arrow_ipc::MessageHeader::RecordBatch))
-}
-
-/// Whether an IPC message's header declares data the write needed: a record batch, or a
-/// dictionary the batches referencing it cannot be decoded without.
-///
-/// Wider than [`declares_record_batch`] because it answers a different question. That one asks
-/// what to decode; this one asks what was lost. A dictionary message carries the values its
-/// batch refers to, so a batch that references one carries nothing without it — a discarded
-/// dictionary is discarded client data even though it is not itself a batch.
-fn declares_ipc_data(data_header: &[u8]) -> Result<bool, String> {
-    Ok(matches!(
-        declared_message_header(data_header)?,
-        Some(arrow_ipc::MessageHeader::RecordBatch | arrow_ipc::MessageHeader::DictionaryBatch)
-    ))
 }
 
 fn create_response_stream(

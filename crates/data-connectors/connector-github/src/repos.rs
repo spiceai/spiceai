@@ -65,9 +65,7 @@ impl GraphQLContext for ReposTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (repositories) + 50 (repositoryTopics) + 3 count-only connections
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(4 + TOPICS_PER_REPO)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 

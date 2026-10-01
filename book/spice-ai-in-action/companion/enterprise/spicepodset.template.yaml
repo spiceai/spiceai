@@ -1,0 +1,36 @@
+apiVersion: spice.ai/v2
+kind: SpicepodSet
+metadata:
+  name: northstar
+  namespace: spice-book
+spec:
+  replicas: 2
+  image:
+    repository: REPLACE_ENTERPRISE_REPOSITORY
+    tag: REPLACE_TESTED_RUNTIME_TAG
+    pullPolicy: IfNotPresent
+    pullSecret: northstar-registry
+  resources:
+    requests:
+      cpu: '1'
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  env:
+  - name: BOOK_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: northstar-runtime
+        key: api-key
+  updateStrategy:
+    type: RollingOrdered
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: northstar-enterprise
+    runtime:
+      auth:
+        api_key:
+          enabled: true
+          keys:
+          - ${ env:BOOK_API_KEY }

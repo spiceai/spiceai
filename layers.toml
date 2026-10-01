@@ -224,6 +224,7 @@ connector-postgres-common = "shared-utility"
 ansi_colors = "foundation"
 arrow_tools = "foundation"
 aws-sdk-credential-bridge = "foundation"
+backoff = "foundation"
 chunking = "foundation"
 # Shared by implementations outside this repo via a git dependency, so its
 # dependency closure has to stay small — foundation is also a budget here.
@@ -265,6 +266,7 @@ runtime-checkpoint-api = "foundation"
 # `embed-api` is assigned explicitly rather than left to `default_tier`, so that
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
+evaluate-api = "foundation"
 embed-api = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
@@ -284,6 +286,7 @@ runtime-rate-control = "foundation"
 # silently place it in shared-utility.
 runtime-resources = "foundation"
 runtime-status = "foundation"
+sharded-cache = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"
 scheduler = "foundation"

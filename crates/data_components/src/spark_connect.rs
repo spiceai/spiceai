@@ -19,12 +19,13 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::Read;
+use crate::function_support::FunctionSupport;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::project_schema;
+use datafusion::common::{DFSchema, project_schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -45,6 +46,7 @@ use datafusion::{
 };
 use futures::Stream;
 use runtime_rate_control::RateController;
+use runtime_udfs_api::deny_spice_specific_functions;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col};
 use tokio::sync::{Mutex, RwLock};
@@ -161,6 +163,14 @@ impl SparkSessionFactory {
 #[derive(Clone)]
 pub struct SparkConnect {
     inner: Arc<SparkConnectInner>,
+    /// Which functions may be pushed into the SQL sent to Spark.
+    ///
+    /// Defaults to the Spice deny-list rather than to "federate everything",
+    /// so a connector that forgets to set it is safe: the omission costs a
+    /// pushdown, not a query that Spark answers `[UNRESOLVED_ROUTINE]` to.
+    /// Behind an `Arc` because `SparkConnect` is cloned per query and per
+    /// partition, and the list it holds is one `String` per Spice function.
+    function_support: Arc<FunctionSupport>,
 }
 
 struct SparkConnectInner {
@@ -213,7 +223,22 @@ impl SparkConnect {
                 join_push_down_context,
                 rate_controller,
             }),
+            function_support: deny_spice_specific_functions(),
         })
+    }
+
+    /// Replaces the default Spice deny-list, so a test can pin the exact
+    /// policy it exercises.
+    #[cfg(test)]
+    #[must_use]
+    fn with_function_support(mut self, function_support: Arc<FunctionSupport>) -> Self {
+        self.function_support = function_support;
+        self
+    }
+
+    /// The functions this connection may ask Spark to evaluate.
+    pub(crate) fn function_support(&self) -> &FunctionSupport {
+        &self.function_support
     }
 
     /// The join push-down context used for federation compute-context matching.
@@ -446,8 +471,27 @@ impl TableProvider for SparkConnectTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // A filter resolves against the table's own schema, which is what
+        // carries the column metadata a per-call support check may need.
+        // `None` would be safe but pessimistic -- a check that refuses on an
+        // unknown type would drop every such filter from the pushdown.
+        let scope = DFSchema::try_from(self.schema()).ok();
+
         let mut filter_push_down = vec![];
         for filter in filters {
+            // The deny-list has to be consulted here as well as in
+            // `can_execute_plan`: `PushDownFilter` runs first, so refusing to
+            // federate the plan only moves a denied predicate into the
+            // `TableScan`, and `scan` then hands it to Spark anyway. Same
+            // screen `SqlTable::supports_filters_pushdown` applies.
+            if !self
+                .spark_connect
+                .function_support()
+                .supports(filter, scope.as_ref())
+            {
+                filter_push_down.push(TableProviderFilterPushDown::Unsupported);
+                continue;
+            }
             match expr_to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
@@ -672,6 +716,237 @@ mod tests {
 
     const TEST_CONNECTION: &str = "sc://dbc-abcd.cloud.databricks.com:443/;use_ssl=true;user_id=spice.ai;session_id=00000000-0000-0000-0000-000000000001;token=secret-token;x-databricks-cluster-id=cluster-123;user_agent=SpiceAI_OSS/1.0;";
 
+    /// A Spice-only UDF over a Spark Connect table must be evaluated locally,
+    /// not unparsed into the SQL sent to Spark.
+    ///
+    /// `SparkConnectTableProvider`'s `SQLExecutor` overrode no
+    /// `can_execute_plan`, so the default `true` federated every plan and
+    /// Spark answered
+    /// `[UNRESOLVED_ROUTINE] Cannot resolve routine \`spice_only_udf\``. The
+    /// same executor is what the Databricks `spark_connect` mode federates
+    /// through, on both the dataset and the `catalogs:` path. Regression test
+    /// for #13664.
+    ///
+    /// Needs a Spark Connect server holding `docs(id INT, body STRING)`:
+    ///
+    /// ```text
+    /// SPARK_REMOTE=sc://127.0.0.1:15002/ cargo test --release -p data_components \
+    ///   --no-default-features --features spark_connect -- --ignored spice_only_udf
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires a live Spark Connect server; set SPARK_REMOTE"]
+    async fn a_spice_only_udf_is_not_pushed_into_the_spark_statement() {
+        let remote = std::env::var("SPARK_REMOTE")
+            .expect("SPARK_REMOTE must name a Spark Connect server holding `docs`");
+
+        // The negative control, first: with no deny-list the same plan
+        // federates, which is what gives the assertion below teeth -- and is
+        // the behaviour this test exists to keep from coming back.
+        let unguarded = SparkConnect::from_connection(&remote)
+            .await
+            .expect("connect to the Spark Connect server")
+            .with_function_support(permit_everything());
+        let unguarded_sql = federated_sql(&unguarded, SPICE_ONLY_QUERY).await;
+        assert!(
+            unguarded_sql
+                .as_deref()
+                .is_some_and(|sql| sql.contains(SPICE_ONLY_UDF)),
+            "the control: with no deny-list the UDF is unparsed into the remote statement, \
+             so an assertion that it is absent once the deny-list is installed means \
+             something. Got: {unguarded_sql:?}"
+        );
+
+        // A deny-list naming only the stand-in UDF, so this half does not
+        // depend on which functions the default Spice set contains.
+        let guarded = SparkConnect::from_connection(&remote)
+            .await
+            .expect("connect to the Spark Connect server")
+            .with_function_support(deny_only(SPICE_ONLY_UDF));
+        let guarded_sql = federated_sql(&guarded, SPICE_ONLY_QUERY).await;
+        assert!(
+            guarded_sql
+                .as_deref()
+                .is_none_or(|sql| !sql.contains(SPICE_ONLY_UDF)),
+            "a denied function must not reach the statement sent to Spark, which cannot \
+             resolve it. Got: {guarded_sql:?}"
+        );
+
+        // A function Spark does have must still be pushed down, so the
+        // deny-list has not simply turned federation off.
+        let control_sql = federated_sql(&guarded, "SELECT id, upper(body) AS c FROM docs").await;
+        assert!(
+            control_sql
+                .as_deref()
+                .is_some_and(|sql| sql.contains("upper(")),
+            "upper() is a Spark function and must keep federating. Got: {control_sql:?}"
+        );
+
+        // The default, with no `with_function_support` at all: a connector
+        // that sets no policy must still be safe, which is what keeps the
+        // next Spark-backed connector from re-opening this bug.
+        let defaulted = SparkConnect::from_connection(&remote)
+            .await
+            .expect("connect to the Spark Connect server");
+        let defaulted_sql =
+            federated_sql(&defaulted, "SELECT id, json_get_str(body) AS c FROM docs").await;
+        assert!(
+            defaulted_sql
+                .as_deref()
+                .is_none_or(|sql| !sql.contains(SPICE_SET_UDF)),
+            "a connection that set no policy must still deny the Spice set. \
+             Got: {defaulted_sql:?}"
+        );
+
+        // The predicate half. `PushDownFilter` runs before the federation
+        // decision, so refusing to federate the plan is not enough on its own:
+        // a denied predicate lands in the `TableScan` and `scan` hands it to
+        // Spark regardless. `supports_filters_pushdown` is what keeps it out.
+        let predicate = "SELECT id FROM docs WHERE spice_only_udf(body) = '{\"color\":\"red\"}'";
+        let predicate_sql = federated_sql(&guarded, predicate).await;
+        assert!(
+            predicate_sql
+                .as_deref()
+                .is_none_or(|sql| !sql.contains(SPICE_ONLY_UDF)),
+            "a denied function in a WHERE clause must not reach Spark either. \
+             Got: {predicate_sql:?}"
+        );
+        assert_eq!(
+            rows(&guarded, predicate).await,
+            vec!["1".to_string()],
+            "and the predicate must still select the right row, evaluated locally"
+        );
+
+        // Control again, on the predicate path: a Spark function in a WHERE
+        // clause must keep being pushed down.
+        let control_predicate = federated_sql(
+            &guarded,
+            "SELECT id FROM docs WHERE upper(body) LIKE '%RED%'",
+        )
+        .await;
+        assert!(
+            control_predicate
+                .as_deref()
+                .is_some_and(|sql| sql.contains("upper(")),
+            "a Spark function in a WHERE clause must keep federating. Got: {control_predicate:?}"
+        );
+    }
+
+    /// A federating session over `spark`'s `docs` table, with the stand-in
+    /// UDFs registered.
+    async fn docs_ctx(spark: &SparkConnect) -> datafusion::prelude::SessionContext {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+
+        let provider = spark
+            .table_provider(TableReference::bare("docs"))
+            .await
+            .expect("build the docs table provider");
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = datafusion::prelude::SessionContext::new_with_state(state);
+        ctx.register_udf(stub_udf(SPICE_ONLY_UDF));
+        ctx.register_udf(stub_udf(SPICE_SET_UDF));
+        ctx.register_table(TableReference::bare("docs"), provider)
+            .expect("register the docs table");
+        ctx
+    }
+
+    /// The first column of every row `sql` returns, rendered as strings.
+    async fn rows(spark: &SparkConnect, sql: &str) -> Vec<String> {
+        let batches = docs_ctx(spark)
+            .await
+            .sql(sql)
+            .await
+            .expect("plan the query")
+            .collect()
+            .await
+            .expect("run the query");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column(0);
+                (0..batch.num_rows())
+                    .map(|row| {
+                        datafusion::common::ScalarValue::try_from_array(column, row)
+                            .expect("read the value")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    const SPICE_ONLY_UDF: &str = "spice_only_udf";
+    const SPICE_ONLY_QUERY: &str = "SELECT id, spice_only_udf(body) AS c FROM docs";
+
+    /// A function that really is in the Spice set the default policy denies,
+    /// so the default can be tested without naming the whole set.
+    const SPICE_SET_UDF: &str = "json_get_str";
+
+    /// A UDF of `name`, standing in for a Spice function Spark does not have.
+    /// The deny-list screens by name, so a stub is denied exactly as the real
+    /// function is.
+    fn stub_udf(name: &str) -> datafusion::logical_expr::ScalarUDF {
+        use arrow::datatypes::DataType;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+
+        create_udf(
+            name,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        )
+    }
+
+    /// A deny-list naming exactly one function, standing in for the Spice set
+    /// a real connection defaults to. Named explicitly so the test does not
+    /// depend on which functions that set happens to contain.
+    fn deny_only(name: &str) -> Arc<crate::function_support::FunctionSupport> {
+        Arc::new(crate::function_support::FunctionSupport::new(
+            Some(crate::function_support::FunctionRestriction::Deny(vec![
+                name.to_string(),
+            ])),
+            None,
+            None,
+        ))
+    }
+
+    /// A policy that restricts nothing, for the negative control -- the
+    /// default is the deny-list, so "unguarded" has to be asked for.
+    fn permit_everything() -> Arc<crate::function_support::FunctionSupport> {
+        Arc::new(crate::function_support::FunctionSupport::new(
+            None, None, None,
+        ))
+    }
+
+    /// The statement the federated plan for `sql` would send to Spark, or
+    /// `None` when nothing federated.
+    async fn federated_sql(spark: &SparkConnect, sql: &str) -> Option<String> {
+        use datafusion::physical_plan::displayable;
+
+        let physical = docs_ctx(spark)
+            .await
+            .sql(sql)
+            .await
+            .expect("plan the query")
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+
+        displayable(physical.as_ref())
+            .indent(false)
+            .to_string()
+            .lines()
+            .find_map(|line| {
+                line.split_once("base_sql=")
+                    .map(|(_, sql)| sql.trim().to_string())
+            })
+    }
+
     #[test]
     fn recoverable_session_errors_are_detected() {
         let closed = SparkError::AnalysisException(
@@ -781,6 +1056,258 @@ mod tests {
         assert!(!rendered.contains("token="));
         SparkConnect::validate_connection_string(&rendered)
             .expect("rebuilt connection string should be valid");
+    }
+
+    /// The scheme a connection string with `use_ssl=false` resolves to.
+    ///
+    /// Only a Spice patch to the `spiceai/spark-connect-rs` fork makes this `http`;
+    /// upstream `ChannelBuilder::endpoint` returns `https` unconditionally. The
+    /// dial below is what proves the consequence — this asserts the mechanism, so
+    /// a failure says which of the two moved.
+    #[test]
+    fn a_non_tls_connection_string_resolves_to_an_http_endpoint() {
+        let channel = ChannelBuilder::create("sc://127.0.0.1:15002/;user_id=spice.ai")
+            .expect("a connection string without use_ssl should parse");
+        assert!(
+            !channel.use_ssl(),
+            "this guard needs a connection string that asks for no TLS"
+        );
+        let endpoint = channel.endpoint();
+        assert!(
+            endpoint.starts_with("http://"),
+            "a Spark Connect endpoint that asks for no TLS resolved to {endpoint}, so the \
+             connection is dialled over TLS and a plaintext Spark Connect server rejects it"
+        );
+    }
+
+    /// A connection string's `user_agent` has to *replace* the client's default,
+    /// not extend it.
+    ///
+    /// Live on every production Databricks connection:
+    /// `DatabricksSparkConnect::new_with_rate_controller` formats
+    /// `user_agent={user_agent}` into the connection string, `from_connection`
+    /// keeps it in `base_options` (only `token` and `session_id` are dropped), and
+    /// `render_connection` puts it back for `SparkSessionBuilder::remote`. Fork
+    /// PRs #9 and #10 are what make the builder read the option and send it as the
+    /// whole `client_type`; without them Databricks attributes Spice's traffic to
+    /// the connect library, and nothing fails while it does.
+    ///
+    /// Read out of `Debug` because the value's only other appearance is the
+    /// `client_type` field of an outgoing Spark Connect request, which needs a
+    /// gRPC server to observe. The control is the second half: it asserts the
+    /// library default is what appears when the option is absent, so the
+    /// replacement assertion cannot be met by a builder carrying no user agent at
+    /// all.
+    #[test]
+    fn a_connection_string_user_agent_replaces_the_client_default() {
+        const DEFAULT_MARKER: &str = "_SPARK_CONNECT_RUST";
+
+        let configured = SparkSessionBuilder::remote(TEST_CONNECTION)
+            .expect("the Databricks connection string should parse");
+        let configured = format!("{:?}", configured.channel_builder);
+        assert!(
+            configured.contains("SpiceAI_OSS/1.0"),
+            "the connection string's user agent never reached the client, so Databricks \
+             attributes Spice's traffic to the connect library instead: {configured}"
+        );
+        assert!(
+            !configured.contains(DEFAULT_MARKER),
+            "the user agent extends the library default rather than replacing it, which is \
+             not the attribution Databricks is given: {configured}"
+        );
+
+        let defaulted = SparkSessionBuilder::remote("sc://127.0.0.1:15002/;user_id=spice.ai")
+            .expect("a connection string without a user agent should parse");
+        let defaulted = format!("{:?}", defaulted.channel_builder);
+        assert!(
+            defaulted.contains(DEFAULT_MARKER),
+            "the control has to show the default the assertion above requires to be absent, \
+             or a builder that carried no user agent would satisfy it: {defaulted}"
+        );
+    }
+
+    /// What a non-TLS Spark Connect endpoint actually receives when Spice dials it:
+    /// the HTTP/2 connection preface, in the clear.
+    ///
+    /// Asserted against a listener rather than against the endpoint string because
+    /// the string is not what fails — a plaintext Spark Connect endpoint dialled
+    /// over TLS never completes a connection, and every dataset on that endpoint
+    /// fails to load. Losing the fork patch shows up here in one of two shapes,
+    /// and both fail: the client sends a TLS `ClientHello` (record type `0x16`),
+    /// or `tonic` refuses an `https` endpoint it has no TLS configuration for and
+    /// nothing reaches the listener at all.
+    #[tokio::test]
+    async fn a_non_tls_spark_endpoint_is_dialled_in_plaintext() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        /// The client half of the HTTP/2 connection preface (RFC 9113 §3.4),
+        /// which a plaintext h2 client sends before anything else.
+        const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds a plaintext listener");
+        let port = listener
+            .local_addr()
+            .expect("the listener has a local address")
+            .port();
+
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.ok()?;
+            // TCP is a byte stream, so the preface arrives in as many segments as the
+            // client happens to write it in: a single `read` can return one byte of it
+            // and the comparison below would fail on a client that behaved correctly.
+            // Read until the preface is complete, or until the peer stops sending.
+            //
+            // Accumulated rather than `read_exact`ed because what arrived is itself a
+            // diagnostic: a peer that opens the connection and sends nothing, or sends
+            // a `ClientHello` and stops, has to reach the assertions below with the
+            // bytes it did send rather than be lost in a read that never returns.
+            let mut first = Vec::with_capacity(H2_PREFACE.len());
+            while first.len() < H2_PREFACE.len() {
+                let mut chunk = [0_u8; H2_PREFACE.len()];
+                match stream.read(&mut chunk).await {
+                    // The peer closed, or the read failed: report what did arrive.
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => first.extend_from_slice(&chunk[..read]),
+                }
+            }
+            Some(first)
+        });
+
+        // The dial is what is under assertion, not the session: nothing on the
+        // other end speaks gRPC, so the handshake never completes and `build`
+        // would wait for a `SETTINGS` frame that never comes. Spawned and left
+        // running for that reason, and dropped with the runtime.
+        let connection = format!("sc://127.0.0.1:{port}/;user_id=spice.ai");
+        drop(tokio::spawn(async move {
+            let _ = SparkSessionBuilder::remote(&connection)
+                .expect("a connection string without use_ssl should parse")
+                .build()
+                .await;
+        }));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
+            .await
+            .expect(
+                "no complete HTTP/2 preface within 10s: either nothing was dialled, because an \
+                 endpoint that asks for no TLS was resolved to https and tonic refuses that \
+                 without a TLS configuration, or the peer opened the connection and stopped \
+                 part-way through sending",
+            )
+            .expect("the accept task panicked")
+            .expect("the accept task saw no connection");
+
+        assert!(
+            !first.is_empty(),
+            "the connection was opened and then abandoned without a byte sent, which is what \
+             tonic does with an https endpoint it has no TLS configuration for"
+        );
+        assert_ne!(
+            first.first(),
+            Some(&0x16),
+            "the client opened a TLS handshake against a plaintext Spark Connect endpoint, so \
+             the connection fails and no dataset on that endpoint loads: {first:02x?}"
+        );
+        assert_eq!(
+            first, H2_PREFACE,
+            "a plaintext Spark Connect endpoint must receive the HTTP/2 preface: {first:02x?}"
+        );
+    }
+
+    /// What a TLS Spark Connect endpoint receives when Spice dials it: a TLS
+    /// `ClientHello`, not a plaintext HTTP/2 preface.
+    ///
+    /// The counterpart to the guard above, and the other half of the fork's TLS
+    /// handling (fork PR #7). `Endpoint::connect` attaches no TLS configuration of
+    /// its own, so the fork attaches one —
+    /// `ClientTlsConfig::new().with_native_roots()` — whenever the connection
+    /// string asks for `use_ssl=true`. Lose it and a Databricks endpoint is either
+    /// dialled in the clear, which the server rejects, or refused by `tonic` for
+    /// having no TLS configuration; either way every dataset on that endpoint
+    /// fails to load.
+    ///
+    /// The listener speaks no TLS, so the handshake never completes and the first
+    /// bytes it reads are the assertion. This pins that TLS is configured at all,
+    /// which is what the patch provides. It does not distinguish *which* root
+    /// store was chosen — the roots a client trusts are not observable from its
+    /// `ClientHello` — so the `with_native_roots` half is guarded only by the
+    /// accessor the same patch added, which
+    /// `a_non_tls_connection_string_resolves_to_an_http_endpoint` calls and the
+    /// compiler therefore requires.
+    #[tokio::test]
+    async fn a_tls_spark_endpoint_is_dialled_with_a_tls_handshake() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        /// A TLS record begins with the content type — `0x16` for handshake — and
+        /// then the two-byte legacy protocol version, `0x03 0x01` for every version
+        /// a `ClientHello` may announce (RFC 8446 §5.1).
+        const TLS_HANDSHAKE: u8 = 0x16;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds a plaintext listener");
+        let port = listener
+            .local_addr()
+            .expect("the listener has a local address")
+            .port();
+
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.ok()?;
+            // Three bytes is the record header's type and version, which is all
+            // that is under assertion; accumulated for the same reason as the
+            // plaintext guard — what arrived is itself the diagnostic.
+            let mut first = Vec::with_capacity(3);
+            while first.len() < 3 {
+                let mut chunk = [0_u8; 3];
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => first.extend_from_slice(&chunk[..read]),
+                }
+            }
+            Some(first)
+        });
+
+        // As in the plaintext guard, the dial is what is under assertion: nothing
+        // on the other end speaks TLS, so the handshake never completes and
+        // `build` would wait forever.
+        let connection = format!("sc://127.0.0.1:{port}/;use_ssl=true;user_id=spice.ai");
+        drop(tokio::spawn(async move {
+            let _ = SparkSessionBuilder::remote(&connection)
+                .expect("a connection string with use_ssl=true should parse")
+                .build()
+                .await;
+        }));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
+            .await
+            .expect(
+                "no TLS record header within 10s: either nothing was dialled, because tonic \
+                 refuses an https endpoint it has no TLS configuration for, or the peer opened \
+                 the connection and stopped part-way through the record header",
+            )
+            .expect("the accept task panicked")
+            .expect("the accept task saw no connection");
+
+        assert!(
+            !first.is_empty(),
+            "the connection was opened and then abandoned without a byte sent, which is what \
+             tonic does with an https endpoint it has no TLS configuration for"
+        );
+        assert_eq!(
+            first.first(),
+            Some(&TLS_HANDSHAKE),
+            "a Spark Connect endpoint asked for over TLS must receive a TLS handshake record, \
+             not {first:02x?} — a plaintext dial is rejected by the server and every dataset \
+             on that endpoint fails to load"
+        );
+        assert_eq!(
+            first.get(1),
+            Some(&0x03),
+            "the record announced a protocol version no TLS ClientHello uses: {first:02x?}"
+        );
     }
 
     /// Extracts the value of a `;key=value;` option from a rendered Spark

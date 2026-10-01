@@ -60,7 +60,7 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 }
 
 /// The `DataFusion` built-ins `DuckDB` must not be handed, because `DuckDB`
-/// cannot evaluate them faithfully: two have a function that looks like the one
+/// cannot evaluate them faithfully: one has a function that looks like the one
 /// asked for but answers a different question, and one has no such function at
 /// all.
 ///
@@ -86,25 +86,22 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// exist!` — the unknown-function failure the deny-list exists to prevent
 /// (issue #10703).
 ///
-/// `regexp_count` is here because its translation is not value-preserving
-/// either, on a narrower input: the dialect renders it
-/// `len(regexp_extract_all(x, p))`, and `regexp_extract_all(NULL, p)` is NULL in
-/// `DuckDB`, so `len(NULL)` is NULL where `DataFusion` counts zero matches and
-/// answers `0`. A count that is NULL rather than `0` propagates differently
-/// through `SUM`, through `= 0`, and through a `WHERE` built on it, so an
-/// accelerated dataset gained or lost rows against an unaccelerated one
-/// (issue #13870). The dialect keeps its handler — the rewrite is right for
-/// non-NULL input and #13870 is about making it NULL-preserving so the pushdown
-/// can come back — but a denied name is never advertised as native, which
-/// [`crate::dialect::duckdb_native_function_names`] enforces.
-///
-/// `regexp_like` and `regexp_replace` are the two `DataFusion` regexp built-ins
-/// left, and both agreed with local evaluation on every input measured,
-/// including a NULL one.
+/// `regexp_like`, `regexp_replace` and `regexp_count` are the three
+/// `DataFusion` regexp built-ins the dialect renders, and all three are
+/// screened per call by the handler rather than by name: only a literal
+/// pattern built from syntax RE2 and the kernel's `regex` crate read alike
+/// renders, because the divergences are silent ones that change which rows
+/// match (`regexp_like('xy١', '\d')` was `false` federated and `true` locally
+/// — issue #14148).
+/// `regexp_count` was here until its rendering was made NULL-preserving
+/// (issue #13870); the call shapes it still cannot render faithfully are
+/// refused by the handler and evaluated locally through the per-call check
+/// below, not by name. A denied name is never advertised as native, which
+/// [`crate::dialect::duckdb_native_function_names`] enforces should a handled
+/// name ever join this list.
 pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::REGEXP_MATCH_NAME,
     crate::dialect::REGEXP_INSTR_NAME,
-    crate::dialect::REGEXP_COUNT_NAME,
 ];
 
 /// The deny-list for a consumer that installs the `DuckDB` dialect but wants
@@ -128,10 +125,9 @@ pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
 pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
-        .scalar_call(Arc::new(|call, _| {
-            crate::dialect::duckdb_can_translate(call)
-        }))
+        .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
+        .with_expression_support(Arc::new(crate::dialect::duckdb_can_evaluate_expression))
 }
 
 /// The one `DuckDB` policy both public accessors return, so the connector and
@@ -140,10 +136,9 @@ fn duckdb_function_support() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::duckdb_native_function_names())
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
-        .scalar_call(Arc::new(|call, _| {
-            crate::dialect::duckdb_can_translate(call)
-        }))
+        .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
+        .with_expression_support(Arc::new(crate::dialect::duckdb_can_evaluate_expression))
 }
 
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
@@ -360,18 +355,25 @@ mod tests {
     }
 
     /// The two layers rank: a name in [`DUCKDB_DENIED_BUILTINS`] does not
-    /// federate even where the per-call check can render it. `regexp_count`
-    /// with an integer start is renderable — `duckdb_can_translate` says so,
-    /// and `dialect::tests::duckdb_declines_a_regexp_count_start_it_cannot_turn_into_an_offset`
-    /// asserts it — but the rendering answers NULL where `DataFusion` answers
-    /// `0` for a NULL input, so the name is denied and the call evaluates
-    /// locally (issue #13870). Renderability is not faithfulness, and only the
-    /// deny-list encodes the difference.
+    /// federate whatever the per-call check says, and a name that is not
+    /// denied federates exactly when the dialect renders the call.
+    /// `regexp_count` with an integer start is the second case: the rendering
+    /// is value-preserving (#13870), so it is not denied by name and the call
+    /// federates; `regexp_match` is the first, denied by name because `DuckDB`
+    /// has no faithful rendering of it at all (#13809).
     #[test]
-    fn a_denied_builtin_does_not_federate_even_when_the_dialect_renders_it() {
+    fn a_denied_name_stays_local_and_a_rendered_name_federates() {
         assert!(
-            !federates(regexp_count(col("s"), lit("a"), Some(lit(1)), None)),
-            "regexp_count is denied by name, so no call of it may federate"
+            federates(regexp_count(col("s"), lit("a"), Some(lit(1)), None)),
+            "regexp_count is rendered faithfully and not denied by name, so it federates"
+        );
+        assert!(
+            !federates(datafusion::functions::regex::expr_fn::regexp_match(
+                col("s"),
+                lit("a"),
+                None,
+            )),
+            "regexp_match is denied by name, so no call of it may federate"
         );
     }
 
@@ -467,5 +469,72 @@ mod tests {
             .expect("the support check must not error"),
             "the gate must not cost a pushdown DuckDB can render"
         );
+    }
+
+    /// A scan of `t(id, a)` with `a` binary, filtered by `predicate` and
+    /// projecting `projection` — the shapes #14355 measured.
+    fn plan_over_binary(predicate: Option<Expr>, projection: Expr) -> LogicalPlan {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("a", DataType::Binary, true),
+        ]);
+        let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
+        if let Some(predicate) = predicate {
+            plan = plan.filter(predicate).expect("filter");
+        }
+        plan.project(vec![projection])
+            .expect("project")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
+    /// binary column into text answers with a row on `DuckDB` where
+    /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan
+    /// holding one, in a projection or a filter, must stay local.
+    #[test]
+    fn a_duckdb_text_cast_over_a_binary_column_is_not_federated() {
+        use datafusion::prelude::{cast, try_cast};
+        for (accessor, support) in [
+            (
+                "table providers",
+                deny_spice_functions_for_duckdb_table_providers(),
+            ),
+            (
+                "DuckLake catalog",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for plan in [
+                plan_over_binary(None, cast(col("a"), DataType::Utf8)),
+                plan_over_binary(None, try_cast(col("a"), DataType::Utf8)),
+                plan_over_binary(None, cast(col("a"), DataType::Utf8View)),
+                plan_over_binary(
+                    Some(cast(col("a"), DataType::Utf8).like(lit("%bad%"))),
+                    col("id"),
+                ),
+            ] {
+                assert!(
+                    contains_unsupported_functions(&plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must keep this plan local:\n{plan}"
+                );
+            }
+
+            // The binary column itself, and a text cast over a non-binary
+            // column, still federate: the refusal costs only the casts it is
+            // about.
+            for plan in [
+                plan_over_binary(None, col("a")),
+                plan_over_binary(None, cast(col("id"), DataType::Utf8)),
+                plan_over_binary(Some(col("a").is_not_null()), col("id")),
+            ] {
+                assert!(
+                    !contains_unsupported_functions(&plan, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must still federate:\n{plan}"
+                );
+            }
+        }
     }
 }

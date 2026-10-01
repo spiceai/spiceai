@@ -57,8 +57,12 @@ pub enum Error {
     #[snafu(display("Invalid GraphQL object access: {message}"))]
     InvalidObjectAccess { message: String },
 
+    /// The API refused the request for a credential or permission reason.
+    ///
+    /// `kind` records how the refusal was reported. Only an explicit deny is
+    /// permanent; see `is_retriable_error`.
     #[snafu(display("{message}"))]
-    InvalidCredentialsOrPermissions { message: String },
+    InvalidCredentialsOrPermissions { message: String, kind: RefusalKind },
 
     #[snafu(display("{message}"))]
     ResourceNotFound { message: String },
@@ -100,6 +104,16 @@ pub enum Error {
     },
 }
 
+/// How a credential/permission refusal was reported by the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The API named the refusal (HTTP 401/403, a `FORBIDDEN` GraphQL error type).
+    Explicit,
+    /// The connector inferred the refusal from an ambiguous message that a
+    /// transient backend failure also produces.
+    Inferred,
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Determines if a GraphQL error is retriable (transient).
@@ -110,24 +124,30 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Connection/timeout errors from reqwest
 /// - JSON decode errors (often due to truncated responses from timeouts)
 ///
-/// Note: `Error::RateLimited` is NOT retriable here because rate limiting is handled
-/// proactively by the `RateLimiter` trait via `check_rate_limit()`, which sleeps until
-/// the rate limit reset time. Any `RateLimited` error reaching this point indicates
-/// an unexpected issue that shouldn't be retried with additional backoff delays.
+/// `Error::RateLimited` is retriable: GitHub's secondary/CPU cap is reported on
+/// the response (`retry-after` + HTTP 403), after `check_rate_limit()` already
+/// ran. The next attempt waits on those headers instead of failing the scan.
+///
+/// `Error::InvalidCredentialsOrPermissions` is retriable unless the API named
+/// the refusal (`RefusalKind::Explicit`). An inferred refusal comes from a
+/// message that a backend timeout also produces, so it must not make the
+/// refresh permanent.
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
+        Error::RateLimited { .. } => true,
+        Error::InvalidCredentialsOrPermissions { kind, .. } => *kind == RefusalKind::Inferred,
         Error::InvalidReqwestStatus { status, .. } => {
             status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
         Error::JsonDecodeError { status, .. } => {
-            // JSON decode errors with server error status codes are often due to
-            // truncated responses from timeouts or server issues.
-            // A non-JSON 403 is also retriable: it indicates a transient upstream
-            // proxy/abuse-detection block (e.g. GitHub's "Request forbidden by
-            // administrative rules"), not a genuine credentials/permissions error
-            // (which would return valid JSON).
-            status.is_server_error() || *status == StatusCode::FORBIDDEN
+            // Truncated bodies show up as HTTP 200 with EOF mid-string; 5xx/403
+            // HTML is the same class of transient upstream failure. A 4xx JSON
+            // error (except 403) is a real client failure and is not retried.
+            status.is_success()
+                || status.is_server_error()
+                || *status == StatusCode::FORBIDDEN
+                || *status == StatusCode::REQUEST_TIMEOUT
         }
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
@@ -159,6 +179,25 @@ pub fn is_gateway_error(error: &Error) -> bool {
         _ => None,
     };
     status.is_some_and(|s| s == StatusCode::BAD_GATEWAY || s == StatusCode::GATEWAY_TIMEOUT)
+}
+
+/// Returns `true` if the error reports that the upstream backend did not
+/// complete the query, so the next attempt must ask for a smaller page.
+///
+/// Two conditions carry this cause. A gateway error (HTTP 502/504) comes from
+/// the proxy in front of the backend. An inferred credential refusal comes from
+/// the backend itself: GitHub answers HTTP 200 with "Something went wrong while
+/// executing your query" when its GraphQL backend runs out of time.
+#[must_use]
+pub fn should_shrink_page_size(error: &Error) -> bool {
+    is_gateway_error(error)
+        || matches!(
+            error,
+            Error::InvalidCredentialsOrPermissions {
+                kind: RefusalKind::Inferred,
+                ..
+            }
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +359,30 @@ mod tests {
     }
 
     #[test]
+    fn rate_limited_is_retriable() {
+        let error = Error::RateLimited {
+            message: "GitHub API rate limit exceeded".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a 403 secondary rate limit must retry the same page after retry-after"
+        );
+    }
+
+    #[test]
+    fn truncated_ok_json_is_retriable() {
+        let error = Error::JsonDecodeError {
+            status: StatusCode::OK,
+            detail: "EOF while parsing a string at line 1 column 219264".to_string(),
+            response_preview: "{\"data\":{\"repository\":".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a truncated HTTP 200 body must retry the same page, not restart the scan"
+        );
+    }
+
+    #[test]
     fn test_json_decode_forbidden_retriable() {
         // A non-JSON 403 response indicates a transient upstream proxy or abuse-detection
         // block (e.g. GitHub's "Request forbidden by administrative rules"), not a genuine
@@ -335,6 +398,53 @@ mod tests {
         );
     }
 
+    /// GitHub sends the same ambiguous message for a backend timeout and for a
+    /// missing permission. An inferred refusal must be retried and must shrink
+    /// the page; only a named refusal is permanent (#14531).
+    #[test]
+    fn test_inferred_credentials_error_is_retriable_and_shrinks() {
+        let inferred = Error::InvalidCredentialsOrPermissions {
+            message: "GitHub returned an internal error".to_string(),
+            kind: RefusalKind::Inferred,
+        };
+        assert!(
+            is_retriable_error(&inferred),
+            "an inferred refusal is an upstream failure and must be retried"
+        );
+        assert!(
+            should_shrink_page_size(&inferred),
+            "an inferred refusal means the query was too expensive; ask for less"
+        );
+
+        let named = Error::InvalidCredentialsOrPermissions {
+            message: "HTTP 403".to_string(),
+            kind: RefusalKind::Explicit,
+        };
+        assert!(
+            !is_retriable_error(&named),
+            "a named refusal is permanent; retrying cannot change the answer"
+        );
+        assert!(
+            !should_shrink_page_size(&named),
+            "a smaller page does not grant a permission"
+        );
+    }
+
+    #[test]
+    fn test_gateway_errors_shrink_the_page() {
+        let gateway = Error::InvalidReqwestStatus {
+            status: StatusCode::BAD_GATEWAY,
+            message: "Bad Gateway".to_string(),
+        };
+        assert!(should_shrink_page_size(&gateway));
+
+        let not_found = Error::InvalidReqwestStatus {
+            status: StatusCode::NOT_FOUND,
+            message: "Not Found".to_string(),
+        };
+        assert!(!should_shrink_page_size(&not_found));
+    }
+
     #[test]
     fn test_non_status_errors_not_retriable() {
         // Test that non-HTTP-status error types are not retriable
@@ -342,6 +452,7 @@ mod tests {
         let non_retriable_errors = vec![
             Error::InvalidCredentialsOrPermissions {
                 message: "Invalid credentials".to_string(),
+                kind: RefusalKind::Explicit,
             },
             Error::ResourceNotFound {
                 message: "Resource not found".to_string(),
@@ -532,6 +643,7 @@ mod tests {
         let non_status_errors = vec![
             Error::InvalidCredentialsOrPermissions {
                 message: "bad creds".to_string(),
+                kind: RefusalKind::Explicit,
             },
             Error::InternalError {
                 message: "internal".to_string(),

@@ -101,22 +101,7 @@ impl GraphQLContext for PullRequestTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // Each connection in the query charges its page size, and 1 for the pull
-        // request connection itself. If review threads are enabled, 1 PR retrieves 20
-        // review threads, which could each have comments that are also retrieved. If
-        // discussion comments are enabled, each PR also retrieves discussion comments.
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        let base = Self::BASE_QUERY_COST;
-        // The `reviewThreads` connection charges its own page size on top of the
-        // comments connection nested under each thread.
-        let review_threads =
-            Self::REVIEW_THREADS_PER_PR + (Self::REVIEW_THREADS_PER_PR * self.max_comments_fetched);
-        match self.include_comments {
-            PullRequestCommentType::None => Some(base),
-            PullRequestCommentType::Review => Some(base + review_threads),
-            PullRequestCommentType::Discussion => Some(base + self.max_comments_fetched), // base + comments_to_fetch (discussion comments)
-            PullRequestCommentType::All => Some(base + review_threads + self.max_comments_fetched),
-        }
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -253,7 +238,7 @@ impl PullRequestTableArgs {
     /// nodes, about 5% of the node limit — so the page size has to be chosen
     /// against the compute budget rather than validated against the node one.
     ///
-    /// Measured against `spiceai/spiceai` (13,700+ pull requests): `first: 100`
+    /// Measured against `spiceai/spiceai` (thousands of pull requests): `first: 100`
     /// fails on the very first page, deterministically, while `first: 25`
     /// returns a full page. 25 also matches `COMMENTS_PAGE_SIZE`, so both
     /// paths now request the same number of pull requests per page.
@@ -291,21 +276,6 @@ impl PullRequestTableArgs {
     /// `closing_issues_count` records GitHub's own total, so a PR that closes
     /// more issues than this is detectable rather than silently short.
     const CLOSING_ISSUES_PER_PR: u32 = 20;
-
-    /// Point cost of one page of the query with no comments requested: 1 for
-    /// the pull request connection, plus the page size of every connection
-    /// underneath it. A connection selected only for its `totalCount` charges 1,
-    /// the same as every other table.
-    const BASE_QUERY_COST: u32 = 1 /* pullRequests */
-        + 100 /* labels */
-        + 25 /* commits */
-        + 100 /* assignees */
-        + Self::CLOSING_ISSUES_PER_PR
-        + 1 /* commits(last: 1) for the check rollup */
-        + 1 /* timelineItems(last: 1) for closed_by */
-        + 1 /* reviews, count only */
-        + 1 /* comments, count only */
-        + 1 /* reactions, count only */;
 
     /// Conservative upper bound on the number of nodes contributed by a
     /// single PR's non-comment fields. Kept as a constant so
@@ -1078,43 +1048,21 @@ mod tests {
 
     #[test]
     fn query_cost_stays_within_the_github_secondary_rate_limit_burst() {
-        // The rate controller's weighted quota is 2000 points per minute; a cost
-        // above the burst capacity fails the acquire outright instead of waiting.
-        // The worst case is every comment type at the `MAX_COMMENTS_FETCHED` cap.
-        let cost = args(PullRequestCommentType::All, crate::MAX_COMMENTS_FETCHED)
-            .query_cost()
-            .expect("pulls to declare a query cost");
-
-        assert!(
-            cost <= 2000,
-            "pulls query cost {cost} exceeds the 2000-point burst, so every scan would fail"
-        );
-    }
-
-    /// The declared cost is what paces the rate controller, so a connection
-    /// added to the query without a matching point is a silent under-charge —
-    /// the controller keeps issuing requests GitHub has already stopped
-    /// accounting for. Pinning both ends forces the derivation to be redone
-    /// alongside any change to the query.
-    #[test]
-    fn query_cost_charges_every_connection_in_the_query() {
-        let base = args(PullRequestCommentType::None, crate::MAX_COMMENTS_FETCHED)
-            .query_cost()
-            .expect("pulls to declare a query cost");
-
-        // 1 pullRequests + 100 labels + 25 commits + 100 assignees
-        // + 20 closingIssuesReferences + 1 commits(last: 1) + 1 timelineItems(last: 1)
-        // + 1 each for the count-only reviews, comments and reactions.
-        assert_eq!(base, 251, "the pulls base cost no longer matches its query");
-
-        let worst_case = args(PullRequestCommentType::All, crate::MAX_COMMENTS_FETCHED)
-            .query_cost()
-            .expect("pulls to declare a query cost");
-
-        // base + 20 reviewThreads + (20 threads x 75 comments) + 75 discussion comments.
-        assert_eq!(
-            worst_case, 1846,
-            "the pulls worst-case cost no longer matches its query"
-        );
+        // GitHub GraphQL secondary points are 1 per non-mutation query, well
+        // under the 1800-point (90% of 2000) burst the rate controller uses.
+        for comments in [
+            PullRequestCommentType::None,
+            PullRequestCommentType::Review,
+            PullRequestCommentType::Discussion,
+            PullRequestCommentType::All,
+        ] {
+            let cost = args(comments, crate::MAX_COMMENTS_FETCHED)
+                .query_cost()
+                .expect("pulls to declare a query cost");
+            assert_eq!(
+                cost,
+                crate::rate_limit::GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
+            );
+        }
     }
 }

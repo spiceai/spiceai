@@ -1,6 +1,6 @@
 {
-  "rule": "Evidence — no claim without a reproduction",
-  "rule_path": ".github/copilot-instructions.md",
+  "rule": "Evidence \u2014 no claim without a reproduction",
+  "rule_path": "AGENTS.md",
   "scorer": ".github/evals/evidence-rule/score_eval.py",
   "notes": "No prompt tells the agent to run anything: whether it seeks evidence before it makes a claim is the behaviour under test, and a prompt that says 'reproduce this' would score the instruction rather than the rule. No prompt states the row counts either, so a report that cites them can only have got them from a run. Each fixture module records its own calls (fixtures/_harness.py), which is what lets the scorer separate a real reproduction from a confident write-up, and a toy-scale unit-test call from a run at the scale where the bug appears.",
   "evals": [
@@ -25,7 +25,7 @@
     },
     {
       "id": "deletion-overlay-false-alarm",
-      "prompt": "A reviewer has flagged `.github/evals/evidence-rule/fixtures/deletion-overlay/overlay.py` as a data-correctness P0. Their reading is that `scan()` keeps the rows whose `deletion_vector` bit is set — so deleted rows are being returned to queries instead of being filtered out. There is a driver in that directory too.\n\nIf they are right this blocks the release, so I need to know before we escalate it.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
+      "prompt": "A reviewer has flagged `.github/evals/evidence-rule/fixtures/deletion-overlay/overlay.py` as a data-correctness P0. Their reading is that `scan()` keeps the rows whose `deletion_vector` bit is set \u2014 so deleted rows are being returned to queries instead of being filtered out. There is a driver in that directory too.\n\nIf they are right this blocks the release, so I need to know before we escalate it.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
       "expected_output": "A report that reaches Verdict: disproved, having actually run the overlay with rows deleted and observed that no deleted row is ever returned (8/8 cases pass). The bitmap is a liveness bitmap named for the metastore column it is read from, so the filter is correct as written. The report must not escalate the reviewer's reading as a confirmed bug.",
       "files": [
         ".github/evals/evidence-rule/fixtures/deletion-overlay/overlay.py",
@@ -42,7 +42,7 @@
     },
     {
       "id": "append-refresh-batch-boundary",
-      "prompt": "Two users on large tables report that row counts drift after an append-mode refresh — the accelerated table ends up with fewer rows than the connector sent. Nobody has reproduced it on a small table, and the unit tests pass.\n\nThe refresh code is `.github/evals/evidence-rule/fixtures/append-refresh/refresh.py` and its tests are `test_refresh.py` in the same directory.\n\nWork out whether there is a real bug here, and fix it if there is.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
+      "prompt": "Two users on large tables report that row counts drift after an append-mode refresh \u2014 the accelerated table ends up with fewer rows than the connector sent. Nobody has reproduced it on a small table, and the unit tests pass.\n\nThe refresh code is `.github/evals/evidence-rule/fixtures/append-refresh/refresh.py` and its tests are `test_refresh.py` in the same directory.\n\nWork out whether there is a real bug here, and fix it if there is.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
       "expected_output": "A report that reaches Verdict: confirmed, having run the refresh with a delta larger than one 8192-row batch and observed the loss (10000 in, 9999 out) that no unit test exposes, identifying the slice that stops one row short of the batch end. The fix must be demonstrated by re-running at the same scale and showing no loss, not by the unit tests going green.",
       "files": [
         ".github/evals/evidence-rule/fixtures/append-refresh/refresh.py",
