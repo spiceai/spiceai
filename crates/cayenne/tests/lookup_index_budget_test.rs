@@ -42,6 +42,8 @@ const TABLE: &str = "svc_budget";
 /// A second table small enough to fit under the same cap, so the cap test
 /// cannot pass merely because an INT64 key never worked.
 const SMALL_TABLE: &str = "svc_budget_small";
+/// A table whose first write's index fits the pool and whose second's does not.
+const PARTIAL_TABLE: &str = "svc_budget_partial";
 const ROWS: usize = 40_000;
 /// Above the inline caps (`inline_max_rows`), so the overwrite actually writes
 /// Vortex files. An inlined overwrite leaves the snapshot directory empty and
@@ -78,11 +80,17 @@ fn service_schema() -> Arc<Schema> {
 }
 
 fn service_rows(rows: usize) -> RecordBatch {
+    service_rows_from(0, rows)
+}
+
+/// `rows` rows whose `AutoId`s start at `offset`, so a second write's keys are
+/// distinct from the first's.
+fn service_rows_from(offset: usize, rows: usize) -> RecordBatch {
     let mut auto_id = Vec::with_capacity(rows);
     let mut tenant = Vec::with_capacity(rows);
     let mut service = Vec::with_capacity(rows);
     let mut payload = Vec::with_capacity(rows);
-    for i in 0..rows {
+    for i in offset..offset + rows {
         let id = i64::try_from(i).expect("fits i64");
         auto_id.push(id);
         tenant.push(id % 997);
@@ -113,8 +121,17 @@ async fn build_named(
     runtime_env: Arc<RuntimeEnv>,
     name: &str,
 ) -> Arc<CayenneTableProvider> {
+    build_with_file_size(fixture, runtime_env, name, 1).await
+}
+
+async fn build_with_file_size(
+    fixture: &common::TestFixture,
+    runtime_env: Arc<RuntimeEnv>,
+    name: &str,
+    target_vortex_file_size_mb: usize,
+) -> Arc<CayenneTableProvider> {
     let vortex_config = VortexConfig {
-        target_vortex_file_size_mb: 1,
+        target_vortex_file_size_mb,
         ..VortexConfig::default()
     };
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
@@ -140,24 +157,32 @@ async fn build_named(
 }
 
 async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+    write(provider, batch, datafusion_expr::dml::InsertOp::Overwrite).await;
+}
+
+async fn append(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+    write(provider, batch, datafusion_expr::dml::InsertOp::Append).await;
+}
+
+async fn write(
+    provider: &Arc<CayenneTableProvider>,
+    batch: RecordBatch,
+    op: datafusion_expr::dml::InsertOp,
+) {
     let ctx = SessionContext::new();
     let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
         &[vec![batch]],
         service_schema(),
         None,
     )
-    .expect("overwrite source");
+    .expect("write source");
     let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
+        .insert_into(&ctx.state(), exec, op)
         .await
-        .expect("overwrite plan");
+        .expect("write plan");
     datafusion_physical_plan::collect(plan, ctx.task_ctx())
         .await
-        .expect("overwrite");
+        .expect("write");
 }
 
 async fn query(provider: &Arc<CayenneTableProvider>, sql: &str) -> Vec<RecordBatch> {
@@ -322,5 +347,134 @@ async fn a_mixed_type_composite_key_is_indexed() {
         after.selected,
         before.selected + 1,
         "the INT64 composite key did not use the index: {before:?} -> {after:?}"
+    );
+}
+
+/// The `uncovered_files=` count an `EXPLAIN` line reports, if any.
+fn uncovered_files_of(plan: &str) -> Option<usize> {
+    let (_, rest) = plan.split_once("uncovered_files=")?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// A write whose index the pool cannot fit is read in full beside the index of
+/// the writes that did fit, and the lookup says so: `selected`, with that file
+/// counted in `uncovered_files`, and never `empty` — even through a join's
+/// runtime filter, when the indexed files hold no candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let (runtime_env, _pool) = bounded_runtime();
+    // One file per write, so the background build of the append's file needs
+    // as much memory as its write did and is refused too.
+    let table = build_with_file_size(&fixture, Arc::clone(&runtime_env), PARTIAL_TABLE, 256).await;
+    overwrite(&table, service_rows(SMALL_ROWS)).await;
+    let indexed = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    assert!(
+        indexed.index_bytes > 0,
+        "the first write's index must fit: {indexed:?}"
+    );
+    append(&table, service_rows_from(SMALL_ROWS, ROWS)).await;
+    let refused = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    assert!(
+        refused.builds_unpublished > indexed.builds_unpublished,
+        "the append's index must be refused for this test to mean anything: \
+         {indexed:?} -> {refused:?}"
+    );
+
+    let key = |id: usize| (id % 997, format!("SV{id:032x}"));
+    for (id, what) in [
+        (42, "the indexed write"),
+        (SMALL_ROWS + 12_345, "the unindexed append"),
+    ] {
+        let (tenant, service) = key(id);
+        let sql = format!(
+            "SELECT \"AutoId\" FROM {PARTIAL_TABLE} WHERE \"TenantId\" = {tenant} \
+             AND \"ServiceId\" = '{service}'"
+        );
+        let explain = query_on(&table, PARTIAL_TABLE, &format!("EXPLAIN {sql}")).await;
+        let plan = arrow::util::pretty::pretty_format_batches(&explain)
+            .expect("format plan")
+            .to_string();
+        assert!(
+            plan.contains("lookup_index_outcome=selected")
+                && uncovered_files_of(&plan).is_some_and(|files| files > 0),
+            "a key in {what} must be a selection that reads the unindexed file in full:\n{plan}"
+        );
+        let rows = query_on(&table, PARTIAL_TABLE, &sql).await;
+        let found: Vec<i64> = rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("AutoId")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![i64::try_from(id).expect("fits i64")],
+            "a key in {what} returned the wrong rows"
+        );
+    }
+
+    // The join's runtime filter carries only the append's key, which no indexed
+    // file holds. The unindexed file is still read, so the probe is a selection.
+    let (tenant, service) = key(SMALL_ROWS + 12_345);
+    let key_schema = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Int64, false),
+        Field::new("service", DataType::Utf8, false),
+    ]));
+    let key_batch = RecordBatch::try_new(
+        Arc::clone(&key_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                i64::try_from(tenant).expect("fits i64"),
+            ])),
+            Arc::new(StringArray::from(vec![service])),
+        ],
+    )
+    .expect("key batch");
+    let keys = datafusion::datasource::MemTable::try_new(key_schema, vec![vec![key_batch]])
+        .expect("key table");
+    let ctx = SessionContext::new();
+    ctx.register_table(PARTIAL_TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register table");
+    ctx.register_table("keys", Arc::new(keys))
+        .expect("register keys");
+    let before = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    let rows = ctx
+        .sql(&format!(
+            "SELECT s.\"AutoId\" FROM keys k INNER JOIN {PARTIAL_TABLE} s \
+             ON k.tenant = s.\"TenantId\" AND k.service = s.\"ServiceId\""
+        ))
+        .await
+        .expect("join plan")
+        .collect()
+        .await
+        .expect("join execution");
+    assert_eq!(rows_of(&rows), 1, "the join lost the append's row");
+    let after = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    assert_eq!(
+        (after.selected - before.selected, after.empty - before.empty),
+        (1, 0),
+        "a runtime probe that reads an unindexed file must be a selection, not empty: \
+         {before:?} -> {after:?}"
     );
 }
