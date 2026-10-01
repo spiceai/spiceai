@@ -1853,7 +1853,9 @@ pub struct CayenneTableProvider {
     /// Whether this provider's writes resolve the keys their data repeats per
     /// `on_conflict` ([`Self::key_resolver`]). True for the accelerator's own
     /// writes — refreshes and change streams; [`TableProvider::insert_into`]
-    /// clears it for a user's statement, which keeps its own semantics.
+    /// clears it for a user's statement
+    /// ([`util::session_state::UserStatementWrite`]), which keeps its own
+    /// semantics.
     resolves_repeated_keys: bool,
     /// Bytes of input a streaming upsert write collapses in memory before it
     /// splits the rest into layers; see [`super::overwrite_layers::CollapseWindow`].
@@ -5528,6 +5530,15 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn clone_for_write_operations(&self) -> Self {
         self.clone_for_write()
+    }
+
+    /// This provider, writing a user's statement: its writes keep statement
+    /// semantics instead of resolving the keys their data repeats per
+    /// `on_conflict` ([`util::session_state::UserStatementWrite`]).
+    #[must_use]
+    pub fn for_user_statement(mut self) -> Self {
+        self.resolves_repeated_keys = false;
+        self
     }
 
     /// Append a CDC upsert stream using Cayenne's native writer path.
@@ -37134,11 +37145,12 @@ impl TableProvider for CayenneTableProvider {
         // - Overwrite: new snapshot creation, catalog commit, state updates, cleanup
         // - Append: write lock, PK validation, on-conflict deletions, new snapshot
         //   when needed, retention filters, sort-and-rewrite, listing table refresh
-        // Only a refresh resolves the keys its data repeats per `on_conflict`; a
-        // user's statement keeps its own semantics.
+        // A user's statement keeps its own semantics; every other write — the
+        // accelerator's refreshes — resolves the keys its data repeats per
+        // `on_conflict`.
         let mut table = self.clone_for_write();
         table.resolves_repeated_keys =
-            self.resolves_repeated_keys && util::session_state::is_refresh_write(state.config());
+            self.resolves_repeated_keys && !util::session_state::is_user_statement(state.config());
         let sink = Arc::new(CayenneDataSink::new(
             table,
             overwrite,

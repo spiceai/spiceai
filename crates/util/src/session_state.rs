@@ -46,30 +46,33 @@ pub fn session_context() -> SessionContext {
     SessionContext::new_with_config(session_config())
 }
 
-/// Marks a session as an accelerator refresh writing into its acceleration, as
-/// opposed to a user's statement.
+/// Marks a session as a user's statement writing into an acceleration (an
+/// `INSERT`, or a write inside `BEGIN … COMMIT`), as opposed to the
+/// accelerator's own writes: refreshes and change streams.
 ///
-/// An accelerator may apply a dataset's `on_conflict` to the keys a refresh's
-/// incoming data repeats (each record batch one upsert); a user's `INSERT`
-/// carries its own statement semantics. [`refresh_session_context`] sets it, and
-/// [`is_refresh_write`] reads it.
+/// An accelerator applies a dataset's `on_conflict` to the keys its own writes'
+/// incoming data repeats (each record batch one upsert); a user's statement
+/// keeps its own semantics. Every other write is the accelerator's own, so a
+/// write path that forgets the marker still resolves repeats rather than
+/// storing them. [`mark_user_statement`] sets it, and [`is_user_statement`]
+/// reads it.
 #[derive(Debug, Default)]
-pub struct AcceleratorRefreshWrite;
+pub struct UserStatementWrite;
 
-/// A [`session_context`] marked as an accelerator refresh's write; see
-/// [`AcceleratorRefreshWrite`].
+/// `state` marked as a user's statement; see [`UserStatementWrite`].
 #[must_use]
-pub fn refresh_session_context() -> SessionContext {
-    SessionContext::new_with_config(
-        session_config().with_extension(Arc::new(AcceleratorRefreshWrite)),
-    )
+pub fn mark_user_statement(state: &SessionState) -> SessionState {
+    let mut state = state.clone();
+    state
+        .config_mut()
+        .set_extension(Arc::new(UserStatementWrite));
+    state
 }
 
-/// Whether `config` belongs to an accelerator refresh's write; see
-/// [`AcceleratorRefreshWrite`].
+/// Whether `config` belongs to a user's statement; see [`UserStatementWrite`].
 #[must_use]
-pub fn is_refresh_write(config: &SessionConfig) -> bool {
-    config.get_extension::<AcceleratorRefreshWrite>().is_some()
+pub fn is_user_statement(config: &SessionConfig) -> bool {
+    config.get_extension::<UserStatementWrite>().is_some()
 }
 
 /// A [`TaskContext`] carrying [`session_config`], for executing a plan outside

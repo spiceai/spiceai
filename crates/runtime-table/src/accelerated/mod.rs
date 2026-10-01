@@ -2146,6 +2146,17 @@ impl TableLayer for AcceleratedTable {
             WriteMode::AcceleratorOnly => {
                 // When on_conflict is configured, writes go only to the accelerator
                 // (the federated source may not support writes, e.g., file connector).
+                // A user's statement: the accelerator keeps its statement
+                // semantics rather than resolving the keys it repeats per
+                // `on_conflict`, which it does for its own writes.
+                let statement = state
+                    .as_any()
+                    .downcast_ref::<datafusion::execution::SessionState>()
+                    .map(util::session_state::mark_user_statement);
+                let state: &dyn Session = match &statement {
+                    Some(statement) => statement,
+                    None => state,
+                };
                 let accelerated_insert_plan = self
                     .accelerator
                     .insert_into(state, input, overwrite)

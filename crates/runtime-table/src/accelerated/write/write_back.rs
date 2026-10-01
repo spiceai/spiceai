@@ -103,15 +103,18 @@ pub(crate) fn insert_write_back(
     schema: SchemaRef,
     dataset_name: &str,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let session_state = state
-        .as_any()
-        .downcast_ref::<SessionState>()
-        .ok_or_else(|| {
-            DataFusionError::Internal(
-                "Session is not a SessionState in insert_write_back".to_string(),
-            )
-        })?
-        .clone();
+    // A user's statement: the accelerator keeps its statement semantics rather
+    // than resolving the keys it repeats per `on_conflict`.
+    let session_state = util::session_state::mark_user_statement(
+        state
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Session is not a SessionState in insert_write_back".to_string(),
+                )
+            })?,
+    );
     let sink = Arc::new(WriteBackDataSink {
         dataset_name: dataset_name.to_string(),
         accelerator,

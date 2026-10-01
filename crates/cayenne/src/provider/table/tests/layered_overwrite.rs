@@ -46,7 +46,7 @@ async fn write(
     op: InsertOp,
     batches: Vec<RecordBatch>,
 ) -> datafusion_common::Result<()> {
-    let ctx = util::session_state::refresh_session_context();
+    let ctx = SessionContext::new();
     let source = MemorySourceConfig::try_new_exec(&[batches], schema(), None)?;
     let plan = provider.insert_into(&ctx.state(), source, op).await?;
     collect(plan, ctx.task_ctx()).await.map(|_| ())
@@ -464,7 +464,7 @@ async fn a_layered_overwrite_resolves_a_string_key_in_both_modes() {
         )
         .await;
         provider.collapse_window_bytes = 1;
-        let ctx = util::session_state::refresh_session_context();
+        let ctx = SessionContext::new();
         let source = MemorySourceConfig::try_new_exec(
             &[vec![
                 rows_of(&[("a", 1), ("b", 1)]),
@@ -748,8 +748,9 @@ async fn a_statement_repeating_a_key_across_batches_still_fails() {
             .expect("source")
         };
         let ctx = SessionContext::new();
+        let statement = util::session_state::mark_user_statement(&ctx.state());
         let plan = provider
-            .insert_into(&ctx.state(), repeated(), InsertOp::Append)
+            .insert_into(&statement, repeated(), InsertOp::Append)
             .await
             .expect("plan");
         let error = collect(plan, ctx.task_ctx())

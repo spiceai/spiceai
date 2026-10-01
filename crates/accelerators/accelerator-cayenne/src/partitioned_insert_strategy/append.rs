@@ -95,6 +95,9 @@ pub(super) struct CayennePartitionedAppendSink {
     schema: SchemaRef,
     physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
     table_root: PathBuf,
+    /// Whether the insert is a user's statement; see
+    /// [`util::session_state::UserStatementWrite`].
+    user_statement: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -674,6 +677,7 @@ impl CayennePartitionedAppendSink {
         schema: SchemaRef,
         physical_exprs: Vec<Arc<dyn PhysicalExpr>>,
         table_root: PathBuf,
+        user_statement: bool,
     ) -> Self {
         Self {
             catalog,
@@ -683,6 +687,7 @@ impl CayennePartitionedAppendSink {
             schema,
             physical_exprs,
             table_root,
+            user_statement,
         }
     }
 
@@ -841,6 +846,11 @@ impl CayennePartitionedAppendSink {
             ));
         }
         let cayenne_owned = cayenne.clone_for_write_operations();
+        let cayenne_owned = if self.user_statement {
+            cayenne_owned.for_user_statement()
+        } else {
+            cayenne_owned
+        };
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );

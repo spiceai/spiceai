@@ -478,6 +478,7 @@ impl InsertStrategy for CayennePartitionedInsertStrategy {
                     Arc::clone(&context.partitions),
                     Arc::clone(&context.schema),
                     physical_exprs,
+                    context.user_statement,
                 ));
                 Ok(Arc::new(DataSinkExec::new(input, sink, None)))
             }
@@ -494,6 +495,7 @@ impl InsertStrategy for CayennePartitionedInsertStrategy {
                     Arc::clone(&context.schema),
                     physical_exprs,
                     self.table_root.clone(),
+                    context.user_statement,
                 ));
                 Ok(Arc::new(DataSinkExec::new(input, sink, None)))
             }

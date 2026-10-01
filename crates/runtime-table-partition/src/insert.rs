@@ -613,6 +613,9 @@ pub struct PartitionContext {
     pub partition_by: Vec<PartitionedBy>,
     pub partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
     pub schema: SchemaRef,
+    /// Whether the insert is a user's statement rather than the accelerator's
+    /// own write; see [`util::session_state::UserStatementWrite`].
+    pub user_statement: bool,
 }
 
 /// Default insertion strategy that uses the existing [`PartitionerExec`]
