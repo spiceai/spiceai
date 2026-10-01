@@ -183,15 +183,9 @@ fn aggregates_a_decimal(expr: &Expr, schema: Option<&DFSchema>, names: &[&str]) 
         return false;
     }
     let scope = schema.unwrap_or_else(|| DFSchema::empty_ref());
-    args.iter().any(|arg| match arg.get_type(scope) {
-        Ok(data_type) => matches!(
-            data_type,
-            DataType::Decimal32(..)
-                | DataType::Decimal64(..)
-                | DataType::Decimal128(..)
-                | DataType::Decimal256(..)
-        ),
-        Err(_) => true,
+    args.iter().any(|arg| {
+        arg.get_type(scope)
+            .map_or(true, |data_type| data_type.is_decimal())
     })
 }
 
@@ -452,9 +446,10 @@ mod tests {
     /// Whether federation would push this plan into `DuckDB`, which is what
     /// `SqlTable::can_execute_plan` asks of the deny-list.
     fn federates(expr: Expr) -> bool {
-        let support = deny_spice_functions_for_duckdb_table_providers();
-        !contains_unsupported_functions(&plan_projecting(expr), &support)
-            .expect("the support check must not error")
+        pushes(
+            &plan_projecting(expr),
+            &deny_spice_functions_for_duckdb_table_providers(),
+        )
     }
 
     /// Regression test for #13900. Federation is an optimization: a call the
