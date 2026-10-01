@@ -189,6 +189,38 @@ pub(crate) fn should_prune_statistics(
     }
 }
 
+/// Select containers with one compiled pruning predicate and a vectorized
+/// statistics evaluation. Missing statistics or a failed evaluation retain rows.
+pub(crate) fn matching_statistics(
+    statistics: Vec<Arc<Statistics>>,
+    schema: &SchemaRef,
+    predicate: &Arc<dyn PhysicalExpr>,
+) -> Vec<bool> {
+    let count = statistics.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let Some(pruning_predicate) =
+        build_pruning_predicate(Arc::clone(predicate), schema, &Count::default())
+    else {
+        return vec![true; count];
+    };
+    let missing: Vec<bool> = statistics
+        .iter()
+        .map(|stats| stats.column_statistics.is_empty())
+        .collect();
+    let prunable = PrunableStatistics::new(statistics, Arc::clone(schema));
+    match pruning_predicate.prune(&prunable) {
+        Ok(mut values) if values.len() == count => {
+            for (keep, missing) in values.iter_mut().zip(missing) {
+                *keep |= missing;
+            }
+            values
+        }
+        _ => vec![true; count],
+    }
+}
+
 /// Compute exact min, max, and null-count statistics for one or more in-memory batches.
 #[must_use]
 pub(crate) fn statistics_from_record_batches(

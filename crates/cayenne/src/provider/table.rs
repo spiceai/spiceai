@@ -32442,16 +32442,16 @@ impl CayenneTableProvider {
         if segments.is_empty() {
             return Ok(None);
         }
-        let schema = Arc::clone(&self.table_metadata.schema);
+        let keep = pruning_predicate.map(|predicate| {
+            super::file_pruning::matching_statistics(
+                segments.iter().map(|segment| Arc::clone(&segment.statistics)).collect(),
+                &self.table_metadata.schema,
+                predicate,
+            )
+        });
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
-        for segment in segments {
-            if let Some(predicate) = pruning_predicate
-                && super::file_pruning::should_prune_statistics(
-                    segment.statistics.as_ref(),
-                    &schema,
-                    predicate,
-                )
-            {
+        for (index, segment) in segments.iter().enumerate() {
+            if keep.as_ref().is_some_and(|mask| !mask[index]) {
                 continue;
             }
             visible_batches.extend(segment.batches.iter().cloned());
