@@ -17,11 +17,11 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Trace two isolated self-test suites
+      - name: Compare isolated before/after self-test suites
         env:
           EXPECT_DIAGNOSTIC_OUTPUT: ${{ runner.temp }}/expect-13761-evidence
         run: |
-          nice -n 15 python3 ./test/models/diagnose_expect.py
+          nice -n 15 python3 ./test/models/diagnose_compare.py
       - name: Preserve boundary traces and task-child stacks
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
