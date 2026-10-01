@@ -985,6 +985,7 @@ mod tests {
     use datafusion::physical_expr::planner::logical2physical;
     use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
     use datafusion::scalar::ScalarValue;
+    use datafusion_execution::cache::DefaultFilesMetadataCache;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::projection::ProjectionExpr;
@@ -1207,6 +1208,212 @@ mod tests {
             runtime_access_plan_provider: None,
             key_column: None,
         }
+    }
+
+    /// Same as [`make_opener`], but with a file-metadata cache attached.
+    fn make_opener_with_cache(
+        object_store: Arc<dyn ObjectStore>,
+        table_schema: TableSchema,
+        file_metadata_cache: Arc<dyn FileMetadataCache>,
+    ) -> VortexOpener {
+        let mut opener = make_opener(object_store, table_schema, None);
+        opener.file_metadata_cache = Some(file_metadata_cache);
+        opener
+    }
+
+    /// An [`ObjectStore`] that counts "footer-locating" reads: a
+    /// `get_opts` call whose bounded range ends exactly at the file's total
+    /// size.
+    ///
+    /// `VortexOpenOptions::read_footer` (vortex-file's `open.rs`) is the only
+    /// caller that ever issues such a read: it fetches the trailing
+    /// `initial_read_size` bytes as `file_size - initial_read_size..file_size`
+    /// to locate and parse the postscript and footer. A data-segment read
+    /// never reaches the file's last byte, because the footer and its trailer
+    /// are always written after every segment. `with_footer` (used when a
+    /// cached footer is supplied) skips `read_footer` entirely, so this count
+    /// is exactly the signal for "did this open re-read the footer from the
+    /// store", independent of the file's size or how compressible its data is.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        file_size: u64,
+        footer_range_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn new(inner: Arc<dyn ObjectStore>, file_size: u64) -> Self {
+            Self {
+                inner,
+                file_size,
+                footer_range_reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Reads the footer-locating read count and resets it to zero.
+        fn take_footer_range_reads(&self) -> usize {
+            self.footer_range_reads
+                .swap(0, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(object_store::GetRange::Bounded(range)) = &options.range
+                && range.end == self.file_size
+            {
+                self.footer_range_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The read path - `VortexOpener::open` - is the cache's only writer for a
+    /// file this process did not itself write. An opener with an empty cache
+    /// must therefore populate it from the footer it just parsed, and a later
+    /// open of the same file must then skip reading that footer from the store
+    /// at all (`VortexOpenOptions::with_footer` makes `open_read` skip its
+    /// footer read entirely), not just skip re-parsing it.
+    #[tokio::test]
+    async fn test_open_populates_footer_cache_from_read_path() -> anyhow::Result<()> {
+        let backing_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "footer_cache.vortex";
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("test record batch should build");
+        let data_size =
+            write_arrow_to_vortex(backing_store.clone(), file_path, batch.clone()).await?;
+
+        let file_schema = batch.schema();
+        let file = PartitionedFile::new(file_path.to_string(), data_size);
+        let table_schema = TableSchema::from_file_schema(file_schema);
+
+        let counting_store = Arc::new(CountingStore::new(backing_store, data_size));
+        let cache: Arc<dyn FileMetadataCache> =
+            Arc::new(DefaultFilesMetadataCache::new(16 * 1024 * 1024));
+
+        assert!(
+            cache.get(file.path()).is_none(),
+            "cache should start out empty"
+        );
+
+        // First open: the cache is empty, so the opener must read and parse
+        // the footer from the store, then put it back.
+        let opener = make_opener_with_cache(
+            counting_store.clone() as Arc<dyn ObjectStore>,
+            table_schema.clone(),
+            cache.clone(),
+        );
+        let stream = opener
+            .open(file.clone())
+            .expect("opener should open file with an empty cache")
+            .await
+            .expect("opening with an empty cache should produce a stream");
+        let data = stream.try_collect::<Vec<_>>().await?;
+        assert_eq!(data.iter().map(|rb| rb.num_rows()).sum::<usize>(), 3);
+
+        assert_eq!(
+            counting_store.take_footer_range_reads(),
+            1,
+            "opening with an empty cache should read the footer from the store exactly once"
+        );
+
+        let entry = cache
+            .get(file.path())
+            .expect("the read path should have cached the footer it just parsed");
+        assert!(
+            entry.is_valid_for(&file.object_meta),
+            "the cached entry should validate against the ObjectMeta the scan listed"
+        );
+        assert!(
+            entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedVortexMetadata>()
+                .is_some(),
+            "the cached entry should be a CachedVortexMetadata"
+        );
+
+        // Second open, same cache: the footer now comes from the cache, so
+        // this split must not read it back from the store at all.
+        let opener = make_opener_with_cache(
+            counting_store.clone() as Arc<dyn ObjectStore>,
+            table_schema,
+            cache,
+        );
+        let stream = opener
+            .open(file.clone())
+            .expect("opener should open file with a warm cache")
+            .await
+            .expect("opening with a warm cache should produce a stream");
+        let data_again = stream.try_collect::<Vec<_>>().await?;
+        assert_eq!(data_again, data);
+
+        assert_eq!(
+            counting_store.take_footer_range_reads(),
+            0,
+            "opening with a warm cache must not re-read the footer from the store"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
