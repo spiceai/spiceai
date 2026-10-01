@@ -350,22 +350,28 @@ def drive(
     lock = threading.Lock()
 
     def worker(replica: str, index: int, dataset: str) -> None:
-        url = f"http://127.0.0.1:{HTTP_PORT_BASE + index}/v1/sql"
+        # One keep-alive connection per worker. A connection per query exhausts
+        # the host's ephemeral ports within minutes of saturating load; see
+        # harness.http.SqlSession.
+        session = http.SqlSession("127.0.0.1", HTTP_PORT_BASE + index, timeout=30.0)
         query = f"SELECT response_status FROM {dataset}"
-        while not stop.is_set():
-            sent = time.time()
-            status, body = http.sql(url, query, timeout=30.0)
-            sample = Query(
-                t_epoch_ms=int(sent * 1000),
-                replica=replica,
-                dataset=dataset,
-                phase=phase_at(sent - t0, phases),
-                outcome=classify(status, body),
-                status=status,
-                latency_ms=int((time.time() - sent) * 1000),
-            )
-            with lock:
-                queries.append(sample)
+        try:
+            while not stop.is_set():
+                sent = time.time()
+                status, body = session.query(query)
+                sample = Query(
+                    t_epoch_ms=int(sent * 1000),
+                    replica=replica,
+                    dataset=dataset,
+                    phase=phase_at(sent - t0, phases),
+                    outcome=classify(status, body),
+                    status=status,
+                    latency_ms=int((time.time() - sent) * 1000),
+                )
+                with lock:
+                    queries.append(sample)
+        finally:
+            session.close()
 
     threads = [
         threading.Thread(target=worker, args=(replica, index, dataset.name), daemon=True)
