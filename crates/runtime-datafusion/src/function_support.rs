@@ -488,6 +488,74 @@ mod tests {
             .expect("build plan")
     }
 
+    /// Regression test for #14397, through both `DuckDB` accessors: no cast into
+    /// a binary type has a `DuckDB` rendering that answers what `DataFusion`
+    /// does, so a plan holding one, in a projection or a filter, must stay
+    /// local instead of failing at planning.
+    #[test]
+    fn a_duckdb_cast_into_binary_is_not_federated() {
+        use datafusion::prelude::{cast, try_cast};
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("a", DataType::Binary, true),
+        ]);
+        let plan = |predicate: Option<Expr>, projection: Expr| {
+            let mut plan = table_scan(Some("t"), &schema, None).expect("scan t");
+            if let Some(predicate) = predicate {
+                plan = plan.filter(predicate).expect("filter");
+            }
+            plan.project(vec![projection])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        };
+        for (accessor, support) in [
+            (
+                "table providers",
+                deny_spice_functions_for_duckdb_table_providers(),
+            ),
+            (
+                "DuckLake catalog",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for refused in [
+                plan(None, cast(col("s"), DataType::Binary)),
+                plan(None, try_cast(col("s"), DataType::Binary)),
+                plan(None, cast(col("s"), DataType::LargeBinary)),
+                plan(None, cast(col("s"), DataType::BinaryView)),
+                plan(None, cast(col("a"), DataType::Binary)),
+                plan(None, cast(lit("abc"), DataType::Binary)),
+                plan(
+                    Some(cast(col("s"), DataType::Binary).eq(col("a"))),
+                    col("id"),
+                ),
+            ] {
+                assert!(
+                    contains_unsupported_functions(&refused, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must keep this plan local:\n{refused}"
+                );
+            }
+
+            // Casts into other types, and the binary column itself, still
+            // federate: the refusal costs only the casts it is about.
+            for federated in [
+                plan(None, col("a")),
+                plan(None, cast(col("s"), DataType::Utf8View)),
+                plan(None, cast(col("id"), DataType::Utf8)),
+                plan(Some(col("a").is_not_null()), col("id")),
+            ] {
+                assert!(
+                    !contains_unsupported_functions(&federated, &support)
+                        .expect("the support check must not error"),
+                    "the {accessor} accessor must still federate:\n{federated}"
+                );
+            }
+        }
+    }
+
     /// Regression test for #14355, through both `DuckDB` accessors: a cast of a
     /// binary column into text answers with a row on `DuckDB` where
     /// `DataFusion` raises (`CAST`) or answers NULL (`TRY_CAST`), so a plan

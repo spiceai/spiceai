@@ -229,8 +229,8 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
-/// `DataFusion` does — today, a cast into text over a binary operand is the one
-/// shape it does not (see `duckdb::cast_is_renderable`).
+/// `DataFusion` does — today, a cast into text over a binary operand and a cast
+/// into binary are the shapes it does not (see `duckdb::cast_is_renderable`).
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     duckdb::cast_is_renderable(expr, scope)

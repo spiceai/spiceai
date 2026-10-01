@@ -417,8 +417,18 @@ pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSc
 /// [`concat_arguments_are_renderable`], no rendering closes that, so the cast
 /// stays local.
 ///
-/// Only text targets are refused: casting binary into a number, a date or a
-/// boolean is unsupported on both engines, so both refuse the query.
+/// Only text targets are refused for a binary operand: casting binary into a
+/// number, a date or a boolean is unsupported on both engines, so both refuse
+/// the query.
+///
+/// A cast *into* binary is refused whatever its operand. The unparser renders
+/// no binary type, so a federated one fails the query at planning with
+/// `Unsupported DataType: conversion: Binary` where `DataFusion` answers it
+/// (issue #14397). Rendering `BLOB` would not close it either: `DuckDB`'s
+/// `CAST(VARCHAR AS BLOB)` reads `\xFF` as one escaped byte and refuses
+/// non-ASCII text, where `DataFusion` keeps the string's UTF-8 bytes — the
+/// strings `\xFF` and `é` are `5c784646` and `c3a9` locally, while `DuckDB`
+/// answers `FF` for the first and raises a conversion error for the second.
 pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     let (Expr::Cast(Cast {
         expr: operand,
@@ -431,7 +441,8 @@ pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool 
     else {
         return true;
     };
-    !field.data_type().is_string() || !operand_reaches_binary(operand, scope)
+    let target = field.data_type();
+    !target.is_binary() && (!target.is_string() || !operand_reaches_binary(operand, scope))
 }
 
 /// Whether any node of this operand's expression tree is, or carries, a binary
