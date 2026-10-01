@@ -321,9 +321,11 @@ fn argmax(values: &[f64]) -> usize {
 /// The one JSON object in `reply`, which may be wrapped in a Markdown fence or sit
 /// between sentences.
 ///
-/// A reply holding a second object is ambiguous — a draft and its revision, say — so it
-/// is rejected rather than read as either. So is an object that repeats a key: parsing
-/// it into a `Value` would keep only the last of two answers to one question.
+/// A reply holding a second JSON object is ambiguous — a draft and its revision, say —
+/// so it is rejected rather than read as either. A `{` that does not begin an object,
+/// such as `{braces}` in trailing prose, is not a second object. An object that repeats
+/// a key is also rejected: parsing it into a `Value` would keep only the last of two
+/// answers to one question.
 fn json_object(reply: &str) -> Result<&str, String> {
     let Some(start) = reply.find('{') else {
         return Err("the reply contains no JSON object".to_string());
@@ -333,7 +335,7 @@ fn json_object(reply: &str) -> Result<&str, String> {
     match values.next() {
         Some(Ok(NoRepeatedKeys)) => {
             let (object, rest) = from_object.split_at(values.byte_offset());
-            if rest.contains('{') {
+            if contains_json_object(rest) {
                 return Err(
                     "the reply contains more than one JSON object; return exactly one".to_string(),
                 );
@@ -346,6 +348,20 @@ fn json_object(reply: &str) -> Result<&str, String> {
         Some(Err(e)) => Err(format!("the reply is not a JSON object ({e})")),
         None => Err("the reply contains no JSON object".to_string()),
     }
+}
+
+/// True when `text` holds a `{` that begins a JSON object.
+fn contains_json_object(text: &str) -> bool {
+    let mut remaining = text;
+    while let Some(start) = remaining.find('{') {
+        let from_brace = remaining.get(start..).unwrap_or_default();
+        let mut values = serde_json::Deserializer::from_str(from_brace).into_iter::<Value>();
+        if matches!(values.next(), Some(Ok(Value::Object(_)))) {
+            return true;
+        }
+        remaining = from_brace.get(1..).unwrap_or_default();
+    }
+    false
 }
 
 /// A JSON number that is a non-negative whole number, however it is written: `2`,
@@ -721,7 +737,7 @@ mod tests {
     }
 
     /// Two objects are a draft and a revision, or two different answers: neither is
-    /// taken.
+    /// taken. A `{` that does not begin an object does not hide a later one.
     #[test]
     fn a_reply_with_two_objects_is_rejected() {
         let answer = json!({"answers": {
@@ -736,6 +752,31 @@ mod tests {
             problem,
             "the reply contains more than one JSON object; return exactly one"
         );
+
+        let with_prose_braces = format!("Draft: {answer} use {{braces}} Final: {answer}");
+        let problem = parse_reply(
+            &with_prose_braces,
+            &sample_questions(),
+            AnswerMode::Probabilities,
+        )
+        .expect_err("two objects with braces in the prose between them");
+        assert_eq!(
+            problem,
+            "the reply contains more than one JSON object; return exactly one"
+        );
+    }
+
+    /// A `{` in trailing prose is not a second object unless it begins one.
+    #[test]
+    fn a_brace_in_trailing_prose_is_not_a_second_object() {
+        let questions: BTreeMap<String, Question> = serde_json::from_value(json!({
+            "q": {"type": "noul", "instructions": "yes or no"}
+        }))
+        .expect("question");
+        let reply = r#"{"answers":{"q":0.5}} Explanation: use {braces} literally."#;
+        let answers = parse_reply(reply, &questions, AnswerMode::Probabilities)
+            .expect("a brace in the explanation is not a second object");
+        assert_eq!(answers.get("q"), Some(&Answer::Noul { noul: 0.5 }));
     }
 
     /// A small model's reply from an end-to-end run: the outer object is never closed.
