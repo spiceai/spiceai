@@ -1079,12 +1079,12 @@ async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
         Ok(Err(err)) => failures.push(format!("the reload task failed: {err}")),
         Err(_) => {}
     }
-    if let Ok(served) = rows(&reader, modules).await {
-        if !served.is_empty() {
-            failures.push(format!(
-                "the stale restore registered '{modules}' while it was still held, served {served:?}"
-            ));
-        }
+    if let Ok(served) = rows(&reader, modules).await
+        && !served.is_empty()
+    {
+        failures.push(format!(
+            "the stale restore registered '{modules}' while it was still held, served {served:?}"
+        ));
     }
 
     hold.release();
