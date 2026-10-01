@@ -401,17 +401,28 @@ pub struct CayenneAccelerator {
 /// PARTITIONED BY` table draws on that same budget while belonging to no
 /// accelerator: keying the gauges off accelerator registration would leave them
 /// silent in a process whose only compaction work is DDL-created.
-/// `snapshots_compaction: enabled` together with a cold tier is refused at
-/// registration: the compacted snapshot would pull the whole cold tier into
-/// local files on every snapshot.
-fn snapshot_compaction_with_cold_tier(
+/// `snapshots_compaction: enabled` is refused at registration for a table it
+/// cannot work with: one with a cold tier (the compacted snapshot would pull
+/// the whole cold tier into local files on every snapshot) or a partitioned
+/// one (snapshots of partitioned Cayenne datasets are not supported).
+fn validate_snapshot_compaction(
     table_name: &str,
     compaction: spicepod::acceleration::SnapshotsCompaction,
     cold_tier_enabled: bool,
+    partitioned: bool,
 ) -> Result<(), String> {
-    if cold_tier_enabled && compaction == spicepod::acceleration::SnapshotsCompaction::Enabled {
+    const DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
+    if compaction != spicepod::acceleration::SnapshotsCompaction::Enabled {
+        return Ok(());
+    }
+    if cold_tier_enabled {
         return Err(format!(
-            "Failed to register dataset {table_name} (cayenne): 'snapshots_compaction: enabled' is not supported together with 'cayenne_datalake_location', because a compacted snapshot would copy the whole datalake tier into local files on every snapshot. Remove 'cayenne_datalake_location' or set 'snapshots_compaction: disabled'. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "Failed to register dataset {table_name} (cayenne): 'snapshots_compaction: enabled' is not supported together with 'cayenne_datalake_location', because a compacted snapshot would copy the whole datalake tier into local files on every snapshot. Remove 'cayenne_datalake_location' or set 'snapshots_compaction: disabled'. See: {DOCS}"
+        ));
+    }
+    if partitioned {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): 'snapshots_compaction: enabled' is not supported for a partitioned dataset, because snapshots of partitioned Cayenne datasets are not supported. Remove 'partition_by' or set 'snapshots_compaction: disabled'. See: {DOCS}"
         ));
     }
     Ok(())
@@ -2756,14 +2767,14 @@ impl CayenneAccelerator {
                 ))),
             });
         }
-        // Snapshot compaction reads the whole table, cold tier included, into
-        // local files on every snapshot; refuse the combination up front rather
-        // than on each snapshot tick.
+        // Snapshot compaction cannot work with a cold tier or a partitioned
+        // table; refuse those up front rather than on each snapshot tick.
         if let Some(acceleration) = source.acceleration()
-            && let Err(detail) = snapshot_compaction_with_cold_tier(
-                &table_name,
+            && let Err(detail) = validate_snapshot_compaction(
+                table_name,
                 acceleration.snapshots_compaction,
                 table_options.vortex_config.cold_tier_enabled(),
+                !acceleration.partition_by.is_empty(),
             )
         {
             return Err(Error::AccelerationCreationFailed {
@@ -8142,6 +8153,27 @@ mod tests {
             "an unpartitioned dataset keeps in-place evolution"
         );
     }
+    #[test]
+    fn snapshot_compaction_is_refused_at_registration_for_cold_tier_and_partitioned_tables() {
+        use spicepod::acceleration::SnapshotsCompaction::{Disabled, Enabled};
+        let cold = validate_snapshot_compaction("trips", Enabled, true, false)
+            .expect_err("compaction with a cold tier must be refused");
+        assert!(cold.contains("dataset trips"), "{cold}");
+        assert!(cold.contains("cayenne_datalake_location"), "{cold}");
+        assert!(cold.contains("snapshots_compaction: disabled"), "{cold}");
+        let partitioned = validate_snapshot_compaction("trips", Enabled, false, true)
+            .expect_err("compaction of a partitioned dataset must be refused");
+        assert!(partitioned.contains("partition_by"), "{partitioned}");
+        assert!(
+            partitioned.contains("snapshots_compaction: disabled"),
+            "{partitioned}"
+        );
+        validate_snapshot_compaction("trips", Enabled, false, false)
+            .expect("plain compaction is accepted");
+        validate_snapshot_compaction("trips", Disabled, true, true)
+            .expect("compaction off is accepted whatever the table");
+    }
+
     /// Datasets sharing one metadata directory share its `SQLite` catalog, so a pod where
     /// some snapshot and others do not cannot be restored consistently and must be refused
     /// up front. That check is generic — it groups by
@@ -8149,24 +8181,6 @@ mod tests {
     /// dataset if this engine does not answer that question. Regression test for exactly
     /// that: the validation moved out of `runtime` when the engine did, and an unimplemented
     /// `shared_store_key` would leave it looking green while checking nothing.
-    #[test]
-    fn snapshot_compaction_with_a_cold_tier_is_refused_at_registration() {
-        use spicepod::acceleration::SnapshotsCompaction;
-        let err = snapshot_compaction_with_cold_tier("trips", SnapshotsCompaction::Enabled, true)
-            .expect_err("compaction with a cold tier must be refused");
-        assert!(err.contains("dataset trips"), "{err}");
-        assert!(err.contains("snapshots_compaction: disabled"), "{err}");
-        assert!(err.contains("cayenne_datalake_location"), "{err}");
-        assert!(
-            snapshot_compaction_with_cold_tier("trips", SnapshotsCompaction::Disabled, true)
-                .is_ok()
-        );
-        assert!(
-            snapshot_compaction_with_cold_tier("trips", SnapshotsCompaction::Enabled, false)
-                .is_ok()
-        );
-    }
-
     #[tokio::test]
     async fn mixed_snapshot_settings_in_one_metadata_dir_are_refused() {
         use data_accelerator_api::validate_snapshot_consistency;
