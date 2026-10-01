@@ -58,18 +58,20 @@ use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 const CAYENNE_TABLE: &str = "cayenne_table";
 
+const DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
+
+/// Errors of snapshot compaction. Each renders as the cause of the
+/// `Failed to create snapshot` message the snapshot trigger logs.
 #[derive(Debug, Snafu)]
 pub enum CompactionError {
-    #[snafu(display(
-        "Failed to read the live table of dataset '{dataset}' for snapshot compaction: {source}"
-    ))]
+    #[snafu(display("Could not read dataset '{dataset}' to compact its snapshot: {source}"))]
     CaptureScan {
         dataset: String,
         source: datafusion::error::DataFusionError,
     },
 
     #[snafu(display(
-        "Failed to export the Cayenne metadata of dataset '{dataset}' for snapshot compaction: {source}"
+        "Could not read the Cayenne table details of dataset '{dataset}' to compact its snapshot: {source}"
     ))]
     ExportLive {
         dataset: String,
@@ -77,12 +79,12 @@ pub enum CompactionError {
     },
 
     #[snafu(display(
-        "Cannot compact the snapshot of dataset '{dataset}': its Cayenne metadata has no '{CAYENNE_TABLE}' row"
+        "Dataset '{dataset}' has no Cayenne table, so its snapshot cannot be compacted"
     ))]
     MissingTableRow { dataset: String },
 
     #[snafu(display(
-        "Cannot compact the snapshot of dataset '{dataset}': the Cayenne metadata layout has no column '{column}' in '{CAYENNE_TABLE}'"
+        "Dataset '{dataset}' uses a Cayenne table layout this version cannot compact ('{column}' is missing). Set `snapshots_compaction: disabled` for this dataset. See: {DOCS}"
     ))]
     MissingColumn {
         dataset: String,
@@ -90,63 +92,57 @@ pub enum CompactionError {
     },
 
     #[snafu(display(
-        "Cannot compact the snapshot of dataset '{dataset}': its data directory {path:?} is not under the dataset's acceleration directory, so a compacted copy could not be re-anchored on the reader. Set `cayenne_file_path` to a directory that contains the dataset's data, or set `snapshots_compaction: disabled`"
+        "The data directory of dataset '{dataset}' ({path}) is outside its acceleration directory, so a compacted snapshot could not be restored elsewhere. Set `cayenne_file_path` to a directory that contains the dataset's data, or set `snapshots_compaction: disabled`. See: {DOCS}"
     ))]
     DataDirNotUnderAnchor { dataset: String, path: String },
 
     #[snafu(display(
-        "Cannot compact the snapshot of dataset '{dataset}': snapshots of a partitioned Cayenne acceleration are not supported"
+        "Snapshots of a partitioned Cayenne dataset are not supported, so the snapshot of dataset '{dataset}' cannot be compacted. Set `snapshots_compaction: disabled` for this dataset. See: {DOCS}"
     ))]
     PartitionedTable { dataset: String },
 
     #[snafu(display(
-        "Cannot compact the snapshot of dataset '{dataset}': it has a cold tier (`cayenne_datalake_location`), and a compacted snapshot would re-encode every cold row into local files on each snapshot. Set `snapshots_compaction: disabled` for this dataset"
+        "Dataset '{dataset}' uses a cold tier (`cayenne_datalake_location`), which snapshots do not support. Remove `cayenne_datalake_location` or set `snapshots_compaction: disabled`. See: {DOCS}"
     ))]
     ColdTierTable { dataset: String },
 
     #[snafu(display(
-        "Failed to prepare the scratch directory for compacting the snapshot of dataset '{dataset}': {source}"
+        "Could not create a temporary directory to compact the snapshot of dataset '{dataset}': {source}. Check the free space and permissions of the temporary directory"
     ))]
     Scratch {
         dataset: String,
         source: std::io::Error,
     },
 
-    #[snafu(display(
-        "Failed to open the scratch Cayenne metadata for compacting the snapshot of dataset '{dataset}': {source}"
-    ))]
+    #[snafu(display("Could not prepare the compacted copy of dataset '{dataset}': {source}"))]
     ScratchCatalog {
         dataset: String,
         source: cayenne::CatalogError,
     },
 
     #[snafu(display(
-        "Failed to rewrite the Cayenne configuration of dataset '{dataset}' for snapshot compaction: {source}"
+        "Could not read the Cayenne settings of dataset '{dataset}' to compact its snapshot: {source}"
     ))]
     VortexConfigJson {
         dataset: String,
         source: serde_json::Error,
     },
 
-    #[snafu(display(
-        "Failed to open the scratch Cayenne table for compacting the snapshot of dataset '{dataset}': {source}"
-    ))]
+    #[snafu(display("Could not open the compacted copy of dataset '{dataset}': {source}"))]
     ScratchTable {
         dataset: String,
         #[snafu(source(from(cayenne::provider::Error, Box::new)))]
         source: Box<cayenne::provider::Error>,
     },
 
-    #[snafu(display(
-        "Failed to write the compacted copy of dataset '{dataset}' for its snapshot: {source}"
-    ))]
+    #[snafu(display("Could not write the compacted copy of dataset '{dataset}': {source}"))]
     Rewrite {
         dataset: String,
         source: datafusion::error::DataFusionError,
     },
 
     #[snafu(display(
-        "The compacted copy of dataset '{dataset}' is not the clean layout snapshot compaction promises ({detail}); the snapshot was not published"
+        "The compacted copy of dataset '{dataset}' is not fully compacted ({detail}), so the snapshot was not published"
     ))]
     NotCompact { dataset: String, detail: String },
 }
@@ -384,7 +380,7 @@ impl CompactionCapture {
             compacted.current_snapshot_id != seed_snapshot_id,
             NotCompactSnafu {
                 dataset,
-                detail: "the rewrite published no snapshot".to_string(),
+                detail: "no data was written".to_string(),
             }
         );
         let delete_files = scratch_catalog
@@ -406,7 +402,7 @@ impl CompactionCapture {
             protected.is_empty(),
             NotCompactSnafu {
                 dataset,
-                detail: format!("{} protected snapshots remain", protected.len()),
+                detail: format!("{} older snapshots remain", protected.len()),
             }
         );
         let inlined = scratch_catalog
@@ -417,7 +413,7 @@ impl CompactionCapture {
             inlined == 0,
             NotCompactSnafu {
                 dataset,
-                detail: format!("{inlined} inlined row batches remain"),
+                detail: format!("{inlined} unflushed row batches remain"),
             }
         );
 
@@ -444,7 +440,7 @@ impl CompactionCapture {
             .await
             .context(ScratchSnafu { dataset })?;
         tracing::info!(
-            "Compacted the snapshot of dataset '{dataset}': {rows_written} rows in {files} data files ({bytes} bytes), one snapshot, no deletion files"
+            "Compacted the snapshot of dataset '{dataset}': {rows_written} rows in {files} files ({bytes} bytes)"
         );
 
         let mut dirs = metadata_dirs;
