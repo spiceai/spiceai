@@ -190,14 +190,23 @@ async fn unreferenced_data_entries(
     anchor: &Path,
     slice: &DatasetMetastoreSlice,
 ) -> std::io::Result<HashSet<PathBuf>> {
-    let table_id = slice
+    let table_row = slice
         .tables
         .get("cayenne_table")
-        .and_then(|rows| rows.first())
+        .and_then(|rows| rows.first());
+    let mut skip = HashSet::new();
+    // A partitioned table keeps its partitions directly under the data
+    // directory; archive it as a whole.
+    if table_row
+        .and_then(|row| slice_text(row, slice_column("cayenne_table", "partition_column")))
+        .is_some()
+    {
+        return Ok(skip);
+    }
+    let table_id = table_row
         .and_then(|row| slice_text(row, slice_column("cayenne_table", "table_id")))
         .map(str::to_string);
     let referenced = referenced_snapshot_ids(slice, anchor);
-    let mut skip = HashSet::new();
     let mut entries = match tokio::fs::read_dir(anchor).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(skip),
@@ -532,6 +541,16 @@ mod tests {
         protected: &[&str],
         delete_paths: &[&str],
     ) -> DatasetMetastoreSlice {
+        slice_with_partition(table_id, current, protected, delete_paths, None)
+    }
+
+    fn slice_with_partition(
+        table_id: &str,
+        current: &str,
+        protected: &[&str],
+        delete_paths: &[&str],
+        partition_column: Option<&str>,
+    ) -> DatasetMetastoreSlice {
         use cayenne::metastore::snapshot::{SLICE_ENGINE, SLICE_FORMAT_VERSION};
         let row = |table: &str, values: &[(&str, &str)]| -> Vec<SliceValue> {
             let columns = EXPECTED_TABLES
@@ -552,12 +571,13 @@ mod tests {
                 .collect()
         };
         let mut tables = std::collections::BTreeMap::new();
+        let mut table_values = vec![("table_id", table_id), ("current_snapshot_id", current)];
+        if let Some(column) = partition_column {
+            table_values.push(("partition_column", column));
+        }
         tables.insert(
             "cayenne_table".to_string(),
-            vec![row(
-                "cayenne_table",
-                &[("table_id", table_id), ("current_snapshot_id", current)],
-            )],
+            vec![row("cayenne_table", &table_values)],
         );
         tables.insert(
             "cayenne_snapshot_sequence".to_string(),
@@ -614,6 +634,15 @@ mod tests {
             .map(PathBuf::from)
             .collect();
         assert_eq!(skip, expected);
+
+        // A partitioned table is archived as a whole.
+        let partitioned = slice_with_partition("tid", "current", &[], &[], Some("region"));
+        assert!(
+            unreferenced_data_entries(anchor, &partitioned)
+                .await
+                .expect("list")
+                .is_empty()
+        );
     }
 
     /// A full refresh retires the previous snapshot directory; the snapshot
