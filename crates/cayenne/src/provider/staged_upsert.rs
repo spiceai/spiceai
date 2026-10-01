@@ -59,9 +59,7 @@ use super::delta_encoding::WritePolicy;
 use super::key_conflicts::ConflictPolicy;
 use super::on_conflict::{CrossBatchRepeats, OnConflictDeletions, PostValidationState};
 use super::overwrite::LayerWrite;
-use super::overwrite_layers::{
-    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS,
-};
+use super::overwrite_layers::{CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter};
 use super::pk_index::PkDigestSet;
 use super::table::CayenneTableProvider;
 
@@ -619,7 +617,7 @@ impl CayenneTableProvider {
                     CollapseWindow::new(self.collapse_window_bytes, reservation.new_empty());
                 let source = LayerSource::new(
                     prepared.stream,
-                    LayerSplitter::new(resolver, MAX_LAYER_ROWS, reservation),
+                    LayerSplitter::new(resolver, reservation),
                     Some(window),
                 );
                 self.write_layers_folded(

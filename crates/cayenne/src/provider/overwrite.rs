@@ -77,9 +77,7 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::key_conflicts::ConflictPolicy;
 use super::mutation_writer::InlineBatchBuffer;
-use super::overwrite_layers::{
-    CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS,
-};
+use super::overwrite_layers::{CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter};
 use super::table::{
     CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
     RangePartitioning, serialize_batches_to_ipc,
@@ -690,7 +688,13 @@ impl CayenneTableProvider {
             }
             Some(resolver) => {
                 let window_reservation = reservation.new_empty();
-                let splitter = LayerSplitter::new(Arc::new(resolver), MAX_LAYER_ROWS, reservation);
+                // A refresh usually holds about the keys of the table it replaces.
+                let expected_keys = self
+                    .optimizer_table_statistics()
+                    .and_then(|stats| stats.num_rows.get_value().copied())
+                    .unwrap_or(0);
+                let splitter = LayerSplitter::new(Arc::new(resolver), reservation)
+                    .with_expected_keys(expected_keys);
                 let mut source = LayerSource::new(
                     data,
                     splitter,
@@ -745,6 +749,12 @@ impl CayenneTableProvider {
             }
             None => lookup_index_observer,
         };
+        // A layered write locates every row it admits, so a later copy finds the
+        // earlier one's position.
+        let write_observer = match &layer_source {
+            Some(source) => Some(source.observer(write_observer)),
+            None => write_observer,
+        };
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
@@ -790,9 +800,9 @@ impl CayenneTableProvider {
             }
         };
 
-        // The later layers join the main snapshot, and the copies they supersede
-        // are located by a read-back of the lower layers' keys, so the refresh
-        // publishes one snapshot. A table that deletes by position hides those
+        // The later layers join the main snapshot, and the write observer has
+        // located every copy they supersede by the time its key is admitted
+        // again, so the refresh publishes one snapshot. A table that deletes by position hides those
         // copies with position deletes; one that deletes by key rewrites the files
         // holding them without them, so it publishes no deletes at all. Both are
         // done before the manifest below, which must list the final files.
@@ -921,8 +931,9 @@ impl CayenneTableProvider {
         write: LayerWrite,
     ) -> Result<(u64, Arc<ColumnStatsAccumulator>)> {
         let file_stats = Arc::new(FileStatsObserver::new(self.table_schema(), None));
-        let observer =
-            Some(Arc::clone(&file_stats) as Arc<dyn vortex_datafusion::VortexWriteObserver>);
+        let observer = Some(source.observer(Some(
+            Arc::clone(&file_stats) as Arc<dyn vortex_datafusion::VortexWriteObserver>
+        )));
         let first = self.first_layer(&mut source)?;
         let (_rows, _files, stats) = self
             .write_to_snapshot_range_partitioned(
@@ -1096,16 +1107,15 @@ impl CayenneTableProvider {
         Ok(Arc::new(folded))
     }
 
-    /// Write every layer after the main snapshot into the main snapshot itself, and
-    /// locate the copies they supersede. Returns the rows the layers wrote and the
-    /// superseded copies' file-local positions, per data file.
+    /// Write every layer after the main snapshot into the main snapshot itself, one
+    /// after another, and return the rows they wrote and the file-local positions
+    /// of the copies they supersede, per data file.
     ///
-    /// The layers still order the copies of a key — a batch repeating a key of the
-    /// current layer starts the next one — but nothing orders them by sequence.
-    /// Instead, once every layer is written, a read-back of the lower layers' key
-    /// columns finds each copy whose key has a later one, for position deletes to
-    /// hide or a rewrite to drop: the refresh publishes one snapshot. Every layer's
-    /// write feeds `observer`.
+    /// The layers order the copies of a key — a batch repeating a key of the
+    /// current layer starts the next one, and a layer is written only once the
+    /// one before it is — and every layer's write reports to `observer`, which
+    /// must be the source's (see [`LayerSource::observer`]), so each superseded
+    /// copy's position is known by the time its key is admitted again.
     async fn write_overwrite_layers_in_place(
         &self,
         source: &mut LayerSource,
@@ -1114,16 +1124,8 @@ impl CayenneTableProvider {
         observer: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
         write_stats_acc: &ColumnStatsAccumulator,
     ) -> Result<(u64, HashMap<String, Vec<u32>>)> {
-        let mut file_layers: HashMap<String, usize> = self
-            .list_snapshot_files_with_sizes(snapshot_id)
-            .await?
-            .into_iter()
-            .map(|(name, _)| (name, 0))
-            .collect();
         let mut rows: u64 = 0;
-        let mut layer = 0;
         while let Some(stream) = source.next_layer() {
-            layer += 1;
             let (layer_rows, _files, layer_stats) = self
                 .write_to_snapshot_range_partitioned(
                     stream,
@@ -1138,27 +1140,12 @@ impl CayenneTableProvider {
                 .await?;
             write_stats_acc.merge_from(&layer_stats);
             rows = rows.saturating_add(layer_rows);
-            for (name, _) in self.list_snapshot_files_with_sizes(snapshot_id).await? {
-                file_layers.entry(name).or_insert(layer);
-            }
         }
         self.sync_local_snapshot_dir(snapshot_id)
             .await
             .map_err(|source| super::Error::Catalog { source })?;
-        // A key's last copy is in the highest layer that records it as possibly
-        // superseding; every copy below that layer is superseded.
-        let mut superseded: HashMap<u128, usize, hash_index::PrehashedBuildHasher> =
-            HashMap::with_hasher(hash_index::PrehashedBuildHasher);
-        for (layer, digests) in source.take_superseding().into_iter().enumerate() {
-            for digest in digests {
-                superseded.insert(digest, layer);
-            }
-        }
-        let position_deletions = self
-            .locate_superseded_copies(snapshot_id, &file_layers, &superseded)
-            .await
-            .map_err(|source| super::Error::Catalog { source })?;
-        Ok((rows, position_deletions))
+        let superseded = source.take_superseded(self.table_name())?;
+        Ok((rows, superseded))
     }
 
     /// Write position deletion vectors for `position_deletions`, at a fresh

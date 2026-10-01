@@ -311,7 +311,7 @@ impl KeyResolver {
         Ok(self.keys.convert_columns(&columns)?)
     }
 
-    fn digests(&self, batch: &RecordBatch) -> Result<Vec<u128>> {
+    pub(crate) fn digests(&self, batch: &RecordBatch) -> Result<Vec<u128>> {
         let keys = self.encode_keys(batch)?;
         Ok(keys
             .iter()

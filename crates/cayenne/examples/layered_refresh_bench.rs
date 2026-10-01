@@ -24,8 +24,12 @@ limitations under the License.
 //!
 //! ```text
 //! cargo run --release -p cayenne --example layered_refresh_bench -- \
-//!     --policy <none|drop|upsert|keep_last> --keys 1000000 --passes 4
+//!     --policy <none|drop|upsert|keep_last> --keys 1000000 --passes 4 [--refreshes 2]
 //! ```
+//!
+//! `--refreshes` repeats the refresh over the table the previous one left; every
+//! refresh after the first replaces a table of known size, which is the common
+//! shape of a scheduled refresh.
 
 #![expect(
     clippy::print_stdout,
@@ -155,6 +159,7 @@ async fn main() {
     let policy = arg("--policy", "upsert");
     let keys: usize = arg("--keys", "1000000").parse().expect("keys");
     let passes: usize = arg("--passes", "1").parse().expect("passes");
+    let refreshes: usize = arg("--refreshes", "1").parse().expect("refreshes");
     let deletion_mode = match arg("--deletion-mode", "position").as_str() {
         "key" => cayenne::metadata::DeletionMode::Key,
         "position" => cayenne::metadata::DeletionMode::Position,
@@ -197,18 +202,25 @@ async fn main() {
         .expect("table");
     let provider = Arc::new(provider);
 
-    let start = Instant::now();
-    let prepared = provider
-        .begin_overwrite(
-            source(keys, passes),
-            ctx.state().config().target_partitions(),
-        )
-        .await
-        .expect("refresh");
-    let written = prepared.row_count();
-    prepared.apply_owned_txn().await.expect("commit");
-    prepared.finish().await.expect("publish");
-    let refresh_s = start.elapsed().as_secs_f64();
+    let mut refresh_s = 0.0;
+    let mut written = 0;
+    for refresh in 1..=refreshes {
+        let start = Instant::now();
+        let prepared = provider
+            .begin_overwrite(
+                source(keys, passes),
+                ctx.state().config().target_partitions(),
+            )
+            .await
+            .expect("refresh");
+        written = prepared.row_count();
+        prepared.apply_owned_txn().await.expect("commit");
+        prepared.finish().await.expect("publish");
+        refresh_s = start.elapsed().as_secs_f64();
+        if refreshes > 1 {
+            println!("  refresh {refresh} of {refreshes}: refresh_s={refresh_s:.2}");
+        }
+    }
     let layers = catalog
         .get_all_snapshot_sequences(provider.table_id())
         .await
