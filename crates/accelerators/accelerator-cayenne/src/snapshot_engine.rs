@@ -143,18 +143,14 @@ fn slice_text(row: &[SliceValue], index: Option<usize>) -> Option<&str> {
     }
 }
 
-/// What the slice references on disk: snapshot ids (the current and protected
-/// snapshots) and deletion files, as paths relative to the data directory.
-struct ReferencedEntries {
-    snapshot_ids: HashSet<String>,
-    deletion_files: HashSet<PathBuf>,
-}
-
-fn referenced_entries(slice: &DatasetMetastoreSlice, anchor: &Path) -> ReferencedEntries {
-    let mut snapshot_ids = HashSet::new();
+/// Snapshot ids the slice references: the current snapshot, the protected
+/// snapshots, and the snapshots whose `deletions/` directory holds a
+/// referenced deletion file.
+fn referenced_snapshot_ids(slice: &DatasetMetastoreSlice, anchor: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
     let current = slice_column("cayenne_table", "current_snapshot_id");
     for row in slice.tables.get("cayenne_table").into_iter().flatten() {
-        snapshot_ids.extend(slice_text(row, current).map(str::to_string));
+        ids.extend(slice_text(row, current).map(str::to_string));
     }
     let snapshot_id = slice_column("cayenne_snapshot_sequence", "snapshot_id");
     for row in slice
@@ -163,33 +159,33 @@ fn referenced_entries(slice: &DatasetMetastoreSlice, anchor: &Path) -> Reference
         .into_iter()
         .flatten()
     {
-        snapshot_ids.extend(slice_text(row, snapshot_id).map(str::to_string));
+        ids.extend(slice_text(row, snapshot_id).map(str::to_string));
     }
     let path = slice_column("cayenne_delete_file", "path");
-    let deletion_files = slice
+    for row in slice
         .tables
         .get("cayenne_delete_file")
         .into_iter()
         .flatten()
-        .filter_map(|row| slice_text(row, path))
-        .map(|p| {
-            Path::new(p)
-                .strip_prefix(anchor)
-                .unwrap_or(Path::new(p))
-                .to_path_buf()
-        })
-        .collect();
-    ReferencedEntries {
-        snapshot_ids,
-        deletion_files,
+    {
+        let Some(path) = slice_text(row, path) else {
+            continue;
+        };
+        let relative = Path::new(path)
+            .strip_prefix(anchor)
+            .unwrap_or(Path::new(path));
+        if let Some(first) = relative.components().next() {
+            ids.insert(first.as_os_str().to_string_lossy().into_owned());
+        }
     }
+    ids
 }
 
 /// Entries under the dataset's data directory that its snapshot must not
 /// archive: snapshot directories the slice does not reference (retired ones
 /// are removed by the sweep while the archive is being written), staging
-/// state, and deletion files the slice does not reference (orphaned ones are
-/// removed by their own sweep). Paths are relative to `anchor`.
+/// state, and `deletions/` directories of unreferenced snapshots. Paths are
+/// relative to `anchor`.
 async fn unreferenced_data_entries(
     anchor: &Path,
     slice: &DatasetMetastoreSlice,
@@ -200,7 +196,7 @@ async fn unreferenced_data_entries(
         .and_then(|rows| rows.first())
         .and_then(|row| slice_text(row, slice_column("cayenne_table", "table_id")))
         .map(str::to_string);
-    let referenced = referenced_entries(slice, anchor);
+    let referenced = referenced_snapshot_ids(slice, anchor);
     let mut skip = HashSet::new();
     let mut entries = match tokio::fs::read_dir(anchor).await {
         Ok(entries) => entries,
@@ -208,51 +204,22 @@ async fn unreferenced_data_entries(
         Err(err) => return Err(err),
     };
     while let Some(entry) = entries.next_entry().await? {
-        let name = PathBuf::from(entry.file_name());
-        if Some(name.to_string_lossy().as_ref()) == table_id.as_deref() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if Some(&name) == table_id.as_ref() {
             // `<table_id>/<snapshot_id>/`: keep the referenced snapshots.
             let mut children = tokio::fs::read_dir(entry.path()).await?;
             while let Some(child) = children.next_entry().await? {
-                if !referenced
-                    .snapshot_ids
-                    .contains(child.file_name().to_string_lossy().as_ref())
-                {
-                    skip.insert(name.join(child.file_name()));
+                let child_name = child.file_name().to_string_lossy().into_owned();
+                if !referenced.contains(&child_name) {
+                    skip.insert(PathBuf::from(&name).join(child_name));
                 }
             }
-        } else if referenced
-            .deletion_files
-            .iter()
-            .any(|file| file.starts_with(&name))
-        {
-            // `<snapshot_id>/deletions/`: keep the referenced files only.
-            for file in files_under(&entry.path()).await? {
-                let relative = file.strip_prefix(anchor).unwrap_or(&file).to_path_buf();
-                if !referenced.deletion_files.contains(&relative) {
-                    skip.insert(relative);
-                }
-            }
-        } else {
-            skip.insert(name);
+        } else if !referenced.contains(&name) {
+            // `<snapshot_id>/deletions/` of a snapshot nothing references.
+            skip.insert(PathBuf::from(name));
         }
     }
     Ok(skip)
-}
-
-async fn files_under(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
-                pending.push(entry.path());
-            } else {
-                files.push(entry.path());
-            }
-        }
-    }
-    Ok(files)
 }
 
 /// Snapshot engine for Cayenne accelerators.
@@ -615,9 +582,9 @@ mod tests {
         }
     }
 
-    /// Retired snapshot directories, staging state, unreferenced `deletions/`
-    /// directories and unreferenced (orphaned) deletion files are skipped; the
-    /// current and protected snapshots and referenced deletion files are kept.
+    /// Retired snapshot directories, staging state and the `deletions/`
+    /// directories of unreferenced snapshots are skipped; the current and
+    /// protected snapshots and referenced `deletions/` directories are kept.
     #[tokio::test]
     async fn unreferenced_data_entries_keeps_only_referenced_snapshots() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -632,12 +599,7 @@ mod tests {
         ] {
             std::fs::create_dir_all(anchor.join(dir)).expect("mkdir");
         }
-        for file in [
-            "current/deletions/delete_1.arrow",
-            "current/deletions/delete_orphan.arrow",
-        ] {
-            std::fs::write(anchor.join(file), b"dv").expect("write");
-        }
+        std::fs::write(anchor.join("current/deletions/delete_1.arrow"), b"dv").expect("write");
         let slice = slice_with(
             "tid",
             "current",
@@ -647,15 +609,10 @@ mod tests {
         let skip = unreferenced_data_entries(anchor, &slice)
             .await
             .expect("list");
-        let expected: HashSet<PathBuf> = [
-            "tid/retired",
-            "tid/_staging",
-            "old",
-            "current/deletions/delete_orphan.arrow",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+        let expected: HashSet<PathBuf> = ["tid/retired", "tid/_staging", "old"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
         assert_eq!(skip, expected);
     }
 
