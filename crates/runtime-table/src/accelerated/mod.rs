@@ -68,6 +68,8 @@ use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod caching_eviction;
+#[cfg(test)]
+mod caching_scan_tests;
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;
@@ -1744,8 +1746,6 @@ impl AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        // For UseSource mode, the scan is handled inside the match arm below (with filter
-        // splitting). For all other modes, perform the accelerator scan upfront.
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
         // predicate. The federated source still receives only the user's
@@ -1792,15 +1792,15 @@ impl AcceleratedTable {
         };
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
-            (false, ZeroResultsAction::UseSource)
+            (false, ZeroResultsAction::ReturnEmpty)
         ) {
-            None
-        } else {
             Some(
                 self.accelerator
                     .scan(state, scan_projection, scan_filters, limit)
                     .await?,
             )
+        } else {
+            None
         };
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -1810,13 +1810,6 @@ impl AcceleratedTable {
 
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
-                // Caching mode: wrap with cache execution plan to handle staleness and background refresh
-                let input = input.ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "accelerator scan input missing in caching mode".to_string(),
-                    )
-                })?;
-
                 // Check which user filters the accelerator doesn't fully
                 // support and need to be re-applied. This ensures correct
                 // results when the accelerator returns Inexact or
@@ -1856,10 +1849,39 @@ impl AcceleratedTable {
                         filters_to_reapply.push(nf);
                     }
                 }
-                let input = if filters_to_reapply.is_empty() {
-                    input
+                let input = if caching::uses_source_first(
+                    filters,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                ) {
+                    let schema = match scan_projection {
+                        Some(projection) => {
+                            Arc::new(self.accelerator.schema().project(projection)?)
+                        }
+                        None => self.accelerator.schema(),
+                    };
+                    caching::CachingScanInput::Deferred {
+                        accelerator: Arc::clone(&self.accelerator),
+                        scan_params: TableScanParams::new(
+                            state,
+                            scan_projection,
+                            scan_filters,
+                            limit,
+                        ),
+                        filters_to_reapply,
+                        schema,
+                    }
                 } else {
-                    wrap_with_filter(input, state, &filters_to_reapply)?
+                    let input = self
+                        .accelerator
+                        .scan(state, scan_projection, scan_filters, limit)
+                        .await?;
+                    caching::CachingScanInput::Planned(wrap_with_filter(
+                        input,
+                        state,
+                        &filters_to_reapply,
+                    )?)
                 };
 
                 let federated_provider = self.federated.table_provider().await;

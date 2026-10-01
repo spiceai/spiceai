@@ -927,6 +927,53 @@ mod tests {
         );
     }
 
+    /// A sorted replace arrives as one stream and is dealt over the session's
+    /// partitions to sort in parallel, then merged. Draining what it returns
+    /// must give every input row exactly once, in one ascending order, however
+    /// many batches the source sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorted_overwrite_input_returns_every_row_in_one_order() {
+        use futures::TryStreamExt;
+        let (_dir, provider) = setup_sorted(vec!["id".to_string()]).await;
+        // 60 batches of scrambled ids: more batches than partitions, so every
+        // partition gets several and the merge sees them all.
+        let n = 60_000_i64;
+        let ids: Vec<i64> = (0..n).map(|i| (i * 7_919) % n).collect();
+        let batches: Vec<Result<RecordBatch, DataFusionError>> = ids
+            .chunks(1_000)
+            .map(|chunk| {
+                Ok(RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(Int64Array::from(chunk.to_vec()))],
+                )
+                .expect("batch"))
+            })
+            .collect();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            test_schema(),
+            futures::stream::iter(batches),
+        ));
+        let (stream, _shards, _policy) = provider
+            .sort_overwrite_input(input, 8)
+            .expect("sorted overwrite input");
+        let out: Vec<RecordBatch> = stream.try_collect().await.expect("drain");
+        let got: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(
+            got == (0..n).collect::<Vec<_>>(),
+            "a sorted replace must return every id once, ascending"
+        );
+    }
+
     /// An unsorted replace keeps the fan-out it was given: nothing about its
     /// output order is load-bearing, so serializing it would only cost encode
     /// throughput.

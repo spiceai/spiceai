@@ -658,6 +658,13 @@ impl MaintainedAggregateRegistry {
         self.state.read().status == RegistryStatus::Stale
     }
 
+    /// The epoch of the last delta or rebuild the registry took in, whether or not
+    /// it is stale.
+    #[cfg(test)]
+    pub(crate) fn epoch_for_test(&self) -> u64 {
+        self.state.read().epoch
+    }
+
     /// Approximate resident bytes currently retained across every view, and the
     /// byte budget they are held to. Exposed for observability: an operator
     /// diagnosing a stale registry needs to see how close the indexes are to

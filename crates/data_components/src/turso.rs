@@ -294,7 +294,7 @@ impl Dialect for TursoDialect {
     }
 
     /// Forwarded rather than inherited: the trait's default says a derived table
-    /// fixes a volatile value, and libSQL flattens one the way SQLite does, so the
+    /// fixes a volatile value, and libSQL flattens one the way `SQLite` does, so the
     /// default would let a filter on such an output through as wrong rows.
     fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
         self.inner.derived_table_evaluates_volatile_outputs_once()

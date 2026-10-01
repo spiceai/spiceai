@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -209,30 +209,8 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
                 let federated_provider = federated_provider_callback().await;
-                let fallback_plan = match federated_provider
-                    .scan(
-                        &scan_params.state,
-                        scan_params.projection.as_ref(),
-                        &scan_params.filters,
-                        scan_params.limit,
-                    )
-                    .await
-                {
-                    Ok(plan) => plan,
-                    Err(e) => {
-                        let error_stream = RecordBatchStreamAdapter::new(
-                            schema,
-                            stream::once(async move { Err(e) }),
-                        );
-                        return Box::pin(error_stream) as SendableRecordBatchStream;
-                    }
-                };
-
-                // Run the physical optimizer on the fallback plan. Without this,
-                // rules like `EnforceDistribution` won't split single file groups 
-                // into multiple parallel partitions, leading to slower scans
                 let fallback_optimized_plan =
-                    match optimize_fallback_plan(fallback_plan, &scan_params.state) {
+                    match scan_params.scan_and_optimize(federated_provider.as_ref(), &[]).await {
                         Ok(plan) => plan,
                         Err(e) => {
                             let error_stream = RecordBatchStreamAdapter::new(
@@ -270,39 +248,6 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
         Ok(Box::pin(stream_adapter))
     }
-}
-
-/// Run the physical optimizer rules from [`SessionState`] on the given [`ExecutionPlan`],
-/// then coalesce back to a single partition if the optimizer produced multiple.
-///
-/// This mirrors the optimization pass that `DefaultPhysicalPlanner::optimize_physical_plan`
-/// performs when creating a plan through the normal query pipeline. Calling it explicitly
-/// is necessary when a plan is constructed outside that pipeline (e.g. via a direct
-/// `TableProvider::scan` call in the fallback path).
-///
-/// The result is always a single-partition plan: if the optimizer (e.g. `EnforceDistribution`)
-/// splits the scan into multiple partitions, a [`CoalescePartitionsExec`] is added on top
-/// because [`FallbackOnZeroResultsScanExec`] expects to produce exactly one output stream.
-fn optimize_fallback_plan(
-    plan: Arc<dyn ExecutionPlan>,
-    session_state: &SessionState,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let config = session_state.config_options();
-    let mut optimized =
-        session_state
-            .physical_optimizers()
-            .iter()
-            .try_fold(plan, |plan, rule| {
-                rule.optimize(plan, config.as_ref())
-                    .map_err(|e| DataFusionError::Context(rule.name().to_string(), Box::new(e)))
-            })?;
-
-    // Coalesce back to a single partition since FallbackOnZeroResultsScanExec outputs one stream
-    if optimized.output_partitioning().partition_count() > 1 {
-        optimized = Arc::new(CoalescePartitionsExec::new(optimized));
-    }
-
-    Ok(optimized)
 }
 
 mod metrics {
@@ -388,7 +333,7 @@ mod tests {
                 empty_memory_exec(),
                 create_fallback_provider(memory_table_provider()),
                 TableScanParams {
-                    state: ctx.state(),
+                    state: Arc::new(ctx.state()),
                     projection: None,
                     filters: vec![],
                     limit: None,
@@ -459,8 +404,8 @@ mod tests {
             let ctx = SessionContext::new_with_config(config);
             let state = ctx.state();
 
-            let optimized =
-                optimize_fallback_plan(plan, &state).expect("optimization should succeed");
+            let optimized = crate::execution_plan::optimize_single_partition_plan(plan, &state)
+                .expect("optimization should succeed");
 
             let plan_display = datafusion::physical_plan::displayable(optimized.as_ref())
                 .indent(true)
@@ -523,7 +468,7 @@ mod tests {
 
             let input_plan = memory_exec();
             let fallback_scan_params = TableScanParams {
-                state: ctx.state(),
+                state: Arc::new(ctx.state()),
                 projection: None,
                 filters: vec![binary_expr(
                     col("a"),
