@@ -18,10 +18,9 @@ parking_lot.workspace = true
 snafu.workspace = true
 # The Verus specification of the key encoding (`escape_proof`); erased by a
 # normal build. Pinned to the Verus release CI runs.
-vstd = "=0.0.0-2026-08-30-0159"
+vstd = "=0.0.0-2026-09-20-0158"
 
 [dev-dependencies]
-proptest = "1"
 rand.workspace = true
 
 [lints]

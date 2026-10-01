@@ -16,14 +16,19 @@ limitations under the License.
 
 //! Property tests: generated operation sequences against a model of the rows
 //! an index must answer, run builds against a naive sort, hostile persisted
-//! bytes, and varint round-trips. A failure shrinks to a minimal case.
+//! bytes, and varint round-trips.
+//!
+//! Each test runs a fixed number of seeded cases, and a failure names its
+//! seed and inputs, so it replays exactly. `KEY_INDEX_PROPTEST_SCALE`
+//! multiplies every test's case count (default 1).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::DataType;
-use proptest::prelude::*;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 
 use crate::tiered::{Candidate, IndexRun, RunBuilder, TieredIndex, UNSEEN_GRACE};
 use crate::{KeyEncoder, KeyField, varint};
@@ -70,22 +75,51 @@ enum Op {
     RebuildFilter,
 }
 
-fn keys() -> impl Strategy<Value = Vec<i64>> {
-    prop::collection::vec(0_i64..24, 0..12)
+/// Cases each test runs, times `KEY_INDEX_PROPTEST_SCALE`.
+fn cases(base: u64) -> u64 {
+    let scale = std::env::var("KEY_INDEX_PROPTEST_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse::<u64>().ok())
+        .unwrap_or(1);
+    (base * scale).max(1)
 }
 
-fn op() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        4 => (prop::collection::vec(keys(), 1..3), prop::collection::vec(0_usize..16, 0..3))
-            .prop_map(|(files, retire)| Op::Publish { files, retire }),
-        2 => prop::collection::vec((keys(), any::<bool>()), 1..3)
-            .prop_map(|files| Op::PublishVisible { files }),
-        3 => prop::collection::vec(0_usize..16, 0..3).prop_map(|drop| Op::Reconcile { drop }),
-        3 => Just(Op::ReconcileSeenOnly),
-        1 => Just(Op::MergeStep),
-        1 => Just(Op::MergeAll),
-        1 => Just(Op::RebuildFilter),
-    ]
+/// `len` in `lengths` values drawn by `value`.
+fn vec_of<T>(
+    rng: &mut StdRng,
+    lengths: std::ops::Range<usize>,
+    mut value: impl FnMut(&mut StdRng) -> T,
+) -> Vec<T> {
+    let len = rng.random_range(lengths);
+    (0..len).map(|_| value(rng)).collect()
+}
+
+fn keys(rng: &mut StdRng) -> Vec<i64> {
+    vec_of(rng, 0..12, |rng| rng.random_range(0_i64..24))
+}
+
+/// One operation, weighted 4:2:3:3:1:1:1 in the order of [`Op`]'s variants.
+fn op(rng: &mut StdRng) -> Op {
+    match rng.random_range(0..15) {
+        0..4 => Op::Publish {
+            files: vec_of(rng, 1..3, keys),
+            retire: vec_of(rng, 0..3, |rng| rng.random_range(0_usize..16)),
+        },
+        4..6 => Op::PublishVisible {
+            files: vec_of(rng, 1..3, |rng| (keys(rng), rng.random_bool(0.5))),
+        },
+        6..9 => Op::Reconcile {
+            drop: vec_of(rng, 0..3, |rng| rng.random_range(0_usize..16)),
+        },
+        9..12 => Op::ReconcileSeenOnly,
+        12 => Op::MergeStep,
+        13 => Op::MergeAll,
+        _ => Op::RebuildFilter,
+    }
+}
+
+fn ops(rng: &mut StdRng) -> Vec<Op> {
+    vec_of(rng, 1..30, op)
 }
 
 /// What a file is in the model: its rows, whether it is live, and whether a
@@ -98,7 +132,7 @@ struct ModelFile {
 
 /// Applies `ops` to an index over `encoder` and to the model, and after each
 /// op compares every key's candidates with the model's live rows.
-fn run_ops(ops: &[Op], encoder: &KeyEncoder, exact: bool) -> Result<(), TestCaseError> {
+fn run_ops(ops: &[Op], encoder: &KeyEncoder, exact: bool) -> Result<(), String> {
     let index = TieredIndex::new(encoder.clone());
     let mut model: BTreeMap<String, ModelFile> = BTreeMap::new();
     let mut next_file = 0;
@@ -227,52 +261,61 @@ fn run_ops(ops: &[Op], encoder: &KeyEncoder, exact: bool) -> Result<(), TestCase
             index.candidates(&encoded(key), |Candidate { file, position }| {
                 got.insert((file.to_string(), position));
             });
-            if exact {
-                prop_assert_eq!(&got, &expected, "step {} ({:?}), key {}", step, op, key);
-            } else {
-                prop_assert!(
-                    expected.is_subset(&got),
-                    "step {} ({:?}), key {}: candidates {:?} miss rows of {:?}",
-                    step,
-                    op,
-                    key,
-                    got,
-                    expected
-                );
+            if exact && got != expected {
+                return Err(format!(
+                    "step {step} ({op:?}), key {key}: candidates {got:?}, expected {expected:?}"
+                ));
+            }
+            if !expected.is_subset(&got) {
+                return Err(format!(
+                    "step {step} ({op:?}), key {key}: candidates {got:?} miss rows of {expected:?}"
+                ));
             }
         }
     }
     Ok(())
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
-    /// Every key's candidates are exactly its rows in the live files, after
-    /// every step of any sequence of writes, read-backs, reconciles, merges
-    /// and filter rebuilds.
-    #[test]
-    fn candidates_match_a_model(ops in prop::collection::vec(op(), 1..30)) {
-        run_ops(&ops, &encoder(), true)?;
+/// Every key's candidates are exactly its rows in the live files, after every
+/// step of any sequence of writes, read-backs, reconciles, merges and filter
+/// rebuilds.
+#[test]
+fn candidates_match_a_model() {
+    for seed in 0..cases(256) {
+        let ops = ops(&mut StdRng::seed_from_u64(seed));
+        if let Err(failure) = run_ops(&ops, &encoder(), true) {
+            panic!("seed {seed}: {failure}\nops: {ops:?}");
+        }
     }
+}
 
-    /// With 2-bit words, keys share words: candidates are then a superset of
-    /// every key's live rows, never missing one.
-    #[test]
-    fn colliding_candidates_never_miss_a_row(ops in prop::collection::vec(op(), 1..30)) {
-        run_ops(&ops, &encoder().with_word_bits(2), false)?;
+/// With 2-bit words, keys share words: candidates are then a superset of
+/// every key's live rows, never missing one.
+#[test]
+fn colliding_candidates_never_miss_a_row() {
+    for seed in 0..cases(256) {
+        let ops = ops(&mut StdRng::seed_from_u64(seed));
+        if let Err(failure) = run_ops(&ops, &encoder().with_word_bits(2), false) {
+            panic!("seed {seed}: {failure}\nops: {ops:?}");
+        }
     }
+}
 
-    /// A run holds exactly the rows added to it, in word order, whatever the
-    /// batches, files, positions and repeated keys.
-    #[test]
-    fn a_run_holds_exactly_its_rows(
-        files in prop::collection::vec(
-            prop::collection::vec((0_i64..40, 0_u64..1 << 40), 0..60),
-            1..4,
-        )
-    ) {
-        let encoder = encoder();
+/// A run holds exactly the rows added to it, in word order, whatever the
+/// batches, files, positions and repeated keys.
+#[test]
+fn a_run_holds_exactly_its_rows() {
+    let encoder = encoder();
+    for seed in 0..cases(256) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let files = vec_of(&mut rng, 1..4, |rng| {
+            vec_of(rng, 0..60, |rng| {
+                (
+                    rng.random_range(0_i64..40),
+                    rng.random_range(0_u64..1 << 40),
+                )
+            })
+        });
         let mut builder = RunBuilder::new(encoder.clone());
         let mut expected: BTreeSet<(u64, String, u64)> = BTreeSet::new();
         for (file_no, rows) in files.iter().enumerate() {
@@ -280,13 +323,19 @@ proptest! {
             builder.add_file(&file).expect("file");
             // A row has one position in its file.
             let mut used = HashSet::new();
-            let rows: Vec<(i64, u64)> = rows.iter().copied().filter(|&(_, p)| used.insert(p)).collect();
+            let rows: Vec<(i64, u64)> = rows
+                .iter()
+                .copied()
+                .filter(|&(_, p)| used.insert(p))
+                .collect();
             if rows.is_empty() {
                 continue;
             }
             let keys: Vec<i64> = rows.iter().map(|&(k, _)| k).collect();
             let positions: Vec<u64> = rows.iter().map(|&(_, p)| p).collect();
-            builder.add_batch_at(&file, &positions, &column(&keys)).expect("batch");
+            builder
+                .add_batch_at(&file, &positions, &column(&keys))
+                .expect("batch");
             for &(key, position) in &rows {
                 expected.insert((encoder.key_word(&encoded(key)), file.clone(), position));
             }
@@ -294,32 +343,39 @@ proptest! {
         let run = builder.finish().expect("finish");
         let mut got = Vec::new();
         run.for_each_row(|word, file, position| got.push((word, file.to_string(), position)));
-        prop_assert!(got.windows(2).all(|pair| pair[0].0 <= pair[1].0), "rows not in word order");
+        assert!(
+            got.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "seed {seed}: rows not in word order"
+        );
         let got: BTreeSet<(u64, String, u64)> = got.into_iter().collect();
-        prop_assert_eq!(got, expected);
+        assert_eq!(got, expected, "seed {seed}");
     }
+}
 
-    /// Arbitrary bytes are rejected or read, never a panic.
-    #[test]
-    fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+/// Arbitrary bytes are rejected or read, never a panic.
+#[test]
+fn arbitrary_bytes_never_panic() {
+    for seed in 0..cases(256) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let bytes = vec_of(&mut rng, 0..512, RngExt::random::<u8>);
         let _ = IndexRun::from_bytes(&bytes);
     }
+}
 
-    /// A run's bytes changed anywhere and then given a valid checksum (so the
-    /// structural checks, not the checksum, have to catch it) are rejected or
-    /// read into a run whose lookups do not panic.
-    #[test]
-    fn resealed_corruptions_never_panic(
-        keys in prop::collection::vec(0_i64..40, 1..80),
-        at in any::<prop::sample::Index>(),
-        flip in 1_u8..,
-    ) {
+/// A run's bytes changed anywhere and then given a valid checksum (so the
+/// structural checks, not the checksum, have to catch it) are rejected or
+/// read into a run whose lookups do not panic.
+#[test]
+fn resealed_corruptions_never_panic() {
+    for seed in 0..cases(256) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let keys = vec_of(&mut rng, 1..80, |rng| rng.random_range(0_i64..40));
         let mut builder = RunBuilder::new(encoder());
         builder.add_batch("f", 0, &column(&keys)).expect("batch");
         let bytes = builder.finish().expect("finish").to_bytes();
         let mut body = bytes[..bytes.len() - 8].to_vec();
-        let i = 12 + at.index(body.len() - 12);
-        body[i] ^= flip;
+        let i = 12 + rng.random_range(0..body.len() - 12);
+        body[i] ^= rng.random_range(1_u8..=u8::MAX);
         crate::persist::seal(&mut body);
         if let Ok(run) = IndexRun::from_bytes(&body) {
             for key in 0..40 {
@@ -328,18 +384,24 @@ proptest! {
             run.for_each_row(|_, _, _| {});
         }
     }
+}
 
-    /// Every `u64` round-trips through a varint.
-    #[test]
-    fn varints_round_trip(values in prop::collection::vec(any::<u64>(), 0..64)) {
+/// Every `u64` round-trips through a varint, at every width.
+#[test]
+fn varints_round_trip() {
+    for seed in 0..cases(256) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let values = vec_of(&mut rng, 0..64, |rng| {
+            rng.random::<u64>() >> rng.random_range(0..64)
+        });
         let mut bytes = Vec::new();
         for &value in &values {
             varint::put(&mut bytes, value);
         }
         let mut at = 0;
         for &value in &values {
-            prop_assert_eq!(varint::get(&bytes, &mut at), Some(value));
+            assert_eq!(varint::get(&bytes, &mut at), Some(value), "seed {seed}");
         }
-        prop_assert_eq!(at, bytes.len());
+        assert_eq!(at, bytes.len(), "seed {seed}");
     }
 }

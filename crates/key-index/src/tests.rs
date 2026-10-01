@@ -18,8 +18,8 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int32Array,
-    Int64Array, LargeStringArray, StringArray, StringViewArray, UInt16Array,
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int8Array, Int32Array, Int64Array,
+    LargeStringArray, StringArray, StringViewArray, UInt16Array,
 };
 use arrow_schema::DataType;
 use rand::rngs::StdRng;
@@ -46,15 +46,15 @@ fn composite_columns(rng: &mut StdRng, rows: usize) -> Vec<ArrayRef> {
             })
         })
         .collect();
-    let floats: Float64Array = (0..rows)
-        .map(|_| [-f64::INFINITY, -1.5, -0.0, 0.0, 2.25, f64::MAX][rng.random_range(0..6)])
+    let smalls: UInt16Array = (0..rows)
+        .map(|_| [0, 1, 255, 256, 40_000, u16::MAX][rng.random_range(0..6)])
         .map(Some)
         .collect();
     let bools: BooleanArray = (0..rows).map(|_| Some(rng.random_bool(0.5))).collect();
     vec![
         Arc::new(ints),
         Arc::new(strings),
-        Arc::new(floats),
+        Arc::new(smalls),
         Arc::new(bools),
     ]
 }
@@ -63,7 +63,7 @@ fn composite_encoder() -> KeyEncoder {
     KeyEncoder::new(vec![
         KeyField::new(DataType::Int64, true),
         KeyField::new(DataType::Utf8, true),
-        KeyField::new(DataType::Float64, false),
+        KeyField::new(DataType::UInt16, false),
         KeyField::new(DataType::Boolean, false),
     ])
     .expect("supported key types")
@@ -76,14 +76,14 @@ fn compare_rows(columns: &[ArrayRef], a: usize, b: usize) -> Ordering {
     use arrow_array::cast::AsArray;
     let ints = columns[0].as_primitive::<arrow_array::types::Int64Type>();
     let strings = columns[1].as_string::<i32>();
-    let floats = columns[2].as_primitive::<arrow_array::types::Float64Type>();
+    let smalls = columns[2].as_primitive::<arrow_array::types::UInt16Type>();
     let bools = columns[3].as_boolean();
     let int = |i: usize| ints.is_valid(i).then(|| ints.value(i));
     let string = |i: usize| strings.is_valid(i).then(|| strings.value(i).as_bytes());
     int(a)
         .cmp(&int(b))
         .then_with(|| string(a).cmp(&string(b)))
-        .then_with(|| floats.value(a).total_cmp(&floats.value(b)))
+        .then_with(|| smalls.value(a).cmp(&smalls.value(b)))
         .then_with(|| bools.value(a).cmp(&bools.value(b)))
 }
 
@@ -211,7 +211,8 @@ fn bind_rejects_mismatched_columns() {
 
 /// The streaming encoder produces exactly the verified escape
 /// (`escape_proof::escape_into`), so the prefix-freedom proved for the
-/// specification holds for the bytes stored in the trees.
+/// specification holds for the bytes stored in the runs. This test, not the
+/// proof, is what ties the streaming encoder to the specification.
 #[test]
 fn streaming_encoder_matches_the_verified_escape() {
     let mut rng = StdRng::seed_from_u64(0x5afe);
@@ -396,4 +397,19 @@ fn key_words_are_exact_for_keys_that_fit_eight_bytes() {
     );
     assert_eq!(got[0], got[2], "equal keys share a word");
     assert_ne!(got[0], got[1]);
+}
+
+/// Floating-point values SQL holds equal can differ in bits (`0.0` and `-0.0`,
+/// NaNs with different payloads), so a lookup encoding the bits would miss
+/// rows. Such a key is refused rather than indexed.
+#[test]
+fn floating_point_keys_are_refused() {
+    for data_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
+        assert_eq!(
+            KeyEncoder::new(vec![KeyField::new(data_type.clone(), false)]).err(),
+            Some(Error::UnsupportedType {
+                data_type: data_type.to_string(),
+            }),
+        );
+    }
 }

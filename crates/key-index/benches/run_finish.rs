@@ -39,24 +39,22 @@ limitations under the License.
 //! `RUN_FINISH_MODE`:
 //! - `finish` (default): one write's run over all the files.
 //! - `merge`: one run per file, merged to one run by repeated `merge_step`.
+//! - `restore`: one write's run over all the files, read back from its
+//!   persisted bytes (`IndexRun::from_bytes`), as a reopened table does.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::{ArrayRef, Int64Array, StringArray};
 use arrow_schema::DataType;
-use key_index::tiered::{RunBuilder, TieredIndex};
+use key_index::tiered::{IndexRun, RunBuilder, TieredIndex};
 use key_index::{KeyEncoder, KeyField};
+
+mod common;
+use common::{env, mix};
 
 /// Present keys each finish rep probes.
 const PROBES: usize = 200_000;
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
 
 fn tenant_service() -> bool {
     std::env::var("RUN_FINISH_KEY").is_ok_and(|key| key == "tenant_service")
@@ -79,13 +77,6 @@ fn encoder() -> KeyEncoder {
         vec![KeyField::new(DataType::Utf8, false)]
     };
     KeyEncoder::new(fields).expect("encoder")
-}
-
-fn mix(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
 }
 
 /// A shuffled permutation of `0..n`, deterministic.
@@ -332,14 +323,41 @@ fn load(file_rows: usize) {
     }
 }
 
+/// Reads one write's run back from its persisted bytes `reps` times.
+fn restore(ids: &[i64], file_rows: usize, reps: usize) {
+    let mut builder = RunBuilder::new(encoder());
+    for (file, chunk) in ids.chunks(file_rows).enumerate() {
+        add(&mut builder, &format!("f{file}.vortex"), chunk);
+    }
+    let bytes = builder.finish().expect("finish").to_bytes();
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let started = Instant::now();
+        let run = IndexRun::from_bytes(&bytes).expect("restore");
+        samples.push(started.elapsed());
+        assert_eq!(run.len(), ids.len());
+    }
+    samples.sort_unstable();
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "restore {:>9} rows, {:>6.1} MB: p50 {:>7.2} ms, p99 {:>7.2} ms, max {:>7.2} ms ({:.1} ns/row at p99)",
+        ids.len(),
+        bytes.len() as f64 / 1e6,
+        ms(at(0.5)),
+        ms(at(0.99)),
+        ms(samples[samples.len() - 1]),
+        at(0.99).as_nanos() as f64 / ids.len() as f64
+    );
+}
+
 fn main() {
     let sizes: Vec<usize> = std::env::var("RUN_FINISH_ROWS")
         .unwrap_or_else(|_| "1192000,5960000,17880000".to_string())
         .split(',')
         .map(|size| size.trim().parse().expect("row count"))
         .collect();
-    let reps = env_usize("RUN_FINISH_REPS", 3);
-    let file_rows = env_usize("RUN_FINISH_FILE_ROWS", 1_192_000);
+    let reps = env("RUN_FINISH_REPS", 3);
+    let file_rows = env("RUN_FINISH_FILE_ROWS", 1_192_000);
     let mode = std::env::var("RUN_FINISH_MODE").unwrap_or_else(|_| "finish".to_string());
     let key_order = std::env::var("RUN_FINISH_ORDER").is_ok_and(|order| order == "key");
     for rows in sizes {
@@ -369,6 +387,7 @@ fn main() {
                 return;
             }
             "merge" => merge(&ids, file_rows, reps),
+            "restore" => restore(&ids, file_rows, reps),
             _ => finish(&ids, file_rows, reps),
         }
     }

@@ -27,7 +27,6 @@ limitations under the License.
 //! | nullable, valid | `01` then the value's encoding |
 //! | signed integers, dates, times, timestamps, durations, `Decimal128` | big-endian, sign bit flipped |
 //! | unsigned integers | big-endian |
-//! | floats | IEEE bits mapped to a total order (as `f64::total_cmp`), then as signed |
 //! | `Boolean` | `00` or `01` |
 //! | `FixedSizeBinary` | the bytes as is |
 //! | strings and binaries (all offset sizes and views) | the bytes with `00` → `01 01` and `01` → `01 02`, then a `00` terminator |
@@ -43,14 +42,18 @@ limitations under the License.
 //! value (`Utf8`, `LargeUtf8` or `Utf8View`), because the encoding depends only
 //! on the value. The declared [`KeyField`] type still has to match the bound
 //! array exactly, so a mismatch is an error rather than a silent miss.
+//!
+//! Floating-point columns are refused. Values SQL holds equal can have
+//! different bits (`0.0` and `-0.0`, or NaNs with different payloads), so
+//! encoding the bits would make a lookup for one miss rows holding the other.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType, DurationMillisecondType,
-    DurationNanosecondType, DurationSecondType, Float32Type, Float64Type, Int8Type, Int16Type,
-    Int32Type, Int64Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
-    Time64NanosecondType, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    DurationNanosecondType, DurationSecondType, Int8Type, Int16Type, Int32Type, Int64Type,
+    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, GenericBinaryArray,
@@ -118,14 +121,9 @@ fn fixed_width(data_type: &DataType) -> Option<usize> {
     Some(match data_type {
         DataType::Int8 | DataType::UInt8 | DataType::Boolean => 1,
         DataType::Int16 | DataType::UInt16 => 2,
-        DataType::Int32
-        | DataType::UInt32
-        | DataType::Float32
-        | DataType::Date32
-        | DataType::Time32(_) => 4,
+        DataType::Int32 | DataType::UInt32 | DataType::Date32 | DataType::Time32(_) => 4,
         DataType::Int64
         | DataType::UInt64
-        | DataType::Float64
         | DataType::Date64
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
@@ -300,8 +298,6 @@ fn is_supported(data_type: &DataType) -> bool {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
             | DataType::Boolean
             | DataType::Date32
             | DataType::Date64
@@ -337,8 +333,6 @@ enum ColumnData<'a> {
     U16(&'a [u16]),
     U32(&'a [u32]),
     U64(&'a [u64]),
-    F32(&'a [f32]),
-    F64(&'a [f64]),
     Bool(&'a BooleanArray),
     Binary(&'a GenericBinaryArray<i32>),
     LargeBinary(&'a GenericBinaryArray<i64>),
@@ -360,8 +354,6 @@ impl<'a> ColumnData<'a> {
             DataType::UInt16 => Self::U16(array.as_primitive::<UInt16Type>().values()),
             DataType::UInt32 => Self::U32(array.as_primitive::<UInt32Type>().values()),
             DataType::UInt64 => Self::U64(array.as_primitive::<UInt64Type>().values()),
-            DataType::Float32 => Self::F32(array.as_primitive::<Float32Type>().values()),
-            DataType::Float64 => Self::F64(array.as_primitive::<Float64Type>().values()),
             DataType::Boolean => Self::Bool(array.as_boolean()),
             DataType::Date32 => Self::I32(array.as_primitive::<Date32Type>().values()),
             DataType::Date64 => Self::I64(array.as_primitive::<Date64Type>().values()),
@@ -542,18 +534,6 @@ fn fixed<const N: usize>(marked: bool, bytes: [u8; N]) -> Run<'static> {
     Run::inline(&buf[..start + N])
 }
 
-#[inline]
-fn f32_key(value: f32) -> i32 {
-    let bits = value.to_bits().cast_signed();
-    bits ^ ((bits >> 31).cast_unsigned() >> 1).cast_signed()
-}
-
-#[inline]
-fn f64_key(value: f64) -> i64 {
-    let bits = value.to_bits().cast_signed();
-    bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed()
-}
-
 impl<'a> KeySource<'a> for RowKeySource<'_, 'a> {
     #[inline]
     fn next_run(&mut self) -> Option<Run<'a>> {
@@ -648,14 +628,6 @@ impl<'a> KeySource<'a> for RowKeySource<'_, 'a> {
                 ColumnData::U16(v) => fixed(marked, v[row].to_be_bytes()),
                 ColumnData::U32(v) => fixed(marked, v[row].to_be_bytes()),
                 ColumnData::U64(v) => fixed(marked, v[row].to_be_bytes()),
-                ColumnData::F32(v) => fixed(
-                    marked,
-                    (f32_key(v[row]).cast_unsigned() ^ (1 << 31)).to_be_bytes(),
-                ),
-                ColumnData::F64(v) => fixed(
-                    marked,
-                    (f64_key(v[row]).cast_unsigned() ^ (1 << 63)).to_be_bytes(),
-                ),
                 ColumnData::Bool(v) => fixed(marked, [u8::from(v.value(row))]),
                 ColumnData::FixedBinary(v) => {
                     self.pending = Pending::Raw(v.value(row));

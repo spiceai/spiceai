@@ -213,15 +213,3 @@ pub fn p50_p99(samples: &mut [f64], digits: usize) -> String {
     let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
     format!("{:.digits$} / {:.digits$}", at(0.5), at(0.99))
 }
-
-/// `p50 / p99 / p99.9` of `samples`.
-pub fn p50_p99_p999(samples: &mut [f64], digits: usize) -> String {
-    samples.sort_by(f64::total_cmp);
-    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
-    format!(
-        "{:.digits$} / {:.digits$} / {:.digits$}",
-        at(0.5),
-        at(0.99),
-        at(0.999)
-    )
-}

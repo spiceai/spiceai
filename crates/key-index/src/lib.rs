@@ -24,7 +24,9 @@ limitations under the License.
 //! first) and prefix-free per column, so the concatenation of a compound key's
 //! columns is injective: two distinct key tuples never encode to the same
 //! bytes. Arrow's row format is not used. `escape_proof` machine-checks the
-//! prefix-freedom.
+//! prefix-freedom of the encoding's specification and of a verified escape;
+//! the streaming encoder that writes keys is tied to that verified escape by
+//! a differential test, not by the proof.
 //!
 //! An index stores a 64-bit word per key ([`KeyEncoder::key_word`]): the
 //! key's own bytes when its fields are fixed-width and fit 8 bytes, so
@@ -41,12 +43,19 @@ limitations under the License.
 //!   a reader uses the index only for the files a live run covers.
 
 mod encode;
-pub mod escape_proof;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the verified escape the streaming encoder is tested against; only tests call it"
+    )
+)]
+mod escape_proof;
 pub mod persist;
 mod source;
 pub mod tiered;
-pub mod varint;
-pub mod word_proof;
+mod varint;
+mod word_proof;
 
 #[cfg(test)]
 mod proptests;
@@ -54,7 +63,6 @@ mod proptests;
 mod tests;
 
 pub use encode::{BoundKeyColumns, KeyEncoder, KeyField, RowKeySource};
-pub use source::{KeySource, Run};
 
 /// One row's encoded key, owned.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
