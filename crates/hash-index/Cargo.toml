@@ -23,7 +23,7 @@ twox-hash.workspace = true
 # `cargo build` erases the specifications, so this carries no runtime cost;
 # `cargo verus focus` re-checks the proofs. Pinned to the Verus release whose
 # verifier is run in CI — the two are versioned together.
-vstd = "=0.0.0-2026-08-30-0159"
+vstd = "=0.0.0-2026-09-20-0158"
 
 [features]
 default = []

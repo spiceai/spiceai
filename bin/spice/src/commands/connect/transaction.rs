@@ -2002,12 +2002,12 @@ mod tests {
             self.interactive
         }
 
-        async fn read_enrollment_key(
+        fn read_enrollment_key(
             &mut self,
             _portal_url: &str,
-        ) -> Result<Option<Zeroizing<String>>> {
+        ) -> impl Future<Output = Result<Option<Zeroizing<String>>>> {
             self.key_prompts += 1;
-            Ok(self.key.take().map(Zeroizing::new))
+            std::future::ready(Ok(self.key.take().map(Zeroizing::new)))
         }
     }
 
@@ -2028,10 +2028,10 @@ mod tests {
             true
         }
 
-        async fn read_enrollment_key(
+        fn read_enrollment_key(
             &mut self,
             _portal_url: &str,
-        ) -> Result<Option<Zeroizing<String>>> {
+        ) -> impl Future<Output = Result<Option<Zeroizing<String>>>> {
             // What another process does when it takes the transaction: the
             // operation this run routed on is gone, and either a different one is
             // pending in its place or nothing is.
@@ -2048,7 +2048,7 @@ mod tests {
                 )
                 .expect("publish the replacement draft");
             }
-            Ok(self.key.take().map(Zeroizing::new))
+            std::future::ready(Ok(self.key.take().map(Zeroizing::new)))
         }
     }
 

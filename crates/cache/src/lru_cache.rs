@@ -204,6 +204,35 @@ impl<
         self
     }
 
+    /// Refresh the item-count, size and hit-ratio metrics after a store, at
+    /// most once every 5 seconds across all callers.
+    async fn report_metrics_after_put(&self) {
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
+
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
+            V::record_max_size(self.max_size() as u64);
+
+            let hits = self.hits.load(Ordering::Relaxed);
+            let total = self.total_requests.load(Ordering::Relaxed);
+            V::update_hit_ratio(hits, total);
+        }
+    }
+
     /// `(hits, total_requests)` as fed to the hit-ratio gauge.
     #[cfg(test)]
     pub(crate) fn hit_ratio_counters(&self) -> (u64, u64) {
@@ -274,31 +303,12 @@ impl<
 
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.backend.insert(*key, value).await;
+        self.report_metrics_after_put().await;
+    }
 
-        let now_seconds = self.initial_instant.elapsed().as_secs();
-        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
-
-        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
-        // performance is comparable with relaxed load/store
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count().await);
-            V::record_size(self.size_bytes().await);
-            V::record_max_size(self.max_size() as u64);
-
-            let hits = self.hits.load(Ordering::Relaxed);
-            let total = self.total_requests.load(Ordering::Relaxed);
-            V::update_hit_ratio(hits, total);
-        }
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, weight: usize) {
+        self.backend.insert_with_weight(*key, value, weight).await;
+        self.report_metrics_after_put().await;
     }
 
     async fn replace_if(
