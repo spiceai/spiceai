@@ -2987,10 +2987,12 @@ impl DataFusion {
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let source_constraints = match &*source_table_provider {
-            FederatedTable::Immediate(table_provider) => table_provider.constraints(),
-            FederatedTable::Deferred(_) => None,
-        };
+        //
+        // While the source is unreachable (a deferred provider), the primary key the
+        // acceleration was built with stands in, so writes after the source returns
+        // match the existing keyed table.
+        let source_constraints = source_table_provider.constraints();
+        let source_constraints = source_constraints.as_ref();
 
         // PK/unique/index column names feed the schema-evolution classifier's
         // constraint guard: constraint columns must never be widened in place.
@@ -3097,6 +3099,25 @@ impl DataFusion {
                 (accelerated_table_provider, None)
             };
 
+        // If the source is deferred (e.g. a Databricks U2M connector that hasn't been triggered
+        // yet), the `FederatedTable` holds only a placeholder schema/provider — not a real
+        // access-verified source. In that case, force `OnLoad` so the dataset isn't marked ready
+        // with a fake schema. Once the deferred connector is triggered, the source will be
+        // re-initialized with a real provider.
+        let effective_ready_state = if source.as_any().is::<DeferredConnector>() {
+            if dataset.ready_state != ReadyState::OnLoad {
+                tracing::warn!(
+                    "Dataset {dataset_name}: configured ready_state '{configured}' is overridden to '{forced}' because the source connector is deferred (e.g. awaiting interactive auth); the dataset will be marked ready only after the initial load completes.",
+                    dataset_name = dataset.name,
+                    configured = dataset.ready_state,
+                    forced = ReadyState::OnLoad,
+                );
+            }
+            ReadyState::OnLoad
+        } else {
+            dataset.ready_state
+        };
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -3125,8 +3146,16 @@ impl DataFusion {
                 || matches!(refresh_mode, RefreshMode::Changes);
 
             if !delay_initial_ready {
-                self.runtime_status
-                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                // The existing acceleration serves scans from here on. Readiness under
+                // `ready_state: on_schema_resolved` also promises the source was reached,
+                // so while the source is still unresolved the accelerated table's builder
+                // marks the dataset ready once it resolves instead.
+                let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
+                    && matches!(&*source_table_provider, FederatedTable::Deferred(_));
+                if !awaits_source {
+                    self.runtime_status
+                        .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                }
                 initial_load_complete = true;
             }
         }
@@ -3287,24 +3316,6 @@ impl DataFusion {
 
         accelerated_table_builder.refresh_on_startup(acceleration_settings.refresh_on_startup);
 
-        // If the source is deferred (e.g. a Databricks U2M connector that hasn't been triggered
-        // yet), the `FederatedTable` holds only a placeholder schema/provider — not a real
-        // access-verified source. In that case, force `OnLoad` so the dataset isn't marked ready
-        // with a fake schema. Once the deferred connector is triggered, the source will be
-        // re-initialized with a real provider.
-        let effective_ready_state = if source.as_any().is::<DeferredConnector>() {
-            if dataset.ready_state != ReadyState::OnLoad {
-                tracing::warn!(
-                    "Dataset {dataset_name}: configured ready_state '{configured}' is overridden to '{forced}' because the source connector is deferred (e.g. awaiting interactive auth); the dataset will be marked ready only after the initial load completes.",
-                    dataset_name = dataset.name,
-                    configured = dataset.ready_state,
-                    forced = ReadyState::OnLoad,
-                );
-            }
-            ReadyState::OnLoad
-        } else {
-            dataset.ready_state
-        };
         accelerated_table_builder.ready_state(effective_ready_state);
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));

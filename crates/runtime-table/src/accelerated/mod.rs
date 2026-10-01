@@ -68,6 +68,7 @@ use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod caching_eviction;
+pub mod checkpoint_primary_key;
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;

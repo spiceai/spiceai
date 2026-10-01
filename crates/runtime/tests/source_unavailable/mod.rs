@@ -22,7 +22,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -50,11 +50,16 @@ use crate::{
 /// A source whose connector cannot be built while it is down, failing the way the
 /// `PostgreSQL` and `MySQL` connectors do when their database refuses the
 /// connection: with `UnableToConnectInvalidHostOrPort`, raised from `create()`.
+///
+/// It can also be slow (every `read_provider` waits `read_delay_ms` first) and can
+/// report a primary key on `id`, the way `DynamoDB` reports its key schema.
 struct UnreachableSource {
     prefix: &'static str,
     up: AtomicBool,
     connect_attempts: AtomicUsize,
     value: AtomicUsize,
+    read_delay_ms: AtomicU64,
+    primary_key: AtomicBool,
 }
 
 impl UnreachableSource {
@@ -64,11 +69,32 @@ impl UnreachableSource {
             up: AtomicBool::new(false),
             connect_attempts: AtomicUsize::new(0),
             value: AtomicUsize::new(value),
+            read_delay_ms: AtomicU64::new(0),
+            primary_key: AtomicBool::new(false),
         })
     }
 
     fn bring_up(&self) {
         self.up.store(true, Ordering::SeqCst);
+    }
+
+    fn take_down(&self) {
+        self.up.store(false, Ordering::SeqCst);
+    }
+
+    fn set_value(&self, value: usize) {
+        self.value.store(value, Ordering::SeqCst);
+    }
+
+    fn set_read_delay(&self, delay: Duration) {
+        self.read_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn report_primary_key(&self) {
+        self.primary_key.store(true, Ordering::SeqCst);
     }
 
     fn connect_attempts(&self) -> usize {
@@ -92,7 +118,14 @@ impl UnreachableSource {
                 Arc::new(Int32Array::from(vec![value; 3])),
             ],
         )?;
-        MemTable::try_new(Self::schema(), vec![vec![batch]])
+        let table = MemTable::try_new(Self::schema(), vec![vec![batch]])?;
+        Ok(if self.primary_key.load(Ordering::SeqCst) {
+            table.with_constraints(datafusion::common::Constraints::new_unverified(vec![
+                datafusion::common::Constraint::PrimaryKey(vec![0]),
+            ]))
+        } else {
+            table
+        })
     }
 
     async fn register(self: &Arc<Self>) {
@@ -122,6 +155,10 @@ impl DataConnector for UnreachableSourceConnector {
         _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
+        let delay = self.source.read_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let table =
             self.source
                 .table()
@@ -256,4 +293,366 @@ async fn a_dataset_whose_source_is_down_at_startup_loads_once_the_source_is_reac
 
     loader.abort();
     Ok(())
+}
+
+/// Accelerated datasets whose acceleration is already on disk when the runtime
+/// starts with the source down or slow (#14610).
+#[cfg(feature = "duckdb")]
+mod served_from_acceleration {
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
+    use app::AppBuilder;
+    use arrow::array::Int64Array;
+    use runtime::{Runtime, status::ComponentStatus};
+    use spicepod::{
+        acceleration::{Acceleration, Mode, RefreshMode},
+        component::dataset::{Dataset as SpicepodDataset, ReadyState},
+        param::Params,
+        semantic::Column,
+    };
+    use tempfile::TempDir;
+
+    use super::{UnreachableSource, dataset_status};
+    use crate::{
+        configure_test_datafusion, init_tracing,
+        utils::{run_query, wait_until_true},
+    };
+
+    /// A `DuckDB` file acceleration that refreshes every second, so a refresh is due
+    /// as soon as the runtime restarts.
+    fn dataset(prefix: &str, duckdb_file: &Path, ready_state: ReadyState) -> SpicepodDataset {
+        let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
+        dataset.ready_state = ready_state;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            refresh_check_interval: Some("1s".to_string()),
+            params: Some(Params::from_string_map(HashMap::from([(
+                "duckdb_file".to_string(),
+                duckdb_file.to_string_lossy().to_string(),
+            )]))),
+            ..Default::default()
+        });
+        dataset
+    }
+
+    /// `dataset` with every column's type declared, which makes an
+    /// `on_registration` dataset eligible for deferred initialization.
+    fn with_declared_columns(mut dataset: SpicepodDataset) -> SpicepodDataset {
+        dataset.columns = ["id", "v"]
+            .into_iter()
+            .map(|name| {
+                let mut column = Column::new(name);
+                column.r#type = Some("int".to_string());
+                column
+            })
+            .collect();
+        dataset
+    }
+
+    async fn start(dataset: SpicepodDataset) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        let app = AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .build();
+        configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        (rt, loader)
+    }
+
+    async fn stop(rt: Arc<Runtime>, loader: tokio::task::JoinHandle<()>) {
+        rt.shutdown().await;
+        loader.abort();
+    }
+
+    /// `(SUM(v), COUNT(*))` of `orders`, or `None` when the query fails.
+    async fn sum_and_count(rt: &Arc<Runtime>) -> Option<(i64, i64)> {
+        query_sum_and_count(rt).await.ok()
+    }
+
+    /// `(SUM(v), COUNT(*))` of `orders`, or why the query failed.
+    async fn query_sum_and_count(rt: &Arc<Runtime>) -> Result<(i64, i64), String> {
+        let batches = run_query(
+            rt,
+            "SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders",
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let batch = batches.first().ok_or("no batches")?;
+        let sum = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("SUM(v) is not Int64")?;
+        let count = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("COUNT(*) is not Int64")?;
+        Ok((sum.value(0), count.value(0)))
+    }
+
+    /// Builds the acceleration from the source (three rows, `v = 1`) and stops the
+    /// runtime once the load has completed.
+    async fn seed(
+        source: &Arc<UnreachableSource>,
+        dataset: SpicepodDataset,
+    ) -> Result<(), anyhow::Error> {
+        source.bring_up();
+        let (rt, loader) = start(dataset).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            sum_and_count(&rt).await == Some((3, 3))
+                && dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = sum_and_count(&rt).await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the acceleration, got {observed:?}");
+        Ok(())
+    }
+
+    /// Restarts with the source down and its data changed to `v = 2`.
+    async fn restart_with_source_down(
+        source: &Arc<UnreachableSource>,
+        dataset: SpicepodDataset,
+    ) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        source.take_down();
+        source.set_value(2);
+        start(dataset).await
+    }
+
+    async fn served_from_acceleration(rt: &Arc<Runtime>, within: Duration) -> bool {
+        wait_until_true(within, || async { sum_and_count(rt).await == Some((3, 3)) }).await
+    }
+
+    async fn refreshed_from_source(rt: &Arc<Runtime>) -> bool {
+        wait_until_true(Duration::from_secs(30), || async {
+            sum_and_count(rt).await == Some((6, 3))
+        })
+        .await
+    }
+
+    /// `ready_state: on_load` with the source down: queries are answered from the
+    /// existing acceleration and the runtime reports ready, instead of the dataset
+    /// staying unregistered; once the source is back the refresh brings the data up
+    /// to date.
+    #[tokio::test]
+    async fn an_acceleration_is_served_and_ready_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("served-while-down", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        let spec = || {
+            dataset(
+                source.prefix,
+                &dir.path().join("orders.duckdb"),
+                ReadyState::OnLoad,
+            )
+        };
+        seed(&source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "queries must be answered from the existing acceleration, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            rt.status().is_ready(),
+            "on_load is ready once the existing acceleration can serve"
+        );
+
+        source.bring_up();
+        assert!(
+            refreshed_from_source(&rt).await,
+            "the refresh must bring the data up to date once the source is back, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// `ready_state: on_schema_resolved` promises the source has been reached, so
+    /// the runtime is not ready while it is down — but queries are still answered
+    /// from the existing acceleration.
+    #[tokio::test]
+    async fn on_schema_resolved_serves_the_acceleration_but_waits_for_the_source_to_be_ready()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("schema-resolved-while-down", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        let spec = || {
+            dataset(
+                source.prefix,
+                &dir.path().join("orders.duckdb"),
+                ReadyState::OnSchemaResolved,
+            )
+        };
+        seed(&source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "queries must be answered from the existing acceleration, got {:?}",
+            sum_and_count(&rt).await
+        );
+        assert!(
+            !rt.status().is_ready(),
+            "on_schema_resolved must not report ready before the source is reached ({:?})",
+            dataset_status(&rt, "orders")
+        );
+
+        source.bring_up();
+        let ready =
+            wait_until_true(Duration::from_secs(30), || async { rt.status().is_ready() }).await;
+        assert!(
+            ready,
+            "on_schema_resolved is ready once the source is reached ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(refreshed_from_source(&rt).await);
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A deferred dataset (`on_registration` with typed `columns:`) still does not
+    /// contact its source at startup, and its first query is answered from the
+    /// existing acceleration rather than failing on the unreachable source.
+    #[tokio::test]
+    async fn a_deferred_dataset_does_not_contact_its_source_at_startup_and_serves_its_acceleration()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("deferred-while-down", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        let duckdb_file = dir.path().join("orders.duckdb");
+        let spec = || {
+            with_declared_columns(dataset(
+                source.prefix,
+                &duckdb_file,
+                ReadyState::OnRegistration,
+            ))
+        };
+        // Build the acceleration the way a previous run would have. Seeding with the
+        // deferred spec itself would not do: under `on_registration` a query is answered
+        // by the source before the acceleration has loaded.
+        seed(
+            &source,
+            dataset(source.prefix, &duckdb_file, ReadyState::OnLoad),
+        )
+        .await?;
+        let attempts_before_restart = source.connect_attempts();
+
+        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+        let registered = wait_until_true(Duration::from_secs(10), || async {
+            dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(registered, "the deferred dataset registers at startup");
+        assert_eq!(
+            source.connect_attempts(),
+            attempts_before_restart,
+            "a deferred dataset must not contact its source at startup"
+        );
+
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "the first query must be answered from the existing acceleration, got {:?}",
+            query_sum_and_count(&rt).await
+        );
+
+        source.bring_up();
+        assert!(
+            refreshed_from_source(&rt).await,
+            "once the source is back the refresh brings the data up to date, got {:?}",
+            sum_and_count(&rt).await
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A source that is reachable but slow to answer does not hold the dataset
+    /// unregistered: queries are answered from the existing acceleration after a
+    /// short wait, and the data catches up once the source answers.
+    #[tokio::test]
+    async fn a_slow_source_does_not_hold_back_an_acceleration() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("slow-source", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        let spec = || {
+            dataset(
+                source.prefix,
+                &dir.path().join("orders.duckdb"),
+                ReadyState::OnLoad,
+            )
+        };
+        seed(&source, spec()).await?;
+
+        source.set_value(2);
+        source.set_read_delay(Duration::from_secs(6));
+        let (rt, loader) = start(spec()).await;
+
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(5)).await,
+            "a slow source must not keep the acceleration from serving, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            refreshed_from_source(&rt).await,
+            "the data catches up once the slow source answers, got {:?}",
+            sum_and_count(&rt).await
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A source that reports a primary key creates the acceleration's table with
+    /// it. Registering while the source is down used to build the accelerator
+    /// without the key, so every refresh after the source returned failed with
+    /// "Primary keys do not match" and the data stayed stale. The key is now
+    /// recovered from the checkpoint.
+    #[tokio::test]
+    async fn a_keyed_acceleration_refreshes_after_its_source_returns() -> Result<(), anyhow::Error>
+    {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("keyed-while-down", 1);
+        source.report_primary_key();
+        source.register().await;
+        let dir = TempDir::new()?;
+        let spec = || {
+            dataset(
+                source.prefix,
+                &dir.path().join("orders.duckdb"),
+                ReadyState::OnLoad,
+            )
+        };
+        seed(&source, spec()).await?;
+
+        let (rt, loader) = restart_with_source_down(&source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+
+        source.bring_up();
+        assert!(
+            refreshed_from_source(&rt).await,
+            "a keyed acceleration must refresh once its source is back, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        assert_eq!(dataset_status(&rt, "orders"), Some(ComponentStatus::Ready));
+        stop(rt, loader).await;
+        Ok(())
+    }
 }

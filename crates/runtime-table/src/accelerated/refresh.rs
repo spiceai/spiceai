@@ -858,7 +858,13 @@ impl Refresher {
         // Captured once for the start-time checkpoint schema AND threaded into the
         // snapshot tasks so they can re-derive the canonical schema from the LIVE
         // accelerator at each checkpoint (live schema evolution under CDC).
-        let federated_schema = self.federated.schema();
+        // The checkpoint also records the primary key the acceleration was built
+        // with, so a registration without the source can rebuild it (see
+        // `checkpoint_primary_key`).
+        let federated_schema = super::checkpoint_primary_key::with_acceleration_primary_key(
+            self.federated.schema(),
+            &self.accelerator,
+        );
         let checkpoint_schema =
             canonical_checkpoint_schema(&self.accelerator.schema(), &federated_schema);
 
