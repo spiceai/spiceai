@@ -132,7 +132,7 @@ struct Routed {
 
 /// Assigns each batch of an overwrite to a layer; see the module documentation.
 pub(crate) struct LayerSplitter {
-    resolver: KeyResolver,
+    resolver: Arc<KeyResolver>,
     /// 64-bit hashes of the current layer's keys. Exact up to a hash collision,
     /// which only starts a layer early, and it grows with the layer instead of
     /// being sized in advance; a chain of bloom filters would sum its filters'
@@ -152,7 +152,7 @@ pub(crate) struct LayerSplitter {
 
 impl LayerSplitter {
     pub(crate) fn new(
-        resolver: KeyResolver,
+        resolver: Arc<KeyResolver>,
         max_layer_rows: usize,
         reservation: MemoryReservation,
     ) -> Self {
@@ -162,7 +162,7 @@ impl LayerSplitter {
     /// Split an append, whose layers supersede by snapshot, without recording
     /// the keys that may supersede an earlier layer's.
     pub(crate) fn for_append(
-        resolver: KeyResolver,
+        resolver: Arc<KeyResolver>,
         max_layer_rows: usize,
         reservation: MemoryReservation,
     ) -> Self {
@@ -170,7 +170,7 @@ impl LayerSplitter {
     }
 
     fn with_superseding(
-        resolver: KeyResolver,
+        resolver: Arc<KeyResolver>,
         max_layer_rows: usize,
         reservation: MemoryReservation,
         track_superseding: bool,
@@ -613,7 +613,7 @@ mod tests {
         window: Option<CollapseWindow>,
     ) -> (Vec<Vec<(i64, String)>>, Vec<Vec<u128>>) {
         let splitter = LayerSplitter::new(
-            resolver(ConflictPolicy::UpsertKeepLast),
+            Arc::new(resolver(ConflictPolicy::UpsertKeepLast)),
             max_layer_rows,
             reservation(),
         );

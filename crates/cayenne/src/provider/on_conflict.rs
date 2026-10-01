@@ -1243,10 +1243,21 @@ pub(crate) struct OnConflictContext<'a> {
     /// this checkout — the common case.
     pub(crate) pending: Option<&'a PendingPkExistence>,
     pub(crate) incoming_keys: &'a HashSet<u128, PrehashedBuildHasher>,
-    /// Whether a key an earlier batch of this write already holds is kept as a
-    /// later copy rather than rejected. Its earlier copy is the writer's to drop,
-    /// and the stored row the earlier copy superseded is already deleted.
-    pub(crate) supersede_repeats: bool,
+    /// What to do with a key an earlier batch of this write already holds.
+    pub(crate) cross_batch_repeats: CrossBatchRepeats,
+}
+
+/// What validation does with a key an earlier batch of the same write already
+/// holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CrossBatchRepeats {
+    /// Fail the write.
+    #[default]
+    Reject,
+    /// Keep the later copy, for a writer that drops the earlier copy itself. The
+    /// stored row the earlier copy superseded is already deleted, so the later
+    /// copy records no second delete.
+    KeepLaterCopy,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -1259,8 +1270,8 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) upsert_options: UpsertOptions,
     existing_keys: Option<CachedPkIndex>,
     pub(crate) incoming_keys: HashSet<u128, PrehashedBuildHasher>,
-    /// See [`OnConflictContext::supersede_repeats`].
-    supersede_repeats: bool,
+    /// See [`OnConflictContext::cross_batch_repeats`].
+    cross_batch_repeats: CrossBatchRepeats,
     pub(crate) kept_keys: PkDigestSet,
     pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
     pub(crate) deleted_pk_i64: Vec<i64>,
@@ -1312,7 +1323,7 @@ impl OnConflictValidationStream {
             upsert_options,
             existing_keys: Some(existing_keys),
             incoming_keys: HashSet::with_capacity_and_hasher(1024, PrehashedBuildHasher),
-            supersede_repeats: false,
+            cross_batch_repeats: CrossBatchRepeats::Reject,
             kept_keys: PkDigestSet::with_capacity(1024),
             delete_specs: HashMap::new(),
             deleted_pk_i64: Vec::new(),
@@ -1326,11 +1337,9 @@ impl OnConflictValidationStream {
         }
     }
 
-    /// Keep a key an earlier batch already holds as a later copy, for a writer
-    /// that drops the earlier copy itself; see
-    /// [`OnConflictContext::supersede_repeats`].
-    pub(crate) fn superseding_repeats(mut self) -> Self {
-        self.supersede_repeats = true;
+    /// Set what validation does with a key an earlier batch already holds.
+    pub(crate) fn with_cross_batch_repeats(mut self, repeats: CrossBatchRepeats) -> Self {
+        self.cross_batch_repeats = repeats;
         self
     }
 
@@ -1372,7 +1381,7 @@ impl OnConflictValidationStream {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
-            supersede_repeats: self.supersede_repeats,
+            cross_batch_repeats: self.cross_batch_repeats,
         };
 
         let validation_start = Instant::now();

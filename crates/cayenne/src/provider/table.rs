@@ -7622,9 +7622,23 @@ impl CayenneTableProvider {
         strategy: &PkDeletionStrategyWithCache,
         session_config: &SessionConfig,
     ) -> ListingOptions {
-        let file_format: Arc<dyn FileFormat> = Arc::new(
-            vortex_format.with_access_plan_provider(Self::position_deletion_plans(strategy)),
-        );
+        Self::create_listing_options_with_positions(
+            vortex_format,
+            Arc::clone(strategy.position_cache()),
+            session_config,
+        )
+    }
+
+    /// [`Self::create_listing_options`] over the position-delete vectors in
+    /// `positions` rather than the table's own.
+    fn create_listing_options_with_positions(
+        vortex_format: &Arc<VortexFormat>,
+        positions: Arc<ArcSwap<PositionBitmap>>,
+        session_config: &SessionConfig,
+    ) -> ListingOptions {
+        let file_format: Arc<dyn FileFormat> = Arc::new(vortex_format.with_access_plan_provider(
+            Arc::new(PositionDeletionAccessPlanProvider::new(positions)),
+        ));
         ListingOptions::new(file_format).with_session_config_options(session_config)
     }
 
@@ -12945,16 +12959,12 @@ impl CayenneTableProvider {
         }
         let ctx = self.create_session_context();
         let state = ctx.state();
-        let format: Arc<dyn FileFormat> = Arc::new(
-            self.context
-                .file_format()
-                .with_access_plan_provider(Arc::new(PositionDeletionAccessPlanProvider::new(
-                    Arc::new(ArcSwap::from_pointee(deletions)),
-                ))),
-        );
-        let options = ListingOptions::new(format)
-            .with_session_config_options(state.config())
-            .with_collect_stat(false);
+        let options = Self::create_listing_options_with_positions(
+            self.context.file_format(),
+            Arc::new(ArcSwap::from_pointee(deletions)),
+            state.config(),
+        )
+        .with_collect_stat(false);
         let config = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(options)
             .with_schema(self.table_schema());
@@ -12967,38 +12977,61 @@ impl CayenneTableProvider {
             .map_err(|err| invalid(format!("failed to read superseded files: {err}")))
     }
 
-    /// Delete the files at `locations` from an unpublished snapshot.
+    /// Delete the files at `locations` from an unpublished snapshot, and release
+    /// what the Vortex caches hold for them: the fold reads them first.
     pub(crate) async fn remove_snapshot_files(
         &self,
         snapshot_id: &str,
-        locations: impl IntoIterator<Item = &String>,
+        locations: Vec<ObjectStorePath>,
     ) -> Result<()> {
-        let invalid = |message: String| Error::Internal {
-            table: self.table_metadata.table_name.clone(),
-            message,
-        };
+        let table_name = self.table_metadata.table_name.clone();
         let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
         ))
-        .map_err(|err| invalid(format!("invalid snapshot URL: {err}")))?;
+        .map_err(|err| Error::Internal {
+            table: table_name.clone(),
+            message: format!("invalid snapshot URL: {err}"),
+        })?;
         let store = self
             .context
             .runtime_env()
             .object_store(&table_url)
-            .map_err(|err| invalid(format!("failed to resolve object store: {err}")))?;
-        for location in locations {
-            store
-                .delete(&object_store::path::Path::from(location.as_str()))
-                .await
-                .map_err(|err| {
-                    invalid(format!(
-                        "failed to delete superseded file {location}: {err}"
-                    ))
-                })?;
+            .map_err(|err| Error::Internal {
+                table: table_name.clone(),
+                message: format!("failed to resolve object store: {err}"),
+            })?;
+        let mut deletes = stream::iter(locations.into_iter().map(|location| {
+            let store = Arc::clone(&store);
+            async move {
+                match store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(location),
+                    Err(source) => Err(source),
+                }
+            }
+        }))
+        .buffer_unordered(OBJECT_STORE_MOVE_CONCURRENCY);
+        let mut removed = HashSet::new();
+        let mut first_error = None;
+        while let Some(result) = deletes.next().await {
+            match result {
+                Ok(location) => {
+                    removed.insert(location);
+                }
+                Err(source) if first_error.is_none() => first_error = Some(source),
+                Err(_) => {}
+            }
         }
-        Ok(())
+        self.invalidate_retired_paths(removed).await;
+        match first_error {
+            Some(source) => Err(Error::ObjectStore {
+                operation: "delete superseded files",
+                table: table_name,
+                source,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Returns the column indices for the configured primary key, if any.
@@ -14198,7 +14231,12 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(stream, false).await
+        self.prepare_stream_for_insert_inner(
+            stream,
+            false,
+            super::on_conflict::CrossBatchRepeats::Reject,
+        )
+        .await
     }
 
     /// Off-lock variant for conditional-commit staging: validates against a
@@ -14208,19 +14246,23 @@ impl CayenneTableProvider {
     /// concurrency is re-checked at commit; a private keyset that is stale by
     /// commit is caught there (the transaction's sequence gate aborts).
     ///
-    /// A key an earlier batch already holds is kept as a later copy rather than
-    /// rejected: the staging writer folds the earlier copies out of its snapshot.
+    /// `repeats` says what to do with a key an earlier batch already holds;
+    /// [`super::on_conflict::CrossBatchRepeats::KeepLaterCopy`] is only for a
+    /// writer that folds the earlier copies out of its snapshot itself.
     pub(crate) async fn prepare_stream_for_insert_offlock(
         &self,
         stream: SendableRecordBatchStream,
+        repeats: super::on_conflict::CrossBatchRepeats,
     ) -> Result<PreparedInsertStream> {
-        self.prepare_stream_for_insert_inner(stream, true).await
+        self.prepare_stream_for_insert_inner(stream, true, repeats)
+            .await
     }
 
     async fn prepare_stream_for_insert_inner(
         &self,
         stream: SendableRecordBatchStream,
         offlock: bool,
+        repeats: super::on_conflict::CrossBatchRepeats,
     ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(PreparedInsertStream::immediate(stream));
@@ -14290,12 +14332,8 @@ impl CayenneTableProvider {
             on_conflict,
             Arc::clone(&post_validation),
             pk_checkout,
-        );
-        let validation_stream = if offlock {
-            validation_stream.superseding_repeats()
-        } else {
-            validation_stream
-        };
+        )
+        .with_cross_batch_repeats(repeats);
 
         Ok(PreparedInsertStream::deferred(
             Box::pin(validation_stream) as SendableRecordBatchStream,
@@ -14805,7 +14843,7 @@ impl CayenneTableProvider {
             }
 
             if ctx.incoming_keys.contains(&digest) {
-                if ctx.supersede_repeats {
+                if ctx.cross_batch_repeats == super::on_conflict::CrossBatchRepeats::KeepLaterCopy {
                     keep_mask.push(true);
                     continue;
                 }
@@ -15256,7 +15294,7 @@ impl CayenneTableProvider {
                 existing: index.existence_ref(s),
                 pending: pending_existence.as_ref(),
                 incoming_keys: &incoming_keys,
-                supersede_repeats: false,
+                cross_batch_repeats: super::on_conflict::CrossBatchRepeats::Reject,
             };
             let result = self.apply_on_conflict_to_batch(hit_batch, &mut ctx)?;
             for (file_path, rows) in result.delete_specs {
@@ -69046,7 +69084,7 @@ mod tests {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &incoming_keys,
-            supersede_repeats: false,
+            cross_batch_repeats: crate::provider::on_conflict::CrossBatchRepeats::Reject,
         };
 
         let result = provider

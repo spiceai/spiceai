@@ -655,15 +655,7 @@ impl ColumnStatsAccumulator {
         }
 
         // Merge per-column NDV sketches (register-wise max).
-        for (idx, other_hll) in other_ndv.into_iter().enumerate() {
-            let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
-                continue;
-            };
-            match slot {
-                Some(hll) => hll.merge(&other_hll),
-                None => *slot = Some(other_hll),
-            }
-        }
+        Self::merge_ndv(&mut state, other_ndv);
     }
 
     /// Merge only `other`'s NDV sketches, leaving the row count and min/max/null
@@ -682,6 +674,10 @@ impl ColumnStatsAccumulator {
             tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping");
             return;
         };
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    fn merge_ndv(state: &mut ColumnStatsState, other_ndv: Vec<Option<crate::hll::HyperLogLog>>) {
         for (idx, other_hll) in other_ndv.into_iter().enumerate() {
             let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
                 continue;

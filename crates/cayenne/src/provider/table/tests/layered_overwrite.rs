@@ -280,8 +280,8 @@ async fn streaming_append_drop_keeps_first_copy() {
 }
 
 /// `[(1,a),(2,a),(3,a)]`, `[(4,b),(2,b)]`, `[(2,c),(5,c),(1,c)]`, `[(6,d)]`: key 2
-/// repeats across three batches and key 1 across two, so the overwrite writes a
-/// main snapshot and two layers above it.
+/// repeats across three batches and key 1 across two, so the overwrite writes
+/// three layers into its snapshot.
 fn repeated_across_batches() -> Vec<RecordBatch> {
     vec![
         batch(&[(1, "a"), (2, "a"), (3, "a")]),

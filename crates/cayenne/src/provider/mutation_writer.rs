@@ -1178,7 +1178,8 @@ impl<'a> AppendMutationWriter<'a> {
                     .await;
             }
             let window_reservation = reservation.new_empty();
-            let splitter = LayerSplitter::for_append(resolver, MAX_LAYER_ROWS, reservation);
+            let splitter =
+                LayerSplitter::for_append(Arc::new(resolver), MAX_LAYER_ROWS, reservation);
             return self
                 .write_layered_append(LayerSource::new(
                     data,

@@ -57,7 +57,7 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::delta_encoding::WritePolicy;
 use super::key_conflicts::ConflictPolicy;
-use super::on_conflict::{OnConflictDeletions, PostValidationState};
+use super::on_conflict::{CrossBatchRepeats, OnConflictDeletions, PostValidationState};
 use super::overwrite::LayerWrite;
 use super::overwrite_layers::{
     CollapseWindow, FirstCopyFilter, LayerSource, LayerSplitter, MAX_LAYER_ROWS,
@@ -570,7 +570,8 @@ impl CayenneTableProvider {
                 Box::pin(FirstCopyFilter::new(data, resolver, reservation))
             }
             Some(resolver) => {
-                layered = Some(reservation);
+                let resolver = Arc::new(resolver);
+                layered = Some((Arc::clone(&resolver), reservation));
                 let schema = data.schema();
                 Box::pin(RecordBatchStreamAdapter::new(
                     schema,
@@ -586,7 +587,14 @@ impl CayenneTableProvider {
             }
         };
 
-        let prepared = self.prepare_stream_for_insert_offlock(data).await?;
+        let repeats = if layered.is_some() {
+            CrossBatchRepeats::KeepLaterCopy
+        } else {
+            CrossBatchRepeats::Reject
+        };
+        let prepared = self
+            .prepare_stream_for_insert_offlock(data, repeats)
+            .await?;
         let post_validation = prepared.post_validation();
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -606,11 +614,7 @@ impl CayenneTableProvider {
                 )
                 .await
                 .map(|(rows, _writer_ops, stats)| (rows, stats)),
-            Some(reservation) => {
-                let resolver = self.key_resolver()?.ok_or_else(|| Error::Internal {
-                    table: self.table_name().to_string(),
-                    message: "a staged upsert lost its primary key".to_string(),
-                })?;
+            Some((resolver, reservation)) => {
                 let window =
                     CollapseWindow::new(self.collapse_window_bytes, reservation.new_empty());
                 let source = LayerSource::new(
