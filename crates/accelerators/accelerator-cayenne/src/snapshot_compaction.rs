@@ -14,36 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Compaction of a Cayenne dataset for publishing (`snapshots_compaction: enabled`).
+//! Snapshot compaction for Cayenne (`snapshots_compaction: enabled`).
 //!
-//! A Cayenne table fed by CDC carries merge-on-read state: protected snapshot
-//! directories, per-commit deletion files, inlined rows and tombstones, and a
-//! RAM tier. Archiving that layout ships every piece to the reader, which then
-//! scans the same union the writer does and downloads state that only grows
-//! between snapshots. Compaction instead publishes the *visible* table as one
-//! snapshot with every deletion applied, and it never touches the live table.
+//! A CDC-fed table carries merge-on-read state: protected snapshots, deletion
+//! files, inlined rows and an in-memory tier. Instead of archiving that
+//! layout, compaction publishes the visible table as one snapshot with every
+//! deletion applied, without modifying the live table:
 //!
-//! The work splits around the accelerator's write lock:
+//! 1. [`CompactionCapture::capture`], under the accelerator write lock: build
+//!    a scan of the live table (Cayenne captures the snapshot pointer,
+//!    deletion view, protected set, inline and in-memory tiers once, under its
+//!    listing fence) and export the dataset's `cayenne_table` row. No data is
+//!    read yet.
+//! 2. [`CompactionCapture::materialize`], after the lock is released: seed a
+//!    scratch metastore with that row (same `table_id`, schema, primary key,
+//!    `on_conflict` and sequence counter), open a provider on it and replay the
+//!    captured scan as `INSERT OVERWRITE` — the full-refresh path, which
+//!    yields one snapshot with no deletion files or protected snapshots. The
+//!    scratch data directory and its metastore slice are archived.
 //!
-//! 1. [`CompactionCapture::capture`] runs while the lock is held. It builds a
-//!    scan of the live table — Cayenne resolves the snapshot pointer, deletion
-//!    view, protected set and RAM tier once, under its listing fence, and the
-//!    plan reads only that captured view — and exports the dataset's
-//!    `cayenne_table` row. This is cheap: no data is read yet.
-//! 2. [`CompactionCapture::materialize`] runs after the lock is released, so
-//!    writes resume while the table is re-encoded. It seeds a scratch metastore
-//!    with the same `cayenne_table` row (same `table_id`, schema, primary key,
-//!    `on_conflict` and sequence number, so the published slice re-imports over
-//!    the reader's existing table rather than beside it), opens a provider on
-//!    it, and replays the captured scan as an `INSERT OVERWRITE`. The overwrite
-//!    path is what a full refresh uses: one fresh snapshot, no deletion files,
-//!    no protected snapshots, sorted by the operator's `cayenne_sort_columns`
-//!    or `cayenne_cluster_by` when set. The scratch data directory and its
-//!    metastore slice are what the archive ships.
-//!
-//! The captured plan pins the directories it reads (`SnapshotScanRef`), so the
-//! live table's snapshot sweeps cannot remove them mid-rewrite however long
-//! the encode takes.
+//! The captured plan pins the directories it reads (`SnapshotScanRef`), so
+//! the live table's sweeps cannot remove them during the rewrite.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -162,7 +153,7 @@ pub enum CompactionError {
 
 pub type Result<T, E = CompactionError> = std::result::Result<T, E>;
 
-/// Column position of `column` in the `cayenne_table` row of a metastore slice.
+/// Position of `column` in a slice's `cayenne_table` row.
 fn table_column(dataset: &str, column: &'static str) -> Result<usize> {
     EXPECTED_TABLES
         .iter()
@@ -171,15 +162,14 @@ fn table_column(dataset: &str, column: &'static str) -> Result<usize> {
         .context(MissingColumnSnafu { dataset, column })
 }
 
-/// The live table's view and identity, taken while the accelerator's write
-/// lock is held. Everything [`Self::materialize`] reads is in here.
+/// The live table's view and identity, taken under the accelerator write lock.
 pub struct CompactionCapture {
     dataset_name: String,
     /// The live `cayenne_table` row, paths relative to the live data directory.
     table_row: SliceRow,
-    /// Scan of the live table, bound to the view captured at plan-build time.
+    /// Scan of the live table, bound to the view captured at plan build.
     scan: Arc<dyn ExecutionPlan>,
-    /// The session the scan was planned with; the rewrite executes in it too.
+    /// Session the scan was planned in; the rewrite runs in it too.
     session: SessionContext,
 }
 
@@ -188,10 +178,9 @@ impl CompactionCapture {
     ///
     /// # Errors
     ///
-    /// Fails when the live table cannot be scanned, when its metadata cannot be
-    /// exported, or when the dataset is one compaction does not support (a data
-    /// directory outside the dataset's acceleration directory, a partitioned
-    /// table, or a table with a cold tier).
+    /// The live table cannot be scanned or exported, or the dataset is not
+    /// supported (data directory outside the acceleration directory,
+    /// partitioned table, cold tier).
     pub async fn capture(
         catalog: &Arc<dyn MetadataCatalog>,
         dataset_name: &str,
@@ -221,8 +210,8 @@ impl CompactionCapture {
                 dataset: dataset_name,
             })?;
 
-        // The scratch copy is re-anchored at the scratch data directory and the
-        // reader re-anchors it again, which only works for a relative path.
+        // The path is re-anchored at the scratch directory and again on the
+        // reader, which needs it to be relative.
         let path_is_relative = table_column(dataset_name, "path_is_relative")?;
         let path = table_column(dataset_name, "path")?;
         ensure!(
@@ -248,8 +237,7 @@ impl CompactionCapture {
                 dataset: dataset_name
             }
         );
-        // The scan would read the cold branch too, pulling the whole cold tier
-        // into warm files on every snapshot.
+        // The scan would pull the whole cold tier into local files.
         let vortex_config_column = table_column(dataset_name, "vortex_config_json")?;
         if let Some(SliceValue::Text(json)) = table_row.get(vortex_config_column) {
             let config: VortexConfig =
@@ -272,16 +260,15 @@ impl CompactionCapture {
         })
     }
 
-    /// Re-encodes the captured view into a scratch Cayenne table and returns
-    /// its data directory and metastore slice for archiving. Runs after the
-    /// write lock is released; `metadata_dirs` are the live metadata
-    /// directories to archive alongside (minus `skip_metadata_files`).
+    /// Re-encodes the captured view into a scratch table and returns its data
+    /// directory and metastore slice for archiving. Runs after the write lock
+    /// is released. `metadata_dirs` are archived alongside, minus
+    /// `skip_metadata_files`.
     ///
     /// # Errors
     ///
-    /// Fails when the scratch directory or metastore cannot be prepared, when
-    /// the rewrite fails, or when the rewritten table is not the clean layout
-    /// compaction promises — the snapshot is then not published.
+    /// The scratch table cannot be prepared, the rewrite fails, or the result
+    /// is not a clean layout; the snapshot is then not published.
     pub async fn materialize(
         self,
         metadata_dirs: Vec<(PathBuf, String)>,
@@ -314,9 +301,7 @@ impl CompactionCapture {
             .context(ScratchCatalogSnafu { dataset })?;
 
         // Seed the scratch metastore with the live table's identity and an
-        // empty snapshot. The overwrite below replaces that snapshot, so the
-        // published slice carries the live `table_id`, schema, primary key,
-        // `on_conflict` and sequence counter with a fresh, compact layout.
+        // empty snapshot; the overwrite below replaces the snapshot.
         let seed_snapshot_id = uuid::Uuid::now_v7().to_string();
         let mut row = self.table_row.clone();
         row[table_column(dataset, "current_snapshot_id")?] =
@@ -361,8 +346,8 @@ impl CompactionCapture {
         .context(ScratchTableSnafu { dataset })?;
 
         let rows_written = {
-            // The sink reads one input partition; the planner normally inserts
-            // this coalesce, but the captured plan bypasses the planner.
+            // The sink reads one input partition; the captured plan bypasses
+            // the planner that would normally insert this coalesce.
             let input: Arc<dyn ExecutionPlan> = if self
                 .scan
                 .properties()
@@ -383,17 +368,14 @@ impl CompactionCapture {
                 .context(RewriteSnafu { dataset })?;
             rows_written(&batches)
         };
-        // Post-write maintenance is detached from the write; wait for it so the
-        // scratch layout is final before it is read and archived.
+        // Wait for detached post-write maintenance before reading the layout.
         provider
             .drain_in_flight_maintenance()
             .await
             .context(ScratchCatalogSnafu { dataset })?;
         drop(provider);
 
-        // The overwrite path guarantees the clean layout; check it anyway, since
-        // publishing a snapshot that merely looks compacted is worse than
-        // failing this one.
+        // Verify the clean layout rather than publish a snapshot that is not.
         let compacted = scratch_catalog
             .get_table(dataset)
             .await
@@ -439,8 +421,7 @@ impl CompactionCapture {
             }
         );
 
-        // The seed snapshot is superseded; the provider's own sweep may already
-        // have removed it.
+        // The seed snapshot is superseded; the sweep may already have removed it.
         if let Err(err) = tokio::fs::remove_dir_all(&seed_snapshot_dir).await
             && err.kind() != std::io::ErrorKind::NotFound
         {

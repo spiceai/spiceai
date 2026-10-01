@@ -676,10 +676,8 @@ pub struct SnapshotManager {
     /// The acceleration engine type (duckdb, sqlite, cayenne, etc.).
     engine: AccelerationEngine,
     snapshot_engine: Arc<dyn SnapshotEngine>,
-    /// `snapshots_compaction: enabled` on the dataset. Whether it takes effect
-    /// depends on `snapshot_engine.supports_compaction()`, which may only be
-    /// known once an engine-specific override is installed via
-    /// [`Self::with_snapshot_engine`].
+    /// `snapshots_compaction: enabled` on the dataset; effective only if the
+    /// installed engine supports it.
     compaction_enabled: bool,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
@@ -706,22 +704,21 @@ impl std::fmt::Debug for SnapshotManager {
     }
 }
 
-/// The accelerator write lock a snapshot is created under, with when it was
-/// acquired and what already ran under it, so the manager can report how long
-/// the lock was held and by which phase.
+/// The accelerator write lock a snapshot is created under, with timings of
+/// the phases the caller already ran under it.
 pub struct SnapshotWriteLock {
     pub guard: OwnedMutexGuard<()>,
     pub acquired_at: Instant,
-    /// How long the caller waited to acquire the lock.
+    /// Time waited to acquire the lock.
     pub wait: Duration,
-    /// Time the caller spent checkpointing under the lock, if it did.
+    /// Time spent checkpointing under the lock.
     pub checkpoint: Duration,
-    /// Time the caller spent counting rows under the lock, if it did.
+    /// Time spent counting rows under the lock.
     pub row_count: Duration,
 }
 
 impl SnapshotWriteLock {
-    /// A lock taken just now, with nothing yet run under it.
+    /// A lock taken just now.
     #[must_use]
     pub fn new(guard: OwnedMutexGuard<()>) -> Self {
         Self {
@@ -733,7 +730,7 @@ impl SnapshotWriteLock {
         }
     }
 
-    /// Records the phases the caller ran under the lock before handing it over.
+    /// Records the phases already run under the lock.
     #[must_use]
     pub fn with_phases(mut self, checkpoint: Duration, row_count: Duration) -> Self {
         self.checkpoint = checkpoint;
@@ -742,19 +739,17 @@ impl SnapshotWriteLock {
     }
 }
 
-/// Where the time of one snapshot went. Logged at debug so the lock hold and
-/// its phases can be compared across configurations.
+/// Per-phase timings of one snapshot, logged at debug.
 #[derive(Debug, Default)]
 struct SnapshotPhases {
     lock_wait: Duration,
     checkpoint: Duration,
     row_count: Duration,
-    /// Engine preparation under the lock (metastore slice export; for a
-    /// compacting engine, the live-table capture).
+    /// Engine preparation under the lock.
     prepare: Duration,
-    /// Total time the accelerator write lock was held.
+    /// Total time the write lock was held.
     lock_held: Duration,
-    /// An engine's deferred build, run after the lock was released.
+    /// Engine's deferred build, after the lock was released.
     build: Duration,
     archive: Duration,
     upload: Duration,
@@ -1007,9 +1002,8 @@ impl SnapshotManager {
             network_retry_strategy,
         };
 
-        // Cayenne's engine lives outside this crate and is installed afterwards
-        // through `with_snapshot_engine`, which reports compaction support for
-        // it; reporting here against the placeholder engine would be wrong.
+        // Cayenne's engine is installed later via `with_snapshot_engine`,
+        // which reports compaction support for it.
         if !matches!(manager.engine, AccelerationEngine::Cayenne) {
             manager.log_compaction_support();
         }
@@ -1017,8 +1011,7 @@ impl SnapshotManager {
         Some(manager)
     }
 
-    /// Reports whether `snapshots_compaction: enabled` takes effect with the
-    /// installed snapshot engine.
+    /// Reports whether `snapshots_compaction: enabled` takes effect.
     fn log_compaction_support(&self) {
         if !self.compaction_enabled {
             return;
@@ -1396,16 +1389,14 @@ impl SnapshotManager {
         .await
     }
 
-    /// [`Self::create_snapshot`] with the accelerator's live table, which a
-    /// snapshot engine that compacts directory-layout snapshots reads instead
-    /// of the on-disk layout (see
-    /// [`SnapshotEngine::prepare_directory_snapshot`]). Without it, such an
-    /// engine archives the layout as-is.
+    /// [`Self::create_snapshot`] with the accelerator's live table, for engines
+    /// that read the table instead of its files
+    /// (see [`SnapshotEngine::prepare_directory_snapshot`]).
     ///
     /// # Errors
     ///
-    /// Same as [`Self::create_snapshot`]; an engine's deferred build failing
-    /// surfaces as [`SnapshotUploadError::PrepareUpload`].
+    /// Same as [`Self::create_snapshot`]; a failed deferred build surfaces as
+    /// [`SnapshotUploadError::PrepareUpload`].
     pub async fn create_snapshot_with_table(
         &self,
         schema: &SchemaRef,
@@ -1618,12 +1609,10 @@ impl SnapshotManager {
     ///
     /// Archives multiple directories into a tar file before upload.
     ///
-    /// The engine's plan decides what is archived and when the write lock is
-    /// released: a plain plan archives the live directories under the lock
-    /// (they change as soon as writes resume), whereas a plan carrying a
-    /// [`engine::DeferredDirectorySnapshot`] has already captured the view it
-    /// needs, so the lock is released first and the build's own scratch
-    /// directories are archived.
+    /// A plain plan archives the live directories under the write lock. A
+    /// plan with a [`engine::DeferredDirectorySnapshot`] has already captured
+    /// what it needs, so the lock is released first and the build's output is
+    /// archived instead.
     async fn create_directory_snapshot(
         &self,
         dirs: &[(PathBuf, String)],

@@ -126,16 +126,12 @@ pub trait SnapshotEngine: Send + Sync {
     ///
     /// `dirs` is `(local_directory, archive_prefix)` pairs as passed to the
     /// archive layer. `dataset_name` is the name of the dataset whose snapshot
-    /// is being created. `live_table` is the accelerator's live table when the
-    /// caller has one: an engine that compacts the snapshot reads the table
-    /// through it, so the archive captures everything the accelerator serves
-    /// (including state held only in memory) rather than what is on disk.
+    /// is being created. `live_table` is the accelerator's live table, when the
+    /// caller has one, for engines that read the table instead of its files.
     ///
-    /// The caller holds the accelerator's write lock for the duration of this
-    /// call, so no concurrent writes are in flight. Work that does not need
-    /// the lock — anything that reads a view already captured here — belongs
-    /// in [`DirectorySnapshotPlan::deferred`], which the caller runs after
-    /// releasing it.
+    /// The caller holds the accelerator's write lock for this call. Work that
+    /// only needs state captured here belongs in
+    /// [`DirectorySnapshotPlan::deferred`], which runs after the lock is released.
     async fn prepare_directory_snapshot(
         &self,
         dirs: &[(PathBuf, String)],
@@ -179,24 +175,21 @@ pub struct DirectoryArchiveExtra {
     pub bytes: Vec<u8>,
 }
 
-/// The layout an engine's [`DeferredDirectorySnapshot`] produces in place of
-/// the accelerator's live directories.
+/// What a [`DeferredDirectorySnapshot`] produces: the directories to archive
+/// instead of the accelerator's live ones.
 pub struct MaterializedDirectorySnapshot {
-    /// `(local_directory, archive_prefix)` pairs to archive instead of the
-    /// live layout the manager was given.
+    /// `(local_directory, archive_prefix)` pairs to archive.
     pub dirs: Vec<(PathBuf, String)>,
     /// Filenames (relative to each `dirs[i].0`) to exclude from the archive.
     pub skip_relative_paths: HashSet<PathBuf>,
     /// Extra in-memory entries to add to the archive.
     pub extra_entries: Vec<DirectoryArchiveExtra>,
-    /// Scratch directories the manager removes once the archive is written,
-    /// whether or not archiving succeeded.
+    /// Scratch directories removed once the archive is written, on success or failure.
     pub cleanup_dirs: Vec<PathBuf>,
 }
 
-/// Work an engine runs *after* the accelerator's write lock is released,
-/// producing the directories to archive. It must only read state captured
-/// while the lock was held (see [`SnapshotEngine::prepare_directory_snapshot`]).
+/// Engine work run after the accelerator's write lock is released. It must
+/// only read state captured in [`SnapshotEngine::prepare_directory_snapshot`].
 pub type DeferredDirectorySnapshot = Pin<
     Box<dyn Future<Output = Result<MaterializedDirectorySnapshot, SnapshotEngineError>> + Send>,
 >;
@@ -214,10 +207,8 @@ pub struct DirectorySnapshotPlan {
     /// Extra in-memory entries to add to the archive after the on-disk
     /// directory contents are written.
     pub extra_entries: Vec<DirectoryArchiveExtra>,
-    /// When set, the manager releases the accelerator's write lock, awaits
-    /// this build, and archives what it returns instead of the live
-    /// directories; `skip_relative_paths` and `extra_entries` above are then
-    /// ignored in favor of the materialized ones.
+    /// When set, the manager releases the write lock, awaits this build and
+    /// archives its result; the fields above are then ignored.
     pub deferred: Option<DeferredDirectorySnapshot>,
 }
 

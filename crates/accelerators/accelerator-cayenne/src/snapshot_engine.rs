@@ -49,11 +49,10 @@ limitations under the License.
 //! on import, making the snapshot portable across nodes with different
 //! local layouts.
 //!
-//! With `snapshots_compaction: enabled` the engine does not archive the live
-//! data directory at all: it captures the table's visible view under the
-//! write lock and, once the lock is released, re-encodes that view into a
-//! scratch table whose single snapshot — no deletion files, no protected
-//! snapshots — is what gets archived (see [`crate::snapshot_compaction`]).
+//! With `snapshots_compaction: enabled` the live data directory is not
+//! archived: the table's visible view is captured under the write lock and
+//! re-encoded into a scratch table after it is released; that single snapshot
+//! is archived (see [`crate::snapshot_compaction`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -140,8 +139,7 @@ pub struct CayenneSnapshotEngine {
     /// the absolute paths stored in the metastore as a strict prefix; the
     /// import-side anchor is where the new paths will be re-rooted.
     data_dir_anchor: PathBuf,
-    /// `snapshots_compaction: enabled`: publish a compacted copy of the table
-    /// instead of the live layout.
+    /// `snapshots_compaction: enabled`.
     compaction: bool,
 }
 
@@ -194,11 +192,10 @@ impl CayenneSnapshotEngine {
         SnapshotEngineError::from_display(err.to_string())
     }
 
-    /// The compacting plan: capture the live table's view now (under the
-    /// write lock), re-encode it into a scratch table once the lock is
-    /// released, and archive the scratch data directory in place of the live
-    /// one. The live metadata directory is still archived (minus
-    /// `cayenne.db*`), exactly as in the uncompacted plan.
+    /// Capture the live table's view under the write lock; re-encode it into
+    /// a scratch table after the lock is released and archive that instead of
+    /// the live data directory. The metadata directory is archived as in the
+    /// uncompacted plan (minus `cayenne.db*`).
     async fn compacted_plan(
         &self,
         dirs: &[(PathBuf, String)],
