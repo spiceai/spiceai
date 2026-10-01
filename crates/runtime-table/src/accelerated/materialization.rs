@@ -135,14 +135,14 @@ impl MaterializationIdentity {
 /// [`starts_configured`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccelerationAtStart<'a> {
-    /// Holds no rows. Established by reading the acceleration, not inferred from a
-    /// missing checkpoint: a first refresh can write rows and stop before it checkpoints.
+    /// No checkpoint from an earlier acceleration: no refresh has completed here, so it
+    /// holds no rows the definition did not produce — except rows a first refresh wrote
+    /// before a stop that came ahead of its first checkpoint (see [`starts_configured`]).
     Empty,
     /// Downloaded from a snapshot that bootstrap checked against this definition.
     Bootstrapped,
     /// Rows an earlier process left, with the definition fingerprint it persisted
-    /// alongside them in the local checkpoint — `None` when it persisted none or there is
-    /// no readable checkpoint.
+    /// alongside them in the local checkpoint, if any.
     Existing {
         persisted_fingerprint: Option<&'a str>,
     },
@@ -164,8 +164,11 @@ pub enum AccelerationAtStart<'a> {
 ///
 /// That retraction is written by the checkpoint that follows the overriding refresh, not
 /// before its rows land, so a process that stops between the two leaves a stamp that
-/// still names the configured definition over the override's rows. The pre-recreation
-/// snapshot trusts the same persisted stamp; retracting it before the write is #14616.
+/// still names the configured definition over the override's rows. The same window opens
+/// on a first refresh: its rows land before the first checkpoint exists, so a stop
+/// between the two leaves rows a later start reads as [`AccelerationAtStart::Empty`]. The
+/// pre-recreation snapshot trusts the same persisted stamp; recording provenance before
+/// the write is #14616.
 #[must_use]
 pub fn starts_configured(
     at_start: AccelerationAtStart<'_>,

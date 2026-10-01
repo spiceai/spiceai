@@ -3382,16 +3382,12 @@ impl DataFusion {
             crate::accelerated::AccelerationAtStart::Existing {
                 persisted_fingerprint: earlier_acceleration_fingerprint.as_deref(),
             }
-        } else if acceleration_holds_rows(Arc::clone(&accelerated_table_provider)).await
-            == Some(false)
-        {
-            crate::accelerated::AccelerationAtStart::Empty
         } else {
-            // Rows with no readable checkpoint — a first refresh that never checkpointed,
-            // or a checkpoint that could not be read — have nothing vouching for them.
-            crate::accelerated::AccelerationAtStart::Existing {
-                persisted_fingerprint: None,
-            }
+            // No checkpoint: nothing has completed a refresh here yet. Decided from the
+            // checkpoint, not by scanning the acceleration: a scan this early, before the
+            // first refresh writes, left `DuckDB` file-mode cross-dataset subqueries reading
+            // empty tables (`acceleration::on_zero_results_subqueries`).
+            crate::accelerated::AccelerationAtStart::Empty
         };
         let configured_fingerprint =
             crate::dataaccelerator::AccelerationSource::definition_fingerprint(dataset)
@@ -6324,29 +6320,6 @@ async fn build_snapshot_creation_config(
             snapshot_creation_trigger,
         )))
     }
-}
-
-/// Whether the acceleration behind `provider` holds any row, or `None` when that cannot be
-/// read. Reads at most one row.
-///
-/// Decides whether an acceleration with no readable checkpoint is empty, which is the only
-/// such state whose rows the configured definition can vouch for: a missing checkpoint
-/// alone does not show that, since a first refresh can write rows and stop before it
-/// checkpoints.
-///
-/// It reads through the accelerator, so an engine that applies retention while scanning
-/// (Cayenne) reports expired rows it still stores as absent. Those rows stay hidden from
-/// every deployment that loads the series, because retention is part of both the
-/// definition and the source selection a follower must match.
-async fn acceleration_holds_rows(provider: Arc<dyn TableProvider>) -> Option<bool> {
-    let batches = util::session_state::session_context()
-        .read_table(provider)
-        .and_then(|frame| frame.limit(0, Some(1)))
-        .ok()?
-        .collect()
-        .await
-        .ok()?;
-    Some(batches.iter().any(|batch| batch.num_rows() > 0))
 }
 
 /// Effective runtime `Refresh.sql` for each accelerated dataset in `view`'s closure.
