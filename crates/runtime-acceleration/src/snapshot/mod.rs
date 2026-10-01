@@ -68,7 +68,7 @@ pub mod metrics;
 pub mod notifications;
 mod writer_lease;
 pub use crate::layout::AccelerationLayout;
-pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior};
+pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled};
 use engine::{SnapshotEngine, create_snapshot_engine};
 use writer_lease::{WriterLease, WriterPermit, claim_publication, superseded_message};
 
@@ -319,6 +319,119 @@ pub struct SnapshotPoll {
     /// The `ETag` of the metadata this poll acted on, when the store reports one. Passing
     /// it to the next poll lets that poll skip entirely if the metadata has not changed.
     pub metadata_e_tag: Option<String>,
+}
+
+/// A dataset's current snapshot as its `metadata.json` records it: what a dataset that
+/// reads snapshots needs to know before it can create the acceleration the snapshot
+/// loads into.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentSnapshot {
+    /// The id `current-snapshot-id` names.
+    pub snapshot_id: u64,
+    /// The acceleration engine that created the snapshot, lowercase as recorded
+    /// (`cayenne`, `duckdb`, `sqlite`, `turso`).
+    pub engine: String,
+    /// The dataset schema recorded for the snapshot.
+    pub schema: SchemaRef,
+}
+
+/// Why [`SnapshotManager::current_snapshot`] found no snapshot to load. Each message is
+/// worded as the cause clause of a message that names the dataset.
+#[derive(Debug, Snafu)]
+#[snafu(module(current_snapshot_error))]
+pub enum CurrentSnapshotError {
+    #[snafu(display("'{metadata}' does not exist"))]
+    MetadataNotFound { metadata: String },
+
+    #[snafu(display(
+        "'{metadata}' has no dataset named '{dataset}' ({})",
+        describe_datasets(available)
+    ))]
+    DatasetNotFound {
+        metadata: String,
+        dataset: String,
+        available: Vec<String>,
+    },
+
+    #[snafu(display("'{metadata}' names no current snapshot for dataset '{dataset}'"))]
+    NoCurrentSnapshot { metadata: String, dataset: String },
+
+    #[snafu(display(
+        "'{metadata}' does not record which acceleration engine created the current snapshot of dataset '{dataset}'"
+    ))]
+    EngineNotRecorded { metadata: String, dataset: String },
+
+    #[snafu(display("'{metadata}' records no schema for dataset '{dataset}'"))]
+    SchemaMissing { metadata: String, dataset: String },
+
+    #[snafu(display(
+        "'{metadata}' records an unreadable schema for dataset '{dataset}': {source}"
+    ))]
+    SchemaInvalid {
+        metadata: String,
+        dataset: String,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("reading '{metadata}' failed: {source}"))]
+    ReadMetadata {
+        metadata: String,
+        source: object_store::Error,
+    },
+
+    #[snafu(display("'{metadata}' is not valid snapshot metadata: {source}"))]
+    ParseMetadata {
+        metadata: String,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display(
+        "'{metadata}' has format version {version}, which this version of Spice cannot read. Upgrade Spice to the version that created the snapshots"
+    ))]
+    UnsupportedMetadataVersion { metadata: String, version: u32 },
+}
+
+impl CurrentSnapshotError {
+    /// Whether the snapshot can still become loadable without a configuration change:
+    /// the metadata, or the dataset's entry in it, may be published later, and a read
+    /// that failed may succeed on a retry. Only metadata written in a format this build
+    /// cannot read needs a different build of Spice.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(self, Self::UnsupportedMetadataVersion { .. })
+    }
+}
+
+/// `'a', 'b'` for the datasets a `metadata.json` lists, for [`CurrentSnapshotError`].
+fn describe_datasets(datasets: &[String]) -> String {
+    if datasets.is_empty() {
+        return "it lists no datasets".to_string();
+    }
+    let names = datasets
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("it lists {names}")
+}
+
+/// The engine that created `entry`: the engine recorded on the entry, then the one
+/// recorded for its dataset, then the engine the snapshot file's extension names —
+/// each writer names its snapshots `<dataset>_<timestamp>.<engine>`.
+fn recorded_snapshot_engine(entry: &SnapshotEntry, dataset: &DatasetMetadata) -> Option<String> {
+    entry
+        .snapshot_engine
+        .clone()
+        .or_else(|| dataset.engine.clone())
+        .or_else(|| {
+            let file_name = entry.snapshot.rsplit('/').next()?;
+            let (_, extension) = file_name.rsplit_once('.')?;
+            ["cayenne", "duckdb", "sqlite", "turso"]
+                .into_iter()
+                .find(|engine| extension.eq_ignore_ascii_case(engine))
+                .map(str::to_string)
+        })
+        .map(|engine| engine.to_ascii_lowercase())
 }
 
 #[derive(Debug)]
@@ -586,7 +699,10 @@ pub enum SnapshotUploadError {
         source: std::io::Error,
     },
     #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
-    PrepareUpload { source: engine::SnapshotEngineError },
+    PrepareUpload {
+        #[snafu(source(from(engine::SnapshotEngineError, Box::new)))]
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     AdapterDisabled { dataset: String },
     #[snafu(display(
@@ -869,6 +985,15 @@ impl SnapshotManager {
 
     fn metadata_path_display(&self) -> String {
         self.metadata_path().to_string()
+    }
+
+    /// `metadata.json` as a URI under this manager's snapshot location, for messages a
+    /// user reads: the object path alone drops the scheme and bucket.
+    fn metadata_uri(&self) -> String {
+        format!(
+            "{}/{METADATA_FILE_NAME}",
+            self.snapshot_location_uri.trim_end_matches('/')
+        )
     }
 
     fn snapshot_uri_for_location(&self, location: &ObjectPath) -> String {
@@ -1270,6 +1395,81 @@ impl SnapshotManager {
             .into_iter()
             .filter_map(|(name, dataset)| Some((name, dataset.current_snapshot_id?)))
             .collect())
+    }
+
+    /// Describes this dataset's current snapshot from `metadata.json`: its id, the
+    /// engine that created it, and the schema recorded for it. Reads only the metadata,
+    /// never the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CurrentSnapshotError`] when there is no current snapshot to describe
+    /// (no metadata, no entry for this dataset, no current snapshot in the entry), when
+    /// the metadata cannot be read or parsed, or when it lacks the engine or schema.
+    pub async fn current_snapshot(&self) -> Result<CurrentSnapshot, CurrentSnapshotError> {
+        let metadata_uri = self.metadata_uri();
+        let handle = self.load_metadata().await.map_err(|err| match err {
+            MetadataLoadError::Read { source, .. } => CurrentSnapshotError::ReadMetadata {
+                metadata: metadata_uri.clone(),
+                source,
+            },
+            MetadataLoadError::Parse { source, .. } => CurrentSnapshotError::ParseMetadata {
+                metadata: metadata_uri.clone(),
+                source,
+            },
+            MetadataLoadError::UnsupportedVersion { version, .. } => {
+                CurrentSnapshotError::UnsupportedMetadataVersion {
+                    metadata: metadata_uri.clone(),
+                    version,
+                }
+            }
+        })?;
+        let Some(handle) = handle else {
+            return current_snapshot_error::MetadataNotFoundSnafu {
+                metadata: metadata_uri,
+            }
+            .fail();
+        };
+
+        let Some(dataset) = handle.metadata.datasets.get(&self.dataset_name) else {
+            let mut available: Vec<String> = handle.metadata.datasets.keys().cloned().collect();
+            available.sort_unstable();
+            return current_snapshot_error::DatasetNotFoundSnafu {
+                metadata: metadata_uri,
+                dataset: self.dataset_name.clone(),
+                available,
+            }
+            .fail();
+        };
+        let entry = dataset.current_snapshot().with_context(|| {
+            current_snapshot_error::NoCurrentSnapshotSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            }
+        })?;
+        let engine = recorded_snapshot_engine(entry, dataset).with_context(|| {
+            current_snapshot_error::EngineNotRecordedSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            }
+        })?;
+        let schema = dataset
+            .current_schema()
+            .with_context(|| current_snapshot_error::SchemaMissingSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            })?
+            .to_schema_ref()
+            .with_context(|_| current_snapshot_error::SchemaInvalidSnafu {
+                metadata: metadata_uri.clone(),
+                dataset: self.dataset_name.clone(),
+            })?;
+
+        Ok(CurrentSnapshot {
+            snapshot_id: entry.snapshot_id,
+            engine,
+            schema,
+        })
     }
 
     /// Downloads the latest snapshot only if its `snapshot_id` is strictly
@@ -1712,7 +1912,9 @@ impl SnapshotManager {
             .snapshot_engine
             .prepare_directory_snapshot(dirs, &self.dataset_name)
             .await
-            .map_err(|source| SnapshotUploadError::PrepareUpload { source })?;
+            .map_err(|source| SnapshotUploadError::PrepareUpload {
+                source: Box::new(source),
+            })?;
         let skip_paths: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
         let extras: Vec<(String, Vec<u8>)> = plan
             .extra_entries
@@ -8231,6 +8433,253 @@ mod tests {
         assert!(
             !declares_nullable_entries(&raw),
             "the published snapshot metadata must not keep a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    fn reader_snapshot_entry(
+        snapshot_id: u64,
+        file_name: &str,
+        engine: Option<&str>,
+    ) -> SnapshotEntry {
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: 0,
+            snapshot: format!(
+                "{SNAPSHOT_URI_PREFIX}/month=2026-09/day=2026-09-26/dataset={DATASET_NAME}/{file_name}"
+            ),
+            snapshot_checksum: String::new(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 0,
+            snapshot_engine: engine.map(str::to_string),
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        }
+    }
+
+    fn reader_metadata(datasets: HashMap<String, DatasetMetadata>) -> SnapshotMetadata {
+        SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 0,
+            datasets,
+        }
+    }
+
+    fn build_reader(store: Arc<InMemory>) -> SnapshotManager {
+        build_manager_for_engine(
+            store,
+            PathBuf::from("unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &sample_schema(),
+            &AccelerationEngine::Cayenne,
+            false,
+        )
+    }
+
+    async fn current_snapshot_of(
+        metadata: &SnapshotMetadata,
+    ) -> Result<CurrentSnapshot, CurrentSnapshotError> {
+        let store = Arc::new(InMemory::new());
+        write_metadata(
+            &store,
+            &Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME),
+            metadata,
+        )
+        .await;
+        build_reader(store).current_snapshot().await
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_describes_the_entry_current_snapshot_id_names() {
+        let schema = sample_schema();
+        let dataset = dataset_metadata(
+            &schema,
+            vec![
+                reader_snapshot_entry(0, "dataset_20260925T000000Z.duckdb", Some("duckdb")),
+                reader_snapshot_entry(1, "dataset_20260926T000000Z.cayenne", Some("cayenne")),
+            ],
+            Some(1),
+        );
+        let metadata = reader_metadata(HashMap::from([(DATASET_NAME.to_string(), dataset)]));
+
+        let current = current_snapshot_of(&metadata)
+            .await
+            .expect("the current snapshot is described");
+
+        assert_eq!(
+            current,
+            CurrentSnapshot {
+                snapshot_id: 1,
+                engine: "cayenne".to_string(),
+                schema,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_falls_back_to_the_dataset_engine_then_the_file_extension() {
+        let schema = sample_schema();
+
+        let mut recorded_on_dataset = dataset_metadata(
+            &schema,
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.snapshot",
+                None,
+            )],
+            Some(0),
+        );
+        recorded_on_dataset.engine = Some("DuckDB".to_string());
+        let current = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            recorded_on_dataset,
+        )])))
+        .await
+        .expect("the dataset-level engine is used");
+        assert_eq!(current.engine, "duckdb");
+
+        let named_by_extension = dataset_metadata(
+            &schema,
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.sqlite",
+                None,
+            )],
+            Some(0),
+        );
+        let current = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            named_by_extension,
+        )])))
+        .await
+        .expect("the file extension names the engine");
+        assert_eq!(current.engine, "sqlite");
+
+        let unrecorded = dataset_metadata(
+            &schema,
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.bin",
+                None,
+            )],
+            Some(0),
+        );
+        let err = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            unrecorded,
+        )])))
+        .await
+        .expect_err("no engine is recorded anywhere");
+        assert!(
+            matches!(err, CurrentSnapshotError::EngineNotRecorded { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_names_the_metadata_it_could_not_find() {
+        let err = build_reader(Arc::new(InMemory::new()))
+            .current_snapshot()
+            .await
+            .expect_err("there is no metadata");
+
+        assert!(
+            matches!(err, CurrentSnapshotError::MetadataNotFound { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.is_retriable(),
+            "a writer may still publish the metadata"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("'{SNAPSHOT_URI_PREFIX}/metadata.json' does not exist")
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_lists_the_datasets_the_metadata_has() {
+        let schema = sample_schema();
+        let other = |name: &str| {
+            let mut dataset = dataset_metadata(
+                &schema,
+                vec![reader_snapshot_entry(
+                    0,
+                    "x_20260926T000000Z.cayenne",
+                    Some("cayenne"),
+                )],
+                Some(0),
+            );
+            dataset.name = name.to_string();
+            dataset
+        };
+        let metadata = reader_metadata(HashMap::from([
+            ("orders".to_string(), other("orders")),
+            ("customers".to_string(), other("customers")),
+        ]));
+
+        let err = current_snapshot_of(&metadata)
+            .await
+            .expect_err("the dataset is not in the metadata");
+
+        assert!(err.is_retriable(), "a writer may still publish the dataset");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'{SNAPSHOT_URI_PREFIX}/metadata.json' has no dataset named '{DATASET_NAME}' (it lists 'customers', 'orders')"
+            )
+        );
+
+        let empty = current_snapshot_of(&reader_metadata(HashMap::new()))
+            .await
+            .expect_err("the metadata lists no datasets");
+        assert!(
+            empty.to_string().ends_with("(it lists no datasets)"),
+            "unexpected message: {empty}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_needs_a_current_snapshot_pointer() {
+        let dataset = dataset_metadata(
+            &sample_schema(),
+            vec![reader_snapshot_entry(
+                0,
+                "dataset_20260926T000000Z.cayenne",
+                Some("cayenne"),
+            )],
+            None,
+        );
+        let err = current_snapshot_of(&reader_metadata(HashMap::from([(
+            DATASET_NAME.to_string(),
+            dataset,
+        )])))
+        .await
+        .expect_err("no snapshot is current");
+
+        assert!(
+            matches!(err, CurrentSnapshotError::NoCurrentSnapshot { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(err.is_retriable());
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_of_a_newer_metadata_format_is_not_retriable() {
+        let mut metadata = reader_metadata(HashMap::new());
+        metadata.format_version = SNAPSHOT_METADATA_FORMAT_VERSION + 1;
+
+        let err = current_snapshot_of(&metadata)
+            .await
+            .expect_err("the format version is unsupported");
+
+        assert!(
+            matches!(err, CurrentSnapshotError::UnsupportedMetadataVersion { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.is_retriable(),
+            "only a different build of Spice can read this metadata"
         );
     }
 }
