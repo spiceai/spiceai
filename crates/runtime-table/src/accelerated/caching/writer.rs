@@ -408,6 +408,22 @@ impl CacheWriter {
             ..
         } = request;
         let state = self.0.context.state();
+        #[cfg(not(windows))]
+        if let Some(cayenne) = cayenne_append_target(self.0.accelerator.as_ref())
+            // A native upsert must not bypass a wrapper's delete/index effects.
+            && spice_table::nodes(self.0.accelerator.as_ref(), spice_table::LayerWalk::Write)
+                .all(|node| node.layer_as::<data_components::poly::PolyTableProvider>().is_some())
+            && cayenne
+                .try_write_cache_entry(
+                    &batches,
+                    &filters,
+                    CACHE_NAMESPACE_COLUMN,
+                    &self.0.context.task_ctx(),
+                )
+                .await?
+        {
+            return Ok(());
+        }
         if replaces_existing {
             match self
                 .0

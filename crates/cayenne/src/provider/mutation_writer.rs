@@ -296,6 +296,7 @@ pub(super) struct AppendMutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
     task_context: &'a Arc<TaskContext>,
+    cache_loss_allowed: bool,
 }
 
 impl<'a> AppendMutationWriter<'a> {
@@ -309,7 +310,13 @@ impl<'a> AppendMutationWriter<'a> {
             table,
             context,
             task_context,
+            cache_loss_allowed: false,
         }
+    }
+
+    pub(super) fn with_cache_loss_allowed(mut self) -> Self {
+        self.cache_loss_allowed = true;
+        self
     }
 
     pub(super) async fn write_cdc_pipelined(
@@ -495,10 +502,11 @@ impl<'a> AppendMutationWriter<'a> {
         // source (`has_slot_advancer`). The two differ in how the runtime acks the
         // source slot: `mode: memory` never checkpoints, so the slot is committed
         // immediately (nothing to defer behind); `cdc_durability: memory` defers the
-        // ack behind the covering durable checkpoint. Every other table/source keeps
-        // the durable path below, byte-identical.
+        // ack behind the covering durable checkpoint. Cache writes explicitly
+        // permit loss before checkpoint and carry no source acknowledgement.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
             || self.table.is_cdc_mem_tier_armed()
+            || (self.cache_loss_allowed && self.table.supports_cache_mem_tier())
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)

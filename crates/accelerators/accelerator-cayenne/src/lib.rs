@@ -2601,6 +2601,33 @@ impl CayenneAccelerator {
 
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
+        let mut primary_keys = primary_keys;
+        let mut on_conflict = on_conflict;
+        let cache_mem_tier = source.is_file_accelerated()
+            && acceleration.is_some_and(|a| {
+                a.refresh_mode == Some(RefreshMode::Caching) && a.partition_by.is_empty()
+            })
+            && !primary_keys.is_empty()
+            && schema.column_with_name("__spice_cache_namespace").is_some()
+            && matches!(
+                on_conflict,
+                Some(datafusion_table_providers::util::on_conflict::OnConflict::Upsert(_))
+            );
+        if cache_mem_tier {
+            // Physical uniqueness must not make one principal's upsert replace
+            // another principal's cached response.
+            if !primary_keys.iter().any(|key| key == "__spice_cache_namespace") {
+                primary_keys.push("__spice_cache_namespace".to_string());
+            }
+            primary_keys.sort();
+            on_conflict = Some(
+                datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(
+                        primary_keys.clone(),
+                    ),
+                ),
+            );
+        }
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
         let maintained_aggregate_specs =
             maintained_aggregate_specs_for_cayenne(acceleration, &schema, &primary_keys)?;
@@ -2644,6 +2671,15 @@ impl CayenneAccelerator {
             &workload,
         )
         .await?;
+
+        vortex_config.cache_mem_tier = cache_mem_tier;
+        if cache_mem_tier {
+            // A complete cache entry must publish through one shard's atomic swap.
+            vortex_config.cdc_mem_tier_shards = 1;
+            if vortex_config.deletion_mode == cayenne::metadata::DeletionMode::Auto {
+                vortex_config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+            }
+        }
 
         // Memory mode: make the mem-tier the permanent in-RAM store — never
         // checkpoint/seal to Vortex, no compaction/cold tier, single shard (so a

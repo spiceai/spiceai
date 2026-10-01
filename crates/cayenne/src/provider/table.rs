@@ -5590,6 +5590,81 @@ impl CayenneTableProvider {
         result
     }
 
+    /// Replace an exact, namespace-scoped singleton cache entry through the CDC
+    /// memory tier. Returns false without mutation when the request cannot be
+    /// represented by one native upsert. Accepted writes may be lost before an
+    /// engine checkpoint; they never acknowledge a replayable source.
+    pub async fn try_write_cache_entry(
+        &self,
+        batches: &[RecordBatch],
+        filters: &[Expr],
+        namespace_column: &str,
+        task_context: &Arc<datafusion_execution::TaskContext>,
+    ) -> datafusion_common::Result<bool> {
+        if !self.supports_cache_mem_tier()
+            || batches.iter().map(RecordBatch::num_rows).sum::<usize>() != 1
+        {
+            return Ok(false);
+        }
+        let pk_columns = self.pk_column_names();
+        if !pk_columns.iter().any(|column| column == namespace_column) {
+            return Ok(false);
+        }
+        // Only a conjunction binding EVERY physical PK column proves that the
+        // replacement predicate can remove at most this one namespace's row.
+        fn bind_key(expr: &Expr, columns: &[String], bound: &mut [bool]) -> bool {
+            let Expr::BinaryExpr(binary) = expr else {
+                return false;
+            };
+            if binary.op == Operator::And {
+                return bind_key(&binary.left, columns, bound)
+                    && bind_key(&binary.right, columns, bound);
+            }
+            if binary.op != Operator::Eq {
+                return false;
+            }
+            let column = match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(value, _))
+                | (Expr::Literal(value, _), Expr::Column(column)) if !value.is_null() => column,
+                _ => return false,
+            };
+            let Some(index) = columns.iter().position(|name| name == &column.name) else {
+                return false;
+            };
+            bound[index] = true;
+            true
+        }
+        let mut bound = vec![false; pk_columns.len()];
+        if !filters.iter().all(|expr| bind_key(expr, &pk_columns, &mut bound))
+            || !bound.into_iter().all(|value| value)
+        {
+            return Ok(false);
+        }
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() == 1) else {
+            return Ok(false);
+        };
+        let coerced = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        if !self.delete_match_mask(batch, &physical)?.is_some_and(|mask| mask.true_count() == 1) {
+            return Ok(false);
+        }
+        let bytes = batch.get_array_memory_size() as u64;
+        let input = Box::pin(RecordBatchStreamAdapter::new(
+            self.table_schema(),
+            futures::stream::iter(vec![Ok(batch.clone())]),
+        ));
+        let start = Instant::now();
+        let guard = self.write_lock_arc().lock_owned().await;
+        let write = AppendMutationWriter::new(self, &self.context, task_context)
+            .with_cache_loss_allowed()
+            .write_cdc_pipelined(input, guard)
+            .await?;
+        self.context.record_ingest(write.rows, write.delete_rows(), bytes, start.elapsed(), None);
+        write.finish().await?;
+        tracing::trace!(table = self.table_name(), "Applied complete cache entry through native upsert");
+        Ok(true)
+    }
+
     /// Returns whether retention filters are configured for this table.
     #[must_use]
     pub(crate) fn has_retention_delete_filters(&self) -> bool {
@@ -9442,6 +9517,20 @@ impl CayenneTableProvider {
         self.cdc_durability().is_memory()
             && self.table_metadata.partition_column.is_none()
             && !self.pk_deletion_strategy.is_position_based()
+    }
+
+    /// Whether best-effort cache writes can use the bounded memory tier while
+    /// retaining file checkpoints. This does not arm replayable CDC admission.
+    pub(crate) fn supports_cache_mem_tier(&self) -> bool {
+        self.table_metadata.vortex_config.cache_mem_tier
+            && !self.is_memory_resident_mode()
+            && self.table_metadata.partition_column.is_none()
+            && !self.pk_deletion_strategy.is_position_based()
+            && self.mem_tier_shard_count() == 1
+            && self.context.pk_conflict_detection() != PkConflictDetection::None
+            && matches!(&self.table_metadata.on_conflict, Some(OnConflict::Upsert(columns))
+                if columns.iter().count() == self.pk_column_indices.len()
+                    && self.pk_column_names().iter().all(|key| columns.contains(key)))
     }
 
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: data
@@ -37917,7 +38006,7 @@ impl CayenneTableProvider {
         // burst, so we do NOT gate on `has_slot_advancer()` here (it would be
         // false at spawn time and the table would never get a checkpointer);
         // `run_mem_tier_checkpoint_tick` re-checks the advancer each tick.
-        if !self.is_cdc_memory_mode() {
+        if !self.is_cdc_memory_mode() && !self.supports_cache_mem_tier() {
             return false;
         }
         let Some(interval) = self.context.mem_tier_checkpoint_interval() else {
@@ -38026,13 +38115,14 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 telemetry::KeyValue::new("outcome", outcome),
             ]);
         };
-        // Only memory-mode tables that the runtime has armed have a deferred
-        // slot ack to advance; everything else has nothing to flush here.
-        if !self.is_cdc_memory_mode() {
+        // Replayable CDC must be armed by its source. Cache writes independently
+        // permit loss before checkpoint, without a source acknowledgement.
+        let cache_mem_tier = self.supports_cache_mem_tier();
+        if !self.is_cdc_memory_mode() && !cache_mem_tier {
             emit_tick("not_memory_mode");
             return;
         }
-        if !self.has_slot_advancer() {
+        if !self.has_slot_advancer() && !cache_mem_tier {
             emit_tick("no_advancer");
             return;
         }
@@ -38110,7 +38200,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                     // an unpublished inline shadow, no Vortex snapshot). A due seal
                     // acquires `mem_checkpoint_lock` itself with the GUARANTEED fair
                     // path (single-drainer vs the bake), so it is NOT pre-held here.
-                    if self.seal_due() {
+                    if !cache_mem_tier && self.seal_due() {
                         match self.seal_mem_tier_durable().await {
                             Ok(_) => emit_tick("sealed"),
                             Err(e) => {

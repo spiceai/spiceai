@@ -990,6 +990,10 @@ pub struct VortexConfig {
     /// the pre-mem-tier behavior.
     #[serde(default)]
     pub cdc_durability: CdcDurability,
+    /// Enables best-effort cache writes through the bounded CDC memory tier.
+    /// File checkpoints remain enabled; cache writes do not acknowledge a source.
+    #[serde(default)]
+    pub cache_mem_tier: bool,
     /// Per-table RAM-tier byte cap before a forced spill (checkpoint) + slot
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
@@ -1546,6 +1550,7 @@ impl Default for VortexConfig {
             deletion_mode: DeletionMode::default(),
             memory_mode: false,
             cdc_durability: CdcDurability::default(),
+            cache_mem_tier: false,
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
             cdc_mem_tier_shards: default_cdc_mem_tier_shards(),
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
