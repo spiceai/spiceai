@@ -1353,6 +1353,10 @@ mod tests {
         /// Serves one batch holding a `MAP` column whose `entries` field the server declares
         /// nullable — the shape the Arrow map layout forbids and the IPC reader lets through.
         NullableMapEntries,
+        /// Serves a `MAP` column declaring its `entries` nullable between two dictionary columns,
+        /// with a dictionary nested in the map, numbered the way a server other than `arrow-rs`
+        /// may number them (see [`crate::flight::dictionary_id_fixture`]).
+        NullableMapEntriesWithReorderedDictionaryIds,
     }
 
     struct TestServer {
@@ -1515,6 +1519,12 @@ mod tests {
                         vec![batch],
                     )
                     .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+                    Ok(Response::new(Box::pin(futures::stream::iter(
+                        data.into_iter().map(Ok),
+                    ))))
+                }
+                DoGetMode::NullableMapEntriesWithReorderedDictionaryIds => {
+                    let data = crate::flight::dictionary_id_fixture::reordered_ids_flight_data();
                     Ok(Response::new(Box::pin(futures::stream::iter(
                         data.into_iter().map(Ok),
                     ))))
@@ -2053,6 +2063,48 @@ mod tests {
         let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
         MapArray::try_new(field, offsets, entries, nulls, ordered)
             .expect("the corrected column can be rebuilt by a kernel");
+
+        server.shutdown().await;
+    }
+
+    /// Regression test: correcting the map declaration must keep the server's dictionary ids.
+    /// The correction re-encoded the schema message, which numbered the dictionaries afresh, so a
+    /// server numbering its dictionaries in another order had each dictionary column decoded
+    /// against another column's dictionary — wrong values, and no error.
+    #[tokio::test]
+    async fn query_to_stream_keeps_the_servers_dictionary_ids_when_correcting_a_map() {
+        use crate::flight::dictionary_id_fixture::{expected_values, values};
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(
+            Arc::clone(&cookie_seen),
+            DoGetMode::NullableMapEntriesWithReorderedDictionaryIds,
+        )
+        .await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let batches = query_to_stream(
+            client,
+            "SELECT a, m, c FROM t".to_string(),
+            cookie_store,
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        assert_eq!(values(batch), expected_values());
 
         server.shutdown().await;
     }

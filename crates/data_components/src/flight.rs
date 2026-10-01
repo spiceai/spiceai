@@ -50,6 +50,8 @@ use tonic::metadata::MetadataMap;
 
 use self::write::FlightTableWriter;
 
+#[cfg(test)]
+pub(crate) mod dictionary_id_fixture;
 pub mod federation;
 pub mod stream;
 pub mod write;
@@ -692,9 +694,47 @@ mod tests {
         .expect("map batch")
     }
 
+    /// What a [`NullableMapEntriesService`] serves.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Payload {
+        /// One `MAP` column.
+        Map,
+        /// A `MAP` column between two dictionary columns, with a dictionary nested in the map,
+        /// numbered the way a producer other than `arrow-rs` may number them (see
+        /// [`crate::flight::dictionary_id_fixture`]).
+        MapWithReorderedDictionaryIds,
+    }
+
+    impl Payload {
+        fn schema(self) -> SchemaRef {
+            match self {
+                Payload::Map => nullable_entries_map_batch().schema(),
+                Payload::MapWithReorderedDictionaryIds => {
+                    crate::flight::dictionary_id_fixture::schema()
+                }
+            }
+        }
+
+        fn flight_data(self) -> Result<Vec<FlightData>, Status> {
+            match self {
+                Payload::Map => {
+                    let batch = nullable_entries_map_batch();
+                    arrow_flight::utils::batches_to_flight_data(
+                        batch.schema().as_ref(),
+                        vec![batch],
+                    )
+                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))
+                }
+                Payload::MapWithReorderedDictionaryIds => {
+                    Ok(crate::flight::dictionary_id_fixture::reordered_ids_flight_data())
+                }
+            }
+        }
+    }
+
     /// A Flight server that declares — and serves — a `MAP` whose `entries` field is nullable.
     #[derive(Clone)]
-    struct NullableMapEntriesService;
+    struct NullableMapEntriesService(Payload);
 
     type EmptyResponseStream<T> = EmptyStream<Result<T, Status>>;
 
@@ -757,7 +797,7 @@ mod tests {
             &self,
             _request: Request<FlightDescriptor>,
         ) -> Result<Response<SchemaResult>, Status> {
-            let schema = nullable_entries_map_batch().schema();
+            let schema = self.0.schema();
             let options = arrow::ipc::writer::IpcWriteOptions::default();
             let result = SchemaResult::try_from(SchemaAsIpc::new(schema.as_ref(), &options))
                 .map_err(|e| Status::internal(format!("encoding the schema: {e}")))?;
@@ -768,10 +808,7 @@ mod tests {
             &self,
             _request: Request<Ticket>,
         ) -> Result<Response<Self::DoGetStream>, Status> {
-            let batch = nullable_entries_map_batch();
-            let data =
-                arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch])
-                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+            let data = self.0.flight_data()?;
             Ok(Response::new(Box::pin(futures::stream::iter(
                 data.into_iter().map(Ok),
             ))))
@@ -788,10 +825,7 @@ mod tests {
             &self,
             _request: Request<tonic::Streaming<FlightData>>,
         ) -> Result<Response<Self::DoExchangeStream>, Status> {
-            let batch = nullable_entries_map_batch();
-            let data =
-                arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch])
-                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+            let data = self.0.flight_data()?;
             Ok(Response::new(Box::pin(futures::stream::iter(
                 data.into_iter().map(Ok),
             ))))
@@ -820,6 +854,10 @@ mod tests {
 
     impl TestServer {
         pub(crate) async fn start() -> Self {
+            Self::serving(Payload::Map).await
+        }
+
+        pub(crate) async fn serving(payload: Payload) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
@@ -827,7 +865,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let handle = tokio::spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(FlightServiceServer::new(NullableMapEntriesService))
+                    .add_service(FlightServiceServer::new(NullableMapEntriesService(payload)))
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                         let _ = shutdown_rx.await;
                     })
@@ -913,6 +951,51 @@ mod tests {
         let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
         MapArray::try_new(field, offsets, entries, nulls, ordered)
             .expect("the corrected column can be rebuilt by a kernel");
+
+        server.shutdown().await;
+    }
+
+    /// Regression test: correcting the map declaration must keep the producer's dictionary ids.
+    /// The correction re-encoded the schema message, which numbered the dictionaries afresh, so a
+    /// server numbering its dictionaries in another order had each dictionary column decoded
+    /// against another column's dictionary — wrong values, and no error.
+    #[tokio::test]
+    async fn correcting_the_map_declaration_keeps_the_servers_dictionary_ids_on_read() {
+        use crate::flight::dictionary_id_fixture::{expected_values, values};
+
+        let server = TestServer::serving(Payload::MapWithReorderedDictionaryIds).await;
+        let client = FlightClient::try_new(
+            Arc::from(format!("http://{}", server.addr)),
+            Credentials::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("client should connect");
+
+        let table = FlightTable::create(
+            "flight",
+            client,
+            TableReference::bare("t"),
+            Arc::new(DefaultDialect {}),
+            None,
+        )
+        .await
+        .expect("table should be created");
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should plan");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        assert_eq!(values(batch), expected_values());
 
         server.shutdown().await;
     }

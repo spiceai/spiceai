@@ -347,4 +347,46 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    /// Regression test: correcting the map declaration must keep the producer's dictionary ids,
+    /// or a producer numbering its dictionaries in another order has each dictionary column of
+    /// the subscription decoded against another column's dictionary.
+    #[tokio::test]
+    async fn correcting_the_map_declaration_keeps_the_producers_dictionary_ids_on_subscribe() {
+        use crate::flight::dictionary_id_fixture::{expected_values, values};
+        use crate::flight::tests::Payload;
+
+        let server = TestServer::serving(Payload::MapWithReorderedDictionaryIds).await;
+        let client = FlightClient::try_new(
+            Arc::from(format!("http://{}", server.addr)),
+            Credentials::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("client should connect");
+
+        let table = FlightTableStreamer::create(TableReference::bare("t"), client)
+            .await
+            .expect("table should be created");
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should plan");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!(
+                "the producer serves exactly one batch, got {}",
+                batches.len()
+            );
+        };
+        assert_eq!(values(batch), expected_values());
+
+        server.shutdown().await;
+    }
 }

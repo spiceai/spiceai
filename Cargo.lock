@@ -969,6 +969,7 @@ dependencies = [
  "base64 0.22.1",
  "criterion 0.7.0",
  "datafusion",
+ "flatbuffers",
  "insta",
  "serde_json",
  "snafu",

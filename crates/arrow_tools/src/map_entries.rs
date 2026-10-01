@@ -45,7 +45,6 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message};
 use snafu::prelude::*;
 
 use crate::type_rewrite::{MapAsList, MapEntriesNonNullable, apply_rules, target_child_types};
@@ -259,9 +258,10 @@ const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
 /// that declaration — so the batches are refused over the one part of them that holds no data,
 /// while every buffer in the stream is well formed. Bytes already at rest were written before
 /// the declaration was corrected, so the repair belongs on the way in: the stream's schema
-/// message is replaced by the [`decodable_schema`] form, under which the decode completes with
-/// every buffer validated, and the batch messages — which carry no declaration of their own —
-/// are decoded untouched against it. Each batch is then brought back to the map it describes.
+/// message is relabelled in place to the [`decodable_schema`] form (see
+/// [`decodable_schema_message`]), under which the decode completes with every buffer validated,
+/// and the messages after it are decoded untouched. Each batch is then brought back to the map
+/// it describes.
 ///
 /// The returned batches carry the conforming schema. A stream that already conforms is decoded
 /// directly and pays nothing for this.
@@ -269,8 +269,9 @@ const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
 /// # Errors
 ///
 /// Returns [`Error::UndecodableStream`] for a stream that does not decode — including one too
-/// short to hold the schema message it claims — and [`Error::MapEntriesContainNulls`] for the
-/// one map shape no relabelling can repair.
+/// short to hold the schema message it claims, or one whose schema message cannot be relabelled
+/// in place — and [`Error::MapEntriesContainNulls`] for the one map shape no relabelling can
+/// repair.
 pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = StreamReader::try_new(Cursor::new(bytes), None).context(UndecodableStreamSnafu)?;
     let declared = reader.schema();
@@ -283,7 +284,9 @@ pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     }
     drop(reader);
 
-    let repaired = with_schema_message(bytes, decodable).context(UndecodableStreamSnafu)?;
+    let repaired = with_relabelled_schema_message(bytes, Relabel::MapAsList, decodable)
+        .map_err(|error| ArrowError::IpcError(error.to_string()))
+        .context(UndecodableStreamSnafu)?;
     StreamReader::try_new(Cursor::new(repaired), None)
         .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
         .context(UndecodableStreamSnafu)?
@@ -295,14 +298,21 @@ pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
 /// The IPC schema-message header a decoder has to be handed in place of `data_header`, together
 /// with the schema that header declared.
 ///
-/// `None` when `data_header` is not a readable schema message, or when what it declares decodes
-/// as it stands — in both cases the message is passed on untouched.
+/// `None` when `data_header` is not a readable schema message, when what it declares decodes as
+/// it stands, or when it cannot be relabelled in place — in each case the message is passed on
+/// untouched, and a declaration the decoder cannot build against is refused by the decode.
 ///
 /// This is the [`decodable_schema`] repair for a decoder that reads its schema off the stream
 /// rather than taking one from its caller, which is how `arrow_flight`'s `FlightDataDecoder`
 /// works: the substitution has to reach it as bytes, before it builds anything. The caller keeps
 /// the returned schema, because that — not the substituted one the decoder will report — is what
 /// [`MapEntriesNormalizer::for_schema`] has to be built from for the batches to be put back.
+///
+/// The header is relabelled in place rather than re-encoded: each `Map` field's type byte is
+/// overwritten with `List`'s and every other byte is kept. The dictionary batches that follow a
+/// schema message name their dictionaries by the ids that message assigns, and those ids are the
+/// producer's to choose — an encoder numbering the fields afresh would hand a dictionary column
+/// another column's dictionary, or one that never arrives.
 #[must_use]
 pub fn decodable_schema_message(data_header: &[u8]) -> Option<(SchemaRef, Vec<u8>)> {
     let declared: SchemaRef = Arc::new(try_schema_from_flatbuffer_bytes(data_header).ok()?);
@@ -310,7 +320,7 @@ pub fn decodable_schema_message(data_header: &[u8]) -> Option<(SchemaRef, Vec<u8
     if Arc::ptr_eq(&decodable, &declared) {
         return None;
     }
-    let header = schema_message(&decodable);
+    let header = relabelled_schema_message(data_header, Relabel::MapAsList, &decodable).ok()?;
     Some((declared, header))
 }
 
@@ -318,8 +328,9 @@ pub fn decodable_schema_message(data_header: &[u8]) -> Option<(SchemaRef, Vec<u8
 /// in place of `data_header`: the [`conforming_schema`] form, which needs nothing done to the
 /// batches afterwards.
 ///
-/// `None` when `data_header` is not a readable schema message, or when what it declares already
-/// conforms — in both cases the message is passed on untouched.
+/// `None` when `data_header` is not a readable schema message, when what it declares already
+/// conforms, or when it cannot be relabelled in place — in each case the message is passed on
+/// untouched.
 ///
 /// This is the repair for a seam with no normalizer behind it, which is what separates it from
 /// [`decodable_schema_message`]: there, the list substitution is undone on the way past and the
@@ -327,6 +338,9 @@ pub fn decodable_schema_message(data_header: &[u8]) -> Option<(SchemaRef, Vec<u8
 /// the batches the caller gets, so they have to come out of the decode already conforming. The
 /// cost is that a producer whose entries really do hold nulls is refused by `ArrayData`
 /// validation rather than by name — the decode is the only thing left to refuse it.
+///
+/// As there, the header is relabelled in place — each nullable `entries` field's `nullable` byte
+/// is cleared — so the producer's dictionary ids are kept.
 #[must_use]
 pub fn conforming_schema_message(data_header: &[u8]) -> Option<Vec<u8>> {
     let declared: SchemaRef = Arc::new(try_schema_from_flatbuffer_bytes(data_header).ok()?);
@@ -334,47 +348,218 @@ pub fn conforming_schema_message(data_header: &[u8]) -> Option<Vec<u8>> {
     if Arc::ptr_eq(&conforming, &declared) {
         return None;
     }
-    Some(schema_message(&conforming))
+    relabelled_schema_message(data_header, Relabel::EntriesNonNullable, &conforming).ok()
 }
 
-/// The flatbuffer an IPC schema message carries for `schema`, which is what a Flight message
-/// holds in its `data_header`.
-fn schema_message(schema: &Schema) -> Vec<u8> {
-    IpcDataGenerator::default()
-        .schema_to_bytes_with_dictionary_tracker(
-            schema,
-            &mut DictionaryTracker::new(false),
-            &IpcWriteOptions::default(),
-        )
-        .ipc_message
+/// Why a schema message could not be relabelled in place.
+///
+/// Every variant describes a message that is not laid out the way the Arrow IPC format and the
+/// flatbuffers encoding lay out a valid one; none arises from a message written by a conforming
+/// producer.
+#[derive(Debug, Snafu)]
+enum RelabelError {
+    #[snafu(display("the schema message is not a readable flatbuffer: {source}"))]
+    UnreadableMessage {
+        source: flatbuffers::InvalidFlatbuffer,
+    },
+
+    #[snafu(display("the stream does not begin with a framed message: {source}"))]
+    UnreadableMessageFraming { source: ArrowError },
+
+    #[snafu(display("the stream ends inside the schema message it declares"))]
+    TruncatedSchemaMessage,
+
+    #[snafu(display("the message is not a schema message"))]
+    NotASchemaMessage,
+
+    #[snafu(display("map field '{field}' does not have exactly one `entries` child"))]
+    MapWithoutEntries { field: String },
+
+    #[snafu(display(
+        "field '{field}' does not store its `{slot}` explicitly, so there is no byte to relabel"
+    ))]
+    SlotNotStored { field: String, slot: &'static str },
+
+    #[snafu(display(
+        "field '{field}' stores {found} as its `{slot}` where {expected} was declared"
+    ))]
+    UnexpectedSlotValue {
+        field: String,
+        slot: &'static str,
+        found: u8,
+        expected: u8,
+    },
+
+    #[snafu(display("the relabelled schema message is not readable: {source}"))]
+    UnreadableRelabelledMessage { source: ArrowError },
+
+    #[snafu(display(
+        "the relabelled schema message declares {found} where {expected} was intended"
+    ))]
+    RelabelledSchemaDiffers { found: String, expected: String },
 }
 
-/// `bytes` with its leading schema message replaced by one declaring `schema`.
-fn with_schema_message(bytes: &[u8], schema: &Schema) -> std::result::Result<Vec<u8>, ArrowError> {
-    let rest = bytes.get(schema_message_len(bytes)?..).ok_or_else(|| {
-        ArrowError::ParseError(
-            "Arrow IPC stream ends inside the schema message it declares".to_string(),
-        )
-    })?;
+/// The one declaration a schema message is relabelled to change.
+#[derive(Clone, Copy)]
+enum Relabel {
+    /// Every `Map` field is declared the `List` it is laid out as ([`MapAsList`]).
+    MapAsList,
+    /// Every `Map` field's `entries` child is declared non-nullable ([`MapEntriesNonNullable`]).
+    EntriesNonNullable,
+}
 
-    let options = IpcWriteOptions::default();
-    let encoded = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
-        schema,
-        &mut DictionaryTracker::new(false),
-        &options,
+/// One byte of a schema message to overwrite: where it is, what it holds, what it becomes.
+struct BytePatch {
+    at: usize,
+    from: u8,
+    to: u8,
+}
+
+/// `data_header` with `relabel` applied by overwriting single bytes, every other byte — the
+/// dictionary ids above all, but also field order, metadata, endianness and features — kept as
+/// the producer wrote it.
+///
+/// Both relabels change one scalar a field table stores: the `type_type` union tag naming a
+/// field's type, or the `nullable` flag. Neither holds its default where it needs changing — a
+/// `Map` tag is not the `NONE` default, and `nullable` defaults to `false` — so a flatbuffers
+/// encoder stores each explicitly and the byte is there to overwrite. A `Map`'s type table is
+/// left behind under the `List` tag; `List` declares no fields, so a reader ignores the one the
+/// `Map` table carries.
+///
+/// The result is verified rather than trusted: it must parse, and the schema it declares must be
+/// `expected`. A field table a producer shared between two places, one relabelled and one not,
+/// fails that check instead of mislabelling the other.
+fn relabelled_schema_message(
+    data_header: &[u8],
+    relabel: Relabel,
+    expected: &Schema,
+) -> std::result::Result<Vec<u8>, RelabelError> {
+    let patches = {
+        let message = arrow::ipc::root_as_message(data_header).context(UnreadableMessageSnafu)?;
+        let schema = message.header_as_schema().context(NotASchemaMessageSnafu)?;
+        let mut patches = Vec::new();
+        for field in schema.fields().into_iter().flatten() {
+            collect_patches(field, relabel, &mut patches)?;
+        }
+        patches
+    };
+
+    let mut relabelled = data_header.to_vec();
+    for BytePatch { at, from, to } in patches {
+        // Every position is a slot the verified message resolved inside itself.
+        if let Some(byte) = relabelled.get_mut(at)
+            && *byte == from
+        {
+            *byte = to;
+        }
+    }
+
+    let found =
+        try_schema_from_flatbuffer_bytes(&relabelled).context(UnreadableRelabelledMessageSnafu)?;
+    ensure!(
+        &found == expected,
+        RelabelledSchemaDiffersSnafu {
+            found: found.to_string(),
+            expected: expected.to_string(),
+        }
     );
+    Ok(relabelled)
+}
 
-    // The message is the flatbuffer plus its continuation marker and length prefix.
-    let mut repaired =
-        Vec::with_capacity(encoded.ipc_message.len() + CONTINUATION_MARKER.len() + 4 + rest.len());
-    write_message(&mut repaired, encoded, &options)?;
-    repaired.extend_from_slice(rest);
+/// Records the byte patches `relabel` needs in `field` and every field nested below it.
+fn collect_patches(
+    field: arrow::ipc::Field<'_>,
+    relabel: Relabel,
+    patches: &mut Vec<BytePatch>,
+) -> std::result::Result<(), RelabelError> {
+    if field.type_type() == arrow::ipc::Type::Map {
+        match relabel {
+            Relabel::MapAsList => patches.push(stored_byte(
+                field,
+                arrow::ipc::Field::VT_TYPE_TYPE,
+                "type_type",
+                arrow::ipc::Type::Map.0,
+                arrow::ipc::Type::List.0,
+            )?),
+            Relabel::EntriesNonNullable => {
+                let entries = field
+                    .children()
+                    .filter(|children| children.len() == 1)
+                    .map(|children| children.get(0))
+                    .context(MapWithoutEntriesSnafu {
+                        field: field.name().unwrap_or_default(),
+                    })?;
+                if entries.nullable() {
+                    patches.push(stored_byte(
+                        entries,
+                        arrow::ipc::Field::VT_NULLABLE,
+                        "nullable",
+                        1,
+                        0,
+                    )?);
+                }
+            }
+        }
+    }
+    for child in field.children().into_iter().flatten() {
+        collect_patches(child, relabel, patches)?;
+    }
+    Ok(())
+}
+
+/// The patch overwriting the one-byte scalar `field` stores at vtable slot `slot`, which must
+/// hold `from`.
+fn stored_byte(
+    field: arrow::ipc::Field<'_>,
+    slot: flatbuffers::VOffsetT,
+    slot_name: &'static str,
+    from: u8,
+    to: u8,
+) -> std::result::Result<BytePatch, RelabelError> {
+    let name = || field.name().unwrap_or_default().to_string();
+    let offset = field._tab.vtable().get(slot);
+    ensure!(
+        offset != 0,
+        SlotNotStoredSnafu {
+            field: name(),
+            slot: slot_name,
+        }
+    );
+    let at = field._tab.loc() + usize::from(offset);
+    let found = field._tab.buf().get(at).copied().unwrap_or_default();
+    ensure!(
+        found == from,
+        UnexpectedSlotValueSnafu {
+            field: name(),
+            slot: slot_name,
+            found,
+            expected: from,
+        }
+    );
+    Ok(BytePatch { at, from, to })
+}
+
+/// `bytes` with `relabel` applied to its leading schema message (see
+/// [`relabelled_schema_message`]). The message keeps its length, so every message after it stays
+/// where it was.
+fn with_relabelled_schema_message(
+    bytes: &[u8],
+    relabel: Relabel,
+    expected: &Schema,
+) -> std::result::Result<Vec<u8>, RelabelError> {
+    let range = schema_message_range(bytes).context(UnreadableMessageFramingSnafu)?;
+    let mut repaired = bytes.to_vec();
+    let header = repaired
+        .get_mut(range)
+        .context(TruncatedSchemaMessageSnafu)?;
+    let relabelled = relabelled_schema_message(header, relabel, expected)?;
+    header.copy_from_slice(&relabelled);
     Ok(repaired)
 }
 
-/// How many bytes the stream's leading schema message occupies, which — a schema message
-/// having no body — is where the next message begins.
-fn schema_message_len(bytes: &[u8]) -> std::result::Result<usize, ArrowError> {
+/// Where the flatbuffer of the stream's leading schema message lies in `bytes`: after the
+/// framing, and — a schema message having no body — up to where the next message begins.
+fn schema_message_range(bytes: &[u8]) -> std::result::Result<std::ops::Range<usize>, ArrowError> {
     // The continuation marker is absent only in the pre-0.15 framing, which writes the
     // metadata length first and nothing else.
     let prefix = if bytes.starts_with(&CONTINUATION_MARKER) {
@@ -394,7 +579,8 @@ fn schema_message_len(bytes: &[u8]) -> std::result::Result<usize, ArrowError> {
         ArrowError::ParseError("Arrow IPC schema message length does not fit in memory".to_string())
     })?;
 
-    Ok(prefix + 4 + metadata_len)
+    let start = prefix + 4;
+    Ok(start..start + metadata_len)
 }
 
 /// Normalizes the batches of a decode point that learns its schema only from the batches
@@ -657,6 +843,19 @@ mod tests {
         MapArray::try_new(field, offsets, entries, nulls, ordered)
     }
 
+    /// The flatbuffer an IPC schema message carries for `schema`, as `arrow-rs` encodes it —
+    /// which is what a Flight message holds in its `data_header`.
+    fn schema_message(schema: &Schema) -> Vec<u8> {
+        use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+        IpcDataGenerator::default()
+            .schema_to_bytes_with_dictionary_tracker(
+                schema,
+                &mut DictionaryTracker::new(false),
+                &IpcWriteOptions::default(),
+            )
+            .ipc_message
+    }
+
     /// Writes `batches` as an Arrow IPC stream under `schema`, the way a producer that
     /// declared its map entries nullable already wrote the bytes now at rest.
     fn ipc_stream(schema: &SchemaRef, batches: &[RecordBatch]) -> Vec<u8> {
@@ -800,8 +999,12 @@ mod tests {
             "unexpected error: {declared}"
         );
 
-        let conformed = with_schema_message(&bytes, &conforming_schema(batch.schema()))
-            .expect("the schema message is replaceable");
+        let conformed = with_relabelled_schema_message(
+            &bytes,
+            Relabel::EntriesNonNullable,
+            &conforming_schema(batch.schema()),
+        )
+        .expect("the schema message is replaceable");
         let conformed = StreamReader::try_new(Cursor::new(conformed), None)
             .expect("the replacement schema message is readable")
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -1447,5 +1650,493 @@ mod tests {
             .expect("normalization of an empty column");
         assert_eq!(normalized.num_rows(), 0);
         assert_eq!(normalized.schema().field(0).data_type(), &map_type(false));
+    }
+
+    /// Streams from a producer that numbers its dictionaries differently from `arrow-rs`.
+    ///
+    /// The Arrow format leaves dictionary ids to the producer: they only have to agree between
+    /// the schema message and the dictionary batches that follow it. `arrow-rs` numbers them
+    /// from 0 in the order it encodes the fields, so a stream written by `arrow-rs` cannot show
+    /// whether a repair keeps the producer's ids; these fixtures write that stream and then give
+    /// its ids the values another producer would have chosen.
+    mod dictionary_ids {
+        use super::*;
+        use arrow::array::{DictionaryArray, Int32Array, StringArray, StructArray};
+        use arrow::compute::cast;
+        use arrow::datatypes::{Field, Fields, Int32Type};
+        use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+
+        /// Every dictionary column indexes its two values in reverse, so a column decoded
+        /// against another column's dictionary yields that column's values, not an error.
+        const KEYS: [i32; 2] = [1, 0];
+
+        pub(super) const A: [&str; 2] = ["north", "south"];
+        pub(super) const MAP_VALUES: [&str; 2] = ["red", "blue"];
+        pub(super) const C: [&str; 2] = ["up", "down"];
+
+        fn dictionary(values: [&str; 2]) -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(KEYS.to_vec()),
+                    Arc::new(StringArray::from(values.to_vec())),
+                )
+                .expect("dictionary column"),
+            )
+        }
+
+        fn dictionary_type() -> DataType {
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        }
+
+        fn entry_fields() -> Fields {
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", dictionary_type(), true),
+            ]
+            .into()
+        }
+
+        pub(super) fn map_type(entries_nullable: bool) -> DataType {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(entry_fields()),
+                    entries_nullable,
+                )),
+                false,
+            )
+        }
+
+        /// Three dictionary columns sharing one value type: `a`, the values of map `m`, and `c`.
+        /// `m` declares its `entries` nullable when `entries_nullable` is set.
+        pub(super) fn batch(
+            entries_nullable: bool,
+            a: [&str; 2],
+            map_values: [&str; 2],
+            c: [&str; 2],
+        ) -> RecordBatch {
+            let entries = StructArray::try_new(
+                entry_fields(),
+                vec![
+                    Arc::new(StringArray::from(vec!["k0", "k1"])) as ArrayRef,
+                    dictionary(map_values),
+                ],
+                None,
+            )
+            .expect("entries struct");
+            let builder = ArrayData::builder(map_type(entries_nullable))
+                .len(2)
+                .add_buffer(arrow::buffer::Buffer::from_slice_ref([0_i32, 1, 2]))
+                .add_child_data(entries.to_data());
+            // SAFETY: the offsets and child data are well formed; the `entries` nullability
+            // declaration is the one thing validation rejects, and it is the shape under test.
+            let map = MapArray::from(unsafe { builder.build_unchecked() });
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", dictionary_type(), true),
+                Field::new("m", map_type(entries_nullable), true),
+                Field::new("c", dictionary_type(), true),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![dictionary(a), Arc::new(map) as ArrayRef, dictionary(c)],
+            )
+            .expect("batch")
+        }
+
+        /// The values every column of `batch` decodes to: `a`, the map's values, then `c`.
+        pub(super) fn values(batch: &RecordBatch) -> Vec<Vec<String>> {
+            let strings = |array: &ArrayRef| {
+                let utf8 = cast(array, &DataType::Utf8).expect("cast to Utf8");
+                utf8.as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8")
+                    .iter()
+                    .map(|value| value.expect("no nulls").to_string())
+                    .collect::<Vec<_>>()
+            };
+            let map = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .expect("a Map column");
+            vec![
+                strings(batch.column(0)),
+                strings(map.values()),
+                strings(batch.column(2)),
+            ]
+        }
+
+        pub(super) fn expected_values() -> Vec<Vec<String>> {
+            let reversed = |values: [&str; 2]| vec![values[1].to_string(), values[0].to_string()];
+            vec![reversed(A), reversed(MAP_VALUES), reversed(C)]
+        }
+
+        /// One IPC message: its flatbuffer header and the body that follows it.
+        pub(super) struct Message {
+            pub(super) header: Vec<u8>,
+            pub(super) body: Vec<u8>,
+        }
+
+        pub(super) fn split(bytes: &[u8]) -> Vec<Message> {
+            let mut messages = Vec::new();
+            let mut at = 0;
+            loop {
+                assert_eq!(bytes[at..at + 4], CONTINUATION_MARKER, "framed message");
+                let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("len"));
+                let len = usize::try_from(len).expect("len fits");
+                at += 8;
+                if len == 0 {
+                    return messages;
+                }
+                let header = bytes[at..at + len].to_vec();
+                at += len;
+                let body_len = arrow::ipc::root_as_message(&header)
+                    .expect("a message")
+                    .bodyLength();
+                let body_len = usize::try_from(body_len).expect("body length");
+                messages.push(Message {
+                    header,
+                    body: bytes[at..at + body_len].to_vec(),
+                });
+                at += body_len;
+            }
+        }
+
+        pub(super) fn join(messages: &[Message]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for message in messages {
+                let padded = message.header.len().next_multiple_of(8);
+                bytes.extend_from_slice(&CONTINUATION_MARKER);
+                bytes.extend_from_slice(&u32::try_from(padded).expect("len").to_le_bytes());
+                bytes.extend_from_slice(&message.header);
+                bytes.resize(bytes.len() + padded - message.header.len(), 0);
+                bytes.extend_from_slice(&message.body);
+            }
+            bytes.extend_from_slice(&CONTINUATION_MARKER);
+            bytes.extend_from_slice(&[0; 4]);
+            bytes
+        }
+
+        fn write_i64(buf: &mut [u8], at: usize, value: i64) {
+            buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        /// Where the explicitly stored `id` of every dictionary encoding in `header`'s schema
+        /// lives, with the id it holds.
+        fn schema_id_slots(header: &[u8]) -> Vec<(usize, i64)> {
+            fn visit(field: arrow::ipc::Field<'_>, slots: &mut Vec<(usize, i64)>) {
+                if let Some(dictionary) = field.dictionary() {
+                    let slot = dictionary
+                        ._tab
+                        .vtable()
+                        .get(arrow::ipc::DictionaryEncoding::VT_ID);
+                    assert_ne!(slot, 0, "the fixture stores every schema id explicitly");
+                    slots.push((dictionary._tab.loc() + usize::from(slot), dictionary.id()));
+                }
+                for child in field.children().into_iter().flatten() {
+                    visit(child, slots);
+                }
+            }
+            let message = arrow::ipc::root_as_message(header).expect("a message");
+            let schema = message.header_as_schema().expect("a schema message");
+            let mut slots = Vec::new();
+            for field in schema.fields().into_iter().flatten() {
+                visit(field, &mut slots);
+            }
+            slots
+        }
+
+        /// Writes `encoded` as `arrow-rs` would, then renumbers its dictionaries the way another
+        /// producer might have: the field `arrow-rs` numbered `k` is declared with
+        /// `field_ids[k]`, and the dictionary batch `arrow-rs` numbered `k` is sent as
+        /// `batch_id(k)`.
+        ///
+        /// `arrow-rs` omits an id of 0 from the dictionary batch it writes, so `batch_id(0)`
+        /// must stay 0; every other id is stored and can be given any value.
+        pub(super) fn producer_stream(
+            encoded: &RecordBatch,
+            field_ids: &[i64],
+            batch_id: impl Fn(i64) -> i64,
+        ) -> Vec<u8> {
+            let schema = encoded.schema();
+            let mut messages = split(&ipc_stream(&schema, std::slice::from_ref(encoded)));
+
+            // Advancing the tracker once makes every id in this schema message nonzero, so each
+            // is stored explicitly and can be rewritten in place; it is otherwise the message
+            // `arrow-rs` wrote, with `arrow-rs`'s id `k` written as `k + 1`.
+            let mut tracker = DictionaryTracker::new(false);
+            tracker.next_dict_id();
+            let mut header = IpcDataGenerator::default()
+                .schema_to_bytes_with_dictionary_tracker(
+                    &schema,
+                    &mut tracker,
+                    &IpcWriteOptions::default(),
+                )
+                .ipc_message;
+            let slots = schema_id_slots(&header);
+            assert_eq!(slots.len(), field_ids.len(), "one id per dictionary field");
+            for (at, written) in slots {
+                let k = usize::try_from(written - 1).expect("arrow-rs id");
+                write_i64(&mut header, at, field_ids[k]);
+            }
+            messages[0].header = header;
+
+            for message in &mut messages[1..] {
+                let (slot, id) = {
+                    let parsed = arrow::ipc::root_as_message(&message.header).expect("a message");
+                    let Some(dictionary) = parsed.header_as_dictionary_batch() else {
+                        continue;
+                    };
+                    let slot = dictionary
+                        ._tab
+                        .vtable()
+                        .get(arrow::ipc::DictionaryBatch::VT_ID);
+                    (dictionary._tab.loc() + usize::from(slot), dictionary.id())
+                };
+                let renumbered = batch_id(id);
+                if id == 0 {
+                    assert_eq!(renumbered, 0, "an omitted id of 0 cannot be renumbered");
+                } else {
+                    write_i64(&mut message.header, slot, renumbered);
+                }
+            }
+            join(&messages)
+        }
+
+        /// The ids of every dictionary encoding `header`'s schema declares, in field order.
+        pub(super) fn schema_ids(header: &[u8]) -> Vec<i64> {
+            fn visit(field: arrow::ipc::Field<'_>, ids: &mut Vec<i64>) {
+                if let Some(dictionary) = field.dictionary() {
+                    ids.push(dictionary.id());
+                }
+                for child in field.children().into_iter().flatten() {
+                    visit(child, ids);
+                }
+            }
+            let message = arrow::ipc::root_as_message(header).expect("a message");
+            let schema = message.header_as_schema().expect("a schema message");
+            let mut ids = Vec::new();
+            for field in schema.fields().into_iter().flatten() {
+                visit(field, &mut ids);
+            }
+            ids
+        }
+
+        /// A producer that numbers `a`, the map's values and `c` as 2, 0 and 1 — the reverse
+        /// of the order `arrow-rs` numbers them in for `a` and `c`. Every id is one `arrow-rs`
+        /// would also use, so a repair that renumbers them finds a dictionary for every column:
+        /// just the wrong one.
+        pub(super) fn reordered_ids_stream(entries_nullable: bool) -> Vec<u8> {
+            // `arrow-rs` sends the dictionary of the column it numbered `k` as batch `k`; for
+            // that batch to be the dictionary of the field this producer numbers `k`, each
+            // column carries the dictionary of the field that takes over its number.
+            let encoded = batch(entries_nullable, MAP_VALUES, C, A);
+            producer_stream(&encoded, &[2, 0, 1], |id| id)
+        }
+
+        /// A producer that numbers its dictionaries 0, 7 and 3 — with gaps, and not ascending.
+        pub(super) fn sparse_ids_stream(entries_nullable: bool) -> Vec<u8> {
+            let encoded = batch(entries_nullable, A, MAP_VALUES, C);
+            producer_stream(&encoded, &[0, 7, 3], |id| match id {
+                1 => 7,
+                2 => 3,
+                other => other,
+            })
+        }
+
+        /// Premise of every test below: the fixtures are well formed. A stream whose map
+        /// declaration already conforms decodes with stock `arrow-rs`, every column against its
+        /// own dictionary.
+        #[test]
+        fn the_fixtures_decode_as_written_when_no_repair_is_needed() {
+            for (name, bytes) in [
+                ("reordered", reordered_ids_stream(false)),
+                ("sparse", sparse_ids_stream(false)),
+            ] {
+                let batches = StreamReader::try_new(Cursor::new(&bytes), None)
+                    .expect("schema")
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap_or_else(|e| panic!("{name}: the producer's own stream decodes: {e}"));
+                assert_eq!(values(&batches[0]), expected_values(), "{name}");
+            }
+            assert_eq!(
+                schema_ids(&split(&reordered_ids_stream(true))[0].header),
+                vec![2, 0, 1]
+            );
+            assert_eq!(
+                schema_ids(&split(&sparse_ids_stream(true))[0].header),
+                vec![0, 7, 3]
+            );
+        }
+
+        /// Regression test: the repair renumbered the producer's dictionaries, so `a` and `c`
+        /// silently decoded against each other's dictionaries (and the map against `c`'s).
+        #[test]
+        fn read_ipc_stream_keeps_reordered_dictionary_ids() {
+            let batches =
+                read_ipc_stream(&reordered_ids_stream(true)).expect("the repaired stream decodes");
+            assert_eq!(values(&batches[0]), expected_values());
+        }
+
+        /// Regression test: the repair renumbered the producer's dictionaries 0, 1, 2, so the
+        /// dictionary batches sent as 7 and 3 matched no field.
+        #[test]
+        fn read_ipc_stream_keeps_sparse_dictionary_ids() {
+            let batches =
+                read_ipc_stream(&sparse_ids_stream(true)).expect("the repaired stream decodes");
+            assert_eq!(values(&batches[0]), expected_values());
+        }
+
+        /// Decodes `bytes` the way a Flight decoder does after its schema message has been
+        /// swapped for `header`.
+        fn decode_with_header(bytes: &[u8], header: Vec<u8>) -> Vec<RecordBatch> {
+            let mut messages = split(bytes);
+            messages[0].header = header;
+            StreamReader::try_new(Cursor::new(join(&messages)), None)
+                .expect("the replacement schema message is readable")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("the stream decodes under the replacement schema message")
+        }
+
+        #[test]
+        fn decodable_schema_message_keeps_the_producers_dictionary_ids() {
+            for (name, bytes) in [
+                ("reordered", reordered_ids_stream(true)),
+                ("sparse", sparse_ids_stream(true)),
+            ] {
+                let original = split(&bytes).remove(0).header;
+                let (declared, header) = decodable_schema_message(&original)
+                    .expect("a nullable entries declaration needs replacing");
+                assert_eq!(
+                    schema_ids(&header),
+                    schema_ids(&original),
+                    "{name}: the dictionary ids are the producer's"
+                );
+                let normalizer = MapEntriesNormalizer::for_schema(&declared);
+                let batches = decode_with_header(&bytes, header);
+                let batch = normalizer
+                    .normalize(batches[0].clone())
+                    .expect("the map is put back");
+                assert_eq!(values(&batch), expected_values(), "{name}");
+            }
+        }
+
+        #[test]
+        fn conforming_schema_message_keeps_the_producers_dictionary_ids() {
+            for (name, bytes) in [
+                ("reordered", reordered_ids_stream(true)),
+                ("sparse", sparse_ids_stream(true)),
+            ] {
+                let original = split(&bytes).remove(0).header;
+                let header = conforming_schema_message(&original)
+                    .expect("a nullable entries declaration needs replacing");
+                assert_eq!(
+                    schema_ids(&header),
+                    schema_ids(&original),
+                    "{name}: the dictionary ids are the producer's"
+                );
+                let batches = decode_with_header(&bytes, header);
+                assert_eq!(batches[0].schema().field(1).data_type(), &map_type(false));
+                assert_eq!(values(&batches[0]), expected_values(), "{name}");
+            }
+        }
+
+        /// The repair touches nothing but the declaration it corrects: the conforming form
+        /// differs from the producer's message in the one `nullable` byte of the map's
+        /// `entries` field, and the decodable form in the one byte naming the map's type.
+        #[test]
+        fn a_repaired_schema_message_differs_only_in_the_corrected_byte() {
+            let original = split(&sparse_ids_stream(true)).remove(0).header;
+            let changed = |repaired: &[u8]| {
+                assert_eq!(
+                    repaired.len(),
+                    original.len(),
+                    "the message keeps its length"
+                );
+                original
+                    .iter()
+                    .zip(repaired)
+                    .filter(|(before, after)| before != after)
+                    .map(|(before, after)| (*before, *after))
+                    .collect::<Vec<_>>()
+            };
+
+            let conforming =
+                conforming_schema_message(&original).expect("the declaration needs correcting");
+            assert_eq!(
+                changed(&conforming),
+                vec![(1, 0)],
+                "`nullable` true -> false"
+            );
+
+            let (_, decodable) =
+                decodable_schema_message(&original).expect("the declaration needs correcting");
+            assert_eq!(
+                changed(&decodable),
+                vec![(arrow::ipc::Type::Map.0, arrow::ipc::Type::List.0)],
+                "the map's type Map -> List"
+            );
+        }
+
+        /// Every map is relabelled for the decoder — the conforming one and the one nested in a
+        /// list as well as the one breaking the rule — one type byte each, and nothing else.
+        #[test]
+        fn every_map_is_relabelled_one_byte_each() {
+            let schema = Schema::new(vec![
+                Field::new(
+                    "nested",
+                    DataType::List(Arc::new(Field::new("item", map_type(true), true))),
+                    true,
+                ),
+                Field::new("conforming", map_type(false), true),
+                Field::new("plain", DataType::Int32, true),
+            ]);
+            let original = super::schema_message(&schema);
+            let (_, decodable) =
+                decodable_schema_message(&original).expect("the declaration needs correcting");
+            let changed = original
+                .iter()
+                .zip(&decodable)
+                .filter(|(before, after)| before != after)
+                .map(|(before, after)| (*before, *after))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                changed,
+                vec![(arrow::ipc::Type::Map.0, arrow::ipc::Type::List.0); 2],
+                "one Map -> List tag per map"
+            );
+            assert_eq!(
+                try_schema_from_flatbuffer_bytes(&decodable).expect("readable"),
+                *decodable_schema(&Arc::new(schema))
+            );
+        }
+
+        /// The relabelled message is checked against the schema it is meant to declare, so a
+        /// message the in-place relabel cannot bring there is refused rather than passed on.
+        #[test]
+        fn a_relabel_that_misses_its_target_is_refused() {
+            let original = split(&sparse_ids_stream(true)).remove(0).header;
+            let unrelated = Schema::new(vec![Field::new("n", DataType::Int32, true)]);
+            let error =
+                relabelled_schema_message(&original, Relabel::EntriesNonNullable, &unrelated)
+                    .expect_err("the relabelled message does not declare the unrelated schema");
+            assert!(
+                matches!(error, RelabelError::RelabelledSchemaDiffers { .. }),
+                "unexpected error: {error}"
+            );
+        }
+
+        /// A stream whose declarations already conform needs no repair, so its schema message is
+        /// passed on as the producer wrote it.
+        #[test]
+        fn a_conforming_schema_message_is_left_untouched() {
+            let bytes = sparse_ids_stream(false);
+            let original = split(&bytes).remove(0).header;
+            assert!(decodable_schema_message(&original).is_none());
+            assert!(conforming_schema_message(&original).is_none());
+            let batches = read_ipc_stream(&bytes).expect("a conforming stream decodes");
+            assert_eq!(values(&batches[0]), expected_values());
+        }
     }
 }
