@@ -17,15 +17,18 @@ limitations under the License.
 //! Resolving datasets that read acceleration snapshots (`file_format: snapshot`): see
 //! [`crate::component::dataset::snapshot_source`].
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use app::App;
 use datafusion::sql::TableReference;
+use parking_lot::Mutex;
 use runtime_acceleration::Engine;
 use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
 use runtime_metrics as metrics;
 use snafu::prelude::*;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry, warn_spaced};
 
 use crate::component::dataset::{
@@ -46,6 +49,79 @@ use crate::dataconnector::snapshot_source::{
 use crate::datafusion::{DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, engine_to_acceleration_engine};
 use crate::init::dataset_loads::DatasetLoad;
 use crate::{LogErrors, Runtime, UnableToBuildDatasetSnafu, status};
+
+/// Holds installed by tests that must supersede a snapshot restore after that
+/// restore has taken the load's attempt. Keyed by table name so parallel tests
+/// do not pause one another's datasets.
+static RESTORE_HOLDS: LazyLock<Mutex<HashMap<String, Arc<SnapshotRestoreHoldInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct SnapshotRestoreHoldInner {
+    dataset: String,
+    started: AtomicBool,
+    started_notify: Notify,
+    release: Semaphore,
+}
+
+/// Pauses the first restore of one snapshot dataset after that restore has taken
+/// the load's attempt, so a test can supersede it and observe that the reload
+/// waits. Other datasets, and restores with no hold installed, are unaffected.
+#[doc(hidden)]
+pub struct SnapshotRestoreHold {
+    inner: Arc<SnapshotRestoreHoldInner>,
+}
+
+impl SnapshotRestoreHold {
+    /// Installs a hold for `dataset`'s first restore. Dropping the returned
+    /// value removes the hold and unblocks any restore waiting on it.
+    #[must_use]
+    pub fn install(dataset: impl Into<String>) -> Self {
+        let dataset = dataset.into();
+        let inner = Arc::new(SnapshotRestoreHoldInner {
+            dataset: dataset.clone(),
+            started: AtomicBool::new(false),
+            started_notify: Notify::new(),
+            release: Semaphore::new(0),
+        });
+        RESTORE_HOLDS.lock().insert(dataset, Arc::clone(&inner));
+        Self { inner }
+    }
+
+    /// Resolves once `resolve_snapshot_source` has taken the restore attempt and
+    /// is waiting on this hold.
+    pub async fn wait_until_restore_started(&self) {
+        let notified = self.inner.started_notify.notified();
+        if self.inner.started.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Lets the held restore continue. Safe to call more than once.
+    pub fn release(&self) {
+        if self.inner.release.available_permits() == 0 {
+            self.inner.release.add_permits(1);
+        }
+    }
+}
+
+impl Drop for SnapshotRestoreHold {
+    fn drop(&mut self) {
+        RESTORE_HOLDS.lock().remove(self.inner.dataset.as_str());
+        self.release();
+    }
+}
+
+/// No-op unless a test installed a [`SnapshotRestoreHold`] for `name`.
+async fn wait_for_installed_restore_hold(name: &TableReference) {
+    let hold = RESTORE_HOLDS.lock().get(name.table()).map(Arc::clone);
+    let Some(hold) = hold else {
+        return;
+    };
+    hold.started.store(true, Ordering::SeqCst);
+    hold.started_notify.notify_waiters();
+    drop(hold.release.acquire().await);
+}
 
 impl Runtime {
     /// Resolves a dataset that reads acceleration snapshots whose engine is not known
@@ -138,6 +214,9 @@ impl Runtime {
             if stopped() {
                 return None;
             }
+            // After the attempt and load permit are held: a test can now supersede
+            // this restore and observe that the reload waits for it.
+            wait_for_installed_restore_hold(&name).await;
             self.initialize_datasets_accelerators(std::slice::from_ref(&resolved))
                 .await
                 .remove(&resolved.name)?
@@ -385,5 +464,53 @@ impl Runtime {
         );
         metrics::datasets::LOAD_ERROR.add(1, &[]);
         tracing::error!("{message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_dataset_without_a_restore_hold_is_not_paused() {
+        let name = TableReference::bare("unheld");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_installed_restore_hold(&name),
+        )
+        .await
+        .expect("a dataset with no hold must not wait");
+    }
+
+    #[tokio::test]
+    async fn a_restore_hold_blocks_until_it_is_released() {
+        let hold = SnapshotRestoreHold::install("held");
+        let waiting = tokio::spawn(async {
+            wait_for_installed_restore_hold(&TableReference::bare("held")).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), hold.wait_until_restore_started())
+            .await
+            .expect("the restore should reach the hold");
+        assert!(
+            !waiting.is_finished(),
+            "the restore must stay blocked until the hold is released"
+        );
+        hold.release();
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("releasing the hold should unblock the restore")
+            .expect("the restore task does not panic");
+    }
+
+    #[tokio::test]
+    async fn a_restore_hold_does_not_pause_another_dataset() {
+        let _hold = SnapshotRestoreHold::install("held");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_installed_restore_hold(&TableReference::bare("other")),
+        )
+        .await
+        .expect("a hold for one dataset must not pause another");
     }
 }

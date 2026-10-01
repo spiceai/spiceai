@@ -39,7 +39,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
-use runtime::{Runtime, status::ComponentStatus};
+use runtime::{Runtime, SnapshotRestoreHold, status::ComponentStatus};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode, SnapshotBehavior, SnapshotsCreationPolicy},
     component::{
@@ -1005,4 +1005,128 @@ async fn other_statuses_than_ready(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     reported
+}
+
+const RESTORE_HELD: Rustfs = Rustfs {
+    name: "spice_test_rustfs_snapshot_source_restore_held",
+    port: 19130,
+};
+
+/// A reload that replaces a snapshot dataset while that dataset is restoring its
+/// first snapshot waits for the restore, then does not register it. The
+/// replacement is what is served.
+#[tokio::test]
+async fn a_replaced_snapshot_dataset_waits_for_its_in_progress_restore() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let container = start_rustfs(RESTORE_HELD).await?;
+            let result = restore_held_scenario(RESTORE_HELD, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let table = datafusion::sql::TableReference::bare(modules);
+    let hold = SnapshotRestoreHold::install(modules);
+
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_restore_held_reader")
+                    .with_dataset(reader_dataset(rustfs, modules, &prefix))
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    let mut reader_load = tokio::spawn(Arc::clone(&reader).load_components());
+    wait_for_error(&reader, &table, "has no snapshot to load yet").await?;
+
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
+    tokio::time::timeout(Duration::from_secs(60), hold.wait_until_restore_started())
+        .await
+        .context("the reader did not start restoring the published snapshot")?;
+
+    let replacement_csv = dir.path().join("replacement.csv");
+    std::fs::write(&replacement_csv, GROWN_CSV)?;
+    let replaced = AppBuilder::new("snapshot_source_restore_held_reader")
+        .with_dataset(csv_dataset(modules, &replacement_csv))
+        .build();
+
+    // The restore holds the load's attempt, so this apply waits in `supersede`
+    // until the restore finishes. The bound is on purpose: the failure is an
+    // apply that returns without waiting.
+    let mut apply = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        async move { reader.apply_app(Arc::new(replaced)).await }
+    });
+    let mut failures = Vec::new();
+    match tokio::time::timeout(Duration::from_secs(5), &mut apply).await {
+        Ok(Ok(true)) => {
+            failures.push("the reload returned while the restore was still held".to_string());
+        }
+        Ok(Ok(false)) => failures.push(
+            "the reload reported that the app did not change while the restore was held"
+                .to_string(),
+        ),
+        Ok(Err(err)) => failures.push(format!("the reload task failed: {err}")),
+        Err(_) => {}
+    }
+    if let Ok(served) = rows(&reader, modules).await {
+        if !served.is_empty() {
+            failures.push(format!(
+                "the stale restore registered '{modules}' while it was still held, served {served:?}"
+            ));
+        }
+    }
+
+    hold.release();
+    match tokio::time::timeout(Duration::from_secs(30), apply).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            failures.push("the reload reported that the app did not change".to_string());
+        }
+        Ok(Err(err)) => failures.push(format!("the reload task failed: {err}")),
+        Err(_) => {
+            failures.push(
+                "the reload was still waiting 30 s after the restore was released".to_string(),
+            );
+        }
+    }
+
+    if let Err(err) = wait_for_ready(&reader, &table).await {
+        failures.push(err.to_string());
+    }
+    match tokio::time::timeout(Duration::from_secs(30), &mut reader_load).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => failures.push(format!("the reader's load failed: {err}")),
+        Err(_) => failures
+            .push("the reader was still loading its components 30 s after the reload".to_string()),
+    }
+    let served = rows(&reader, modules).await?;
+    if served.len() != 5 {
+        failures.push(format!(
+            "'{modules}' should serve the replacement's 5 rows, served {served:?}"
+        ));
+    }
+    for status in other_statuses_than_ready(&reader, &table, Duration::from_secs(3)).await {
+        failures.push(format!("after the reload, '{modules}' reported {status}"));
+    }
+
+    reader_load.abort();
+    reader.shutdown().await;
+    writer.shutdown().await;
+    ensure!(
+        failures.is_empty(),
+        "the in-progress restore was not superseded cleanly:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
 }
