@@ -48,13 +48,14 @@ on:
         default: false
 
 concurrency:
-  # A newer run cancels the one in progress for the same pull request, merge group or non-trunk
-  # branch. Trunk pushes share one group and never cancel: each holds a `spiceai-macos-large` slot
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel:
+  # each holds a `spiceai-macos-large` slot
   # for its macOS build, the pool the merge queue builds on, so a newer push replaces only the run
   # still waiting. The trunk commit is the merge-group commit that already passed this workflow;
   # the jobs that run only on push cover the first and latest commit of a burst of merges.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
-  cancel-in-progress: ${{ github.ref_name != 'trunk' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   # CI performance optimizations
