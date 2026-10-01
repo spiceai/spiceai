@@ -1736,13 +1736,24 @@ impl SnapshotManager {
             uuid::Uuid::now_v7()
         ));
 
-        let total_archived =
-            archive_directories_to_file_with_plan(dirs, &temp_archive_path, &skip_paths, &extras)
-                .await
-                .map_err(|source| SnapshotUploadError::ArchiveCreate {
-                    path: temp_archive_path.clone(),
+        let total_archived = match archive_directories_to_file_with_plan(
+            dirs,
+            &temp_archive_path,
+            &skip_paths,
+            &extras,
+        )
+        .await
+        {
+            Ok(total) => total,
+            Err(source) => {
+                // A retry writes a new path, so remove the partial archive now.
+                let _ = fs::remove_file(&temp_archive_path).await;
+                return Err(SnapshotUploadError::ArchiveCreate {
+                    path: temp_archive_path,
                     source,
-                })?;
+                });
+            }
+        };
 
         tracing::debug!(
             "Created tar archive for snapshot. dataset={} archive_size={}",
@@ -5616,6 +5627,46 @@ mod tests {
             .await
             .expect("read downloaded snapshot");
         assert_eq!(downloaded.as_slice(), good_contents.as_ref());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_archive_removes_the_partial_archive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("temp dir");
+        let unreadable = root.path().join("data/unreadable");
+        std::fs::create_dir_all(&unreadable).expect("create data dir");
+        std::fs::create_dir_all(root.path().join("metadata")).expect("create metadata dir");
+        std::fs::write(root.path().join("data/a.vortex"), b"data").expect("write data file");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("make dir unreadable");
+
+        let schema = sample_schema();
+        let mut manager = build_cayenne_manager(Arc::new(InMemory::new()), root.path(), &schema);
+        manager.dataset_name = format!("archive_cleanup_{}", uuid::Uuid::now_v7().simple());
+        let prefix = format!("snapshot_{}_", manager.dataset_name);
+
+        let guard = Arc::new(Mutex::new(())).lock_owned().await;
+        let result = manager
+            .create_snapshot(&schema, guard, None, None, ForceCreate(true))
+            .await;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert!(
+            matches!(result, Err(SnapshotUploadError::ArchiveCreate { .. })),
+            "expected an archive error, got {result:?}"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "partial archive left behind: {leftover:?}"
+        );
     }
 
     #[test]
