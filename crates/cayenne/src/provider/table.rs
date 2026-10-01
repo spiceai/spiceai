@@ -15277,6 +15277,19 @@ impl CayenneTableProvider {
         // this apply is about to hide/supersede. The serial feed after
         // `try_join_all` reuses this epoch (dense applier chain).
         let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
+        // A shard that validation left with neither rows nor deletions (a
+        // `DoNothing` apply whose keys all exist) appends no segment, so nothing
+        // would ever record — or a checkpoint release — the bytes reserved for it;
+        // they are handed back once the appends land. Memory mode reserves nothing
+        // globally.
+        let unappended_bytes = per_shard_validated
+            .iter()
+            .zip(&per_shard_bytes)
+            .filter(|((filtered_batches, deletions, _), _)| {
+                !filtered_batches.iter().any(|b| b.num_rows() > 0)
+                    && deletions.total_superseded() == 0
+            })
+            .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));
         let append_futures = per_shard_validated.iter().enumerate().filter_map(
             |(s, (filtered_batches, deletions, kept))| {
                 let has_rows = filtered_batches.iter().any(|b| b.num_rows() > 0);
@@ -15304,6 +15317,11 @@ impl CayenneTableProvider {
         // The per-shard `MemTier::epoch`s returned here are NOT the slot-ack axis at
         // N>1 (incommensurable); they are drained to surface append errors only.
         futures::future::try_join_all(append_futures).await?;
+        // Only after every append succeeded: on an append error the caller
+        // releases the whole reservation itself.
+        if unappended_bytes > 0 && !self.is_memory_resident_mode() {
+            crate::provider::mem_tier_budget::release_bytes(unappended_bytes);
+        }
         // The relation and published epoch now agree. Registry maintenance can
         // remain asynchronous: scans at the new epoch fall back until it catches up.
         drop(ivm_visibility_guard);

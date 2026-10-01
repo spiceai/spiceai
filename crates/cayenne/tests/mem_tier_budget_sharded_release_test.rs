@@ -28,7 +28,12 @@ limitations under the License.
 //! rather than failing, so the surplus is silently taken from other tables'
 //! reservations, and the budget then admits more than it holds.
 //!
-//! Its own test binary with a single test: the budget is process-global.
+//! A `DoNothing` apply whose keys all exist keeps no rows and supersedes none,
+//! so it appends no segment at all — nothing records the bytes reserved for it,
+//! and the apply itself must hand them back.
+//!
+//! Its own test binary with a single test: the budget is process-global, so
+//! the cases run in sequence rather than on parallel test threads.
 
 mod common;
 
@@ -64,24 +69,40 @@ const OTHER_TABLES_BYTES: u64 = 4 << 20;
 #[test]
 fn a_sharded_checkpoint_releases_exactly_what_its_applies_reserved() -> Result<(), String> {
     common::run_with_backend_blocking(common::BackendType::Sqlite, |fixture| async move {
-        let result = run(&fixture).await;
-        set_global_mem_tier_bytes(0);
-        let (used_after_checkpoint, rows) = result?;
+        // Run every case before asserting, so one failure does not hide another.
+        let mut got = Vec::new();
+        for (name, on_conflict, passes) in [
+            ("upsert", OnConflict::Upsert(id_column()), 1),
+            // The second pass replays every key: all of it is filtered out.
+            ("do_nothing_replay", OnConflict::DoNothing(id_column()), 2),
+        ] {
+            let result = run(&fixture, name, on_conflict, passes).await;
+            set_global_mem_tier_bytes(0);
+            got.push((name, result?));
+        }
+        let want: Vec<_> = got
+            .iter()
+            .map(|(name, _)| (*name, (OTHER_TABLES_BYTES, APPLIES * ROWS_PER_APPLY)))
+            .collect();
         assert_eq!(
-            rows,
-            APPLIES * ROWS_PER_APPLY,
-            "every applied row is served after the checkpoint"
-        );
-        assert_eq!(
-            used_after_checkpoint, OTHER_TABLES_BYTES,
-            "the checkpoint released exactly this table's reservations, leaving the other \
-             tables' {OTHER_TABLES_BYTES} B reserved"
+            got, want,
+            "after the checkpoint, only the other tables' {OTHER_TABLES_BYTES} B stay reserved, \
+             and every applied row is served (bytes reserved, rows served)"
         );
         Ok(())
     })
 }
 
-async fn run(fixture: &common::TestFixture) -> TestResult<(u64, i64)> {
+fn id_column() -> ColumnReference {
+    ColumnReference::new(vec!["id".to_string()])
+}
+
+async fn run(
+    fixture: &common::TestFixture,
+    name: &str,
+    on_conflict: OnConflict,
+    passes: usize,
+) -> TestResult<(u64, i64)> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("maybe", DataType::Int64, true),
@@ -92,13 +113,11 @@ async fn run(fixture: &common::TestFixture) -> TestResult<(u64, i64)> {
         CayenneTableProvider::create_table(
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
             CreateTableOptions {
-                table_name: "sharded".to_string(),
+                table_name: name.to_string(),
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "id".to_string(),
-                ]))),
-                base_path: fixture.data_path.to_string_lossy().to_string(),
+                on_conflict: Some(on_conflict),
+                base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: VortexConfig {
                     cdc_durability: CdcDurability::Memory,
@@ -119,7 +138,7 @@ async fn run(fixture: &common::TestFixture) -> TestResult<(u64, i64)> {
         .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-    ctx.register_table("sharded", Arc::clone(&table) as _)?;
+    ctx.register_table(name, Arc::clone(&table) as _)?;
 
     set_global_mem_tier_bytes(256 << 20);
     assert!(
@@ -129,7 +148,7 @@ async fn run(fixture: &common::TestFixture) -> TestResult<(u64, i64)> {
 
     // Many small applies, each spread over every shard: the split's per-shard
     // overhead is largest relative to the raw batch here.
-    for apply in 0..APPLIES {
+    for apply in (0..passes).flat_map(|_| 0..APPLIES) {
         let first = apply * ROWS_PER_APPLY;
         let keys = first..first + ROWS_PER_APPLY;
         let columns: Vec<ArrayRef> = vec![
@@ -160,7 +179,7 @@ async fn run(fixture: &common::TestFixture) -> TestResult<(u64, i64)> {
     release_global_mem_tier_bytes(OTHER_TABLES_BYTES);
 
     let batches = ctx
-        .sql("SELECT COUNT(*) FROM sharded")
+        .sql(&format!("SELECT COUNT(*) FROM {name}"))
         .await?
         .collect()
         .await?;
