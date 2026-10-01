@@ -32,7 +32,7 @@ use async_openai::types::chat::{
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails, ToolChoiceOptions,
+    FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -470,9 +470,8 @@ impl Chat for ToolUsingChat {
     }
 }
 
-/// Create a new [`CreateChatCompletionRequest`] with new messages.
-///
-/// Remove `tool_choice` if it is named (since it was just used), and set it to `Auto`.
+/// Create the next round's [`CreateChatCompletionRequest`]: the new messages, and
+/// the [`next_round_tool_choice`].
 fn create_new_recursive_req(
     req: &CreateChatCompletionRequest,
     new_msg: Vec<ChatCompletionRequestMessage>,
@@ -480,19 +479,7 @@ fn create_new_recursive_req(
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
-
-    // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
-    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
-    if matches!(
-        new_req.tool_choice,
-        Some(ChatCompletionToolChoiceOption::Function(_)) | None
-    ) {
-        // Auto is default when tools exist.
-        tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
-        new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Mode(
-            ToolChoiceOptions::Auto,
-        ));
-    }
+    new_req.tool_choice = Some(next_round_tool_choice(new_req.tool_choice.take()));
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_completion_tokens) = new_req.max_completion_tokens
@@ -503,6 +490,43 @@ fn create_new_recursive_req(
     }
 
     new_req
+}
+
+/// The `tool_choice` for the round after one that called tools (issue #14459).
+///
+/// A choice that forces a call — a named function or custom tool, `required`, or
+/// `allowed_tools` in `required` mode — is satisfied once a round has called a tool,
+/// so the next round gets `auto`, and `allowed_tools` keeps its tool list in `auto`
+/// mode. Re-sending it would force a call on every round until
+/// `tool_recursion_limit` runs out, and the turn could never end in an answer.
+///
+/// An unset choice becomes `auto` too: the model's Spicepod `tool_choice` default is
+/// filled into an unset choice on every round, below this loop.
+fn next_round_tool_choice(
+    choice: Option<ChatCompletionToolChoiceOption>,
+) -> ChatCompletionToolChoiceOption {
+    match choice {
+        None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
+        Some(
+            ChatCompletionToolChoiceOption::Function(_)
+            | ChatCompletionToolChoiceOption::Custom(_)
+            | ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
+        ) => {
+            tracing::debug!("Not forcing a tool call again after a round that made one.");
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)
+        }
+        Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
+            for entry in &mut allowed.allowed_tools {
+                entry.mode = ToolChoiceAllowedMode::Auto;
+            }
+            ChatCompletionToolChoiceOption::AllowedTools(allowed)
+        }
+        Some(
+            choice @ ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto | ToolChoiceOptions::None,
+            ),
+        ) => choice,
+    }
 }
 
 pub fn combine_usage(
@@ -870,9 +894,11 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
 mod tests {
     use super::*;
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestUserMessageArgs, FunctionCall,
+        ChatCompletionAllowedTools, ChatCompletionAllowedToolsChoice,
+        ChatCompletionMessageToolCall, ChatCompletionNamedToolChoiceCustom,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, CustomName,
+        FunctionCall,
     };
 
     fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
@@ -1053,5 +1079,56 @@ mod tests {
             "[].Assistant.tool_calls[].id" => "[tool_call_id]",
             "[].Tool.tool_call_id" => "[tool_call_id]"
         });
+    }
+
+    fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
+        ChatCompletionToolChoiceOption::AllowedTools(ChatCompletionAllowedToolsChoice {
+            allowed_tools: vec![ChatCompletionAllowedTools {
+                mode,
+                tools: vec![serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "list_datasets" }
+                })],
+            }],
+        })
+    }
+
+    // regression test for #14459
+    #[test]
+    fn test_next_round_tool_choice() {
+        let auto = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto);
+        for forced in [
+            None,
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Required,
+            )),
+            Some(ChatCompletionToolChoiceOption::Function(
+                "list_datasets".into(),
+            )),
+            Some(ChatCompletionToolChoiceOption::Custom(
+                ChatCompletionNamedToolChoiceCustom {
+                    custom: CustomName {
+                        name: "client_tool".to_string(),
+                    },
+                },
+            )),
+        ] {
+            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+        }
+
+        // `allowed_tools` keeps its tool list, in `auto` mode.
+        assert_eq!(
+            next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
+            allowed_tools(ToolChoiceAllowedMode::Auto)
+        );
+
+        // Choices that force nothing pass through unchanged.
+        for unforced in [
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
+            allowed_tools(ToolChoiceAllowedMode::Auto),
+        ] {
+            assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+        }
     }
 }
