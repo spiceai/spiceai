@@ -715,6 +715,7 @@ impl SnapshotUploadError {
             | Self::UploadMetadataSchemaDeserialize { .. }
             | Self::UploadMetadataSchemaMissing { .. }
             | Self::UploadSchemaMismatch { .. }
+            | Self::MissingAccelerationFile { .. }
             | Self::AdapterDisabled { .. } => false,
             _ => true,
         }
