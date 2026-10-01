@@ -701,12 +701,8 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
 /// deliberately excluded — they are calibration readings the line does not print;
 /// they still reach the fingerprint where they matter, through the knobs they
 /// resolved.
-///
-/// `metastore_dir` is keyed as well as printed: a table whose metastore path moves is
-/// reading a different catalog, and re-emitting the line is what makes that visible.
 fn auto_tuned_config_fingerprint(
     table_name: &str,
-    metastore_dir: &str,
     hw: &autotune::HardwareProfile,
     workload: &autotune::WorkloadProfile,
     config: &cayenne::metadata::VortexConfig,
@@ -715,7 +711,7 @@ fn auto_tuned_config_fingerprint(
 
     let mut hasher = DefaultHasher::new();
     format!(
-        "{table_name}|{metastore_dir}|{cores}|{total_mem_bytes}|{data_storage:?}|{metastore_storage:?}|\
+        "{table_name}|{cores}|{total_mem_bytes}|{data_storage:?}|{metastore_storage:?}|\
          {row_count:?}|{table_bytes:?}|{schema_present}|{has_primary_key}|{is_upsert}|{config:?}",
         cores = hw.cores,
         total_mem_bytes = hw.total_mem_bytes,
@@ -781,11 +777,6 @@ fn changes_scan_view_lag() -> Duration {
     *CHANGES_SCAN_VIEW_LAG
 }
 
-/// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
-/// replicas that batch applies). Everything else — `full` / `append` /
-/// `snapshot` / `caching`, and **writable** `changes` (write-back UPDATE/DML)
-/// — is [`ScanViewReuse::UntilInvalidated`], so a mutation cannot read a
-/// lag-cached view of its own table.
 /// The `upsert` refinement (`upsert_dedup` / `upsert_dedup_by_row_id`) the
 /// runtime passes in the acceleration's options.
 fn upsert_dedup_for<S: std::hash::BuildHasher>(
@@ -801,6 +792,11 @@ fn upsert_dedup_for<S: std::hash::BuildHasher>(
     }
 }
 
+/// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
+/// replicas that batch applies). Everything else — `full` / `append` /
+/// `snapshot` / `caching`, and **writable** `changes` (write-back UPDATE/DML)
+/// — is [`ScanViewReuse::UntilInvalidated`], so a mutation cannot read a
+/// lag-cached view of its own table.
 fn scan_view_reuse_for(source: &dyn AccelerationSource) -> ScanViewReuse {
     let is_readonly_changes = !source.allows_write()
         && source.acceleration().is_some_and(|acceleration| {
@@ -2355,14 +2351,7 @@ impl CayenneAccelerator {
             // dataset that keeps failing to load is rebuilt on every retry. Every
             // emit below is a pure function of `config` and `hw.cores`, so the one
             // fingerprint covers them all.
-
-            // The catalog this table's metadata actually lives in. Printed because it is
-            // the one input to Cayenne's identity that nothing else reports: a pod that
-            // resolves a different path finds an empty metastore and creates a new table,
-            // leaving the previous table's files on disk under its old id.
-            let metastore_dir = Self::resolve_metadata_dir(source.acceleration());
-            let fingerprint =
-                auto_tuned_config_fingerprint(table_name, &metastore_dir, &hw, workload, &config);
+            let fingerprint = auto_tuned_config_fingerprint(table_name, &hw, workload, &config);
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
                 // A `cayenne_goal_*` SLO with the closed loop off does nothing, and
                 // it is easy to set one globally and assume it took effect.
@@ -2394,7 +2383,6 @@ impl CayenneAccelerator {
                     total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
                     data_storage = %hw.data_storage,
                     metastore_storage = %hw.metastore_storage,
-                    metastore_dir = %metastore_dir,
                     runtime_footer_cache_mb = ?config.footer_cache_mb,
                     tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
                     // Inferred workload signals (from schema inference). When these are
