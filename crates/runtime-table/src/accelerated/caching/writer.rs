@@ -105,7 +105,7 @@ impl CacheFillPermit {
     }
 }
 
-/// Dataset-owned direct applies. There is no pending-response queue or flush timer.
+/// Dataset-owned source admission and submission to the ingestion service.
 #[derive(Clone)]
 pub struct CacheWriter(Arc<Inner>);
 
@@ -188,6 +188,22 @@ impl CacheWriter {
     ) {
         let (sender, driver) =
             Arc::new(task).open_ingestion(refresh, &self.0.apply_runtime, self.0.context.clone());
+        let owner = Arc::downgrade(&self.0);
+        let sender = sender.with_publication_observer(Arc::new(move |result| {
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(()) => owner.health.lock().record_success(),
+                Err(DataFusionError::Plan(_) | DataFusionError::NotImplemented(_)) => {
+                    tracing::debug!(dataset = %owner.dataset, ?result, "Complete-set replacement refused before publication");
+                }
+                Err(error) => {
+                    owner.health.lock().record_failure(error);
+                    tracing::warn!(dataset = %owner.dataset, %error, "Change ingestion could not publish a cache response");
+                }
+            }
+        }));
         *self.0.ingestion.lock() = Some(sender);
         *self.0.ingestion_task.lock() = Some(driver);
     }
@@ -364,6 +380,18 @@ impl CacheWriter {
         let request = self.prepare(request, permit).inspect_err(|error| {
             tracing::debug!(dataset = %self.0.dataset, "Cache response was not prepared: {error}");
         })?;
+        let ingestion = self.0.ingestion.lock().clone();
+        if let Some(ingestion) = ingestion {
+            let key = SetKey::from_filters(self.0.accelerator.schema(), &request.filters)?;
+            let replacement = ReplaceSet::try_new(key, request.batches)?;
+            let admission = ingestion
+                .admit(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+                .await?;
+            return admission
+                .submit(replacement, Recovery::Rebuildable)
+                .published()
+                .await;
+        }
         let _guard = self.0.write_mutex.lock().await;
         let result = if self.0.recovery_failed.load(Ordering::Acquire) {
             Err(DataFusionError::Execution(format!(
@@ -435,18 +463,6 @@ impl CacheWriter {
             replaces_existing,
             ..
         } = request;
-        let ingestion = self.0.ingestion.lock().clone();
-        if let Some(ingestion) = ingestion {
-            let key = SetKey::from_filters(self.0.accelerator.schema(), &filters)?;
-            let replacement = ReplaceSet::try_new(key, batches)?;
-            let admission = ingestion
-                .admit(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
-                .await?;
-            return admission
-                .submit(replacement, Recovery::Rebuildable)
-                .published()
-                .await;
-        }
         let state = self.0.context.state();
         if replaces_existing {
             match self

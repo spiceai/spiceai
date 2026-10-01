@@ -30,7 +30,7 @@ pub(crate) enum Mutation {
     ReplaceSet {
         replacement: ReplaceSet,
         recovery: Recovery,
-        published: oneshot::Sender<Result<()>>,
+        published: PublicationCompletion,
     },
 }
 
@@ -54,6 +54,35 @@ impl Mutation {
     }
 }
 
+/// Runs on the service's completion path, independently of receipt polling.
+pub(crate) type PublicationObserver = Arc<dyn Fn(&Result<()>) + Send + Sync>;
+
+pub(crate) struct PublicationCompletion {
+    sender: Option<oneshot::Sender<Result<()>>>,
+    observer: Option<PublicationObserver>,
+}
+
+impl PublicationCompletion {
+    pub(crate) fn complete(mut self, result: Result<()>) {
+        if let Some(sender) = self.sender.take() {
+            if let Some(observer) = &self.observer {
+                observer(&result);
+            }
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for PublicationCompletion {
+    fn drop(&mut self) {
+        if self.sender.is_some()
+            && let Some(observer) = &self.observer
+        {
+            observer(&Err(closed()));
+        }
+    }
+}
+
 pub(crate) type IngestItem = std::result::Result<Mutation, cdc::StreamError>;
 
 pub(crate) struct IngestInput {
@@ -68,6 +97,7 @@ pub(crate) struct IngestInput {
 pub(crate) struct IngestSender {
     sender: mpsc::Sender<IngestItem>,
     queued_bytes: Arc<AtomicU64>,
+    observer: Option<PublicationObserver>,
 }
 
 pub(crate) fn channel(capacity: usize) -> (IngestSender, IngestInput) {
@@ -83,12 +113,18 @@ pub(crate) fn channel(capacity: usize) -> (IngestSender, IngestInput) {
         IngestSender {
             sender,
             queued_bytes,
+            observer: None,
         },
         input,
     )
 }
 
 impl IngestSender {
+    pub(crate) fn with_publication_observer(mut self, observer: PublicationObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     pub(crate) async fn closed(&self) {
         self.sender.closed().await;
     }
@@ -120,6 +156,7 @@ impl IngestSender {
         Ok(Admission {
             permit,
             queued_bytes: Arc::clone(&self.queued_bytes),
+            observer: self.observer.clone(),
         })
     }
 }
@@ -127,6 +164,7 @@ impl IngestSender {
 pub(crate) struct Admission {
     permit: mpsc::OwnedPermit<IngestItem>,
     queued_bytes: Arc<AtomicU64>,
+    observer: Option<PublicationObserver>,
 }
 
 impl Admission {
@@ -137,7 +175,10 @@ impl Admission {
         self.permit.send(Ok(Mutation::ReplaceSet {
             replacement,
             recovery,
-            published,
+            published: PublicationCompletion {
+                sender: Some(published),
+                observer: self.observer,
+            },
         }));
         IngestReceipt(receiver)
     }
@@ -192,4 +233,106 @@ fn closed() -> DataFusionError {
     DataFusionError::Execution(
         "Change ingestion is closed; accepted publication may require recovery".into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::cdc::mutation::SetKey;
+    use datafusion::common::ScalarValue;
+
+    fn replacement() -> ReplaceSet {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let key = SetKey::try_new(schema, vec![("id".into(), ScalarValue::Int64(Some(1)))])
+            .expect("valid grouping key");
+        ReplaceSet::try_new(key, vec![]).expect("empty complete set")
+    }
+
+    async fn submit(sender: &IngestSender) -> IngestReceipt {
+        sender
+            .admit(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .expect("channel has capacity")
+            .submit(replacement(), Recovery::Rebuildable)
+    }
+
+    async fn completion(input: &mut IngestInput) -> PublicationCompletion {
+        let Some(Ok(Mutation::ReplaceSet { published, .. })) = input.receiver.recv().await else {
+            panic!("expected a finite replacement");
+        };
+        published
+    }
+
+    #[tokio::test]
+    async fn completion_does_not_depend_on_receipt_polling() {
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        let (sender, mut input) = channel(1);
+        let sender = sender.with_publication_observer(Arc::new(move |result| {
+            sink.lock().push(result.is_ok());
+        }));
+        let receipt = submit(&sender).await;
+        completion(&mut input).await.complete(Ok(()));
+        assert_eq!(*observed.lock(), vec![true]);
+        receipt.published().await.expect("publication succeeded");
+        assert_eq!(*observed.lock(), vec![true]);
+    }
+
+    #[tokio::test]
+    async fn abandoned_receipt_does_not_cancel_completion() {
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        let (sender, mut input) = channel(1);
+        let sender = sender.with_publication_observer(Arc::new(move |result| {
+            sink.lock().push(result.is_ok());
+        }));
+        drop(submit(&sender).await);
+        completion(&mut input).await.complete(Ok(()));
+        assert_eq!(*observed.lock(), vec![true]);
+    }
+
+    #[tokio::test]
+    async fn accepted_but_dropped_mutation_reports_uncertain_completion() {
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        let (sender, input) = channel(1);
+        let sender = sender.with_publication_observer(Arc::new(move |result| {
+            sink.lock().push(result.is_ok());
+        }));
+        let receipt = submit(&sender).await;
+        drop(input);
+        assert_eq!(*observed.lock(), vec![false]);
+        let error = receipt
+            .published()
+            .await
+            .expect_err("publication was not completed");
+        assert!(error.to_string().contains("may require recovery"));
+        assert_eq!(*observed.lock(), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn observations_follow_service_order_not_receipt_order() {
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        let (sender, mut input) = channel(2);
+        let sender = sender.with_publication_observer(Arc::new(move |result| {
+            sink.lock().push(result.is_ok());
+        }));
+        let first = submit(&sender).await;
+        let second = submit(&sender).await;
+        completion(&mut input)
+            .await
+            .complete(Err(DataFusionError::Plan("invalid replacement".into())));
+        completion(&mut input).await.complete(Ok(()));
+        second
+            .published()
+            .await
+            .expect("second publication succeeded");
+        first
+            .published()
+            .await
+            .expect_err("first publication refused");
+        assert_eq!(*observed.lock(), vec![false, true]);
+    }
 }

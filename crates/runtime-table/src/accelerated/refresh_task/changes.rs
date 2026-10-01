@@ -1803,7 +1803,7 @@ impl RefreshTask {
                         )
                     });
 
-                    let _ = published.send(result);
+                    published.complete(result);
                     if failed {
                         return false;
                     }
@@ -1930,11 +1930,30 @@ impl RefreshTask {
                 .iter()
                 .map(RecordBatch::num_rows)
                 .sum::<usize>();
-            let write = cayenne
-                .write_replace_set(replacement, recovery, &context.write_ctx)
-                .await?;
-            let in_memory = write.in_memory_epoch().is_some();
-            write.finish().await?;
+            let _guard = self.accelerator_write_mutex.lock().await;
+            let result: datafusion::error::Result<bool> = async {
+                let write = cayenne
+                    .write_replace_set(replacement, recovery, &context.write_ctx)
+                    .await?;
+                let in_memory = write.in_memory_epoch().is_some();
+                write.finish().await?;
+                Ok(in_memory)
+            }
+            .await;
+            let in_memory = match result {
+                Ok(in_memory) => in_memory,
+                Err(error) => {
+                    if !matches!(
+                        error,
+                        DataFusionError::Plan(_) | DataFusionError::NotImplemented(_)
+                    ) && let Err(recovery_error) = cayenne.recover_incomplete_writes().await
+                    {
+                        tracing::error!(dataset = %self.dataset_name, %recovery_error, "Ingestion recovery failed; the driver is stopping");
+                    }
+                    // Cleanup does not turn an uncertain publication into success.
+                    return Err(error);
+                }
+            };
             self.update_last_updated_at();
             metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(rows as u64, context.metric_labels.dataset());
             tracing::trace!(dataset = %self.dataset_name, rows, in_memory, "Published complete replacement through change ingestion");
