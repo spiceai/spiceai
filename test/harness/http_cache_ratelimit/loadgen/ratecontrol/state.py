@@ -278,6 +278,11 @@ def check_state(
             per_window[arrival.epoch_ms // state.window_ms] = (
                 per_window.get(arrival.epoch_ms // state.window_ms, 0) + 1
             )
+        # Summing two adjacent windows absorbs a request granted inside the
+        # pair that landed inside it too. It cannot absorb one granted in the
+        # window *before* the pair that landed in the pair's first window, so
+        # the bound carries one request of slack for that leading edge. A real
+        # oversell scales with the budget; this does not.
         inner = window_ids[1:-1]
         pair_over = []
         for window_id in inner[:-1]:
@@ -285,13 +290,23 @@ def check_state(
                 windows.get(window_id + 1, windows[window_id]).effective_burst or 0
             )
             arrived = per_window.get(window_id, 0) + per_window.get(window_id + 1, 0)
-            if arrived > budget:
+            if arrived > budget + 1:
                 pair_over.append((window_id, arrived, budget))
+        worst = max(
+            (
+                per_window.get(w, 0)
+                + per_window.get(w + 1, 0)
+                - ((windows[w].effective_burst or 0) + (windows.get(w + 1, windows[w]).effective_burst or 0))
+                for w in inner[:-1]
+            ),
+            default=0,
+        )
         checks.append(
             Check(
                 f"{prefix}: arrivals within the leased budget over adjacent windows",
                 not pair_over,
-                f"{len(pair_over)}/{max(0, len(inner) - 1)} adjacent window pairs over budget"
+                f"{len(pair_over)}/{max(0, len(inner) - 1)} adjacent window pairs over budget by"
+                f" more than the one-request edge allowance; worst pair was {worst:+d}"
                 + (f": {pair_over[:3]}" if pair_over else ""),
             )
         )

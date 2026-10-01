@@ -217,40 +217,85 @@ def check_admission_ratio(
 def check_metrics_agreement(
     scenario: Scenario, scrapers: dict[str, MetricsScraper], assertions: AssertionSet
 ) -> None:
-    """Do the replicas publish the same throttle, having never spoken?"""
+    """Do the replicas publish the same throttle, having never spoken?
+
+    Compared only across **settled** seconds: a second counts only when no
+    replica's published value changed from the second before it. Each replica
+    refreshes its lease on its own tick phase and publishes what the window it
+    last leased said, so a 1 Hz scrape catches different replicas at different
+    points in the window cycle. With two replicas the phases often align; with
+    three one of them reliably does not, and it then reports exactly what its
+    peers report one second later. That is a sampling offset, not a
+    disagreement, and it cannot be told apart from one while the value is
+    moving. Where nothing is moving, a difference can only be a real one.
+
+    The budget itself is settled far more strictly by the shared state object:
+    `effective_burst` is one value per window, first-write-wins, and
+    `sum(granted) <= effective_burst` is checked on every window.
+    """
     if scenario.topology.replicas < 2 or scenario.topology.cluster is None:
         return
-    by_second: dict[tuple[int, str], dict[str, tuple[float, ...]]] = defaultdict(dict)
+    tracked = (
+        "dataset_http_rate_control_cluster_effective_burst",
+        "dataset_http_rate_control_adaptive_admission_ratio",
+    )
+    by_second: dict[tuple[int, str], dict[str, tuple[tuple[str, float], ...]]] = defaultdict(dict)
     for replica, scraper in scrapers.items():
         for sample in scraper.samples:
-            if sample.metric_name not in (
-                "dataset_http_rate_control_cluster_effective_burst",
-                "dataset_http_rate_control_adaptive_admission_ratio",
-            ):
+            if sample.metric_name not in tracked:
                 continue
             key = (sample.scrape_epoch_ms // 1000, sample.origin)
-            current = by_second[key].get(replica, ())
-            by_second[key][replica] = current + ((sample.metric_name, sample.value),)
+            by_second[key][replica] = by_second[key].get(replica, ()) + (
+                (sample.metric_name, sample.value),
+            )
 
-    comparable = agree = 0
-    for values in by_second.values():
+    previous: dict[str, dict[str, tuple]] = defaultdict(dict)
+    comparable = agree = moving = 0
+    for second, origin in sorted(by_second):
+        values = {
+            replica: tuple(sorted(series)) for replica, series in by_second[(second, origin)].items()
+        }
         if len(values) < 2:
             continue
+        settled = all(previous[origin].get(replica) == value for replica, value in values.items())
+        previous[origin] = values
+        if not settled:
+            moving += 1
+            continue
         comparable += 1
-        agree += len({tuple(sorted(v)) for v in values.values()}) == 1
+        agree += len(set(values.values())) == 1
+
     if not comparable:
         assertions.add(
             "metrics: replicas publish a comparable throttle",
             False,
-            "no second had two replicas scraped together",
+            f"no settled second had two replicas scraped together ({moving} moving)",
         )
         return
     assertions.add(
         "metrics: every replica derives the same throttle, with no replica-to-replica traffic",
-        agree >= 0.9 * comparable,
-        f"identical in {agree}/{comparable} seconds"
-        " (disagreement is expected only where a 1 Hz scrape straddles a window boundary)",
+        agree >= 0.95 * comparable,
+        f"identical in {agree}/{comparable} settled seconds"
+        f" ({moving} seconds skipped because a published value was still moving)",
     )
+
+    # Phase-independent corroboration: over the whole run every replica should
+    # walk the same set of budgets. A replica computing its own coefficient
+    # would visit values its peers never do.
+    published: dict[str, set[float]] = defaultdict(set)
+    for replica, scraper in scrapers.items():
+        for sample in scraper.samples:
+            if sample.metric_name == tracked[0]:
+                published[replica].add(sample.value)
+    if len(published) >= 2:
+        sets = list(published.values())
+        shared = set.intersection(*sets)
+        union = set.union(*sets)
+        assertions.add(
+            "metrics: the replicas walk the same set of budgets over the run",
+            len(shared) >= 0.8 * len(union),
+            f"{len(shared)}/{len(union)} of the budgets published were published by every replica",
+        )
 
     for name, label in (
         ("dataset_http_rate_control_lease_refresh_errors_total", "lease refresh errors"),
