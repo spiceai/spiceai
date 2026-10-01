@@ -770,11 +770,15 @@ async fn a_staged_upsert_keeps_the_last_copy_across_batches() {
         let expected = owned(&[(1, "c"), (2, "b"), (3, "b"), (9, "old")]);
         for (stage, provider) in [
             ("after commit", provider.clone_for_write()),
-            ("after reopen", reopen(&catalog, &runtime_env, UpsertDedup::None).await),
+            (
+                "after reopen",
+                reopen(&catalog, &runtime_env, UpsertDedup::None).await,
+            ),
         ] {
             let (rows, count) = visible(&provider).await;
             let ctx = SessionContext::new();
-            ctx.register_table("t", Arc::new(provider)).expect("register");
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
             let max = ctx
                 .sql("SELECT MAX(value) FROM t")
                 .await
@@ -788,7 +792,9 @@ async fn a_staged_upsert_keeps_the_last_copy_across_batches() {
                 .to_string();
             eprintln!("{mode:?} {stage}: {rows:?} COUNT(*) {count} MAX {max}");
             if rows != expected || count != 4 || max != "old" {
-                failures.push(format!("{mode:?} {stage}: {rows:?} COUNT(*) {count} MAX {max}"));
+                failures.push(format!(
+                    "{mode:?} {stage}: {rows:?} COUNT(*) {count} MAX {max}"
+                ));
             }
         }
     }
