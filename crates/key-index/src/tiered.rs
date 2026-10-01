@@ -516,7 +516,6 @@ impl RunBuilder {
         columns: &[ArrayRef],
     ) -> Result<()> {
         let bound = self.encoder.bind(columns).context(KeySnafu)?;
-        let file_id = self.file_id(file)?;
         let rows = bound.num_rows();
         if let Some(offset) = (rows as u64).checked_sub(1) {
             let last = first_position.saturating_add(offset);
@@ -528,6 +527,9 @@ impl RunBuilder {
                 }
             );
         }
+        // Registered only once the batch is accepted: a run covers each of its
+        // files, so a refused batch must not add one.
+        let file_id = self.file_id(file)?;
         self.ingest(&bound, file_id, |row| first_position + row as u64);
         Ok(())
     }
@@ -1987,6 +1989,19 @@ mod tests {
                 ..
             })
         ));
+        // A refused batch adds no file, so a run cannot claim to cover a
+        // file whose rows it does not hold.
+        let mut refused = RunBuilder::new(encoder());
+        assert!(
+            refused
+                .add_batch("b", POSITION_MASK, &column(&[1, 2]))
+                .is_err()
+        );
+        assert!(
+            refused.files().is_empty(),
+            "a refused batch's file is registered: {:?}",
+            refused.files()
+        );
     }
 }
 
