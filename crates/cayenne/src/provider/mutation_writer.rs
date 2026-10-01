@@ -957,10 +957,11 @@ impl<'a> AppendMutationWriter<'a> {
     }
 
     /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains the
-    /// RAW decoded stream, applies the whole-apply OOM-safety caps/budget exactly
-    /// as [`Self::write_cdc_in_memory`], then DECOUPLES decode from validation:
-    /// each batch is split by PK shard and the per-batch on-conflict validation
-    /// runs PER SHARD ([`CayenneTableProvider::validate_and_append_sharded`]),
+    /// RAW decoded stream and splits each batch by PK shard, applies the
+    /// whole-apply OOM-safety caps/budget exactly as [`Self::write_cdc_in_memory`]
+    /// to the shards' bytes, then DECOUPLES decode from validation: the per-batch
+    /// on-conflict validation runs PER SHARD
+    /// ([`CayenneTableProvider::validate_and_append_sharded`]),
     /// with the N shard appends joined concurrently. The combined post-validation
     /// state is published for the durable fallback.
     ///
@@ -989,22 +990,29 @@ impl<'a> AppendMutationWriter<'a> {
         // deferred to the per-shard step below).
         let schema = stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut stream).await {
             let batch = batch?;
-            incoming.add(&batch);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
             batches.push(batch);
         }
         drop(stream);
-        let incoming_bytes = incoming.total();
         record_cayenne_write_phase(
             self.table.table_name(),
             "inmemory_stream_drain",
             drain_start,
         );
+
+        // Split by PK shard BEFORE budgeting: the tier retains the shards, not the
+        // raw batches, and the split copies every column into per-shard
+        // allocations whose bytes can exceed the raw batches'. Reserving the
+        // shards' own total keeps the reservation equal to what their segments
+        // record and a checkpoint releases.
+        let split = self
+            .table
+            .split_apply_by_pk_shard(&batches, &pk_indices, &converter)?;
+        let incoming_bytes = split.total_bytes();
 
         // Whole-apply (whole-tier) OOM-safety: per-table byte cap spill + global
         // budget reservation, identical to the serial path. The byte trigger is
@@ -1042,6 +1050,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // `prepare_stream_for_insert`. To keep that contract, the fallback
                 // re-streams the raw batches into a FRESH `prepare_stream_for_insert`
                 // at the caller.
+                drop(split);
                 return Ok(MemShardedOutcome::FallBackToDurable {
                     batches,
                     schema,
@@ -1049,18 +1058,19 @@ impl<'a> AppendMutationWriter<'a> {
                 });
             }
         }
+        // Admitted: the tier keeps only the shards.
+        drop(batches);
 
         // Validate + append per shard. On error, release the byte reservation so
         // the global budget doesn't leak (matching the serial path).
         let apply = match self
             .table
             .validate_and_append_sharded(
-                batches,
+                split,
                 sharded_index,
                 &pk_indices,
                 &converter,
                 &on_conflict,
-                incoming_bytes,
             )
             .await
         {

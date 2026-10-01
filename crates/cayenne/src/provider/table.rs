@@ -57,8 +57,8 @@ use super::on_conflict::{
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
-    pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
+    ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -15020,23 +15020,27 @@ impl CayenneTableProvider {
         ))
     }
 
-    pub(crate) async fn validate_and_append_sharded(
+    /// Split every raw batch of an apply into the tier's N per-shard sub-batches
+    /// (order-preserving Arrow filter on the `OwnedRow` shard hash), and measure
+    /// what each shard will hold.
+    ///
+    /// `per_shard_batches[s]` accumulates shard s's sub-batches in apply order;
+    /// empty sub-batches are dropped (an empty append is a no-op). At N>1 the
+    /// filter copies every column into fresh allocations, so the shards share
+    /// nothing with the raw batches or with each other, and each carries its own
+    /// buffer padding and array bookkeeping: their bytes can sum to more than the
+    /// raw batches'. The returned total is therefore what the caller must budget
+    /// and reserve — the same figure the shard segments record and a checkpoint
+    /// later releases, so reservation and release net to zero.
+    pub(crate) fn split_apply_by_pk_shard(
         &self,
-        batches: Vec<RecordBatch>,
-        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        on_conflict: &OnConflict,
-        total_incoming_bytes: u64,
-    ) -> Result<ShardedApplyResult> {
+    ) -> Result<ShardedApplyBatches> {
         let n = self.mem_tier.shard_count().max(1);
-
-        // 1. Split every raw batch into N per-shard sub-batches (order-preserving
-        //    Arrow filter on the OwnedRow shard hash).
-        //    `per_shard_batches[s]` accumulates shard s's sub-batches in apply
-        //    order. Empty sub-batches are dropped (an empty append is a no-op).
         let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
-        for batch in &batches {
+        for batch in batches {
             let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
             for (s, sub) in shards.into_iter().enumerate() {
                 if sub.num_rows() == 0 {
@@ -15045,17 +15049,32 @@ impl CayenneTableProvider {
                 per_shard_batches[s].push(sub);
             }
         }
-        let mut per_shard_bytes: Vec<u64> = per_shard_batches
+        let per_shard_bytes = per_shard_batches
             .iter()
             .map(|shard| arrow_tools::batch_bytes::RetainedBytes::of(shard))
             .collect();
-        // Guard against rounding loss: ensure the byte reservation accounting sums
-        // back to the whole-apply figure the caller reserved (assign any remainder
-        // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
-        let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
-        if assigned < total_incoming_bytes && !per_shard_bytes.is_empty() {
-            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
-        }
+        Ok(ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        })
+    }
+
+    /// Validate and append an apply already split by
+    /// [`Self::split_apply_by_pk_shard`], whose
+    /// [`ShardedApplyBatches::total_bytes`] the caller has reserved against the
+    /// global budget.
+    pub(crate) async fn validate_and_append_sharded(
+        &self,
+        split: ShardedApplyBatches,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        on_conflict: &OnConflict,
+    ) -> Result<ShardedApplyResult> {
+        let ShardedApplyBatches {
+            per_shard_batches,
+            per_shard_bytes,
+        } = split;
 
         // 2. Validate each shard CONCURRENTLY against ITS existence view, building
         //    that shard's `OnConflictDeletions`. The shards are independent — a key
@@ -15101,9 +15120,12 @@ impl CayenneTableProvider {
             let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
-            // sub-batches are dropped), so the incoming batches sum to the same
-            // count the shards do — computed here without re-touching the data.
-            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            // sub-batches are dropped), so the shards sum to the incoming count.
+            let total_rows: usize = per_shard_batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum();
             if non_empty_shards <= 1 || total_rows <= SMALL_APPLY_INLINE_ROWS {
                 // INLINE: either ≤1 non-empty shard (no cross-shard parallelism to
                 // exploit) or a small enough apply that the per-shard OS-thread
@@ -15147,7 +15169,7 @@ impl CayenneTableProvider {
                     // a lazy spawn-then-join iterator chain would start each thread
                     // only as the join step pulled it, validating the shards one at a
                     // time instead of together.
-                    let mut handles: Vec<Option<_>> = Vec::with_capacity(n);
+                    let mut handles: Vec<Option<_>> = Vec::with_capacity(per_shard_batches.len());
                     for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
                         if shard_batches.is_empty() {
                             handles.push(None);

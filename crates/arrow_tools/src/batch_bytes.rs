@@ -22,9 +22,8 @@ limitations under the License.
 //! (Flight, Flight SQL, a stored IPC blob) reads each message body into one
 //! allocation and points every column and child buffer at a slice of it, so that
 //! sum bills one allocation once per buffer: on an eleven-column,
-//! nineteen-buffer schema it reported 12.5x the memory the batches held, and a
-//! byte-capped in-memory store admitted 4,000 such rows where it admitted
-//! 82,000 builder-built ones.
+//! nineteen-buffer schema it reported 19.0x the memory the batches held
+//! (15,379,456 B against 808,960 B resident for ~4,000 rows).
 //!
 //! # Dedupe key
 //!
