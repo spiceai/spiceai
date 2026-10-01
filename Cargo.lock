@@ -6221,6 +6221,7 @@ dependencies = [
  "runtime-table-partition",
  "secrecy",
  "snafu",
+ "spice-table",
  "spicepod",
  "sysinfo 0.38.4",
  "tokio",

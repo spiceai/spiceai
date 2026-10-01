@@ -1723,17 +1723,18 @@ pub(crate) async fn create_table_provider(
         &cmd.options,
         cmd.constraints.clone(),
     );
+    let write_provider = guard_unique_index_overwrites(write_provider, cmd);
     // DuckDB writes a whole stream as one `INSERT … ON CONFLICT DO NOTHING`,
     // which refuses a key repeated within one batch and resolves one repeated
     // across batches in parallel-insert order, so `drop` keeps the first copy
-    // here, before the write reaches DuckDB.
+    // here, before the write reaches DuckDB. It sits above the unique-index
+    // guard so the guard validates the rows `drop` keeps.
     let write_provider = keep_first::wrap_with_keep_first_if_needed(
         write_provider,
         &cmd.options,
         cmd.schema.as_arrow(),
         &cmd.constraints,
     );
-    let write_provider = guard_unique_index_overwrites(write_provider, cmd);
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(
@@ -2677,15 +2678,28 @@ mod tests {
         );
     }
 
-    async fn drop_on_conflict_table(name: &str) -> Arc<dyn TableProvider> {
-        let schema = Arc::new(Schema::new(vec![
+    fn id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("v", DataType::Utf8, false),
-        ]));
-        let mut options = HashMap::new();
+        ]))
+    }
+
+    async fn drop_on_conflict_table(name: &str) -> Arc<dyn TableProvider> {
+        drop_on_conflict_table_with(name, HashMap::new(), vec![Constraint::PrimaryKey(vec![0])])
+            .await
+    }
+
+    /// An `(id, v)` table with `on_conflict: { id: drop }` and the given extra
+    /// options and constraints.
+    async fn drop_on_conflict_table_with(
+        name: &str,
+        mut options: HashMap<String, String>,
+        constraints: Vec<Constraint>,
+    ) -> Arc<dyn TableProvider> {
         options.insert("on_conflict".to_string(), "do_nothing:id".to_string());
         let external_table = CreateExternalTable {
-            schema: ToDFSchema::to_dfschema_ref(schema)
+            schema: ToDFSchema::to_dfschema_ref(id_v_schema())
                 .expect("to convert Arrow schema to DataFusion schema"),
             name: TableReference::bare(name),
             location: String::new(),
@@ -2697,7 +2711,7 @@ mod tests {
             order_exprs: vec![],
             unbounded: false,
             options,
-            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            constraints: Constraints::new_unverified(constraints),
             column_defaults: HashMap::default(),
             temporary: false,
         };
@@ -2708,12 +2722,8 @@ mod tests {
     }
 
     fn id_v_batch(rows: &[(i64, &str)]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("v", DataType::Utf8, false),
-        ]));
         RecordBatch::try_new(
-            schema,
+            id_v_schema(),
             vec![
                 Arc::new(Int64Array::from(
                     rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
@@ -2804,6 +2814,32 @@ mod tests {
             assert_eq!(rows.len(), 8192, "attempt {attempt}");
             assert_eq!(rows[0], (0, "first".to_string()), "attempt {attempt}");
         }
+    }
+
+    /// A unique index on the `drop` key validates the rows that remain after
+    /// the repeats are dropped, not the repeats themselves.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_a_unique_index_covers() {
+        let table = drop_on_conflict_table_with(
+            "drop_unique_index",
+            [("indexes".to_string(), "id:unique".to_string())]
+                .into_iter()
+                .collect(),
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("a repeated key must not fail a drop overwrite");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
     }
 
     /// An append under `drop` keeps a stored row over an incoming copy of its

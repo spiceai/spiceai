@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_accelerator_api::keep_first::KeepFirstTableProvider;
 use data_components::poly::PolyTableProvider;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_table_providers::{
@@ -278,10 +277,6 @@ fn duckdb_writer_context(
     ) {
         let writer = poly.writer();
         return duckdb_writer_context(&writer);
-    }
-
-    if let Some(keep_first) = provider.downcast_ref::<KeepFirstTableProvider>() {
-        return duckdb_writer_context(keep_first.inner());
     }
 
     provider

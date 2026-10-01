@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A wrapper `TableProvider` that applies `on_conflict: drop` to the keys a
-//! single write repeats, before the write reaches the accelerator.
+//! A table layer that applies `on_conflict: drop` to the keys a single write
+//! repeats, before the write reaches the accelerator.
 //!
 //! `drop` keeps the first copy of a key. An accelerator that resolves it with
 //! `INSERT … ON CONFLICT DO NOTHING` only does so against rows already in the
@@ -44,7 +44,7 @@ use datafusion::{
         SendableRecordBatchStream, TaskContext,
         memory_pool::{MemoryConsumer, MemoryReservation},
     },
-    logical_expr::{Expr, TableType, dml::InsertOp},
+    logical_expr::dml::InsertOp,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
         coalesce_partitions::CoalescePartitionsExec, metrics::MetricsSet,
@@ -53,15 +53,17 @@ use datafusion::{
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
-/// Wraps `provider` so that every write keeps only the first copy of each key
-/// when `on_conflict` resolves conflicts by dropping the incoming row.
+/// Layers [`KeepFirst`] over `provider` when `on_conflict` resolves conflicts
+/// by dropping the incoming row, so every write keeps only the first copy of
+/// each key.
 ///
 /// Returns `provider` unchanged for any other `on_conflict` (or none).
 #[must_use]
 pub fn wrap_with_keep_first_if_needed<S: std::hash::BuildHasher>(
     provider: Arc<dyn TableProvider>,
-    options: &std::collections::HashMap<String, String, S>,
+    options: &HashMap<String, String, S>,
     schema: &Schema,
     constraints: &Constraints,
 ) -> Arc<dyn TableProvider> {
@@ -69,10 +71,12 @@ pub fn wrap_with_keep_first_if_needed<S: std::hash::BuildHasher>(
     if key_sets.is_empty() {
         provider
     } else {
-        Arc::new(KeepFirstTableProvider {
-            inner: provider,
-            key_sets: Arc::from(key_sets),
-        })
+        SpiceTable::over(
+            Arc::new(KeepFirst {
+                key_sets: Arc::from(key_sets),
+            }),
+            provider,
+        )
     }
 }
 
@@ -80,7 +84,7 @@ pub fn wrap_with_keep_first_if_needed<S: std::hash::BuildHasher>(
 /// single `drop`, or every primary-key and unique constraint when each target
 /// is `drop`.
 fn drop_key_sets<S: std::hash::BuildHasher>(
-    options: &std::collections::HashMap<String, String, S>,
+    options: &HashMap<String, String, S>,
     schema: &Schema,
     constraints: &Constraints,
 ) -> Vec<Vec<String>> {
@@ -106,9 +110,7 @@ fn drop_key_sets<S: std::hash::BuildHasher>(
                 let (Constraint::PrimaryKey(indices) | Constraint::Unique(indices)) = constraint;
                 indices
                     .iter()
-                    .map(|&index| {
-                        (index < schema.fields().len()).then(|| schema.field(index).name().clone())
-                    })
+                    .map(|&index| schema.fields().get(index).map(|field| field.name().clone()))
                     .collect::<Option<Vec<_>>>()
                     .filter(|columns| !columns.is_empty())
             })
@@ -119,65 +121,34 @@ fn drop_key_sets<S: std::hash::BuildHasher>(
 
 /// Keeps the first copy of each key a write repeats; see the module docs.
 #[derive(Debug)]
-pub struct KeepFirstTableProvider {
-    inner: Arc<dyn TableProvider>,
+pub struct KeepFirst {
     key_sets: Arc<[Vec<String>]>,
 }
 
-impl KeepFirstTableProvider {
-    /// The provider writes are passed on to.
-    #[must_use]
-    pub fn inner(&self) -> &Arc<dyn TableProvider> {
-        &self.inner
-    }
-}
-
-#[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for KeepFirstTableProvider {
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.inner.statistics()
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
-        args: datafusion::catalog::ScanArgs<'a>,
-    ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
-        self.inner.scan_with_args(state, args).await
+impl TableLayer for KeepFirst {
+    /// Rewrites writes, so the write walk stops here rather than routing a
+    /// write past the filter; every other walk sees through it.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => Some(below),
+            LayerWalk::Write => None,
+        }
     }
 
     async fn insert_into(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
@@ -189,48 +160,10 @@ impl TableProvider for KeepFirstTableProvider {
         // drops a row whose only conflict was with a row never written. An
         // overwrite starts from an empty table, so it has no stored rows.
         if self.key_sets.len() > 1 && op != InsertOp::Overwrite {
-            return self.inner.insert_into(state, input, op).await;
+            return below.insert_into(state, input, op).await;
         }
         let exec = KeepFirstExec::try_new(input, &self.key_sets)?;
-        self.inner.insert_into(state, Arc::new(exec), op).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
-
-    async fn truncate(
-        &self,
-        state: &dyn Session,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(
-        &self,
-    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
+        below.insert_into(state, Arc::new(exec), op).await
     }
 }
 
@@ -240,7 +173,6 @@ impl TableProvider for KeepFirstTableProvider {
 #[derive(Debug)]
 struct KeepFirstExec {
     input: Arc<dyn ExecutionPlan>,
-    key_sets: Arc<[Vec<String>]>,
     key_indices: Arc<[Vec<usize>]>,
     properties: Arc<PlanProperties>,
 }
@@ -248,13 +180,8 @@ struct KeepFirstExec {
 impl KeepFirstExec {
     fn try_new(
         input: Arc<dyn ExecutionPlan>,
-        key_sets: &Arc<[Vec<String>]>,
+        key_sets: &[Vec<String>],
     ) -> datafusion::error::Result<Self> {
-        let input = if input.output_partitioning().partition_count() > 1 {
-            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
         let schema = input.schema();
         let key_indices = key_sets
             .iter()
@@ -265,22 +192,37 @@ impl KeepFirstExec {
                     .collect::<datafusion::error::Result<Vec<_>>>()
             })
             .collect::<datafusion::error::Result<Vec<_>>>()?;
+        Ok(Self::with_indices(input, Arc::from(key_indices)))
+    }
+
+    fn with_indices(input: Arc<dyn ExecutionPlan>, key_indices: Arc<[Vec<usize>]>) -> Self {
+        let input = if input.output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
         // Dropping rows keeps the input's order and partitioning.
-        Ok(Self {
+        Self {
             properties: Arc::clone(input.properties()),
             input,
-            key_sets: Arc::clone(key_sets),
-            key_indices: Arc::from(key_indices),
-        })
+            key_indices,
+        }
     }
 }
 
 impl DisplayAs for KeepFirstExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let schema = self.input.schema();
         let keys: Vec<String> = self
-            .key_sets
+            .key_indices
             .iter()
-            .map(|columns| format!("[{}]", columns.join(", ")))
+            .map(|indices| {
+                let names: Vec<&str> = indices
+                    .iter()
+                    .map(|&index| schema.field(index).name().as_str())
+                    .collect();
+                format!("[{}]", names.join(", "))
+            })
             .collect();
         write!(f, "KeepFirstExec: keys={}", keys.join(", "))
     }
@@ -310,7 +252,10 @@ impl ExecutionPlan for KeepFirstExec {
         let [child] = <[_; 1]>::try_from(children).map_err(|_| {
             DataFusionError::Internal("KeepFirstExec requires exactly one child".to_string())
         })?;
-        Ok(Arc::new(Self::try_new(child, &self.key_sets)?))
+        Ok(Arc::new(Self::with_indices(
+            child,
+            Arc::clone(&self.key_indices),
+        )))
     }
 
     fn execute(
@@ -345,6 +290,8 @@ struct KeyColumns {
     indices: Vec<usize>,
     converter: RowConverter,
     batches: Vec<Rows>,
+    /// Bytes held by `batches`, kept as they are pushed.
+    batch_bytes: usize,
     entries: Vec<KeyEntry>,
     /// Hash of an encoded key to the latest entry with that hash.
     heads: HashMap<u64, usize, ahash::RandomState>,
@@ -377,7 +324,7 @@ impl KeyColumns {
     }
 
     fn allocated_size(&self) -> usize {
-        self.batches.iter().map(Rows::size).sum::<usize>()
+        self.batch_bytes
             + self.batches.capacity() * std::mem::size_of::<Rows>()
             + self.entries.capacity() * std::mem::size_of::<KeyEntry>()
             + self.heads.capacity() * (std::mem::size_of::<(u64, usize)>() + 1)
@@ -402,6 +349,7 @@ impl SeenKeys {
                     indices: indices.clone(),
                     converter: RowConverter::new(fields)?,
                     batches: Vec::new(),
+                    batch_bytes: 0,
                     entries: Vec::new(),
                     heads: HashMap::default(),
                     hasher: ahash::RandomState::new(),
@@ -432,10 +380,15 @@ impl SeenKeys {
                         NullBuffer::union(acc.as_ref(), column.logical_nulls().as_ref())
                     }),
             );
-            key.batches.push(key.converter.convert_columns(&columns)?);
+            let rows = key.converter.convert_columns(&columns)?;
+            key.batch_bytes += rows.size();
+            key.batches.push(rows);
         }
+        // This batch's encoded keys, just pushed above.
+        let batch_index = self.keys.first().map_or(0, |key| key.batches.len() - 1);
 
         let mut keep = Vec::with_capacity(num_rows);
+        let mut dropped = 0;
         let mut hashes = vec![None; self.keys.len()];
         for row in 0..num_rows {
             let mut repeated = false;
@@ -444,18 +397,16 @@ impl SeenKeys {
                 if nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
                     continue;
                 }
-                let Some(rows) = key.batches.last() else {
-                    continue;
-                };
-                let encoded = rows.row(row);
+                let encoded = key.batches[batch_index].row(row);
                 let value = key.hasher.hash_one(encoded.as_ref());
                 *hash = Some(value);
                 repeated = repeated || key.contains(value, encoded.as_ref());
             }
-            if !repeated {
+            if repeated {
+                dropped += 1;
+            } else {
                 for (key, hash) in self.keys.iter_mut().zip(&hashes) {
                     if let Some(hash) = *hash {
-                        let batch_index = key.batches.len() - 1;
                         key.insert(hash, batch_index, row);
                     }
                 }
@@ -470,7 +421,7 @@ impl SeenKeys {
                 .sum::<usize>(),
         )?;
 
-        if keep.iter().all(|&kept| kept) {
+        if dropped == 0 {
             return Ok(batch);
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
@@ -479,7 +430,8 @@ impl SeenKeys {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeepFirstExec, KeepFirstTableProvider, wrap_with_keep_first_if_needed};
+    use super::{KeepFirst, KeepFirstExec, wrap_with_keep_first_if_needed};
+    use spice_table::SpiceTable;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -521,6 +473,13 @@ mod tests {
         Arc::new(DataSourceExec::new(Arc::new(src)))
     }
 
+    fn has_keep_first(table: &Arc<dyn TableProvider>) -> bool {
+        table
+            .downcast_ref::<SpiceTable>()
+            .and_then(SpiceTable::layer_as::<KeepFirst>)
+            .is_some()
+    }
+
     fn pk() -> Constraints {
         Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])])
     }
@@ -535,6 +494,7 @@ mod tests {
     /// stored, in storage order.
     async fn write_and_read(
         on_conflict: &str,
+        constraints: &Constraints,
         input: Arc<dyn ExecutionPlan>,
         ctx: &SessionContext,
     ) -> datafusion::error::Result<Vec<(Option<i32>, String)>> {
@@ -543,7 +503,7 @@ mod tests {
             Arc::clone(&inner) as Arc<dyn TableProvider>,
             &options(on_conflict),
             &schema(),
-            &pk(),
+            constraints,
         );
         let plan = table
             .insert_into(&ctx.state(), input, InsertOp::Append)
@@ -578,7 +538,7 @@ mod tests {
             (Some(2), "b"),
             (Some(1), "c"),
         ])]]);
-        let rows = write_and_read("do_nothing:id", input, &SessionContext::new())
+        let rows = write_and_read("do_nothing:id", &pk(), input, &SessionContext::new())
             .await
             .expect("write succeeds");
         assert_eq!(
@@ -594,7 +554,7 @@ mod tests {
             batch(&[(Some(0), "last")]),
             batch(&[(Some(1), "last"), (Some(2), "only")]),
         ]]);
-        let rows = write_and_read("do_nothing:id", input, &SessionContext::new())
+        let rows = write_and_read("do_nothing:id", &pk(), input, &SessionContext::new())
             .await
             .expect("write succeeds");
         assert_eq!(
@@ -615,7 +575,7 @@ mod tests {
             vec![batch(&[(Some(0), "p0"), (Some(1), "p0")])],
             vec![batch(&[(Some(0), "p1"), (Some(2), "p1")])],
         ]);
-        let mut rows = write_and_read("do_nothing:id", input, &SessionContext::new())
+        let mut rows = write_and_read("do_nothing:id", &pk(), input, &SessionContext::new())
             .await
             .expect("write succeeds");
         rows.sort_unstable();
@@ -627,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn drop_never_treats_null_keys_as_repeats() {
         let input = source(&[vec![batch(&[(None, "a"), (None, "b"), (Some(1), "c")])]]);
-        let rows = write_and_read("do_nothing:id", input, &SessionContext::new())
+        let rows = write_and_read("do_nothing:id", &pk(), input, &SessionContext::new())
             .await
             .expect("write succeeds");
         assert_eq!(rows.len(), 3, "{rows:?}");
@@ -675,37 +635,26 @@ mod tests {
             Constraint::PrimaryKey(vec![0]),
             Constraint::Unique(vec![1]),
         ]);
-        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
-        let table = wrap_with_keep_first_if_needed(
-            Arc::clone(&inner) as Arc<dyn TableProvider>,
-            &options("do_nothing_all"),
-            &schema(),
-            &constraints,
-        );
-        let ctx = SessionContext::new();
         let input = source(&[vec![batch(&[(Some(1), "a"), (Some(1), "b")])]]);
-        let plan = table
-            .insert_into(&ctx.state(), input, InsertOp::Append)
-            .await
-            .expect("plan");
-        collect(plan, ctx.task_ctx()).await.expect("write succeeds");
-        let scan = inner
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .expect("scan");
-        let stored: usize = collect(scan, ctx.task_ctx())
-            .await
-            .expect("scan runs")
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        assert_eq!(stored, 2, "both rows reach the table, which resolves them");
+        let rows = write_and_read(
+            "do_nothing_all",
+            &constraints,
+            input,
+            &SessionContext::new(),
+        )
+        .await
+        .expect("write succeeds");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both rows reach the table, which resolves them: {rows:?}"
+        );
     }
 
     #[tokio::test]
     async fn an_empty_write_writes_nothing() {
         let input = source(&[vec![]]);
-        let rows = write_and_read("do_nothing:id", input, &SessionContext::new())
+        let rows = write_and_read("do_nothing:id", &pk(), input, &SessionContext::new())
             .await
             .expect("write succeeds");
         assert!(rows.is_empty());
@@ -722,7 +671,7 @@ mod tests {
         let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
         let rows: Vec<(Option<i32>, &str)> = (0..10_000).map(|id| (Some(id), "v")).collect();
         let input = source(&[vec![batch(&rows)]]);
-        let error = write_and_read("do_nothing:id", input, &ctx)
+        let error = write_and_read("do_nothing:id", &pk(), input, &ctx)
             .await
             .expect_err("10,000 keys do not fit in 1 KiB");
         assert!(error.to_string().contains("Resources exhausted"), "{error}");
@@ -739,15 +688,11 @@ mod tests {
             let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
             let table =
                 wrap_with_keep_first_if_needed(inner, &options(on_conflict), &schema(), &pk());
-            assert_eq!(
-                table.is::<KeepFirstTableProvider>(),
-                wrapped,
-                "{on_conflict}"
-            );
+            assert_eq!(has_keep_first(&table), wrapped, "{on_conflict}");
         }
 
         let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
         let table = wrap_with_keep_first_if_needed(inner, &HashMap::new(), &schema(), &pk());
-        assert!(!table.is::<KeepFirstTableProvider>(), "no on_conflict");
+        assert!(!has_keep_first(&table), "no on_conflict");
     }
 }
