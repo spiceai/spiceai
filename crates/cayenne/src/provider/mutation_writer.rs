@@ -249,7 +249,8 @@ enum MemWriteOutcome {
     /// tier durable. The caller must take the durable path for this batch (its
     /// committer advances the slot per-batch, which is safe because the spill
     /// drained every prior mem batch to durable first). The re-streamed batches
-    /// + the held write guard are handed back.
+    /// and the held write guard are handed back; the caller must pass the stream
+    /// through `prepare_stream_for_insert` again.
     FallBackToDurable {
         stream: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
@@ -348,8 +349,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
-            && self.table.is_cdc_memory_mode()
-            && self.table.has_slot_advancer()
+            && self.table.is_cdc_mem_tier_armed()
             && self.table.metadata().partition_column.is_none()
         {
             if let Some(prepared) = self
@@ -413,8 +413,8 @@ impl<'a> AppendMutationWriter<'a> {
         }
 
         let prepared = self.table.prepare_stream_for_insert(data).await?;
-        let post_validation = prepared.post_validation();
-        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let mut post_validation = prepared.post_validation();
+        let mut may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
 
         // Retention used to block the pipelined path because it ran inline
@@ -498,7 +498,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ack behind the covering durable checkpoint. Every other table/source keeps
         // the durable path below, byte-identical.
         let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
-            || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
+            || self.table.is_cdc_mem_tier_armed()
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
@@ -511,10 +511,19 @@ impl<'a> AppendMutationWriter<'a> {
                 // are durable). This batch takes the durable path below with a
                 // NORMAL committer — safe because the slot is not ahead of
                 // durable (spill-then-fallback ordering guard).
+                //
+                // The spill moved rows the batch's conflicts were resolved
+                // against into files, so validate the batch again: the durable
+                // path must tombstone the prior versions where they live now.
                 MemWriteOutcome::FallBackToDurable {
                     stream,
                     write_guard,
-                } => (stream, write_guard),
+                } => {
+                    let prepared = self.table.prepare_stream_for_insert(stream).await?;
+                    post_validation = prepared.post_validation();
+                    may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+                    (prepared.stream, write_guard)
+                }
             }
         } else {
             (prepared_stream, write_guard)
@@ -576,6 +585,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // handles the empty-delete case (reserve 1 sequence, publish a
                 // bare ProtectedSnapshot).
                 let stage_on_conflict = may_have_on_conflict_deletions || pending_pk_deletions;
+
                 let (staging_snapshot_id, target_snapshot_id, target_kind) = if stage_on_conflict {
                     let (staging_snapshot_id, target_snapshot_id) =
                         CayenneTableProvider::new_staging_snapshot_id_pair();
@@ -690,13 +700,56 @@ impl<'a> AppendMutationWriter<'a> {
                 // steady state, where the overlap decides whether one key ends up
                 // with one live row or two (#13642).
                 //
-                // `sequence_high_water()` is the stamp, matching
-                // `CayenneCdcWrite::finish`. On this arm it buys existence, not
-                // ordering: no sequence is reserved here, so the stamp can equal a
-                // concurrent transaction's begin token and per-key OCC does not see
-                // this append at all (#13685). The publish re-stamps with the
-                // commit's own high water.
-                let record_seq = self.table.sequence_high_water().await;
+                // This record has to ORDER the append, not merely note it: per-key
+                // OCC (`transaction_has_conflict`) aborts a transaction only when a
+                // footprint key carries `sequence > that transaction's begin token`,
+                // so a stamp EQUAL to the token reads as "committed before you
+                // began" and the transaction commits straight through this append's
+                // staged window — one declared primary key, two live rows (#13685).
+                //
+                // The `stage_on_conflict` arm draws its sequences in
+                // `prepare_on_conflict_deletions_for_staged_snapshot`, so the high
+                // water is already this append's own. The other arm publishes into
+                // the current snapshot and draws nothing, leaving that high water at
+                // exactly what such a token holds — so it draws one here, the same
+                // shape `begin_deferred_snapshot_append` gives its `append_sequence`.
+                // Both readings of the check then see the append: the per-key stamp
+                // moves, and so does the per-table high water the degraded fallback
+                // compares.
+                //
+                // Only when the append actually publishes rows: one that wrote none
+                // gives a transaction nothing to race, so moving the high water for
+                // it would abort concurrent transactions over a write nobody can
+                // observe. The gate is the ROW count, not `validated_keys` — a
+                // PK-less table and one at `pk_conflict_detection: none` both
+                // validate to an empty key set on every append (`immediate`), and
+                // those are precisely the tables with no per-key stamp to fall back
+                // on. `sequence_high_water`'s own mem-tier checkpoint gates on
+                // `any_nonempty` for the same reason. Drawn before `finish()`
+                // publishes, so a failure to draw one rolls back a private write.
+                let record_seq = if stage_on_conflict || rows == 0 {
+                    self.table.sequence_high_water().await
+                } else {
+                    match self.table.reserve_sequences_local(1).await {
+                        Ok(sequence) => sequence,
+                        Err(error) => {
+                            // `debug!`, not `warn!`: a new user-visible log line is
+                            // product surface and this fix carries no Enhancement
+                            // for one. The rollback failure is not dropped — the
+                            // staged WAL it leaves is rolled forward idempotently by
+                            // the next write's `ensure_no_incomplete_write` — and the
+                            // reservation error is what the caller sees.
+                            if let Err(cleanup_error) = prepared_append.rollback().await {
+                                tracing::debug!(
+                                    table = self.table.table_name(),
+                                    %cleanup_error,
+                                    "Rollback of a staged append failed after its sequence draw failed; recovery will roll the staging WAL forward"
+                                );
+                            }
+                            return Err(error.into());
+                        }
+                    }
+                };
                 self.table.record_file_pk_keys(&validated_keys, record_seq);
                 self.table.attach_inflight_staged_pk_keys(
                     prepared_append.staging_snapshot_id(),
@@ -803,13 +856,6 @@ impl<'a> AppendMutationWriter<'a> {
             drain_start,
         );
 
-        let PostValidationState {
-            on_conflict_deletions,
-            validated_keys,
-        } = take_post_validation(post_validation);
-        let superseded =
-            u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
-
         // CAP CHECK + spill/fallback decision (OOM-safety, correctness item #2).
         //
         // 1. Per-table BYTE cap breached → spill (checkpoint) FIRST — double-
@@ -862,24 +908,19 @@ impl<'a> AppendMutationWriter<'a> {
                 );
                 let stream = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                     .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
-                // Restore the post-validation state consumed by `take_post_validation`
-                // above. The durable fallback path (`try_inline_or_restream`) re-reads
-                // `post_validation`, so without this the on-conflict deletions and
-                // validated-key bookkeeping would be lost — silently skipping conflict
-                // semantics under sustained memory-mode overload (a correctness risk).
-                restore_post_validation(
-                    post_validation,
-                    PostValidationState {
-                        on_conflict_deletions,
-                        validated_keys,
-                    },
-                );
                 return Ok(MemWriteOutcome::FallBackToDurable {
                     stream,
                     write_guard,
                 });
             }
         }
+
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+        let superseded =
+            u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
 
         // Append to the RAM tier under the listing fence. The reserved bytes stay
         // held (released by the checkpoint that flushes this epoch). On append
@@ -898,11 +939,11 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
-        // Record the inlined PK keys so a subsequent same-table upsert sees this
-        // batch's rows as present (same bookkeeping as the durable inline path).
+        // Record the PK keys so a subsequent same-table upsert sees this batch's
+        // rows as present.
         let record_seq = self.table.sequence_high_water().await;
         self.table
-            .record_inlined_pk_keys(&validated_keys, record_seq);
+            .record_mem_tier_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
@@ -1165,6 +1206,13 @@ impl<'a> AppendMutationWriter<'a> {
         // of the conflict resolution). The live-row delta is `inserted -
         // superseded`, which keeps the metastore `num_rows` tracking COUNT(*)
         // under CDC upsert instead of summing every insert.
+        // This write's own sequence for the primary-key OCC stamp below, `None`
+        // when it drew none: `write_staged_append` draws it for the plain-append
+        // arm and returns it, the `needs_new_snapshot` arm draws its own while
+        // writing its snapshot (and nothing at all when it writes no rows, for the
+        // same reason `write_staged_append` does not), and the stamp falls back to
+        // the high water in both of those cases.
+        let mut append_sequence: Option<i64> = None;
         let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
             let new_snapshot_start = Instant::now();
             let (rows, stats_acc, validated_keys, superseded) = self
@@ -1185,9 +1233,10 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
             let write_start = Instant::now();
-            let (rows, writer_ops, stats_acc) = self
+            let (rows, writer_ops, stats_acc, drawn_sequence) = self
                 .write_staged_append(prepared_stream, target_size_bytes, estimated_bytes)
                 .await?;
+            append_sequence = drawn_sequence;
 
             tracing::debug!(
                 table = self.table.table_name(),
@@ -1239,7 +1288,10 @@ impl<'a> AppendMutationWriter<'a> {
             // count and cleared only when retention had actually deleted rows).
             self.table.clear_cached_pk_keyset();
         } else {
-            let record_seq = self.table.sequence_high_water().await;
+            let record_seq = match append_sequence {
+                Some(sequence) => sequence,
+                None => self.table.sequence_high_water().await,
+            };
             self.table.record_file_pk_keys(&validated_keys, record_seq);
         }
 
@@ -1503,12 +1555,20 @@ impl<'a> AppendMutationWriter<'a> {
         })
     }
 
+    /// Write a batch into the current snapshot and publish it.
+    ///
+    /// The fourth element of the result is the sequence this append drew for its
+    /// primary-key OCC stamp, `None` when it wrote no rows. It is drawn here, in
+    /// the one place that knows the row count while the rows are still invisible:
+    /// `finalize_staged_write` below publishes them, and a stamp that does not
+    /// sit above every transaction begin token issued before that publish lets a
+    /// transaction commit over this append (#13685).
     async fn write_staged_append(
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
-    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>, Option<i64>)> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
         self.table
             .clear_staging_snapshot_dir(&staging_snapshot_id)
@@ -1523,7 +1583,7 @@ impl<'a> AppendMutationWriter<'a> {
             .store(true, Ordering::Release);
 
         let write_start = Instant::now();
-        let result = match self
+        let (rows, writer_ops, stats_acc) = match self
             .table
             .write_to_snapshot(
                 stream,
@@ -1555,11 +1615,36 @@ impl<'a> AppendMutationWriter<'a> {
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
 
+        // Zero rows publishes nothing, so there is nothing for a transaction to
+        // race and no sequence to draw (see the fn doc). A draw that fails on a
+        // block refill leaves the private files this write just staged, so it
+        // takes the same cleanup the write-error arm above takes.
+        let append_sequence = if rows > 0 {
+            match self.table.reserve_sequences_local(1).await {
+                Ok(sequence) => Some(sequence),
+                Err(error) => {
+                    if let Err(cleanup_err) = self
+                        .table
+                        .clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                            self.table.table_name(),
+                        );
+                    }
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
             None,
             staging_snapshot_id,
-            result.0,
+            rows,
         );
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
@@ -1568,7 +1653,7 @@ impl<'a> AppendMutationWriter<'a> {
         // publish-bound signal (the single-writer finalization on the CDC-apply path).
         self.context.record_publish_latency(publish_start.elapsed());
 
-        Ok(result)
+        Ok((rows, writer_ops, stats_acc, append_sequence))
     }
 
     async fn write_staged_append_prepared(
